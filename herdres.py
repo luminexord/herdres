@@ -3504,6 +3504,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "reply": "This is a mapped Herdr pane topic. Use /send <text> to forward to this pane, or /help."}
 
     if command in {"help", "start"}:
+        implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
+        plain_text_help = (
+            "Plain text from you is forwarded directly to this pane."
+            if implicit
+            else "Plain text is not forwarded unless implicit send is enabled."
+        )
         return {
             "handled": True,
             "reply": (
@@ -3514,7 +3520,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 "/debug - technical mapping details\n"
                 "/send <text> - send instruction to this pane\n"
                 "/keys <keys> - send explicit keys\n"
-                "Plain text is not forwarded unless implicit send is enabled."
+                f"{plain_text_help}"
             ),
         }
     if command in {"status", "report"}:

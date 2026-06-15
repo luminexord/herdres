@@ -80,7 +80,21 @@ Inside a mapped pane topic:
 - `/send <text>` - send instruction to this pane
 - `/keys <keys>` - send explicit keys to this pane
 
-Plain text is not forwarded unless `implicit_send_enabled` is enabled in state.
+Plain text is not forwarded unless `telegram.implicit_send_enabled` is enabled in state. When enabled, plain text from an authorized owner in a mapped pane topic is sent only to that mapped pane. The General topic remains normal Hermes chat.
+
+Inbound pane-topic control is handled through the Hermes Telegram gateway, so Hermes must load the small bridge hook:
+
+```bash
+install -Dm644 herdr_topic_bridge.py ~/.local/share/herdr-telegram-topics/herdr_topic_bridge.py
+install -Dm755 herdr_telegram_topics_install_bridge.py ~/.local/bin/herdr_telegram_topics_install_bridge.py
+mkdir -p ~/.config/systemd/user/hermes-gateway.service.d
+cat > ~/.config/systemd/user/hermes-gateway.service.d/herdr-telegram-topics.conf <<'EOF'
+[Service]
+ExecStartPre=-%h/.local/bin/herdr_telegram_topics_install_bridge.py --quiet
+EOF
+systemctl --user daemon-reload
+systemctl --user restart hermes-gateway.service
+```
 
 ## Rich Message Behavior
 
