@@ -62,7 +62,7 @@ ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "
     "yes",
     "on",
 }
-RICH_RENDER_VERSION = 10
+RICH_RENDER_VERSION = 11
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "9000"))
@@ -122,6 +122,19 @@ RESUME_CONTROL_RE = re.compile(
     re.IGNORECASE,
 )
 STRUCTURED_SECTION_RE = re.compile(r"^\s*([A-Za-z][A-Za-z ]{0,40})\s*:\s*(.*?)\s*$")
+INLINE_CODE_RE = re.compile(r"`([^`\n]{1,300})`")
+COMMIT_LINE_RE = re.compile(r"^`?([0-9a-f]{7,12})\s+(.+?)`?$", re.IGNORECASE)
+FENCE_START_RE = re.compile(r"^\s*```\s*([A-Za-z0-9_+-]{0,32})\s*$")
+TOKEN_CODE_RE = re.compile(
+    r"(?<![\w/])("
+    r"(?:~|/)[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)+(?::\d+)?|"
+    r"\b[A-Z][A-Z0-9_]{2,}\b|"
+    r"\b[A-Za-z_][A-Za-z0-9_]*\.(?:py|json|toml|service|timer|sh|md|txt|yaml|yml)\b(?::\d+)?|"
+    r"\b[A-Za-z_][A-Za-z0-9_]*=\S+\b|"
+    r"\b(?:sendRichMessage|editForumTopic|editMessageText|createForumTopic)\b|"
+    r"\b[0-9a-f]{7,12}\b"
+    r")(?![\w/])"
+)
 SECTION_ALIASES = {
     "summary": "summary",
     "short summary": "summary",
@@ -1020,7 +1033,7 @@ def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
 
 
 def _rich_paragraph(value: str) -> str:
-    clean = _html_text(value, MAX_RICH_DETAIL_CHARS).strip()
+    clean = _rich_inline(value, MAX_RICH_DETAIL_CHARS).strip()
     if not clean:
         return ""
     return f"<p>{clean}</p>"
@@ -1087,11 +1100,35 @@ def looks_like_path_or_symbol(value: str) -> bool:
     return False
 
 
+def _rich_text_segment(value: str) -> str:
+    text = str(value or "")
+    parts: list[str] = []
+    pos = 0
+    for match in TOKEN_CODE_RE.finditer(text):
+        parts.append(html.escape(text[pos:match.start()], quote=False).replace("`", ""))
+        parts.append(f"<code>{html.escape(match.group(1), quote=False)}</code>")
+        pos = match.end()
+    parts.append(html.escape(text[pos:], quote=False).replace("`", ""))
+    rendered = "".join(parts)
+    rendered = re.sub(r"\*\*([^*\n]{1,300})\*\*", r"<b>\1</b>", rendered)
+    return rendered
+
+
 def _rich_inline(value: str, max_chars: int = 500) -> str:
     clean = str(value or "").strip()
-    if _is_codeish_line(clean) or looks_like_path_or_symbol(clean):
+    if not clean:
+        return ""
+    if "`" not in clean and (_is_codeish_line(clean) or looks_like_path_or_symbol(clean)):
         return f"<code>{_html_text(clean, max_chars)}</code>"
-    return _html_text(clean, max_chars)
+    clean = sanitize_text(clean, max_chars)
+    parts: list[str] = []
+    pos = 0
+    for match in INLINE_CODE_RE.finditer(clean):
+        parts.append(_rich_text_segment(clean[pos:match.start()]))
+        parts.append(f"<code>{_html_text(match.group(1), max_chars)}</code>")
+        pos = match.end()
+    parts.append(_rich_text_segment(clean[pos:]))
+    return "".join(parts)
 
 
 def _looks_like_section(line: str, next_line: str | None = None) -> bool:
@@ -1298,7 +1335,7 @@ def _is_table_separator(cells: list[str]) -> bool:
     return bool(cells) and all(re.fullmatch(r":?-{2,}:?", cell or "") for cell in cells)
 
 
-def _rich_table_section(lines: list[str]) -> str:
+def _rich_table_section(lines: list[str], *, rich_cells: bool = False) -> str:
     rows: list[list[str]] = []
     for line in lines:
         if not line.strip():
@@ -1315,11 +1352,12 @@ def _rich_table_section(lines: list[str]) -> str:
     normalized = [row + [""] * (width - len(row)) for row in rows[:20]]
     header = normalized[0]
     body = normalized[1:]
+    cell_html = _rich_inline if rich_cells else _html_text
     html_rows = [
-        "<tr>" + "".join(f"<th>{_html_text(cell, 160)}</th>" for cell in header) + "</tr>",
+        "<tr>" + "".join(f"<th>{cell_html(cell, 160)}</th>" for cell in header) + "</tr>",
     ]
     html_rows.extend(
-        "<tr>" + "".join(f"<td>{_html_text(cell, 160)}</td>" for cell in row) + "</tr>"
+        "<tr>" + "".join(f"<td>{cell_html(cell, 160)}</td>" for cell in row) + "</tr>"
         for row in body
     )
     return "<table bordered striped>\n" + "\n".join(html_rows) + "\n</table>"
@@ -1472,7 +1510,289 @@ def has_resume_control_noise(raw_text: str) -> bool:
 
 
 def _blockquote_text(value: str, max_chars: int) -> str:
-    return _html_text(value, max_chars).replace("\n", "<br>")
+    lines = sanitize_text(value, max_chars).splitlines()
+    return "<br>".join(_rich_inline(line, max_chars) for line in lines)
+
+
+TURN_COLLAPSED_SECTION_KEYS = {"proof", "logs", "commands", "diff", "raw output", "raw"}
+TURN_KNOWN_HEADING_KEYS = {
+    "implemented",
+    "pushed",
+    "verification",
+    "what changed",
+    "what i did",
+    "recommended follow-ups",
+    "recommended follow ups",
+    "next steps",
+    "risks",
+    "proof",
+    "details",
+    "deployment",
+    "deployed",
+    "summary",
+    "result",
+}
+
+
+def _turn_heading_title(line: str) -> str:
+    clean = re.sub(r"^\s{0,3}#{1,6}\s+", "", str(line or "").strip())
+    clean = clean.rstrip(":").rstrip(".").strip()
+    return re.sub(r"\s+", " ", clean)
+
+
+def _next_nonempty_line(lines: list[str], start: int) -> str | None:
+    for idx in range(start, len(lines)):
+        if str(lines[idx] or "").strip():
+            return str(lines[idx])
+    return None
+
+
+def _is_table_line(line: str) -> bool:
+    return bool(_table_cells(line))
+
+
+def _is_turn_heading_line(
+    line: str,
+    next_nonempty: str | None,
+    *,
+    first_block: bool = False,
+    previous_blank: bool = False,
+) -> bool:
+    clean = str(line or "").strip()
+    if not clean or len(clean) > 120:
+        return False
+    if FENCE_START_RE.match(clean) or _bullet_text(clean) or _numbered_text(clean) or _checklist_item(clean):
+        return False
+    if clean.startswith(">") or _is_table_line(clean) or _is_codeish_line(clean):
+        return False
+    words = _turn_heading_title(clean).split()
+    if not 1 <= len(words) <= 6:
+        return False
+    if "`" in clean and len(words) > 3:
+        return False
+    key = _turn_heading_title(clean).lower()
+    if key in TURN_KNOWN_HEADING_KEYS:
+        return True
+    if clean.startswith("#"):
+        return True
+    if clean.endswith(":"):
+        return True
+    if first_block and len(words) <= 4 and not clean.endswith(("!", "?")):
+        return True
+    if previous_blank and next_nonempty and len(words) <= 4 and not clean.endswith(("!", "?")):
+        return True
+    return False
+
+
+def _rich_commit_line(line: str) -> str | None:
+    match = COMMIT_LINE_RE.match(str(line or "").strip())
+    if not match:
+        return None
+    return f"<p><code>{_html_text(match.group(1), 40)}</code> {_rich_inline(match.group(2), 500)}</p>"
+
+
+def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) -> str:
+    parts: list[str] = []
+    idx = 0
+    previous_blank = True
+    while idx < len(lines):
+        line = str(lines[idx] or "").rstrip()
+        if not line.strip():
+            previous_blank = True
+            idx += 1
+            continue
+
+        fence = FENCE_START_RE.match(line)
+        if fence:
+            language = fence.group(1).strip()
+            code_lines: list[str] = []
+            idx += 1
+            while idx < len(lines) and not str(lines[idx]).strip().startswith("```"):
+                code_lines.append(str(lines[idx]).rstrip())
+                idx += 1
+            if idx < len(lines):
+                idx += 1
+            class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
+            parts.append(f"<pre><code{class_attr}>{_html_text(chr(10).join(code_lines), 3000)}</code></pre>")
+            previous_blank = False
+            continue
+
+        next_nonempty = _next_nonempty_line(lines, idx + 1)
+        if _is_turn_heading_line(line, next_nonempty, first_block=not seen_heading, previous_blank=previous_blank):
+            title = _turn_heading_title(line)
+            key = title.lower()
+            if key in TURN_COLLAPSED_SECTION_KEYS:
+                body_lines: list[str] = []
+                idx += 1
+                while idx < len(lines):
+                    candidate = str(lines[idx] or "").rstrip()
+                    candidate_next = _next_nonempty_line(lines, idx + 1)
+                    if candidate.strip() and _is_turn_heading_line(
+                        candidate,
+                        candidate_next,
+                        first_block=False,
+                        previous_blank=previous_blank,
+                    ):
+                        break
+                    body_lines.append(candidate)
+                    previous_blank = not candidate.strip()
+                    idx += 1
+                body_html = _render_final_reply_blocks(body_lines, seen_heading=True)
+                if body_html:
+                    parts.append(f"<details><summary>{_html_text(title, 100)}</summary>{body_html}</details>")
+                previous_blank = False
+                seen_heading = True
+                continue
+            tag = "h3" if not seen_heading else "h4"
+            parts.append(f"<{tag}>{_html_text(title, 100)}</{tag}>")
+            seen_heading = True
+            previous_blank = False
+            idx += 1
+            continue
+
+        if _is_table_line(line) and idx + 1 < len(lines) and _is_table_line(str(lines[idx + 1])):
+            table_lines: list[str] = []
+            while idx < len(lines) and _is_table_line(str(lines[idx])):
+                table_lines.append(str(lines[idx]).rstrip())
+                idx += 1
+            table_html = _rich_table_section(table_lines, rich_cells=True)
+            if table_html:
+                parts.append(table_html)
+            previous_blank = False
+            continue
+
+        checklist = _checklist_item(line)
+        if checklist:
+            checklist_lines: list[str] = []
+            while idx < len(lines) and _checklist_item(str(lines[idx] or "")):
+                checklist_lines.append(str(lines[idx]).rstrip())
+                idx += 1
+            checklist_html = _rich_checklist_section(checklist_lines)
+            if checklist_html:
+                parts.append(checklist_html)
+            previous_blank = False
+            continue
+
+        bullet = _bullet_text(line)
+        if bullet:
+            items: list[str] = []
+            while idx < len(lines):
+                item = _bullet_text(str(lines[idx] or ""))
+                if item is None:
+                    break
+                idx += 1
+                while idx < len(lines):
+                    continuation = str(lines[idx] or "")
+                    if (
+                        not continuation.strip()
+                        or _bullet_text(continuation)
+                        or _numbered_text(continuation)
+                        or _checklist_item(continuation)
+                    ):
+                        break
+                    if not continuation.startswith((" ", "\t")):
+                        break
+                    item = f"{item.rstrip()} {continuation.strip()}"
+                    idx += 1
+                items.append(item)
+            parts.append("<ul>\n" + "\n".join(f"<li>{_rich_inline(item, 900)}</li>" for item in items) + "\n</ul>")
+            previous_blank = False
+            continue
+
+        numbered = _numbered_text(line)
+        if numbered:
+            items: list[tuple[int, str]] = []
+            while idx < len(lines):
+                parsed = _numbered_text(str(lines[idx] or ""))
+                if not parsed:
+                    break
+                number, text = parsed
+                idx += 1
+                while idx < len(lines):
+                    continuation = str(lines[idx] or "")
+                    if (
+                        not continuation.strip()
+                        or _bullet_text(continuation)
+                        or _numbered_text(continuation)
+                        or _checklist_item(continuation)
+                    ):
+                        break
+                    if not continuation.startswith((" ", "\t")):
+                        break
+                    text = f"{text.rstrip()} {continuation.strip()}"
+                    idx += 1
+                items.append((number, text))
+            parts.append("<ol>\n" + "\n".join(f"<li>{_rich_inline(text, 900)}</li>" for _, text in items) + "\n</ol>")
+            previous_blank = False
+            continue
+
+        if line.strip().startswith(">"):
+            quote_lines: list[str] = []
+            while idx < len(lines) and str(lines[idx] or "").strip().startswith(">"):
+                quote_lines.append(re.sub(r"^\s*>\s?", "", str(lines[idx]).rstrip()))
+                idx += 1
+            parts.append("<blockquote>" + "<br>".join(_rich_inline(quote, 900) for quote in quote_lines) + "</blockquote>")
+            previous_blank = False
+            continue
+
+        commit_html = _rich_commit_line(line)
+        if commit_html:
+            parts.append(commit_html)
+            previous_blank = False
+            idx += 1
+            continue
+
+        if _is_codeish_line(line):
+            code_lines = [line.strip()]
+            idx += 1
+            while idx < len(lines) and _is_codeish_line(str(lines[idx] or "")):
+                code_lines.append(str(lines[idx]).strip())
+                idx += 1
+            parts.append(f"<pre><code>{_html_text(chr(10).join(code_lines), 1800)}</code></pre>")
+            previous_blank = False
+            continue
+
+        paragraph = [line.strip()]
+        idx += 1
+        while idx < len(lines):
+            candidate = str(lines[idx] or "").rstrip()
+            if not candidate.strip():
+                break
+            candidate_next = _next_nonempty_line(lines, idx + 1)
+            if (
+                FENCE_START_RE.match(candidate)
+                or _bullet_text(candidate)
+                or _numbered_text(candidate)
+                or _checklist_item(candidate)
+                or candidate.strip().startswith(">")
+                or _is_codeish_line(candidate)
+                or (_is_table_line(candidate) and idx + 1 < len(lines) and _is_table_line(str(lines[idx + 1])))
+                or _is_turn_heading_line(candidate, candidate_next, first_block=False, previous_blank=False)
+            ):
+                break
+            paragraph.append(candidate.strip())
+            idx += 1
+        parts.append(_rich_paragraph(" ".join(paragraph)))
+        previous_blank = False
+    return "\n".join(part for part in parts if part)
+
+
+def render_final_reply_html(value: str) -> str:
+    clean = sanitize_text(str(value or ""), FINAL_REPLY_MAX_CHARS).strip()
+    if not clean:
+        return ""
+    return _render_final_reply_blocks(clean.splitlines())
+
+
+def _turn_fallback_body_html(assistant_final: str, reserved_chars: int) -> str:
+    budget = max(1200, min(FINAL_REPLY_MAX_CHARS, MAX_RICH_HTML_CHARS - reserved_chars - 500))
+    while budget >= 900:
+        fallback = sanitize_text(assistant_final, budget)
+        body = render_final_reply_html(fallback) or _rich_paragraph(fallback)
+        if len(body) <= max(900, MAX_RICH_HTML_CHARS - reserved_chars):
+            return body
+        budget = budget // 2
+    return _rich_paragraph(sanitize_text(assistant_final, 900))
 
 
 def render_turn_item_html(item: dict[str, Any]) -> str:
@@ -1486,30 +1806,28 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
             f"{_blockquote_text(user_text, USER_PROMPT_MAX_CHARS)}"
             "</blockquote>"
         )
-    body_html, overflow = _rich_structured_block(
-        assistant_final.splitlines(),
-        max_chars=FINAL_REPLY_MAX_CHARS,
-        max_lines=FINAL_REPLY_MAX_LINES,
-    )
+    body_html = render_final_reply_html(assistant_final)
     if body_html:
         parts.append(body_html)
     elif assistant_final:
         parts.append(_rich_paragraph(assistant_final))
-    if overflow:
-        overflow_html, _ = _rich_structured_block(overflow, max_chars=1200, max_lines=20)
-        if overflow_html:
-            parts.append(f"<details><summary>More</summary>{overflow_html}</details>")
     rendered = "\n".join(part for part in parts if part).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
-        fallback = sanitize_text(assistant_final, 900)
+        quote_html = ""
         if user_text:
-            return (
+            quote_html = (
                 "<blockquote><b>You asked</b><br>"
                 f"{_blockquote_text(user_text, USER_PROMPT_MAX_CHARS)}"
-                "</blockquote>\n"
-                f"{_rich_paragraph(fallback)}"
+                "</blockquote>"
             )
-        return _rich_paragraph(fallback)
+        body_html = _turn_fallback_body_html(assistant_final, len(quote_html))
+        if quote_html:
+            rendered = f"{quote_html}\n{body_html}"
+        else:
+            rendered = body_html
+        if len(rendered) > MAX_RICH_HTML_CHARS:
+            body_html = _rich_paragraph(sanitize_text(assistant_final, 900))
+            return f"{quote_html}\n{body_html}" if quote_html else body_html
     return rendered
 
 

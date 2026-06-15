@@ -1415,11 +1415,112 @@ What changed:
 
         self.assertIn("<b>You asked</b>", html)
         self.assertIn("Why did the bot freeze?", html)
-        self.assertIn("<h4>Likely cause</h4>", html)
+        self.assertIn("<h3>Likely cause</h3>", html)
         self.assertIn("<li>Browser navigation hung.</li>", html)
         self.assertNotIn("<h3>Question</h3>", html)
         self.assertNotIn("<h3>Report</h3>", html)
         self.assertNotIn("<h3>Update</h3>", html)
+
+    def test_turn_feed_formats_screenshot_case_as_rich_html(self) -> None:
+        item = {
+            "kind": "turn",
+            "user_text": (
+                "also you see how each pane on herdr can have a name? i would like it so that "
+                "if i change a name on a herdr pane manually, it automatically changes the name "
+                "of the topic on telegram"
+            ),
+            "assistant_final_text": """Implemented.
+Herdres now watches the Herdr pane `label` field and syncs Telegram topic names from it:
+- Existing labeled panes are baselined first, so it does not surprise-rename current owner-corrected topics.
+- If you manually change a Herdr pane name after this, the next sync updates the mapped Telegram topic name with `editForumTopic`.
+- If Telegram says the topic is missing during rename, Herdres clears that pane's stale topic mapping and recreates it on the next sync.
+- No Herdr core changes, no LLM calls, no extra messages posted.
+
+Deployed live to `/home/smith/.local/bin/herdr_telegram_topics.py`.
+
+Pushed
+`cdee2ca Sync Telegram topic names from Herdr pane labels`
+
+Verification
+
+- `python3 -m py_compile herdres.py herdr_turn_adapter.py`
+- `python3 -m unittest discover -s tests -p 'test*.py' -q` -> 78 tests OK
+- Live sync ran successfully: `renamed=0`, `sent=0`, `panes=6`
+- Existing `entmoot italy ping` label was baselined while keeping Telegram topic `Italy Ping`.
+""",
+        }
+
+        html = herdres.render_turn_item_html(item)
+
+        self.assertIn("<blockquote>", html)
+        self.assertIn("<h3>Implemented</h3>", html)
+        self.assertIn("<h4>Pushed</h4>", html)
+        self.assertIn("<h4>Verification</h4>", html)
+        self.assertIn("<code>label</code>", html)
+        self.assertIn("<code>editForumTopic</code>", html)
+        self.assertIn("<code>/home/smith/.local/bin/herdr_telegram_topics.py</code>", html)
+        self.assertIn("<code>cdee2ca</code> Sync Telegram topic names from Herdr pane labels", html)
+        self.assertIn("<code>renamed=0</code>", html)
+        self.assertNotIn("`", html)
+
+    def test_single_inline_command_does_not_become_pre_block(self) -> None:
+        html = herdres.render_final_reply_html("- `python3 -m py_compile herdres.py`")
+
+        self.assertNotIn("<pre>", html)
+        self.assertIn("<code>python3 -m py_compile herdres.py</code>", html)
+
+    def test_fenced_code_becomes_pre_code(self) -> None:
+        html = herdres.render_final_reply_html("```bash\nsystemctl --user status herdres.timer\n```")
+
+        self.assertIn('<pre><code class="language-bash">', html)
+        self.assertIn("systemctl --user status herdres.timer", html)
+
+    def test_unmatched_backtick_does_not_render_literal_entity_text(self) -> None:
+        html = herdres.render_final_reply_html("This has one ` unmatched marker.")
+
+        self.assertNotIn("`", html)
+        self.assertNotIn("&amp;#96;", html)
+        self.assertNotIn("&#96;", html)
+        self.assertIn("unmatched marker", html)
+
+    def test_report_table_cells_do_not_gain_turn_inline_code(self) -> None:
+        html = herdres._rich_table_section(["File | Status", "herdres.py | OK"])
+
+        self.assertIn("<td>herdres.py</td>", html)
+        self.assertNotIn("<td><code>herdres.py</code></td>", html)
+
+    def test_turn_table_cells_use_rich_inline_code(self) -> None:
+        html = herdres.render_final_reply_html("Files\nFile | Status\nherdres.py | OK")
+
+        self.assertIn("<td><code>herdres.py</code></td>", html)
+
+    def test_short_standalone_lines_become_turn_headings(self) -> None:
+        html = herdres.render_final_reply_html("Pushed\n`cdee2ca Sync topic names`\n\nVerification\n- tests OK")
+
+        self.assertIn("<h3>Pushed</h3>", html)
+        self.assertIn("<h4>Verification</h4>", html)
+        self.assertIn("<code>cdee2ca</code> Sync topic names", html)
+
+    def test_oversized_turn_fallback_keeps_more_than_tiny_summary(self) -> None:
+        text = "Implemented.\n" + "\n".join(
+            f"- Item {idx}: `renamed={idx}` with enough text to inflate rich HTML output."
+            for idx in range(1, 180)
+        )
+        item = {"kind": "turn", "user_text": "Long update?", "assistant_final_text": text}
+
+        html = herdres.render_turn_item_html(item)
+
+        self.assertLessEqual(len(html), herdres.MAX_RICH_HTML_CHARS + 300)
+        self.assertIn("Item 1", html)
+        self.assertIn("Item 30", html)
+
+    def test_proof_section_collapses_in_turn_renderer(self) -> None:
+        html = herdres.render_final_reply_html(
+            "Verification\n- tests OK\n\nProof\n```bash\nsystemctl --user status herdres.timer\n```"
+        )
+
+        self.assertIn("<h3>Verification</h3>", html)
+        self.assertIn("<details><summary>Proof</summary>", html)
 
     def test_turn_feed_ignores_incomplete_and_unavailable_turns(self) -> None:
         self.assertIsNone(
