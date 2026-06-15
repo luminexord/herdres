@@ -99,7 +99,9 @@ Fallback policy:
 
 ## Clean Report Markers
 
-Herdres posts only bounded reports, known report headings, real choice prompts, actionable questions, and blocked/error items. For the cleanest pane output, have the pane emit an explicit bounded report:
+By default, automatic sync posts only bounded reports, real choice prompts, actionable questions, and blocked/error items. It does not auto-post unbounded `Summary:`, `Final:`, `Verification:`, or `What changed:` transcript text unless `HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS=1` is set.
+
+For the cleanest pane output, have the pane emit an explicit bounded report:
 
 ```text
 HERDRES_REPORT_START
@@ -115,6 +117,29 @@ HERDRES_REPORT_END
 
 `HERDRES_REPORT_TITLE:` is optional, but recommended. Without it, the first report line must be a short title such as `Deployment`, `Flight Recorder`, or `What changed:`. Malformed bounded reports are ignored instead of being posted as noisy Telegram updates.
 
+Bounded reports can also use structured sections:
+
+```text
+HERDRES_REPORT_START
+HERDRES_REPORT_TITLE: Sprint Status
+SUMMARY:
+Driver App release is done and Route Optimizer is blocked.
+TABLE:
+Task | Owner | Status
+Driver App release | Alex | Done
+Route optimizer | Luke | Blocked
+CHECKLIST:
+[x] Review PR
+[ ] Run staging smoke test
+DETAILS: Risks
+- Route Optimizer dependency is blocking release.
+FOOTER:
+Sprint - Smith - 10:58
+HERDRES_REPORT_END
+```
+
+These render as Telegram rich headings, paragraphs, tables, checklists, collapsible details, and footers when rich messages are available.
+
 ## Useful Environment Variables
 
 ```bash
@@ -128,6 +153,7 @@ HERDR_TELEGRAM_TOPICS_FEED_READ_LINES=140
 HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS=9000
 HERDR_TELEGRAM_TOPICS_RICH_MESSAGES=1
 HERDR_TELEGRAM_TOPICS_LIVE_CARD=1
+HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS=0
 HERDR_TELEGRAM_TOPICS_DRY_RUN=0
 ```
 

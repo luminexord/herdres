@@ -172,7 +172,7 @@ Fixed the long report cutoff.
 {body}
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
         self.assertIsNotNone(item)
         assert item is not None
 
@@ -198,7 +198,7 @@ HERDRES_REPORT_END
 noise after
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNotNone(item)
         assert item is not None
@@ -216,7 +216,7 @@ Result, Flight Recorder, etc.
 HERDRES_REPORT_END
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNone(item)
 
@@ -230,7 +230,7 @@ Verification:
 HERDRES_REPORT_END
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNotNone(item)
         assert item is not None
@@ -243,7 +243,7 @@ HERDRES_REPORT_END
     def test_report_markers_must_be_standalone_lines(self) -> None:
         raw = "Example: HERDRES_REPORT_START this should not start a report HERDRES_REPORT_END"
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNone(item)
 
@@ -265,13 +265,71 @@ Verification:
 HERDRES_REPORT_END
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNotNone(item)
         assert item is not None
         self.assertEqual(item["kind"], "report")
         self.assertEqual(item["title"], "Deployment")
         self.assertIn("Added cache", herdres.item_plain_text(item))
+
+    def test_bounded_sprint_status_renders_table_checklist_details(self) -> None:
+        raw = """HERDRES_REPORT_START
+HERDRES_REPORT_TITLE: Sprint Status
+
+SUMMARY:
+Driver App release is done, Portal QA is in progress, Route Optimizer is blocked.
+
+TABLE:
+Task | Owner | Status
+Driver App release | Alex | Done
+Portal QA | Sam | In progress
+Route optimizer | Luke | Blocked
+
+CHECKLIST:
+[x] Review PR
+[ ] Run staging smoke test
+
+DETAILS: Risks
+- Route Optimizer dependency is blocking release.
+
+FOOTER:
+Sprint - Smith - 10:58
+HERDRES_REPORT_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("<h3>Sprint Status</h3>", html)
+        self.assertIn("<table>", html)
+        self.assertIn("<th>Task</th>", html)
+        self.assertIn("<td>Alex</td>", html)
+        self.assertIn('<input type="checkbox" checked>', html)
+        self.assertIn('<input type="checkbox">', html)
+        self.assertIn("<details><summary>Risks</summary>", html)
+        self.assertIn("<footer>Sprint - Smith - 10:58</footer>", html)
+
+    def test_structured_sections_require_colon(self) -> None:
+        raw = """HERDRES_REPORT_START
+HERDRES_REPORT_TITLE: Deploy Notes
+Summary of the deploy is below.
+Tables are useful when they are intentional.
+- Normal bullet.
+HERDRES_REPORT_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("Summary of the deploy is below.", html)
+        self.assertIn("Tables are useful", html)
+        self.assertNotIn("<table>", html)
+        self.assertNotIn("<b>of the deploy is below.:</b>", html)
 
     def test_done_heading_report_with_numbered_list_stays_report(self) -> None:
         raw = """What changed:
@@ -282,7 +340,7 @@ Verification:
 2. Timer run succeeded.
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNotNone(item)
         assert item is not None
@@ -300,7 +358,7 @@ Investigation
 HERDRES_REPORT_END
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNotNone(item)
         assert item is not None
@@ -321,7 +379,7 @@ New Update
 HERDRES_REPORT_END
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNotNone(item)
         assert item is not None
@@ -346,7 +404,7 @@ Verification:
 - tests pass
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNotNone(item)
         assert item is not None
@@ -362,7 +420,7 @@ I verified the thing and it is done.
 I am pushing now.
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNone(item)
 
@@ -378,7 +436,7 @@ Verification:
 Want me to deploy next?
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNotNone(item)
         assert item is not None
@@ -393,7 +451,7 @@ I am preparing the final message.
 What changed:
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNone(item)
 
@@ -413,7 +471,7 @@ Verification:
 - tests pass
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNotNone(item)
         assert item is not None
@@ -440,7 +498,7 @@ Verified with:
 - unittest
 """
 
-        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
 
         self.assertIsNotNone(item)
         assert item is not None
@@ -462,6 +520,37 @@ Verified with:
 """
 
         item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNone(item)
+
+    def test_summary_heading_does_not_auto_send_without_marker(self) -> None:
+        raw = """Summary:
+This is a transcript summary, not a final report.
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNone(item)
+
+    def test_what_changed_heading_does_not_auto_send_without_marker(self) -> None:
+        raw = """What changed:
+- This is visible transcript text without explicit report markers.
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNone(item)
+
+    def test_restart_transcript_does_not_send_update(self) -> None:
+        raw = """Conversation interrupted and goal paused.
+
+Summary:
+Previous conversation state...
+/venv/bin/python script.py
+"""
+
+        self.assertTrue(herdres.has_resume_control_noise(raw))
+        item = herdres.extract_clean_feed_item({"agent_status": "idle"}, {}, raw)
 
         self.assertIsNone(item)
 
@@ -536,7 +625,7 @@ What changed:
             save_state=Mock(),
             pane_list=Mock(return_value=[pane]),
             preflight_is_fresh=Mock(return_value=True),
-            pane_feed_output=Mock(return_value="What changed:\n\n- Fixed extraction."),
+            pane_feed_output=Mock(return_value="HERDRES_REPORT_START\nFix\n- Fixed extraction.\nHERDRES_REPORT_END"),
             send_feed_item=Mock(return_value={"ok": False, "format": "rich", "error": "temporary"}),
             LIVE_CARD_ENABLED=False,
         ):
@@ -571,7 +660,7 @@ What changed:
             "save_state": Mock(),
             "pane_list": Mock(return_value=[pane]),
             "preflight_is_fresh": Mock(return_value=True),
-            "pane_feed_output": Mock(return_value="What changed:\n\n- Fixed extraction."),
+            "pane_feed_output": Mock(return_value="HERDRES_REPORT_START\nFix\n- Fixed extraction.\nHERDRES_REPORT_END"),
             "send_feed_item": send_feed_item,
             "LIVE_CARD_ENABLED": False,
         }
@@ -584,6 +673,92 @@ What changed:
         self.assertFalse(second["changed"])
         send_feed_item.assert_called_once()
 
+    def test_sync_suppresses_resume_transcript_until_bounded_report(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "idle",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "last_clean_hash": "old",
+            "last_clean_text": "old update",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        send_feed_item = Mock(return_value={"ok": True})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_feed_output=Mock(return_value="Conversation interrupted and goal paused.\n\nSummary:\nPrevious state."),
+            send_feed_item=send_feed_item,
+            LIVE_CARD_ENABLED=False,
+        ):
+            first = herdres.sync_once()
+            second = herdres.sync_once()
+
+        self.assertTrue(first["changed"])
+        self.assertFalse(second["changed"])
+        self.assertTrue(entry.get("suppress_auto_feed_until_bounded_report"))
+        self.assertNotIn("last_clean_hash", entry)
+        send_feed_item.assert_not_called()
+
+    def test_sync_clears_resume_suppress_and_sends_later_question(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "blocked",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "suppress_auto_feed_until_bounded_report": True,
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        send_feed_item = Mock(return_value={"ok": True})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_feed_output=Mock(return_value="Question\nWould you like me to deploy now?"),
+            send_feed_item=send_feed_item,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertNotIn("suppress_auto_feed_until_bounded_report", entry)
+        send_feed_item.assert_called_once()
+
     def test_live_card_hash_ignores_label_only_changes(self) -> None:
         pane_a = {"agent_status": "working", "label": "Brewed for 1m"}
         pane_b = {"agent_status": "working", "label": "Brewed for 5m"}
@@ -593,7 +768,7 @@ What changed:
             herdres.clean_feed_hash(herdres.live_status_item(pane_b)),
         )
 
-    def test_pane_feed_output_tries_clean_sources_before_visible(self) -> None:
+    def test_pane_feed_output_auto_uses_recent_unwrapped_only(self) -> None:
         calls: list[str] = []
 
         def fake_pane_output(pane_id: str, *, lines: int, max_chars: int, source: str) -> str:
@@ -602,6 +777,19 @@ What changed:
 
         with patch.object(herdres, "pane_output", side_effect=fake_pane_output):
             text = herdres.pane_feed_output("pane-1")
+
+        self.assertEqual(text, "")
+        self.assertEqual(calls, ["recent-unwrapped"])
+
+    def test_pane_feed_output_manual_can_fall_back_to_transcript(self) -> None:
+        calls: list[str] = []
+
+        def fake_pane_output(pane_id: str, *, lines: int, max_chars: int, source: str) -> str:
+            calls.append(source)
+            return "clean transcript" if source == "transcript" else ""
+
+        with patch.object(herdres, "pane_output", side_effect=fake_pane_output):
+            text = herdres.pane_feed_output("pane-1", manual=True)
 
         self.assertEqual(text, "clean transcript")
         self.assertEqual(calls, ["recent-unwrapped", "transcript"])

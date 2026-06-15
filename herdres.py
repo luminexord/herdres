@@ -52,11 +52,19 @@ HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
-RICH_RENDER_VERSION = 8
+ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+RICH_RENDER_VERSION = 9
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
+AUTO_FEED_SOURCES = ("recent-unwrapped",)
+MANUAL_FEED_SOURCES = ("recent-unwrapped", "transcript", "visible")
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)\b(bot_token|token|api[_-]?key|secret|password|passwd|authorization)\s*[:=]\s*([^\s]+)"),
@@ -81,6 +89,19 @@ ACTION_QUESTION_RE = re.compile(
     r"\b(should i|should we|do you want me to|would you like me to|would you like|approve|choose|select|run|deploy|continue|proceed)\b",
     re.IGNORECASE,
 )
+RESUME_CONTROL_RE = re.compile(
+    r"\b("
+    r"conversation interrupted|"
+    r"goal paused|"
+    r"goal resumed|"
+    r"conversation resumed|"
+    r"transcript restored|"
+    r"compacted conversation|"
+    r"previous conversation state"
+    r")\b",
+    re.IGNORECASE,
+)
+STRUCTURED_SECTION_RE = re.compile(r"^\s*(SUMMARY|TABLE|CHECKLIST|DETAILS|FOOTER)\s*:\s*(.*?)\s*$", re.IGNORECASE)
 
 
 class BridgeError(RuntimeError):
@@ -400,8 +421,9 @@ def pane_output(
     return sanitize_text(str(text), max_chars=max_chars)
 
 
-def pane_feed_output(pane_id: str) -> str:
-    for source in ("recent-unwrapped", "transcript", "visible"):
+def pane_feed_output(pane_id: str, *, manual: bool = False) -> str:
+    sources = MANUAL_FEED_SOURCES if manual else AUTO_FEED_SOURCES
+    for source in sources:
         text = pane_output(
             pane_id,
             lines=FEED_READ_LINES,
@@ -1060,6 +1082,154 @@ def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_
     return "\n".join(part for part in parts if part), overflow
 
 
+def _split_structured_sections(lines: list[str]) -> tuple[list[tuple[str, str, list[str]]], bool]:
+    sections: list[tuple[str, str, list[str]]] = []
+    current_kind = ""
+    current_title = ""
+    current_lines: list[str] = []
+    has_structured = False
+
+    def flush() -> None:
+        nonlocal current_kind, current_title, current_lines
+        if current_lines or current_kind:
+            sections.append((current_kind, current_title, current_lines))
+        current_kind = ""
+        current_title = ""
+        current_lines = []
+
+    for raw in lines:
+        match = STRUCTURED_SECTION_RE.match(str(raw or ""))
+        if match:
+            flush()
+            has_structured = True
+            current_kind = match.group(1).lower()
+            current_title = match.group(2).strip()
+            current_lines = []
+            continue
+        current_lines.append(str(raw or "").rstrip())
+    flush()
+    return sections, has_structured
+
+
+def _table_cells(line: str) -> list[str]:
+    text = str(line or "").strip()
+    if "|" not in text:
+        return []
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    cells = [cell.strip() for cell in text.split("|")]
+    return cells if len(cells) >= 2 and any(cells) else []
+
+
+def _is_table_separator(cells: list[str]) -> bool:
+    return bool(cells) and all(re.fullmatch(r":?-{2,}:?", cell or "") for cell in cells)
+
+
+def _rich_table_section(lines: list[str]) -> str:
+    rows: list[list[str]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        cells = _table_cells(line)
+        if not cells:
+            continue
+        if _is_table_separator(cells):
+            continue
+        rows.append(cells[:20])
+    if len(rows) < 2:
+        return ""
+    width = max(len(row) for row in rows[:20])
+    normalized = [row + [""] * (width - len(row)) for row in rows[:20]]
+    header = normalized[0]
+    body = normalized[1:]
+    html_rows = [
+        "<tr>" + "".join(f"<th>{_html_text(cell, 160)}</th>" for cell in header) + "</tr>",
+    ]
+    html_rows.extend(
+        "<tr>" + "".join(f"<td>{_html_text(cell, 160)}</td>" for cell in row) + "</tr>"
+        for row in body
+    )
+    return "<table>\n" + "\n".join(html_rows) + "\n</table>"
+
+
+def _checklist_item(line: str) -> tuple[bool, str] | None:
+    match = re.match(r"^\s*(?:[-*+\u2022]\s*)?\[(x|X| )\]\s+(.+)$", line or "")
+    if not match:
+        return None
+    return match.group(1).lower() == "x", match.group(2).strip()
+
+
+def _rich_checklist_section(lines: list[str]) -> str:
+    items: list[tuple[bool, str]] = []
+    for line in lines:
+        parsed = _checklist_item(line)
+        if parsed:
+            items.append(parsed)
+    if not items:
+        return ""
+    rendered = []
+    for checked, text in items[:40]:
+        attr = " checked" if checked else ""
+        rendered.append(f"<li><input type=\"checkbox\"{attr}>{_rich_inline(text, 500)}</li>")
+    return "<ul>\n" + "\n".join(rendered) + "\n</ul>"
+
+
+def _rich_structured_report(lines: list[str]) -> str:
+    sections, has_structured = _split_structured_sections(lines)
+    if not has_structured:
+        return ""
+    parts: list[str] = []
+    for kind, title, body in sections:
+        body = strip_outer_blank_lines(body)
+        if not kind:
+            block, _ = _rich_structured_block(body, max_chars=1200, max_lines=20)
+            if block:
+                parts.append(block)
+            continue
+        if kind == "summary":
+            summary = compact_block(body, max_lines=6, max_chars=900)
+            if summary:
+                label = title or "Summary"
+                parts.append(f"<p><b>{_html_text(label, 80)}:</b> {_html_text(summary, 900)}</p>")
+            continue
+        if kind == "table":
+            table_html = _rich_table_section(body)
+            if title:
+                parts.append(f"<h4>{_html_text(title, 100)}</h4>")
+            if table_html:
+                parts.append(table_html)
+            elif body:
+                block, _ = _rich_structured_block(body, max_chars=1200, max_lines=20)
+                if block:
+                    parts.append(block)
+            continue
+        if kind == "checklist":
+            heading = title or "Checklist"
+            checklist_html = _rich_checklist_section(body)
+            parts.append(f"<h4>{_html_text(heading, 100)}</h4>")
+            if checklist_html:
+                parts.append(checklist_html)
+            elif body:
+                block, _ = _rich_structured_block(body, max_chars=1200, max_lines=30)
+                if block:
+                    parts.append(block)
+            continue
+        if kind == "details":
+            summary = title or "Details"
+            block, _ = _rich_structured_block(body, max_chars=1800, max_lines=40)
+            if block:
+                parts.append(f"<details><summary>{_html_text(summary, 100)}</summary>{block}</details>")
+            continue
+        if kind == "footer":
+            footer = compact_block(body, max_lines=3, max_chars=500)
+            if footer:
+                parts.append(f"<footer>{_html_text(footer, 500)}</footer>")
+            continue
+    return "\n".join(part for part in parts if part)
+
+
 def _rich_lines_block(value: str, *, max_chars: int = MAX_RICH_DETAIL_CHARS) -> str:
     block, overflow = _rich_structured_block(value, max_chars=max_chars, max_lines=12)
     if overflow:
@@ -1107,6 +1277,10 @@ def is_action_question(lines: list[str]) -> bool:
     return bool(ACTION_QUESTION_RE.search(tail))
 
 
+def has_resume_control_noise(raw_text: str) -> bool:
+    return bool(RESUME_CONTROL_RE.search(raw_text or ""))
+
+
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
     title = str(item.get("title") or "").strip()
@@ -1142,11 +1316,14 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     elif content_lines:
         body_max_lines = 80 if kind in {"report", "blocked", "error"} else 30
         body_max_chars = 5000 if kind in {"report", "blocked", "error"} else MAX_RICH_DETAIL_CHARS
-        body_html, overflow = _rich_structured_block(
-            content_lines,
-            max_chars=body_max_chars,
-            max_lines=body_max_lines,
-        )
+        body_html = _rich_structured_report(content_lines) if kind == "report" else ""
+        overflow: list[str] = []
+        if not body_html:
+            body_html, overflow = _rich_structured_block(
+                content_lines,
+                max_chars=body_max_chars,
+                max_lines=body_max_lines,
+            )
         if body_html:
             parts.append(body_html)
         if overflow:
@@ -1237,7 +1414,13 @@ def extract_choices(lines: list[str], *, allow_trailing_without_context: bool = 
     }
 
 
-def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_text: str) -> dict[str, Any] | None:
+def extract_clean_feed_item(
+    pane: dict[str, Any],
+    entry: dict[str, Any],
+    raw_text: str,
+    *,
+    allow_unbounded_reports: bool = ALLOW_UNBOUNDED_REPORTS,
+) -> dict[str, Any] | None:
     lines = clean_feed_lines(raw_text)
     if not lines:
         return None
@@ -1254,13 +1437,13 @@ def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_tex
             return make_feed_item("report", title, body, notify=False)
         return None
 
-    report_idx = report_start_index(lines)
-
-    if report_idx is not None and status in {"done", "idle"}:
-        title, body = report_title_and_body(lines)
-        if body.strip():
-            return make_feed_item("report", title, body, notify=False)
-        return None
+    if allow_unbounded_reports:
+        report_idx = report_start_index(lines)
+        if report_idx is not None and status in {"done", "idle"}:
+            title, body = report_title_and_body(lines)
+            if body.strip():
+                return make_feed_item("report", title, body, notify=False)
+            return None
 
     choices = extract_choices(lines, allow_trailing_without_context=status in {"blocked", "error", "unknown"})
     if choices:
@@ -1427,8 +1610,8 @@ def latest_clean_report(entry: dict[str, Any], pane: dict[str, Any] | None = Non
     if text:
         return text
     if pane:
-        raw = pane_feed_output(str(pane.get("pane_id") or ""))
-        item = extract_clean_feed_item(pane, entry, raw)
+        raw = pane_feed_output(str(pane.get("pane_id") or ""), manual=True)
+        item = extract_clean_feed_item(pane, entry, raw, allow_unbounded_reports=True)
         if item:
             return str(item.get("text") or "").strip()
     return "No clean report is available yet."
@@ -1450,8 +1633,8 @@ def latest_clean_item(entry: dict[str, Any], pane: dict[str, Any] | None = None)
         }.get(kind, "Report")
         return make_feed_item(kind, title, text, notify=False)
     if pane:
-        raw = pane_feed_output(str(pane.get("pane_id") or ""))
-        return extract_clean_feed_item(pane, entry, raw)
+        raw = pane_feed_output(str(pane.get("pane_id") or ""), manual=True)
+        return extract_clean_feed_item(pane, entry, raw, allow_unbounded_reports=True)
     return None
 
 
@@ -2096,7 +2279,34 @@ def sync_once() -> dict[str, Any]:
                 changed = True
         if CLEAN_FEED_ENABLED:
             raw = pane_feed_output(str(pane.get("pane_id") or ""))
-            item = extract_clean_feed_item(pane, entry, raw)
+            clean_lines = clean_feed_lines(raw)
+            bounded_report = extract_bounded_report(clean_lines)
+            item = None
+            if bounded_report:
+                if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
+                    changed = True
+                item = extract_clean_feed_item(
+                    pane,
+                    entry,
+                    raw,
+                    allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
+                )
+            elif has_resume_control_noise(raw):
+                if entry.get("last_clean_hash") or not entry.get("suppress_auto_feed_until_bounded_report"):
+                    clear_clean_feed_state(entry)
+                    changed = True
+                if not entry.get("suppress_auto_feed_until_bounded_report"):
+                    entry["suppress_auto_feed_until_bounded_report"] = True
+                    changed = True
+            else:
+                if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
+                    changed = True
+                item = extract_clean_feed_item(
+                    pane,
+                    entry,
+                    raw,
+                    allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
+                )
             old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
             if item:
                 item_hash = clean_feed_hash(item)
