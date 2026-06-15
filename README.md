@@ -130,6 +130,22 @@ If Herdr cannot provide structured turn data, it should return:
 
 When turn feed is enabled and the endpoint is unavailable, incomplete, or empty, Herdres sends nothing and does not fall back to `pane read`. This keeps Herdr upgrade-safe: Herdres consumes an optional upstream CLI contract and does not require local Herdr patches.
 
+For local deployments that need this before Herdr exposes the endpoint upstream, Herdres includes `herdr_turn_adapter.py`. It is a wrapper, not a Herdr patch:
+
+```bash
+install -Dm755 herdr_turn_adapter.py ~/.local/bin/herdr_turn_adapter.py
+```
+
+Configure only the Herdres service to use it:
+
+```bash
+HERDR_BIN=/home/smith/.local/bin/herdr_turn_adapter.py
+HERDR_REAL_BIN=/home/smith/.local/bin/herdr
+HERDR_TELEGRAM_TOPICS_TURN_FEED=1
+```
+
+The wrapper implements only `herdr pane turn <pane_id> --last --format json`. Every other command is delegated to `HERDR_REAL_BIN`. Current local extraction supports Codex session IDs reported by Herdr, and Claude when Herdr reports a Claude `agent_session_id`. If a pane has no session id, the wrapper returns `available=false` and Herdres sends nothing.
+
 ## Clean Report Markers
 
 By default, automatic sync posts only bounded reports, real choice prompts, actionable questions, and blocked/error items. It does not auto-post unbounded `Summary:`, `Final:`, `Verification:`, or `What changed:` transcript text unless `HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS=1` is set.
@@ -190,6 +206,7 @@ HERDRES_CHOICES_END
 
 ```bash
 HERDR_BIN=herdr
+HERDR_REAL_BIN=/home/smith/.local/bin/herdr
 HERDR_TELEGRAM_TOPICS_STATE=~/.local/share/herdres/state.json
 HERDR_TELEGRAM_TOPICS_LOCK=~/.local/share/herdres/sync.lock
 HERDR_TELEGRAM_TOPICS_GENERAL_THREAD_ID=1
