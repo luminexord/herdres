@@ -691,9 +691,27 @@ def strip_visible_composer(lines: list[str]) -> list[str]:
         line = lines[idx]
         if option_match(line):
             continue
-        if is_composer_boundary(line):
+        if is_composer_boundary(line) and visible_composer_tail(lines[idx + 1:]):
             return lines[:idx]
     return lines
+
+
+def visible_composer_tail(lines: list[str]) -> bool:
+    for line in lines:
+        raw = ANSI_RE.sub("", line or "").strip()
+        low = noise_key(line)
+        if not raw:
+            continue
+        if raw.startswith("●") or option_match(raw):
+            return False
+        if low.startswith("tip: use /btw"):
+            continue
+        if PROMPT_ONLY_RE.fullmatch(raw):
+            continue
+        if choice_ui_chrome_line(raw):
+            continue
+        continue
+    return True
 
 
 def is_tui_status_noise(line: str, *, in_tool_block: bool = False) -> bool:
@@ -2773,6 +2791,55 @@ def prompt_delivery_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, 
     if item.get("decision_id"):
         active_prompt["decision_id"] = str(item.get("decision_id") or "")
     return choices_reply_markup(prompt_id, options), active_prompt, False
+
+
+def current_visible_choice_item_for_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
+    pane_id = str(entry.get("pane_id") or "")
+    if not pane_id:
+        return None
+    pane = pane_by_id(pane_id) or {"pane_id": pane_id}
+    return extract_visible_choice_feed_item(pane)
+
+
+def refresh_stale_visible_prompt(
+    state: dict[str, Any],
+    entry: dict[str, Any],
+    chat_id: str,
+    topic_id: str,
+    telegram: dict[str, Any],
+    prompt_id: str,
+) -> bool:
+    current_item = current_visible_choice_item_for_entry(entry)
+    if not current_item:
+        return False
+    current_prompt_id = str(current_item.get("prompt_id") or "")
+    if not current_prompt_id or current_prompt_id == prompt_id:
+        return False
+    reply_markup, active_prompt, _clear = prompt_delivery_state(current_item)
+    result = send_feed_item(
+        chat_id,
+        current_item,
+        telegram=telegram,
+        thread_id=topic_id,
+        notify=bool(current_item.get("notify")),
+        reply_markup=reply_markup,
+    )
+    if result.get("ok"):
+        if active_prompt:
+            entry["active_prompt"] = active_prompt
+        entry["last_clean_hash"] = clean_feed_hash(current_item)
+        entry["last_clean_semantic_hash"] = clean_feed_hash(current_item, include_render_version=False)
+        entry["last_clean_render_hash"] = clean_feed_hash(current_item)
+        if result.get("message_id"):
+            entry["last_clean_message_id"] = str(result["message_id"])
+        entry["last_clean_kind"] = str(current_item.get("kind") or "choices")
+        entry["last_clean_text"] = item_plain_text(current_item)
+        entry["last_clean_item"] = current_item
+        entry["last_clean_sent_at"] = utc_now()
+        entry["last_turn_id"] = current_item.get("turn_id") or ""
+        entry.pop("last_clean_send_error", None)
+        save_state(state)
+    return True
 
 
 def format_status(
@@ -5032,6 +5099,10 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     prompt = entry.get("active_prompt") if isinstance(entry.get("active_prompt"), dict) else {}
     if str(prompt.get("id") or "") != prompt_id:
         return {"handled": True, "answer": "Those choices are no longer active."}
+    prompt_item = prompt.get("item") if isinstance(prompt.get("item"), dict) else {}
+    if str(prompt_item.get("turn_id") or "").startswith("visible-choice:"):
+        if refresh_stale_visible_prompt(state, entry, chat_id, topic_id, telegram, prompt_id):
+            return {"handled": True, "answer": "Those choices changed. I sent the current prompt.", "show_alert": True}
     options = list(prompt.get("options") or [])
 
     pane_id = str(entry.get("pane_id") or "")

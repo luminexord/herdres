@@ -2087,6 +2087,34 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertIn("5. Chat about this", labels)
         self.assertNotIn("Tell me differently", labels)
 
+    def test_submitted_prompt_history_does_not_strip_current_choices(self) -> None:
+        raw = """❯ ask me again the questions, i answered
+  wrong
+
+● No problem — here they are again.
+
+Codex thinks your real objection is register, not length. Which is it?
+
+❯ 1. Mostly register/tone
+     Tone is the issue.
+  2. Mostly length
+     Length is the issue.
+  3. Both, equally
+     Both matter.
+  4. Type something.
+─────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+"""
+
+        item = herdres.extract_choices(herdres.clean_feed_lines(raw))
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(len(item["options"]), 5)
+        self.assertIn("Which is it?", item["summary"])
+
     def test_decision_buttons_can_send_explicit_text(self) -> None:
         item = herdres.make_turn_feed_item(
             {
@@ -2227,6 +2255,40 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["choice"], "")
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["select_choice"], "4")
         send_to_pane.assert_not_called()
+
+    def test_stale_visible_choice_callback_refreshes_current_prompt(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["active_prompt"] = {
+            "id": "oldprompt",
+            "item": {"kind": "choices", "turn_id": "visible-choice:oldprompt"},
+            "options": [{"number": "1", "label": "Old option"}],
+        }
+        current_item = {
+            "kind": "choices",
+            "title": "Decision needed",
+            "summary": "Current question?",
+            "detail": "",
+            "text": "Question\nCurrent question?\n\n1) Current option",
+            "options": [{"number": "1", "label": "Current option"}],
+            "prompt_id": "newprompt",
+            "turn_id": "visible-choice:newprompt",
+            "notify": True,
+        }
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1000"})
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane), patch.multiple(
+            herdres,
+            current_visible_choice_item_for_entry=Mock(return_value=current_item),
+            send_feed_item=send_feed_item,
+        ):
+            result = herdres.callback_reply(callback_payload(user_id="42", data="herdr:c:oldprompt:1"))
+
+        self.assertEqual(result["answer"], "Those choices changed. I sent the current prompt.")
+        self.assertTrue(result["show_alert"])
+        send_to_pane.assert_not_called()
+        send_feed_item.assert_called_once()
+        self.assertEqual(state["panes"]["pane-1"]["active_prompt"]["id"], "newprompt")
 
     def test_force_reply_visible_choice_detail_uses_send_keys_then_text(self) -> None:
         state = callback_state()
