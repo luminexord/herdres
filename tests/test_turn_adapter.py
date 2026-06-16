@@ -98,6 +98,51 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["user_text"], "Still running?")
         self.assertEqual(turn["assistant_final_text"], "")
 
+    def test_codex_returns_latest_complete_when_newer_user_turn_is_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}},
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "What finished?"}],
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "turn_id": "turn-1",
+                            "last_agent_message": "The completed result.",
+                        },
+                    },
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-2"}},
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "This newer turn is still open."}],
+                        },
+                    },
+                ],
+            )
+
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertTrue(turn["available"])
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn["turn_id"], "turn-1")
+        self.assertEqual(turn["user_text"], "What finished?")
+        self.assertEqual(turn["assistant_final_text"], "The completed result.")
+        self.assertTrue(turn["has_open_turn"])
+        self.assertEqual(turn["open_turn_id"], "turn-2")
+
     def test_claude_extracts_last_end_turn_assistant_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "session-1.jsonl"

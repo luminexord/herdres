@@ -2242,6 +2242,52 @@ Verification
         self.assertEqual(args[3], pane)
         self.assertTrue(kwargs["turn_only"])
 
+    def test_event_retries_done_status_to_settle_turn_feed(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "plugin_event_enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {},
+        }
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "done",
+        }
+        event_json = herdres.json.dumps({"pane": {"pane_id": "pane-1"}, "agent_status": "done"})
+        sync_pane_once = Mock()
+
+        def wrapped_sync(*args, **kwargs):
+            if sync_pane_once.call_count == 1:
+                return False
+            args[4]["feed_sends"] = args[4].get("feed_sends", 0) + 1
+            args[4]["sends"] = args[4].get("sends", 0) + 1
+            return True
+
+        with patch.dict(herdres.os.environ, {"HERDR_PLUGIN_EVENT_JSON": event_json}, clear=False), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=pane),
+            preflight_for_event=Mock(return_value=(True, "")),
+            sync_pane_once=sync_pane_once,
+            EVENT_SETTLE_SECONDS=0.05,
+            EVENT_SETTLE_INTERVAL_SECONDS=0.01,
+        ):
+            sync_pane_once.side_effect = wrapped_sync
+            result = herdres.event_once()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["feed_sent"], 1)
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(sync_pane_once.call_count, 2)
+
     def test_event_turn_feed_does_not_read_pane_output(self) -> None:
         pane = {
             "pane_id": "pane-1",

@@ -269,6 +269,10 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
             if event.get("type") == "event_msg" and payload.get("type") == "turn_aborted":
                 open_turn = False
 
+    if open_turn and latest_complete:
+        latest_complete["has_open_turn"] = True
+        latest_complete["open_turn_id"] = current_turn_id
+        return latest_complete
     if open_turn:
         return {
             "available": True,

@@ -70,6 +70,8 @@ FINAL_REPLY_MAX_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LIN
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
+EVENT_SETTLE_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_SECONDS", "4"))
+EVENT_SETTLE_INTERVAL_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_INTERVAL", "0.75"))
 AUTO_FEED_SOURCES = ("recent-unwrapped",)
 MANUAL_FEED_SOURCES = ("recent-unwrapped", "transcript", "visible")
 
@@ -3554,6 +3556,7 @@ def sync_pane_once(
                     )
                 if result.get("ok"):
                     counters["sends"] = counters.get("sends", 0) + 1
+                    counters["feed_sends"] = counters.get("feed_sends", 0) + 1
                     if pending_active_prompt:
                         entry["active_prompt"] = pending_active_prompt
                     elif clear_active_prompt:
@@ -3751,6 +3754,19 @@ def event_pane_id(context: dict[str, Any], event: dict[str, Any]) -> str:
     return ""
 
 
+def event_status(context: dict[str, Any], event: dict[str, Any]) -> str:
+    for root in (event, context):
+        found = _first_string_value(root, {"agent_status", "status", "state"})
+        if found:
+            return found.lower()
+    return ""
+
+
+def should_settle_event(pane: dict[str, Any], context: dict[str, Any], event: dict[str, Any]) -> bool:
+    status = event_status(context, event) or str(pane.get("agent_status") or "").lower()
+    return status in {"done", "idle", "blocked", "error"}
+
+
 def plugin_enable_once(enabled: bool) -> dict[str, Any]:
     load_dotenv()
     state = load_state()
@@ -3795,14 +3811,33 @@ def event_once() -> dict[str, Any]:
             "error": preflight_error,
         }
 
-    counters = {"sends": 0, "creates": 0, "verifies": 0, "renames": 0}
+    counters = {"sends": 0, "creates": 0, "verifies": 0, "renames": 0, "feed_sends": 0}
     caps = {
         "max_sends": min(MAX_SENDS_PER_RUN, 2),
         "max_creates": min(MAX_CREATES_PER_RUN, 1),
         "max_verifies": min(MAX_TOPIC_VERIFIES_PER_RUN, 1),
     }
+    attempts = 0
+    changed = False
+    settle = should_settle_event(pane, context, event)
+    deadline = time.monotonic() + max(0.0, EVENT_SETTLE_SECONDS)
     try:
-        changed = sync_pane_once(state, chat_id, telegram, pane, counters, caps, turn_only=True)
+        while True:
+            attempts += 1
+            before_feed_sends = counters.get("feed_sends", 0)
+            changed = sync_pane_once(state, chat_id, telegram, pane, counters, caps, turn_only=True) or changed
+            if counters.get("feed_sends", 0) > before_feed_sends:
+                break
+            entry = (state.get("panes") or {}).get(pane_key(pane), {})
+            if TURN_FEED_ENABLED and entry.get("last_turn_available") is False:
+                break
+            if not settle or time.monotonic() >= deadline or counters.get("sends", 0) >= caps["max_sends"]:
+                break
+            time.sleep(max(0.1, EVENT_SETTLE_INTERVAL_SECONDS))
+            refreshed = pane_by_id(pane_id)
+            if not refreshed or not refreshed.get("agent"):
+                break
+            pane = refreshed
     except Exception as exc:
         state["last_plugin_event_error"] = sanitize_text(str(exc), 500)
         state["last_plugin_event_error_at"] = utc_now()
@@ -3817,6 +3852,8 @@ def event_once() -> dict[str, Any]:
         "changed": changed,
         "pane_id": pane_id,
         "sent": counters["sends"],
+        "feed_sent": counters["feed_sends"],
+        "attempts": attempts,
         "created": counters["creates"],
         "verified": counters["verifies"],
         "renamed": counters["renames"],

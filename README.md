@@ -122,6 +122,8 @@ herdr plugin link ~/.local/share/herdres/herdres-plugin
 
 `herdres event` reads `HERDR_PLUGIN_CONTEXT_JSON` and `HERDR_PLUGIN_EVENT_JSON`, reconciles only the changed pane, ensures the topic exists, syncs the pane label to the Telegram topic name, and sends/edits the structured turn or pending decision if one is available. In plugin mode it does not parse terminal text. If structured turn data is unavailable, it sends nothing.
 
+For completed/idle/blocked/error status events, `herdres event` waits briefly and rechecks the structured turn feed before giving up. This handles the normal race where Herdr fires `pane.agent_status_changed` just before the agent session file exposes the final completed turn. Tune this with `HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_SECONDS` and `HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_INTERVAL`.
+
 Plugin events can be toggled independently of normal sync:
 
 ```bash
@@ -287,6 +289,8 @@ HERDR_TELEGRAM_TOPICS_LOCK=~/.local/share/herdres/sync.lock
 HERDR_TELEGRAM_TOPICS_SCRIPT=~/.local/bin/herdres
 HERDR_TELEGRAM_TOPICS_GENERAL_THREAD_ID=1
 HERDR_TELEGRAM_TOPICS_PLUGIN_EVENTS=1
+HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_SECONDS=4
+HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_INTERVAL=0.75
 HERDR_TELEGRAM_TOPICS_MAX_CREATES=3
 HERDR_TELEGRAM_TOPICS_MAX_SENDS=8
 HERDR_TELEGRAM_TOPICS_FEED_READ_LINES=140
