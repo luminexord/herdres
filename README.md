@@ -1,3 +1,4 @@
+<img width="2048" height="2048" alt="herdres" src="https://github.com/user-attachments/assets/d8324729-676a-49d8-9d24-800a8a411348" />
 # Herdres
 
 Rich Telegram forum-topic visibility and control for Herdr panes.
