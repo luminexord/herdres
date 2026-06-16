@@ -16,8 +16,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_STATE = Path("/home/smith/.local/share/herdr-telegram-topics/state.json")
-DEFAULT_SCRIPT = Path("/home/smith/.local/bin/herdr_telegram_topics.py")
+DEFAULT_STATE = Path.home() / ".local/share/herdres/state.json"
+DEFAULT_SCRIPT = Path.home() / ".local/bin/herdres"
 GENERAL_THREAD_ID = "1"
 
 

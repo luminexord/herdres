@@ -85,16 +85,51 @@ Plain text is not forwarded unless `telegram.implicit_send_enabled` is enabled i
 Inbound pane-topic control is handled through the Hermes Telegram gateway, so Hermes must load the small bridge hook:
 
 ```bash
-install -Dm644 herdr_topic_bridge.py ~/.local/share/herdr-telegram-topics/herdr_topic_bridge.py
+install -Dm644 herdr_topic_bridge.py ~/.local/share/herdres/herdr_topic_bridge.py
 install -Dm755 herdr_telegram_topics_install_bridge.py ~/.local/bin/herdr_telegram_topics_install_bridge.py
 mkdir -p ~/.config/systemd/user/hermes-gateway.service.d
 cat > ~/.config/systemd/user/hermes-gateway.service.d/herdr-telegram-topics.conf <<'EOF'
 [Service]
+Environment=HERDR_TELEGRAM_TOPICS_STATE=%h/.local/share/herdres/state.json
+Environment=HERDR_TELEGRAM_TOPICS_SCRIPT=%h/.local/bin/herdres
 ExecStartPre=-%h/.local/bin/herdr_telegram_topics_install_bridge.py --quiet
 EOF
 systemctl --user daemon-reload
 systemctl --user restart hermes-gateway.service
 ```
+
+## Herdr Plugin Event Trigger
+
+Herdr 0.7.0 adds local plugin events. Herdres can use those events as a low-latency trigger layer while keeping the Telegram forum-topic UX in Herdres.
+
+The included plugin is intentionally thin:
+
+```text
+pane.agent_status_changed -> herdres event
+```
+
+It does not replace the Hermes bridge for inbound Telegram commands and callbacks, and it does not use the official plain Telegram notification example.
+
+Install or link it after Herdr is upgraded:
+
+```bash
+herdr --version
+herdr plugin list --json
+herdr plugin link ~/.local/share/herdres/herdres-plugin
+```
+
+`install-user.sh` writes the installed plugin manifest with an absolute `~/.local/bin/herdres` command so it does not depend on Herdr's plugin `PATH`. If you link `herdres-plugin/` directly from a source checkout, make sure `herdres` is resolvable in the plugin runtime environment or edit the manifest command to an absolute path.
+
+`herdres event` reads `HERDR_PLUGIN_CONTEXT_JSON` and `HERDR_PLUGIN_EVENT_JSON`, reconciles only the changed pane, ensures the topic exists, syncs the pane label to the Telegram topic name, and sends/edits the structured turn or pending decision if one is available. In plugin mode it does not parse terminal text. If structured turn data is unavailable, it sends nothing.
+
+Plugin events can be toggled independently of normal sync:
+
+```bash
+~/.local/bin/herdres plugin-disable
+~/.local/bin/herdres plugin-enable
+```
+
+Keep the systemd timer enabled as a slower repair/reconcile path. It detects closed panes, repairs stale topic mappings, and covers missed plugin events.
 
 ## Rich Message Behavior
 
@@ -249,7 +284,9 @@ HERDR_BIN=herdr
 HERDR_REAL_BIN=/home/smith/.local/bin/herdr
 HERDR_TELEGRAM_TOPICS_STATE=~/.local/share/herdres/state.json
 HERDR_TELEGRAM_TOPICS_LOCK=~/.local/share/herdres/sync.lock
+HERDR_TELEGRAM_TOPICS_SCRIPT=~/.local/bin/herdres
 HERDR_TELEGRAM_TOPICS_GENERAL_THREAD_ID=1
+HERDR_TELEGRAM_TOPICS_PLUGIN_EVENTS=1
 HERDR_TELEGRAM_TOPICS_MAX_CREATES=3
 HERDR_TELEGRAM_TOPICS_MAX_SENDS=8
 HERDR_TELEGRAM_TOPICS_FEED_READ_LINES=140

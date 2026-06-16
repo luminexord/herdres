@@ -213,6 +213,7 @@ def initial_state() -> dict[str, Any]:
     return {
         "version": 1,
         "enabled": os.getenv("HERDR_TELEGRAM_TOPICS_ENABLED", "1").lower() in {"1", "true", "yes", "on"},
+        "plugin_event_enabled": os.getenv("HERDR_TELEGRAM_TOPICS_PLUGIN_EVENTS", "1").lower() in {"1", "true", "yes", "on"},
         "telegram": {
             "chat_id": os.getenv("HERDR_TELEGRAM_TOPICS_CHAT_ID", DEFAULT_CHAT_ID),
             "general_thread_id": os.getenv("HERDR_TELEGRAM_TOPICS_GENERAL_THREAD_ID", DEFAULT_GENERAL_THREAD_ID),
@@ -249,6 +250,7 @@ def load_state() -> dict[str, Any]:
     if not isinstance(data, dict) or data.get("version") != 1:
         raise BridgeError("unsupported state schema")
     data.setdefault("enabled", True)
+    data.setdefault("plugin_event_enabled", True)
     data.setdefault("telegram", {})
     data.setdefault("panes", {})
     return data
@@ -3278,6 +3280,38 @@ def preflight_alert_text(error_text: str) -> str:
     )
 
 
+def configure_telegram_state(state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    telegram = state.setdefault("telegram", {})
+    chat_id = str(telegram.get("chat_id") or os.getenv("HERDR_TELEGRAM_TOPICS_CHAT_ID") or DEFAULT_CHAT_ID)
+    telegram["chat_id"] = chat_id
+    telegram.setdefault("general_thread_id", os.getenv("HERDR_TELEGRAM_TOPICS_GENERAL_THREAD_ID", DEFAULT_GENERAL_THREAD_ID))
+    telegram.setdefault(
+        "owner_user_ids",
+        [p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()],
+    )
+    telegram.setdefault("implicit_send_enabled", False)
+    return telegram, chat_id
+
+
+def preflight_for_event(state: dict[str, Any], chat_id: str, telegram: dict[str, Any]) -> tuple[bool, str]:
+    try:
+        if not preflight_is_fresh(telegram):
+            preflight(chat_id)
+            telegram["last_preflight_ok_at"] = utc_now()
+        telegram.pop("last_preflight_error", None)
+        telegram.pop("last_event_preflight_error", None)
+        return True, ""
+    except Exception as exc:
+        error_text = sanitize_text(str(exc), 500)
+        if is_transient_telegram_error(error_text) and preflight_ok_within(telegram):
+            telegram["last_preflight_warning"] = error_text
+            telegram["last_preflight_warning_at"] = utc_now()
+            return True, error_text
+        telegram["last_event_preflight_error"] = error_text
+        telegram["last_event_preflight_error_at"] = utc_now()
+        return False, error_text
+
+
 def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str, dict[str, Any], bool]:
     key = pane_key(pane)
     panes = state.setdefault("panes", {})
@@ -3346,20 +3380,236 @@ def should_send_status(entry: dict[str, Any], obj_hash: str, pane: dict[str, Any
     return False
 
 
+def sync_pane_once(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    pane: dict[str, Any],
+    counters: dict[str, int],
+    caps: dict[str, int],
+    *,
+    turn_only: bool = False,
+) -> bool:
+    changed = False
+    key, entry, new_entry = ensure_pane_entry(state, pane)
+    entry["last_seen_at"] = utc_now()
+    entry["last_known_status"] = str(pane.get("agent_status") or "unknown")
+    max_creates = int(caps.get("max_creates", MAX_CREATES_PER_RUN))
+    max_sends = int(caps.get("max_sends", MAX_SENDS_PER_RUN))
+    max_verifies = int(caps.get("max_verifies", MAX_TOPIC_VERIFIES_PER_RUN))
+
+    if not entry.get("topic_id") and counters.get("creates", 0) < max_creates:
+        topic_name = str(entry.get("topic_name") or topic_name_for_pane(pane))
+        topic_id = create_topic(chat_id, topic_name)
+        counters["creates"] = counters.get("creates", 0) + 1
+        entry["topic_id"] = topic_id
+        entry["topic_name"] = topic_name
+        entry["last_topic_verified_at"] = utc_now()
+        entry.pop("topic_missing_at", None)
+        entry.pop("topic_missing_id", None)
+        entry.pop("topic_missing_reason", None)
+        entry.pop("topic_rename_pending_at", None)
+        entry.pop("topic_rename_from", None)
+        entry.pop("topic_rename_to", None)
+        save_state(state)
+        changed = True
+        if not CLEAN_FEED_ENABLED and counters.get("sends", 0) < max_sends:
+            send_message(
+                chat_id,
+                f"Linked Telegram topic to Herdr pane.\nPane key: {key}\n\n{format_status(pane, include_commands=True)}",
+                thread_id=topic_id,
+            )
+            counters["sends"] = counters.get("sends", 0) + 1
+    if not entry.get("topic_id"):
+        return changed
+
+    rename_pending = bool(entry.get("topic_rename_pending_at"))
+    if rename_pending or (counters.get("verifies", 0) < max_verifies and topic_verify_due(entry)):
+        verify_result = verify_topic_mapping(chat_id, entry)
+        if rename_pending:
+            counters["renames"] = counters.get("renames", 0) + 1
+        else:
+            counters["verifies"] = counters.get("verifies", 0) + 1
+        if verify_result.get("ok"):
+            changed = True
+        elif result_topic_missing(verify_result):
+            clear_topic_mapping(entry, str(verify_result.get("error") or verify_result))
+            save_state(state)
+            return True
+        else:
+            verify_error = sanitize_text(str(verify_result), 500)
+            if entry.get("last_topic_verify_error") != verify_error:
+                entry["last_topic_verify_error"] = verify_error
+                entry["last_topic_verify_error_at"] = utc_now()
+                changed = True
+
+    stable_obj_hash = status_hash(stable_status_object(pane))
+    live_item = live_status_item(pane)
+    live_card_hash = clean_feed_hash(live_item)
+    if LIVE_CARD_ENABLED and counters.get("sends", 0) < max_sends and (
+        not entry.get("card_message_id") or entry.get("card_status_hash") != live_card_hash
+    ):
+        card_result = update_live_card(chat_id, entry, live_item, telegram=telegram)
+        if card_result.get("attempted"):
+            counters["sends"] = counters.get("sends", 0) + 1
+        if result_topic_missing(card_result):
+            clear_topic_mapping(entry, str(card_result.get("error") or card_result))
+            save_state(state)
+            return True
+        if card_result.get("ok"):
+            entry["card_status_hash"] = live_card_hash
+            changed = True
+
+    if CLEAN_FEED_ENABLED:
+        item = None
+        if TURN_FEED_ENABLED:
+            before_turn_state = (
+                entry.get("last_turn_available"),
+                entry.get("last_turn_reason"),
+                entry.get("last_turn_id"),
+            )
+            item = extract_turn_feed_item(pane, entry)
+            after_turn_state = (
+                entry.get("last_turn_available"),
+                entry.get("last_turn_reason"),
+                entry.get("last_turn_id"),
+            )
+            if before_turn_state != after_turn_state:
+                changed = True
+        elif not turn_only:
+            raw = pane_feed_output(str(pane.get("pane_id") or ""))
+            bounded_report = extract_bounded_report_from_raw(raw)
+            if bounded_report:
+                if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
+                    changed = True
+                item = extract_clean_feed_item(
+                    pane,
+                    entry,
+                    raw,
+                    allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
+                )
+            elif has_resume_control_noise(raw):
+                if entry.get("last_clean_hash") or not entry.get("suppress_auto_feed_until_bounded_report"):
+                    clear_clean_feed_state(entry)
+                    changed = True
+                if not entry.get("suppress_auto_feed_until_bounded_report"):
+                    entry["suppress_auto_feed_until_bounded_report"] = True
+                    changed = True
+            else:
+                if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
+                    changed = True
+                item = extract_clean_feed_item(
+                    pane,
+                    entry,
+                    raw,
+                    allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
+                )
+
+        old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
+        if item:
+            item_render_hash = clean_feed_hash(item)
+            item_semantic_hash = clean_feed_hash(item, include_render_version=False)
+            previous_semantic_hash = str(entry.get("last_clean_semantic_hash") or "")
+            previous_render_hash = str(entry.get("last_clean_render_hash") or entry.get("last_clean_hash") or "")
+            same_semantic = bool(previous_semantic_hash and previous_semantic_hash == item_semantic_hash)
+            render_changed = item_render_hash != previous_render_hash
+            content_changed = not same_semantic
+            should_deliver = old_clean_has_noise or content_changed or render_changed
+            if counters.get("sends", 0) < max_sends and should_deliver and not recent_attempt(entry, item_render_hash):
+                reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
+                entry["last_clean_attempt_hash"] = item_render_hash
+                entry["last_clean_attempt_at"] = utc_now()
+                changed = True
+                did_edit = False
+                message_id = str(entry.get("last_clean_message_id") or "")
+                if same_semantic and (render_changed or old_clean_has_noise) and message_id:
+                    result = edit_feed_item(
+                        chat_id,
+                        message_id,
+                        item,
+                        telegram=telegram,
+                        reply_markup=reply_markup,
+                    )
+                    if result.get("ok"):
+                        did_edit = True
+                    elif result.get("not_found"):
+                        result = send_feed_item(
+                            chat_id,
+                            item,
+                            telegram=telegram,
+                            thread_id=entry["topic_id"],
+                            notify=bool(item.get("notify")),
+                            reply_markup=reply_markup,
+                        )
+                    else:
+                        result = {**result, "edit_failed": True}
+                else:
+                    result = send_feed_item(
+                        chat_id,
+                        item,
+                        telegram=telegram,
+                        thread_id=entry["topic_id"],
+                        notify=bool(item.get("notify")),
+                        reply_markup=reply_markup,
+                    )
+                if result.get("ok"):
+                    counters["sends"] = counters.get("sends", 0) + 1
+                    if pending_active_prompt:
+                        entry["active_prompt"] = pending_active_prompt
+                    elif clear_active_prompt:
+                        entry.pop("active_prompt", None)
+                    entry["last_clean_hash"] = item_render_hash
+                    entry["last_clean_semantic_hash"] = item_semantic_hash
+                    entry["last_clean_render_hash"] = item_render_hash
+                    if result.get("message_id"):
+                        entry["last_clean_message_id"] = str(result["message_id"])
+                    elif did_edit and message_id:
+                        entry["last_clean_message_id"] = message_id
+                    entry["last_clean_kind"] = str(item.get("kind") or "")
+                    entry["last_clean_text"] = item_plain_text(item)
+                    entry["last_clean_item"] = item
+                    entry["last_clean_sent_at"] = utc_now()
+                    entry.pop("last_clean_send_error", None)
+                    changed = True
+                elif result_topic_missing(result):
+                    clear_topic_mapping(entry, str(result.get("error") or result))
+                    save_state(state)
+                    return True
+                else:
+                    entry["last_clean_send_error"] = sanitize_text(str(result), 500)
+                    changed = True
+        elif old_clean_has_noise:
+            clear_clean_feed_state(entry)
+            changed = True
+        entry["last_status_hash"] = stable_obj_hash
+    elif counters.get("sends", 0) < max_sends and should_send_status(entry, stable_obj_hash, pane, new_entry):
+        pane_status = str(pane.get("agent_status") or "").lower()
+        include_recent = pane_status in {"blocked", "unknown"}
+        status_result = send_legacy_message_result(
+            chat_id,
+            format_status(pane, include_recent=include_recent),
+            thread_id=entry["topic_id"],
+            notify=pane_status in {"blocked", "error"},
+        )
+        if status_result.get("ok"):
+            counters["sends"] = counters.get("sends", 0) + 1
+            entry["last_status_hash"] = stable_obj_hash
+            entry["last_notified_status"] = pane_status
+            entry["last_sent_at"] = utc_now()
+            changed = True
+        elif result_topic_missing(status_result):
+            clear_topic_mapping(entry, str(status_result.get("error") or status_result))
+            save_state(state)
+            return True
+    return changed
+
+
 def sync_once() -> dict[str, Any]:
     load_dotenv()
     state = load_state()
     if not state.get("enabled", True):
         return {"ok": True, "changed": False, "message": "disabled"}
-    telegram = state.setdefault("telegram", {})
-    chat_id = str(telegram.get("chat_id") or os.getenv("HERDR_TELEGRAM_TOPICS_CHAT_ID") or DEFAULT_CHAT_ID)
-    telegram["chat_id"] = chat_id
-    telegram.setdefault("general_thread_id", os.getenv("HERDR_TELEGRAM_TOPICS_GENERAL_THREAD_ID", DEFAULT_GENERAL_THREAD_ID))
-    telegram.setdefault(
-        "owner_user_ids",
-        [p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()],
-    )
-    telegram.setdefault("implicit_send_enabled", False)
+    telegram, chat_id = configure_telegram_state(state)
 
     all_panes = pane_list()
     include_shells = os.getenv("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "").lower() in {"1", "true", "yes", "on"}
@@ -3425,217 +3675,19 @@ def sync_once() -> dict[str, Any]:
             telegram["last_preflight_error"] = error_text
             save_state(state)
             raise
-    creates = 0
-    verifies = 0
-    renames = 0
-
+    counters = {"sends": sends, "creates": 0, "verifies": 0, "renames": 0}
+    caps = {
+        "max_sends": MAX_SENDS_PER_RUN,
+        "max_creates": MAX_CREATES_PER_RUN,
+        "max_verifies": MAX_TOPIC_VERIFIES_PER_RUN,
+    }
     for pane in panes:
-        key, entry, new_entry = ensure_pane_entry(state, pane)
-        entry["last_seen_at"] = utc_now()
-        entry["last_known_status"] = str(pane.get("agent_status") or "unknown")
-        if not entry.get("topic_id") and creates < MAX_CREATES_PER_RUN:
-            topic_name = str(entry.get("topic_name") or topic_name_for_pane(pane))
-            topic_id = create_topic(chat_id, topic_name)
-            creates += 1
-            entry["topic_id"] = topic_id
-            entry["topic_name"] = topic_name
-            entry["last_topic_verified_at"] = utc_now()
-            entry.pop("topic_missing_at", None)
-            entry.pop("topic_missing_id", None)
-            entry.pop("topic_missing_reason", None)
-            entry.pop("topic_rename_pending_at", None)
-            entry.pop("topic_rename_from", None)
-            entry.pop("topic_rename_to", None)
-            save_state(state)
+        if sync_pane_once(state, chat_id, telegram, pane, counters, caps):
             changed = True
-            if not CLEAN_FEED_ENABLED and sends < MAX_SENDS_PER_RUN:
-                send_message(
-                    chat_id,
-                    f"Linked Telegram topic to Herdr pane.\nPane key: {key}\n\n{format_status(pane, include_commands=True)}",
-                    thread_id=topic_id,
-                )
-                sends += 1
-        if not entry.get("topic_id"):
-            continue
-        rename_pending = bool(entry.get("topic_rename_pending_at"))
-        if rename_pending or (verifies < MAX_TOPIC_VERIFIES_PER_RUN and topic_verify_due(entry)):
-            verify_result = verify_topic_mapping(chat_id, entry)
-            if rename_pending:
-                renames += 1
-            else:
-                verifies += 1
-            if verify_result.get("ok"):
-                changed = True
-            elif result_topic_missing(verify_result):
-                clear_topic_mapping(entry, str(verify_result.get("error") or verify_result))
-                save_state(state)
-                changed = True
-                continue
-            else:
-                verify_error = sanitize_text(str(verify_result), 500)
-                if entry.get("last_topic_verify_error") != verify_error:
-                    entry["last_topic_verify_error"] = verify_error
-                    entry["last_topic_verify_error_at"] = utc_now()
-                    changed = True
-        stable_obj_hash = status_hash(stable_status_object(pane))
-        live_item = live_status_item(pane)
-        live_card_hash = clean_feed_hash(live_item)
-        if LIVE_CARD_ENABLED and sends < MAX_SENDS_PER_RUN and (
-            not entry.get("card_message_id") or entry.get("card_status_hash") != live_card_hash
-        ):
-            card_result = update_live_card(chat_id, entry, live_item, telegram=telegram)
-            if card_result.get("attempted"):
-                sends += 1
-            if result_topic_missing(card_result):
-                clear_topic_mapping(entry, str(card_result.get("error") or card_result))
-                save_state(state)
-                changed = True
-                continue
-            if card_result.get("ok"):
-                entry["card_status_hash"] = live_card_hash
-                changed = True
-        if CLEAN_FEED_ENABLED:
-            item = None
-            if TURN_FEED_ENABLED:
-                before_turn_state = (
-                    entry.get("last_turn_available"),
-                    entry.get("last_turn_reason"),
-                    entry.get("last_turn_id"),
-                )
-                item = extract_turn_feed_item(pane, entry)
-                after_turn_state = (
-                    entry.get("last_turn_available"),
-                    entry.get("last_turn_reason"),
-                    entry.get("last_turn_id"),
-                )
-                if before_turn_state != after_turn_state:
-                    changed = True
-            else:
-                raw = pane_feed_output(str(pane.get("pane_id") or ""))
-                bounded_report = extract_bounded_report_from_raw(raw)
-                if bounded_report:
-                    if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
-                        changed = True
-                    item = extract_clean_feed_item(
-                        pane,
-                        entry,
-                        raw,
-                        allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
-                    )
-                elif has_resume_control_noise(raw):
-                    if entry.get("last_clean_hash") or not entry.get("suppress_auto_feed_until_bounded_report"):
-                        clear_clean_feed_state(entry)
-                        changed = True
-                    if not entry.get("suppress_auto_feed_until_bounded_report"):
-                        entry["suppress_auto_feed_until_bounded_report"] = True
-                        changed = True
-                else:
-                    if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
-                        changed = True
-                    item = extract_clean_feed_item(
-                        pane,
-                        entry,
-                        raw,
-                        allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
-                    )
-            old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
-            if item:
-                item_render_hash = clean_feed_hash(item)
-                item_semantic_hash = clean_feed_hash(item, include_render_version=False)
-                previous_semantic_hash = str(entry.get("last_clean_semantic_hash") or "")
-                previous_render_hash = str(entry.get("last_clean_render_hash") or entry.get("last_clean_hash") or "")
-                same_semantic = bool(previous_semantic_hash and previous_semantic_hash == item_semantic_hash)
-                render_changed = item_render_hash != previous_render_hash
-                content_changed = not same_semantic
-                should_deliver = old_clean_has_noise or content_changed or render_changed
-                if sends < MAX_SENDS_PER_RUN and should_deliver and not recent_attempt(entry, item_render_hash):
-                    reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
-                    entry["last_clean_attempt_hash"] = item_render_hash
-                    entry["last_clean_attempt_at"] = utc_now()
-                    changed = True
-                    did_edit = False
-                    message_id = str(entry.get("last_clean_message_id") or "")
-                    if same_semantic and (render_changed or old_clean_has_noise) and message_id:
-                        result = edit_feed_item(
-                            chat_id,
-                            message_id,
-                            item,
-                            telegram=telegram,
-                            reply_markup=reply_markup,
-                        )
-                        if result.get("ok"):
-                            did_edit = True
-                        elif result.get("not_found"):
-                            result = send_feed_item(
-                                chat_id,
-                                item,
-                                telegram=telegram,
-                                thread_id=entry["topic_id"],
-                                notify=bool(item.get("notify")),
-                                reply_markup=reply_markup,
-                            )
-                        else:
-                            result = {**result, "edit_failed": True}
-                    else:
-                        result = send_feed_item(
-                            chat_id,
-                            item,
-                            telegram=telegram,
-                            thread_id=entry["topic_id"],
-                            notify=bool(item.get("notify")),
-                            reply_markup=reply_markup,
-                        )
-                    if result.get("ok"):
-                        sends += 1
-                        if pending_active_prompt:
-                            entry["active_prompt"] = pending_active_prompt
-                        elif clear_active_prompt:
-                            entry.pop("active_prompt", None)
-                        entry["last_clean_hash"] = item_render_hash
-                        entry["last_clean_semantic_hash"] = item_semantic_hash
-                        entry["last_clean_render_hash"] = item_render_hash
-                        if result.get("message_id"):
-                            entry["last_clean_message_id"] = str(result["message_id"])
-                        elif did_edit and message_id:
-                            entry["last_clean_message_id"] = message_id
-                        entry["last_clean_kind"] = str(item.get("kind") or "")
-                        entry["last_clean_text"] = item_plain_text(item)
-                        entry["last_clean_item"] = item
-                        entry["last_clean_sent_at"] = utc_now()
-                        entry.pop("last_clean_send_error", None)
-                        changed = True
-                    elif result_topic_missing(result):
-                        clear_topic_mapping(entry, str(result.get("error") or result))
-                        save_state(state)
-                        changed = True
-                        continue
-                    else:
-                        entry["last_clean_send_error"] = sanitize_text(str(result), 500)
-                        changed = True
-            elif old_clean_has_noise:
-                clear_clean_feed_state(entry)
-                changed = True
-            entry["last_status_hash"] = stable_obj_hash
-        elif sends < MAX_SENDS_PER_RUN and should_send_status(entry, stable_obj_hash, pane, new_entry):
-            pane_status = str(pane.get("agent_status") or "").lower()
-            include_recent = pane_status in {"blocked", "unknown"}
-            status_result = send_legacy_message_result(
-                chat_id,
-                format_status(pane, include_recent=include_recent),
-                thread_id=entry["topic_id"],
-                notify=pane_status in {"blocked", "error"},
-            )
-            if status_result.get("ok"):
-                sends += 1
-                entry["last_status_hash"] = stable_obj_hash
-                entry["last_notified_status"] = pane_status
-                entry["last_sent_at"] = utc_now()
-                changed = True
-            elif result_topic_missing(status_result):
-                clear_topic_mapping(entry, str(status_result.get("error") or status_result))
-                save_state(state)
-                changed = True
-                continue
+    sends = counters["sends"]
+    creates = counters["creates"]
+    verifies = counters["verifies"]
+    renames = counters["renames"]
 
     save_state(state)
     return {
@@ -3646,6 +3698,128 @@ def sync_once() -> dict[str, Any]:
         "verified": verifies,
         "renamed": renames,
         "sent": sends,
+    }
+
+
+def parse_plugin_json_env(name: str) -> dict[str, Any]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _first_string_value(obj: Any, keys: set[str]) -> str:
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_l = str(key).lower()
+            if key_l in keys and value not in (None, ""):
+                return str(value)
+        for value in obj.values():
+            found = _first_string_value(value, keys)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _first_string_value(value, keys)
+            if found:
+                return found
+    return ""
+
+
+def event_pane_id(context: dict[str, Any], event: dict[str, Any]) -> str:
+    for root in (event, context):
+        if not isinstance(root, dict):
+            continue
+        pane_container = root.get("pane")
+        if isinstance(pane_container, str) and pane_container:
+            return pane_container
+        found = _first_string_value(pane_container, {"pane_id", "paneid", "id"})
+        if found:
+            return found
+        for container_key in ("agent", "resource", "payload", "data"):
+            container = root.get(container_key)
+            found = _first_string_value(container, {"pane_id", "paneid"})
+            if found:
+                return found
+        found = _first_string_value(root, {"pane_id", "paneid"})
+        if found:
+            return found
+    return ""
+
+
+def plugin_enable_once(enabled: bool) -> dict[str, Any]:
+    load_dotenv()
+    state = load_state()
+    state["plugin_event_enabled"] = bool(enabled)
+    state["plugin_event_enabled_at"] = utc_now()
+    save_state(state)
+    return {"ok": True, "plugin_event_enabled": bool(enabled)}
+
+
+def event_once() -> dict[str, Any]:
+    load_dotenv()
+    state = load_state()
+    if not state.get("enabled", True):
+        return {"ok": True, "changed": False, "message": "disabled"}
+    if not state.get("plugin_event_enabled", True):
+        return {"ok": True, "changed": False, "message": "plugin events disabled"}
+
+    telegram, chat_id = configure_telegram_state(state)
+    context = parse_plugin_json_env("HERDR_PLUGIN_CONTEXT_JSON")
+    event = parse_plugin_json_env("HERDR_PLUGIN_EVENT_JSON")
+    pane_id = event_pane_id(context, event)
+    if not pane_id:
+        state["last_plugin_event_missing_pane_at"] = utc_now()
+        save_state(state)
+        return {"ok": True, "changed": False, "message": "no pane id in plugin event"}
+
+    pane = pane_by_id(pane_id)
+    if not pane or not pane.get("agent"):
+        state["last_plugin_event_unknown_pane_at"] = utc_now()
+        state["last_plugin_event_unknown_pane_id"] = sanitize_text(pane_id, 120)
+        save_state(state)
+        return {"ok": True, "changed": False, "pane_id": pane_id, "message": "pane not found or not an agent"}
+
+    preflight_ok, preflight_error = preflight_for_event(state, chat_id, telegram)
+    if not preflight_ok:
+        save_state(state)
+        return {
+            "ok": True,
+            "changed": False,
+            "pane_id": pane_id,
+            "message": "telegram preflight failed",
+            "error": preflight_error,
+        }
+
+    counters = {"sends": 0, "creates": 0, "verifies": 0, "renames": 0}
+    caps = {
+        "max_sends": min(MAX_SENDS_PER_RUN, 2),
+        "max_creates": min(MAX_CREATES_PER_RUN, 1),
+        "max_verifies": min(MAX_TOPIC_VERIFIES_PER_RUN, 1),
+    }
+    try:
+        changed = sync_pane_once(state, chat_id, telegram, pane, counters, caps, turn_only=True)
+    except Exception as exc:
+        state["last_plugin_event_error"] = sanitize_text(str(exc), 500)
+        state["last_plugin_event_error_at"] = utc_now()
+        save_state(state)
+        return {"ok": True, "changed": False, "pane_id": pane_id, "message": "event sync failed"}
+
+    state["last_plugin_event_at"] = utc_now()
+    state["last_plugin_event_pane_id"] = pane_id
+    save_state(state)
+    return {
+        "ok": True,
+        "changed": changed,
+        "pane_id": pane_id,
+        "sent": counters["sends"],
+        "created": counters["creates"],
+        "verified": counters["verifies"],
+        "renamed": counters["renames"],
     }
 
 
@@ -4069,6 +4243,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("sync")
+    sub.add_parser("event")
+    sub.add_parser("plugin-enable")
+    sub.add_parser("plugin-disable")
     sub.add_parser("command")
     sub.add_parser("callback")
     probe = sub.add_parser("probe")
@@ -4077,6 +4254,12 @@ def main() -> int:
     try:
         if args.cmd == "sync":
             result = with_lock(sync_once)
+        elif args.cmd == "event":
+            result = with_lock(event_once, blocking=True)
+        elif args.cmd == "plugin-enable":
+            result = with_lock(lambda: plugin_enable_once(True), blocking=True)
+        elif args.cmd == "plugin-disable":
+            result = with_lock(lambda: plugin_enable_once(False), blocking=True)
         elif args.cmd == "command":
             payload = json.loads(sys.stdin.read() or "{}")
             result = with_lock(lambda: command_reply(payload), blocking=True)

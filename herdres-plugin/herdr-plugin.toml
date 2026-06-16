@@ -1,0 +1,20 @@
+id = "gaijinjoe.herdres"
+name = "Herdres"
+version = "0.1.0"
+description = "Trigger Herdres Telegram forum-topic sync from Herdr pane events."
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["herdres", "event"]
+
+[[actions]]
+id = "enable"
+title = "Enable Herdres Telegram events"
+command = ["herdres", "plugin-enable"]
+
+[[actions]]
+id = "disable"
+title = "Disable Herdres Telegram events"
+command = ["herdres", "plugin-disable"]

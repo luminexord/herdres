@@ -17,8 +17,8 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_HERMES_ROOT = Path("/home/smith/.hermes/hermes-agent")
-DEFAULT_BRIDGE_SOURCE = Path("/home/smith/.local/share/herdr-telegram-topics/herdr_topic_bridge.py")
+DEFAULT_HERMES_ROOT = Path.home() / ".hermes/hermes-agent"
+DEFAULT_BRIDGE_SOURCE = Path.home() / ".local/share/herdres/herdr_topic_bridge.py"
 
 CALL_SNIPPET = "        if await self._maybe_handle_herdr_topic_message(msg):\n            return\n"
 CALLBACK_CALL_SNIPPET = "        if await self._maybe_handle_herdr_topic_callback(query):\n            return\n"

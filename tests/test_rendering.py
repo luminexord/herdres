@@ -2108,6 +2108,193 @@ Verification
             herdres.clean_feed_hash(second, include_render_version=False),
         )
 
+    def test_bridge_defaults_match_canonical_herdres_paths(self) -> None:
+        module_path = Path(__file__).resolve().parents[1] / "herdr_topic_bridge.py"
+        spec = importlib.util.spec_from_file_location("herdr_topic_bridge", module_path)
+        bridge = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(bridge)
+
+        self.assertEqual(bridge.DEFAULT_STATE, Path.home() / ".local/share/herdres/state.json")
+        self.assertEqual(bridge.DEFAULT_SCRIPT, Path.home() / ".local/bin/herdres")
+
+    def test_plugin_manifest_hooks_herdres_event(self) -> None:
+        import tomllib
+
+        manifest = Path(__file__).resolve().parents[1] / "herdres-plugin" / "herdr-plugin.toml"
+        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+
+        self.assertEqual(data["id"], "gaijinjoe.herdres")
+        self.assertEqual(data["min_herdr_version"], "0.7.0")
+        self.assertIn({"on": "pane.agent_status_changed", "command": ["herdres", "event"]}, data["events"])
+        commands = {action["id"]: action["command"] for action in data["actions"]}
+        self.assertEqual(commands["enable"], ["herdres", "plugin-enable"])
+        self.assertEqual(commands["disable"], ["herdres", "plugin-disable"])
+
+    def test_plugin_enable_flag_is_separate_from_global_enabled(self) -> None:
+        state = {"version": 1, "enabled": False, "plugin_event_enabled": True, "telegram": {}, "panes": {}}
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+        ):
+            result = herdres.plugin_enable_once(False)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(state["enabled"])
+        self.assertFalse(state["plugin_event_enabled"])
+
+    def test_event_noops_when_plugin_event_has_no_pane_id(self) -> None:
+        state = {"version": 1, "enabled": True, "plugin_event_enabled": True, "telegram": {}, "panes": {}}
+        pane_by_id = Mock()
+        preflight_for_event = Mock()
+        sync_pane_once = Mock()
+
+        with patch.dict(herdres.os.environ, {"HERDR_PLUGIN_EVENT_JSON": "{}"}, clear=False), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=pane_by_id,
+            preflight_for_event=preflight_for_event,
+            sync_pane_once=sync_pane_once,
+        ):
+            result = herdres.event_once()
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertIn("no pane id", result["message"])
+        pane_by_id.assert_not_called()
+        preflight_for_event.assert_not_called()
+        sync_pane_once.assert_not_called()
+
+    def test_event_noops_for_unknown_pane(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "plugin_event_enabled": True,
+            "telegram": {"chat_id": "-1001"},
+            "panes": {},
+        }
+        event_json = herdres.json.dumps({"pane_id": "pane-missing"})
+        preflight_for_event = Mock()
+        sync_pane_once = Mock()
+
+        with patch.dict(herdres.os.environ, {"HERDR_PLUGIN_EVENT_JSON": event_json}, clear=False), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=None),
+            preflight_for_event=preflight_for_event,
+            sync_pane_once=sync_pane_once,
+        ):
+            result = herdres.event_once()
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["pane_id"], "pane-missing")
+        preflight_for_event.assert_not_called()
+        sync_pane_once.assert_not_called()
+
+    def test_event_pane_id_does_not_use_generic_resource_id(self) -> None:
+        event = {"resource": {"id": "not-a-pane"}, "payload": {"status": "done"}}
+
+        self.assertEqual(herdres.event_pane_id({}, event), "")
+
+    def test_event_reconciles_only_changed_pane_with_turn_only_mode(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "plugin_event_enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {},
+        }
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "done",
+        }
+        event_json = herdres.json.dumps({"pane": {"pane_id": "pane-1"}})
+        sync_pane_once = Mock(return_value=True)
+
+        with patch.dict(herdres.os.environ, {"HERDR_PLUGIN_EVENT_JSON": event_json}, clear=False), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=pane),
+            preflight_for_event=Mock(return_value=(True, "")),
+            sync_pane_once=sync_pane_once,
+        ):
+            result = herdres.event_once()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["pane_id"], "pane-1")
+        args, kwargs = sync_pane_once.call_args
+        self.assertIs(args[0], state)
+        self.assertEqual(args[3], pane)
+        self.assertTrue(kwargs["turn_only"])
+
+    def test_event_turn_feed_does_not_read_pane_output(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "done",
+        }
+        key = herdres.pane_key(pane)
+        state = {
+            "version": 1,
+            "enabled": True,
+            "plugin_event_enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {
+                key: {
+                    "pane_key": key,
+                    "pane_id": "pane-1",
+                    "topic_id": "77",
+                    "last_topic_verified_at": herdres.utc_now(),
+                }
+            },
+        }
+        event_json = herdres.json.dumps({"pane": {"pane_id": "pane-1"}})
+        pane_feed_output = Mock(return_value="HERDRES_REPORT_START\nLeak\n- should not read\nHERDRES_REPORT_END")
+
+        with patch.dict(herdres.os.environ, {"HERDR_PLUGIN_EVENT_JSON": event_json}, clear=False), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=pane),
+            preflight_for_event=Mock(return_value=(True, "")),
+            pane_turn=Mock(return_value={"available": False, "reason": "no_structured_turn_source"}),
+            pane_feed_output=pane_feed_output,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.event_once()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        pane_feed_output.assert_not_called()
+
+    def test_event_uses_blocking_lock_from_cli(self) -> None:
+        lock = Mock(return_value={"ok": True, "changed": False})
+        with patch.object(herdres.sys, "argv", ["herdres", "event"]), patch.object(herdres, "with_lock", lock):
+            result = herdres.main()
+
+        self.assertEqual(result, 0)
+        self.assertTrue(lock.call_args.kwargs["blocking"])
+
 
 def callback_state() -> dict:
     return {
