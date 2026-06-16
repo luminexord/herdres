@@ -85,6 +85,9 @@ FINAL_REPLY_MAX_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LIN
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
+PANE_INPUT_FILE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS", "1200"))
+PANE_INPUT_FILE_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES", "6"))
+PANE_INPUT_FILE_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_MAX_CHARS", "120000"))
 EVENT_SETTLE_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_SECONDS", "4"))
 EVENT_SETTLE_INTERVAL_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_INTERVAL", "0.75"))
 DUPLICATE_TOPIC_DELETE_LIMIT = int(os.getenv("HERDR_TELEGRAM_TOPICS_DUPLICATE_DELETE_LIMIT", "12"))
@@ -2909,11 +2912,67 @@ def update_topic_status_icon(
     return {"ok": bool(ok), "attempted": True, "kind": "updated" if ok else "failed", "icon_key": icon_key, "emoji": emoji}
 
 
+def pane_input_needs_file(text: str) -> bool:
+    value = str(text or "")
+    if len(value) >= PANE_INPUT_FILE_CHARS:
+        return True
+    return value.count("\n") + 1 >= PANE_INPUT_FILE_LINES
+
+
+def safe_file_component(value: str, fallback: str = "pane") -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "").strip())
+    text = text.strip(".-")
+    return text[:80] or fallback
+
+
+def write_inbound_pane_message(pane_id: str, text: str) -> Path:
+    root = state_path().parent / "inbound" / safe_file_component(pane_id)
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    content = str(text or "")
+    if len(content) > PANE_INPUT_FILE_MAX_CHARS:
+        content = content[:PANE_INPUT_FILE_MAX_CHARS] + "\n\n[Herdres truncated this inbound Telegram message locally.]"
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+    stamp = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = root / f"{stamp}-{digest}.txt"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(content)
+        if not content.endswith("\n"):
+            fh.write("\n")
+    return path
+
+
+def pane_input_file_instruction(path: Path, text: str) -> str:
+    preview = re.sub(r"\s+", " ", str(text or "").strip())
+    preview = sanitize_text(preview, 420)
+    line_count = str(text or "").count("\n") + 1 if text else 0
+    char_count = len(str(text or ""))
+    suffix = f" Preview: {preview}" if preview else ""
+    return (
+        "Telegram topic message received. "
+        f"The full owner message is saved at {path}. "
+        "Read that file and treat its contents as the user's instruction; then respond to the owner. "
+        f"It has {line_count} lines and {char_count} chars."
+        f"{suffix}"
+    )
+
+
 def send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, str]:
     pane = pane_by_id(pane_id)
     if not pane:
         return False, "Herdr pane is not currently live."
-    proc = run_cmd([herdr_bin(), "pane", "run", pane_id, text], timeout=timeout)
+    outbound = str(text or "")
+    if pane_input_needs_file(outbound):
+        try:
+            inbound_path = write_inbound_pane_message(pane_id, outbound)
+        except OSError as exc:
+            return False, f"Could not write inbound message file: {sanitize_text(str(exc), 300)}"
+        outbound = pane_input_file_instruction(inbound_path, outbound)
+    proc = run_cmd([herdr_bin(), "pane", "run", pane_id, outbound], timeout=timeout)
     if proc.returncode != 0:
         return False, sanitize_text(proc.stderr or proc.stdout, 800)
     return True, ""

@@ -85,6 +85,16 @@ Inside a mapped pane topic:
 
 Plain text is not forwarded unless `telegram.implicit_send_enabled` is enabled in state. When enabled, plain text from an authorized owner in a mapped pane topic is sent only to that mapped pane. The General topic remains normal Hermes chat.
 
+Long or multiline Telegram inputs are not pasted into the terminal directly. Herdres writes the exact owner message to `~/.local/share/herdres/inbound/<pane>/...txt` with owner-only permissions and submits a short instruction telling the pane to read that file. This avoids Herdr/TUI bracketed-paste collapse such as `[Pasted text #1 ...]` being sent as the actual instruction.
+
+Controls:
+
+```bash
+HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS=1200
+HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES=6
+HERDR_TELEGRAM_TOPICS_INPUT_FILE_MAX_CHARS=120000
+```
+
 Inbound pane-topic control is handled through the Hermes Telegram gateway, so Hermes must load the small bridge hook:
 
 ```bash

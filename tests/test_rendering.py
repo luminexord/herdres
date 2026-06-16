@@ -1,4 +1,6 @@
 import importlib.util
+import re
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -978,6 +980,64 @@ Verification
         self.assertEqual(calls[-1][1]["icon_custom_emoji_id"], "icon-working")
         send_notice.assert_not_called()
         delete_message.assert_called_once_with("-1001", "10")
+
+    def test_send_to_pane_materializes_long_multiline_input(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "codex"}
+        long_text = "\n".join(f"line {idx}" for idx in range(20))
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value=pane),
+            run_cmd=run_cmd,
+            state_path=Mock(return_value=Path(tmpdir) / "state.json"),
+            PANE_INPUT_FILE_CHARS=1200,
+            PANE_INPUT_FILE_LINES=6,
+        ):
+            ok, detail = herdres.send_to_pane("pane-1", long_text)
+            self.assertTrue(ok, detail)
+            self.assertEqual(commands[0][:3], [herdres.herdr_bin(), "pane", "run"])
+            self.assertEqual(commands[0][3], "pane-1")
+            outbound = commands[0][4]
+            self.assertIn("Read that file", outbound)
+            self.assertIn("20 lines", outbound)
+            self.assertNotIn("line 19\n", outbound)
+            match = re.search(r"saved at (.+?\.txt)", outbound)
+            self.assertIsNotNone(match)
+            saved = Path(match.group(1))
+            self.assertEqual(saved.read_text(encoding="utf-8").strip(), long_text)
+
+    def test_send_to_pane_keeps_short_input_inline(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "codex"}
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value=pane),
+            run_cmd=run_cmd,
+            PANE_INPUT_FILE_CHARS=1200,
+            PANE_INPUT_FILE_LINES=6,
+        ):
+            ok, detail = herdres.send_to_pane("pane-1", "short instruction")
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(commands[0][4], "short instruction")
 
     def test_cleanup_duplicates_delete_archives_closed_entry(self) -> None:
         state = {
