@@ -2346,7 +2346,7 @@ def _lead_heading_split(line: str, *, allow_status_title: bool = False) -> tuple
     title_key = title.lower()
     if len(words) == 1 and allow_status_title and title_key in TURN_STATUS_HEADING_KEYS:
         pass
-    elif not 2 <= len(words) <= 8:
+    elif not 2 <= len(words) <= 5 or ":" in title:
         return None
     if title_key in {"yes", "no", "ok", "okay"}:
         return None
@@ -2464,25 +2464,28 @@ def _render_text_fence(code_lines: list[str]) -> str:
     return "<br><br>".join(blocks)
 
 
+_SPACIOUS_END = re.compile(r"</(?:pre|h[1-6]|ul|ol|blockquote|details|table)>$")
+_SPACIOUS_START = re.compile(r"^<(?:pre|h[1-6]|ul|ol|blockquote|details|table)\b")
+
+
 def _join_blocks(parts: list[str]) -> str:
-    # One blank line between blocks, sized to each block's own trailing space:
-    #   - a <pre> code block carries its own margin -> add nothing;
-    #   - a block that ends in a closing tag (</p>, </h3>, </b>, </ul>, </code>...)
-    #     already breaks to the next line -> one <br> gives a blank line;
-    #   - a block ending in plain text (e.g. a text-fenced list) has no trailing
-    #     break -> two <br> to show a blank line.
+    # The gateway renders block elements (<pre>, <h3>, <ul>, <blockquote>...) with
+    # their own vertical margins, but flows plain text / <p> / inline <b> tightly.
+    # So only insert a <br> between two flow blocks; never next to a block that
+    # already carries its own margin (adding one there double-spaces).
     kept = [p for p in parts if p and p.strip()]
     if not kept:
         return ""
     result = kept[0]
     for part in kept[1:]:
         prev = result.rstrip()
-        if prev.endswith("</pre>"):
-            sep = ""
+        nxt = part.lstrip()
+        if _SPACIOUS_END.search(prev) or _SPACIOUS_START.match(nxt):
+            sep = ""               # block element carries its own margin
         elif prev.endswith(">"):
-            sep = "<br>"
+            sep = "<br>"           # flow block already breaks one line -> one <br> = blank line
         else:
-            sep = "<br><br>"
+            sep = "<br><br>"       # plain-text-ending block (e.g. text-fenced list) -> two <br>
         result += sep + part
     return result
 
