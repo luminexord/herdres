@@ -50,9 +50,9 @@ Verified with:
         html = herdres.render_feed_item_html(item)
 
         self.assertIn("<h3>Report</h3>", html)
-        self.assertIn("<h4>Changes made</h4>", html)
+        self.assertIn("<b>Changes made</b>", html)
         self.assertIn("<code>.local/bin/herdr_telegram_topics.py:520</code>", html)
-        self.assertIn("<h4>Verified with</h4>", html)
+        self.assertIn("<b>Verified with</b>", html)
         self.assertIn("<ul>", html)
         self.assertGreaterEqual(html.count("<li>"), 5)
         self.assertIn("Converts only real markdown bullets into rich lists, stripping the -.", html)
@@ -484,7 +484,7 @@ HERDRES_REPORT_END
         html = herdres.render_feed_item_html(item)
         self.assertIn("<details><summary>Risks</summary>", html)
         self.assertIn("<details><summary>Proof</summary><pre><code>", html)
-        self.assertIn("<h4>Next</h4>", html)
+        self.assertIn("<b>Next</b>", html)
         self.assertIn('<input type="checkbox">Watch next timer run', html)
 
     def test_done_heading_report_with_numbered_list_stays_report(self) -> None:
@@ -2185,7 +2185,7 @@ Codex thinks your real objection is register, not raw word count. Which is it?
         self.assertIn("short explainer", item["options"][0]["description"])
         html = herdres.render_feed_item_html(item)
         self.assertIn("value-ranker", html)
-        self.assertIn("<h4>Question</h4>", html)
+        self.assertIn("<b>Question</b>", html)
         self.assertIn("Codex thinks", html)
 
     def test_visible_readonly_choice_fallback_keeps_prompt_without_buttons(self) -> None:
@@ -2569,7 +2569,7 @@ teacher tone), not raw word count — your rejects say "AI-ish / over-analyzes,"
         self.assertIn("teacher/analyst voice", item["options"][0]["description"])
         html = herdres.render_feed_item_html(item)
         self.assertIn("Both agree on the root cause", html)
-        self.assertIn("<h4>Question</h4>", html)
+        self.assertIn("<b>Question</b>", html)
         self.assertIn("This picks the fix lever", html)
 
     def test_self_contained_choice_prompt_suppresses_repeated_context_and_keeps_chat_option(self) -> None:
@@ -3613,8 +3613,8 @@ Verification
 
         self.assertIn("<blockquote>", html)
         self.assertIn("<h3>Implemented</h3>", html)
-        self.assertIn("<h4>Pushed</h4>", html)
-        self.assertIn("<h4>Verification</h4>", html)
+        self.assertIn("<b>Pushed</b>", html)
+        self.assertIn("<b>Verification</b>", html)
         self.assertIn("<code>label</code>", html)
         self.assertIn("<code>editForumTopic</code>", html)
         self.assertIn("<code>/home/smith/.local/bin/herdr_telegram_topics.py</code>", html)
@@ -3657,7 +3657,7 @@ Verification
         html = herdres.render_final_reply_html("Pushed\n`cdee2ca Sync topic names`\n\nVerification\n- tests OK")
 
         self.assertIn("<h3>Pushed</h3>", html)
-        self.assertIn("<h4>Verification</h4>", html)
+        self.assertIn("<b>Verification</b>", html)
         self.assertIn("<code>cdee2ca</code> Sync topic names", html)
 
     def test_turn_renderer_breaks_claude_dense_progress_text_into_readable_blocks(self) -> None:
@@ -3695,14 +3695,14 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         html = herdres.render_final_reply_html(text)
 
         self.assertIn("<h3>Fixed</h3>", html)
-        self.assertIn("<h4>What happened</h4>", html)
-        self.assertIn("<h4>Fix</h4>", html)
+        self.assertIn("<b>What happened</b>", html)
+        self.assertIn("<b>Fix</b>", html)
         self.assertIn("genuinely reviewing now", html)
         self.assertIn("2h12m", html)
         self.assertIn("No harm done", html)
         self.assertNotIn("What happened: my first", html)
-        self.assertNotIn("<h4>model</h4>", html)
-        self.assertNotIn("<h4>sandbox</h4>", html)
+        self.assertNotIn("<b>model</b>", html)
+        self.assertNotIn("<b>sandbox</b>", html)
 
     def test_dense_turn_inline_section_split_is_strict(self) -> None:
         html = herdres.render_final_reply_html(
@@ -3716,11 +3716,11 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         )
 
         self.assertNotIn("<h3>Fixed</h3>", html)
-        self.assertNotIn("<h4>Note</h4>", html)
-        self.assertNotIn("<h4>Example</h4>", html)
-        self.assertNotIn("<h4>The change</h4>", html)
+        self.assertNotIn("<b>Note</b>", html)
+        self.assertNotIn("<b>Example</b>", html)
+        self.assertNotIn("<b>The change</b>", html)
         self.assertIn("<li>Fix: this bullet should stay a bullet.</li>", html)
-        self.assertEqual(html.count("<h4>What changed</h4>"), 1)
+        self.assertEqual(html.count("<b>What changed</b>"), 1)
 
     def test_oversized_turn_fallback_keeps_more_than_tiny_summary(self) -> None:
         text = "Implemented.\n" + "\n".join(

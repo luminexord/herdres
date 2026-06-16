@@ -1834,6 +1834,13 @@ def _limited_lines(value: str | list[str], *, max_chars: int, max_lines: int = 3
     return lines, overflow
 
 
+def _atx_heading_title(line: str) -> str | None:
+    s = str(line or "").strip()
+    if re.match(r"^#{1,6}\s+\S", s):
+        return re.sub(r"^#{1,6}\s+", "", s).strip().rstrip("#").strip()
+    return None
+
+
 def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_DETAIL_CHARS, max_lines: int = 30) -> tuple[str, list[str]]:
     lines, overflow = _limited_lines(value, max_chars=max_chars, max_lines=max_lines)
     if not lines:
@@ -1860,6 +1867,7 @@ def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_
                         not continuation.strip()
                         or _bullet_text(continuation)
                         or _numbered_text(continuation)
+                        or _atx_heading_title(continuation)
                         or (
                             not continuation.startswith((" ", "\t"))
                             and _looks_like_section(continuation, lines[idx + 1] if idx + 1 < len(lines) else None)
@@ -1890,6 +1898,7 @@ def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_
                         not continuation.strip()
                         or _bullet_text(continuation)
                         or _numbered_text(continuation)
+                        or _atx_heading_title(continuation)
                         or (
                             not continuation.startswith((" ", "\t"))
                             and _looks_like_section(continuation, lines[idx + 1] if idx + 1 < len(lines) else None)
@@ -1919,17 +1928,23 @@ def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_
             parts.append(f"<pre><code>{code_text}</code></pre>")
             continue
 
+        atx_title = _atx_heading_title(line)
+        if atx_title:
+            parts.append(f"<b>{_html_text(atx_title, 120)}</b>")
+            idx += 1
+            continue
+
         next_line = lines[idx + 1] if idx + 1 < len(lines) else None
         path_section = _split_path_section(line)
         if path_section:
             heading, ref = path_section
-            parts.append(f"<h4>{_html_text(heading, 100)}</h4>")
+            parts.append(f"<b>{_html_text(heading, 100)}</b>")
             parts.append(f"<p><code>{_html_text(ref, 300)}</code></p>")
             idx += 1
             continue
 
         if _looks_like_section(line, next_line):
-            parts.append(f"<h4>{_html_text(line.rstrip(':'), 100)}</h4>")
+            parts.append(f"<b>{_html_text(line.rstrip(':'), 100)}</b>")
             idx += 1
             continue
 
@@ -2100,7 +2115,7 @@ def _rich_structured_report(lines: list[str]) -> str:
         if kind == "table":
             table_html = _rich_table_section(body)
             if title:
-                parts.append(f"<h4>{_html_text(title, 100)}</h4>")
+                parts.append(f"<b>{_html_text(title, 100)}</b>")
             if table_html:
                 parts.append(table_html)
             elif body:
@@ -2111,7 +2126,7 @@ def _rich_structured_report(lines: list[str]) -> str:
         if kind == "checklist":
             heading = title or "Checklist"
             checklist_html = _rich_checklist_section(body)
-            parts.append(f"<h4>{_html_text(heading, 100)}</h4>")
+            parts.append(f"<b>{_html_text(heading, 100)}</b>")
             if checklist_html:
                 parts.append(checklist_html)
             elif body:
@@ -2306,9 +2321,9 @@ def _is_turn_heading_line(
         return True
     if clean.endswith(":"):
         return True
-    if first_block and next_nonempty and len(words) <= 4 and not clean.endswith(("!", "?")):
+    if first_block and next_nonempty and len(words) <= 4 and clean[:1].isupper() and not clean.endswith(("!", "?")):
         return True
-    if previous_blank and next_nonempty and len(words) <= 4 and not clean.endswith(("!", "?")):
+    if previous_blank and next_nonempty and len(words) <= 4 and clean[:1].isupper() and not clean.endswith(("!", "?")):
         return True
     return False
 
@@ -2472,7 +2487,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                 previous_blank = False
                 seen_heading = True
                 continue
-            tag = "h3" if not seen_heading else "h4"
+            tag = "h3" if not seen_heading else "b"
             parts.append(f"<{tag}>{_html_text(title, 100)}</{tag}>")
             seen_heading = True
             previous_blank = False
@@ -2574,7 +2589,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
         lead_split = _lead_heading_split(line, allow_status_title=not seen_heading) if (previous_blank or not seen_heading) else None
         if lead_split:
             title, rest = lead_split
-            tag = "h3" if not seen_heading else "h4"
+            tag = "h3" if not seen_heading else "b"
             parts.append(f"<{tag}>{_html_text(title, 100)}</{tag}>")
             parts.extend(_rich_paragraph_blocks(rest))
             seen_heading = True
@@ -2585,7 +2600,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
         inline_section = _inline_section_split(line)
         if inline_section:
             title, body = inline_section
-            tag = "h3" if not seen_heading else "h4"
+            tag = "h3" if not seen_heading else "b"
             parts.append(f"<{tag}>{_html_text(title, 100)}</{tag}>")
             parts.extend(_rich_paragraph_blocks(body))
             seen_heading = True
@@ -2743,7 +2758,7 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
     )
     for idx, question in enumerate(questions, start=1):
         title = str(question.get("title") or f"Question {idx}").strip()
-        parts.append(f"<h4>{idx}. {_rich_inline(title, 180)}</h4>")
+        parts.append(f"<b>{idx}. {_rich_inline(title, 180)}</b>")
         answer = interaction_answer_text(question, answers.get(str(question.get("question_id") or "")))
         if answer:
             parts.append(f"<p><b>Current answer:</b> {_rich_inline(answer, 500)}</p>")
@@ -2805,7 +2820,7 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
                 parts.append(detail_html)
         if summary:
             if detail:
-                parts.append("<h4>Question</h4>")
+                parts.append("<b>Question</b>")
             parts.append(_rich_lines_block(summary, max_chars=700))
         parts.append(_rich_options_block(options))
     elif content_lines:
