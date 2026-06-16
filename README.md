@@ -405,7 +405,7 @@ Choose the next action.
 HERDRES_CHOICES_END
 ```
 
-Explicit choices are treated as agent-authored safe controls. Inferred visible-screen choice buttons are controlled separately by `HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS=1` and should remain off unless you have verified the pane's native prompt can be safely driven from Telegram.
+Explicit choices are treated as agent-authored safe controls. Structured `pending_decision` data remains the supported automatic button path. Inferred legacy and visible-screen choice buttons are controlled separately and should remain off unless you have verified the pane's native prompt can be safely driven from Telegram.
 
 ## Useful Environment Variables
 
@@ -427,7 +427,7 @@ HERDR_TELEGRAM_TOPICS_FEED_READ_LINES=140
 HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS=9000
 HERDR_TELEGRAM_TOPICS_TURN_FEED=1
 HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS=0
-HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES=1  # only applies when visible choice buttons are explicitly enabled
+HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES=0
 HERDR_TELEGRAM_TOPICS_STRUCTURED_INTERACTIONS=1
 HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS=16000
 HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES=140

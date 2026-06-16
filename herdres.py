@@ -71,7 +71,7 @@ VISIBLE_CHOICE_BUTTONS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE
     "yes",
     "on",
 }
-LEGACY_CHOICES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES", "1").lower() in {
+LEGACY_CHOICES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES", "0").lower() in {
     "1",
     "true",
     "yes",
@@ -1210,7 +1210,7 @@ def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if turn.get("available") is not True:
         return None
-    decision = normalize_pending_decision(turn)
+    decision = normalize_pending_decision(turn) if STRUCTURED_INTERACTIONS_ENABLED else None
     if decision and (turn.get("awaiting_input") is True or turn.get("complete") is not True):
         return make_decision_feed_item(turn, decision)
     if turn.get("complete") is not True:
@@ -2799,22 +2799,45 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         entry.pop(key, None)
 
 
+def awaiting_detail_source(awaiting: dict[str, Any]) -> str:
+    source = str(awaiting.get("choice_source") or awaiting.get("source") or "").strip()
+    if source:
+        return source
+    if awaiting.get("decision_id"):
+        return "pending_decision"
+    if str(awaiting.get("visible_choice") or "").strip():
+        return "visible_scrape"
+    return ""
+
+
+def prompt_interaction_disabled(item_or_prompt: dict[str, Any]) -> bool:
+    source = prompt_source(item_or_prompt)
+    if source == "visible_readonly":
+        return True
+    if source == "visible_scrape":
+        return not VISIBLE_CHOICE_BUTTONS_ENABLED
+    if source == "legacy_clean_feed":
+        return (not VISIBLE_CHOICE_BUTTONS_ENABLED) or (not LEGACY_CHOICES_ENABLED)
+    if source == "legacy":
+        return not LEGACY_CHOICES_ENABLED
+    if source == "pending_decision":
+        return not STRUCTURED_INTERACTIONS_ENABLED
+    return False
+
+
 def clear_disabled_visible_choice_state(state: dict[str, Any]) -> bool:
-    if VISIBLE_CHOICE_BUTTONS_ENABLED:
-        return False
     changed = False
     for entry in (state.get("panes") or {}).values():
         active = entry.get("active_prompt") if isinstance(entry.get("active_prompt"), dict) else {}
         awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
-        active_visible = bool(active) and visible_choice_prompt_blocked(active)
-        awaiting_visible = bool(awaiting.get("visible_choice")) and not (
-            awaiting.get("interaction_id") or awaiting.get("decision_id")
-        )
-        if active_visible:
+        active_disabled = bool(active) and prompt_interaction_disabled(active)
+        awaiting_source = awaiting_detail_source(awaiting)
+        awaiting_disabled = bool(awaiting_source) and prompt_interaction_disabled({"choice_source": awaiting_source})
+        if active_disabled:
             entry.pop("active_prompt", None)
             entry["last_visible_choice_cleared_at"] = utc_now()
             changed = True
-        if awaiting_visible:
+        if awaiting_disabled:
             entry.pop("awaiting_detail", None)
             entry["last_visible_choice_cleared_at"] = utc_now()
             changed = True
@@ -2885,10 +2908,7 @@ def prompt_source(item_or_prompt: dict[str, Any]) -> str:
 
 
 def visible_choice_prompt_blocked(item_or_prompt: dict[str, Any]) -> bool:
-    source = prompt_source(item_or_prompt)
-    if source == "visible_readonly":
-        return True
-    return source in {"visible_scrape", "legacy_clean_feed"} and not VISIBLE_CHOICE_BUTTONS_ENABLED
+    return prompt_interaction_disabled(item_or_prompt)
 
 
 def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[str, Any]:
@@ -2920,11 +2940,7 @@ def prompt_delivery_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, 
     if str(item.get("kind") or "").lower() not in {"choices", "decision"}:
         return None, None, True
     source = prompt_source(item)
-    if source == "visible_readonly":
-        return None, None, True
-    if source in {"visible_scrape", "legacy_clean_feed"} and not VISIBLE_CHOICE_BUTTONS_ENABLED:
-        return None, None, True
-    if source == "legacy_clean_feed" and not LEGACY_CHOICES_ENABLED:
+    if prompt_interaction_disabled(item):
         return None, None, True
     options = list(item.get("options") or [])
     if not options:
@@ -5194,12 +5210,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if command == "plain":
         awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
         if awaiting and str(awaiting.get("user_id") or "") == user_id:
-            if str(awaiting.get("visible_choice") or "").strip() and not VISIBLE_CHOICE_BUTTONS_ENABLED:
+            awaiting_source = awaiting_detail_source(awaiting)
+            if awaiting_source and prompt_interaction_disabled({"choice_source": awaiting_source}):
                 entry.pop("awaiting_detail", None)
                 save_state(state)
                 return {
                     "handled": True,
-                    "reply": "That visible-screen choice prompt is no longer safe to answer from Telegram. Use /raw or answer in Herdr.",
+                    "reply": "That choice prompt is no longer active from Telegram. Use /raw or answer in Herdr.",
                 }
             try:
                 created_at = _dt.datetime.fromisoformat(str(awaiting.get("created_at", "")).replace("Z", "+00:00"))
@@ -5342,6 +5359,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         options = list(prompt.get("options") or [])
         prompt_id = str(prompt.get("id") or "")
         prompt_text = str(prompt.get("text") or "")
+        if prompt and prompt_interaction_disabled(prompt):
+            entry.pop("active_prompt", None)
+            entry.pop("awaiting_detail", None)
+            save_state(state)
+            return {"handled": True, "reply": "No active choices for this pane."}
         if not prompt_id or not options or not prompt_text:
             return {"handled": True, "reply": "No active choices for this pane."}
         prompt_item = dict(prompt.get("item") or {})
@@ -5436,13 +5458,13 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     prompt = entry.get("active_prompt") if isinstance(entry.get("active_prompt"), dict) else {}
     if str(prompt.get("id") or "") != prompt_id:
         return {"handled": True, "answer": "Those choices are no longer active."}
-    if visible_choice_prompt_blocked(prompt):
+    if prompt_interaction_disabled(prompt):
         entry.pop("active_prompt", None)
         entry.pop("awaiting_detail", None)
         save_state(state)
         return {
             "handled": True,
-            "answer": "These visible-screen choices are no longer safe to answer from Telegram. Use /raw or answer in Herdr.",
+            "answer": "These choices are no longer active from Telegram. Use /choices to refresh, /raw to inspect, or answer in Herdr.",
             "show_alert": True,
         }
     prompt_item = prompt.get("item") if isinstance(prompt.get("item"), dict) else {}
@@ -5486,6 +5508,8 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         entry["awaiting_detail"] = {
             "user_id": user_id,
             "prompt_id": prompt_id,
+            "choice_source": prompt_source(prompt),
+            "decision_id": sanitize_text(str(prompt.get("decision_id") or ""), 300),
             "choice": sanitize_text(choice_text, 500).strip(),
             "select_choice": sanitize_text(select_choice, 40).strip(),
             "visible_choice": sanitize_text(visible_choice, 40).strip(),
