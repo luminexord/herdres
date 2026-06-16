@@ -1932,6 +1932,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             "Mostly length",
             "Both, equally",
             "Type something.",
+            "Chat about this",
         ])
         self.assertIn("teacher/analyst voice", item["options"][0]["description"])
         self.assertIn("word count", item["options"][1]["description"])
@@ -2047,6 +2048,44 @@ teacher tone), not raw word count — your rejects say "AI-ish / over-analyzes,"
         self.assertIn("Both agree on the root cause", html)
         self.assertIn("<h4>Question</h4>", html)
         self.assertIn("This picks the fix lever", html)
+
+    def test_self_contained_choice_prompt_suppresses_repeated_context_and_keeps_chat_option(self) -> None:
+        raw = """Codex 5.5 xhigh concurs with the workflow.
+
+The converged plan is long and already visible above.
+
+How should I proceed on the build?
+
+❯ 1. Build P1+P2, guard off, then flip ✔
+     Recommended. Ship instrumentation and the guard together.
+  2. Instrument first only
+     Safest, slower.
+  3. Go for the discriminator fix
+     Most principled, heaviest.
+  4. Type something.
+─────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+"""
+
+        item = herdres.extract_choices(herdres.clean_feed_lines(raw))
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual([opt["label"] for opt in item["options"]], [
+            "Build P1+P2, guard off, then flip ✔",
+            "Instrument first only",
+            "Go for the discriminator fix",
+            "Type something.",
+            "Chat about this",
+        ])
+        self.assertEqual(item["detail"], "")
+        self.assertIn("How should I proceed", item["summary"])
+        markup = herdres.choices_reply_markup(item["prompt_id"], item["options"])
+        labels = [row[0]["text"] for row in markup["inline_keyboard"]]
+        self.assertIn("5. Chat about this", labels)
+        self.assertNotIn("Tell me differently", labels)
 
     def test_decision_buttons_can_send_explicit_text(self) -> None:
         item = herdres.make_turn_feed_item(
@@ -2168,6 +2207,54 @@ teacher tone), not raw word count — your rejects say "AI-ish / over-analyzes,"
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["choice"], "1")
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["force_reply_message_id"], "777")
         send_to_pane.assert_not_called()
+
+    def test_callback_visible_custom_choice_selects_menu_before_sending_detail(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["active_prompt"] = {
+            "id": "prompt1",
+            "options": [
+                {"number": "4", "label": "Type something."},
+                {"number": "5", "label": "Chat about this"},
+            ],
+        }
+        send_notice = Mock(return_value={"ok": True, "message_id": "777"})
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_notice=send_notice, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(user_id="42", data="herdr:d:prompt1:4"))
+
+        self.assertEqual(result["answer"], "Write the details in this topic.")
+        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["choice"], "")
+        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["select_choice"], "4")
+        send_to_pane.assert_not_called()
+
+    def test_force_reply_visible_choice_detail_uses_send_keys_then_text(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42",
+            "prompt_id": "prompt1",
+            "choice": "",
+            "select_choice": "4",
+            "option": "Type something.",
+            "force_reply_message_id": "999",
+            "created_at": herdres.utc_now(),
+        }
+        send_choice_detail_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state), patch.object(herdres, "send_choice_detail_to_pane", send_choice_detail_to_pane):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "user_id": "42",
+                    "text": "ask gitmoot and report back",
+                    "reply_to_message_id": "999",
+                }
+            )
+
+        self.assertEqual(result["reply"], "Sent details.")
+        send_choice_detail_to_pane.assert_called_once_with("pane-1", "4", "ask gitmoot and report back")
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
 
     def test_callback_rejects_non_owner_stale_prompt_and_unknown_choice(self) -> None:
         for payload, expected in (

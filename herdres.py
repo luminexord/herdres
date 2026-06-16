@@ -825,6 +825,11 @@ def choice_continuation_line(line: str) -> bool:
     return True
 
 
+def choice_separator_line(line: str) -> bool:
+    stripped = str(line or "").strip()
+    return bool(stripped.startswith(("─", "━")))
+
+
 def choice_ui_chrome_line(line: str) -> bool:
     stripped = str(line or "").strip()
     if not stripped:
@@ -2434,6 +2439,16 @@ def visible_choice_question_context(lines: list[str], start: int) -> tuple[str, 
     return context, question
 
 
+def choice_question_is_self_contained(question: str, options: list[dict[str, str]]) -> bool:
+    flat = re.sub(r"\s+", " ", str(question or "").strip()).lower()
+    if not flat:
+        return False
+    if not re.search(r"\b(how should i proceed|which path should i take|what should i do|how do you want me to proceed)\b", flat):
+        return False
+    described = sum(1 for opt in options if str(opt.get("description") or "").strip())
+    return described >= max(1, min(3, len(options) - 1))
+
+
 def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, Any] | None:
     best: tuple[int, int, list[dict[str, str]]] | None = None
     idx = 0
@@ -2460,6 +2475,12 @@ def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, An
         while idx < len(lines):
             item = option_match(lines[idx])
             if not item:
+                if options and not str(lines[idx] or "").strip() and idx + 1 < len(lines) and option_match(lines[idx + 1]):
+                    idx += 1
+                    continue
+                if options and choice_separator_line(lines[idx]):
+                    idx += 1
+                    continue
                 if options and choice_continuation_line(lines[idx]):
                     continuation_lines.append(lines[idx])
                     idx += 1
@@ -2490,6 +2511,8 @@ def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, An
         return None
     intro, question = visible_choice_question_context(lines, start)
     question = question or compact_block(context, max_lines=8, max_chars=1000) or "Choose a response."
+    if choice_question_is_self_contained(question, options):
+        intro = ""
     body_lines: list[str] = []
     for opt in options:
         body_lines.append(f"{opt['number']}) {opt['label']}")
@@ -2709,6 +2732,10 @@ def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[
         if is_custom:
             has_custom_button = True
             button_text = label or "Custom reply"
+        elif choice_needs_detail(opt):
+            has_custom_button = True
+            display_number = number if number.isdigit() else str(idx)
+            button_text = f"{display_number}. {label}" if label else display_number
         else:
             display_number = number if number.isdigit() else str(idx)
             button_text = f"{display_number}. {label}" if label else display_number
@@ -3187,6 +3214,20 @@ def send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, st
     if proc.returncode != 0:
         return False, sanitize_text(proc.stderr or proc.stdout, 800)
     return True, ""
+
+
+def send_choice_detail_to_pane(pane_id: str, choice: str, detail_text: str, *, timeout: int = 8) -> tuple[bool, str]:
+    choice = str(choice or "").strip()
+    if not choice:
+        return send_to_pane(pane_id, detail_text, timeout=timeout)
+    pane = pane_by_id(pane_id)
+    if not pane:
+        return False, "Herdr pane is not currently live."
+    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, choice, "enter"], timeout=timeout)
+    if proc.returncode != 0:
+        return False, sanitize_text(proc.stderr or proc.stdout, 800)
+    time.sleep(0.2)
+    return send_to_pane(pane_id, detail_text, timeout=timeout)
 
 
 def telegram_token() -> str:
@@ -4787,8 +4828,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             if force_reply_message_id and reply_to_message_id != force_reply_message_id:
                 return {"handled": True, "reply": "Reply directly to the detail prompt, or tap the button again."}
             choice = str(awaiting.get("choice") or "").strip()
-            outbound = f"{choice}\n{arg}" if choice else arg
-            ok, detail = send_to_pane(pane_id, outbound)
+            select_choice = str(awaiting.get("select_choice") or "").strip()
+            if select_choice:
+                ok, detail = send_choice_detail_to_pane(pane_id, select_choice, arg)
+            else:
+                outbound = f"{choice}\n{arg}" if choice else arg
+                ok, detail = send_to_pane(pane_id, outbound)
             if not ok:
                 return {"handled": True, "reply": f"Send failed: {detail}"}
             entry.pop("awaiting_detail", None)
@@ -5006,20 +5051,25 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
 
     if action == "d":
         choice_text = ""
+        select_choice = ""
         option_label = "custom"
         if option:
             option_label = str(option.get("label") or option.get("id") or choice_number)
             if str(option.get("id") or "").lower() != "custom" and choice_number.lower() != "custom":
-                choice_text = str(option.get("send_text") if "send_text" in option else option.get("number") or choice_number)
+                if "send_text" in option:
+                    choice_text = str(option.get("send_text") or "")
+                else:
+                    select_choice = str(option.get("number") or choice_number)
         entry["awaiting_detail"] = {
             "user_id": user_id,
             "prompt_id": prompt_id,
             "choice": sanitize_text(choice_text, 500).strip(),
+            "select_choice": sanitize_text(select_choice, 40).strip(),
             "option": sanitize_text(option_label, 160),
             "created_at": utc_now(),
         }
-        notice_title = "Custom reply" if not choice_text else f"Details for {choice_number}"
-        notice_body = "Write the instruction to send to this pane." if not choice_text else "Write the details to send with this choice."
+        notice_title = "Custom reply" if not choice_text and not select_choice else f"Details for {choice_number}"
+        notice_body = "Write the instruction to send to this pane." if not choice_text and not select_choice else "Write the details to send with this choice."
         notice = send_notice(
             chat_id,
             notice_title,
@@ -5037,17 +5087,19 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         if notice.get("message_id"):
             entry["awaiting_detail"]["force_reply_message_id"] = str(notice["message_id"])
         save_state(state)
-        return {"handled": True, "answer": "Write the instruction in this topic." if not choice_text else "Write the details in this topic."}
+        return {"handled": True, "answer": "Write the instruction in this topic." if not choice_text and not select_choice else "Write the details in this topic."}
 
     if not option:
         return {"handled": True, "answer": "Choice not found."}
 
     if choice_needs_detail(option):
-        choice_text = str(option.get("send_text") if "send_text" in option else choice_number).strip()
+        choice_text = str(option.get("send_text") or "").strip() if "send_text" in option else ""
+        select_choice = "" if "send_text" in option else str(option.get("number") or choice_number).strip()
         entry["awaiting_detail"] = {
             "user_id": user_id,
             "prompt_id": prompt_id,
             "choice": sanitize_text(choice_text, 500),
+            "select_choice": sanitize_text(select_choice, 40),
             "option": str(option.get("label") or ""),
             "created_at": utc_now(),
         }
