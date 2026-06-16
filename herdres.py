@@ -88,6 +88,14 @@ CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_T
 PANE_INPUT_FILE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS", "1200"))
 PANE_INPUT_FILE_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES", "6"))
 PANE_INPUT_FILE_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_MAX_CHARS", "120000"))
+VISIBLE_CHOICE_SELECT_MODE = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_SELECT_MODE", "number").strip().lower()
+VISIBLE_CHOICE_NUMBER_ENTER = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_NUMBER_ENTER", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+VISIBLE_CHOICE_VERIFY_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_VERIFY_SECONDS", "2.5"))
 EVENT_SETTLE_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_SECONDS", "4"))
 EVENT_SETTLE_INTERVAL_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_INTERVAL", "0.75"))
 DUPLICATE_TOPIC_DELETE_LIMIT = int(os.getenv("HERDR_TELEGRAM_TOPICS_DUPLICATE_DELETE_LIMIT", "12"))
@@ -3266,7 +3274,13 @@ def pane_input_file_instruction(path: Path, text: str) -> str:
     )
 
 
-def send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, str]:
+def send_to_pane(
+    pane_id: str,
+    text: str,
+    *,
+    timeout: int = 8,
+    submit_staged: bool = False,
+) -> tuple[bool, str]:
     pane = pane_by_id(pane_id)
     if not pane:
         return False, "Herdr pane is not currently live."
@@ -3280,7 +3294,123 @@ def send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, st
     proc = run_cmd([herdr_bin(), "pane", "run", pane_id, outbound], timeout=timeout)
     if proc.returncode != 0:
         return False, sanitize_text(proc.stderr or proc.stdout, 800)
+    if submit_staged:
+        submit_ok, submit_detail = submit_staged_pane_input_if_needed(pane_id, timeout=timeout)
+        if not submit_ok:
+            return False, submit_detail
     return True, ""
+
+
+def pane_input_looks_staged(pane_id: str) -> bool:
+    raw = pane_output(pane_id, lines=12, max_chars=1200, source="visible")
+    if not raw.strip():
+        return False
+    lines = raw.splitlines()[-8:]
+    for line in lines:
+        clean = ANSI_RE.sub("", str(line or "")).strip()
+        if PROMPT_WITH_TEXT_RE.match(clean):
+            return True
+        if re.search(r"\[Pasted text #\d+", clean, re.IGNORECASE):
+            return True
+    return False
+
+
+def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:
+    # Herdr normally submits pane run input itself. Some TUI states leave pasted
+    # or multiline text staged in the input box; only press Enter when we can
+    # see that staged input, to avoid double-submitting a completed command.
+    time.sleep(0.1)
+    if not pane_input_looks_staged(pane_id):
+        return True, ""
+    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "enter"], timeout=timeout)
+    if proc.returncode != 0:
+        return False, sanitize_text(proc.stderr or proc.stdout, 800)
+    return True, ""
+
+
+def visible_choice_selection_keys(choice: str) -> list[str]:
+    choice = str(choice or "").strip()
+    if VISIBLE_CHOICE_SELECT_MODE in {"number", "numbers", "digit", "digits"}:
+        if not choice:
+            return ["enter"]
+        return [choice, "enter"] if VISIBLE_CHOICE_NUMBER_ENTER else [choice]
+    try:
+        displayed_number = int(choice)
+    except ValueError:
+        displayed_number = 0
+    if displayed_number < 1:
+        return [choice, "enter"] if choice else ["enter"]
+    return ["up"] * 24 + ["down"] * (displayed_number - 1) + ["enter"]
+
+
+def visible_custom_detail_ready_text(raw: str) -> bool:
+    lines = clean_feed_lines(raw)
+    last_option_idx = -1
+    for idx, line in enumerate(lines):
+        if option_match(line):
+            last_option_idx = idx
+    if last_option_idx >= 0:
+        lines = lines[last_option_idx + 1 :]
+    if not any(str(line or "").strip() for line in lines):
+        return False
+    low = re.sub(r"\s+", " ", " ".join(lines)).lower()
+    return bool(
+        re.search(
+            r"\b("
+            r"type (?:your |an? )?(?:answer|response|instruction)|"
+            r"write (?:your |an? )?(?:answer|response|instruction)|"
+            r"provide (?:details|an? answer|a response|your response)|"
+            r"paste (?:your |an? )?(?:answer|response|instruction)|"
+            r"custom (?:answer|response|instruction)|"
+            r"(?:answer|response|instruction) now|"
+            r"details? (?:for|to send|now)"
+            r")\b",
+            low,
+        )
+    )
+
+
+def wait_for_visible_custom_detail_field(
+    pane_id: str,
+    *,
+    timeout_seconds: float = VISIBLE_CHOICE_VERIFY_SECONDS,
+) -> bool:
+    deadline = time.time() + max(0.2, timeout_seconds)
+    while time.time() < deadline:
+        raw = pane_output(pane_id, lines=READ_LINES_COMMAND_MAX, max_chars=FEED_MAX_CHARS, source="visible")
+        if raw.strip() and visible_custom_detail_ready_text(raw):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def visible_prompt_matches_awaiting(entry: dict[str, Any], awaiting: dict[str, Any]) -> bool:
+    current = current_visible_choice_item_for_entry(entry)
+    if not current:
+        return False
+    expected_prompt_id = str(awaiting.get("prompt_id") or "")
+    current_prompt_id = str(current.get("prompt_id") or "")
+    if expected_prompt_id and current_prompt_id and expected_prompt_id != current_prompt_id:
+        return False
+    choice = str(awaiting.get("visible_choice") or "").strip()
+    if not choice:
+        return False
+    current_options = list(current.get("options") or [])
+    current_match = next((opt for opt in current_options if str(opt.get("number") or "") == choice), None)
+    if not current_match:
+        return False
+    expected_options = awaiting.get("visible_options")
+    if isinstance(expected_options, list) and expected_options:
+        expected_match = next(
+            (opt for opt in expected_options if str(opt.get("number") or "") == choice),
+            None,
+        )
+        if isinstance(expected_match, dict):
+            expected_label = re.sub(r"\s+", " ", str(expected_match.get("label") or "").strip()).lower()
+            current_label = re.sub(r"\s+", " ", str(current_match.get("label") or "").strip()).lower()
+            if expected_label and current_label and expected_label != current_label:
+                return False
+    return True
 
 
 def send_choice_detail_to_pane(pane_id: str, choice: str, detail_text: str, *, timeout: int = 8) -> tuple[bool, str]:
@@ -3297,15 +3427,30 @@ def send_choice_detail_to_pane(pane_id: str, choice: str, detail_text: str, *, t
     return send_to_pane(pane_id, detail_text, timeout=timeout)
 
 
-def send_custom_detail_to_pane(pane_id: str, detail_text: str, *, timeout: int = 8) -> tuple[bool, str]:
+def send_visible_choice_detail_to_pane(
+    pane_id: str,
+    choice: str,
+    detail_text: str,
+    *,
+    timeout: int = 8,
+) -> tuple[bool, str]:
+    choice = str(choice or "").strip()
+    if not choice:
+        return False, "This custom option is no longer mapped to a visible choice."
     pane = pane_by_id(pane_id)
     if not pane:
         return False, "Herdr pane is not currently live."
-    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "escape"], timeout=timeout)
+    keys = visible_choice_selection_keys(choice)
+    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, *keys], timeout=timeout)
     if proc.returncode != 0:
         return False, sanitize_text(proc.stderr or proc.stdout, 800)
-    time.sleep(0.2)
-    return send_to_pane(pane_id, detail_text, timeout=timeout)
+    if not wait_for_visible_custom_detail_field(pane_id):
+        return (
+            False,
+            "I selected the custom option, but Herdr did not show a custom-answer field. "
+            "I did not send your text to avoid answering the wrong prompt.",
+        )
+    return send_to_pane(pane_id, detail_text, timeout=timeout, submit_staged=True)
 
 
 def telegram_token() -> str:
@@ -4907,9 +5052,20 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 return {"handled": True, "reply": "Reply directly to the detail prompt, or tap the button again."}
             choice = str(awaiting.get("choice") or "").strip()
             select_choice = str(awaiting.get("select_choice") or "").strip()
-            cancel_before_send = _boolish(awaiting.get("cancel_before_send"))
-            if cancel_before_send:
-                ok, detail = send_custom_detail_to_pane(pane_id, arg)
+            visible_choice = str(awaiting.get("visible_choice") or "").strip()
+            if visible_choice:
+                if not visible_prompt_matches_awaiting(entry, awaiting):
+                    entry.pop("awaiting_detail", None)
+                    save_state(state)
+                    return {
+                        "handled": True,
+                        "reply": "Those choices changed before I could send your answer. Use /choices to resend the current choices.",
+                    }
+                ok, detail = send_visible_choice_detail_to_pane(
+                    pane_id,
+                    visible_choice,
+                    arg,
+                )
             elif select_choice:
                 ok, detail = send_choice_detail_to_pane(pane_id, select_choice, arg)
             else:
@@ -5137,7 +5293,8 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if action == "d":
         choice_text = ""
         select_choice = ""
-        cancel_before_send = False
+        visible_choice = ""
+        visible_choice_index = 0
         option_label = "custom"
         if option:
             option_label = str(option.get("label") or option.get("id") or choice_number)
@@ -5145,20 +5302,32 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 if "send_text" in option:
                     choice_text = str(option.get("send_text") or "")
                 else:
-                    cancel_before_send = True
+                    visible_choice = str(option.get("number") or choice_number).strip()
+                    for idx, candidate in enumerate(options, start=1):
+                        if candidate is option:
+                            visible_choice_index = idx
+                            break
         entry["awaiting_detail"] = {
             "user_id": user_id,
             "prompt_id": prompt_id,
             "choice": sanitize_text(choice_text, 500).strip(),
             "select_choice": sanitize_text(select_choice, 40).strip(),
-            "cancel_before_send": bool(cancel_before_send),
+            "visible_choice": sanitize_text(visible_choice, 40).strip(),
+            "visible_choice_index": visible_choice_index,
+            "visible_options": [
+                {
+                    "number": sanitize_text(str(opt.get("number") or ""), 40),
+                    "label": sanitize_text(str(opt.get("label") or ""), 160),
+                }
+                for opt in options
+            ],
             "option": sanitize_text(option_label, 160),
             "created_at": utc_now(),
         }
-        notice_title = "Custom reply" if not choice_text and not select_choice and not cancel_before_send else f"Details for {choice_number}"
+        notice_title = "Custom reply" if not choice_text and not select_choice and not visible_choice else f"Details for {choice_number}"
         notice_body = (
             "Write the instruction to send to this pane."
-            if not choice_text and not select_choice and not cancel_before_send
+            if not choice_text and not select_choice and not visible_choice
             else "Write the details to send with this choice."
         )
         notice = send_notice(
@@ -5182,7 +5351,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
             "handled": True,
             "answer": (
                 "Write the instruction in this topic."
-                if not choice_text and not select_choice and not cancel_before_send
+                if not choice_text and not select_choice and not visible_choice
                 else "Write the details in this topic."
             ),
         }
@@ -5193,13 +5362,28 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if choice_needs_detail(option):
         choice_text = str(option.get("send_text") or "").strip() if "send_text" in option else ""
         select_choice = ""
-        cancel_before_send = "send_text" not in option
+        visible_choice = ""
+        visible_choice_index = 0
+        if "send_text" not in option:
+            visible_choice = str(option.get("number") or choice_number).strip()
+            for idx, candidate in enumerate(options, start=1):
+                if candidate is option:
+                    visible_choice_index = idx
+                    break
         entry["awaiting_detail"] = {
             "user_id": user_id,
             "prompt_id": prompt_id,
             "choice": sanitize_text(choice_text, 500),
             "select_choice": sanitize_text(select_choice, 40),
-            "cancel_before_send": bool(cancel_before_send),
+            "visible_choice": sanitize_text(visible_choice, 40),
+            "visible_choice_index": visible_choice_index,
+            "visible_options": [
+                {
+                    "number": sanitize_text(str(opt.get("number") or ""), 40),
+                    "label": sanitize_text(str(opt.get("label") or ""), 160),
+                }
+                for opt in options
+            ],
             "option": str(option.get("label") or ""),
             "created_at": utc_now(),
         }

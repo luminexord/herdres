@@ -999,6 +999,7 @@ Verification
             pane_by_id=Mock(return_value=pane),
             run_cmd=run_cmd,
             state_path=Mock(return_value=Path(tmpdir) / "state.json"),
+            pane_input_looks_staged=Mock(return_value=False),
             PANE_INPUT_FILE_CHARS=1200,
             PANE_INPUT_FILE_LINES=6,
         ):
@@ -1031,6 +1032,7 @@ Verification
             herdres,
             pane_by_id=Mock(return_value=pane),
             run_cmd=run_cmd,
+            pane_input_looks_staged=Mock(return_value=False),
             PANE_INPUT_FILE_CHARS=1200,
             PANE_INPUT_FILE_LINES=6,
         ):
@@ -1038,6 +1040,169 @@ Verification
 
         self.assertTrue(ok, detail)
         self.assertEqual(commands[0][4], "short instruction")
+
+    def test_send_to_pane_submits_staged_pasted_input(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude"}
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value=pane),
+            run_cmd=run_cmd,
+            pane_input_looks_staged=Mock(return_value=True),
+        ):
+            ok, detail = herdres.send_to_pane("pane-1", "long pasted instruction", submit_staged=True)
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(commands[0][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
+        self.assertEqual(commands[1], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "enter"])
+
+    def test_visible_choice_selection_uses_numbers_by_default(self) -> None:
+        with patch.object(herdres, "VISIBLE_CHOICE_SELECT_MODE", "number"), patch.object(
+            herdres,
+            "VISIBLE_CHOICE_NUMBER_ENTER",
+            True,
+        ):
+            keys = herdres.visible_choice_selection_keys("4")
+
+        self.assertEqual(keys, ["4", "enter"])
+
+    def test_visible_choice_selection_can_omit_enter_when_digits_auto_activate(self) -> None:
+        with patch.object(herdres, "VISIBLE_CHOICE_SELECT_MODE", "number"), patch.object(
+            herdres,
+            "VISIBLE_CHOICE_NUMBER_ENTER",
+            False,
+        ):
+            keys = herdres.visible_choice_selection_keys("4")
+
+        self.assertEqual(keys, ["4"])
+
+    def test_visible_choice_selection_arrow_navigation_uses_displayed_number(self) -> None:
+        with patch.object(herdres, "VISIBLE_CHOICE_SELECT_MODE", "arrows"):
+            keys = herdres.visible_choice_selection_keys("4")
+
+        self.assertEqual(keys, ["up"] * 24 + ["down"] * 3 + ["enter"])
+
+    def test_visible_custom_detail_ready_allows_old_choices_above_prompt(self) -> None:
+        raw = """Question
+How should I proceed?
+
+1) Build P1+P2
+2) Instrument first
+3) Discriminator
+4) Type something
+
+Write your custom answer now:
+❯
+"""
+
+        self.assertTrue(herdres.visible_custom_detail_ready_text(raw))
+        self.assertFalse(
+            herdres.visible_custom_detail_ready_text(
+                "Question\nHow should I proceed?\n\n1) Build P1+P2\n4) Type something\n"
+            )
+        )
+        self.assertFalse(
+            herdres.visible_custom_detail_ready_text(
+                "Question\nHow should I proceed?\n\n1) Build P1+P2\n4) Type something\n\nEnter to select · Esc to cancel"
+            )
+        )
+
+    def test_visible_choice_detail_fails_closed_without_custom_field(self) -> None:
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        send_to_pane = Mock(return_value=(True, ""))
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value={"pane_id": "pane-1"}),
+            run_cmd=run_cmd,
+            wait_for_visible_custom_detail_field=Mock(return_value=False),
+            send_to_pane=send_to_pane,
+        ):
+            ok, detail = herdres.send_visible_choice_detail_to_pane(
+                "pane-1",
+                "4",
+                "custom text",
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("did not show a custom-answer field", detail)
+        send_to_pane.assert_not_called()
+        self.assertEqual(commands[0], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "4", "enter"])
+
+    def test_visible_choice_detail_sends_after_custom_field_verification(self) -> None:
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        send_to_pane = Mock(return_value=(True, ""))
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value={"pane_id": "pane-1"}),
+            run_cmd=run_cmd,
+            wait_for_visible_custom_detail_field=Mock(return_value=True),
+            send_to_pane=send_to_pane,
+        ):
+            ok, detail = herdres.send_visible_choice_detail_to_pane(
+                "pane-1",
+                "4",
+                "custom text",
+            )
+
+        self.assertTrue(ok, detail)
+        send_to_pane.assert_called_once_with("pane-1", "custom text", timeout=8, submit_staged=True)
+
+    def test_visible_prompt_matches_awaiting_requires_current_prompt_identity(self) -> None:
+        entry = {"pane_id": "pane-1"}
+        awaiting = {
+            "prompt_id": "prompt1",
+            "visible_choice": "4",
+            "visible_options": [{"number": "4", "label": "Type something."}],
+        }
+        current = {
+            "prompt_id": "prompt1",
+            "options": [{"number": "4", "label": "Type something."}],
+        }
+
+        with patch.object(herdres, "current_visible_choice_item_for_entry", Mock(return_value=current)):
+            self.assertTrue(herdres.visible_prompt_matches_awaiting(entry, awaiting))
+
+        with patch.object(herdres, "current_visible_choice_item_for_entry", Mock(return_value=None)):
+            self.assertFalse(herdres.visible_prompt_matches_awaiting(entry, awaiting))
+
+        changed_prompt = dict(current, prompt_id="prompt2")
+        with patch.object(herdres, "current_visible_choice_item_for_entry", Mock(return_value=changed_prompt)):
+            self.assertFalse(herdres.visible_prompt_matches_awaiting(entry, awaiting))
+
+        missing_choice = dict(current, options=[{"number": "5", "label": "Chat about this"}])
+        with patch.object(herdres, "current_visible_choice_item_for_entry", Mock(return_value=missing_choice)):
+            self.assertFalse(herdres.visible_prompt_matches_awaiting(entry, awaiting))
+
+        changed_label = dict(current, options=[{"number": "4", "label": "Different option"}])
+        with patch.object(herdres, "current_visible_choice_item_for_entry", Mock(return_value=changed_label)):
+            self.assertFalse(herdres.visible_prompt_matches_awaiting(entry, awaiting))
 
     def test_cleanup_duplicates_delete_archives_closed_entry(self) -> None:
         state = {
@@ -1866,6 +2031,7 @@ What changed:
             pane_by_id=Mock(return_value={"pane_id": "pane-1", "agent": "codex", "agent_status": "idle"}),
             herdr_bin=Mock(return_value="herdr"),
             run_cmd=fake_run_cmd,
+            pane_input_looks_staged=Mock(return_value=False),
         ):
             ok, detail = herdres.send_to_pane("pane-1", "Explain this codebase")
 
@@ -1885,6 +2051,7 @@ What changed:
             pane_by_id=Mock(return_value={"pane_id": "pane-1", "agent": "codex", "agent_status": "working"}),
             herdr_bin=Mock(return_value="herdr"),
             run_cmd=fake_run_cmd,
+            pane_input_looks_staged=Mock(return_value=False),
         ):
             ok, detail = herdres.send_to_pane("pane-1", "rn")
 
@@ -2236,7 +2403,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["force_reply_message_id"], "777")
         send_to_pane.assert_not_called()
 
-    def test_callback_visible_custom_choice_cancels_before_sending_detail(self) -> None:
+    def test_callback_visible_custom_choice_waits_for_in_question_detail(self) -> None:
         state = callback_state()
         state["panes"]["pane-1"]["active_prompt"] = {
             "id": "prompt1",
@@ -2253,8 +2420,8 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         self.assertEqual(result["answer"], "Write the details in this topic.")
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["choice"], "")
-        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["select_choice"], "")
-        self.assertTrue(state["panes"]["pane-1"]["awaiting_detail"]["cancel_before_send"])
+        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["visible_choice"], "4")
+        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["visible_choice_index"], 1)
         send_to_pane.assert_not_called()
 
     def test_stale_visible_choice_callback_refreshes_current_prompt(self) -> None:
@@ -2291,21 +2458,26 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         send_feed_item.assert_called_once()
         self.assertEqual(state["panes"]["pane-1"]["active_prompt"]["id"], "newprompt")
 
-    def test_force_reply_visible_choice_detail_cancels_then_sends_text(self) -> None:
+    def test_force_reply_visible_choice_detail_selects_option_then_sends_text(self) -> None:
         state = callback_state()
         state["panes"]["pane-1"]["awaiting_detail"] = {
             "user_id": "42",
             "prompt_id": "prompt1",
             "choice": "",
-            "select_choice": "",
-            "cancel_before_send": True,
+            "visible_choice": "4",
+            "visible_choice_index": 2,
+            "visible_options": [{"number": "4", "label": "Type something."}],
             "option": "Type something.",
             "force_reply_message_id": "999",
             "created_at": herdres.utc_now(),
         }
-        send_custom_detail_to_pane = Mock(return_value=(True, ""))
+        send_visible_choice_detail_to_pane = Mock(return_value=(True, ""))
 
-        with callback_patches(state), patch.object(herdres, "send_custom_detail_to_pane", send_custom_detail_to_pane):
+        with callback_patches(state), patch.multiple(
+            herdres,
+            send_visible_choice_detail_to_pane=send_visible_choice_detail_to_pane,
+            visible_prompt_matches_awaiting=Mock(return_value=True),
+        ):
             result = herdres.command_reply(
                 {
                     "chat_id": "-1001",
@@ -2317,7 +2489,44 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             )
 
         self.assertEqual(result["reply"], "Sent details.")
-        send_custom_detail_to_pane.assert_called_once_with("pane-1", "ask gitmoot and report back")
+        send_visible_choice_detail_to_pane.assert_called_once_with(
+            "pane-1",
+            "4",
+            "ask gitmoot and report back",
+        )
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+
+    def test_force_reply_visible_choice_detail_fails_closed_when_prompt_changed(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42",
+            "prompt_id": "prompt1",
+            "choice": "",
+            "visible_choice": "4",
+            "visible_options": [{"number": "4", "label": "Type something."}],
+            "option": "Type something.",
+            "force_reply_message_id": "999",
+            "created_at": herdres.utc_now(),
+        }
+        send_visible_choice_detail_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state), patch.multiple(
+            herdres,
+            send_visible_choice_detail_to_pane=send_visible_choice_detail_to_pane,
+            visible_prompt_matches_awaiting=Mock(return_value=False),
+        ):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "user_id": "42",
+                    "text": "ask gitmoot and report back",
+                    "reply_to_message_id": "999",
+                }
+            )
+
+        self.assertIn("choices changed", result["reply"])
+        send_visible_choice_detail_to_pane.assert_not_called()
         self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
 
     def test_callback_rejects_non_owner_stale_prompt_and_unknown_choice(self) -> None:
