@@ -200,6 +200,22 @@ STRUCTURED_SECTION_RE = re.compile(r"^\s*([A-Za-z][A-Za-z ]{0,40})\s*:\s*(.*?)\s
 INLINE_CODE_RE = re.compile(r"`([^`\n]{1,300})`")
 COMMIT_LINE_RE = re.compile(r"^`?([0-9a-f]{7,12})\s+(.+?)`?$", re.IGNORECASE)
 FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
+# Claude Code working-spinner status line, e.g. "✻ Baked for 4m 47s",
+# "✻ Brewed for 28s", or "✻ Brewing… (4s · esc to interrupt)". It rotates
+# through many verbs and the duration can be multi-unit, so match the SHAPE.
+# Anchored on the spinner GLYPH (matched against the raw, ANSI-stripped line)
+# so legitimate prose/bullets like "Waited for 3s" or "- Compiled for 2m" are
+# NOT swallowed. The working-status gate is the primary defense; this only
+# keeps a stray spinner out of a genuine prompt scrape.
+SPINNER_GLYPHS = "✶✷✸✹✺✻✼✽✾"  # Claude Code spinner star family (NOT decorative bullets)
+SPINNER_STATUS_RE = re.compile(
+    rf"^[{SPINNER_GLYPHS}]\s+\S.*?\besc to interrupt\b[)\s]*$"
+    rf"|^[{SPINNER_GLYPHS}]\s+\S+\s+for\s+\d+\s*[smhd](?:\s+\d+\s*[smhd])*\s*$",
+    re.IGNORECASE,
+)
+# Agent statuses that mean the pane is actively producing output (never a
+# genuine awaiting-input prompt) — used to suppress visible-screen scraping.
+ACTIVE_AGENT_STATUSES = {"working", "running", "active", "in_progress", "pending"}
 TOKEN_CODE_RE = re.compile(
     r"(?<![\w/])("
     r"(?:~|/)[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)+(?::\d+)?|"
@@ -843,7 +859,7 @@ def is_noise_line(line: str) -> bool:
         return True
     if low == "summary)":
         return True
-    if re.fullmatch(r"(worked|crunched|simmered|sauteed|sautéed|thinking|processed) for \d+\s*[smh]", low):
+    if SPINNER_STATUS_RE.match(ANSI_RE.sub("", line or "").strip()):
         return True
     if any(fragment in low for fragment in (
         "ctrl+o",
@@ -1622,7 +1638,9 @@ def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[s
     return make_turn_feed_item(turn)
 
 
-def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
+def extract_turn_feed_item(
+    pane: dict[str, Any], entry: dict[str, Any], *, allow_visible_fallback: bool = True
+) -> dict[str, Any] | None:
     turn = pane_turn(str(pane.get("pane_id") or ""))
     available = bool(turn.get("available", True))
     reason = sanitize_text(str(turn.get("reason") or ""), 300)
@@ -1633,18 +1651,25 @@ def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[
         else:
             entry.pop("last_turn_reason", None)
     item = select_turn_feed_item(turn, entry)
-    if not item:
+    status = str(pane.get("agent_status") or "").strip().lower()
+    # Prefer the actual completed turn over any visible-screen scrape. This
+    # covers the auto-continue case AND the done->working status-lag race: even
+    # if the status momentarily reads non-working while the terminal has already
+    # started the next spinner, we deliver the real completed message (deduped
+    # downstream) rather than scraping in-progress screen output. Only a
+    # genuinely blocked pane (a real on-screen prompt awaiting the user) bypasses
+    # this to the visible path.
+    if not item and status != "blocked" and turn.get("complete") is True and turn.get("has_open_turn") is True:
+        item = make_turn_feed_item({**turn, "has_open_turn": False})
+    # Visible-screen prompt fallback: never scrape an actively-working pane — its
+    # screen is its own in-progress output (spinner, tool noise, the echo of an
+    # already-delivered reply), which produced the "Input needed" spam and
+    # whole-screen blobs. Genuine prompts surface in blocked/idle states.
+    if not item and allow_visible_fallback and status not in ACTIVE_AGENT_STATUSES:
         if VISIBLE_CHOICE_BUTTONS_ENABLED:
             item = extract_visible_choice_feed_item(pane)
         elif VISIBLE_READONLY_PROMPTS_ENABLED:
             item = extract_visible_readonly_feed_item(pane)
-    if not item and turn.get("complete") is True and turn.get("has_open_turn") is True:
-        # The agent finished a reply and immediately auto-continued (a new turn
-        # opened) without asking the user anything, so neither the structured
-        # nor the visible-question path produced an item. Deliver that completed
-        # final message anyway instead of dropping it; downstream dedup keeps it
-        # to a single post even while the follow-up turn is still in progress.
-        item = make_turn_feed_item({**turn, "has_open_turn": False})
     if item:
         entry["last_turn_id"] = item.get("turn_id") or ""
     return item
@@ -5301,6 +5326,13 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
         if created or not entry.get("topic_name"):
             entry["topic_name"] = label_topic_name
             entry["topic_title_source"] = "pane-label"
+            if old_topic_name and old_topic_name != label_topic_name and old_topic_name.startswith("[OLD]"):
+                # Reusing a closed pane's topic — rename it back from "[OLD] …"
+                # now instead of leaving the stale title until a TTL verify.
+                entry["topic_rename_pending_at"] = utc_now()
+                entry["topic_rename_from"] = old_topic_name
+                entry["topic_rename_to"] = label_topic_name
+                entry.pop("last_topic_verified_at", None)
         elif label_topic_name and old_topic_name != label_topic_name:
             # Only rename when a label we have already seen actually changed;
             # on first sight, baseline the existing (possibly owner-corrected)
@@ -5449,7 +5481,11 @@ def sync_pane_once(
                 entry.get("last_turn_reason"),
                 entry.get("last_turn_id"),
             )
-            item = extract_turn_feed_item(pane, entry)
+            # The plugin/event path (turn_only) must never scrape the visible
+            # screen: a status-change event can fire before the turn is flushed,
+            # and scraping a transiently-done/idle pane sends a malformed blob and
+            # breaks the settle loop. Visible prompts surface on the timer path.
+            item = extract_turn_feed_item(pane, entry, allow_visible_fallback=not turn_only)
             after_turn_state = (
                 entry.get("last_turn_available"),
                 entry.get("last_turn_reason"),
@@ -5457,7 +5493,7 @@ def sync_pane_once(
             )
             if before_turn_state != after_turn_state:
                 changed = True
-        elif not turn_only:
+        elif not turn_only and str(pane.get("agent_status") or "").strip().lower() not in ACTIVE_AGENT_STATUSES:
             raw = pane_feed_output(str(pane.get("pane_id") or ""))
             bounded_report = extract_bounded_report_from_raw(raw)
             if bounded_report:
@@ -5657,16 +5693,28 @@ def sync_once() -> dict[str, Any]:
         entry["last_known_status"] = "closed"
         entry["closed_at"] = utc_now()
         changed = True
-        if entry.get("topic_id") and sends < MAX_SENDS_PER_RUN:
-            send_notice(
-                chat_id,
-                "Closed",
-                "This Herdr pane is no longer live.",
-                telegram=telegram,
-                thread_id=entry["topic_id"],
-                notify=True,
-            )
-            sends += 1
+        topic_id = entry.get("topic_id")
+        if topic_id:
+            # Mark the topic name so a closed pane is obvious at a glance and its
+            # topic isn't mistaken for a live one.
+            current_name = str(entry.get("topic_name") or "").strip()
+            if current_name and not current_name.startswith("[OLD]"):
+                old_name = sanitize_text(f"[OLD] {current_name}", 120).strip()
+                try:
+                    if edit_topic(chat_id, topic_id, old_name):
+                        entry["topic_name"] = old_name
+                except BridgeError:
+                    pass
+            if sends < MAX_SENDS_PER_RUN:
+                send_notice(
+                    chat_id,
+                    "Closed",
+                    "This Herdr pane is no longer live.",
+                    telegram=telegram,
+                    thread_id=topic_id,
+                    notify=True,
+                )
+                sends += 1
 
     if not panes:
         state["last_sync_empty_at"] = utc_now()

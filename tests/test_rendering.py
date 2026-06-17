@@ -5656,5 +5656,102 @@ class AttachmentTests(unittest.TestCase):
         deliver.assert_not_called()
 
 
+class SpinnerAndWorkingPaneTests(unittest.TestCase):
+    def test_is_noise_line_strips_claude_spinner_variants(self) -> None:
+        for line in [
+            "✻ Baked for 4m 47s",
+            "✻ Brewed for 28s",
+            "✻ Herding for 1m 3s",
+            "✻ Pondering for 12s",
+            "✻ Simmering for 2h 5m 1s",
+            "✻ Brewing… (4s · esc to interrupt)",
+        ]:
+            self.assertTrue(herdres.is_noise_line(line), f"should be noise: {line!r}")
+        # Glyph-anchored: legitimate prose/bullets are NOT swallowed.
+        for line in [
+            "We worked for 3 hours on the fix.",
+            "Want me to do that?",
+            "I baked a cake for the team.",
+            "Waited for 3s",
+            "- Compiled for 2m",
+            "✦ Waited for 3 days before deploying.",  # decorative glyph + trailing prose
+            "✻ Brewing… (4s · esc to interrupt) Should I continue?",  # spinner + REAL trailing question
+        ]:
+            self.assertFalse(herdres.is_noise_line(line), f"should NOT be noise: {line!r}")
+
+    def test_event_path_never_scrapes_visible(self) -> None:
+        # turn_only/event path passes allow_visible_fallback=False: even when the
+        # turn is unavailable and status is a transient done/idle, never scrape.
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "done"}
+        turn = {"available": False, "reason": "no_completed_turn"}
+        vro = Mock(return_value={"kind": "choices", "turn_id": "x", "text": "scraped"})
+        with patch.object(herdres, "pane_turn", Mock(return_value=turn)), \
+             patch.object(herdres, "extract_visible_readonly_feed_item", vro):
+            item = herdres.extract_turn_feed_item(pane, {}, allow_visible_fallback=False)
+        vro.assert_not_called()
+        self.assertIsNone(item)
+
+    def test_reused_closed_topic_schedules_un_old_rename(self) -> None:
+        state = {"panes": {"oldkey": {
+            "pane_key": "oldkey", "topic_id": "77", "topic_name": "[OLD] Topics Pane",
+            "pane_label_raw": "Topics Pane", "pane_label_topic_name": "Topics Pane",
+            "agent_session_id": "sess-1",
+            "last_known_status": "closed", "closed_at": "2026-01-01T00:00:00+00:00",
+        }}}
+        pane = {"pane_id": "w1:p9", "terminal_id": "t", "workspace_id": "w1", "tab_id": "t1",
+                "label": "Topics Pane", "agent": "codex", "agent_session": {"value": "sess-1"}}
+        _key, entry, created = herdres.ensure_pane_entry(state, pane)
+        self.assertTrue(created)
+        self.assertEqual(entry["topic_name"], "Topics Pane")  # un-[OLD]'d in state
+        self.assertEqual(entry.get("topic_rename_from"), "[OLD] Topics Pane")
+        self.assertEqual(entry.get("topic_rename_to"), "Topics Pane")  # rename scheduled
+
+    def test_status_lag_race_prefers_completed_turn_over_scrape(self) -> None:
+        # done->working lag: status reads non-working but a new turn is open and
+        # the terminal may already show a spinner. We must deliver the completed
+        # turn, NOT scrape the screen.
+        for status in ("done", "idle", "running"):
+            pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": status}
+            turn = {"available": True, "complete": True, "has_open_turn": True, "turn_id": "t1",
+                    "assistant_final_text": "Real completed reply."}
+            vro = Mock(return_value={"kind": "choices", "turn_id": "visible-readonly:x", "text": "scraped"})
+            with patch.object(herdres, "pane_turn", Mock(return_value=turn)), \
+                 patch.object(herdres, "extract_visible_readonly_feed_item", vro):
+                item = herdres.extract_turn_feed_item(pane, {})
+            vro.assert_not_called()
+            assert item is not None
+            self.assertEqual(item["turn_id"], "t1", f"status={status}")
+
+    def test_clean_feed_lines_drops_spinner_so_question_is_stable(self) -> None:
+        joined = " ".join(herdres.clean_feed_lines("Should I deploy the fix now?\n✻ Baked for 4m 47s\n"))
+        self.assertNotIn("Baked for", joined)  # volatile spinner removed -> stable dedup
+        self.assertIn("deploy the fix now", joined)
+
+    def test_working_pane_does_not_surface_visible_readonly(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "working"}
+        turn = {"available": True, "complete": True, "has_open_turn": True, "turn_id": "t1",
+                "user_text": "do x", "assistant_final_text": "Done. Want me to continue?"}
+        vro = Mock(return_value={"kind": "choices", "turn_id": "visible-readonly:x", "text": "scraped"})
+        with patch.object(herdres, "pane_turn", Mock(return_value=turn)), \
+             patch.object(herdres, "extract_visible_readonly_feed_item", vro):
+            item = herdres.extract_turn_feed_item(pane, {})
+        vro.assert_not_called()  # working pane: never scrape the screen
+        assert item is not None
+        self.assertEqual(item["turn_id"], "t1")  # the completed turn is delivered instead
+
+    def test_blocked_pane_still_surfaces_visible_readonly(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "blocked"}
+        turn = {"available": True, "complete": True, "has_open_turn": True, "turn_id": "t1",
+                "assistant_final_text": "ctx"}
+        ro_item = {"kind": "choices", "turn_id": "visible-readonly:x", "text": "Pick one"}
+        vro = Mock(return_value=ro_item)
+        with patch.object(herdres, "pane_turn", Mock(return_value=turn)), \
+             patch.object(herdres, "extract_visible_readonly_feed_item", vro):
+            item = herdres.extract_turn_feed_item(pane, {})
+        vro.assert_called_once()  # genuine awaiting-input prompt still surfaces
+        assert item is not None
+        self.assertEqual(item["turn_id"], "visible-readonly:x")
+
+
 if __name__ == "__main__":
     unittest.main()
