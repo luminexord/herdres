@@ -1071,6 +1071,34 @@ Verification
         self.assertEqual(commands[0][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
         self.assertEqual(commands[1], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "enter"])
 
+    def test_send_to_pane_submits_staged_input_by_default(self) -> None:
+        # Regression: an inbound Telegram message reached the pane input box but
+        # was never submitted because the /send path used the old default
+        # submit_staged=False. send_to_pane must press Enter on staged input even
+        # without an explicit submit_staged kwarg.
+        pane = {"pane_id": "pane-1", "agent": "claude"}
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value=pane),
+            run_cmd=run_cmd,
+            pane_input_looks_staged=Mock(return_value=True),
+        ):
+            ok, detail = herdres.send_to_pane("pane-1", "Everything pushed on origin right?")
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(commands[0][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
+        self.assertEqual(commands[-1], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "enter"])
+
     def test_visible_choice_selection_uses_numbers_by_default(self) -> None:
         with patch.object(herdres, "VISIBLE_CHOICE_SELECT_MODE", "number"), patch.object(
             herdres,

@@ -4065,7 +4065,7 @@ def send_to_pane(
     text: str,
     *,
     timeout: int = 8,
-    submit_staged: bool = False,
+    submit_staged: bool = True,
 ) -> tuple[bool, str]:
     pane = pane_by_id(pane_id)
     if not pane:
@@ -4102,11 +4102,19 @@ def pane_input_looks_staged(pane_id: str) -> bool:
 
 
 def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:
-    # Herdr normally submits pane run input itself. Some TUI states leave pasted
-    # or multiline text staged in the input box; only press Enter when we can
-    # see that staged input, to avoid double-submitting a completed command.
-    time.sleep(0.1)
-    if not pane_input_looks_staged(pane_id):
+    # `herdr pane run` is *supposed* to submit the input itself, but in some TUI
+    # states it leaves the text staged in the input box (we observed an inbound
+    # Telegram message sitting in the box, never sent). Press Enter when we can
+    # see staged input. The check is conditional, so a command that herdr already
+    # submitted leaves an empty box (which never matches) and is not double-sent.
+    # Poll briefly to tolerate terminal render lag before giving up.
+    staged = False
+    for delay in (0.15, 0.35, 0.6):
+        time.sleep(delay)
+        if pane_input_looks_staged(pane_id):
+            staged = True
+            break
+    if not staged:
         return True, ""
     proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "enter"], timeout=timeout)
     if proc.returncode != 0:
