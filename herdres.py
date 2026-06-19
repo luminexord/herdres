@@ -234,7 +234,9 @@ TOKEN_CODE_RE = re.compile(
     r"(?:~|/)[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)+(?::\d+)?|"
     r"\b[A-Z][A-Z0-9_]*[_0-9][A-Z0-9_]*\b|"
     r"\b[A-Za-z_][A-Za-z0-9_]*\.(?:py|json|toml|service|timer|sh|md|txt|yaml|yml)\b(?::\d+)?|"
-    r"\b[A-Za-z_][A-Za-z0-9_]*=\S+\b|"
+    # env-style assignment ONLY (uppercase key, >=2 chars): DEBUG=true, FOO_BAR=1.
+    # NOT statistical notation like N=16, f=2, w=15, p=0.05 (common in prose).
+    r"\b[A-Z][A-Z0-9_]+=\S+|"
     r"\b(?:sendRichMessage|editForumTopic|editMessageText|createForumTopic)\b|"
     r"\b[0-9a-f]{7,12}\b"
     r")(?![\w/])"

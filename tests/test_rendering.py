@@ -5290,6 +5290,20 @@ def callback_patches(
     )
 
 
+class CodeDetectionTests(unittest.TestCase):
+    def test_statistical_notation_is_not_code(self) -> None:
+        html = herdres.render_final_reply_html(
+            "Results: N=16, OFF f=2 w=15 -> ON f=2 w=21, p=0.05."
+        )
+        for token in ("N=16", "f=2", "w=15", "w=21", "p=0.05"):
+            self.assertNotIn(f"<code>{token}</code>", html)
+            self.assertIn(token, html)  # still present, just plain text
+
+    def test_env_style_assignment_still_code(self) -> None:
+        html = herdres.render_final_reply_html("Set DEBUG=true to enable.")
+        self.assertIn("<code>DEBUG=true</code>", html)
+
+
 class RichMessageSplitTests(unittest.TestCase):
     def _balanced(self, s: str) -> bool:
         import re as _re
