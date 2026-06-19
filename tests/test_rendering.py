@@ -4178,18 +4178,31 @@ Verification
         self.assertEqual(commands[-1], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "enter"])
 
     def test_submit_staged_input_reports_failure_when_box_never_clears(self) -> None:
-        # The submit keystroke "succeeds" (returncode 0) but the TUI never accepts
-        # it (e.g. a raw \\r it ignores) and the text stays staged. We must report
-        # failure, not a false "sent" that silently drops the user's message.
+        # IDLE agent: the submit keystroke "succeeds" (returncode 0) but the TUI
+        # never accepts it (e.g. a raw \\r it ignores) and the text stays staged.
+        # We must report failure, not a false "sent" that silently drops it.
         with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
             herdres,
             run_cmd=Mock(return_value=Mock(returncode=0, stdout="", stderr="")),
             pane_input_looks_staged=Mock(return_value=True),  # box never clears
         ):
-            ok, detail = herdres.submit_staged_pane_input_if_needed("pane-1", timeout=1)
+            ok, detail = herdres.submit_staged_pane_input_if_needed("pane-1", timeout=1, agent_status="idle")
 
         self.assertFalse(ok)
         self.assertIn("staged", detail)
+
+    def test_submit_staged_input_queues_when_agent_working(self) -> None:
+        # WORKING agent: the box stays staged because a busy agent queues typed
+        # input until its turn ends — that is "queued", not a failure.
+        with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
+            herdres,
+            run_cmd=Mock(return_value=Mock(returncode=0, stdout="", stderr="")),
+            pane_input_looks_staged=Mock(return_value=True),  # box never clears (queued)
+        ):
+            ok, detail = herdres.submit_staged_pane_input_if_needed("pane-1", timeout=1, agent_status="working")
+
+        self.assertTrue(ok)
+        self.assertIn("Queued", detail)
 
     def test_visible_choice_selection_uses_numbers_by_default(self) -> None:
         with patch.object(herdres, "VISIBLE_CHOICE_SELECT_MODE", "number"), patch.object(

@@ -5838,9 +5838,12 @@ def send_to_pane(
             return False, clear_detail
         return send_text_and_enter_to_pane(pane_id, outbound, timeout=timeout)
     if submit_staged:
-        submit_ok, submit_detail = submit_staged_pane_input_if_needed(pane_id, timeout=timeout)
+        submit_ok, submit_detail = submit_staged_pane_input_if_needed(
+            pane_id, timeout=timeout, agent_status=str(pane.get("agent_status") or "")
+        )
         if not submit_ok:
             return False, submit_detail
+        return True, submit_detail
     return True, ""
 
 
@@ -5905,7 +5908,7 @@ def clear_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tupl
     return clear_staged_pane_input(pane_id, timeout=timeout)
 
 
-def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:
+def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8, agent_status: str = "") -> tuple[bool, str]:
     # `herdr pane run` is *supposed* to submit the input itself, but in some TUI
     # states it leaves the text staged in the input box (we observed an inbound
     # Telegram message sitting in the box, never sent). Press Enter when we can
@@ -5934,6 +5937,12 @@ def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tup
         time.sleep(delay)
         if not pane_input_looks_staged(pane_id):
             return True, ""
+    # Still staged. A working agent queues typed input and won't accept Enter as a
+    # submit until its turn finishes, so the text legitimately sits in the box
+    # (queued, not lost) — report that rather than a hard failure. Only when the
+    # agent is idle does a still-staged box mean the keystroke was truly ignored.
+    if str(agent_status or "").strip().lower() == "working":
+        return True, "Queued — the agent is busy; your message will run when the current turn finishes."
     return False, "submitted Enter but the pane input still shows staged text"
 
 
@@ -9858,7 +9867,9 @@ def forward_text_to_pane_response(pane_id: str, text: str, *, usage: str = "") -
     ok, detail = send_to_pane(pane_id, outbound)
     if not ok:
         return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
-    return {"handled": True, "reply": ""}
+    # On a normal submit `detail` is empty (silent success); when the agent was
+    # busy it carries the "Queued …" note, which we surface so the sender knows.
+    return {"handled": True, "reply": sanitize_text(detail, 300)}
 
 
 def is_single_live_space_pane(state: dict[str, Any], chat_id: str, topic_id: str) -> bool:
