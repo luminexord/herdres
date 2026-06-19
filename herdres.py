@@ -6159,8 +6159,12 @@ def parse_command(text: str) -> tuple[str, str]:
         return "", ""
     if not stripped.startswith("/"):
         return "plain", stripped
-    first, _, rest = stripped.partition(" ")
-    command = first[1:].split("@", 1)[0].strip().lower().replace("_", "-")
+    # Split on the first run of ANY whitespace (not just a space) so a command
+    # whose argument starts on the next line — e.g. "/send\n<multi-line>" or
+    # "/goal\n<goal>" — is still recognized as that command.
+    parts = stripped.split(None, 1)
+    command = parts[0][1:].split("@", 1)[0].strip().lower().replace("_", "-")
+    rest = parts[1] if len(parts) > 1 else ""
     return command, rest.strip()
 
 
@@ -6462,11 +6466,33 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         if proc.returncode != 0:
             return {"handled": True, "reply": f"Keys failed: {sanitize_text(proc.stderr or proc.stdout, 800)}"}
         return {"handled": True, "reply": f"Sent keys: {' '.join(keys)}"}
-    # Not one of herdres' own meta-commands: forward it verbatim to the pane so
-    # agent slash-commands (e.g. /goal, /clear, /compact, /model) reach the CLI
-    # agent's input instead of being rejected as "unknown". Only the leading
+    # Not one of herdres' own meta-commands: forward it to the pane so agent
+    # slash-commands (e.g. /goal, /clear, /compact, /model) reach the CLI agent
+    # as commands instead of being rejected as "unknown". Only the leading
     # @botname (added by Telegram in groups) is stripped.
     forward_text = re.sub(r"^(/\S+?)@\S+", r"\1", text.strip())
+    if pane_input_needs_file(forward_text):
+        # Long/multiline command: the command token MUST stay on a short single
+        # line so the agent registers it as a slash-command — a long/multiline
+        # paste becomes an opaque "[Pasted text]" block and the command is lost.
+        # So keep "/cmd …" short and stage the bulk argument to a file the agent
+        # reads (rather than replacing the whole command with a file instruction,
+        # which dropped the command and truncated a preview).
+        parts = forward_text.split(None, 1)
+        cmd_token = parts[0]
+        arg = parts[1] if len(parts) > 1 else ""  # keep the argument intact (no extra trimming)
+        try:
+            staged_path = write_inbound_pane_message(pane_id, arg or forward_text)
+        except OSError as exc:
+            return {"handled": True, "reply": f"Could not stage that command: {sanitize_text(str(exc), 300)}"}
+        forward_text = (
+            f"{cmd_token} The full input for this command is saved at {staged_path} — read that "
+            f"file and use its complete contents as the {cmd_token.lstrip('/')} input, then proceed."
+        )
+        if pane_input_needs_file(forward_text):
+            # Pathological (e.g. an enormous state path): refuse rather than let
+            # send_to_pane silently file-convert and drop the slash-command.
+            return {"handled": True, "reply": f"Could not forward /{command}: the command reference is too long."}
     ok, detail = send_to_pane(pane_id, forward_text)
     if not ok:
         return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}

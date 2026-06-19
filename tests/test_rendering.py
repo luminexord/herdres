@@ -5625,6 +5625,42 @@ class AttachmentTests(unittest.TestCase):
         sent.assert_called_once_with("pane-1", "/goal pursue the refactor")
         self.assertEqual(result["reply"], "Sent /goal to this pane.")
 
+    def test_parse_command_splits_on_any_whitespace(self) -> None:
+        self.assertEqual(herdres.parse_command("/send\nmulti\nline"), ("send", "multi\nline"))
+        self.assertEqual(herdres.parse_command("/goal\ndo the thing"), ("goal", "do the thing"))
+        self.assertEqual(herdres.parse_command("/raw 50"), ("raw", "50"))      # space case unchanged
+        self.assertEqual(herdres.parse_command("/goal@Bot do it"), ("goal", "do it"))
+        self.assertEqual(herdres.parse_command("hello there"), ("plain", "hello there"))
+
+    def test_command_reply_long_command_keeps_command_and_files_argument(self) -> None:
+        # A long /goal must stay a "/goal …" command (not become a file-read
+        # instruction) and must not be truncated; the bulk goes to a file.
+        state = callback_state()
+        state["panes"]["pane-1"].pop("active_prompt", None)
+        sent = Mock(return_value=(True, ""))
+        long_arg = "pursue this detailed objective. " * 80  # > 1200 chars
+        with tempfile.TemporaryDirectory() as tmp, patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            state_path=Mock(return_value=Path(tmp) / "state.json"),
+            send_to_pane=sent,
+        ):
+            herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/goal " + long_arg}
+            )
+            files = list((Path(tmp) / "inbound" / "pane-1").glob("*"))
+            staged_text = files[0].read_text(encoding="utf-8") if files else ""
+        sent.assert_called_once()
+        forwarded = sent.call_args.args[1]
+        self.assertTrue(forwarded.startswith("/goal "))           # command preserved
+        self.assertIn("read that", forwarded.lower())
+        self.assertNotIn("truncated", forwarded.lower())          # not the old cut-off instruction
+        self.assertLess(len(forwarded), 600)                      # short line, not a paste blob
+        self.assertEqual(len(files), 1)
+        self.assertIn("pursue this detailed objective", staged_text)  # full goal staged to the file
+
     def test_command_reply_forwarded_command_strips_botname(self) -> None:
         state = callback_state()
         state["panes"]["pane-1"].pop("active_prompt", None)
