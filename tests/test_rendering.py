@@ -3339,6 +3339,32 @@ Verification
         self.assertEqual(commands[1][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
         self.assertEqual(commands[1][4], "how are you")
 
+    def test_send_to_pane_uses_fallback_clear_before_run(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "codex"}
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value=pane),
+            run_cmd=run_cmd,
+            pane_input_looks_staged=Mock(side_effect=[True, True, True, True, True, False, False, False, False]),
+        ):
+            ok, detail = herdres.send_to_pane("pane-1", "@herdr_codex_bot sup")
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(commands[0], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "ctrl+u"])
+        self.assertEqual(commands[1], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "ctrl+a", "ctrl+k"])
+        self.assertEqual(commands[2][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
+        self.assertEqual(commands[2][4], "@herdr_codex_bot sup")
+
     def test_send_to_pane_ignores_codex_goal_usage_footer(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "codex"}
         current_composer = """• Service tier set to default

@@ -5612,16 +5612,29 @@ def pane_input_looks_staged(pane_id: str) -> bool:
     return False
 
 
+CLEAR_STAGED_INPUT_KEY_SEQUENCES = (
+    ("ctrl+u",),
+    ("ctrl+a", "ctrl+k"),
+    ("escape", "ctrl+u"),
+    ("ctrl+a", "backspace"),
+)
+
+
 def clear_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:
     if not pane_input_looks_staged(pane_id):
         return True, ""
-    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "ctrl+u"], timeout=timeout)
-    if proc.returncode != 0:
-        return False, sanitize_text(proc.stderr or proc.stdout, 800)
-    for delay in (0.1, 0.2, 0.35):
-        time.sleep(delay)
-        if not pane_input_looks_staged(pane_id):
-            return True, ""
+    last_error = ""
+    for keys in CLEAR_STAGED_INPUT_KEY_SEQUENCES:
+        proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, *keys], timeout=timeout)
+        if proc.returncode != 0:
+            last_error = sanitize_text(proc.stderr or proc.stdout, 800)
+            continue
+        for delay in (0.1, 0.2, 0.35, 0.6):
+            time.sleep(delay)
+            if not pane_input_looks_staged(pane_id):
+                return True, ""
+    if last_error:
+        return False, last_error
     return False, "Could not clear existing staged pane input; refusing to append Telegram text."
 
 
