@@ -356,6 +356,17 @@ def initial_state() -> dict[str, Any]:
     }
 
 
+def normalize_state(data: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise BridgeError("unsupported state schema")
+    data.setdefault("enabled", True)
+    data.setdefault("plugin_event_enabled", True)
+    data.setdefault("telegram", {})
+    data.setdefault("panes", {})
+    clear_disabled_visible_choice_state(data)
+    return data
+
+
 def load_state() -> dict[str, Any]:
     path = state_path()
     if not path.exists():
@@ -367,8 +378,7 @@ def load_state() -> dict[str, Any]:
         if backup.exists():
             try:
                 data = json.loads(backup.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and data.get("version") == 1:
-                    return data
+                return normalize_state(data)
             except Exception:
                 pass
         backup = path.with_suffix(path.suffix + f".corrupt-{int(time.time())}.bak")
@@ -377,14 +387,7 @@ def load_state() -> dict[str, Any]:
         except OSError:
             pass
         raise BridgeError(f"state file is corrupt: {exc}") from exc
-    if not isinstance(data, dict) or data.get("version") != 1:
-        raise BridgeError("unsupported state schema")
-    data.setdefault("enabled", True)
-    data.setdefault("plugin_event_enabled", True)
-    data.setdefault("telegram", {})
-    data.setdefault("panes", {})
-    clear_disabled_visible_choice_state(data)
-    return data
+    return normalize_state(data)
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -1762,8 +1765,6 @@ def extract_turn_feed_item(
             item = extract_visible_choice_feed_item(pane)
         elif VISIBLE_READONLY_PROMPTS_ENABLED:
             item = extract_visible_readonly_feed_item(pane)
-    if item:
-        entry["last_turn_id"] = item.get("turn_id") or ""
     return item
 
 
@@ -3697,6 +3698,50 @@ def bind_active_prompt_message(
     return True
 
 
+def record_delivered_feed_item(
+    entry: dict[str, Any],
+    item: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    pending_active_prompt: dict[str, Any] | None,
+    clear_active_prompt: bool,
+    item_render_hash: str | None = None,
+    item_semantic_hash: str | None = None,
+    fallback_message_id: str | int | None = None,
+) -> None:
+    if pending_active_prompt:
+        bind_active_prompt_message(
+            entry,
+            pending_active_prompt,
+            result.get("message_id") or fallback_message_id or "",
+        )
+    elif clear_active_prompt:
+        entry.pop("active_prompt", None)
+        entry.pop("awaiting_detail", None)
+    # The dedup hashes MUST be the PRE-delivery values: prompt_delivery_state()
+    # mutates choice/decision items (rewrites options + prompt_id), so recomputing
+    # here would store a post-mutation hash that never matches the pre-mutation
+    # hash the next sync cycle compares against — causing duplicate re-sends.
+    if item_render_hash is None:
+        item_render_hash = clean_feed_hash(item)
+    if item_semantic_hash is None:
+        item_semantic_hash = clean_feed_hash(item, include_render_version=False)
+    entry["last_clean_hash"] = item_render_hash
+    entry["last_clean_semantic_hash"] = item_semantic_hash
+    entry["last_clean_render_hash"] = item_render_hash
+    if result.get("message_id"):
+        entry["last_clean_message_id"] = str(result["message_id"])
+    elif fallback_message_id:
+        entry["last_clean_message_id"] = str(fallback_message_id)
+    entry["last_clean_kind"] = str(item.get("kind") or "")
+    entry["last_clean_text"] = item_plain_text(item)
+    entry["last_clean_item"] = item
+    entry["last_clean_sent_at"] = utc_now()
+    if item.get("turn_id"):
+        entry["last_turn_id"] = str(item.get("turn_id") or "")
+    entry.pop("last_clean_send_error", None)
+
+
 def active_prompt_message_rejection(prompt: dict[str, Any], callback_message_id: str) -> str:
     bound_message_id = str(prompt.get("message_id") or "").strip()
     callback_message_id = str(callback_message_id or "").strip()
@@ -3864,7 +3909,7 @@ def latest_clean_item(entry: dict[str, Any], pane: dict[str, Any] | None = None)
 
 def latest_turn_item(entry: dict[str, Any], pane: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if pane:
-        item = extract_turn_feed_item(pane, entry)
+        item = extract_turn_feed_item(pane, dict(entry), allow_visible_fallback=False)
         if item:
             return item
     item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
@@ -4689,7 +4734,10 @@ def telegram_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise BridgeError(f"Telegram {method} failed: {desc}") from exc
     except Exception as exc:
         raise BridgeError(f"Telegram {method} failed: {exc}") from exc
-    parsed = json.loads(body)
+    try:
+        parsed = json.loads(body)
+    except Exception as exc:
+        raise BridgeError(f"Telegram {method} failed: invalid JSON") from exc
     if not parsed.get("ok"):
         params = parsed.get("parameters") or {}
         if params.get("retry_after"):
@@ -5579,6 +5627,12 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
             entry["reused_from_pane_key"] = old_key
             entry["reused_topic_mapping_at"] = utc_now()
             entry.pop("closed_at", None)
+            entry.pop("closed_topic_finalized", None)
+            entry.pop("status_icon_key", None)
+            entry.pop("topic_status_icon_key", None)
+            entry.pop("topic_status_icon_emoji", None)
+            entry.pop("topic_status_icon_custom_emoji_id", None)
+            entry.pop("topic_status_icon_updated_at", None)
             panes[key] = entry
             created = True
         else:
@@ -5861,27 +5915,16 @@ def sync_pane_once(
                     counters["sends"] = counters.get("sends", 0) + 1
                     counters["feed_sends"] = counters.get("feed_sends", 0) + 1
                     feed_delivered_this_pane = True
-                    if pending_active_prompt:
-                        bind_active_prompt_message(
-                            entry,
-                            pending_active_prompt,
-                            result.get("message_id") or (message_id if did_edit else ""),
-                        )
-                    elif clear_active_prompt:
-                        entry.pop("active_prompt", None)
-                        entry.pop("awaiting_detail", None)
-                    entry["last_clean_hash"] = item_render_hash
-                    entry["last_clean_semantic_hash"] = item_semantic_hash
-                    entry["last_clean_render_hash"] = item_render_hash
-                    if result.get("message_id"):
-                        entry["last_clean_message_id"] = str(result["message_id"])
-                    elif did_edit and message_id:
-                        entry["last_clean_message_id"] = message_id
-                    entry["last_clean_kind"] = str(item.get("kind") or "")
-                    entry["last_clean_text"] = item_plain_text(item)
-                    entry["last_clean_item"] = item
-                    entry["last_clean_sent_at"] = utc_now()
-                    entry.pop("last_clean_send_error", None)
+                    record_delivered_feed_item(
+                        entry,
+                        item,
+                        result,
+                        pending_active_prompt=pending_active_prompt,
+                        clear_active_prompt=clear_active_prompt,
+                        item_render_hash=item_render_hash,
+                        item_semantic_hash=item_semantic_hash,
+                        fallback_message_id=message_id if did_edit else None,
+                    )
                     changed = True
                 elif result_topic_missing(result):
                     clear_topic_mapping(entry, str(result.get("error") or result))
@@ -5965,7 +6008,9 @@ def sync_once() -> dict[str, Any]:
     state = load_state()
     changed = clear_disabled_visible_choice_state(state)
     if not state.get("enabled", True):
-        return {"ok": True, "changed": False, "message": "disabled"}
+        if changed:
+            save_state(state)
+        return {"ok": True, "changed": changed, "message": "disabled"}
     telegram, chat_id = configure_telegram_state(state)
 
     all_panes = pane_list()
@@ -6334,6 +6379,8 @@ def event_once() -> dict[str, Any]:
             if not refreshed or not refreshed.get("agent"):
                 break
             pane = refreshed
+    except RateLimited:
+        raise
     except Exception as exc:
         state["last_plugin_event_error"] = sanitize_text(str(exc), 500)
         state["last_plugin_event_error_at"] = utc_now()
@@ -6511,19 +6558,10 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if command in {"status", "report"}:
         pane = pane_by_id(pane_id)
         if TURN_FEED_ENABLED:
-            before_turn_state = (
-                entry.get("last_turn_available"),
-                entry.get("last_turn_reason"),
-                entry.get("last_turn_id"),
-            )
             item = latest_turn_item(entry, pane)
-            after_turn_state = (
-                entry.get("last_turn_available"),
-                entry.get("last_turn_reason"),
-                entry.get("last_turn_id"),
-            )
-            state_changed = before_turn_state != after_turn_state
             if item:
+                report_render_hash = clean_feed_hash(item)
+                report_semantic_hash = clean_feed_hash(item, include_render_version=False)
                 reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
                 result = send_feed_item(
                     chat_id,
@@ -6534,28 +6572,20 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     reply_markup=reply_markup,
                 )
                 if result.get("ok"):
-                    if pending_active_prompt:
-                        bind_active_prompt_message(entry, pending_active_prompt, result.get("message_id"))
-                    elif clear_active_prompt:
-                        entry.pop("active_prompt", None)
-                        entry.pop("awaiting_detail", None)
-                    entry["last_clean_hash"] = clean_feed_hash(item)
-                    entry["last_clean_semantic_hash"] = clean_feed_hash(item, include_render_version=False)
-                    entry["last_clean_render_hash"] = clean_feed_hash(item)
-                    if result.get("message_id"):
-                        entry["last_clean_message_id"] = str(result["message_id"])
-                    entry["last_clean_kind"] = str(item.get("kind") or "turn")
-                    entry["last_clean_text"] = item_plain_text(item)
-                    entry["last_clean_item"] = item
-                    entry["last_clean_sent_at"] = utc_now()
-                    entry.pop("last_clean_send_error", None)
+                    record_delivered_feed_item(
+                        entry,
+                        item,
+                        result,
+                        pending_active_prompt=pending_active_prompt,
+                        clear_active_prompt=clear_active_prompt,
+                        item_render_hash=report_render_hash,
+                        item_semantic_hash=report_semantic_hash,
+                    )
                     save_state(state)
                     return {"handled": True, "reply": ""}
                 entry["last_clean_send_error"] = sanitize_text(str(result), 500)
                 save_state(state)
                 return {"handled": True, "reply": item_plain_text(item)}
-            if state_changed:
-                save_state(state)
             return {"handled": True, "reply": latest_turn_report(entry, None)}
         item = latest_clean_item(entry, pane)
         if item:

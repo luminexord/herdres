@@ -3398,6 +3398,31 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertNotIn("active_prompt", entry)
         self.assertNotIn("awaiting_detail", entry)
 
+    def test_sync_disabled_mode_saves_prompt_cleanup(self) -> None:
+        entry = {
+            "active_prompt": {
+                "id": "visible1",
+                "choice_source": "visible_scrape",
+            },
+            "awaiting_detail": {"user_id": "42", "visible_choice": "4"},
+        }
+        state = {"version": 1, "enabled": False, "telegram": {}, "panes": {"pane": entry}}
+        save_state = Mock()
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=save_state,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertNotIn("active_prompt", entry)
+        self.assertNotIn("awaiting_detail", entry)
+        save_state.assert_called_once_with(state)
+
     def test_bound_active_prompt_with_detail_survives_cleanup_until_expired(self) -> None:
         entry = {
             "active_prompt": test_active_prompt({
@@ -3975,6 +4000,74 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertIn("You asked", entry["last_clean_text"])
         self.assertIn("Likely cause", entry["last_clean_text"])
         self.assertNotIn("Question\nShould not be parsed", entry["last_clean_text"])
+
+    def test_sync_turn_feed_failed_send_does_not_advance_turn_cursor(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "done",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "last_turn_id": "turn-a",
+            "last_topic_verified_at": herdres.utc_now(),
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+
+        def mk(tid: str, text: str) -> dict:
+            return {"available": True, "complete": True, "turn_id": tid, "assistant_final_text": text}
+
+        recent = [mk("turn-a", "Already sent."), mk("turn-b", "Retry me."), mk("turn-c", "Later.")]
+        pane_turn = Mock(return_value={**recent[-1], "recent_turns": recent})
+        send_feed_item = Mock(side_effect=[
+            {"ok": False, "error": "temporary"},
+            {"ok": True, "message_id": "999"},
+        ])
+
+        patches = {
+            "load_dotenv": Mock(),
+            "load_state": Mock(return_value=state),
+            "save_state": Mock(),
+            "pane_list": Mock(return_value=[pane]),
+            "preflight_is_fresh": Mock(return_value=True),
+            "pane_turn": pane_turn,
+            "send_feed_item": send_feed_item,
+            "TURN_FEED_ENABLED": True,
+            "LIVE_CARD_ENABLED": False,
+            "STATUS_MARKER_ENABLED": False,
+        }
+        with patch.multiple(herdres, **patches):
+            first = herdres.sync_once()
+
+        self.assertTrue(first["changed"])
+        self.assertEqual(send_feed_item.call_args.args[1]["turn_id"], "turn-b")
+        self.assertEqual(entry["last_turn_id"], "turn-a")
+        self.assertNotIn("last_clean_item", entry)
+
+        old_attempt = (
+            herdres._dt.datetime.now(tz=herdres._dt.timezone.utc)
+            - herdres._dt.timedelta(seconds=herdres.CLEAN_ATTEMPT_TTL_SECONDS + 1)
+        )
+        entry["last_clean_attempt_at"] = old_attempt.isoformat()
+
+        with patch.multiple(herdres, **patches):
+            second = herdres.sync_once()
+
+        self.assertTrue(second["changed"])
+        self.assertEqual(send_feed_item.call_args.args[1]["turn_id"], "turn-b")
+        self.assertEqual(entry["last_turn_id"], "turn-b")
+        self.assertEqual(entry["last_clean_item"]["turn_id"], "turn-b")
 
     def test_status_marker_does_not_send_in_same_run_as_final_reply(self) -> None:
         pane = {
@@ -4810,6 +4903,7 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         send_feed_item.assert_called_once()
         sent_item = send_feed_item.call_args.args[1]
         self.assertEqual(sent_item["kind"], "turn")
+        self.assertEqual(entry["last_turn_id"], "turn-1")
         self.assertEqual(entry["last_clean_kind"], "turn")
         self.assertIn("Final answer only.", entry["last_clean_text"])
 
@@ -4872,7 +4966,7 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertNotIn("active_prompt", entry)
         self.assertNotIn("awaiting_detail", entry)
 
-    def test_report_command_turn_feed_unavailable_does_not_parse_pane_output(self) -> None:
+    def test_report_command_turn_feed_unavailable_is_read_only(self) -> None:
         pane = {
             "pane_id": "pane-1",
             "terminal_id": "term-1",
@@ -4881,7 +4975,13 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
             "agent": "claude",
             "agent_status": "done",
         }
-        entry = {"pane_id": "pane-1", "topic_id": "77"}
+        entry = {
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "last_turn_available": True,
+            "last_turn_reason": "previous",
+            "last_turn_id": "turn-old",
+        }
         state = {
             "version": 1,
             "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
@@ -4890,12 +4990,13 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         pane_turn = Mock(return_value={"available": False, "reason": "no_structured_turn_source"})
         pane_feed_output = Mock(return_value="HERDRES_REPORT_START\nFallback\n- Do not parse this.\nHERDRES_REPORT_END")
         send_feed_item = Mock(return_value={"ok": True})
+        save_state = Mock()
 
         with patch.multiple(
             herdres,
             load_dotenv=Mock(),
             load_state=Mock(return_value=state),
-            save_state=Mock(),
+            save_state=save_state,
             pane_by_id=Mock(return_value=pane),
             pane_turn=pane_turn,
             pane_feed_output=pane_feed_output,
@@ -4908,12 +5009,45 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
 
         self.assertTrue(result["handled"])
         self.assertEqual(result["reply"], "No structured turn is available yet.")
-        self.assertFalse(entry["last_turn_available"])
-        self.assertEqual(entry["last_turn_reason"], "no_structured_turn_source")
+        self.assertTrue(entry["last_turn_available"])
+        self.assertEqual(entry["last_turn_reason"], "previous")
+        self.assertEqual(entry["last_turn_id"], "turn-old")
         pane_turn.assert_called_once_with("pane-1")
         pane_feed_output.assert_not_called()
         send_feed_item.assert_not_called()
+        save_state.assert_not_called()
         self.assertNotIn("last_clean_hash", entry)
+
+    def test_record_delivered_stores_supplied_pre_mutation_hashes(self) -> None:
+        # prompt_delivery_state() mutates a choice item's options (adds callback_id)
+        # before delivery, changing its hash. record_delivered_feed_item must store
+        # the PRE-mutation hashes the caller computed, NOT recompute from the mutated
+        # item — otherwise the next sync cycle (which hashes a fresh, unmutated item)
+        # sees the prompt as "changed" and re-sends it every cycle.
+        mutated_item = {
+            "kind": "choices",
+            "turn_id": "turn-1",
+            "summary": "Choose:",
+            "options": [{"number": 1, "label": "A", "callback_id": "post-mutation"}],
+        }
+        pre_render = "PRE_RENDER_HASH"
+        pre_semantic = "PRE_SEMANTIC_HASH"
+        entry: dict = {}
+        herdres.record_delivered_feed_item(
+            entry,
+            mutated_item,
+            {"ok": True, "message_id": "9"},
+            pending_active_prompt=None,
+            clear_active_prompt=False,
+            item_render_hash=pre_render,
+            item_semantic_hash=pre_semantic,
+        )
+        # stored the supplied (pre-mutation) hashes verbatim...
+        self.assertEqual(entry["last_clean_render_hash"], pre_render)
+        self.assertEqual(entry["last_clean_hash"], pre_render)
+        self.assertEqual(entry["last_clean_semantic_hash"], pre_semantic)
+        # ...and did NOT recompute from the mutated item (which would regress dedup)
+        self.assertNotEqual(entry["last_clean_render_hash"], herdres.clean_feed_hash(mutated_item))
 
     def test_turn_feed_hash_includes_turn_pair(self) -> None:
         first = herdres.make_turn_feed_item(
@@ -4940,6 +5074,44 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
             herdres.clean_feed_hash(first, include_render_version=False),
             herdres.clean_feed_hash(second, include_render_version=False),
         )
+
+    def test_load_state_normalizes_backup_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text("{broken", encoding="utf-8")
+            path.with_suffix(path.suffix + ".bak").write_text(
+                herdres.json.dumps({"version": 1}),
+                encoding="utf-8",
+            )
+
+            with patch.dict(herdres.os.environ, {"HERDR_TELEGRAM_TOPICS_STATE": str(path)}, clear=False):
+                state = herdres.load_state()
+
+        self.assertTrue(state["enabled"])
+        self.assertTrue(state["plugin_event_enabled"])
+        self.assertEqual(state["telegram"], {})
+        self.assertEqual(state["panes"], {})
+
+    def test_telegram_api_invalid_success_json_raises_bridge_error(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b"{broken"
+
+        with patch.dict(
+            herdres.os.environ,
+            {"TELEGRAM_BOT_TOKEN": "token", "HERDR_TELEGRAM_TOPICS_DRY_RUN": ""},
+            clear=False,
+        ), patch.object(herdres.urllib.request, "urlopen", Mock(return_value=FakeResponse())):
+            with self.assertRaises(herdres.BridgeError) as ctx:
+                herdres.telegram_api("sendMessage", {"chat_id": "1", "text": "hello"})
+
+        self.assertIn("invalid JSON", str(ctx.exception))
 
     def test_bridge_defaults_match_canonical_herdres_paths(self) -> None:
         module_path = Path(__file__).resolve().parents[1] / "herdr_topic_bridge.py"
@@ -5074,6 +5246,39 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertIs(args[0], state)
         self.assertEqual(args[3], pane)
         self.assertTrue(kwargs["turn_only"])
+
+    def test_event_propagates_rate_limited(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "plugin_event_enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {},
+        }
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "done",
+        }
+        event_json = herdres.json.dumps({"pane": {"pane_id": "pane-1"}})
+        save_state = Mock()
+
+        with patch.dict(herdres.os.environ, {"HERDR_PLUGIN_EVENT_JSON": event_json}, clear=False), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=save_state,
+            pane_by_id=Mock(return_value=pane),
+            preflight_for_event=Mock(return_value=(True, "")),
+            sync_pane_once=Mock(side_effect=herdres.RateLimited(3)),
+        ):
+            with self.assertRaises(herdres.RateLimited):
+                herdres.event_once()
+
+        save_state.assert_not_called()
 
     def test_event_retries_done_status_to_settle_turn_feed(self) -> None:
         state = {
@@ -6073,6 +6278,12 @@ class SpinnerAndWorkingPaneTests(unittest.TestCase):
             "pane_label_raw": "Topics Pane", "pane_label_topic_name": "Topics Pane",
             "agent_session_id": "sess-1",
             "last_known_status": "closed", "closed_at": "2026-01-01T00:00:00+00:00",
+            "closed_topic_finalized": True,
+            "status_icon_key": "closed",
+            "topic_status_icon_key": "closed",
+            "topic_status_icon_emoji": "📁",
+            "topic_status_icon_custom_emoji_id": "closed-id",
+            "topic_status_icon_updated_at": "2026-01-01T00:00:01+00:00",
         }}}
         pane = {"pane_id": "w1:p9", "terminal_id": "t", "workspace_id": "w1", "tab_id": "t1",
                 "label": "Topics Pane", "agent": "codex", "agent_session": {"value": "sess-1"}}
@@ -6081,6 +6292,13 @@ class SpinnerAndWorkingPaneTests(unittest.TestCase):
         self.assertEqual(entry["topic_name"], "Topics Pane")  # un-[OLD]'d in state
         self.assertEqual(entry.get("topic_rename_from"), "[OLD] Topics Pane")
         self.assertEqual(entry.get("topic_rename_to"), "Topics Pane")  # rename scheduled
+        self.assertNotIn("closed_at", entry)
+        self.assertNotIn("closed_topic_finalized", entry)
+        self.assertNotIn("status_icon_key", entry)
+        self.assertNotIn("topic_status_icon_key", entry)
+        self.assertNotIn("topic_status_icon_emoji", entry)
+        self.assertNotIn("topic_status_icon_custom_emoji_id", entry)
+        self.assertNotIn("topic_status_icon_updated_at", entry)
 
     def test_status_lag_race_prefers_completed_turn_over_scrape(self) -> None:
         # done->working lag: status reads non-working but a new turn is open and
