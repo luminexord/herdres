@@ -111,6 +111,16 @@ systemctl --user daemon-reload
 systemctl --user restart hermes-gateway.service
 ```
 
+Standalone inbound gateway:
+
+Herdres also includes `herdres-gateway.py`, a stdlib-only `getUpdates` daemon
+that can replace the Hermes inbound bridge for pane-topic commands and
+callbacks. Set `HERDRES_GATEWAY_BOT_TOKEN` in `~/.config/herdres/herdres.env`
+for a gateway-owned bot, or let it fall back to `TELEGRAM_BOT_TOKEN` during a
+single-token migration. For any one bot token, run either Hermes polling or
+`herdres-gateway.service`, never both, because Telegram permits only one active
+`getUpdates` consumer per bot token.
+
 ## Herdr Plugin Event Trigger
 
 Herdr 0.7.0 adds local plugin events. Herdres can use those events as a low-latency trigger layer while keeping the Telegram forum-topic UX in Herdres.

@@ -1,0 +1,17 @@
+[Unit]
+Description=Herdres inbound Telegram gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/herdres/herdres.env
+Environment=HERDR_TELEGRAM_TOPICS_STATE=%h/.local/share/herdres/state.json
+Environment=HERDR_TELEGRAM_TOPICS_SCRIPT=%h/.local/bin/herdres
+Environment=HERDR_TELEGRAM_TOPICS_GATEWAY_OFFSET=%h/.local/share/herdres/gateway.offset
+ExecStart=%h/.local/bin/herdres-gateway
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
