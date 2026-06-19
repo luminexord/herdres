@@ -5290,6 +5290,66 @@ def callback_patches(
     )
 
 
+class RichMessageSplitTests(unittest.TestCase):
+    def _balanced(self, s: str) -> bool:
+        import re as _re
+        for tag in ("p", "table", "ul", "ol", "blockquote", "pre", "h3", "li", "tr", "td", "th", "b"):
+            if len(_re.findall(rf"<{tag}\b", s)) != len(_re.findall(rf"</{tag}>", s)):
+                return False
+        return True
+
+    def test_short_html_stays_one_chunk(self) -> None:
+        html = "<p>hello</p><ul>\n<li>a</li>\n<li>b</li>\n</ul>"
+        self.assertEqual(herdres.split_rich_html(html, 6000), [html])
+
+    def test_long_html_splits_at_block_boundaries(self) -> None:
+        html = "".join(f"<p>paragraph number {i} with some filler text here</p>" for i in range(200))
+        chunks = herdres.split_rich_html(html, 1000)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(c) <= 1000 for c in chunks))
+        self.assertTrue(all(self._balanced(c) for c in chunks))      # no half-cut tags
+        self.assertEqual("".join(chunks), html)                       # nothing lost
+
+    def test_oversize_single_block_is_hard_split_and_rewrapped(self) -> None:
+        rows = "".join(f"<tr><td>row {i}</td><td>value {i}</td></tr>" for i in range(300))
+        html = "<table bordered striped>" + rows + "</table>"
+        chunks = herdres.split_rich_html(html, 1500)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(c) <= 1500 for c in chunks))
+        # every piece is a self-contained <table>...</table>, not a half-open tag
+        for c in chunks:
+            self.assertTrue(c.startswith("<table"))
+            self.assertTrue(c.endswith("</table>"))
+            self.assertTrue(self._balanced(c))
+
+    def test_send_rich_message_splits_oversize_into_multiple_sends(self) -> None:
+        html = "".join(f"<p>paragraph number {i} with filler</p>" for i in range(400))
+        calls = []
+
+        def fake_api(method, payload):
+            calls.append((method, payload))
+            return {"ok": True, "result": {"message_id": 100 + len(calls)}}
+
+        tg = {"rich_messages": {"supported": "yes"}}
+        with patch.object(herdres, "telegram_api", side_effect=fake_api):
+            result = herdres.send_rich_message("-100", html, telegram=tg, thread_id="5",
+                                               reply_markup={"inline_keyboard": [[{"text": "x", "callback_data": "y"}]]})
+        rich_calls = [p for m, p in calls if m == "sendRichMessage"]
+        self.assertGreater(len(rich_calls), 1)                        # split into >1 send
+        for p in rich_calls:
+            self.assertLessEqual(len(p["rich_message"]), herdres.RICH_SAFE_CHARS + 200)
+        # buttons only on the final chunk
+        self.assertNotIn("reply_markup", rich_calls[0])
+        self.assertIn("reply_markup", rich_calls[-1])
+        self.assertEqual(result["message_id"], "101")                 # anchor = first message
+
+    def test_send_rich_message_single_when_small(self) -> None:
+        calls = []
+        with patch.object(herdres, "telegram_api", side_effect=lambda m, p: calls.append((m, p)) or {"ok": True, "result": {"message_id": 7}}):
+            herdres.send_rich_message("-100", "<p>tiny</p>", telegram={"rich_messages": {"supported": "yes"}})
+        self.assertEqual(len([m for m, _ in calls if m == "sendRichMessage"]), 1)
+
+
 class CodexFenceAndAcronymTests(unittest.TestCase):
     def test_text_fence_numbered_list_is_not_code_block(self) -> None:
         html = herdres.render_final_reply_html("Steps:\n\n```text\n1. Backup files.\n2. Restart service.\n3. Verify.\n```")

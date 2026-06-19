@@ -47,6 +47,12 @@ READ_LINES_COMMAND_MAX = 160
 MAX_REPLY_CHARS = 3200
 MAX_STATUS_CHARS = 1500
 MAX_RICH_HTML_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS", "14000"))
+# Telegram clients render rich messages only up to a size limit; past it the
+# whole message shows "This message is not supported in your version of
+# Telegram" (the API accepts it regardless, so there's no error to catch).
+# Empirically ~7KB of HTML still renders, so split well under that and deliver
+# long content as multiple messages instead of one that silently breaks.
+RICH_SAFE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SAFE_CHARS", "6000"))
 MAX_RICH_DETAIL_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_DETAIL_CHARS", "2400"))
 PREFLIGHT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PREFLIGHT_TTL", "900"))
 PREFLIGHT_GRACE_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PREFLIGHT_GRACE", "86400"))
@@ -4912,32 +4918,97 @@ def edit_message_text(
     return {"ok": True, "kind": "edited", "message_id": telegram_message_id(response)}
 
 
-def send_rich_message(
+_RICH_TOP_BLOCK_RE = re.compile(
+    r"<(p|h[1-6]|table|ul|ol|blockquote|pre|details|footer|b)\b[^>]*>.*?</\1>|<br\s*/?>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _hard_split_rich_block(block: str, limit: int) -> list[str]:
+    # A single top-level block bigger than the limit (e.g. a long table or <pre>).
+    # Split its inner content at row/list/line boundaries and re-wrap each piece in
+    # the same tag so we never emit a half-open tag.
+    m = re.match(r"(<([a-zA-Z0-9]+)\b[^>]*>)(.*)(</\2>)\Z", block, re.DOTALL)
+    if not m:
+        # No clean wrapper (inline text / <br>): break on whitespace near the limit.
+        pieces, cur = [], ""
+        for token in re.split(r"(\s+)", block):
+            if cur and len(cur) + len(token) > limit:
+                pieces.append(cur)
+                cur = token
+            else:
+                cur += token
+        if cur:
+            pieces.append(cur)
+        return pieces or [block[:limit]]
+    open_tag, _name, inner, close_tag = m.groups()
+    budget = max(200, limit - len(open_tag) - len(close_tag))
+    pieces, cur = [], ""
+    for part in re.split(r"(</tr>|</li>|<br\s*/?>|\n)", inner):
+        if cur and len(cur) + len(part) > budget:
+            pieces.append(open_tag + cur + close_tag)
+            cur = part
+        else:
+            cur += part
+    if cur:
+        pieces.append(open_tag + cur + close_tag)
+    return pieces
+
+
+def split_rich_html(html_text: str, limit: int) -> list[str]:
+    """Split rich HTML into chunks each <= limit, breaking only between top-level
+    blocks (paragraphs, tables, lists, quotes, ...) so no tag is ever cut in half."""
+    if len(html_text) <= limit:
+        return [html_text]
+    segments: list[str] = []
+    pos = 0
+    for match in _RICH_TOP_BLOCK_RE.finditer(html_text):
+        if match.start() > pos:
+            between = html_text[pos:match.start()]
+            if between.strip():
+                segments.append(between)
+        segments.append(match.group(0))
+        pos = match.end()
+    if pos < len(html_text):
+        tail = html_text[pos:]
+        if tail.strip():
+            segments.append(tail)
+    if not segments:
+        return _hard_split_rich_block(html_text, limit)
+    chunks: list[str] = []
+    cur = ""
+    for seg in segments:
+        if len(seg) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.extend(_hard_split_rich_block(seg, limit))
+            continue
+        if cur and len(cur) + len(seg) > limit:
+            chunks.append(cur)
+            cur = seg
+        else:
+            cur += seg
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _send_rich_chunk(
     chat_id: str,
     html_text: str,
     *,
-    telegram: dict[str, Any] | None = None,
-    fallback_text: str = "",
-    thread_id: str | int | None = None,
-    notify: bool = False,
-    reply_markup: dict[str, Any] | None = None,
-    reply_to_message_id: str | int | None = None,
+    telegram: dict[str, Any] | None,
+    fallback: str,
+    thread_id: str | int | None,
+    notify: bool,
+    reply_markup: dict[str, Any] | None,
+    reply_to_message_id: str | int | None,
 ) -> dict[str, Any]:
-    fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
-    if not rich_enabled(telegram):
-        return send_legacy_message_result(
-            chat_id,
-            fallback,
-            thread_id=thread_id,
-            notify=notify,
-            reply_markup=reply_markup,
-            reply_to_message_id=reply_to_message_id,
-        )
-
     payload: dict[str, Any] = {
         "chat_id": chat_id,
         "rich_message": json.dumps(
-            {"html": sanitize_text(html_text, MAX_RICH_HTML_CHARS), "skip_entity_detection": True},
+            {"html": html_text, "skip_entity_detection": True},
             separators=(",", ":"),
         ),
     }
@@ -4986,6 +5057,68 @@ def send_rich_message(
         return {"ok": False, "format": "rich", "kind": kind, "transient": True, "error": str(exc)}
     mark_rich_supported(telegram)
     return {"ok": True, "format": "rich", "message_id": telegram_message_id(response)}
+
+
+def send_rich_message(
+    chat_id: str,
+    html_text: str,
+    *,
+    telegram: dict[str, Any] | None = None,
+    fallback_text: str = "",
+    thread_id: str | int | None = None,
+    notify: bool = False,
+    reply_markup: dict[str, Any] | None = None,
+    reply_to_message_id: str | int | None = None,
+) -> dict[str, Any]:
+    fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
+    if not rich_enabled(telegram):
+        return send_legacy_message_result(
+            chat_id,
+            fallback,
+            thread_id=thread_id,
+            notify=notify,
+            reply_markup=reply_markup,
+            reply_to_message_id=reply_to_message_id,
+        )
+
+    sanitized = sanitize_text(html_text, MAX_RICH_HTML_CHARS)
+    chunks = split_rich_html(sanitized, RICH_SAFE_CHARS)
+    # Common case: one chunk, identical behaviour to before.
+    if len(chunks) <= 1:
+        return _send_rich_chunk(
+            chat_id,
+            sanitized,
+            telegram=telegram,
+            fallback=fallback,
+            thread_id=thread_id,
+            notify=notify,
+            reply_markup=reply_markup,
+            reply_to_message_id=reply_to_message_id,
+        )
+    # Oversize: deliver as sequential messages. The buttons (reply_markup) ride the
+    # last chunk; reply_to ties the first. First chunk's result is the anchor.
+    first_result: dict[str, Any] | None = None
+    last = len(chunks) - 1
+    for idx, chunk in enumerate(chunks):
+        result = _send_rich_chunk(
+            chat_id,
+            chunk,
+            telegram=telegram,
+            fallback=sanitize_text(html_to_plain(chunk), MAX_REPLY_CHARS),
+            thread_id=thread_id,
+            notify=notify if idx == 0 else False,
+            reply_markup=reply_markup if idx == last else None,
+            reply_to_message_id=reply_to_message_id if idx == 0 else None,
+        )
+        if idx == 0:
+            first_result = result
+            if not result.get("ok"):
+                return result
+        elif not result.get("ok") and not rich_enabled(telegram):
+            # rich capability dropped mid-stream; remaining chunks already went
+            # out as legacy via _send_rich_chunk's fallback. Stop chaining rich.
+            break
+    return first_result or {"ok": False, "format": "rich", "kind": "empty"}
 
 
 def edit_rich_message(
