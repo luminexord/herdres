@@ -173,6 +173,15 @@ def managed_bot_kind_for_username(state: dict, username: str) -> str:
     return ""
 
 
+def managed_bot_has_token(state: dict, kind: str) -> bool:
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+    record = bots.get(str(kind or "")) if isinstance(bots, dict) else None
+    if not isinstance(record, dict) or record.get("enabled") is False:
+        return False
+    return bool(str(record.get("token") or "").strip())
+
+
 def mentioned_managed_bot_kind(state: dict, text: str) -> str:
     for match in MANAGED_BOT_MENTION_RE.finditer(str(text or "")):
         kind = managed_bot_kind_for_username(state, match.group(1))
@@ -181,11 +190,30 @@ def mentioned_managed_bot_kind(state: dict, text: str) -> str:
     return ""
 
 
-def target_bot_kind_for_message(state: dict, text: str, bot_key: str | None) -> str:
+def replied_managed_bot_kind(state: dict, message: dict | None) -> str:
+    reply = (message or {}).get("reply_to_message") or {}
+    user = reply.get("from") if isinstance(reply, dict) else {}
+    if not isinstance(user, dict):
+        return ""
+    return managed_bot_kind_for_username(state, str(user.get("username") or ""))
+
+
+def targeted_managed_bot_kind(state: dict, text: str, message: dict | None = None) -> str:
+    return replied_managed_bot_kind(state, message) or mentioned_managed_bot_kind(state, text)
+
+
+def manager_should_defer_to_child_bot(state: dict, text: str, message: dict, bot_key: str | None) -> bool:
+    if managed_bot_kind_for_key(bot_key):
+        return False
+    kind = targeted_managed_bot_kind(state, text, message)
+    return bool(kind and managed_bot_has_token(state, kind))
+
+
+def target_bot_kind_for_message(state: dict, text: str, bot_key: str | None, message: dict | None = None) -> str:
     key_kind = managed_bot_kind_for_key(bot_key)
     if key_kind:
         return key_kind
-    return mentioned_managed_bot_kind(state, text)
+    return targeted_managed_bot_kind(state, text, message)
 
 
 def thread_id_of(message: dict) -> str | None:
@@ -357,7 +385,10 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
         f"message chat={chat_id} thread={thread_id} from={user_id} bot={from_bot} "
         f"text={str(text or '')[:40]!r}"
     )
-    target_bot_kind = target_bot_kind_for_message(state, str(text or ""), bot_key)
+    if manager_should_defer_to_child_bot(state, str(text or ""), message, bot_key):
+        dlog("deferred targeted message to managed child bot")
+        return
+    target_bot_kind = target_bot_kind_for_message(state, str(text or ""), bot_key, message)
     reply_to = message.get("reply_to_message") or {}
     resolved = resolve_mapped_entry(
         state,

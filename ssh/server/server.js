@@ -26,6 +26,8 @@ import { spawn as spawnProc } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { cleanHerdrPtyEnv } from './herdr-env.js';
+import { collectStatus, runHerdrJson } from './status.js';
+import { createScrollWriter } from './scroll-control.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OWNER_ID = (process.env.HERDRES_OWNER_ID || '').trim();
@@ -95,6 +97,12 @@ let idleTimer = null;
 let statusTimer = null;
 let cols = 80;
 let rows = 24;
+const scrollWriter = createScrollWriter({
+  getSize: () => ({ cols, rows }),
+  getTerm: () => term,
+  loadLayout: () => runHerdrJson(HERDR_BIN, ['pane', 'layout', '--current']),
+  log,
+});
 
 const broadcast = (data, binary) => {
   for (const v of viewers) if (v.readyState === 1) v.send(data, { binary });
@@ -163,25 +171,24 @@ function viewersChanged() {
 
 function pollStatus() {
   if (viewers.size === 0) return;
-  const p = spawnProc(HERDR_BIN, ['pane', 'list'], { timeout: 6000 });
-  let out = '';
-  p.stdout.on('data', (b) => (out += b));
-  p.on('error', () => {});
-  p.on('close', () => {
-    try {
-      const data = JSON.parse(out);
-      const list = data.result?.panes || data.panes || [];
-      const panes = list.map((x) => ({
-        id: x.pane_id,
-        label: x.label || x.title || x.agent || x.pane_id,
-        status: x.agent_status || 'unknown',
-        focused: !!x.focused,
-      }));
-      broadcastCtrl({ t: 'status', panes });
-    } catch {}
-  });
+  collectStatus(HERDR_BIN)
+    .then((status) => broadcastCtrl({ t: 'status', ...status }))
+    .catch((e) => log('status poll failed:', e.message));
 }
 statusTimer = setInterval(pollStatus, STATUS_INTERVAL_MS);
+
+function runHerdrControl(args) {
+  let done = false;
+  const finish = (err) => {
+    if (err) log(`${HERDR_BIN} ${args.join(' ')} failed:`, err.message);
+    if (done) return;
+    done = true;
+    pollStatus();
+  };
+  const p = spawnProc(HERDR_BIN, args, { stdio: 'ignore', timeout: 4000 });
+  p.once('error', finish);
+  p.once('close', () => finish(null));
+}
 
 // --- static serving -------------------------------------------------------
 const MIME = {
@@ -231,9 +238,16 @@ wss.on('connection', (ws) => {
       if (msg.t === 'resize') {
         cols = Math.max(2, msg.cols | 0);
         rows = Math.max(2, msg.rows | 0);
+        scrollWriter.invalidate();
         if (term) term.resize(cols, rows);
+      } else if (msg.t === 'focus_space' && msg.id) {
+        scrollWriter.invalidate();
+        runHerdrControl(['workspace', 'focus', String(msg.id)]);
       } else if (msg.t === 'focus' && msg.id) {
-        spawnProc(HERDR_BIN, ['agent', 'focus', String(msg.id)]);
+        scrollWriter.invalidate();
+        runHerdrControl(['agent', 'focus', String(msg.id)]);
+      } else if (msg.t === 'scroll') {
+        scrollWriter.write(msg);
       }
       return;
     }
@@ -253,6 +267,7 @@ wss.on('connection', (ws) => {
     viewers.add(ws);
     ws.send(ctrl({ t: 'ready', host: true }));
     viewersChanged();
+    pollStatus();
   });
 
   ws.on('close', () => {

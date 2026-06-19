@@ -202,6 +202,7 @@ TUI_LEADING_CHROME_RE = re.compile(r"^\s*[│┃└┌┐┘├┤╭╮╰╯�
 PROMPT_ONLY_RE = re.compile(r"^\s*(?:❯|›)\s*$")
 PROMPT_WITH_TEXT_RE = re.compile(r"^\s*(?:❯|›)\s+\S+")
 PROMPT_PLACEHOLDER_RE = re.compile(r"^\s*(?:❯|›)\s+Write tests for @filename\s*$", re.IGNORECASE)
+CODEX_GOAL_USAGE_FOOTER_RE = re.compile(r"\bgoal\s+hit\s+usage limits?\s*\(/goal resume\)", re.IGNORECASE)
 REPORT_BLOCK_RE = re.compile(r"(?ms)^\s*HERDRES_REPORT_START\s*$\s*(.*?)^\s*HERDRES_REPORT_END\s*$")
 CHOICES_BLOCK_RE = re.compile(r"(?ms)^\s*HERDRES_CHOICES_START\s*$\s*(.*?)^\s*HERDRES_CHOICES_END\s*$")
 REPORT_TITLE_RE = re.compile(r"^\s*HERDRES_REPORT_TITLE\s*:\s*(.{1,80})\s*$", re.IGNORECASE)
@@ -374,6 +375,41 @@ class RateLimited(BridgeError):
 
 def utc_now() -> str:
     return _dt.datetime.now(tz=_dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def parse_utc_datetime(value: str) -> _dt.datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed.astimezone(_dt.timezone.utc)
+
+
+def format_elapsed_minutes(total_seconds: float) -> str:
+    safe_seconds = max(0, int(total_seconds))
+    total_minutes = max(1, safe_seconds // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours <= 0:
+        return f"{minutes}m"
+    if minutes <= 0:
+        return f"{hours}h"
+    return f"{hours}h {minutes}m"
+
+
+def request_elapsed_label(started_at: str, *, now: _dt.datetime | None = None) -> str:
+    started = parse_utc_datetime(started_at)
+    if started is None:
+        return ""
+    current = now or _dt.datetime.now(tz=_dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=_dt.timezone.utc)
+    elapsed_seconds = (current.astimezone(_dt.timezone.utc) - started).total_seconds()
+    return format_elapsed_minutes(elapsed_seconds)
 
 
 def load_dotenv(path: Path = DEFAULT_ENV) -> None:
@@ -2393,6 +2429,46 @@ def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def ensure_request_started(entry: dict[str, Any], turn_id: str) -> str:
+    clean_turn_id = sanitize_text(str(turn_id or ""), 300)
+    if not clean_turn_id:
+        return ""
+    if str(entry.get("request_turn_id") or "") != clean_turn_id:
+        entry["request_turn_id"] = clean_turn_id
+        entry["request_started_at"] = utc_now()
+        return str(entry["request_started_at"])
+    started_at = str(entry.get("request_started_at") or "").strip()
+    if not started_at:
+        entry["request_started_at"] = utc_now()
+        return str(entry["request_started_at"])
+    return started_at
+
+
+def request_started_at_for_turn(entry: dict[str, Any], turn_id: str) -> str:
+    clean_turn_id = str(turn_id or "")
+    if clean_turn_id and str(entry.get("request_turn_id") or "") == clean_turn_id:
+        return str(entry.get("request_started_at") or "")
+    if clean_turn_id and str(entry.get("last_prompt_turn_id") or "") == clean_turn_id:
+        return str(entry.get("last_prompt_sent_at") or "")
+    return ""
+
+
+def worklog_label_for_turn(entry: dict[str, Any], turn_id: str) -> str:
+    elapsed = request_elapsed_label(request_started_at_for_turn(entry, turn_id))
+    if not elapsed:
+        return WORKLOG_LABEL
+    return f"{WORKLOG_LABEL} ({elapsed})"
+
+
+def apply_worklog_label(item: dict[str, Any] | None, entry: dict[str, Any]) -> dict[str, Any] | None:
+    if not item or str(item.get("kind") or "").lower() != "turn":
+        return item
+    if not str(item.get("worklog_text") or item.get("assistant_stream_text") or "").strip():
+        return item
+    item["worklog_label"] = worklog_label_for_turn(entry, str(item.get("turn_id") or ""))
+    return item
+
+
 def turn_open_prompt(turn: dict[str, Any]) -> tuple[str, str]:
     if not isinstance(turn, dict) or turn.get("available") is not True:
         return "", ""
@@ -2612,8 +2688,10 @@ def record_suppressed_clean_item(entry: dict[str, Any], item: dict[str, Any], re
 
 
 def attach_stream_worklog(item: dict[str, Any] | None, entry: dict[str, Any], turn: dict[str, Any]) -> dict[str, Any] | None:
-    if not item or str(item.get("kind") or "").lower() != "turn" or item.get("worklog_text"):
+    if not item or str(item.get("kind") or "").lower() != "turn":
         return item
+    if item.get("worklog_text"):
+        return apply_worklog_label(item, entry)
     item_turn_id = str(item.get("turn_id") or "")
     stream_turn_id = str(entry.get("last_stream_turn_id") or entry.get("pending_stream_turn_id") or "")
     if not stream_turn_id and turn.get("has_open_turn") is True:
@@ -2628,7 +2706,7 @@ def attach_stream_worklog(item: dict[str, Any] | None, entry: dict[str, Any], tu
     ).strip()
     if worklog_text:
         item["worklog_text"] = worklog_text
-    return item
+    return apply_worklog_label(item, entry)
 
 
 API_ERROR_NOTICE_TITLE = "⚠️ API error — pane stopped"
@@ -2742,6 +2820,8 @@ def extract_turn_feed_item(
         record_suppressed_clean_item(entry, item, "newer_prompt_already_visible")
         item = None
     prompt_hash = stream_text_hash(prompt_text) if prompt_turn_id and prompt_text else ""
+    if prompt_turn_id and prompt_text:
+        ensure_request_started(entry, prompt_turn_id)
     prompt_already_sent = str(entry.get("last_prompt_turn_id") or "") == prompt_turn_id and (
         not str(entry.get("last_prompt_hash") or "") or str(entry.get("last_prompt_hash") or "") == prompt_hash
     )
@@ -3987,22 +4067,28 @@ def render_assistant_response_quote_html(assistant_final: str) -> str:
     return _rich_details_quote_html(RESPONSE_LABEL, body_html)
 
 
-def render_worklog_quote_html(worklog_text: str, *, response_available: bool) -> str:
+def render_worklog_quote_html(
+    worklog_text: str,
+    *,
+    response_available: bool,
+    label: str = WORKLOG_LABEL,
+) -> str:
     clean = str(worklog_text or "").strip()
     if not clean:
         return ""
     body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
-    return _rich_details_quote_html(WORKLOG_LABEL, body_html, open_by_default=not response_available)
+    return _rich_details_quote_html(label or WORKLOG_LABEL, body_html, open_by_default=not response_available)
 
 
 def render_turn_item_html(item: dict[str, Any]) -> str:
     user_text = str(item.get("user_text") or "").strip()
     worklog_text = str(item.get("worklog_text") or item.get("assistant_stream_text") or "").strip()
+    worklog_label = str(item.get("worklog_label") or WORKLOG_LABEL).strip() or WORKLOG_LABEL
     assistant_final = str(item.get("assistant_final_text") or "").strip()
     parts: list[str] = []
     if user_text:
         parts.append(render_user_prompt_quote_html(user_text))
-    worklog_html = render_worklog_quote_html(worklog_text, response_available=bool(assistant_final))
+    worklog_html = render_worklog_quote_html(worklog_text, response_available=bool(assistant_final), label=worklog_label)
     if worklog_html:
         parts.append(worklog_html)
     response_html = render_assistant_response_quote_html(assistant_final)
@@ -4016,7 +4102,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
         worklog_html = ""
         if worklog_text:
             worklog_body = _turn_fallback_body_html(worklog_text, len(quote_html) + 120)
-            worklog_html = _rich_details_quote_html(WORKLOG_LABEL, worklog_body, open_by_default=not bool(assistant_final))
+            worklog_html = _rich_details_quote_html(worklog_label, worklog_body, open_by_default=not bool(assistant_final))
         response_html = ""
         if assistant_final:
             body_html = _turn_fallback_body_html(assistant_final, len(quote_html) + len(worklog_html) + 120)
@@ -4026,7 +4112,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
             worklog_html = ""
             if worklog_text:
                 worklog_html = _rich_details_quote_html(
-                    WORKLOG_LABEL,
+                    worklog_label,
                     _rich_paragraph(sanitize_text(worklog_text, 900)),
                     open_by_default=not bool(assistant_final),
                 )
@@ -4038,7 +4124,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     return rendered
 
 
-def render_stream_turn_html(user_text: str, worklog_text: str) -> str:
+def render_stream_turn_html(user_text: str, worklog_text: str, *, worklog_label: str = WORKLOG_LABEL) -> str:
     clean_user = sanitize_text(str(user_text or ""), USER_PROMPT_MAX_CHARS).strip()
     clean_worklog = sanitize_text(str(worklog_text or ""), MAX_REPLY_CHARS).strip()
     if clean_user:
@@ -4047,10 +4133,11 @@ def render_stream_turn_html(user_text: str, worklog_text: str) -> str:
                 "kind": "turn",
                 "user_text": clean_user,
                 "worklog_text": clean_worklog,
+                "worklog_label": worklog_label,
                 "assistant_final_text": "",
             }
         )
-    return render_worklog_quote_html(clean_worklog, response_available=False)
+    return render_worklog_quote_html(clean_worklog, response_available=False, label=worklog_label)
 
 
 def render_decision_item_html(item: dict[str, Any]) -> str:
@@ -4511,6 +4598,7 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
     }
     if include_render_version:
         payload["render_version"] = RICH_RENDER_VERSION
+        payload["worklog_label"] = item.get("worklog_label")
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -5506,6 +5594,9 @@ def pane_input_looks_staged(pane_id: str) -> bool:
     if not raw.strip():
         return False
     lines = raw.splitlines()[-16:]
+    clean_lines = [ANSI_RE.sub("", str(line or "")).strip() for line in lines]
+    if any(CODEX_GOAL_USAGE_FOOTER_RE.search(line) for line in clean_lines):
+        return False
     for line in reversed(lines):
         clean = ANSI_RE.sub("", str(line or "")).strip()
         if PROMPT_PLACEHOLDER_RE.fullmatch(clean):
@@ -6295,14 +6386,14 @@ def stream_draft_id(chat_id: str, space_key_value: str, pane_key_value: str, tur
     return value or 1
 
 
-def stream_throttle_reason(entry: dict[str, Any], turn_id: str) -> str:
+def stream_throttle_reason(entry: dict[str, Any], turn_id: str, *, max_updates: int | None = None) -> str:
     if str(entry.get("last_stream_turn_id") or "") != str(turn_id):
         return ""
     try:
         update_count = int(entry.get("last_stream_update_count") or 0)
     except (TypeError, ValueError):
         update_count = 0
-    if MAX_STREAM_DRAFTS > 0 and update_count >= MAX_STREAM_DRAFTS:
+    if max_updates is not None and max_updates > 0 and update_count >= max_updates:
         return "max_stream_updates"
     if STREAM_MIN_INTERVAL_SECONDS > 0 and entry.get("last_stream_sent_at"):
         try:
@@ -6488,7 +6579,7 @@ def send_stream_draft(
     text_hash = stream_render_hash(clean_text, user_text)
     if entry.get("last_stream_hash") == text_hash and str(entry.get("last_stream_turn_id") or "") == str(turn_id):
         return {"ok": True, "skipped": True, "reason": "unchanged_hash", "hash": text_hash}
-    throttle_reason = stream_throttle_reason(entry, str(turn_id))
+    throttle_reason = stream_throttle_reason(entry, str(turn_id), max_updates=MAX_STREAM_DRAFTS)
     if throttle_reason:
         return {"ok": True, "skipped": True, "reason": throttle_reason, "hash": text_hash}
     draft_id = stream_draft_id(
@@ -6497,7 +6588,7 @@ def send_stream_draft(
         str(entry.get("pane_key") or ""),
         str(turn_id),
     )
-    html_text = render_stream_turn_html(user_text, clean_text)
+    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)))
     result = send_rich_message_draft(
         chat_id,
         html_text,
@@ -6547,7 +6638,7 @@ def send_stream_message(
     if throttle_reason:
         return {"ok": True, "skipped": True, "reason": throttle_reason, "hash": text_hash, "format": "message"}
 
-    html_text = render_stream_turn_html(user_text, clean_text)
+    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)))
     fallback_text = html_to_plain(html_text)
     message_id = str(entry.get("last_stream_message_id") or "")
     if not message_id:
@@ -8060,6 +8151,7 @@ def send_pending_prompt_message(
     if not turn_id or not prompt_text:
         return {"changed": False, "topic_missing": False}
     prompt_hash = str(entry.get("pending_prompt_hash") or stream_text_hash(prompt_text))
+    ensure_request_started(entry, turn_id)
     last_prompt_hash = str(entry.get("last_prompt_hash") or "")
     if str(entry.get("last_prompt_turn_id") or "") == turn_id and (
         not last_prompt_hash or last_prompt_hash == prompt_hash

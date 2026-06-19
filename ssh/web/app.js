@@ -1,6 +1,13 @@
 /* herdres Mini App — viewer client.
    Mirrors the Mac's herdr TUI: relay bytes -> xterm, taps/keys -> relay. */
 
+import { installTerminalTouchScrolling } from './touch-scroll.js';
+import { renderSpacePaneNavigation } from './navigation.js';
+import { hasCoarsePointer, shouldAutoFocusTerminal } from './focus-policy.js';
+import { focusPaneInStatus } from './space-panes.js';
+import { recoverTerminalAfterFit } from './terminal-recovery.js';
+import { installScrollJoystick } from './scroll-joystick.js';
+
 (() => {
   'use strict';
 
@@ -11,7 +18,16 @@
   const curtain = $('curtain');
   const curtainTitle = $('curtain-title');
   const curtainBody = $('curtain-body');
-  const drove = $('drove');
+  const spaces = $('spaces');
+  const panesBar = $('drove');
+  const screen = $('screen');
+  const keys = $('keys');
+  let selectedSpace = '';
+  let latestStatus = { spaces: [], panes: [] };
+
+  function focusTerminalIfAppropriate() {
+    if (shouldAutoFocusTerminal({ coarsePointer: hasCoarsePointer(window) })) term.focus();
+  }
 
   // --- Telegram chrome ----------------------------------------------------
   if (tg) {
@@ -60,7 +76,7 @@
   });
   const fit = new window.FitAddon.FitAddon();
   term.loadAddon(fit);
-  term.open($('screen'));
+  term.open(screen);
 
   let ctrlArmed = false;
   const kCtrl = $('k-ctrl');
@@ -144,7 +160,8 @@
         showCurtain('Session ended', 'herdr closed on the Mac.');
         break;
       case 'status':
-        renderDrove(msg.panes || []);
+        latestStatus = { spaces: msg.spaces || [], panes: msg.panes || [] };
+        renderNavigation();
         break;
     }
   }
@@ -153,7 +170,7 @@
     curtain.hidden = true;
     setLink('live', 'live');
     term.reset();
-    term.focus();
+    focusTerminalIfAppropriate();
     scheduleFit(); // re-sends size, which nudges herdr to repaint
   }
 
@@ -169,17 +186,28 @@
 
   // --- sizing -------------------------------------------------------------
   let fitTimer = null;
+  let fitSize = { cols: 0, rows: 0 };
   function scheduleFit() {
     clearTimeout(fitTimer);
     fitTimer = setTimeout(() => {
       try {
         fit.fit();
       } catch (_) {}
+      fitSize = recoverTerminalAfterFit({ coarsePointer: hasCoarsePointer(window), previousSize: fitSize, term });
       sendControl({ t: 'resize', cols: term.cols, rows: term.rows });
     }, 120);
   }
   window.addEventListener('resize', scheduleFit);
   window.addEventListener('orientationchange', scheduleFit);
+
+  installTerminalTouchScrolling({
+    screen,
+    strips: [spaces, panesBar],
+    keys,
+    term,
+    focusOnTap: shouldAutoFocusTerminal({ coarsePointer: hasCoarsePointer(window) }),
+  });
+  installScrollJoystick({ root: $('scroll-joy'), onScroll: sendControl });
 
   // --- link + curtain -----------------------------------------------------
   function setLink(state, label) {
@@ -195,25 +223,23 @@
   }
 
   // --- drove line ---------------------------------------------------------
-  const STATUS = { working: 'working', idle: 'idle', blocked: 'blocked', done: 'done' };
-  function renderDrove(panes) {
-    if (!panes.length) {
-      drove.innerHTML = '<span class="drove__empty">no panes yet</span>';
-      return;
-    }
-    drove.innerHTML = '';
-    for (const p of panes) {
-      const el = document.createElement('button');
-      el.className = 'head' + (p.focused ? ' head--focused' : '');
-      el.dataset.status = STATUS[p.status] || 'idle';
-      el.innerHTML = `<span class="head__pip"></span><span class="head__name"></span>`;
-      el.querySelector('.head__name').textContent = p.label;
-      el.addEventListener('click', () => {
-        sendControl({ t: 'focus', id: p.id });
-        term.focus();
-      });
-      drove.appendChild(el);
-    }
+  function renderNavigation() {
+    selectedSpace = renderSpacePaneNavigation({
+      spacesEl: spaces,
+      panesEl: panesBar,
+      status: latestStatus,
+      selected: selectedSpace,
+      onSpace: (id) => {
+        selectedSpace = id;
+        sendControl({ t: 'focus_space', id });
+        renderNavigation();
+      },
+      onPane: (id) => {
+        latestStatus = focusPaneInStatus(latestStatus, id);
+        renderNavigation();
+        sendControl({ t: 'focus', id });
+      },
+    });
   }
 
   // --- key bar ------------------------------------------------------------
@@ -235,7 +261,7 @@
     return raw;
   }
 
-  $('keys').addEventListener('click', (ev) => {
+  keys.addEventListener('click', (ev) => {
     const btn = ev.target.closest('.key');
     if (!btn) return;
     if (btn.dataset.mod === 'ctrl') {
@@ -249,7 +275,7 @@
       disarmCtrl();
     }
     sendInput(out);
-    term.focus();
+    focusTerminalIfAppropriate();
   });
 
   // --- go -----------------------------------------------------------------

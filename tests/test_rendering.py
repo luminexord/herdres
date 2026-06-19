@@ -5,6 +5,7 @@ import json
 import re
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -944,6 +945,56 @@ class TelegramDraftTests(unittest.TestCase):
         self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", rich_message["html"])
         self.assertNotIn("<b>Response</b>", rich_message["html"])
 
+    def test_request_elapsed_label_formats_minutes_and_hours(self) -> None:
+        self.assertEqual(
+            herdres.request_elapsed_label(
+                "2026-06-19T10:00:00+00:00",
+                now=datetime(2026, 6, 19, 10, 2, 30, tzinfo=timezone.utc),
+            ),
+            "2m",
+        )
+        self.assertEqual(
+            herdres.request_elapsed_label(
+                "2026-06-19T10:00:00+00:00",
+                now=datetime(2026, 6, 19, 11, 4, 0, tzinfo=timezone.utc),
+            ),
+            "1h 4m",
+        )
+
+    def test_stream_draft_renders_elapsed_worklog_label(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}}
+        started_at = (datetime.now(timezone.utc) - timedelta(minutes=2, seconds=5)).replace(microsecond=0).isoformat()
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+            "request_turn_id": "turn-1",
+            "request_started_at": started_at,
+        }
+        calls: list[tuple[str, dict]] = []
+
+        def fake_api(method: str, payload: dict) -> dict:
+            calls.append((method, payload))
+            return {"ok": True, "result": True}
+
+        with patch.object(herdres, "telegram_api", fake_api), patch.multiple(
+            herdres,
+            STREAM_MIN_INTERVAL_SECONDS=0,
+            STREAM_MIN_CHARS=0,
+        ):
+            result = herdres.send_stream_draft(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer",
+            )
+
+        self.assertTrue(result["ok"])
+        rich_message = json.loads(calls[0][1]["rich_message"])
+        self.assertIn("<details open><summary><b>Worklog (2m)</b></summary><blockquote>", rich_message["html"])
+
     def test_stream_draft_throttle_enforces_min_interval_between_updates(self) -> None:
         telegram = {"rich_messages": {"supported": "yes"}}
         entry = {
@@ -1063,6 +1114,48 @@ class TelegramDraftTests(unittest.TestCase):
         self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", edit_rich.call_args.args[2])
         self.assertTrue(second["ok"])
         self.assertFalse(second.get("sent_message", False))
+
+    def test_stream_message_edits_visible_reply_after_draft_cap(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}, "streaming_drafts": {"supported": "no"}}
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+            "last_stream_turn_id": "turn-1",
+            "last_stream_update_count": 8,
+            "last_stream_hash": "old-hash",
+            "last_stream_message_id": "5001",
+        }
+        send_rich = Mock(return_value={"ok": True, "message_id": "new-message", "format": "rich"})
+        edit_rich = Mock(return_value={"ok": True, "message_id": "5001", "kind": "edited"})
+
+        with patch.multiple(
+            herdres,
+            send_rich_message=send_rich,
+            edit_rich_message=edit_rich,
+            STREAM_MIN_INTERVAL_SECONDS=0,
+            STREAM_MIN_CHARS=0,
+            MAX_STREAM_DRAFTS=8,
+        ):
+            result = herdres.send_stream_message(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Newer worklog that should still edit the visible message after the draft cap.",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["format"], "message-edit")
+        self.assertFalse(result.get("skipped", False))
+        send_rich.assert_not_called()
+        edit_rich.assert_called_once()
+        self.assertEqual(entry["last_stream_update_count"], 9)
+        self.assertEqual(
+            entry["last_stream_text"],
+            "Newer worklog that should still edit the visible message after the draft cap.",
+        )
 
 
 class ManagedBotTests(unittest.TestCase):
@@ -1366,6 +1459,8 @@ class StreamingIntegrationTests(unittest.TestCase):
             self.assertEqual(len(edit_calls), 0)
             self.assertEqual(entry["last_prompt_message_id"], "2001")
             self.assertEqual(entry["last_pane_message_id"], "2001")
+            self.assertEqual(entry["request_turn_id"], "turn-1")
+            self.assertTrue(entry["request_started_at"])
             prompt_html = json.loads(send_calls[0][1]["rich_message"])["html"]
             self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", prompt_html)
             self.assertIn(user_text, prompt_html)
@@ -1383,7 +1478,7 @@ class StreamingIntegrationTests(unittest.TestCase):
             working_html = json.loads(edit_calls[0][1]["rich_message"])["html"]
             self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", working_html)
             self.assertIn(user_text, working_html)
-            self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", working_html)
+            self.assertIn("<details open><summary><b>Worklog (1m)</b></summary><blockquote>", working_html)
             self.assertIn(worklog_text, working_html)
             self.assertNotIn("<b>Response</b>", working_html)
 
@@ -1403,10 +1498,10 @@ class StreamingIntegrationTests(unittest.TestCase):
         self.assertEqual(final_item["assistant_final_text"], response_text)
         self.assertEqual(entry["last_clean_message_id"], "2001")
         self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", final_html)
-        self.assertIn("<details><summary><b>Worklog</b></summary><blockquote>", final_html)
+        self.assertIn("<details><summary><b>Worklog (1m)</b></summary><blockquote>", final_html)
         self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", final_html)
-        self.assertLess(final_html.index("<b>User:</b>"), final_html.index("<b>Worklog</b>"))
-        self.assertLess(final_html.index("<b>Worklog</b>"), final_html.index("<b>Response</b>"))
+        self.assertLess(final_html.index("<b>User:</b>"), final_html.index("<b>Worklog (1m)</b>"))
+        self.assertLess(final_html.index("<b>Worklog (1m)</b>"), final_html.index("<b>Response</b>"))
 
     def test_sync_completed_turn_resends_final_when_anchor_is_not_latest_message(self) -> None:
         state, pane, _key, entry = self._state()
@@ -3243,6 +3338,36 @@ Verification
         self.assertEqual(commands[0], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "ctrl+u"])
         self.assertEqual(commands[1][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
         self.assertEqual(commands[1][4], "how are you")
+
+    def test_send_to_pane_ignores_codex_goal_usage_footer(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "codex"}
+        current_composer = """• Service tier set to default
+
+
+› Explain this codebase
+
+  gpt-5.5 xhigh · ~/Projects/herdres  Goal hit usage limits (/goal resume)"""
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value=pane),
+            pane_output=Mock(return_value=current_composer),
+            run_cmd=run_cmd,
+        ):
+            ok, detail = herdres.send_to_pane("pane-1", "okay create PoCs")
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(commands[0][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
+        self.assertEqual(commands[0][4], "okay create PoCs")
 
     def test_pane_input_stage_detection_ignores_old_visible_prompt_history(self) -> None:
         visible_history = """Previous answer.

@@ -35,13 +35,21 @@
         </span>
       </header>
 
-      <!-- The drove line: one marker per herdr pane, colored by agent status. -->
+      <nav id="spaces" class="drove" aria-label="Herdr spaces">
+        <span class="drove__empty">no spaces yet</span>
+      </nav>
       <nav id="drove" class="drove" aria-label="Herdr panes">
         <span class="drove__empty">no panes yet</span>
       </nav>
 
       <!-- The mirror of the live herdr screen. -->
       <main id="screen" class="screen"></main>
+
+      <div id="scroll-joy" class="scroll-joy" aria-label="Active pane scroll controls">
+        <button class="scroll-joy__button" data-scroll="up" aria-label="Scroll active pane up">↑</button>
+        <span class="scroll-joy__nub" aria-hidden="true"></span>
+        <button class="scroll-joy__button" data-scroll="down" aria-label="Scroll active pane down">↓</button>
+      </div>
 
       <!-- Touch control surface: keys a soft keyboard makes awkward. -->
       <footer class="bar bar--keys" id="keys">
@@ -71,6 +79,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
-    <script src="app.js"></script>
+    <script type="module" src="app.js"></script>
   </body>
 </html>
