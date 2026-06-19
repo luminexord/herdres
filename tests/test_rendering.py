@@ -399,9 +399,12 @@ HERDRES_REPORT_END
         assert item is not None
         html = herdres.render_feed_item_html(item)
         self.assertIn("<h3>Sprint Status</h3>", html)
-        self.assertIn("<table bordered striped>", html)
-        self.assertIn("<th>Task</th>", html)
-        self.assertIn("<td>Alex</td>", html)
+        # Tables render as a universally-supported monospace <pre> grid, not a
+        # version-gated native <table> (which breaks older Telegram clients).
+        self.assertNotIn("<table", html)
+        self.assertIn("<pre>", html)
+        self.assertIn("Task", html)
+        self.assertIn("Alex", html)
         self.assertIn('<input type="checkbox" checked>', html)
         self.assertIn('<input type="checkbox">', html)
         self.assertIn("<details><summary>Risks</summary>", html)
@@ -3731,16 +3734,25 @@ Verification
         self.assertNotIn("&#96;", html)
         self.assertIn("unmatched marker", html)
 
-    def test_report_table_cells_do_not_gain_turn_inline_code(self) -> None:
+    def test_table_renders_as_pre_grid_not_native_table(self) -> None:
+        # Native <table> elements are version-gated and break older Telegram
+        # clients, so tables render as a monospace <pre> grid with plain cells.
         html = herdres._rich_table_section(["File | Status", "herdres.py | OK"])
 
-        self.assertIn("<td>herdres.py</td>", html)
-        self.assertNotIn("<td><code>herdres.py</code></td>", html)
+        self.assertTrue(html.startswith("<pre>") and html.endswith("</pre>"))
+        self.assertNotIn("<table", html)
+        self.assertNotIn("<td>", html)
+        self.assertNotIn("<code>", html)
+        self.assertIn("herdres.py", html)
+        self.assertIn("File", html)
 
-    def test_turn_table_cells_use_rich_inline_code(self) -> None:
+    def test_turn_table_renders_as_pre_grid(self) -> None:
         html = herdres.render_final_reply_html("Files\nFile | Status\nherdres.py | OK")
 
-        self.assertIn("<td><code>herdres.py</code></td>", html)
+        self.assertIn("<pre>", html)
+        self.assertNotIn("<table", html)
+        self.assertNotIn("<code>herdres.py</code>", html)
+        self.assertIn("herdres.py", html)
 
     def test_short_standalone_lines_become_turn_headings(self) -> None:
         html = herdres.render_final_reply_html("Pushed\n`cdee2ca Sync topic names`\n\nVerification\n- tests OK")

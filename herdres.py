@@ -2172,7 +2172,18 @@ def _is_table_separator(cells: list[str]) -> bool:
     return bool(cells) and all(re.fullmatch(r":?-{2,}:?", cell or "") for cell in cells)
 
 
+def _strip_inline_markdown(text: str) -> str:
+    # Inside a <pre> block Telegram renders text literally, so drop markdown
+    # emphasis/code markers to keep the monospace grid clean.
+    return re.sub(r"(\*\*|__|\*|_|`)", "", str(text or "")).strip()
+
+
 def _rich_table_section(lines: list[str], *, rich_cells: bool = False) -> str:
+    # NOTE: native rich <table> elements are version-gated — older Telegram
+    # clients render them as "This message is not supported in your version of
+    # Telegram." So we emit an aligned monospace <pre> grid instead, which every
+    # client supports (and scrolls horizontally on mobile). rich_cells is kept
+    # for call-site compatibility but unused (cells are plain text inside <pre>).
     rows: list[list[str]] = []
     for line in lines:
         if not line.strip():
@@ -2182,22 +2193,23 @@ def _rich_table_section(lines: list[str], *, rich_cells: bool = False) -> str:
             continue
         if _is_table_separator(cells):
             continue
-        rows.append(cells[:20])
+        rows.append([_strip_inline_markdown(cell)[:160] for cell in cells[:20]])
     if len(rows) < 2:
         return ""
-    width = max(len(row) for row in rows[:20])
-    normalized = [row + [""] * (width - len(row)) for row in rows[:20]]
-    header = normalized[0]
-    body = normalized[1:]
-    cell_html = _rich_inline if rich_cells else _html_text
-    html_rows = [
-        "<tr>" + "".join(f"<th>{cell_html(cell, 160)}</th>" for cell in header) + "</tr>",
-    ]
-    html_rows.extend(
-        "<tr>" + "".join(f"<td>{cell_html(cell, 160)}</td>" for cell in row) + "</tr>"
-        for row in body
-    )
-    return "<table bordered striped>\n" + "\n".join(html_rows) + "\n</table>"
+    width = max(len(row) for row in rows)
+    normalized = [row + [""] * (width - len(row)) for row in rows]
+    col_w = [0] * width
+    for row in normalized:
+        for i, cell in enumerate(row):
+            if len(cell) > col_w[i]:
+                col_w[i] = len(cell)
+
+    def _fmt(row: list[str]) -> str:
+        return " | ".join(cell.ljust(col_w[i]) for i, cell in enumerate(row)).rstrip()
+
+    sep = "-+-".join("-" * col_w[i] for i in range(width))
+    table_text = "\n".join([_fmt(normalized[0]), sep, *(_fmt(row) for row in normalized[1:])])
+    return "<pre>" + html.escape(table_text, quote=False) + "</pre>"
 
 
 def _checklist_item(line: str) -> tuple[bool, str] | None:
