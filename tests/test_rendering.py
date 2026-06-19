@@ -5336,6 +5336,25 @@ class RichMessageSplitTests(unittest.TestCase):
             self.assertTrue(c.endswith("</table>"))
             self.assertTrue(self._balanced(c))
 
+    def test_hard_split_keeps_row_closing_delimiter_with_row(self) -> None:
+        row = "<tr><td>" + ("x" * 186) + "</td></tr>"
+        html = "<table>" + row + row + "</table>"
+        chunks = herdres.split_rich_html(html, 100)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertTrue(self._balanced(c))
+
+    def test_hard_split_newline_inside_row_stays_balanced(self) -> None:
+        # A "\n" inside an open <tr> must NOT be treated as a split boundary for a
+        # table (only </tr> is) — otherwise a chunk could end mid-row, unbalanced.
+        row = "<tr><td>" + ("a" * 90) + "\n" + ("b" * 90) + "</td></tr>"
+        html = "<table>" + row + row + "</table>"
+        chunks = herdres.split_rich_html(html, 120)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertTrue(self._balanced(c))
+        self.assertEqual("".join(chunks).count("<tr>"), "".join(chunks).count("</tr>"))
+
     def test_send_rich_message_splits_oversize_into_multiple_sends(self) -> None:
         html = "".join(f"<p>paragraph number {i} with filler</p>" for i in range(400))
         calls = []
@@ -5362,6 +5381,77 @@ class RichMessageSplitTests(unittest.TestCase):
         with patch.object(herdres, "telegram_api", side_effect=lambda m, p: calls.append((m, p)) or {"ok": True, "result": {"message_id": 7}}):
             herdres.send_rich_message("-100", "<p>tiny</p>", telegram={"rich_messages": {"supported": "yes"}})
         self.assertEqual(len([m for m, _ in calls if m == "sendRichMessage"]), 1)
+
+    def test_send_rich_message_uses_legacy_when_telegram_is_none(self) -> None:
+        calls = []
+        with patch.object(herdres, "telegram_api", side_effect=lambda m, p: calls.append((m, p)) or {"ok": True, "result": {"message_id": 7}}):
+            result = herdres.send_rich_message("-100", "<p><b>tiny</b></p>", telegram=None)
+        self.assertEqual([m for m, _ in calls], ["sendMessage"])
+        self.assertEqual(result["format"], "legacy")
+        self.assertEqual(calls[0][1]["text"], "tiny")
+
+    def test_send_rich_message_uses_legacy_when_support_unknown(self) -> None:
+        calls = []
+        tg = {}
+        with patch.object(herdres, "telegram_api", side_effect=lambda m, p: calls.append((m, p)) or {"ok": True, "result": {"message_id": 8}}):
+            result = herdres.send_rich_message("-100", "<p>tiny</p>", telegram=tg)
+        self.assertEqual([m for m, _ in calls], ["sendMessage"])
+        self.assertEqual(result["format"], "legacy")
+        self.assertEqual(tg["rich_messages"]["supported"], "unknown")
+
+    def test_send_rich_message_uses_rich_when_supported(self) -> None:
+        calls = []
+        tg = {"rich_messages": {"supported": "yes"}}
+        with patch.object(herdres, "telegram_api", side_effect=lambda m, p: calls.append((m, p)) or {"ok": True, "result": {"message_id": 9}}):
+            result = herdres.send_rich_message("-100", "<p>tiny</p>", telegram=tg)
+        self.assertEqual([m for m, _ in calls], ["sendRichMessage"])
+        self.assertEqual(result["format"], "rich")
+
+    def test_send_rich_message_reports_later_chunk_failure(self) -> None:
+        html = "".join(f"<p>paragraph number {i} with filler</p>" for i in range(400))
+        calls = []
+
+        def fake_chunk(chat_id, chunk, **kwargs):
+            calls.append(chunk)
+            if len(calls) == 1:
+                return {"ok": True, "format": "rich", "message_id": "100"}
+            return {"ok": False, "format": "rich", "kind": "transient", "transient": True, "error": "boom"}
+
+        with patch.object(herdres, "_send_rich_chunk", side_effect=fake_chunk):
+            result = herdres.send_rich_message("-100", html, telegram={"rich_messages": {"supported": "yes"}})
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["partial_sent"])
+        self.assertEqual(result["failed_chunk_index"], 1)
+        self.assertEqual(result["message_id"], "100")
+        self.assertEqual(len(calls), 2)
+
+    def test_send_rich_message_stops_rich_after_capability_fallback(self) -> None:
+        html = "".join(f"<p>paragraph number {i} with filler</p>" for i in range(400))
+        calls = []
+        tg = {"rich_messages": {"supported": "yes"}}
+
+        def fake_api(method, payload):
+            calls.append((method, payload))
+            if method == "sendRichMessage":
+                raise herdres.BridgeError("Telegram sendRichMessage failed: method not found")
+            return {"ok": True, "result": {"message_id": len(calls)}}
+
+        with patch.object(herdres, "telegram_api", side_effect=fake_api):
+            result = herdres.send_rich_message("-100", html, telegram=tg)
+        self.assertTrue(result["ok"])
+        self.assertEqual(len([m for m, _ in calls if m == "sendRichMessage"]), 1)
+        self.assertGreater(len([m for m, _ in calls if m == "sendMessage"]), 1)
+        self.assertEqual(tg["rich_messages"]["supported"], "no")
+
+    def test_edit_rich_message_uses_plain_edit_payload(self) -> None:
+        calls = []
+        tg = {"rich_messages": {"supported": "yes"}}
+        with patch.object(herdres, "telegram_api", side_effect=lambda m, p: calls.append((m, p)) or {"ok": True, "result": {"message_id": 10}}):
+            result = herdres.edit_rich_message("-100", "10", "<p><b>updated</b></p>", telegram=tg)
+        self.assertTrue(result["ok"])
+        self.assertEqual([m for m, _ in calls], ["editMessageText"])
+        self.assertEqual(calls[0][1]["text"], "updated")
+        self.assertNotIn("rich_message", calls[0][1])
 
 
 class CodexFenceAndAcronymTests(unittest.TestCase):

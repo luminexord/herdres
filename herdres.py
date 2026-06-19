@@ -4787,7 +4787,7 @@ def rich_enabled(telegram: dict[str, Any] | None) -> bool:
     if not RICH_MESSAGES_ENABLED:
         return False
     rich = rich_telegram_state(telegram)
-    return str(rich.get("supported") or "unknown") != "no"
+    return str(rich.get("supported") or "unknown") == "yes"
 
 
 def mark_rich_supported(telegram: dict[str, Any] | None) -> None:
@@ -4945,13 +4945,36 @@ def _hard_split_rich_block(block: str, limit: int) -> list[str]:
         return pieces or [block[:limit]]
     open_tag, _name, inner, close_tag = m.groups()
     budget = max(200, limit - len(open_tag) - len(close_tag))
+    # Break only at structurally-complete boundaries so a chunk is never tag
+    # unbalanced: whole rows for tables, whole items for lists, else lines/<br>.
+    # Restricting the boundary by block type means a stray "\n" inside an open
+    # <tr>/<li> can't split that row/item.
+    if "</tr>" in inner:
+        delim = r"(</tr>)"
+    elif "</li>" in inner:
+        delim = r"(</li>)"
+    else:
+        delim = r"(<br\s*/?>|\n)"
+    boundary = re.compile(delim[1:-1], re.IGNORECASE)
     pieces, cur = [], ""
-    for part in re.split(r"(</tr>|</li>|<br\s*/?>|\n)", inner):
-        if cur and len(cur) + len(part) > budget:
+    unit = ""
+    for part in re.split(delim, inner):
+        if not part:
+            continue
+        unit += part
+        if boundary.fullmatch(part):
+            if cur and len(cur) + len(unit) > budget:
+                pieces.append(open_tag + cur + close_tag)
+                cur = unit
+            else:
+                cur += unit
+            unit = ""
+    if unit:
+        if cur and len(cur) + len(unit) > budget:
             pieces.append(open_tag + cur + close_tag)
-            cur = part
+            cur = unit
         else:
-            cur += part
+            cur += unit
     if cur:
         pieces.append(open_tag + cur + close_tag)
     return pieces
@@ -5007,6 +5030,16 @@ def _send_rich_chunk(
     reply_markup: dict[str, Any] | None,
     reply_to_message_id: str | int | None,
 ) -> dict[str, Any]:
+    if not rich_enabled(telegram):
+        return send_legacy_message_result(
+            chat_id,
+            fallback,
+            thread_id=thread_id,
+            notify=notify,
+            reply_markup=reply_markup,
+            reply_to_message_id=reply_to_message_id,
+        )
+
     payload: dict[str, Any] = {
         "chat_id": chat_id,
         "rich_message": json.dumps(
@@ -5116,10 +5149,12 @@ def send_rich_message(
             first_result = result
             if not result.get("ok"):
                 return result
-        elif not result.get("ok") and not rich_enabled(telegram):
-            # rich capability dropped mid-stream; remaining chunks already went
-            # out as legacy via _send_rich_chunk's fallback. Stop chaining rich.
-            break
+        elif not result.get("ok"):
+            result["partial_sent"] = True
+            result["failed_chunk_index"] = idx
+            if first_result.get("message_id"):
+                result["message_id"] = first_result["message_id"]
+            return result
     return first_result or {"ok": False, "format": "rich", "kind": "empty"}
 
 
@@ -5133,43 +5168,7 @@ def edit_rich_message(
     reply_markup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
-    if not rich_enabled(telegram):
-        return edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup)
-
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "message_id": str(message_id),
-        "rich_message": json.dumps(
-            {"html": sanitize_text(html_text, MAX_RICH_HTML_CHARS), "skip_entity_detection": True},
-            separators=(",", ":"),
-        ),
-    }
-    payload.update(_reply_markup_payload(reply_markup))
-    try:
-        response = telegram_api("editMessageText", payload)
-    except RateLimited:
-        raise
-    except BridgeError as exc:
-        kind = classify_telegram_error(exc)
-        if kind == "not_modified":
-            return {"ok": True, "kind": kind}
-        if kind == "not_found":
-            return {"ok": False, "kind": kind, "not_found": True, "error": str(exc)}
-        if kind == "topic_not_found":
-            return {"ok": False, "kind": kind, "topic_missing": True, "error": str(exc)}
-        if kind == "capability":
-            mark_rich_disabled(telegram, str(exc))
-            legacy = edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup)
-            legacy["fallback_reason"] = kind
-            return legacy
-        if kind == "bad_request":
-            note_rich_bad_request(telegram, str(exc))
-            legacy = edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup)
-            legacy["fallback_reason"] = kind
-            return legacy
-        return {"ok": False, "kind": kind, "transient": True, "error": str(exc)}
-    mark_rich_supported(telegram)
-    return {"ok": True, "kind": "edited", "message_id": telegram_message_id(response)}
+    return edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup)
 
 
 def send_feed_item(
