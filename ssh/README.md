@@ -72,6 +72,21 @@ and reach `<mac>.<tailnet>.ts.net`. Then tap the Mini App button in your bot.
 
 ### Keep it running (launchd)
 
+`install-macos.sh` installs the cockpit server, Node dependencies, wrapper, and
+launchd plist together with the regular Herdres agents:
+
+```bash
+./install-macos.sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gaijinjoe.herdres-cockpit.plist
+```
+
+The wrapper reads `~/.config/herdres/herdres.env`, uses the first
+`TELEGRAM_ALLOWED_USERS` id as `HERDRES_OWNER_ID` if needed, and uses the real
+`herdr` binary for the cockpit even when the Telegram bot bridge points
+`HERDR_BIN` at `herdr_turn_adapter.py`.
+
+Manual install is still possible:
+
 ```bash
 mkdir -p ~/.local/share/herdres/ssh
 cp -R server web ~/.local/share/herdres/ssh/        # or symlink the repo

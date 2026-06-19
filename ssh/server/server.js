@@ -25,6 +25,7 @@ import crypto from 'node:crypto';
 import { spawn as spawnProc } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { cleanHerdrPtyEnv } from './herdr-env.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OWNER_ID = (process.env.HERDRES_OWNER_ID || '').trim();
@@ -119,7 +120,7 @@ async function ensureTerm() {
       cols,
       rows,
       cwd: os.homedir(),
-      env: { ...process.env, TERM: 'xterm-256color' },
+      env: cleanHerdrPtyEnv(),
     });
     t.onData((d) => broadcast(Buffer.from(d, 'utf8'), true));
     t.onExit(({ exitCode }) => {

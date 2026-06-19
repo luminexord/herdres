@@ -6,7 +6,8 @@
   "description": "Mac-side cockpit: serves the Herdres Mini App and bridges it to a local herdr PTY over the tailnet.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

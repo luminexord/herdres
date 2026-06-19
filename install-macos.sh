@@ -29,7 +29,7 @@ done
 [ -n "$PY" ] || { echo "error: need Python >= 3.11 on PATH (try: brew install python@3.11)"; exit 1; }
 echo "Using interpreter: $PY ($("$PY" --version 2>&1))"
 
-mkdir -p "$BIN" "$CFG" "$CFG/managed-bots" "$SHARE/herdres-plugin" "$SHARE/inbound" "$LA"
+mkdir -p "$BIN" "$CFG" "$CFG/managed-bots" "$SHARE/herdres-plugin" "$SHARE/inbound" "$SHARE/ssh/server" "$SHARE/ssh/web" "$LA"
 
 # 2. Install scripts, pinning the shebang to the chosen interpreter
 install_pinned() { install -m 755 "$HERE/$1" "$BIN/$2"; /usr/bin/sed -i '' "1s|.*|#!$PY|" "$BIN/$2"; }
@@ -56,7 +56,21 @@ fi
 sed "s#\\[\"herdres\", #\\[\"$BIN/herdres\", #g" \
     "$HERE/herdres-plugin/herdr-plugin.toml" > "$SHARE/herdres-plugin/herdr-plugin.toml"
 
-# 5. launchd wrappers (mirror systemd EnvironmentFile)
+if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete --exclude node_modules "$HERE/ssh/server/" "$SHARE/ssh/server/"
+    rsync -a --delete "$HERE/ssh/web/" "$SHARE/ssh/web/"
+else
+    cp -R "$HERE/ssh/server/." "$SHARE/ssh/server/"
+    rm -rf "$SHARE/ssh/server/node_modules"
+    cp -R "$HERE/ssh/web/." "$SHARE/ssh/web/"
+fi
+
+if command -v npm >/dev/null 2>&1; then
+    (cd "$SHARE/ssh/server" && npm ci --omit=dev && npm_config_build_from_source=true npm rebuild node-pty --foreground-scripts)
+else
+    echo "warning: npm not found; cockpit dependencies were not installed"
+fi
+
 cat > "$SHARE/herdres-sync.sh" <<'EOF'
 #!/bin/sh
 set -a; . "$HOME/.config/herdres/herdres.env"; set +a
@@ -67,12 +81,44 @@ cat > "$SHARE/herdres-gateway.sh" <<'EOF'
 set -a; . "$HOME/.config/herdres/herdres.env"; set +a
 exec "$HOME/.local/bin/herdres-gateway"
 EOF
-chmod +x "$SHARE/herdres-sync.sh" "$SHARE/herdres-gateway.sh"
+cat > "$SHARE/herdres-cockpit.sh" <<'EOF'
+#!/bin/sh
+if [ -f "$HOME/.config/herdres/herdres.env" ]; then
+    set -a; . "$HOME/.config/herdres/herdres.env"; set +a
+fi
 
-# 6. launchd agents (materialize templates)
+if [ -z "${HERDRES_OWNER_ID:-}" ] && [ -n "${TELEGRAM_ALLOWED_USERS:-}" ]; then
+    HERDRES_OWNER_ID="$(printf '%s' "$TELEGRAM_ALLOWED_USERS" | cut -d, -f1 | tr -d '[:space:]')"
+    export HERDRES_OWNER_ID
+fi
+
+if [ -z "${HERDRES_OWNER_ID:-}" ]; then
+    echo "error: set HERDRES_OWNER_ID or TELEGRAM_ALLOWED_USERS in $HOME/.config/herdres/herdres.env" >&2
+    exit 1
+fi
+
+if [ -n "${HERDR_COCKPIT_SHARE_CMD:-}" ]; then
+    HERDR_SHARE_CMD="$HERDR_COCKPIT_SHARE_CMD"
+elif [ -z "${HERDR_SHARE_CMD:-}" ]; then
+    HERDR_SHARE_CMD="${HERDR_REAL_BIN:-$HOME/.local/bin/herdr}"
+fi
+export HERDR_SHARE_CMD
+
+if [ -n "${HERDR_COCKPIT_HERDR_BIN:-}" ]; then
+    HERDR_BIN="$HERDR_COCKPIT_HERDR_BIN"
+elif [ -z "${HERDR_BIN:-}" ] || [ "$(basename "$HERDR_BIN")" = "herdr_turn_adapter.py" ]; then
+    HERDR_BIN="${HERDR_REAL_BIN:-$HOME/.local/bin/herdr}"
+fi
+export HERDR_BIN
+
+exec node "$HOME/.local/share/herdres/ssh/server/server.js"
+EOF
+chmod +x "$SHARE/herdres-sync.sh" "$SHARE/herdres-gateway.sh" "$SHARE/herdres-cockpit.sh"
+
 for label in herdres herdres-gateway; do
     sed "s#__HOME__#$HOME#g" "$HERE/launchd/com.gaijinjoe.$label.plist" > "$LA/com.gaijinjoe.$label.plist"
 done
+sed "s#__HOME__#$HOME#g" "$HERE/ssh/com.gaijinjoe.herdres-cockpit.plist" > "$LA/com.gaijinjoe.herdres-cockpit.plist"
 
 cat <<EOF
 
@@ -81,6 +127,8 @@ Installed. Finish with:
   2) herdr plugin link $SHARE/herdres-plugin
   3) launchctl bootstrap gui/\$(id -u) $LA/com.gaijinjoe.herdres.plist
   4) launchctl bootstrap gui/\$(id -u) $LA/com.gaijinjoe.herdres-gateway.plist
+  5) launchctl bootstrap gui/\$(id -u) $LA/com.gaijinjoe.herdres-cockpit.plist
+  6) tailscale serve --bg https / http://127.0.0.1:8787
 
 Reload an agent after edits:
   launchctl bootout   gui/\$(id -u)/com.gaijinjoe.herdres-gateway
