@@ -3369,6 +3369,36 @@ Verification
         self.assertEqual(commands[0][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
         self.assertEqual(commands[0][4], "okay create PoCs")
 
+    def test_send_to_pane_ignores_truncated_codex_goal_usage_footer(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "codex"}
+        current_composer = """─ Worked for 2m 06s ──────
+
+
+› Explain this codebase
+
+  Goal hit usage limits (/"""
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value=pane),
+            pane_output=Mock(return_value=current_composer),
+            run_cmd=run_cmd,
+        ):
+            ok, detail = herdres.send_to_pane("pane-1", "Complete the next 20 slices")
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(commands[0][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
+        self.assertEqual(commands[0][4], "Complete the next 20 slices")
+
     def test_pane_input_stage_detection_ignores_old_visible_prompt_history(self) -> None:
         visible_history = """Previous answer.
 

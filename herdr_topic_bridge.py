@@ -62,8 +62,11 @@ def _message_thread_id(message: Any) -> str | None:
 
 
 def _topic_space_entry(state: dict[str, Any], chat_id: str, thread_id: str | None) -> tuple[str, dict[str, Any]] | None:
-    telegram = state.get("telegram") or {}
-    if chat_id != str(telegram.get("chat_id") or ""):
+    telegram = state.get("telegram")
+    if not isinstance(telegram, dict):
+        return None
+    configured_chat = str(telegram.get("chat_id") or "")
+    if not configured_chat or chat_id != configured_chat:
         return None
     if not thread_id or thread_id == str(telegram.get("general_thread_id", GENERAL_THREAD_ID)):
         return None
@@ -122,7 +125,7 @@ def _resolve_mapped_entry(
 ) -> tuple[str, dict[str, Any]] | None:
     telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
     configured_chat = str(telegram.get("chat_id") or "")
-    if configured_chat and str(chat_id) != configured_chat:
+    if not configured_chat or str(chat_id) != configured_chat:
         return None
     if prefer_message_id:
         routed = _route_message_entry(state, chat_id, thread_id, message_id)

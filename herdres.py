@@ -202,7 +202,7 @@ TUI_LEADING_CHROME_RE = re.compile(r"^\s*[│┃└┌┐┘├┤╭╮╰╯�
 PROMPT_ONLY_RE = re.compile(r"^\s*(?:❯|›)\s*$")
 PROMPT_WITH_TEXT_RE = re.compile(r"^\s*(?:❯|›)\s+\S+")
 PROMPT_PLACEHOLDER_RE = re.compile(r"^\s*(?:❯|›)\s+Write tests for @filename\s*$", re.IGNORECASE)
-CODEX_GOAL_USAGE_FOOTER_RE = re.compile(r"\bgoal\s+hit\s+usage limits?\s*\(/goal resume\)", re.IGNORECASE)
+CODEX_GOAL_USAGE_FOOTER_RE = re.compile(r"\bgoal\s+hit\s+usage limits?\b", re.IGNORECASE)
 REPORT_BLOCK_RE = re.compile(r"(?ms)^\s*HERDRES_REPORT_START\s*$\s*(.*?)^\s*HERDRES_REPORT_END\s*$")
 CHOICES_BLOCK_RE = re.compile(r"(?ms)^\s*HERDRES_CHOICES_START\s*$\s*(.*?)^\s*HERDRES_CHOICES_END\s*$")
 REPORT_TITLE_RE = re.compile(r"^\s*HERDRES_REPORT_TITLE\s*:\s*(.{1,80})\s*$", re.IGNORECASE)
@@ -2644,7 +2644,10 @@ def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[s
     if isinstance(turn, dict):
         recent = turn.get("recent_turns")
         if isinstance(recent, list) and len(recent) >= 2:
-            delivered = str((entry.get("last_clean_item") or {}).get("turn_id") or "")
+            last_clean_turn = str((entry.get("last_clean_item") or {}).get("turn_id") or "")
+            streamed = str(entry.get("last_stream_turn_id") or entry.get("pending_stream_turn_id") or "")
+            legacy_turn = str(entry.get("last_turn_id") or "")
+            delivered = last_clean_turn or ("" if streamed and legacy_turn == streamed else legacy_turn)
             ids = [str(t.get("turn_id") or "") for t in recent]
             if delivered and delivered in ids:
                 idx = ids.index(delivered)
@@ -2652,7 +2655,6 @@ def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[s
                     catch_up = make_turn_feed_item(recent[idx + 1])
                     if catch_up:
                         return catch_up
-            streamed = str(entry.get("last_stream_turn_id") or entry.get("pending_stream_turn_id") or "")
             if not delivered and streamed and streamed in ids:
                 streamed_item = make_turn_feed_item(recent[ids.index(streamed)])
                 if streamed_item:
@@ -6118,18 +6120,23 @@ def telegram_message_id(response: dict[str, Any]) -> str | None:
     return None
 
 
-def classify_telegram_error(exc: Exception) -> str:
+def _telegram_error_is_bot_access(exc: Exception) -> bool:
     text = str(exc).lower()
-    if isinstance(exc, RateLimited):
-        return "rate_limited"
-    if (
+    return (
         "forbidden" in text
         or "bot was kicked" in text
         or "bot is not a member" in text
         or "chat not found" in text
         or "not enough rights" in text
         or "need administrator rights" in text
-    ):
+    )
+
+
+def classify_telegram_error(exc: Exception, *, managed_bot_context: bool = False) -> str:
+    text = str(exc).lower()
+    if isinstance(exc, RateLimited):
+        return "rate_limited"
+    if managed_bot_context and _telegram_error_is_bot_access(exc):
         return "bot_access"
     if (
         "message thread not found" in text
@@ -6291,6 +6298,28 @@ def _rich_disabled_reason_is_capability(reason: str) -> bool:
 
 def rich_enabled(telegram: dict[str, Any] | None) -> bool:
     if not RICH_MESSAGES_ENABLED:
+        return False
+    rich = rich_telegram_state(telegram)
+    if str(rich.get("supported") or "unknown") != "no":
+        return True
+    if _rich_disabled_reason_is_capability(str(rich.get("disabled_reason") or "")):
+        return False
+    disabled_version_text = str(rich.get("disabled_render_version") or "").strip()
+    disabled_version = int(disabled_version_text) if disabled_version_text.isdigit() else 0
+    if disabled_version == RICH_RENDER_VERSION:
+        return False
+    rich["supported"] = "unknown"
+    rich.pop("disabled_reason", None)
+    rich.pop("disabled_at", None)
+    rich.pop("bad_request_streak", None)
+    rich.pop("disabled_render_version", None)
+    return True
+
+
+def rich_message_send_enabled(telegram: dict[str, Any] | None) -> bool:
+    if not isinstance(telegram, dict):
+        return False
+    if not rich_enabled(telegram):
         return False
     rich = rich_telegram_state(telegram)
     return str(rich.get("supported") or "unknown") == "yes"
@@ -6503,7 +6532,7 @@ def send_message_draft(
     except RateLimited:
         raise
     except BridgeError as exc:
-        kind = classify_telegram_error(exc)
+        kind = classify_telegram_error(exc, managed_bot_context=bool(api_token))
         if kind in {"capability", "bad_request"}:
             mark_streaming_disabled(telegram, str(exc))
         if kind == "not_found":
@@ -6525,7 +6554,7 @@ def send_rich_message_draft(
     api_token: str | None = None,
 ) -> dict[str, Any]:
     fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
-    if not rich_enabled(telegram):
+    if not rich_message_send_enabled(telegram):
         return send_message_draft(
             chat_id,
             fallback,
@@ -6550,7 +6579,7 @@ def send_rich_message_draft(
     except RateLimited:
         raise
     except BridgeError as exc:
-        kind = classify_telegram_error(exc)
+        kind = classify_telegram_error(exc, managed_bot_context=bool(api_token))
         if kind in {"capability", "bad_request"}:
             mark_streaming_disabled(telegram, str(exc))
         if kind == "not_found":
@@ -6660,6 +6689,7 @@ def send_stream_message(
             telegram=telegram,
             fallback_text=fallback_text,
             api_token=managed_bot_token_for_entry(telegram, entry),
+            rich_payload=True,
         )
         if result.get("not_found"):
             entry.pop("last_stream_message_id", None)
@@ -6769,7 +6799,7 @@ def send_legacy_message_result(
     except RateLimited:
         raise
     except BridgeError as exc:
-        kind = classify_telegram_error(exc)
+        kind = classify_telegram_error(exc, managed_bot_context=bool(api_token))
         if kind == "topic_not_found":
             return {"ok": False, "format": "legacy", "kind": kind, "topic_missing": True, "error": str(exc)}
         if kind == "not_found":
@@ -6811,7 +6841,7 @@ def edit_message_text(
     except RateLimited:
         raise
     except BridgeError as exc:
-        kind = classify_telegram_error(exc)
+        kind = classify_telegram_error(exc, managed_bot_context=bool(api_token))
         result = {"ok": kind == "not_modified", "format": "legacy", "kind": kind, "error": str(exc)}
         if kind == "not_found":
             result["not_found"] = True
@@ -7065,7 +7095,7 @@ def _send_rich_chunk(
     api_token: str | None = None,
     allow_managed_bot_fallback: bool = False,
 ) -> dict[str, Any]:
-    if not rich_enabled(telegram):
+    if not rich_message_send_enabled(telegram):
         return send_legacy_message_result(
             chat_id,
             fallback,
@@ -7093,7 +7123,7 @@ def _send_rich_chunk(
     except RateLimited:
         raise
     except BridgeError as exc:
-        kind = classify_telegram_error(exc)
+        kind = classify_telegram_error(exc, managed_bot_context=bool(api_token))
         if kind == "capability":
             _record_rich_failure(kind, telegram, exc)
             result = send_legacy_message_result(
@@ -7161,7 +7191,7 @@ def send_rich_message(
     allow_managed_bot_fallback: bool = False,
 ) -> dict[str, Any]:
     fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
-    if not rich_enabled(telegram):
+    if not rich_message_send_enabled(telegram):
         return send_legacy_message_result(
             chat_id,
             fallback,
@@ -7228,9 +7258,10 @@ def edit_rich_message(
     fallback_text: str = "",
     reply_markup: dict[str, Any] | None = None,
     api_token: str | None = None,
+    rich_payload: bool = False,
 ) -> dict[str, Any]:
     fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
-    if not rich_enabled(telegram):
+    if not rich_payload or not rich_message_send_enabled(telegram):
         return edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup, api_token=api_token)
 
     payload: dict[str, Any] = {
@@ -7247,13 +7278,13 @@ def edit_rich_message(
     except RateLimited:
         raise
     except BridgeError as exc:
-        kind = classify_telegram_error(exc)
+        kind = classify_telegram_error(exc, managed_bot_context=bool(api_token))
         if kind == "not_modified":
-            return {"ok": True, "kind": kind}
+            return {"ok": True, "format": "rich", "kind": kind}
         if kind == "not_found":
-            return {"ok": False, "kind": kind, "not_found": True, "error": str(exc)}
+            return {"ok": False, "format": "rich", "kind": kind, "not_found": True, "error": str(exc)}
         if kind == "topic_not_found":
-            return {"ok": False, "kind": kind, "topic_missing": True, "error": str(exc)}
+            return {"ok": False, "format": "rich", "kind": kind, "topic_missing": True, "error": str(exc)}
         if kind == "capability":
             mark_rich_disabled(telegram, str(exc))
             legacy = edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup, api_token=api_token)
@@ -7264,9 +7295,9 @@ def edit_rich_message(
             legacy = edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup, api_token=api_token)
             legacy["fallback_reason"] = kind
             return legacy
-        return {"ok": False, "kind": kind, "transient": kind == "transient", "error": str(exc)}
+        return {"ok": False, "format": "rich", "kind": kind, "transient": kind == "transient", "error": str(exc)}
     mark_rich_supported(telegram)
-    return {"ok": True, "kind": "edited", "message_id": telegram_message_id(response)}
+    return {"ok": True, "format": "rich", "kind": "edited", "message_id": telegram_message_id(response)}
 
 
 def send_feed_item(
@@ -7312,6 +7343,7 @@ def edit_feed_item(
         fallback_text=item_plain_text(item),
         reply_markup=reply_markup,
         api_token=api_token,
+        rich_payload=True,
     )
 
 
@@ -7373,6 +7405,7 @@ def update_live_card(
             telegram=telegram,
             fallback_text=plain,
             api_token=api_token,
+            rich_payload=True,
         )
         if result.get("ok"):
             entry["card_hash"] = card_hash
@@ -7522,7 +7555,7 @@ def pin_chat_message(chat_id: str, message_id: str | int) -> dict[str, Any]:
         "disable_notification": "true",
     }
     try:
-        telegram_api_for_token("pinChatMessage", payload, None)
+        response = telegram_api_for_token("pinChatMessage", payload, None)
     except RateLimited:
         raise
     except BridgeError as exc:
@@ -7531,6 +7564,12 @@ def pin_chat_message(chat_id: str, message_id: str | int) -> dict[str, Any]:
             return {"ok": True, "kind": "unchanged"}
         kind = classify_telegram_error(exc)
         return {"ok": False, "kind": kind, "transient": kind == "transient", "error": str(exc)}
+    if not response.get("ok", True):
+        description = str(response.get("description") or response.get("error") or response)
+        text = description.lower()
+        if "already pinned" in text or "message is pinned" in text:
+            return {"ok": True, "kind": "unchanged"}
+        return {"ok": False, "kind": "bad_request", "transient": False, "error": sanitize_text(description, 500)}
     return {"ok": True, "kind": "pinned"}
 
 

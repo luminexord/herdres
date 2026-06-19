@@ -17,7 +17,7 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
     def test_chat_not_found_is_child_bot_access_failure(self) -> None:
         error = herdres.BridgeError("Telegram sendMessage failed: Bad Request: chat not found")
 
-        self.assertEqual(herdres.classify_telegram_error(error), "bot_access")
+        self.assertEqual(herdres.classify_telegram_error(error, managed_bot_context=True), "bot_access")
 
     def test_missing_reply_target_is_pane_root_not_found(self) -> None:
         error = herdres.BridgeError("Telegram sendMessage failed: Bad Request: message to be replied not found")
