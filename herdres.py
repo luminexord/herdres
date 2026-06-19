@@ -4699,7 +4699,11 @@ def send_visible_choice_detail_to_pane(
 
 def telegram_token() -> str:
     load_dotenv()
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    # Prefer a herdres-specific outbound token. Nothing else sets it, so it always
+    # comes from herdres.env and wins even when TELEGRAM_BOT_TOKEN is pre-injected
+    # into the environment (e.g. Hermes's EnvironmentFile on the timer service),
+    # which load_dotenv would otherwise refuse to override.
+    token = os.getenv("HERDRES_OUTBOUND_BOT_TOKEN", "").strip() or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise BridgeError("TELEGRAM_BOT_TOKEN is not available")
     return token
