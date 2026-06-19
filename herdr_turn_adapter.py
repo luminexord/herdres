@@ -98,9 +98,12 @@ def is_internal_codex_user_text(text: str) -> bool:
     return stripped.startswith((
         "<environment_context>",
         "<turn_aborted>",
+        "<codex_internal_context>",
+        "<codex_internal_context ",
         "<permissions instructions>",
         "<collaboration_mode>",
         "<skills_instructions>",
+        "<subagent_notification>",
         "<model_switch>",
     ))
 

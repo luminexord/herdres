@@ -69,6 +69,15 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["user_text"], "<literal> What happened?")
         self.assertEqual(turn["assistant_final_text"], "Final answer only.")
 
+    def test_codex_suppresses_new_internal_user_prefixes(self) -> None:
+        self.assertTrue(adapter.is_internal_codex_user_text("<codex_internal_context foo>ignore"))
+        self.assertTrue(adapter.is_internal_codex_user_text("  <codex_internal_context>ignore"))
+        self.assertTrue(adapter.is_internal_codex_user_text("<subagent_notification>ignore</subagent_notification>"))
+        self.assertFalse(adapter.is_internal_codex_user_text("<codex_user_text>keep"))
+        self.assertFalse(adapter.is_internal_codex_user_text("normal prompt"))
+        # must NOT over-match a real prompt that merely starts with the tag text
+        self.assertFalse(adapter.is_internal_codex_user_text("<codex_internal_contextualize this>keep"))
+
     def test_codex_open_turn_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"

@@ -113,6 +113,28 @@ class BridgeRoutingTests(unittest.TestCase):
         self.assertFalse(handled)
         self.assertIsNone(payload)
 
+    def test_missing_configured_chat_id_fails_closed(self):
+        state = self._state()
+        state["telegram"].pop("chat_id")
+        msg = _msg(text="hi", chat=types.SimpleNamespace(id="", is_forum=True))
+        handled, payload = self._run(msg, state)
+        self.assertFalse(handled)
+        self.assertIsNone(payload)
+
+    def test_malformed_telegram_config_fails_closed(self):
+        state = self._state()
+        state["telegram"] = "not-a-dict"
+        handled, payload = self._run(_msg(text="hi"), state)
+        self.assertFalse(handled)
+        self.assertIsNone(payload)
+
+    def test_malformed_pane_entry_is_ignored(self):
+        state = self._state()
+        state["panes"] = {"bad": "not-a-dict"}
+        handled, payload = self._run(_msg(text="hi"), state)
+        self.assertFalse(handled)
+        self.assertIsNone(payload)
+
     def test_owner_prefilter_drops_non_owner_without_spawning(self):
         state = self._state()
         state["telegram"]["owner_user_ids"] = ["42"]

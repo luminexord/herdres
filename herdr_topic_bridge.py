@@ -54,13 +54,15 @@ def _message_thread_id(message: Any) -> str | None:
 
 
 def _mapped_topic_entry(state: dict[str, Any], chat_id: str, thread_id: str | None) -> dict[str, Any] | None:
-    telegram = state.get("telegram") or {}
-    if chat_id != str(telegram.get("chat_id") or ""):
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    configured_chat = str(telegram.get("chat_id") or "")
+    if not configured_chat or chat_id != configured_chat:
         return None
     if not thread_id or thread_id == str(telegram.get("general_thread_id", GENERAL_THREAD_ID)):
         return None
-    for entry in (state.get("panes") or {}).values():
-        if str(entry.get("topic_id") or "") == thread_id:
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    for entry in panes.values():
+        if isinstance(entry, dict) and str(entry.get("topic_id") or "") == thread_id:
             return entry
     return None
 
