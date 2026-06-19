@@ -203,7 +203,9 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
         }
         send_to_pane = Mock(return_value=(True, ""))
 
-        with patch.object(herdres, "load_state", Mock(return_value=state)), patch.object(
+        with patch.object(herdres, "load_dotenv", Mock()), patch.object(
+            herdres, "load_state", Mock(return_value=state)
+        ), patch.object(
             herdres,
             "send_to_pane",
             send_to_pane,
