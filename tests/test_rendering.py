@@ -5303,6 +5303,33 @@ class CodeDetectionTests(unittest.TestCase):
         html = herdres.render_final_reply_html("Set DEBUG=true to enable.")
         self.assertIn("<code>DEBUG=true</code>", html)
 
+    def test_env_style_assignment_excludes_trailing_sentence_punctuation(self) -> None:
+        html = herdres.render_final_reply_html("Set DEBUG=true.")
+        self.assertIn("<code>DEBUG=true</code>.", html)
+        self.assertNotIn("<code>DEBUG=true.</code>", html)
+
+    def test_statistical_notation_with_trailing_punctuation_stays_plain(self) -> None:
+        html = herdres.render_final_reply_html("Results stayed at N=16; f=2.")
+        self.assertIn("N=16; f=2.", html)
+        self.assertNotIn("<code>N=16</code>", html)
+        self.assertNotIn("<code>f=2</code>", html)
+
+    def test_env_assignment_excludes_trailing_closing_delimiter(self) -> None:
+        html = herdres.render_final_reply_html("Set DEBUG=true) and continue.")
+        self.assertIn("<code>DEBUG=true</code>)", html)
+        self.assertNotIn("<code>DEBUG=true)</code>", html)
+
+
+class HtmlToPlainTests(unittest.TestCase):
+    def test_table_cells_are_separated_in_plaintext_fallback(self) -> None:
+        text = herdres.html_to_plain("<table><tr><td>File</td><td>Status</td></tr></table>")
+        self.assertEqual(text, "File | Status")
+        self.assertNotIn("FileStatus", text)
+
+    def test_table_header_cells_are_separated_in_plaintext_fallback(self) -> None:
+        text = herdres.html_to_plain("<table><tr><th>Name</th><th>Result</th></tr></table>")
+        self.assertEqual(text, "Name | Result")
+
 
 class RichMessageSplitTests(unittest.TestCase):
     def _balanced(self, s: str) -> bool:

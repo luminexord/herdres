@@ -229,18 +229,32 @@ ACTIVE_AGENT_STATUSES = {"working", "running", "active", "in_progress", "pending
 GOAL_ACTIVE_RE = re.compile(r"/goal active\b", re.IGNORECASE)
 # Number of footer (tail) lines of the visible screen to scan for the marker.
 GOAL_MARKER_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_GOAL_MARKER_LINES", "16"))
+CODE_FILE_EXTENSIONS = ("py", "json", "toml", "service", "timer", "sh", "md", "txt", "yaml", "yml")
+PATH_OR_SYMBOL_FILE_EXTENSIONS = (
+    "py", "js", "ts", "tsx", "jsx", "json", "md", "txt", "yaml", "yml", "toml", "sh", "service", "timer"
+)
+CODE_FILE_EXT_RE = "|".join(CODE_FILE_EXTENSIONS)
+PATH_OR_SYMBOL_FILE_EXT_RE = "|".join(PATH_OR_SYMBOL_FILE_EXTENSIONS)
+CODE_PATH_BRANCH = r"(?:~|/)[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)+(?::\d+)?"
+CODE_SYMBOL_BRANCH = r"[A-Z][A-Z0-9_]*[_0-9][A-Z0-9_]*"
+CODE_FILE_BRANCH = rf"[A-Za-z_][A-Za-z0-9_]*\.(?:{CODE_FILE_EXT_RE})(?::\d+)?"
+# Env-style assignment ONLY (uppercase key, >=2 chars): DEBUG=true, FOO_BAR=1.
+# NOT statistical notation like N=16, f=2, w=15, p=0.05 (common in prose).
+CODE_ENV_ASSIGN_BRANCH = r"[A-Z][A-Z0-9_]+=\S+"
+CODE_API_BRANCH = r"(?:sendRichMessage|editForumTopic|editMessageText|createForumTopic)"
+INLINE_CODE_HASH_BRANCH = r"[0-9a-f]{7,12}"
+SYMBOL_CODE_HASH_BRANCH = r"[0-9a-f]{7,40}"
 TOKEN_CODE_RE = re.compile(
     r"(?<![\w/])("
-    r"(?:~|/)[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)+(?::\d+)?|"
-    r"\b[A-Z][A-Z0-9_]*[_0-9][A-Z0-9_]*\b|"
-    r"\b[A-Za-z_][A-Za-z0-9_]*\.(?:py|json|toml|service|timer|sh|md|txt|yaml|yml)\b(?::\d+)?|"
-    # env-style assignment ONLY (uppercase key, >=2 chars): DEBUG=true, FOO_BAR=1.
-    # NOT statistical notation like N=16, f=2, w=15, p=0.05 (common in prose).
-    r"\b[A-Z][A-Z0-9_]+=\S+|"
-    r"\b(?:sendRichMessage|editForumTopic|editMessageText|createForumTopic)\b|"
-    r"\b[0-9a-f]{7,12}\b"
+    rf"{CODE_PATH_BRANCH}|"
+    rf"\b{CODE_SYMBOL_BRANCH}\b|"
+    rf"\b{CODE_FILE_BRANCH}\b|"
+    rf"\b{CODE_ENV_ASSIGN_BRANCH}|"
+    rf"\b{CODE_API_BRANCH}\b|"
+    rf"\b{INLINE_CODE_HASH_BRANCH}\b"
     r")(?![\w/])"
 )
+TOKEN_CODE_TRAILING_PUNCT_RE = re.compile(r"[.,;:!?)\]}]+$")
 # Markdown link / image / bare-URL / math spans, masked before inline-code detection
 # so a URL query string or an equation is never shattered into a <code> box.
 MD_IMAGE_RE = re.compile(r"!\[([^\]\n]*)\]\(\s*(https?://[^)\s]+|/[^)\s]+)\s*\)")
@@ -1853,7 +1867,7 @@ def _is_codeish_line(line: str) -> bool:
         # Treat as a command only when it looks command-shaped (short, or has a
         # flag/path/operator) so prose like "git handles version control" stays prose.
         return len(stripped.split()) <= 3 or bool(re.search(r"(?:^|\s)[-/]|--|[=|<>]", stripped))
-    if re.fullmatch(r"[A-Z][A-Z0-9_]+=\S+", stripped):
+    if re.fullmatch(CODE_ENV_ASSIGN_BRANCH, stripped):
         return True
     return False
 
@@ -1862,15 +1876,15 @@ def looks_like_path_or_symbol(value: str) -> bool:
     clean = str(value or "").strip()
     if not clean or len(clean.split()) > 3:
         return False
-    if re.fullmatch(r"[A-Z][A-Z0-9_]*[_0-9][A-Z0-9_]*", clean):
+    if re.fullmatch(CODE_SYMBOL_BRANCH, clean):
         return True
-    if re.fullmatch(r"[0-9a-f]{7,40}", clean, re.IGNORECASE):
+    if re.fullmatch(SYMBOL_CODE_HASH_BRANCH, clean, re.IGNORECASE):
         return True
-    if re.fullmatch(r"commit\s+[0-9a-f]{7,40}", clean, re.IGNORECASE):
+    if re.fullmatch(rf"commit\s+{SYMBOL_CODE_HASH_BRANCH}", clean, re.IGNORECASE):
         return True
     if re.search(r"(^|[~/\\])[\w.+-]+(?:/[\w.+-]+)+(?::\d+)?$", clean):
         return True
-    if re.search(r"\b[\w.+-]+\.(?:py|js|ts|tsx|jsx|json|md|txt|yaml|yml|toml|sh|service|timer)(?::\d+)?$", clean):
+    if re.search(rf"\b[\w.+-]+\.(?:{PATH_OR_SYMBOL_FILE_EXT_RE})(?::\d+)?$", clean):
         return True
     return False
 
@@ -1891,8 +1905,14 @@ def _rich_code_and_escape(text: str) -> str:
     pos = 0
     for match in TOKEN_CODE_RE.finditer(text):
         parts.append(html.escape(text[pos:match.start()], quote=False).replace("`", ""))
-        parts.append(f"<code>{html.escape(match.group(1), quote=False)}</code>")
-        pos = match.end()
+        code = match.group(1)
+        trailing = TOKEN_CODE_TRAILING_PUNCT_RE.search(code)
+        code_end = match.end()
+        if trailing:
+            code_end -= len(trailing.group(0))
+            code = code[: trailing.start()]
+        parts.append(f"<code>{html.escape(code, quote=False)}</code>")
+        pos = code_end
     parts.append(html.escape(text[pos:], quote=False).replace("`", ""))
     return "".join(parts)
 
@@ -2620,8 +2640,22 @@ def _render_text_fence(code_lines: list[str]) -> str:
     return "<br><br>".join(blocks)
 
 
-_SPACIOUS_END = re.compile(r"</(?:pre|h[1-6]|ul|ol|blockquote|details|table)>$")
-_SPACIOUS_START = re.compile(r"^<(?:pre|h[1-6]|ul|ol|blockquote|details|table)\b")
+_RICH_TOP_BLOCK_TAGS = ("p", "h[1-6]", "table", "ul", "ol", "blockquote", "pre", "details", "footer", "b")
+_RICH_SPACIOUS_BLOCK_TAGS = ("pre", "h[1-6]", "ul", "ol", "blockquote", "details", "table")
+_RICH_PLAIN_BREAK_EXTRA_TAGS = ("li", "tr", "summary")
+
+
+def _rich_tag_pattern(tags: tuple[str, ...]) -> str:
+    return "|".join(tags)
+
+
+_RICH_TOP_BLOCK_TAG_RE = _rich_tag_pattern(_RICH_TOP_BLOCK_TAGS)
+_RICH_SPACIOUS_BLOCK_TAG_RE = _rich_tag_pattern(_RICH_SPACIOUS_BLOCK_TAGS)
+_RICH_PLAIN_BREAK_TAG_RE = _rich_tag_pattern(
+    tuple(tag for tag in _RICH_TOP_BLOCK_TAGS if tag != "b") + _RICH_PLAIN_BREAK_EXTRA_TAGS
+)
+_SPACIOUS_END = re.compile(rf"</(?:{_RICH_SPACIOUS_BLOCK_TAG_RE})>$")
+_SPACIOUS_START = re.compile(rf"^<(?:{_RICH_SPACIOUS_BLOCK_TAG_RE})\b")
 
 
 def _join_blocks(parts: list[str]) -> str:
@@ -4822,7 +4856,8 @@ def note_rich_bad_request(telegram: dict[str, Any] | None, reason: str) -> None:
 def html_to_plain(html_text: str) -> str:
     # Clean plain-text projection of rich HTML for the legacy sendMessage fallback:
     # keeps line structure, never leaks raw markdown.
-    text = re.sub(r"</(?:blockquote|pre|p|h[1-6]|li|ul|ol|tr|details|summary|footer)>", "\n", html_text)
+    text = re.sub(r"</t[dh]>\s*<t[dh]\b[^>]*>", " | ", html_text, flags=re.IGNORECASE)
+    text = re.sub(rf"</(?:{_RICH_PLAIN_BREAK_TAG_RE})>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<br\s*/?>", "\n", text)
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text)
@@ -4921,7 +4956,7 @@ def edit_message_text(
 
 
 _RICH_TOP_BLOCK_RE = re.compile(
-    r"<(p|h[1-6]|table|ul|ol|blockquote|pre|details|footer|b)\b[^>]*>.*?</\1>|<br\s*/?>",
+    rf"<({_RICH_TOP_BLOCK_TAG_RE})\b[^>]*>.*?</\1>|<br\s*/?>",
     re.DOTALL | re.IGNORECASE,
 )
 
