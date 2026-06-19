@@ -107,6 +107,75 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["user_text"], "Still running?")
         self.assertEqual(turn["assistant_final_text"], "")
 
+    def test_codex_open_turn_exposes_stream_text_without_completing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-2"}},
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Still running?"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Partial answer in progress."}],
+                        },
+                    },
+                ],
+            )
+
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertFalse(turn["complete"])
+        self.assertEqual(turn["assistant_final_text"], "")
+        self.assertEqual(turn["assistant_stream_text"], "Partial answer in progress.")
+        self.assertEqual(turn["stream_source"], "codex")
+        self.assertEqual(turn["stream_revision"], adapter.stream_revision("Partial answer in progress."))
+
+    def test_codex_open_turn_suppresses_subagent_notification_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-2"}},
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "<subagent_notification>{}</subagent_notification>"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Working on the repair."}],
+                        },
+                    },
+                ],
+            )
+
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertTrue(turn["available"])
+        self.assertFalse(turn["complete"])
+        self.assertEqual(turn["turn_id"], "turn-2")
+        self.assertEqual(turn["user_text"], "")
+        self.assertNotIn("open_user_text", turn)
+        self.assertEqual(turn["assistant_stream_text"], "Working on the repair.")
+
     def test_codex_returns_latest_complete_when_newer_user_turn_is_open(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
@@ -151,6 +220,7 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["assistant_final_text"], "The completed result.")
         self.assertTrue(turn["has_open_turn"])
         self.assertEqual(turn["open_turn_id"], "turn-2")
+        self.assertEqual(turn["open_user_text"], "This newer turn is still open.")
 
     def test_claude_extracts_last_end_turn_assistant_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -264,6 +334,71 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["assistant_final_text"], "The completed result.")
         self.assertTrue(turn["has_open_turn"])
         self.assertEqual(turn["open_turn_id"], "user-2")
+        self.assertEqual(turn["open_user_text"], "This newer turn is still open.")
+
+    def test_claude_open_turn_exposes_stream_text_without_completing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Keep working?"}},
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-1",
+                        "timestamp": "2026-06-15T10:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "stop_reason": "tool_use",
+                            "content": [{"type": "text", "text": "Partial Claude answer."}],
+                        },
+                    },
+                ],
+            )
+
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertFalse(turn["complete"])
+        self.assertEqual(turn["assistant_final_text"], "")
+        self.assertEqual(turn["assistant_stream_text"], "Partial Claude answer.")
+        self.assertEqual(turn["stream_source"], "claude")
+        self.assertEqual(turn["stream_revision"], adapter.stream_revision("Partial Claude answer."))
+
+    def test_stream_text_ignores_api_error_and_internal_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Recover?"}},
+                    {
+                        "type": "assistant",
+                        "uuid": "api-error-1",
+                        "isApiErrorMessage": True,
+                        "error": "overloaded",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "API Error: overloaded"}],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "uuid": "internal-1",
+                        "message": {
+                            "role": "user",
+                            "content": "<task-notification><task-id>abc</task-id></task-notification>",
+                        },
+                    },
+                ],
+            )
+
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertFalse(turn["complete"])
+        self.assertEqual(turn["assistant_final_text"], "")
+        self.assertNotIn("assistant_stream_text", turn)
+        self.assertIn("api_error", turn)
+        self.assertNotIn("task-notification", turn["user_text"])
 
     def test_claude_no_session_id_can_match_unique_visible_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

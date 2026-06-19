@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_STATE = Path.home() / ".local/share/herdres/state.json"
 DEFAULT_SCRIPT = Path.home() / ".local/bin/herdres"
 GENERAL_THREAD_ID = "1"
+AMBIGUOUS_PANE_THREAD_REPLY = "Reply inside a pane thread so I know which Herdr pane to control."
 
 
 def _state_path() -> Path:
@@ -60,18 +61,95 @@ def _message_thread_id(message: Any) -> str | None:
     return str(thread_id)
 
 
-def _mapped_topic_entry(state: dict[str, Any], chat_id: str, thread_id: str | None) -> dict[str, Any] | None:
-    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
-    configured_chat = str(telegram.get("chat_id") or "")
-    if not configured_chat or chat_id != configured_chat:
+def _topic_space_entry(state: dict[str, Any], chat_id: str, thread_id: str | None) -> tuple[str, dict[str, Any]] | None:
+    telegram = state.get("telegram") or {}
+    if chat_id != str(telegram.get("chat_id") or ""):
         return None
     if not thread_id or thread_id == str(telegram.get("general_thread_id", GENERAL_THREAD_ID)):
         return None
-    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
-    for entry in panes.values():
-        if isinstance(entry, dict) and str(entry.get("topic_id") or "") == thread_id:
-            return entry
+    for key, space in (state.get("spaces") or {}).items():
+        if isinstance(space, dict) and str(space.get("topic_id") or "") == str(thread_id):
+            return str(key), space
     return None
+
+
+def _live_entries_for_space(state: dict[str, Any], space: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for pane_key in space.get("pane_keys") or []:
+        key = str(pane_key)
+        entry = panes.get(key)
+        if isinstance(entry, dict) and str(entry.get("last_known_status") or "").lower() != "closed":
+            entries.append((key, entry))
+    return entries
+
+
+def _route_message_entry(
+    state: dict[str, Any],
+    chat_id: str,
+    thread_id: str | None,
+    message_id: str | int | None,
+) -> tuple[str, dict[str, Any]] | None:
+    if not thread_id:
+        return None
+    message_key = str(message_id or "").strip()
+    if not message_key:
+        return None
+    mapped_space = _topic_space_entry(state, chat_id, thread_id)
+    if not mapped_space:
+        return None
+    _space_key, space = mapped_space
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    routes = space.get("message_routes") if isinstance(space.get("message_routes"), dict) else {}
+    routed_key = str(routes.get(message_key) or "")
+    routed_entry = panes.get(routed_key)
+    if routed_key and isinstance(routed_entry, dict):
+        return routed_key, routed_entry
+    for pane_key, entry in _live_entries_for_space(state, space):
+        if str(entry.get("pane_root_message_id") or "") == message_key:
+            return pane_key, entry
+    return None
+
+
+def _resolve_mapped_entry(
+    state: dict[str, Any],
+    chat_id: str,
+    thread_id: str | None,
+    *,
+    message_id: str | int | None = None,
+    reply_to_message_id: str | int | None = None,
+    prefer_message_id: bool = False,
+) -> tuple[str, dict[str, Any]] | None:
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    configured_chat = str(telegram.get("chat_id") or "")
+    if configured_chat and str(chat_id) != configured_chat:
+        return None
+    if prefer_message_id:
+        routed = _route_message_entry(state, chat_id, thread_id, message_id)
+        if routed:
+            return routed
+    routed = _route_message_entry(state, chat_id, thread_id, reply_to_message_id)
+    if routed:
+        return routed
+    mapped_space = _topic_space_entry(state, chat_id, thread_id)
+    if mapped_space:
+        _space_key, space = mapped_space
+        live_entries = _live_entries_for_space(state, space)
+        if len(live_entries) == 1:
+            return live_entries[0]
+        return None
+    for entry in (state.get("panes") or {}).values():
+        if isinstance(entry, dict) and str(entry.get("topic_id") or "") == thread_id:
+            return str(entry.get("pane_key") or ""), entry
+    return None
+
+
+def _mapped_topic_entry(state: dict[str, Any], chat_id: str, thread_id: str | None) -> dict[str, Any] | None:
+    resolved = _resolve_mapped_entry(state, chat_id, thread_id)
+    if not resolved:
+        return None
+    _pane_key, entry = resolved
+    return entry
 
 
 def _mapped_entry(state: dict[str, Any], message: Any) -> dict[str, Any] | None:
@@ -79,7 +157,18 @@ def _mapped_entry(state: dict[str, Any], message: Any) -> dict[str, Any] | None:
     if chat is None:
         return None
     chat_id = str(getattr(chat, "id", ""))
-    return _mapped_topic_entry(state, chat_id, _message_thread_id(message))
+    reply_to = getattr(message, "reply_to_message", None)
+    resolved = _resolve_mapped_entry(
+        state,
+        chat_id,
+        _message_thread_id(message),
+        message_id=getattr(message, "message_id", ""),
+        reply_to_message_id=getattr(reply_to, "message_id", "") if reply_to else "",
+    )
+    if not resolved:
+        return None
+    _pane_key, entry = resolved
+    return entry
 
 
 def _is_forwarded(message: Any) -> bool:
@@ -176,15 +265,43 @@ async def maybe_handle_herdr_topic_message(adapter: Any, message: Any) -> bool:
     state = _load_state()
     if not state:
         return False
-    entry = _mapped_entry(state, message)
-    if not entry:
-        return False
-    if _stand_down():
-        return True
-
+    chat = getattr(message, "chat", None)
+    chat_id = str(getattr(chat, "id", ""))
+    thread_id = _message_thread_id(message)
+    reply_to = getattr(message, "reply_to_message", None)
     user = getattr(message, "from_user", None)
     user_id = str(getattr(user, "id", "") if user else "")
     from_bot = bool(getattr(user, "is_bot", False)) if user else True
+    resolved = _resolve_mapped_entry(
+        state,
+        chat_id,
+        thread_id,
+        message_id=getattr(message, "message_id", ""),
+        reply_to_message_id=getattr(reply_to, "message_id", "") if reply_to else "",
+    )
+    if not resolved:
+        if _topic_space_entry(state, chat_id, thread_id):
+            if _stand_down():
+                return True
+            owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
+            if from_bot or (owners and user_id not in owners):
+                return True
+            metadata = {"thread_id": thread_id} if thread_id else None
+            try:
+                await adapter._send_with_retry(
+                    chat_id=chat_id,
+                    content=AMBIGUOUS_PANE_THREAD_REPLY,
+                    reply_to=str(getattr(message, "message_id", "")),
+                    metadata=metadata,
+                )
+            except Exception:
+                logger.warning("Failed to send Herdr ambiguous-topic hint", exc_info=True)
+            return True
+        return False
+    pane_key, entry = resolved
+    if _stand_down():
+        return True
+
     # Cheap owner pre-filter so non-owner / bot traffic in a mapped topic does
     # not spawn the herdres subprocess (it would just be dropped there anyway).
     # command_reply re-applies the authoritative gate. Only filter when owners
@@ -192,10 +309,10 @@ async def maybe_handle_herdr_topic_message(adapter: Any, message: Any) -> bool:
     owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
     if from_bot or (owners and user_id not in owners):
         return True
-    reply_to = getattr(message, "reply_to_message", None)
     payload = {
-        "chat_id": str(getattr(getattr(message, "chat", None), "id", "")),
-        "topic_id": _message_thread_id(message),
+        "chat_id": chat_id,
+        "topic_id": thread_id,
+        "pane_key": pane_key,
         "message_id": str(getattr(message, "message_id", "")),
         "reply_to_message_id": str(getattr(reply_to, "message_id", "") if reply_to else ""),
         "user_id": user_id,
@@ -243,16 +360,24 @@ async def maybe_handle_herdr_topic_callback(adapter: Any, query: Any) -> bool:
         return False
     chat_id = str(getattr(chat, "id", getattr(message, "chat_id", "")))
     thread_id = _message_thread_id(message)
-    entry = _mapped_topic_entry(state, chat_id, thread_id)
-    if not entry:
+    resolved = _resolve_mapped_entry(
+        state,
+        chat_id,
+        thread_id,
+        message_id=getattr(message, "message_id", ""),
+        prefer_message_id=True,
+    )
+    if not resolved:
         return False
     if _stand_down():
         return True
+    pane_key, _entry = resolved
 
     user = getattr(query, "from_user", None)
     payload = {
         "chat_id": chat_id,
         "topic_id": thread_id,
+        "pane_key": pane_key,
         "message_id": str(getattr(message, "message_id", "")),
         "user_id": str(getattr(user, "id", "") if user else ""),
         "data": data,

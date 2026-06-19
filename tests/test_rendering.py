@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import importlib.util
+import json
 import re
 import tempfile
 import unittest
@@ -11,6 +14,2042 @@ SPEC = importlib.util.spec_from_file_location("herdres", MODULE_PATH)
 herdres = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(herdres)
+
+
+class DocumentationRenderTests(unittest.TestCase):
+    def test_readme_describes_space_topics_not_pane_topics(self) -> None:
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("one Telegram forum topic per Herdr space", readme)
+        self.assertIn("Reply to a Herdres pane message", readme)
+        self.assertIn("sendMessageDraft", readme)
+        self.assertIn("sendRichMessageDraft", readme)
+        self.assertNotRegex(
+            readme,
+            r"Creates or maintains one Telegram forum topic per Herdr pane|"
+            r"maps each live Herdr pane to a Telegram forum topic",
+        )
+
+    def test_env_example_documents_streaming_controls(self) -> None:
+        env_example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("HERDR_TELEGRAM_TOPICS_STREAMING=1", env_example)
+        self.assertIn("HERDR_TELEGRAM_TOPICS_STREAM_MIN_INTERVAL=2", env_example)
+        self.assertIn("HERDR_TELEGRAM_TOPICS_STREAM_MIN_CHARS=80", env_example)
+        self.assertIn("HERDR_TELEGRAM_TOPICS_MAX_DRAFTS=8", env_example)
+
+    def test_env_example_documents_managed_bot_controls(self) -> None:
+        env_example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1", env_example)
+        self.assertIn("HERDR_TELEGRAM_TOPICS_MANAGED_BOT_CODEX_PHOTO=", env_example)
+
+
+class SpaceTopicStateTests(unittest.TestCase):
+    def test_space_key_prefers_space_id_then_workspace_then_cwd_default(self) -> None:
+        self.assertEqual(herdres.space_key({"space_id": "alpha"}), "space:alpha")
+        self.assertEqual(herdres.space_key({"workspace_id": "workspace-1"}), "workspace:workspace-1")
+        self.assertEqual(herdres.space_key({"foreground_cwd": "/tmp/herdres-demo"}), "cwd:herdres-demo")
+        self.assertEqual(herdres.space_key({}), "default")
+
+        self.assertEqual(herdres.space_name_for_pane({"space_name": "herdres"}), "herdres")
+        self.assertEqual(
+            herdres.space_name_for_pane({"workspace_id": "workspace-1"}),
+            "Workspace 1",
+        )
+
+    def test_pane_list_adds_herdr_workspace_label_as_space_name(self) -> None:
+        pane_payload = {
+            "result": {
+                "panes": [
+                    {
+                        "pane_id": "w2:p1",
+                        "terminal_id": "term-1",
+                        "workspace_id": "w2",
+                        "tab_id": "w2:t1",
+                    }
+                ]
+            }
+        }
+        workspace_payload = {
+            "result": {
+                "workspaces": [
+                    {"workspace_id": "w2", "label": "herdres"},
+                ]
+            }
+        }
+
+        with patch.object(herdres, "herdr_json", Mock(side_effect=[pane_payload, workspace_payload])):
+            panes = herdres.pane_list()
+
+        self.assertEqual(panes[0]["space_name"], "herdres")
+        self.assertEqual(panes[0]["workspace_label"], "herdres")
+
+    def test_pane_thread_name_uses_herdr_pane_label(self) -> None:
+        labeled = {
+            "pane_id": "wabc123:p2",
+            "agent": "codex",
+            "label": "  Build Runner  ",
+        }
+        alias_only = {"pane_id": "wabc123:p2", "agent": "codex", "label": ""}
+        agent_and_id = {"pane_id": "pane-1234567890", "agent": "codex", "label": ""}
+
+        self.assertEqual(herdres.pane_thread_name(labeled), "Build Runner")
+        self.assertEqual(herdres.pane_thread_name(alias_only), "wabc123:2")
+        self.assertEqual(herdres.pane_thread_name(agent_and_id), "Codex pane-1234567890")
+        self.assertEqual(herdres.pane_thread_name({}), "Pane")
+
+    def test_legacy_pane_topic_state_migrates_to_space_without_renaming(self) -> None:
+        state = {
+            "version": 1,
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "pane-1",
+                    "workspace": "workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Build Runner",
+                },
+                "pane-2": {
+                    "pane_key": "pane-2",
+                    "pane_id": "pane-2",
+                    "workspace": "workspace-1",
+                    "topic_id": "88",
+                    "topic_name": "Test Runner",
+                },
+            },
+        }
+
+        changed = herdres.migrate_legacy_pane_topics(state)
+
+        self.assertTrue(changed)
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["topic_id"], "77")
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["pane_keys"], ["pane-1", "pane-2"])
+        self.assertEqual(state["panes"]["pane-1"]["space_key"], "workspace:workspace-1")
+        self.assertEqual(state["panes"]["pane-2"]["space_key"], "workspace:workspace-1")
+        self.assertEqual(state["panes"]["pane-1"]["pane_thread_name"], "Build Runner")
+        self.assertEqual(state["panes"]["pane-2"]["pane_thread_name"], "Test Runner")
+        self.assertEqual(state["panes"]["pane-2"]["legacy_topic_id"], "88")
+        self.assertEqual(state["panes"]["pane-2"]["topic_id"], "77")
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["topic_name"], "Workspace 1")
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["topic_rename_from"], "Build Runner")
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["topic_rename_to"], "Workspace 1")
+        self.assertEqual(state["panes"]["pane-1"]["topic_name"], "Workspace 1")
+        self.assertEqual(state["panes"]["pane-1"]["legacy_topic_name"], "Build Runner")
+        self.assertNotIn("topic_rename_pending_at", state["panes"]["pane-1"])
+
+
+class SpaceTopicSyncTests(unittest.TestCase):
+    def _pane(self, pane_id: str, workspace_id: str, label: str) -> dict:
+        return {
+            "pane_id": pane_id,
+            "terminal_id": f"term-{pane_id}",
+            "workspace_id": workspace_id,
+            "tab_id": f"tab-{workspace_id}",
+            "agent": "codex",
+            "agent_status": "idle",
+            "label": label,
+            "cwd": "/workspace/herdres",
+        }
+
+    def _sync_caps(self) -> tuple[dict, dict]:
+        counters = {
+            "creates": 0,
+            "sends": 0,
+            "feed_sends": 0,
+            "marker_sends": 0,
+            "verifies": 0,
+            "renames": 0,
+            "icon_updates": 0,
+        }
+        caps = {
+            "max_creates": 5,
+            "max_sends": 10,
+            "max_feed_sends": 0,
+            "max_marker_sends": 0,
+            "max_verifies": 0,
+        }
+        return counters, caps
+
+    def test_new_idle_pane_does_not_send_visible_scaffolding_by_default(self) -> None:
+        state = {"version": 1, "telegram": {"chat_id": "-1001"}, "spaces": {}, "panes": {}}
+        telegram = state["telegram"]
+        pane = self._pane("pane-1", "workspace-1", "Build Runner")
+        counters, caps = self._sync_caps()
+        caps["max_marker_sends"] = 10
+        create_topic = Mock(return_value="77")
+        send_rich = Mock(return_value={"ok": True, "format": "rich", "message_id": "1001"})
+        update_status_marker = Mock(return_value={"ok": True, "attempted": True, "message_id": "1002"})
+        update_live_card = Mock(return_value={"ok": True, "attempted": True, "message_id": "1003"})
+
+        with patch.multiple(
+            herdres,
+            create_topic=create_topic,
+            send_rich_message=send_rich,
+            update_status_marker=update_status_marker,
+            update_live_card=update_live_card,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            STATUS_ICON_ENABLED=False,
+            TURN_FEED_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", telegram, pane, counters, caps, turn_only=True)
+
+        self.assertTrue(changed)
+        create_topic.assert_called_once_with("-1001", "Workspace 1")
+        send_rich.assert_not_called()
+        update_status_marker.assert_not_called()
+        update_live_card.assert_not_called()
+        key = herdres.pane_key(pane)
+        self.assertEqual(state["panes"][key]["topic_id"], "77")
+        self.assertNotIn("pane_root_message_id", state["panes"][key])
+        self.assertNotIn("status_marker_message_id", state["panes"][key])
+        self.assertNotIn("card_message_id", state["panes"][key])
+
+    def test_two_panes_same_space_create_one_forum_topic_and_two_roots(self) -> None:
+        state = {"version": 1, "telegram": {"chat_id": "-1001"}, "spaces": {}, "panes": {}}
+        telegram = state["telegram"]
+        pane_a = self._pane("pane-1", "workspace-1", "Build Runner")
+        pane_b = self._pane("pane-2", "workspace-1", "Test Runner")
+        counters, caps = self._sync_caps()
+        create_topic = Mock(return_value="77")
+        send_root = Mock(
+            side_effect=[
+                {"ok": True, "format": "rich", "message_id": "1001"},
+                {"ok": True, "format": "rich", "message_id": "1002"},
+            ],
+        )
+
+        with patch.multiple(
+            herdres,
+            create_topic=create_topic,
+            send_rich_message=send_root,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            STATUS_ICON_ENABLED=False,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            PANE_ROOT_MESSAGES_ENABLED=True,
+            TURN_FEED_ENABLED=False,
+        ):
+            changed_a = herdres.sync_pane_once(state, "-1001", telegram, pane_a, counters, caps, turn_only=True)
+            changed_b = herdres.sync_pane_once(state, "-1001", telegram, pane_b, counters, caps, turn_only=True)
+
+        self.assertTrue(changed_a)
+        self.assertTrue(changed_b)
+        create_topic.assert_called_once_with("-1001", "Workspace 1")
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["topic_id"], "77")
+        self.assertEqual(counters["creates"], 1)
+        self.assertEqual(send_root.call_count, 2)
+        root_threads = [call.kwargs["thread_id"] for call in send_root.call_args_list]
+        self.assertEqual(root_threads, ["77", "77"])
+        key_a = herdres.pane_key(pane_a)
+        key_b = herdres.pane_key(pane_b)
+        self.assertEqual(state["panes"][key_a]["pane_root_message_id"], "1001")
+        self.assertEqual(state["panes"][key_b]["pane_root_message_id"], "1002")
+        self.assertEqual(state["panes"][key_a]["topic_id"], "77")
+        self.assertEqual(state["panes"][key_b]["topic_id"], "77")
+        self.assertEqual(state["panes"][key_a]["pane_thread_name"], "Build Runner")
+        self.assertEqual(state["panes"][key_b]["pane_thread_name"], "Test Runner")
+
+    def test_two_panes_different_spaces_create_two_topics(self) -> None:
+        state = {"version": 1, "telegram": {"chat_id": "-1001"}, "spaces": {}, "panes": {}}
+        telegram = state["telegram"]
+        pane_a = self._pane("pane-1", "workspace-1", "Build Runner")
+        pane_b = self._pane("pane-2", "workspace-2", "Test Runner")
+        counters, caps = self._sync_caps()
+        create_topic = Mock(side_effect=["77", "88"])
+        send_root = Mock(
+            side_effect=[
+                {"ok": True, "format": "rich", "message_id": "1001"},
+                {"ok": True, "format": "rich", "message_id": "1002"},
+            ],
+        )
+
+        with patch.multiple(
+            herdres,
+            create_topic=create_topic,
+            send_rich_message=send_root,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            STATUS_ICON_ENABLED=False,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            PANE_ROOT_MESSAGES_ENABLED=True,
+            TURN_FEED_ENABLED=False,
+        ):
+            herdres.sync_pane_once(state, "-1001", telegram, pane_a, counters, caps, turn_only=True)
+            herdres.sync_pane_once(state, "-1001", telegram, pane_b, counters, caps, turn_only=True)
+
+        self.assertEqual(create_topic.call_args_list[0].args, ("-1001", "Workspace 1"))
+        self.assertEqual(create_topic.call_args_list[1].args, ("-1001", "Workspace 2"))
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["topic_id"], "77")
+        self.assertEqual(state["spaces"]["workspace:workspace-2"]["topic_id"], "88")
+        self.assertEqual([call.kwargs["thread_id"] for call in send_root.call_args_list], ["77", "88"])
+
+    def test_missing_pane_root_is_recreated_without_recreating_space_topic(self) -> None:
+        pane = self._pane("pane-1", "workspace-1", "Build Runner")
+        key = herdres.pane_key(pane)
+        state = {
+            "version": 1,
+            "telegram": {"chat_id": "-1001"},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workspace 1",
+                    "pane_keys": [key],
+                }
+            },
+            "panes": {
+                key: {
+                    "pane_key": key,
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_thread_name": "Build Runner",
+                }
+            },
+        }
+        counters, caps = self._sync_caps()
+        create_topic = Mock(return_value="should-not-create")
+        send_root = Mock(return_value={"ok": True, "format": "rich", "message_id": "1001"})
+
+        with patch.multiple(
+            herdres,
+            create_topic=create_topic,
+            send_rich_message=send_root,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            STATUS_ICON_ENABLED=False,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            PANE_ROOT_MESSAGES_ENABLED=True,
+            TURN_FEED_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps, turn_only=True)
+
+        self.assertTrue(changed)
+        create_topic.assert_not_called()
+        send_root.assert_called_once()
+        self.assertEqual(send_root.call_args.kwargs["thread_id"], "77")
+        self.assertEqual(state["panes"][key]["pane_root_message_id"], "1001")
+
+    def test_existing_space_topic_renames_to_herdr_workspace_label(self) -> None:
+        pane = self._pane("pane-1", "w2", "Build Runner")
+        pane["space_name"] = "herdres"
+        key = herdres.pane_key(pane)
+        state = {
+            "version": 1,
+            "telegram": {"chat_id": "-1001"},
+            "spaces": {
+                "workspace:w2": {
+                    "space_key": "workspace:w2",
+                    "space_id": "w2",
+                    "topic_id": "20",
+                    "topic_name": "W2",
+                    "pane_keys": [key],
+                    "last_topic_verified_at": herdres.utc_now(),
+                }
+            },
+            "panes": {
+                key: {
+                    "pane_key": key,
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:w2",
+                    "topic_id": "20",
+                    "pane_root_message_id": "1001",
+                    "pane_thread_name": "Build Runner",
+                    "last_topic_verified_at": herdres.utc_now(),
+                }
+            },
+        }
+        counters, caps = self._sync_caps()
+        edit_topic = Mock(return_value=True)
+
+        with patch.multiple(
+            herdres,
+            edit_topic=edit_topic,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            STATUS_ICON_ENABLED=False,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            TURN_FEED_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps, turn_only=True)
+
+        self.assertTrue(changed)
+        edit_topic.assert_called_once_with("-1001", "20", "herdres")
+        self.assertEqual(state["spaces"]["workspace:w2"]["topic_name"], "herdres")
+        self.assertNotIn("topic_rename_pending_at", state["spaces"]["workspace:w2"])
+
+    def test_space_topic_name_is_periodically_verified_without_pending_rename(self) -> None:
+        pane = self._pane("pane-1", "workspace-1", "Build Runner")
+        key = herdres.pane_key(pane)
+        state = {
+            "version": 1,
+            "telegram": {"chat_id": "-1001"},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "space_id": "workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workspace 1",
+                    "pane_keys": [key],
+                }
+            },
+            "panes": {
+                key: {
+                    "pane_key": key,
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workspace 1",
+                    "pane_root_message_id": "1001",
+                }
+            },
+        }
+        counters, caps = self._sync_caps()
+        caps["max_verifies"] = 1
+        edit_topic = Mock(return_value=True)
+
+        with patch.multiple(
+            herdres,
+            edit_topic=edit_topic,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            STATUS_ICON_ENABLED=False,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            TURN_FEED_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps, turn_only=True)
+
+        self.assertTrue(changed)
+        edit_topic.assert_called_once_with("-1001", "77", "Workspace 1")
+        self.assertEqual(counters["verifies"], 1)
+        self.assertIn("last_topic_verified_at", state["spaces"]["workspace:workspace-1"])
+
+    def test_closed_pane_in_shared_space_does_not_rename_space_topic(self) -> None:
+        live_pane = self._pane("pane-1", "workspace-1", "Build Runner")
+        closed_pane = self._pane("pane-2", "workspace-1", "Test Runner")
+        live_key = herdres.pane_key(live_pane)
+        closed_key = herdres.pane_key(closed_pane)
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {
+                "chat_id": "-1001",
+                "general_thread_id": "1",
+                "last_preflight_ok_at": herdres.utc_now(),
+            },
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workspace 1",
+                    "pane_keys": [live_key, closed_key],
+                }
+            },
+            "panes": {
+                live_key: {
+                    "pane_key": live_key,
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Build Runner",
+                    "pane_root_message_id": "1001",
+                    "last_known_status": "working",
+                },
+                closed_key: {
+                    "pane_key": closed_key,
+                    "pane_id": "pane-2",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Test Runner",
+                    "pane_root_message_id": "1002",
+                    "last_known_status": "working",
+                },
+            },
+        }
+        edit_topic = Mock(return_value=True)
+        send_notice = Mock(return_value={"ok": True, "message_id": "2002"})
+
+        with patch.multiple(
+            herdres,
+            load_state=Mock(return_value=state),
+            pane_list=Mock(return_value=[live_pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            sync_pane_once=Mock(return_value=False),
+            edit_topic=edit_topic,
+            edit_topic_icon=Mock(return_value=True),
+            send_notice=send_notice,
+            save_state=Mock(),
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["ok"])
+        edit_topic.assert_not_called()
+        send_notice.assert_called_once()
+        self.assertEqual(send_notice.call_args.kwargs["thread_id"], "77")
+        self.assertIsNone(send_notice.call_args.kwargs["reply_to_message_id"])
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["topic_name"], "Workspace 1")
+        self.assertEqual(state["panes"][closed_key]["last_known_status"], "closed")
+
+
+class PaneThreadRoutingTests(unittest.TestCase):
+    def _pane_state(self) -> tuple[dict, dict, str, dict]:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "done",
+            "label": "Build Runner",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_thread_name": "Build Runner",
+            "pane_root_message_id": "1001",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workspace 1",
+                    "pane_keys": [key],
+                }
+            },
+            "panes": {key: entry},
+        }
+        return state, pane, key, entry
+
+    def test_final_turn_posts_inside_space_topic_without_root_reply_by_default(self) -> None:
+        state, pane, key, entry = self._pane_state()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "What failed?",
+                "assistant_final_text": "The build failed in pytest.",
+            }
+        )
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
+        counters = {
+            "creates": 0,
+            "sends": 0,
+            "feed_sends": 0,
+            "marker_sends": 0,
+            "verifies": 0,
+            "renames": 0,
+            "icon_updates": 0,
+        }
+        caps = {
+            "max_creates": 5,
+            "max_sends": 10,
+            "max_feed_sends": 10,
+            "max_marker_sends": 0,
+            "max_verifies": 0,
+        }
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_feed_item.assert_called_once()
+        self.assertEqual(send_feed_item.call_args.kwargs["thread_id"], "77")
+        self.assertIsNone(send_feed_item.call_args.kwargs["reply_to_message_id"])
+        self.assertEqual(herdres.route_message_to_pane(state, "-1001", "77", "2001"), (key, entry))
+
+    def test_pane_root_reply_target_requires_opt_in(self) -> None:
+        entry = {"pane_root_message_id": "1001"}
+
+        with patch.object(herdres, "PANE_ROOT_MESSAGES_ENABLED", False):
+            self.assertIsNone(herdres.pane_root_reply_target(entry))
+        with patch.object(herdres, "PANE_ROOT_MESSAGES_ENABLED", True):
+            self.assertEqual(herdres.pane_root_reply_target(entry), "1001")
+
+    def test_message_route_index_records_final_prompt_and_notice_messages(self) -> None:
+        state, _pane, key, entry = self._pane_state()
+
+        herdres.record_pane_message_route(state, "workspace:workspace-1", key, "1001")
+        herdres.record_pane_message_route(state, "workspace:workspace-1", key, "2001")
+        herdres.record_pane_message_route(state, "workspace:workspace-1", key, "3001")
+
+        self.assertEqual(herdres.route_message_to_pane(state, "-1001", "77", "1001"), (key, entry))
+        self.assertEqual(herdres.route_message_to_pane(state, "-1001", "77", "2001"), (key, entry))
+        self.assertEqual(herdres.route_message_to_pane(state, "-1001", "77", "3001"), (key, entry))
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["message_routes"]["3001"], key)
+
+    def test_legacy_send_message_uses_reply_parameters_when_root_id_exists(self) -> None:
+        payloads = []
+
+        def fake_api(method: str, payload: dict) -> dict:
+            payloads.append((method, payload))
+            return {"ok": True, "result": {"message_id": 42}}
+
+        with patch.object(herdres, "telegram_api", fake_api):
+            message_id = herdres.send_message("-1001", "hello", thread_id="77", reply_to_message_id="1001")
+
+        self.assertEqual(message_id, "42")
+        self.assertEqual(payloads[0][0], "sendMessage")
+        self.assertIn("reply_parameters", payloads[0][1])
+        self.assertNotIn("reply_to_message_id", payloads[0][1])
+        self.assertEqual(payloads[0][1]["message_thread_id"], "77")
+
+
+class SharedTopicCommandTests(unittest.TestCase):
+    def _shared_state(self) -> dict:
+        return {
+            "version": 1,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workspace 1",
+                    "pane_keys": ["pane-1", "pane-2"],
+                    "message_routes": {"1002": "pane-2", "3002": "pane-2"},
+                }
+            },
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_root_message_id": "1001",
+                    "last_known_status": "working",
+                    "active_prompt": test_active_prompt({
+                        "id": "prompt1",
+                        "text": "Question\nRun old pane?",
+                        "choice_source": "explicit_block",
+                        "options": [{"number": "1", "label": "Run old"}],
+                    }, message_id="3001"),
+                },
+                "pane-2": {
+                    "pane_key": "pane-2",
+                    "pane_id": "pane-2",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_root_message_id": "1002",
+                    "last_known_status": "working",
+                    "active_prompt": test_active_prompt({
+                        "id": "prompt2",
+                        "text": "Question\nRun new pane?",
+                        "choice_source": "explicit_block",
+                        "options": [{"number": "1", "label": "Run new"}],
+                    }, message_id="3002"),
+                },
+            },
+        }
+
+    def test_command_reply_uses_reply_route_not_first_topic_match(self) -> None:
+        state = self._shared_state()
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "4000",
+                    "reply_to_message_id": "1002",
+                    "user_id": "42",
+                    "text": "/send run tests",
+                }
+        )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        send_to_pane.assert_called_once_with("pane-2", "run tests")
+
+    def test_command_reply_plain_reply_routes_without_implicit_send(self) -> None:
+        state = self._shared_state()
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "4000",
+                    "reply_to_message_id": "1002",
+                    "user_id": "42",
+                    "text": "run tests",
+                }
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        send_to_pane.assert_called_once_with("pane-2", "run tests")
+
+    def test_callback_reply_routes_by_callback_message_id(self) -> None:
+        state = self._shared_state()
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "3002",
+                    "user_id": "42",
+                    "data": "herdr:c:prompt2:1",
+                }
+            )
+
+        self.assertEqual(result["answer"], "Selected 1.")
+        send_to_pane.assert_called_once_with("pane-2", "1")
+
+    def test_command_reply_ambiguous_top_level_shared_topic_does_not_send_to_pane(self) -> None:
+        state = self._shared_state()
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "4000",
+                    "reply_to_message_id": "",
+                    "user_id": "42",
+                    "text": "/send run tests",
+                }
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertIn("Reply inside a pane thread", result["reply"])
+        send_to_pane.assert_not_called()
+
+    def test_command_reply_bot_mention_routes_to_matching_pane_in_shared_topic(self) -> None:
+        state = self._shared_state()
+        state["telegram"]["managed_bots"] = {
+            "codex": {"username": "herdr_codex_bot", "token": "CODEX_TOKEN", "enabled": True},
+            "claude": {"username": "herdr_claude_bot", "token": "CLAUDE_TOKEN", "enabled": True},
+        }
+        state["panes"]["pane-1"]["agent"] = "codex"
+        state["panes"]["pane-2"]["agent"] = "claude"
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "4000",
+                    "reply_to_message_id": "",
+                    "user_id": "42",
+                    "text": "@herdr_claude_bot run tests",
+                }
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        send_to_pane.assert_called_once_with("pane-2", "run tests")
+
+    def test_command_reply_bot_mention_overrides_mismatched_reply_route(self) -> None:
+        state = self._shared_state()
+        state["telegram"]["implicit_send_enabled"] = True
+        state["telegram"]["managed_bots"] = {
+            "codex": {"username": "herdr_codex_bot", "token": "CODEX_TOKEN", "enabled": True},
+            "claude": {"username": "herdr_claude_bot", "token": "CLAUDE_TOKEN", "enabled": True},
+        }
+        state["panes"]["pane-1"]["agent"] = "codex"
+        state["panes"]["pane-2"]["agent"] = "claude"
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "4000",
+                    "reply_to_message_id": "1001",
+                    "user_id": "42",
+                    "text": "@herdr_claude_bot run tests",
+                }
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        send_to_pane.assert_called_once_with("pane-2", "run tests")
+
+
+class TelegramDraftTests(unittest.TestCase):
+    def test_rich_enabled_recovers_from_non_capability_disabled_reason(self) -> None:
+        telegram = {
+            "rich_messages": {
+                "supported": "no",
+                "disabled_reason": "Telegram sendRichMessage failed: Bad Request: chat not found",
+            }
+        }
+
+        self.assertTrue(herdres.rich_enabled(telegram))
+        self.assertEqual(telegram["rich_messages"]["supported"], "unknown")
+        self.assertNotIn("disabled_reason", telegram["rich_messages"])
+
+    def test_rich_enabled_keeps_real_capability_disabled_reason(self) -> None:
+        telegram = {
+            "rich_messages": {
+                "supported": "no",
+                "disabled_reason": "Telegram sendRichMessage failed: Bad Request: method not found",
+            }
+        }
+
+        self.assertFalse(herdres.rich_enabled(telegram))
+        self.assertEqual(telegram["rich_messages"]["supported"], "no")
+
+    def test_send_rich_message_draft_payload_uses_space_thread_and_root_reply(self) -> None:
+        payloads = []
+        telegram = {"rich_messages": {"supported": "yes"}}
+
+        def fake_api(method: str, payload: dict) -> dict:
+            payloads.append((method, payload))
+            return {"ok": True, "result": True}
+
+        with patch.object(herdres, "telegram_api", fake_api):
+            result = herdres.send_rich_message_draft(
+                "-1001",
+                "<b>Partial</b>",
+                telegram=telegram,
+                fallback_text="Partial",
+                draft_id=12345,
+                thread_id="77",
+                reply_to_message_id="1001",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(payloads[0][0], "sendRichMessageDraft")
+        payload = payloads[0][1]
+        self.assertEqual(payload["chat_id"], "-1001")
+        self.assertEqual(payload["draft_id"], "12345")
+        self.assertEqual(payload["message_thread_id"], "77")
+        self.assertIn("reply_parameters", payload)
+        self.assertIn("rich_message", payload)
+
+    def test_draft_capability_error_disables_streaming_not_final_messages(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}}
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+        }
+
+        with patch.object(
+            herdres,
+            "telegram_api",
+            Mock(side_effect=herdres.BridgeError("Telegram sendRichMessageDraft failed: Bad Request: method not found")),
+        ):
+            result = herdres.send_stream_draft(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["kind"], "capability")
+        self.assertEqual(telegram["streaming_drafts"]["supported"], "no")
+        self.assertTrue(herdres.rich_enabled(telegram))
+
+    def test_dry_run_supports_draft_methods(self) -> None:
+        with patch.dict(herdres.os.environ, {"HERDR_TELEGRAM_TOPICS_DRY_RUN": "1"}):
+            self.assertTrue(herdres.telegram_api("sendMessageDraft", {"chat_id": "-1001", "draft_id": "1"})["ok"])
+            self.assertTrue(herdres.telegram_api("sendRichMessageDraft", {"chat_id": "-1001", "draft_id": "2"})["ok"])
+
+    def test_stream_draft_throttle_skips_unchanged_hash(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}}
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+        }
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with patch.object(herdres, "telegram_api", api):
+            first = herdres.send_stream_draft(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer",
+            )
+            second = herdres.send_stream_draft(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer",
+            )
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["skipped"])
+        self.assertEqual(api.call_count, 1)
+        self.assertEqual(entry["last_stream_hash"], herdres.stream_text_hash("Partial answer"))
+
+    def test_stream_draft_renders_partial_text_as_open_worklog(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}}
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+        }
+        calls: list[tuple[str, dict]] = []
+
+        def fake_api(method: str, payload: dict) -> dict:
+            calls.append((method, payload))
+            return {"ok": True, "result": True}
+
+        with patch.object(herdres, "telegram_api", fake_api), patch.multiple(
+            herdres,
+            STREAM_MIN_INTERVAL_SECONDS=0,
+            STREAM_MIN_CHARS=0,
+        ):
+            result = herdres.send_stream_draft(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer",
+            )
+
+        self.assertTrue(result["ok"])
+        rich_message = json.loads(calls[0][1]["rich_message"])
+        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", rich_message["html"])
+        self.assertNotIn("<b>Response</b>", rich_message["html"])
+
+    def test_stream_draft_throttle_enforces_min_interval_between_updates(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}}
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+        }
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with patch.object(herdres, "telegram_api", api), patch.multiple(
+            herdres,
+            STREAM_MIN_INTERVAL_SECONDS=60,
+            STREAM_MIN_CHARS=0,
+            MAX_STREAM_DRAFTS=8,
+        ):
+            first = herdres.send_stream_draft(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer",
+            )
+            second = herdres.send_stream_draft(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer with a little more detail",
+            )
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["skipped"])
+        self.assertEqual(second["reason"], "below_min_interval")
+        self.assertEqual(api.call_count, 1)
+
+    def test_stream_draft_throttle_enforces_max_updates_per_turn(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}}
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+        }
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with patch.object(herdres, "telegram_api", api), patch.multiple(
+            herdres,
+            STREAM_MIN_INTERVAL_SECONDS=0,
+            STREAM_MIN_CHARS=0,
+            MAX_STREAM_DRAFTS=1,
+        ):
+            first = herdres.send_stream_draft(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer",
+            )
+            second = herdres.send_stream_draft(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer with a little more detail",
+            )
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["skipped"])
+        self.assertEqual(second["reason"], "max_stream_updates")
+        self.assertEqual(api.call_count, 1)
+
+    def test_stream_message_fallback_sends_then_edits_visible_reply(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}, "streaming_drafts": {"supported": "no"}}
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+        }
+        send_rich = Mock(return_value={"ok": True, "message_id": "5001", "format": "rich"})
+        edit_rich = Mock(return_value={"ok": True, "message_id": "5001", "kind": "edited"})
+
+        with patch.multiple(
+            herdres,
+            send_rich_message=send_rich,
+            edit_rich_message=edit_rich,
+            STREAM_MIN_INTERVAL_SECONDS=0,
+        ):
+            first = herdres.send_stream_message(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer",
+            )
+            second = herdres.send_stream_message(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text=(
+                    "Partial answer with more detail that is long enough to pass the streaming "
+                    "minimum character threshold and update the visible preview."
+                ),
+            )
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(first["sent_message"])
+        self.assertEqual(entry["last_stream_message_id"], "5001")
+        send_rich.assert_called_once()
+        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", send_rich.call_args.args[1])
+        self.assertNotIn("<b>Response</b>", send_rich.call_args.args[1])
+        self.assertEqual(send_rich.call_args.kwargs["thread_id"], "77")
+        self.assertIsNone(send_rich.call_args.kwargs["reply_to_message_id"])
+        edit_rich.assert_called_once()
+        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", edit_rich.call_args.args[2])
+        self.assertTrue(second["ok"])
+        self.assertFalse(second.get("sent_message", False))
+
+
+class ManagedBotTests(unittest.TestCase):
+    def test_setup_markup_uses_open_pane_bot_kinds(self) -> None:
+        panes = [
+            {"agent": "codex", "agent_status": "working"},
+            {"agent": "Claude Code", "agent_status": "idle"},
+            {"agent": "codex", "agent_status": "blocked"},
+            {"agent": "", "agent_status": "idle"},
+        ]
+        kinds = herdres.managed_bot_kinds_for_panes(panes)
+        markup = herdres.managed_bot_setup_reply_markup("ManagerBot", kinds=kinds)
+        buttons = [button for row in markup["inline_keyboard"] for button in row]
+
+        self.assertEqual(kinds, ["codex", "claude"])
+        self.assertEqual([button["text"] for button in buttons], ["Codex", "Claude"])
+        self.assertIn("https://t.me/newbot/ManagerBot/herdr_codex_bot", buttons[0]["url"])
+        self.assertIn("name=Herdr%20Codex", buttons[0]["url"])
+
+    def test_private_request_keyboard_uses_managed_bot_buttons(self) -> None:
+        keyboard = herdres.managed_bot_request_keyboard()
+        first = keyboard["keyboard"][0][0]
+
+        self.assertEqual(first["text"], "Create Codex bot")
+        self.assertEqual(first["request_managed_bot"]["request_id"], 41001)
+        self.assertEqual(first["request_managed_bot"]["suggested_name"], "Herdr Codex")
+        self.assertEqual(first["request_managed_bot"]["suggested_username"], "herdr_codex_bot")
+
+    def test_managed_bot_update_fetches_token_and_configures_profile(self) -> None:
+        state = {"version": 1, "telegram": {"managed_bots": {}}}
+        calls: list[tuple[str, dict, str | None]] = []
+
+        def fake_api(method: str, payload: dict, *, token: str | None = None) -> dict:
+            calls.append((method, payload, token))
+            if method == "getManagedBotToken":
+                return {"ok": True, "result": "CHILD_TOKEN"}
+            return {"ok": True, "result": True}
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            telegram_api=fake_api,
+            managed_bot_profile_photo_path=Mock(return_value=None),
+        ):
+            result = herdres.managed_bot_update(
+                {
+                    "managed_bot": {
+                        "user": {"id": 42},
+                        "bot": {"id": 111, "username": "herdr_codex_bot", "first_name": "Herdr Codex"},
+                    }
+                }
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["kind"], "codex")
+        self.assertEqual(state["telegram"]["managed_bots"]["codex"]["token"], "CHILD_TOKEN")
+        self.assertIn(("getManagedBotToken", {"user_id": "111"}, None), calls)
+        self.assertIn(("setMyName", {"name": "Herdr Codex"}, "CHILD_TOKEN"), calls)
+        self.assertIn(("setMyDescription", {"description": "Herdr Codex pane bot for Herdres."}, "CHILD_TOKEN"), calls)
+
+    def test_profile_photo_upload_uses_child_bot_token(self) -> None:
+        calls: list[tuple[str, dict, dict, str | None]] = []
+
+        def fake_multipart(method: str, fields: dict, files: dict, *, token: str | None = None) -> dict:
+            calls.append((method, fields, files, token))
+            return {"ok": True, "result": True}
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
+            image.write(b"\xff\xd8\xff\xd9")
+            image.flush()
+            with patch.object(herdres, "telegram_api", Mock(return_value={"ok": True, "result": True})), patch.object(
+                herdres,
+                "telegram_api_multipart",
+                fake_multipart,
+            ):
+                result = herdres.configure_managed_bot_profile("codex", "CHILD_TOKEN", photo_path=Path(image.name))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls[0][0], "setMyProfilePhoto")
+        self.assertEqual(calls[0][3], "CHILD_TOKEN")
+        self.assertIn("attach://profile_photo", calls[0][1]["photo"])
+        self.assertIn("profile_photo", calls[0][2])
+
+    def test_stream_update_uses_matching_managed_bot_token(self) -> None:
+        telegram = {
+            "rich_messages": {"supported": "yes"},
+            "streaming_drafts": {"supported": "yes"},
+            "managed_bots": {"claude": {"token": "CLAUDE_TOKEN", "enabled": True}},
+        }
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+            "agent": "claude",
+        }
+        calls: list[tuple[str, dict, str | None]] = []
+
+        def fake_api(method: str, payload: dict, *, token: str | None = None) -> dict:
+            calls.append((method, payload, token))
+            return {"ok": True, "result": True}
+
+        with patch.object(herdres, "telegram_api", fake_api), patch.multiple(
+            herdres,
+            STREAM_MIN_INTERVAL_SECONDS=0,
+            STREAM_MIN_CHARS=0,
+        ):
+            result = herdres.send_stream_update(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="Partial answer from Claude",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls[0][2], "CLAUDE_TOKEN")
+
+    def test_stream_update_renders_user_block_with_open_worklog(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}, "streaming_drafts": {"supported": "yes"}}
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+        }
+        calls: list[tuple[str, dict, str | None]] = []
+
+        def fake_api(method: str, payload: dict, *, token: str | None = None) -> dict:
+            calls.append((method, payload, token))
+            return {"ok": True, "result": True}
+
+        with patch.object(herdres, "telegram_api", fake_api), patch.multiple(
+            herdres,
+            STREAM_MIN_INTERVAL_SECONDS=0,
+            STREAM_MIN_CHARS=0,
+        ):
+            result = herdres.send_stream_update(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="The CPU profile is still running.",
+                user_text="Run the profile.",
+            )
+
+        self.assertTrue(result["ok"])
+        rich_message = json.loads(calls[0][1]["rich_message"])
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", rich_message["html"])
+        self.assertIn("Run the profile.", rich_message["html"])
+        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", rich_message["html"])
+        self.assertNotIn("<b>Response</b>", rich_message["html"])
+
+    def test_stream_update_reissues_same_worklog_when_user_block_is_added(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}, "streaming_drafts": {"supported": "yes"}}
+        entry = {
+            "pane_key": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+            "last_stream_turn_id": "turn-1",
+            "last_stream_hash": herdres.stream_text_hash("The CPU profile is still running."),
+        }
+        calls: list[tuple[str, dict, str | None]] = []
+
+        def fake_api(method: str, payload: dict, *, token: str | None = None) -> dict:
+            calls.append((method, payload, token))
+            return {"ok": True, "result": True}
+
+        with patch.object(herdres, "telegram_api", fake_api), patch.multiple(
+            herdres,
+            STREAM_MIN_INTERVAL_SECONDS=0,
+            STREAM_MIN_CHARS=0,
+        ):
+            result = herdres.send_stream_update(
+                "-1001",
+                telegram,
+                entry,
+                turn_id="turn-1",
+                text="The CPU profile is still running.",
+                user_text="Run the profile.",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(calls), 1)
+        rich_message = json.loads(calls[0][1]["rich_message"])
+        self.assertIn("<b>User:</b>", rich_message["html"])
+
+
+class StreamingIntegrationTests(unittest.TestCase):
+    def _state(self) -> tuple[dict, dict, str, dict]:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "working",
+            "label": "Build Runner",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+            "pane_thread_name": "Build Runner",
+            "last_known_status": "working",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workspace 1",
+                    "pane_keys": [key],
+                }
+            },
+            "panes": {key: entry},
+        }
+        return state, pane, key, entry
+
+    def _caps(self) -> tuple[dict, dict]:
+        counters = {"creates": 0, "sends": 0, "feed_sends": 0, "marker_sends": 0, "verifies": 0, "renames": 0, "icon_updates": 0}
+        caps = {"max_creates": 0, "max_sends": 10, "max_feed_sends": 10, "max_marker_sends": 10, "max_verifies": 0}
+        return counters, caps
+
+    def test_sync_turn_lifecycle_renders_user_worklog_response_sequence(self) -> None:
+        state, pane, _key, entry = self._state()
+        state["telegram"]["rich_messages"] = {"supported": "yes"}
+        state["telegram"]["streaming_drafts"] = {"supported": "no"}
+        user_text = "Run the profile."
+        worklog_text = "The CPU profile is still running."
+        response_text = "Profile complete."
+        pane_turn = Mock(
+            side_effect=[
+                {
+                    "available": True,
+                    "complete": False,
+                    "turn_id": "turn-1",
+                    "user_text": user_text,
+                    "assistant_final_text": "",
+                    "assistant_stream_text": "",
+                },
+                {
+                    "available": True,
+                    "complete": False,
+                    "turn_id": "turn-1",
+                    "user_text": user_text,
+                    "assistant_final_text": "",
+                    "assistant_stream_text": worklog_text,
+                },
+                {
+                    "available": True,
+                    "complete": True,
+                    "turn_id": "turn-1",
+                    "user_text": user_text,
+                    "assistant_final_text": response_text,
+                },
+            ]
+        )
+        api_calls = []
+        next_message_id = 2000
+
+        def telegram_api(method, payload, *, token=None):
+            nonlocal next_message_id
+            api_calls.append((method, dict(payload)))
+            if method == "sendRichMessage":
+                next_message_id += 1
+                return {"ok": True, "result": {"message_id": str(next_message_id)}}
+            return {"ok": True, "result": True}
+
+        patch_args = {
+            "pane_turn": pane_turn,
+            "telegram_api": telegram_api,
+            "save_state": Mock(),
+            "apply_api_error_warning": Mock(return_value={"topic_missing": False, "changed": False}),
+            "TURN_FEED_ENABLED": True,
+            "CLEAN_FEED_ENABLED": True,
+            "LIVE_CARD_ENABLED": False,
+            "STATUS_MARKER_ENABLED": False,
+            "STATUS_ICON_ENABLED": False,
+            "STREAMING_DRAFTS_ENABLED": True,
+            "STREAM_MIN_INTERVAL_SECONDS": 0,
+            "STREAM_MIN_CHARS": 0,
+        }
+
+        with patch.multiple(herdres, **patch_args):
+            counters, caps = self._caps()
+            self.assertTrue(herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps))
+
+            send_calls = [call for call in api_calls if call[0] == "sendRichMessage"]
+            edit_calls = [call for call in api_calls if call[0] == "editMessageText"]
+            self.assertEqual(len(send_calls), 1)
+            self.assertEqual(len(edit_calls), 0)
+            self.assertEqual(entry["last_prompt_message_id"], "2001")
+            self.assertEqual(entry["last_pane_message_id"], "2001")
+            prompt_html = json.loads(send_calls[0][1]["rich_message"])["html"]
+            self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", prompt_html)
+            self.assertIn(user_text, prompt_html)
+            self.assertNotIn("<b>Worklog</b>", prompt_html)
+            self.assertNotIn("<b>Response</b>", prompt_html)
+
+            counters, caps = self._caps()
+            self.assertTrue(herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps))
+
+            send_calls = [call for call in api_calls if call[0] == "sendRichMessage"]
+            edit_calls = [call for call in api_calls if call[0] == "editMessageText"]
+            self.assertEqual(len(send_calls), 1)
+            self.assertEqual(len(edit_calls), 1)
+            self.assertEqual(edit_calls[0][1]["message_id"], "2001")
+            working_html = json.loads(edit_calls[0][1]["rich_message"])["html"]
+            self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", working_html)
+            self.assertIn(user_text, working_html)
+            self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", working_html)
+            self.assertIn(worklog_text, working_html)
+            self.assertNotIn("<b>Response</b>", working_html)
+
+            counters, caps = self._caps()
+            self.assertTrue(herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps))
+
+        send_calls = [call for call in api_calls if call[0] == "sendRichMessage"]
+        edit_calls = [call for call in api_calls if call[0] == "editMessageText"]
+        self.assertEqual(len(send_calls), 1)
+        self.assertEqual(len(edit_calls), 2)
+        self.assertEqual(edit_calls[1][1]["message_id"], "2001")
+        final_html = json.loads(edit_calls[1][1]["rich_message"])["html"]
+        final_item = entry["last_clean_item"]
+        self.assertEqual(final_item["kind"], "turn")
+        self.assertEqual(final_item["user_text"], user_text)
+        self.assertEqual(final_item["worklog_text"], worklog_text)
+        self.assertEqual(final_item["assistant_final_text"], response_text)
+        self.assertEqual(entry["last_clean_message_id"], "2001")
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", final_html)
+        self.assertIn("<details><summary><b>Worklog</b></summary><blockquote>", final_html)
+        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", final_html)
+        self.assertLess(final_html.index("<b>User:</b>"), final_html.index("<b>Worklog</b>"))
+        self.assertLess(final_html.index("<b>Worklog</b>"), final_html.index("<b>Response</b>"))
+
+    def test_sync_completed_turn_resends_final_when_anchor_is_not_latest_message(self) -> None:
+        state, pane, _key, entry = self._state()
+        state["telegram"]["rich_messages"] = {"supported": "yes"}
+        user_text = "Run the profile."
+        response_text = "Profile complete."
+        entry.update({
+            "last_prompt_turn_id": "turn-1",
+            "last_prompt_hash": herdres.stream_text_hash(user_text),
+            "last_prompt_text": user_text,
+            "last_prompt_message_id": "2001",
+            "last_pane_message_id": "2002",
+        })
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": user_text,
+                "assistant_final_text": response_text,
+            }
+        )
+        api_calls = []
+
+        def telegram_api(method, payload, *, token=None):
+            api_calls.append((method, dict(payload)))
+            if method == "sendRichMessage":
+                return {"ok": True, "result": {"message_id": "2003"}}
+            return {"ok": True, "result": True}
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            telegram_api=telegram_api,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            CLEAN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            counters, caps = self._caps()
+            self.assertTrue(herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps))
+
+        send_calls = [call for call in api_calls if call[0] == "sendRichMessage"]
+        edit_calls = [call for call in api_calls if call[0] == "editMessageText"]
+        self.assertEqual(len(send_calls), 1)
+        self.assertEqual(len(edit_calls), 0)
+        final_html = json.loads(send_calls[0][1]["rich_message"])["html"]
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", final_html)
+        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", final_html)
+        self.assertEqual(entry["last_clean_message_id"], "2003")
+        self.assertEqual(entry["last_pane_message_id"], "2003")
+
+    def test_sync_sends_prompt_then_draft_for_incomplete_turn_stream_text(self) -> None:
+        state, pane, _key, entry = self._state()
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "turn_id": "turn-1",
+                "user_text": "Still running?",
+                "assistant_final_text": "",
+                "assistant_stream_text": "Partial answer.",
+            }
+        )
+        send_stream = Mock(return_value={"ok": True, "draft_id": "123", "hash": "abc"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_stream_update=send_stream,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_stream.assert_called_once()
+        self.assertEqual(send_stream.call_args.kwargs["turn_id"], "turn-1")
+        self.assertEqual(send_stream.call_args.kwargs["text"], "Partial answer.")
+        send_feed_item.assert_called_once()
+        prompt_item = send_feed_item.call_args.args[1]
+        self.assertEqual(prompt_item["kind"], "prompt")
+        self.assertEqual(prompt_item["turn_id"], "turn-1")
+        self.assertEqual(prompt_item["user_text"], "Still running?")
+        self.assertEqual(send_feed_item.call_args.kwargs["thread_id"], "77")
+        self.assertIsNone(send_feed_item.call_args.kwargs["reply_to_message_id"])
+        self.assertEqual(entry["last_prompt_turn_id"], "turn-1")
+        self.assertEqual(entry["last_prompt_message_id"], "2001")
+
+    def test_sync_does_not_send_older_completed_turn_after_newer_prompt(self) -> None:
+        state, pane, _key, entry = self._state()
+        entry.update({
+            "last_clean_item": {
+                "kind": "turn",
+                "turn_id": "turn-0",
+                "user_text": "Previous prompt",
+                "assistant_final_text": "Previous answer.",
+            },
+            "last_prompt_turn_id": "turn-2",
+            "last_prompt_text": "Current prompt",
+            "last_prompt_message_id": "2002",
+        })
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "turn_id": "turn-2",
+                "user_text": "Current prompt",
+                "assistant_final_text": "",
+                "assistant_stream_text": "Current worklog.",
+                "recent_turns": [
+                    {
+                        "available": True,
+                        "complete": True,
+                        "turn_id": "turn-0",
+                        "user_text": "Previous prompt",
+                        "assistant_final_text": "Previous answer.",
+                    },
+                    {
+                        "available": True,
+                        "complete": True,
+                        "turn_id": "turn-1",
+                        "user_text": "Older prompt",
+                        "assistant_final_text": "Older answer that should not replay.",
+                    },
+                    {
+                        "available": True,
+                        "complete": False,
+                        "turn_id": "turn-2",
+                        "user_text": "Current prompt",
+                        "assistant_final_text": "",
+                        "assistant_stream_text": "Current worklog.",
+                    },
+                ],
+            }
+        )
+        send_stream = Mock(return_value={"ok": True, "draft_id": "123", "hash": "abc"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_stream_update=send_stream,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_feed_item.assert_not_called()
+        send_stream.assert_called_once()
+        self.assertEqual(send_stream.call_args.kwargs["turn_id"], "turn-2")
+
+    def test_sync_does_not_repost_render_only_change_without_message_id(self) -> None:
+        state, pane, _key, entry = self._state()
+        counters, caps = self._caps()
+        turn = {
+            "available": True,
+            "complete": True,
+            "turn_id": "turn-1",
+            "user_text": "Run tests",
+            "assistant_final_text": "Tests passed.",
+        }
+        item = herdres.make_turn_feed_item(turn)
+        assert item is not None
+        entry.update({
+            "last_clean_item": item,
+            "last_clean_text": herdres.item_plain_text(item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(item, include_render_version=False),
+            "last_clean_hash": "old-render-hash",
+            "last_clean_render_hash": "old-render-hash",
+        })
+        pane_turn = Mock(return_value=turn)
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_feed_item.assert_not_called()
+        self.assertEqual(entry["last_clean_hash"], herdres.clean_feed_hash(item))
+
+    def test_sync_streams_open_turn_after_completed_turn_already_delivered(self) -> None:
+        state, pane, _key, entry = self._state()
+        completed_turn = {
+            "available": True,
+            "complete": True,
+            "turn_id": "turn-1",
+            "user_text": "Previous prompt",
+            "assistant_final_text": "Previous final answer.",
+        }
+        completed_item = herdres.make_turn_feed_item(completed_turn)
+        assert completed_item is not None
+        entry.update({
+            "last_turn_id": "turn-1",
+            "last_clean_item": completed_item,
+            "last_clean_text": herdres.item_plain_text(completed_item),
+            "last_clean_hash": herdres.clean_feed_hash(completed_item),
+            "last_clean_render_hash": herdres.clean_feed_hash(completed_item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(completed_item, include_render_version=False),
+            "last_clean_message_id": "2001",
+            "last_clean_kind": "turn",
+        })
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                **completed_turn,
+                "has_open_turn": True,
+                "open_turn_id": "turn-2",
+                "open_user_text": "Next prompt",
+                "assistant_stream_text": "Partial next answer.",
+                "stream_revision": "stream-rev-2",
+                "recent_turns": [completed_turn],
+            }
+        )
+        send_stream = Mock(return_value={"ok": True, "draft_id": "123", "hash": "abc"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2002"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_stream_update=send_stream,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_stream.assert_called_once()
+        self.assertEqual(send_stream.call_args.kwargs["turn_id"], "turn-2")
+        self.assertEqual(send_stream.call_args.kwargs["text"], "Partial next answer.")
+        send_feed_item.assert_called_once()
+        prompt_item = send_feed_item.call_args.args[1]
+        self.assertEqual(prompt_item["kind"], "prompt")
+        self.assertEqual(prompt_item["turn_id"], "turn-2")
+        self.assertEqual(prompt_item["user_text"], "Next prompt")
+        self.assertEqual(entry["last_prompt_turn_id"], "turn-2")
+
+    def test_completed_turn_after_stream_sends_final_and_clears_stream_state(self) -> None:
+        state, pane, _key, entry = self._state()
+        entry.update({
+            "last_stream_hash": "old",
+            "last_stream_turn_id": "turn-1",
+            "last_stream_draft_id": "123",
+            "last_stream_sent_at": herdres.utc_now(),
+        })
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "Still running?",
+                "assistant_final_text": "Final answer.",
+            }
+        )
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_feed_item.assert_called_once()
+        self.assertEqual(entry["last_clean_message_id"], "2001")
+        self.assertNotIn("last_stream_hash", entry)
+        self.assertNotIn("last_stream_draft_id", entry)
+
+    def test_completed_turn_edits_visible_stream_message_to_final(self) -> None:
+        state, pane, _key, entry = self._state()
+        entry.update({
+            "last_stream_hash": "old",
+            "last_stream_turn_id": "turn-1",
+            "last_stream_message_id": "3001",
+            "last_stream_text": "Partial answer.",
+            "last_stream_sent_at": herdres.utc_now(),
+        })
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "Still running?",
+                "assistant_final_text": "Final answer.",
+            }
+        )
+        edit_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            edit_feed_item=edit_feed_item,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        edit_feed_item.assert_called_once()
+        self.assertEqual(edit_feed_item.call_args.args[1], "3001")
+        edited_item = edit_feed_item.call_args.args[2]
+        self.assertEqual(edited_item["worklog_text"], "Partial answer.")
+        edited_html = herdres.render_turn_item_html(edited_item)
+        self.assertIn("<details><summary><b>Worklog</b></summary><blockquote>", edited_html)
+        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", edited_html)
+        send_feed_item.assert_not_called()
+        self.assertEqual(entry["last_clean_message_id"], "3001")
+        self.assertNotIn("last_stream_message_id", entry)
+
+    def test_streaming_config_disabled_keeps_status_marker_fallback(self) -> None:
+        state, pane, _key, _entry = self._state()
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "turn_id": "turn-1",
+                "user_text": "Still running?",
+                "assistant_final_text": "",
+                "assistant_stream_text": "Partial answer.",
+            }
+        )
+        send_stream = Mock(return_value={"ok": True})
+        marker = Mock(return_value={"ok": True, "attempted": True, "message_id": "3001"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_stream_update=send_stream,
+            send_feed_item=send_feed_item,
+            update_status_marker=marker,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            STREAMING_DRAFTS_ENABLED=False,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=True,
+            STATUS_MARKER_SUPPRESS_WHEN_ICON_OK=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_stream.assert_not_called()
+        send_feed_item.assert_called_once()
+        marker.assert_called_once()
+
+    def test_draft_unsupported_streams_visible_message_without_status_marker(self) -> None:
+        state, pane, _key, _entry = self._state()
+        state["telegram"]["streaming_drafts"] = {"supported": "no"}
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "turn_id": "turn-1",
+                "user_text": "Still running?",
+                "assistant_final_text": "",
+                "assistant_stream_text": "Partial answer.",
+            }
+        )
+        send_stream = Mock(return_value={"ok": True, "format": "message", "sent_message": True, "message_id": "3001"})
+        marker = Mock(return_value={"ok": True, "attempted": True, "message_id": "4001"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_stream_update=send_stream,
+            send_feed_item=send_feed_item,
+            update_status_marker=marker,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            STREAMING_DRAFTS_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=True,
+            STATUS_MARKER_SUPPRESS_WHEN_ICON_OK=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_feed_item.assert_called_once()
+        send_stream.assert_called_once()
+        self.assertEqual(send_stream.call_args.kwargs["turn_id"], "turn-1")
+        marker.assert_not_called()
+        self.assertEqual(counters["sends"], 2)
+
+    def test_turn_only_event_path_streams_without_visible_scrape(self) -> None:
+        state, pane, _key, _entry = self._state()
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "turn_id": "turn-1",
+                "user_text": "Still running?",
+                "assistant_final_text": "",
+                "assistant_stream_text": "Partial answer.",
+            }
+        )
+        pane_feed_output = Mock(return_value="visible scrape should not happen")
+        send_stream = Mock(return_value={"ok": True, "draft_id": "123", "hash": "abc"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            pane_feed_output=pane_feed_output,
+            send_stream_update=send_stream,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps, turn_only=True)
+
+        self.assertTrue(changed)
+        send_feed_item.assert_called_once()
+        send_stream.assert_called_once()
+        pane_feed_output.assert_not_called()
+
+    def test_sync_does_not_resend_prompt_for_same_turn(self) -> None:
+        state, pane, _key, entry = self._state()
+        entry.update({
+            "last_prompt_turn_id": "turn-1",
+            "last_prompt_message_id": "2001",
+        })
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "turn_id": "turn-1",
+                "user_text": "Still running?",
+                "assistant_final_text": "",
+                "assistant_stream_text": "Partial answer.",
+            }
+        )
+        send_stream = Mock(return_value={"ok": True, "draft_id": "123", "hash": "abc"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2002"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_stream_update=send_stream,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_feed_item.assert_not_called()
+        send_stream.assert_called_once()
+        self.assertNotIn("pending_prompt_turn_id", entry)
+
+    def test_sync_resends_prompt_for_same_turn_when_prompt_hash_changed(self) -> None:
+        state, pane, _key, entry = self._state()
+        entry.update({
+            "last_prompt_turn_id": "turn-1",
+            "last_prompt_hash": "old-internal-prompt",
+            "last_prompt_message_id": "2001",
+        })
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "turn_id": "turn-1",
+                "user_text": "Actual user prompt",
+                "assistant_final_text": "",
+                "assistant_stream_text": "Partial answer.",
+            }
+        )
+        send_stream = Mock(return_value={"ok": True, "draft_id": "123", "hash": "abc"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2002"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_stream_update=send_stream,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_feed_item.assert_called_once()
+        prompt_item = send_feed_item.call_args.args[1]
+        self.assertEqual(prompt_item["kind"], "prompt")
+        self.assertEqual(prompt_item["user_text"], "Actual user prompt")
+        self.assertEqual(entry["last_prompt_turn_id"], "turn-1")
+        self.assertEqual(entry["last_prompt_message_id"], "2002")
+        self.assertEqual(entry["last_prompt_hash"], herdres.stream_text_hash("Actual user prompt"))
+        send_stream.assert_called_once()
+
+    def test_sync_clears_shared_space_mapping_when_stream_topic_is_missing(self) -> None:
+        state, pane, _key, entry = self._state()
+        entry["last_prompt_turn_id"] = "turn-1"
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "turn_id": "turn-1",
+                "user_text": "Still running?",
+                "assistant_final_text": "",
+                "assistant_stream_text": "Partial answer.",
+            }
+        )
+        send_stream = Mock(
+            return_value={
+                "ok": False,
+                "kind": "topic_not_found",
+                "topic_missing": True,
+                "error": "forum topic not found",
+            }
+        )
+        save_state = Mock()
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_stream_update=send_stream,
+            save_state=save_state,
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        self.assertNotIn("topic_id", state["spaces"]["workspace:workspace-1"])
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["topic_missing_id"], "77")
+        self.assertNotIn("topic_id", entry)
+        save_state.assert_called_once_with(state)
+
+    def test_sync_clears_pane_root_when_prompt_reply_target_is_missing(self) -> None:
+        state, pane, _key, entry = self._state()
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "turn_id": "turn-1",
+                "user_text": "Still running?",
+                "assistant_final_text": "",
+                "assistant_stream_text": "",
+            }
+        )
+        send_feed_item = Mock(
+            return_value={
+                "ok": False,
+                "kind": "not_found",
+                "not_found": True,
+                "error": "reply message not found",
+            }
+        )
+        save_state = Mock()
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_feed_item=send_feed_item,
+            save_state=save_state,
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["topic_id"], "77")
+        self.assertEqual(entry["topic_id"], "77")
+        self.assertNotIn("pane_root_message_id", entry)
+        self.assertEqual(entry["pane_root_message_missing_id"], "1001")
+        save_state.assert_called_once_with(state)
 
 
 class RenderingTests(unittest.TestCase):
@@ -824,6 +2863,134 @@ Verification
         self.assertEqual(title, "🟡 Working")
         self.assertEqual(body, "Working on 2/5 workflows; 1 active.")
 
+    def test_space_pinned_status_summary_orders_red_yellow_green(self) -> None:
+        panes = [
+            {"agent": "codex", "agent_status": "idle"},
+            {"agent": "kimi", "agent_status": "blocked"},
+            {"agent": "claude", "agent_status": "working"},
+            {"agent": "omp", "agent_status": "closed"},
+        ]
+
+        self.assertEqual(herdres.space_pinned_status_text(panes), "Kimi 🔴 | Claude 🟡 | Codex 🟢")
+
+    def test_sync_creates_and_pins_space_status_for_open_panes_only(self) -> None:
+        pane_a = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        pane_b = {
+            "pane_id": "pane-2",
+            "terminal_id": "term-2",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "kimi",
+            "agent_status": "blocked",
+        }
+        pane_other = {
+            "pane_id": "pane-3",
+            "terminal_id": "term-3",
+            "workspace_id": "workspace-2",
+            "tab_id": "tab-2",
+            "agent": "claude",
+            "agent_status": "working",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {"space_key": "workspace:workspace-1", "topic_id": "77"},
+                "workspace:workspace-2": {"space_key": "workspace:workspace-2", "topic_id": "88"},
+            },
+            "panes": {},
+        }
+        send_message = Mock(side_effect=["501", "502"])
+        pin_chat_message = Mock(return_value={"ok": True})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane_a, pane_b, pane_other]),
+            preflight_is_fresh=Mock(return_value=True),
+            sync_pane_once=Mock(return_value=False),
+            ensure_managed_bot_setup_message=Mock(return_value=False),
+            ensure_managed_bot_group_access_message=Mock(return_value=False),
+            send_message=send_message,
+            pin_chat_message=pin_chat_message,
+            PINNED_STATUS_ENABLED=True,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["pinned_status_updated"], 2)
+        self.assertEqual(send_message.call_args_list[0].args[:2], ("-1001", "Kimi 🔴 | Codex 🟢"))
+        self.assertEqual(send_message.call_args_list[0].kwargs["thread_id"], "77")
+        self.assertEqual(send_message.call_args_list[1].args[:2], ("-1001", "Claude 🟡"))
+        self.assertEqual(send_message.call_args_list[1].kwargs["thread_id"], "88")
+        self.assertEqual(pin_chat_message.call_args_list[0].args, ("-1001", "501"))
+        self.assertEqual(pin_chat_message.call_args_list[1].args, ("-1001", "502"))
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["pinned_status_message_id"], "501")
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["pinned_status_text"], "Kimi 🔴 | Codex 🟢")
+
+    def test_sync_edits_existing_pinned_space_status_without_resending(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "working",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pinned_status_message_id": "501",
+                    "pinned_status_text": "Codex 🟢",
+                    "pinned_status_hash": "old",
+                    "pinned_status_pinned_at": herdres.utc_now(),
+                }
+            },
+            "panes": {},
+        }
+        send_message = Mock()
+        edit_message_text = Mock(return_value={"ok": True, "message_id": "501"})
+        pin_chat_message = Mock(return_value={"ok": True})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            sync_pane_once=Mock(return_value=False),
+            ensure_managed_bot_setup_message=Mock(return_value=False),
+            ensure_managed_bot_group_access_message=Mock(return_value=False),
+            send_message=send_message,
+            edit_message_text=edit_message_text,
+            pin_chat_message=pin_chat_message,
+            PINNED_STATUS_ENABLED=True,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["pinned_status_updated"], 1)
+        send_message.assert_not_called()
+        edit_message_text.assert_called_once_with("-1001", "501", "Codex 🟡")
+        pin_chat_message.assert_not_called()
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["pinned_status_text"], "Codex 🟡")
+
     def test_sync_sends_status_marker_and_deletes_previous_marker(self) -> None:
         pane = {
             "pane_id": "pane-1",
@@ -863,6 +3030,7 @@ Verification
             STATUS_MARKER_ENABLED=True,
             LIVE_CARD_ENABLED=True,
             TURN_FEED_ENABLED=True,
+            PINNED_STATUS_ENABLED=False,
         ):
             result = herdres.sync_once()
 
@@ -887,6 +3055,7 @@ Verification
             "pane_key": key,
             "pane_id": "pane-1",
             "topic_id": "77",
+            "pane_root_message_id": "1001",
             "status_marker_message_id": "10",
             "status_marker_hash": herdres.status_marker_hash(pane),
             "last_turn_available": False,
@@ -914,6 +3083,7 @@ Verification
             STATUS_MARKER_ENABLED=True,
             LIVE_CARD_ENABLED=True,
             TURN_FEED_ENABLED=True,
+            PINNED_STATUS_ENABLED=False,
         ):
             result = herdres.sync_once()
 
@@ -973,6 +3143,7 @@ Verification
             STATUS_MARKER_ENABLED=True,
             STATUS_MARKER_SUPPRESS_WHEN_ICON_OK=True,
             LIVE_CARD_ENABLED=False,
+            PINNED_STATUS_ENABLED=False,
         ):
             result = herdres.sync_once()
 
@@ -984,6 +3155,7 @@ Verification
         self.assertNotIn("status_marker_message_id", entry)
         self.assertEqual(calls[-1][0], "editForumTopic")
         self.assertEqual(calls[-1][1]["icon_custom_emoji_id"], "icon-working")
+        self.assertEqual(calls[-1][1]["name"], "Workspace 1")
         send_notice.assert_not_called()
         delete_message.assert_called_once_with("-1001", "10")
 
@@ -1047,6 +3219,65 @@ Verification
         self.assertTrue(ok, detail)
         self.assertEqual(commands[0][4], "short instruction")
 
+    def test_send_to_pane_clears_existing_staged_input_before_run(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude"}
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value=pane),
+            run_cmd=run_cmd,
+            pane_input_looks_staged=Mock(side_effect=[True, False, False, False, False]),
+        ):
+            ok, detail = herdres.send_to_pane("pane-1", "how are you")
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(commands[0], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "ctrl+u"])
+        self.assertEqual(commands[1][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
+        self.assertEqual(commands[1][4], "how are you")
+
+    def test_pane_input_stage_detection_ignores_old_visible_prompt_history(self) -> None:
+        visible_history = """Previous answer.
+
+❯ old text that was already submitted
+  wrapped old text
+
+⏺ Answer to the old text
+...[truncated by herdr-topic bridge]"""
+        current_composer = """⏺ Answer to the old text
+
+─────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on"""
+
+        def pane_output(_pane_id: str, **kwargs: object) -> str:
+            if kwargs.get("source") == "recent-unwrapped":
+                return current_composer
+            return visible_history
+
+        with patch.object(herdres, "pane_output", side_effect=pane_output):
+            self.assertFalse(herdres.pane_input_looks_staged("pane-1"))
+
+    def test_pane_input_stage_detection_ignores_codex_placeholder_prompt(self) -> None:
+        current_composer = """• Working (30s • esc to interrupt)
+
+
+› Write tests for @filename
+
+  gpt-5.5 xhigh fast · ~/Projects/herdres                       Goal achieved (17m)"""
+
+        with patch.object(herdres, "pane_output", return_value=current_composer):
+            self.assertFalse(herdres.pane_input_looks_staged("pane-1"))
+
     def test_send_to_pane_submits_staged_pasted_input(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "claude"}
         commands = []
@@ -1063,7 +3294,7 @@ Verification
             herdres,
             pane_by_id=Mock(return_value=pane),
             run_cmd=run_cmd,
-            pane_input_looks_staged=Mock(return_value=True),
+            pane_input_looks_staged=Mock(side_effect=[False, True]),
         ):
             ok, detail = herdres.send_to_pane("pane-1", "long pasted instruction", submit_staged=True)
 
@@ -1091,7 +3322,7 @@ Verification
             herdres,
             pane_by_id=Mock(return_value=pane),
             run_cmd=run_cmd,
-            pane_input_looks_staged=Mock(return_value=True),
+            pane_input_looks_staged=Mock(side_effect=[False, True]),
         ):
             ok, detail = herdres.send_to_pane("pane-1", "Everything pushed on origin right?")
 
@@ -1305,7 +3536,7 @@ What changed:
             "agent_status": "done",
         }
         key = herdres.pane_key(pane)
-        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77", "pane_root_message_id": "1001"}
         state = {
             "version": 1,
             "enabled": True,
@@ -1342,7 +3573,7 @@ What changed:
             "agent_status": "done",
         }
         key = herdres.pane_key(pane)
-        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77", "pane_root_message_id": "1001"}
         state = {
             "version": 1,
             "enabled": True,
@@ -1360,6 +3591,8 @@ What changed:
             "send_feed_item": send_feed_item,
             "TURN_FEED_ENABLED": False,
             "LIVE_CARD_ENABLED": False,
+            "STATUS_MARKER_ENABLED": False,
+            "PINNED_STATUS_ENABLED": False,
         }
 
         with patch.multiple(herdres, **common_patches):
@@ -1553,6 +3786,7 @@ What changed:
             "pane_key": key,
             "pane_id": "pane-1",
             "topic_id": "77",
+            "pane_root_message_id": "1001",
             "last_clean_hash": "old",
             "last_clean_text": "old update",
         }
@@ -1575,6 +3809,8 @@ What changed:
             send_feed_item=send_feed_item,
             TURN_FEED_ENABLED=False,
             LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            PINNED_STATUS_ENABLED=False,
         ):
             first = herdres.sync_once()
             second = herdres.sync_once()
@@ -1680,6 +3916,7 @@ What changed:
             TURN_FEED_ENABLED=True,
             LIVE_CARD_ENABLED=False,
             STATUS_MARKER_ENABLED=False,
+            PINNED_STATUS_ENABLED=False,
         ):
             result = herdres.sync_once()
 
@@ -1772,7 +4009,7 @@ What changed:
             result = herdres.sync_once()
 
         self.assertTrue(result["changed"])
-        self.assertEqual(result["verified"], 1)
+        self.assertEqual(result["renamed"], 1)
         self.assertNotIn("topic_id", entry)
         self.assertEqual(entry["topic_missing_id"], "77")
         self.assertNotIn("card_message_id", entry)
@@ -1803,6 +4040,7 @@ What changed:
             "panes": {key: entry},
         }
         create_topic = Mock(return_value="88")
+        send_root = Mock(return_value={"ok": True, "format": "rich", "message_id": "1001"})
 
         with patch.multiple(
             herdres,
@@ -1812,16 +4050,21 @@ What changed:
             pane_list=Mock(return_value=[pane]),
             preflight_is_fresh=Mock(return_value=True),
             create_topic=create_topic,
+            send_rich_message=send_root,
             pane_turn=Mock(return_value={"available": False, "reason": "no_structured_turn_source"}),
             TURN_FEED_ENABLED=True,
             LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
         ):
             result = herdres.sync_once()
 
         self.assertTrue(result["changed"])
         self.assertEqual(result["created"], 1)
-        create_topic.assert_called_once_with("-1001", "Restored")
+        create_topic.assert_called_once_with("-1001", "Workspace 1")
         self.assertEqual(entry["topic_id"], "88")
+        self.assertNotIn("pane_root_message_id", entry)
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["topic_id"], "88")
+        send_root.assert_not_called()
         self.assertIn("last_topic_verified_at", entry)
         self.assertNotIn("topic_missing_id", entry)
         self.assertNotIn("topic_missing_at", entry)
@@ -1843,7 +4086,10 @@ What changed:
 
         self.assertFalse(created)
         self.assertIs(updated, entry)
-        self.assertEqual(entry["topic_name"], "Italy Ping")
+        self.assertEqual(entry["topic_name"], "Workspace 1")
+        self.assertEqual(entry["topic_title_source"], "space")
+        self.assertEqual(entry["legacy_topic_name"], "Italy Ping")
+        self.assertEqual(entry["pane_thread_name"], "entmoot italy ping")
         self.assertEqual(entry["pane_label_raw"], "entmoot italy ping")
         self.assertEqual(entry["pane_label_topic_name"], "Entmoot Italy")
         self.assertNotIn("topic_rename_pending_at", entry)
@@ -1873,14 +4119,15 @@ What changed:
 
         herdres.ensure_pane_entry(state, pane)
 
-        self.assertEqual(entry["topic_name"], "Topics Pane")
-        self.assertEqual(entry["topic_title_source"], "pane-label")
+        self.assertEqual(entry["topic_name"], "Workspace 1")
+        self.assertEqual(entry["topic_title_source"], "space")
+        self.assertEqual(entry["legacy_topic_name"], "Topic Names")
         self.assertEqual(entry["pane_label_raw"], "Topics Pane")
         self.assertEqual(entry["pane_label_topic_name"], "Topics Pane")
-        self.assertEqual(entry["topic_rename_from"], "Topic Names")
-        self.assertEqual(entry["topic_rename_to"], "Topics Pane")
+        self.assertEqual(entry["pane_thread_name"], "Topics Pane")
+        self.assertNotIn("topic_rename_pending_at", entry)
 
-    def test_pane_label_change_schedules_topic_rename(self) -> None:
+    def test_pane_label_change_updates_thread_name_without_topic_rename(self) -> None:
         pane = {
             "pane_id": "pane-1",
             "terminal_id": "term-1",
@@ -1900,12 +4147,13 @@ What changed:
 
         herdres.ensure_pane_entry(state, pane)
 
-        self.assertEqual(entry["topic_name"], "Flight Recorder")
-        self.assertEqual(entry["topic_title_source"], "pane-label")
-        self.assertEqual(entry["topic_rename_from"], "Old Topic")
-        self.assertEqual(entry["topic_rename_to"], "Flight Recorder")
+        self.assertEqual(entry["topic_name"], "Workspace 1")
+        self.assertEqual(entry["topic_title_source"], "space")
+        self.assertEqual(entry["pane_thread_name"], "flight recorder")
+        self.assertEqual(entry["legacy_topic_name"], "Old Topic")
+        self.assertNotIn("topic_rename_pending_at", entry)
 
-    def test_new_labeled_pane_creates_topic_from_label(self) -> None:
+    def test_new_labeled_pane_uses_label_as_thread_not_topic(self) -> None:
         pane = {
             "pane_id": "pane-1",
             "terminal_id": "term-1",
@@ -1921,10 +4169,12 @@ What changed:
 
         self.assertTrue(created)
         self.assertEqual(state["panes"][key], entry)
-        self.assertEqual(entry["topic_name"], "Docker Cache")
-        self.assertEqual(entry["topic_title_source"], "pane-label")
+        self.assertEqual(entry["topic_name"], "Workspace 1")
+        self.assertEqual(entry["topic_title_source"], "space")
+        self.assertEqual(entry["pane_label_topic_name"], "Docker Cache")
+        self.assertEqual(entry["pane_thread_name"], "docker cache")
 
-    def test_sync_renames_topic_when_pane_label_changes(self) -> None:
+    def test_sync_pane_label_change_does_not_rename_space_topic(self) -> None:
         pane = {
             "pane_id": "pane-1",
             "terminal_id": "term-1",
@@ -1947,6 +4197,16 @@ What changed:
             "version": 1,
             "enabled": True,
             "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "space_id": "workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workspace 1",
+                    "pane_keys": [key],
+                    "last_topic_verified_at": herdres.utc_now(),
+                }
+            },
             "panes": {key: entry},
         }
         edit_topic = Mock(return_value=True)
@@ -1966,10 +4226,12 @@ What changed:
             result = herdres.sync_once()
 
         self.assertTrue(result["changed"])
-        self.assertEqual(result["renamed"], 1)
-        edit_topic.assert_called_once_with("-1001", "77", "Flight Recorder")
-        self.assertEqual(entry["topic_name"], "Flight Recorder")
+        self.assertEqual(result["renamed"], 0)
+        edit_topic.assert_not_called()
+        self.assertEqual(entry["topic_name"], "Workspace 1")
         self.assertEqual(entry["pane_label_raw"], "flight recorder")
+        self.assertEqual(entry["pane_thread_name"], "flight recorder")
+        self.assertEqual(entry["legacy_topic_name"], "Old Topic")
         self.assertNotIn("topic_rename_pending_at", entry)
 
     def test_sync_clears_topic_mapping_when_clean_send_reports_deleted_topic(self) -> None:
@@ -2523,6 +4785,29 @@ Which file changed. Should the report include the full diff? Files touched:
         assert item is not None
         self.assertEqual(item["turn_id"], "C")
 
+    def test_select_turn_feed_item_finalizes_streamed_turn_before_catchup(self) -> None:
+        def mk(tid: str, user: str, asst: str) -> dict:
+            return {
+                "available": True,
+                "complete": True,
+                "turn_id": tid,
+                "user_text": user,
+                "assistant_final_text": asst,
+            }
+
+        streamed = mk("turn-1", "original prompt", "final streamed answer")
+        auto_continued = mk("turn-2", "", "follow-up answer")
+        turn = {**auto_continued, "recent_turns": [streamed, auto_continued]}
+
+        item = herdres.select_turn_feed_item(
+            turn,
+            {"last_turn_id": "turn-1", "last_stream_turn_id": "turn-1"},
+        )
+
+        assert item is not None
+        self.assertEqual(item["turn_id"], "turn-1")
+        self.assertIn("original prompt", item["text"])
+
     def test_open_completed_turn_falls_back_to_visible_readonly_prompt(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "blocked"}
         turn = {
@@ -2768,7 +5053,9 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertEqual(item["decision_id"], "turn-1:decision-1")
         self.assertEqual(item["choice_source"], "pending_decision")
         html = herdres.render_feed_item_html(item)
-        self.assertIn("<b>You asked</b>", html)
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
+        self.assertIn("<b>User:</b>", html)
+        self.assertNotIn("You asked", html)
         self.assertIn("<h3>Decision needed</h3>", html)
         self.assertIn("How should I proceed?", html)
         markup, active_prompt, clear_prompt = herdres.prompt_delivery_state(item)
@@ -3685,6 +5972,19 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
         self.assertNotIn("active_prompt", state["panes"]["pane-1"])
 
+    def test_prompt_feed_renders_user_label_in_open_details_quote(self) -> None:
+        item = herdres.make_prompt_feed_item("turn-1", "Why did the bot freeze?\nCheck logs.")
+
+        html = herdres.render_feed_item_html(item)
+
+        self.assertEqual(item["title"], "User:")
+        self.assertEqual(item["text"], "User:\nWhy did the bot freeze?\nCheck logs.")
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
+        self.assertIn("<b>User:</b>", html)
+        self.assertIn("Why did the bot freeze?", html)
+        self.assertNotIn("You asked", html)
+        self.assertEqual(herdres.item_plain_text(item), "User:\nWhy did the bot freeze?\nCheck logs.")
+
     def test_turn_feed_renders_user_prompt_and_final_reply_without_label(self) -> None:
         item = herdres.make_turn_feed_item(
             {
@@ -3701,13 +6001,46 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertEqual(item["kind"], "turn")
         html = herdres.render_feed_item_html(item)
 
-        self.assertIn("<b>You asked</b>", html)
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
+        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", html)
+        self.assertIn("<b>User:</b>", html)
+        self.assertNotIn("You asked", html)
         self.assertIn("Why did the bot freeze?", html)
         self.assertIn("<h3>Likely cause</h3>", html)
         self.assertIn("<li>Browser navigation hung.</li>", html)
         self.assertNotIn("<h3>Question</h3>", html)
         self.assertNotIn("<h3>Report</h3>", html)
         self.assertNotIn("<h3>Update</h3>", html)
+
+    def test_turn_feed_renders_worklog_closed_when_response_exists(self) -> None:
+        item = {
+            "kind": "turn",
+            "user_text": "Run the profile.",
+            "worklog_text": "I started the CPU profile and am waiting on results.",
+            "assistant_final_text": "Profile complete.\n\n- Hot path found.",
+        }
+
+        html = herdres.render_turn_item_html(item)
+
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
+        self.assertIn("<details><summary><b>Worklog</b></summary><blockquote>", html)
+        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", html)
+        self.assertLess(html.index("<b>User:</b>"), html.index("<b>Worklog</b>"))
+        self.assertLess(html.index("<b>Worklog</b>"), html.index("<b>Response</b>"))
+
+    def test_turn_feed_renders_worklog_open_when_response_missing(self) -> None:
+        item = {
+            "kind": "turn",
+            "user_text": "Run the profile.",
+            "worklog_text": "The CPU profile is still running.",
+            "assistant_final_text": "",
+        }
+
+        html = herdres.render_turn_item_html(item)
+
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
+        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", html)
+        self.assertNotIn("<b>Response</b>", html)
 
     def test_turn_feed_formats_screenshot_case_as_rich_html(self) -> None:
         item = {
@@ -3718,36 +6051,37 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
                 "of the topic on telegram"
             ),
             "assistant_final_text": """Implemented.
-Herdres now watches the Herdr pane `label` field and syncs Telegram topic names from it:
-- Existing labeled panes are baselined first, so it does not surprise-rename current owner-corrected topics.
-- If you manually change a Herdr pane name after this, the next sync updates the mapped Telegram topic name with `editForumTopic`.
-- If Telegram says the topic is missing during rename, Herdres clears that pane's stale topic mapping and recreates it on the next sync.
-- No Herdr core changes, no LLM calls, no extra messages posted.
+Herdres now watches Herdr space names for Telegram topic names and Herdr pane `label` values for pane thread roots:
+- Existing labeled panes keep their labels as thread names; they do not rename the shared space topic.
+- If you manually change a Herdr pane name after this, the next sync updates the pane root with `sendMessage` routing metadata.
+- If Telegram says the space topic is missing, Herdres clears that stale topic mapping and recreates it on the next sync.
+- No Herdr core changes and no LLM calls.
 
 Deployed live to `/home/smith/.local/bin/herdr_telegram_topics.py`.
 
 Pushed
-`cdee2ca Sync Telegram topic names from Herdr pane labels`
+`cdee2ca Sync Telegram topics from Herdr spaces`
 
 Verification
 
 - `python3 -m py_compile herdres.py herdr_turn_adapter.py`
 - `python3 -m unittest discover -s tests -p 'test*.py' -q` -> 78 tests OK
 - Live sync ran successfully: `renamed=0`, `sent=0`, `panes=6`
-- Existing `entmoot italy ping` label was baselined while keeping Telegram topic `Italy Ping`.
+- Existing `entmoot italy ping` label was kept as the pane thread name while the Telegram topic stayed the Herdr space name.
 """,
         }
 
         html = herdres.render_turn_item_html(item)
 
-        self.assertIn("<blockquote>", html)
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
+        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", html)
         self.assertIn("<h3>Implemented</h3>", html)
         self.assertIn("<b>Pushed</b>", html)
         self.assertIn("<b>Verification</b>", html)
         self.assertIn("<code>label</code>", html)
-        self.assertIn("<code>editForumTopic</code>", html)
+        self.assertIn("<code>sendMessage</code>", html)
         self.assertIn("<code>/home/smith/.local/bin/herdr_telegram_topics.py</code>", html)
-        self.assertIn("<code>cdee2ca</code> Sync Telegram topic names from Herdr pane labels", html)
+        self.assertIn("<code>cdee2ca</code> Sync Telegram topics from Herdr spaces", html)
         self.assertIn("<code>renamed=0</code>", html)
         self.assertNotIn("`", html)
 
@@ -4012,7 +6346,8 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertEqual(entry["last_turn_id"], "turn-1")
         self.assertEqual(entry["last_clean_kind"], "turn")
         self.assertEqual(entry["last_clean_message_id"], "999")
-        self.assertIn("You asked", entry["last_clean_text"])
+        self.assertIn("User:", entry["last_clean_text"])
+        self.assertNotIn("You asked", entry["last_clean_text"])
         self.assertIn("Likely cause", entry["last_clean_text"])
         self.assertNotIn("Question\nShould not be parsed", entry["last_clean_text"])
 
@@ -5139,7 +7474,10 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertEqual(bridge.DEFAULT_SCRIPT, Path.home() / ".local/bin/herdres")
 
     def test_plugin_manifest_hooks_herdres_event(self) -> None:
-        import tomllib
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            import tomli as tomllib
 
         manifest = Path(__file__).resolve().parents[1] / "herdres-plugin" / "herdr-plugin.toml"
         data = tomllib.loads(manifest.read_text(encoding="utf-8"))
@@ -6069,9 +8407,9 @@ class AttachmentTests(unittest.TestCase):
         ):
             result = herdres.command_reply(
                 {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/goal pursue the refactor"}
-            )
+        )
         sent.assert_called_once_with("pane-1", "/goal pursue the refactor")
-        self.assertEqual(result["reply"], "Sent /goal to this pane.")
+        self.assertEqual(result["reply"], "")
 
     def test_parse_command_splits_on_any_whitespace(self) -> None:
         self.assertEqual(herdres.parse_command("/send\nmulti\nline"), ("send", "multi\nline"))
@@ -6377,7 +8715,7 @@ class SpinnerAndWorkingPaneTests(unittest.TestCase):
         vro.assert_not_called()
         self.assertIsNone(item)
 
-    def test_reused_closed_topic_schedules_un_old_rename(self) -> None:
+    def test_reused_closed_topic_preserves_space_topic_name(self) -> None:
         state = {"panes": {"oldkey": {
             "pane_key": "oldkey", "topic_id": "77", "topic_name": "[OLD] Topics Pane",
             "pane_label_raw": "Topics Pane", "pane_label_topic_name": "Topics Pane",
@@ -6394,16 +8732,10 @@ class SpinnerAndWorkingPaneTests(unittest.TestCase):
                 "label": "Topics Pane", "agent": "codex", "agent_session": {"value": "sess-1"}}
         _key, entry, created = herdres.ensure_pane_entry(state, pane)
         self.assertTrue(created)
-        self.assertEqual(entry["topic_name"], "Topics Pane")  # un-[OLD]'d in state
-        self.assertEqual(entry.get("topic_rename_from"), "[OLD] Topics Pane")
-        self.assertEqual(entry.get("topic_rename_to"), "Topics Pane")  # rename scheduled
-        self.assertNotIn("closed_at", entry)
-        self.assertNotIn("closed_topic_finalized", entry)
-        self.assertNotIn("status_icon_key", entry)
-        self.assertNotIn("topic_status_icon_key", entry)
-        self.assertNotIn("topic_status_icon_emoji", entry)
-        self.assertNotIn("topic_status_icon_custom_emoji_id", entry)
-        self.assertNotIn("topic_status_icon_updated_at", entry)
+        self.assertEqual(entry["topic_name"], "W1")
+        self.assertEqual(entry["legacy_topic_name"], "[OLD] Topics Pane")
+        self.assertEqual(entry["pane_thread_name"], "Topics Pane")
+        self.assertNotIn("topic_rename_pending_at", entry)
 
     def test_status_lag_race_prefers_completed_turn_over_scrape(self) -> None:
         # done->working lag: status reads non-working but a new turn is open and

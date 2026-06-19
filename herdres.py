@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 DEFAULT_STATE = Path.home() / ".local/share/herdres/state.json"
@@ -69,10 +69,41 @@ STATUS_MARKER_SUPPRESS_WHEN_ICON_OK = os.getenv(
 ).lower() in {"1", "true", "yes", "on"}
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 TURN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_TURN_FEED", "1").lower() in {"1", "true", "yes", "on"}
+STREAMING_DRAFTS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STREAMING", "1").lower() in {"1", "true", "yes", "on"}
+STREAM_MIN_INTERVAL_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_STREAM_MIN_INTERVAL", "2"))
+STREAM_MIN_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STREAM_MIN_CHARS", "80"))
+MAX_STREAM_DRAFTS = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_DRAFTS", "8"))
+MANAGED_BOTS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MANAGER_BOT_KIND = "manager"
+MANAGED_BOT_ROUTE_KIND_FIELDS = (
+    "pane_root_bot_kind",
+    "status_marker_bot_kind",
+    "last_clean_bot_kind",
+    "last_stream_bot_kind",
+    "last_prompt_bot_kind",
+)
+MANAGED_BOT_REISSUE_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOT_REISSUE_RETRY_SECONDS", "300"))
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 RICH_BAD_REQUEST_LIMIT = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_BAD_REQUEST_LIMIT", "3"))
-LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
-STATUS_MARKER_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "1").lower() in {"1", "true", "yes", "on"}
+LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "0").lower() in {"1", "true", "yes", "on"}
+STATUS_MARKER_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "0").lower() in {"1", "true", "yes", "on"}
+PANE_ROOT_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+PINNED_STATUS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_PINNED_STATUS", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 VISIBLE_CHOICE_BUTTONS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS", "0").lower() in {
     "1",
     "true",
@@ -109,7 +140,10 @@ ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "
     "yes",
     "on",
 }
-RICH_RENDER_VERSION = 16
+RICH_RENDER_VERSION = 20
+USER_PROMPT_LABEL = "User:"
+WORKLOG_LABEL = "Worklog"
+RESPONSE_LABEL = "Response"
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "16000"))
@@ -167,6 +201,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 TUI_LEADING_CHROME_RE = re.compile(r"^\s*[│┃└┌┐┘├┤╭╮╰╯⎿]\s*")
 PROMPT_ONLY_RE = re.compile(r"^\s*(?:❯|›)\s*$")
 PROMPT_WITH_TEXT_RE = re.compile(r"^\s*(?:❯|›)\s+\S+")
+PROMPT_PLACEHOLDER_RE = re.compile(r"^\s*(?:❯|›)\s+Write tests for @filename\s*$", re.IGNORECASE)
 REPORT_BLOCK_RE = re.compile(r"(?ms)^\s*HERDRES_REPORT_START\s*$\s*(.*?)^\s*HERDRES_REPORT_END\s*$")
 CHOICES_BLOCK_RE = re.compile(r"(?ms)^\s*HERDRES_CHOICES_START\s*$\s*(.*?)^\s*HERDRES_CHOICES_END\s*$")
 REPORT_TITLE_RE = re.compile(r"^\s*HERDRES_REPORT_TITLE\s*:\s*(.{1,80})\s*$", re.IGNORECASE)
@@ -229,6 +264,45 @@ ACTIVE_AGENT_STATUSES = {"working", "running", "active", "in_progress", "pending
 GOAL_ACTIVE_RE = re.compile(r"/goal active\b", re.IGNORECASE)
 # Number of footer (tail) lines of the visible screen to scan for the marker.
 GOAL_MARKER_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_GOAL_MARKER_LINES", "16"))
+MANAGED_BOT_REQUEST_BASE_ID = 41000
+MANAGED_BOT_SPECS: dict[str, dict[str, Any]] = {
+    "codex": {
+        "request_id": MANAGED_BOT_REQUEST_BASE_ID + 1,
+        "label": "Codex",
+        "name": "Herdr Codex",
+        "suggested_username": "herdr_codex_bot",
+        "description": "Herdr Codex pane bot for Herdres.",
+        "short_description": "Codex panes in Herdr.",
+        "aliases": ("codex", "gpt", "openai"),
+    },
+    "claude": {
+        "request_id": MANAGED_BOT_REQUEST_BASE_ID + 2,
+        "label": "Claude",
+        "name": "Herdr Claude",
+        "suggested_username": "herdr_claude_bot",
+        "description": "Herdr Claude pane bot for Herdres.",
+        "short_description": "Claude panes in Herdr.",
+        "aliases": ("claude", "anthropic"),
+    },
+    "kimi": {
+        "request_id": MANAGED_BOT_REQUEST_BASE_ID + 3,
+        "label": "Kimi",
+        "name": "Herdr Kimi",
+        "suggested_username": "herdr_kimi_bot",
+        "description": "Herdr Kimi pane bot for Herdres.",
+        "short_description": "Kimi panes in Herdr.",
+        "aliases": ("kimi", "moonshot"),
+    },
+    "omp": {
+        "request_id": MANAGED_BOT_REQUEST_BASE_ID + 4,
+        "label": "OMP",
+        "name": "Herdr OMP",
+        "suggested_username": "herdr_omp_bot",
+        "description": "Herdr OMP pane bot for Herdres.",
+        "short_description": "OMP panes in Herdr.",
+        "aliases": ("omp",),
+    },
+}
 CODE_FILE_EXTENSIONS = ("py", "json", "toml", "service", "timer", "sh", "md", "txt", "yaml", "yml")
 PATH_OR_SYMBOL_FILE_EXTENSIONS = (
     "py", "js", "ts", "tsx", "jsx", "json", "md", "txt", "yaml", "yml", "toml", "sh", "service", "timer"
@@ -255,6 +329,7 @@ TOKEN_CODE_RE = re.compile(
     r")(?![\w/])"
 )
 TOKEN_CODE_TRAILING_PUNCT_RE = re.compile(r"[.,;:!?)\]}]+$")
+MANAGED_BOT_MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,64})")
 # Markdown link / image / bare-URL / math spans, masked before inline-code detection
 # so a URL query string or an equation is never shattered into a <code> box.
 MD_IMAGE_RE = re.compile(r"!\[([^\]\n]*)\]\(\s*(https?://[^)\s]+|/[^)\s]+)\s*\)")
@@ -349,7 +424,9 @@ def initial_state() -> dict[str, Any]:
             "general_thread_id": os.getenv("HERDR_TELEGRAM_TOPICS_GENERAL_THREAD_ID", DEFAULT_GENERAL_THREAD_ID),
             "owner_user_ids": owners,
             "implicit_send_enabled": False,
+            "managed_bots": {},
         },
+        "spaces": {},
         "panes": {},
         "created_at": utc_now(),
         "updated_at": utc_now(),
@@ -362,7 +439,9 @@ def normalize_state(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("enabled", True)
     data.setdefault("plugin_event_enabled", True)
     data.setdefault("telegram", {})
+    data.setdefault("spaces", {})
     data.setdefault("panes", {})
+    migrate_legacy_pane_topics(data)
     clear_disabled_visible_choice_state(data)
     return data
 
@@ -437,6 +516,570 @@ def compact_path(path: str | None) -> str:
     return sanitize_text(value, max_chars=160)
 
 
+def managed_bot_specs() -> dict[str, dict[str, Any]]:
+    return MANAGED_BOT_SPECS
+
+
+def managed_bot_setup_enabled() -> bool:
+    return MANAGED_BOTS_ENABLED
+
+
+def managed_bot_newbot_url(manager_username: str, spec: dict[str, Any]) -> str:
+    manager = str(manager_username or "").strip().lstrip("@")
+    suggested = str(spec.get("suggested_username") or "").strip().lstrip("@")
+    name = urllib.parse.quote(str(spec.get("name") or ""), safe="")
+    return f"https://t.me/newbot/{manager}/{suggested}?name={name}"
+
+
+def managed_bot_kinds_for_panes(panes: list[dict[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    for pane in panes:
+        if str(pane.get("agent_status") or "").lower() == "closed":
+            continue
+        kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
+        if kind:
+            seen.add(kind)
+    return [kind for kind in managed_bot_specs() if kind in seen]
+
+
+def pane_agent_status_label(pane: dict[str, Any]) -> str:
+    kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
+    spec = managed_bot_specs().get(kind) if kind else None
+    if spec:
+        return str(spec.get("label") or kind.title())
+    agent = clean_label_topic_title(str(pane.get("agent") or ""), fallback="")
+    return agent or pane_thread_name(pane)
+
+
+def pane_pinned_status_emoji(pane: dict[str, Any]) -> str:
+    status = str(pane.get("agent_status") or "").strip().lower().replace("-", "_")
+    if status in {"blocked", "waiting", "error", "failed", "failure"}:
+        return "🔴"
+    if status in ACTIVE_AGENT_STATUSES or status in {"working", "busy", "workflow"}:
+        return "🟡"
+    if status in {"idle", "done", "complete", "completed", "success", "succeeded"}:
+        return "🟢"
+    return "⚪"
+
+
+PINNED_STATUS_SORT_ORDER = {"🔴": 0, "🟡": 1, "🟢": 2, "⚪": 3}
+
+
+def pane_pinned_status_sort_key(pane: dict[str, Any]) -> int:
+    return PINNED_STATUS_SORT_ORDER.get(pane_pinned_status_emoji(pane), 3)
+
+
+def space_pinned_status_text(panes: list[dict[str, Any]]) -> str:
+    open_panes = [
+        pane
+        for pane in panes
+        if str(pane.get("agent_status") or "").strip().lower() != "closed"
+    ]
+    parts: list[str] = []
+    for pane in sorted(open_panes, key=pane_pinned_status_sort_key):
+        parts.append(f"{pane_agent_status_label(pane)} {pane_pinned_status_emoji(pane)}")
+    return sanitize_text(" | ".join(parts), MAX_REPLY_CHARS)
+
+
+def open_panes_by_space(panes: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for pane in panes:
+        if str(pane.get("agent_status") or "").strip().lower() == "closed":
+            continue
+        grouped.setdefault(space_key(pane), []).append(pane)
+    return grouped
+
+
+def managed_bot_setup_reply_markup(manager_username: str, *, kinds: list[str] | None = None) -> dict[str, Any]:
+    selected = kinds if kinds is not None else list(managed_bot_specs().keys())
+    buttons: list[dict[str, str]] = []
+    for kind in selected:
+        spec = managed_bot_specs().get(kind)
+        if not spec:
+            continue
+        buttons.append({
+            "text": str(spec.get("label") or spec.get("name") or "Bot"),
+            "url": managed_bot_newbot_url(manager_username, spec),
+        })
+    return {"inline_keyboard": [buttons[index : index + 2] for index in range(0, len(buttons), 2)]}
+
+
+def managed_bot_username_for_kind(telegram: dict[str, Any], kind: str) -> str:
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+    record = bots.get(kind) if isinstance(bots, dict) else None
+    if isinstance(record, dict):
+        username = str(record.get("username") or "").strip().lstrip("@")
+        if username:
+            return username
+    spec = managed_bot_specs().get(kind) or {}
+    return str(spec.get("suggested_username") or "").strip().lstrip("@")
+
+
+def managed_bot_kind_for_username(telegram: dict[str, Any] | None, username: str) -> str:
+    clean_username = str(username or "").strip().lstrip("@").lower()
+    if not clean_username:
+        return ""
+    telegram_data = telegram if isinstance(telegram, dict) else {}
+    bots = telegram_data.get("managed_bots") if isinstance(telegram_data.get("managed_bots"), dict) else {}
+    for kind, spec in managed_bot_specs().items():
+        candidates = {str(spec.get("suggested_username") or "").strip().lstrip("@").lower()}
+        record = bots.get(kind) if isinstance(bots, dict) else None
+        if isinstance(record, dict):
+            candidates.add(str(record.get("username") or "").strip().lstrip("@").lower())
+        if clean_username in candidates:
+            return kind
+    return ""
+
+
+def mentioned_managed_bot_kind(telegram: dict[str, Any] | None, text: str) -> str:
+    for match in MANAGED_BOT_MENTION_RE.finditer(str(text or "")):
+        kind = managed_bot_kind_for_username(telegram, match.group(1))
+        if kind:
+            return kind
+    return ""
+
+
+def strip_managed_bot_mentions(telegram: dict[str, Any] | None, text: str) -> str:
+    def replacement(match: re.Match[str]) -> str:
+        if managed_bot_kind_for_username(telegram, match.group(1)):
+            return ""
+        return match.group(0)
+
+    without_mentions = MANAGED_BOT_MENTION_RE.sub(replacement, str(text or ""))
+    return re.sub(r"[ \t]{2,}", " ", without_mentions).strip()
+
+
+def entry_matches_managed_bot_kind(entry: dict[str, Any], kind: str) -> bool:
+    clean_kind = str(kind or "").strip().lower()
+    if not clean_kind:
+        return True
+    return managed_bot_kind_for_entry(entry) == clean_kind
+
+
+def managed_bot_group_url(username: str) -> str:
+    clean_username = str(username or "").strip().lstrip("@")
+    return f"https://t.me/{clean_username}?startgroup=herdres"
+
+
+def managed_bot_group_access_reply_markup(telegram: dict[str, Any], kinds: list[str]) -> dict[str, Any]:
+    buttons: list[dict[str, str]] = []
+    for kind in kinds:
+        spec = managed_bot_specs().get(kind)
+        username = managed_bot_username_for_kind(telegram, kind)
+        if not spec or not username:
+            continue
+        buttons.append({
+            "text": f"Add {spec.get('label') or spec.get('name') or 'Bot'}",
+            "url": managed_bot_group_url(username),
+        })
+    return {"inline_keyboard": [buttons[index : index + 2] for index in range(0, len(buttons), 2)]}
+
+
+def managed_bot_request_keyboard(*, kinds: list[str] | None = None) -> dict[str, Any]:
+    selected = kinds if kinds is not None else list(managed_bot_specs().keys())
+    keyboard: list[list[dict[str, Any]]] = []
+    for kind in selected:
+        spec = managed_bot_specs().get(kind)
+        if not spec:
+            continue
+        keyboard.append([
+            {
+                "text": f"Create {spec.get('label')} bot",
+                "request_managed_bot": {
+                    "request_id": int(spec.get("request_id") or 0),
+                    "suggested_name": str(spec.get("name") or ""),
+                    "suggested_username": str(spec.get("suggested_username") or ""),
+                },
+            }
+        ])
+    return {
+        "keyboard": keyboard,
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "is_persistent": True,
+    }
+
+
+def managed_bot_kind_for_agent(value: str | None) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+    words = set(text.split())
+    for kind, spec in managed_bot_specs().items():
+        aliases = {str(alias).lower() for alias in spec.get("aliases") or ()}
+        if kind in words or aliases.intersection(words):
+            return kind
+        if any(alias and alias in text for alias in aliases):
+            return kind
+    return ""
+
+
+def managed_bot_kind_for_payload(bot: dict[str, Any]) -> str:
+    text = " ".join(
+        [
+            str(bot.get("username") or ""),
+            str(bot.get("first_name") or ""),
+            str(bot.get("name") or ""),
+        ]
+    ).lower()
+    for kind, spec in managed_bot_specs().items():
+        if kind in text:
+            return kind
+        username = str(spec.get("suggested_username") or "").lower()
+        if username and username in text:
+            return kind
+    return ""
+
+
+def managed_bot_kind_for_entry(entry: dict[str, Any], pane: dict[str, Any] | None = None) -> str:
+    explicit = str(entry.get("managed_bot_kind") or "").strip().lower()
+    if explicit in managed_bot_specs():
+        return explicit
+    if pane:
+        kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
+        if kind:
+            return kind
+    return managed_bot_kind_for_agent(str(entry.get("agent") or ""))
+
+
+def managed_bot_token_for_entry(
+    telegram: dict[str, Any] | None,
+    entry: dict[str, Any],
+    pane: dict[str, Any] | None = None,
+) -> str | None:
+    if not managed_bot_setup_enabled() or not isinstance(telegram, dict):
+        return None
+    kind = managed_bot_kind_for_entry(entry, pane)
+    if not kind:
+        return None
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+    record = bots.get(kind) if isinstance(bots, dict) else None
+    if not isinstance(record, dict) or record.get("enabled") is False:
+        return None
+    token = str(record.get("token") or "").strip()
+    return token or None
+
+
+def desired_message_bot_kind(
+    telegram: dict[str, Any] | None,
+    entry: dict[str, Any],
+    pane: dict[str, Any] | None = None,
+) -> str:
+    if managed_bot_token_for_entry(telegram, entry, pane):
+        kind = managed_bot_kind_for_entry(entry, pane)
+        if kind:
+            return kind
+    return MANAGER_BOT_KIND
+
+
+def sent_message_bot_kind(
+    telegram: dict[str, Any] | None,
+    entry: dict[str, Any],
+    pane: dict[str, Any] | None,
+    result: dict[str, Any],
+) -> str:
+    if result.get("managed_bot_fallback"):
+        return MANAGER_BOT_KIND
+    return desired_message_bot_kind(telegram, entry, pane)
+
+
+def _iso_age_seconds(value: str) -> float | None:
+    try:
+        then = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (_dt.datetime.now(tz=_dt.timezone.utc) - then).total_seconds()
+
+
+def message_bot_reissue_due(entry: dict[str, Any], bot_kind_field: str, desired_kind: str) -> bool:
+    current = str(entry.get(bot_kind_field) or "")
+    if current == desired_kind:
+        return False
+    if not current and desired_kind == MANAGER_BOT_KIND:
+        return False
+    retry_kind = str(entry.get(f"{bot_kind_field}_retry_kind") or "")
+    retry_at = str(entry.get(f"{bot_kind_field}_retry_at") or "")
+    age = _iso_age_seconds(retry_at) if retry_at else None
+    if current == MANAGER_BOT_KIND and retry_kind == desired_kind and age is not None:
+        return age >= MANAGED_BOT_REISSUE_RETRY_SECONDS
+    return True
+
+
+def record_message_bot_kind(
+    entry: dict[str, Any],
+    bot_kind_field: str,
+    bot_kind: str,
+    desired_kind: str,
+) -> None:
+    entry[bot_kind_field] = bot_kind
+    if bot_kind == desired_kind:
+        entry.pop(f"{bot_kind_field}_retry_kind", None)
+        entry.pop(f"{bot_kind_field}_retry_at", None)
+        return
+    entry[f"{bot_kind_field}_retry_kind"] = desired_kind
+    entry[f"{bot_kind_field}_retry_at"] = utc_now()
+
+
+def note_managed_bot_access_required(entry: dict[str, Any], bot_kind_field: str, desired_kind: str) -> None:
+    if not desired_kind or desired_kind == MANAGER_BOT_KIND:
+        return
+    if not entry.get(bot_kind_field):
+        entry[bot_kind_field] = MANAGER_BOT_KIND
+    entry[f"{bot_kind_field}_retry_kind"] = desired_kind
+    entry[f"{bot_kind_field}_retry_at"] = utc_now()
+    entry[f"{bot_kind_field}_access_required"] = True
+
+
+def managed_bot_access_retry_waiting(entry: dict[str, Any], bot_kind_field: str, desired_kind: str) -> bool:
+    if not desired_kind or desired_kind == MANAGER_BOT_KIND:
+        return False
+    if str(entry.get(f"{bot_kind_field}_retry_kind") or "") != desired_kind:
+        return False
+    retry_at = str(entry.get(f"{bot_kind_field}_retry_at") or "")
+    age = _iso_age_seconds(retry_at) if retry_at else None
+    return age is not None and age < MANAGED_BOT_REISSUE_RETRY_SECONDS
+
+
+def managed_bot_profile_photo_path(kind: str) -> Path | None:
+    env_name = f"HERDR_TELEGRAM_TOPICS_MANAGED_BOT_{kind.upper()}_PHOTO"
+    configured = os.getenv(env_name, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    default_path = Path.home() / ".config/herdres/managed-bots" / f"{kind}.jpg"
+    return default_path if default_path.exists() else None
+
+
+def configure_managed_bot_profile(kind: str, token: str, *, photo_path: Path | None = None) -> dict[str, Any]:
+    spec = managed_bot_specs().get(kind)
+    if not spec:
+        return {"ok": False, "error": f"unknown managed bot kind: {kind}"}
+    errors: list[str] = []
+    for method, field, value in (
+        ("setMyName", "name", spec.get("name")),
+        ("setMyDescription", "description", spec.get("description")),
+        ("setMyShortDescription", "short_description", spec.get("short_description")),
+    ):
+        try:
+            telegram_api(method, {field: str(value or "")}, token=token)
+        except Exception as exc:
+            errors.append(f"{method}: {sanitize_text(str(exc), 240)}")
+    selected_photo = photo_path if photo_path is not None else managed_bot_profile_photo_path(kind)
+    photo_status = "not_configured"
+    if selected_photo:
+        if selected_photo.exists():
+            try:
+                telegram_api_multipart(
+                    "setMyProfilePhoto",
+                    {
+                        "photo": json.dumps(
+                            {"type": "static", "photo": "attach://profile_photo"},
+                            separators=(",", ":"),
+                        )
+                    },
+                    {"profile_photo": selected_photo},
+                    token=token,
+                )
+                photo_status = "updated"
+            except Exception as exc:
+                photo_status = "failed"
+                errors.append(f"setMyProfilePhoto: {sanitize_text(str(exc), 240)}")
+        else:
+            photo_status = "missing"
+            errors.append(f"profile photo not found: {selected_photo}")
+    return {"ok": not errors, "errors": errors, "photo": photo_status}
+
+
+def extract_managed_bot_update(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("managed_bot"), dict):
+        obj = payload["managed_bot"]
+        if isinstance(obj.get("bot"), dict):
+            return obj
+    message = payload.get("message") if isinstance(payload.get("message"), dict) else payload
+    created = message.get("managed_bot_created") if isinstance(message, dict) else None
+    if isinstance(created, dict) and isinstance(created.get("bot"), dict):
+        return {"bot": created["bot"], "user": message.get("from") or {}}
+    if isinstance(payload.get("bot"), dict):
+        return payload
+    return None
+
+
+def managed_bot_update(payload: dict[str, Any]) -> dict[str, Any]:
+    load_dotenv()
+    state = load_state()
+    telegram = state.setdefault("telegram", {})
+    bots = telegram.setdefault("managed_bots", {})
+    if not isinstance(bots, dict):
+        bots = {}
+        telegram["managed_bots"] = bots
+    update = extract_managed_bot_update(payload)
+    if not update:
+        return {"ok": False, "handled": False, "error": "no managed bot payload"}
+    bot = update.get("bot") if isinstance(update.get("bot"), dict) else {}
+    user = update.get("user") if isinstance(update.get("user"), dict) else {}
+    kind = managed_bot_kind_for_payload(bot)
+    if not kind:
+        return {"ok": False, "handled": True, "error": "could not infer managed bot kind"}
+    bot_id = str(bot.get("id") or "")
+    if not bot_id:
+        return {"ok": False, "handled": True, "kind": kind, "error": "managed bot update had no bot id"}
+    token_result = telegram_api("getManagedBotToken", {"user_id": bot_id})
+    child_token = str(token_result.get("result") or "").strip()
+    if not child_token:
+        return {"ok": False, "handled": True, "kind": kind, "error": "getManagedBotToken returned no token"}
+    profile = configure_managed_bot_profile(kind, child_token)
+    bots[kind] = {
+        "kind": kind,
+        "bot_id": bot_id,
+        "username": str(bot.get("username") or ""),
+        "name": str(bot.get("first_name") or bot.get("name") or ""),
+        "owner_user_id": str(user.get("id") or ""),
+        "token": child_token,
+        "enabled": True,
+        "profile": profile,
+        "updated_at": utc_now(),
+    }
+    telegram.pop("managed_bot_setup_message_error", None)
+    telegram["managed_bot_last_update_at"] = utc_now()
+    save_state(state)
+    return {"ok": bool(profile.get("ok")), "handled": True, "kind": kind, "profile": profile}
+
+
+def manager_bot_username(telegram: dict[str, Any]) -> str:
+    cached = str(telegram.get("bot_username") or "").strip().lstrip("@")
+    if cached:
+        return cached
+    result = telegram_api("getMe", {}).get("result") or {}
+    username = str(result.get("username") or "").strip().lstrip("@")
+    if username:
+        telegram["bot_username"] = username
+    if "can_manage_bots" in result:
+        telegram["can_manage_bots"] = bool(result.get("can_manage_bots"))
+    return username
+
+
+def managed_bot_group_access_kinds(state: dict[str, Any], open_panes: list[dict[str, Any]]) -> list[str]:
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+    open_kinds = set(managed_bot_kinds_for_panes(open_panes))
+    seen: set[str] = set()
+    for pane in open_panes:
+        key = pane_key(pane)
+        entry = panes.get(key) if isinstance(panes, dict) else None
+        if not isinstance(entry, dict):
+            continue
+        for field in MANAGED_BOT_ROUTE_KIND_FIELDS:
+            kind = str(entry.get(f"{field}_retry_kind") or "")
+            if kind not in open_kinds:
+                continue
+            record = bots.get(kind) if isinstance(bots, dict) else None
+            if isinstance(record, dict) and record.get("token") and record.get("enabled") is not False:
+                seen.add(kind)
+    return [kind for kind in managed_bot_specs() if kind in seen]
+
+
+def ensure_managed_bot_group_access_message(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    counters: dict[str, int],
+    max_sends: int,
+    open_panes: list[dict[str, Any]],
+) -> bool:
+    if not managed_bot_setup_enabled() or not chat_id:
+        return False
+    missing_access = managed_bot_group_access_kinds(state, open_panes)
+    if not missing_access:
+        return False
+    access_kinds = {str(kind) for kind in telegram.get("managed_bot_group_access_kinds") or []}
+    if telegram.get("managed_bot_group_access_message_id") and set(missing_access).issubset(access_kinds):
+        return False
+    if counters.get("sends", 0) >= max_sends:
+        return False
+    labels = ", ".join(str(managed_bot_specs()[kind]["label"]) for kind in missing_access)
+    body = (
+        f"Telegram is rejecting pane messages from these managed bots in this forum group: {labels}. "
+        "Add each bot to the group, then Herdres will send pane threads and replies from the matching bot."
+    )
+    result = send_notice(
+        chat_id,
+        "Add pane bots to this group",
+        body,
+        telegram=telegram,
+        thread_id=telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID),
+        notify=True,
+        reply_markup=managed_bot_group_access_reply_markup(telegram, missing_access),
+    )
+    counters["sends"] = counters.get("sends", 0) + 1
+    if result.get("ok") and result.get("message_id"):
+        telegram["managed_bot_group_access_message_id"] = str(result["message_id"])
+        telegram["managed_bot_group_access_kinds"] = missing_access
+        telegram["managed_bot_group_access_sent_at"] = utc_now()
+        telegram.pop("managed_bot_group_access_message_error", None)
+    else:
+        telegram["managed_bot_group_access_message_error"] = sanitize_text(str(result), 500)
+    save_state(state)
+    return True
+
+
+def ensure_managed_bot_setup_message(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    counters: dict[str, int],
+    max_sends: int,
+    open_panes: list[dict[str, Any]],
+) -> bool:
+    if not managed_bot_setup_enabled() or not chat_id:
+        return False
+    if telegram.get("can_manage_bots") is not True:
+        return False
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+    open_kinds = managed_bot_kinds_for_panes(open_panes)
+    if not open_kinds:
+        return False
+    missing = [kind for kind in open_kinds if not isinstance(bots.get(kind), dict) or not bots[kind].get("token")]
+    if not missing:
+        return False
+    setup_kinds = {str(kind) for kind in telegram.get("managed_bot_setup_kinds") or []}
+    if telegram.get("managed_bot_setup_message_id") and set(missing).issubset(setup_kinds):
+        return False
+    if counters.get("sends", 0) >= max_sends:
+        return False
+    try:
+        username = manager_bot_username(telegram)
+    except Exception as exc:
+        telegram["managed_bot_setup_message_error"] = sanitize_text(str(exc), 300)
+        return True
+    if not username:
+        telegram["managed_bot_setup_message_error"] = "getMe returned no manager bot username"
+        return True
+    labels = ", ".join(str(managed_bot_specs()[kind]["label"]) for kind in missing)
+    body = (
+        f"Create managed pane bots for the currently open pane types: {labels}. "
+        "After creation, add each child bot to this forum group so direct replies to that bot can be received."
+    )
+    result = send_notice(
+        chat_id,
+        "Managed pane bots",
+        body,
+        telegram=telegram,
+        thread_id=telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID),
+        notify=True,
+        reply_markup=managed_bot_setup_reply_markup(username, kinds=missing),
+    )
+    counters["sends"] = counters.get("sends", 0) + 1
+    if result.get("ok") and result.get("message_id"):
+        telegram["managed_bot_setup_message_id"] = str(result["message_id"])
+        telegram["managed_bot_setup_kinds"] = missing
+        telegram["managed_bot_setup_sent_at"] = utc_now()
+        telegram.pop("managed_bot_setup_message_error", None)
+    else:
+        telegram["managed_bot_setup_message_error"] = sanitize_text(str(result), 500)
+    save_state(state)
+    return True
+
+
 def run_cmd(args: list[str], *, timeout: int = 10, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
@@ -469,12 +1112,46 @@ def herdr_text(args: list[str], *, timeout: int = 10) -> str:
     return proc.stdout
 
 
+def workspace_label_map() -> dict[str, str]:
+    try:
+        data = herdr_json(["workspace", "list"], timeout=8)
+    except BridgeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    workspaces = data.get("result", {}).get("workspaces")
+    if not isinstance(workspaces, list):
+        return {}
+    labels: dict[str, str] = {}
+    for workspace in workspaces:
+        if not isinstance(workspace, dict):
+            continue
+        workspace_id = str(workspace.get("workspace_id") or "")
+        label = clean_space_topic_title(str(workspace.get("label") or ""), fallback="")
+        if workspace_id and label:
+            labels[workspace_id] = label
+    return labels
+
+
 def pane_list() -> list[dict[str, Any]]:
     data = herdr_json(["pane", "list"], timeout=8)
     if isinstance(data, dict):
         panes = data.get("result", {}).get("panes")
         if isinstance(panes, list):
-            return panes
+            labels = workspace_label_map()
+            if not labels:
+                return panes
+            enriched: list[dict[str, Any]] = []
+            for pane in panes:
+                if not isinstance(pane, dict):
+                    continue
+                item = dict(pane)
+                label = labels.get(str(item.get("workspace_id") or ""))
+                if label:
+                    item["space_name"] = label
+                    item["workspace_label"] = label
+                enriched.append(item)
+            return enriched
     raise BridgeError("unexpected herdr pane list response")
 
 
@@ -521,6 +1198,54 @@ def pane_key(pane: dict[str, Any]) -> str:
     raw = "|".join(parts)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
     return f"{parts[0]}:{digest}"
+
+
+def _space_component(value: str) -> str:
+    text = sanitize_text(value, 120).strip()
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"[^A-Za-z0-9_.:-]+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    return text
+
+
+def space_key(pane: dict[str, Any]) -> str:
+    explicit_space = _space_component(str(pane.get("space_id") or ""))
+    if explicit_space:
+        return f"space:{explicit_space}"
+    workspace = _space_component(str(pane.get("workspace_id") or pane.get("workspace") or ""))
+    if workspace:
+        return f"workspace:{workspace}"
+    cwd_value = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
+    cwd_name = _space_component(Path(cwd_value).name if cwd_value else "")
+    if cwd_name:
+        return f"cwd:{cwd_name}"
+    return "default"
+
+
+def clean_space_topic_title(value: str, *, fallback: str = "Herdr Space") -> str:
+    text = sanitize_text(value, 80)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:32].strip() or fallback
+
+
+def space_name_for_pane(pane: dict[str, Any]) -> str:
+    explicit_name = clean_space_topic_title(
+        str(pane.get("space_name") or pane.get("workspace_label") or pane.get("workspace_name") or ""),
+        fallback="",
+    )
+    if explicit_name:
+        return explicit_name
+    explicit_space = clean_label_topic_title(str(pane.get("space_id") or ""), fallback="")
+    if explicit_space:
+        return explicit_space
+    workspace = clean_label_topic_title(str(pane.get("workspace_id") or pane.get("workspace") or ""), fallback="")
+    if workspace:
+        return workspace
+    cwd_value = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
+    cwd_name = clean_label_topic_title(Path(cwd_value).name if cwd_value else "", fallback="")
+    if cwd_name:
+        return cwd_name
+    return "Herdr Space"
 
 
 def pane_handle_alias(value: str) -> str:
@@ -618,6 +1343,157 @@ def topic_name_for_pane(pane: dict[str, Any]) -> str:
         return cwd_title
 
     return clean_topic_title(str(pane.get("agent") or "Task"))
+
+
+def pane_thread_name(pane: dict[str, Any]) -> str:
+    label = pane_manual_label(pane)
+    if label:
+        return label
+    pane_id = str(pane.get("pane_id") or "")
+    alias = pane_handle_alias(pane_id)
+    if alias:
+        return alias
+    short_id = short_pane_id(pane_id) if pane_id else ""
+    agent = clean_label_topic_title(str(pane.get("agent") or ""), fallback="")
+    if agent and short_id:
+        return f"{agent} {short_id}"
+    if short_id:
+        return short_id
+    if agent:
+        return agent
+    return "Pane"
+
+
+def pane_entry_iter(state: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any]]]:
+    panes = state.setdefault("panes", {})
+    for key, entry in panes.items():
+        if isinstance(entry, dict):
+            yield str(key), entry
+
+
+def ensure_space_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str, dict[str, Any], bool]:
+    key = space_key(pane)
+    spaces = state.setdefault("spaces", {})
+    entry = spaces.get(key)
+    changed = False
+    if not isinstance(entry, dict):
+        entry = {"space_key": key, "created_at": utc_now(), "pane_keys": []}
+        spaces[key] = entry
+        changed = True
+    if entry.get("space_key") != key:
+        entry["space_key"] = key
+        changed = True
+    space_id = str(pane.get("space_id") or pane.get("workspace_id") or pane.get("workspace") or "")
+    if space_id and entry.get("space_id") != space_id:
+        entry["space_id"] = space_id
+        changed = True
+    workspace_label = clean_space_topic_title(
+        str(pane.get("space_name") or pane.get("workspace_label") or pane.get("workspace_name") or ""),
+        fallback="",
+    )
+    if workspace_label and entry.get("workspace_name") != workspace_label:
+        entry["workspace_name"] = workspace_label
+        changed = True
+    topic_name = space_name_for_pane(pane)
+    current_topic_name = str(entry.get("topic_name") or "")
+    if not current_topic_name:
+        entry["topic_name"] = topic_name
+        changed = True
+    elif workspace_label and current_topic_name != topic_name:
+        entry["topic_name"] = topic_name
+        entry["topic_title_source"] = "workspace-label"
+        if entry.get("topic_id"):
+            entry["topic_rename_pending_at"] = utc_now()
+            entry["topic_rename_from"] = current_topic_name
+            entry["topic_rename_to"] = topic_name
+            entry.pop("last_topic_verified_at", None)
+        changed = True
+    pane_keys = entry.setdefault("pane_keys", [])
+    key_for_pane = pane_key(pane)
+    if key_for_pane not in pane_keys:
+        pane_keys.append(key_for_pane)
+        changed = True
+    return key, entry, changed
+
+
+def migrate_legacy_pane_topics(state: dict[str, Any]) -> bool:
+    changed = False
+    spaces = state.setdefault("spaces", {})
+    for key, entry in pane_entry_iter(state):
+        pane_like = {
+            "pane_id": entry.get("pane_id") or key,
+            "workspace_id": entry.get("workspace_id") or entry.get("workspace") or "",
+            "tab_id": entry.get("tab") or "",
+            "label": entry.get("pane_label_raw") or entry.get("topic_name") or "",
+            "agent": entry.get("agent") or "",
+            "foreground_cwd": entry.get("foreground_cwd") or entry.get("cwd") or "",
+        }
+        key_for_space = space_key(pane_like)
+        space_entry = spaces.get(key_for_space)
+        if not isinstance(space_entry, dict):
+            space_entry = {
+                "space_key": key_for_space,
+                "space_id": str(pane_like.get("workspace_id") or ""),
+                "topic_name": space_name_for_pane(pane_like),
+                "pane_keys": [],
+            }
+            spaces[key_for_space] = space_entry
+            changed = True
+        pane_keys = space_entry.setdefault("pane_keys", [])
+        if key not in pane_keys:
+            pane_keys.append(key)
+            changed = True
+        if entry.get("space_key") != key_for_space:
+            entry["space_key"] = key_for_space
+            changed = True
+        thread_name = pane_thread_name(pane_like)
+        if entry.get("pane_thread_name") != thread_name:
+            entry["pane_thread_name"] = thread_name
+            changed = True
+        legacy_topic_id = str(entry.get("topic_id") or "")
+        if legacy_topic_id and not space_entry.get("topic_id"):
+            space_entry["topic_id"] = legacy_topic_id
+            for verify_key in ("last_topic_verified_at", "last_topic_verify_attempt_at"):
+                verify_value = entry.get(verify_key)
+                if verify_value and not space_entry.get(verify_key):
+                    space_entry[verify_key] = verify_value
+            legacy_name = str(entry.get("topic_name") or "")
+            space_name = space_name_for_pane(pane_like)
+            if not space_entry.get("topic_name"):
+                space_entry["topic_name"] = space_name
+            if legacy_name and legacy_name != space_name:
+                space_entry["topic_rename_pending_at"] = utc_now()
+                space_entry["topic_rename_from"] = legacy_name
+                space_entry["topic_rename_to"] = space_name
+            changed = True
+        space_topic_id = str(space_entry.get("topic_id") or "")
+        if legacy_topic_id and space_topic_id and legacy_topic_id != space_topic_id:
+            if entry.get("legacy_topic_id") != legacy_topic_id:
+                entry["legacy_topic_id"] = legacy_topic_id
+                changed = True
+            if entry.get("topic_name") and entry.get("legacy_topic_name") != entry.get("topic_name"):
+                entry["legacy_topic_name"] = entry.get("topic_name")
+                changed = True
+            entry["topic_id"] = space_topic_id
+            changed = True
+        elif space_topic_id and entry.get("topic_id") != space_topic_id:
+            entry["topic_id"] = space_topic_id
+            changed = True
+        space_topic_name = str(space_entry.get("topic_name") or space_name_for_pane(pane_like))
+        current_topic_name = str(entry.get("topic_name") or "")
+        if current_topic_name and current_topic_name != space_topic_name:
+            if entry.get("legacy_topic_name") != current_topic_name:
+                entry["legacy_topic_name"] = current_topic_name
+                changed = True
+        if space_topic_name and current_topic_name != space_topic_name:
+            entry["topic_name"] = space_topic_name
+            entry["topic_title_source"] = "space"
+            changed = True
+        for rename_key in ("topic_rename_pending_at", "topic_rename_from", "topic_rename_to"):
+            if rename_key in entry:
+                entry.pop(rename_key, None)
+                changed = True
+    return changed
 
 
 def status_object(pane: dict[str, Any]) -> dict[str, Any]:
@@ -1387,7 +2263,7 @@ def make_decision_feed_item(turn: dict[str, Any], decision: dict[str, Any]) -> d
     assistant_context = sanitize_text(str(turn.get("assistant_final_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
     text_parts: list[str] = []
     if user_text:
-        text_parts.extend(["You asked", user_text, ""])
+        text_parts.extend([USER_PROMPT_LABEL, user_text, ""])
     if assistant_context:
         text_parts.extend([assistant_context, ""])
     text_parts.append(prompt)
@@ -1435,7 +2311,7 @@ def make_interaction_feed_item(turn: dict[str, Any], interaction: dict[str, Any]
     note = f"{INTERACTION_READONLY_WARNING_TITLE}\n{INTERACTION_READONLY_WARNING_BODY}"
     text_parts: list[str] = []
     if user_text:
-        text_parts.extend(["You asked", user_text, ""])
+        text_parts.extend([USER_PROMPT_LABEL, user_text, ""])
     if assistant_context:
         text_parts.extend([assistant_context, ""])
     text_parts.append(prompt)
@@ -1494,9 +2370,13 @@ def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
     if not assistant_final:
         return None
     user_text = sanitize_text(str(turn.get("user_text") or ""), USER_PROMPT_MAX_CHARS).strip()
+    raw_worklog = turn.get("worklog_text") or ("" if turn.get("has_open_turn") is True else turn.get("assistant_stream_text"))
+    worklog_text = sanitize_text(str(raw_worklog or ""), FINAL_REPLY_MAX_CHARS).strip()
     text_parts: list[str] = []
     if user_text:
-        text_parts.extend(["You asked", user_text, ""])
+        text_parts.extend([USER_PROMPT_LABEL, user_text, ""])
+    if worklog_text:
+        text_parts.extend([WORKLOG_LABEL, worklog_text, ""])
     text_parts.append(assistant_final)
     return {
         "kind": "turn",
@@ -1507,7 +2387,40 @@ def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
         "text": "\n".join(text_parts).strip(),
         "turn_id": sanitize_text(str(turn.get("turn_id") or ""), 300),
         "user_text": user_text,
+        "worklog_text": worklog_text,
         "assistant_final_text": assistant_final,
+        "notify": False,
+    }
+
+
+def turn_open_prompt(turn: dict[str, Any]) -> tuple[str, str]:
+    if not isinstance(turn, dict) or turn.get("available") is not True:
+        return "", ""
+    if turn.get("has_open_turn") is True:
+        turn_id = str(turn.get("open_turn_id") or "")
+        user_text = str(turn.get("open_user_text") or "")
+    elif turn.get("complete") is False:
+        turn_id = str(turn.get("turn_id") or "")
+        user_text = str(turn.get("user_text") or "")
+    else:
+        return "", ""
+    user_text = sanitize_text(user_text, USER_PROMPT_MAX_CHARS).strip()
+    if not turn_id or not user_text:
+        return "", ""
+    return sanitize_text(turn_id, 300), user_text
+
+
+def make_prompt_feed_item(turn_id: str, user_text: str) -> dict[str, Any]:
+    prompt = sanitize_text(user_text, USER_PROMPT_MAX_CHARS).strip()
+    return {
+        "kind": "prompt",
+        "title": USER_PROMPT_LABEL,
+        "summary": prompt,
+        "detail": "",
+        "lines": prompt.splitlines(),
+        "text": f"{USER_PROMPT_LABEL}\n{prompt}".strip(),
+        "turn_id": sanitize_text(str(turn_id or ""), 300),
+        "user_text": prompt,
         "notify": False,
     }
 
@@ -1655,11 +2568,7 @@ def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[s
     if isinstance(turn, dict):
         recent = turn.get("recent_turns")
         if isinstance(recent, list) and len(recent) >= 2:
-            delivered = str(
-                (entry.get("last_clean_item") or {}).get("turn_id")
-                or entry.get("last_turn_id")
-                or ""
-            )
+            delivered = str((entry.get("last_clean_item") or {}).get("turn_id") or "")
             ids = [str(t.get("turn_id") or "") for t in recent]
             if delivered and delivered in ids:
                 idx = ids.index(delivered)
@@ -1667,7 +2576,59 @@ def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[s
                     catch_up = make_turn_feed_item(recent[idx + 1])
                     if catch_up:
                         return catch_up
+            streamed = str(entry.get("last_stream_turn_id") or entry.get("pending_stream_turn_id") or "")
+            if not delivered and streamed and streamed in ids:
+                streamed_item = make_turn_feed_item(recent[ids.index(streamed)])
+                if streamed_item:
+                    return streamed_item
     return make_turn_feed_item(turn)
+
+
+def turn_item_precedes_prompt(item: dict[str, Any], turn: dict[str, Any], prompt_turn_id: str) -> bool:
+    item_turn_id = str(item.get("turn_id") or "")
+    prompt_id = str(prompt_turn_id or "")
+    if not item_turn_id or not prompt_id or item_turn_id == prompt_id:
+        return False
+    recent = turn.get("recent_turns") if isinstance(turn, dict) else None
+    if not isinstance(recent, list):
+        return False
+    ids = [str(candidate.get("turn_id") or "") for candidate in recent if isinstance(candidate, dict)]
+    if item_turn_id not in ids or prompt_id not in ids:
+        return False
+    return ids.index(item_turn_id) < ids.index(prompt_id)
+
+
+def record_suppressed_clean_item(entry: dict[str, Any], item: dict[str, Any], reason: str) -> None:
+    item_render_hash = clean_feed_hash(item)
+    item_semantic_hash = clean_feed_hash(item, include_render_version=False)
+    entry["last_clean_hash"] = item_render_hash
+    entry["last_clean_semantic_hash"] = item_semantic_hash
+    entry["last_clean_render_hash"] = item_render_hash
+    entry["last_clean_text"] = item_plain_text(item)
+    entry["last_clean_item"] = item
+    entry["last_clean_suppressed_reason"] = sanitize_text(reason, 120)
+    entry["last_clean_suppressed_at"] = utc_now()
+    entry.pop("last_clean_send_error", None)
+
+
+def attach_stream_worklog(item: dict[str, Any] | None, entry: dict[str, Any], turn: dict[str, Any]) -> dict[str, Any] | None:
+    if not item or str(item.get("kind") or "").lower() != "turn" or item.get("worklog_text"):
+        return item
+    item_turn_id = str(item.get("turn_id") or "")
+    stream_turn_id = str(entry.get("last_stream_turn_id") or entry.get("pending_stream_turn_id") or "")
+    if not stream_turn_id and turn.get("has_open_turn") is True:
+        stream_turn_id = str(turn.get("open_turn_id") or "")
+    if not stream_turn_id and turn.get("assistant_stream_text"):
+        stream_turn_id = str(turn.get("turn_id") or "")
+    if stream_turn_id and item_turn_id and item_turn_id != stream_turn_id:
+        return item
+    worklog_text = sanitize_text(
+        str(turn.get("assistant_stream_text") or entry.get("last_stream_text") or entry.get("pending_stream_text") or ""),
+        FINAL_REPLY_MAX_CHARS,
+    ).strip()
+    if worklog_text:
+        item["worklog_text"] = worklog_text
+    return item
 
 
 API_ERROR_NOTICE_TITLE = "⚠️ API error — pane stopped"
@@ -1690,7 +2651,7 @@ def apply_api_error_warning(
     entry: dict[str, Any],
     counters: dict[str, int],
     max_sends: int,
-) -> dict[str, bool]:
+) -> dict[str, Any]:
     """Send a one-time ⚠️ warning for an unresolved model-API-error stall.
 
     The dedup id (last_api_error_id) is set ONLY after a successful send, so a
@@ -1709,13 +2670,26 @@ def apply_api_error_warning(
                 telegram=telegram,
                 thread_id=entry["topic_id"],
                 notify=True,
+                reply_to_message_id=pane_root_reply_target(entry),
+                api_token=managed_bot_token_for_entry(telegram, entry),
             )
             if notice.get("ok"):
                 entry["last_api_error_id"] = err_id
                 counters["sends"] = counters.get("sends", 0) + 1
-                return {"changed": True, "topic_missing": False}
+                return {
+                    "changed": True,
+                    "topic_missing": False,
+                    "message_id": str(notice.get("message_id") or ""),
+                }
             if result_topic_missing(notice):
                 return {"changed": False, "topic_missing": True}
+            if result_pane_root_missing(notice):
+                return {
+                    "changed": False,
+                    "topic_missing": False,
+                    "pane_root_missing": True,
+                    "error": str(notice.get("error") or notice),
+                }
         return {"changed": False, "topic_missing": False}
     if not pending and entry.get("last_api_error_id") and entry.get("last_turn_available") is True:
         entry.pop("last_api_error_id", None)
@@ -1746,7 +2720,7 @@ def extract_turn_feed_item(
         entry["pending_api_error"] = api_error
     else:
         entry.pop("pending_api_error", None)
-    item = select_turn_feed_item(turn, entry)
+    item = attach_stream_worklog(select_turn_feed_item(turn, entry), entry, turn)
     # Prefer the actual completed turn over any visible-screen scrape. This
     # covers the auto-continue case AND the done->working status-lag race: even
     # if the status momentarily reads non-working while the terminal has already
@@ -1755,7 +2729,48 @@ def extract_turn_feed_item(
     # genuinely blocked pane (a real on-screen prompt awaiting the user) bypasses
     # this to the visible path.
     if not item and status != "blocked" and turn.get("complete") is True and turn.get("has_open_turn") is True:
-        item = make_turn_feed_item({**turn, "has_open_turn": False})
+        item = attach_stream_worklog(make_turn_feed_item({**turn, "has_open_turn": False, "assistant_stream_text": ""}), entry, turn)
+    prompt_turn_id, prompt_text = turn_open_prompt(turn)
+    if item and str(item.get("turn_id") or "") == prompt_turn_id and str(item.get("kind") or "").lower() in {
+        "decision",
+        "interaction_readonly",
+    }:
+        prompt_turn_id = ""
+        prompt_text = ""
+    newest_prompt_turn_id = prompt_turn_id or str(entry.get("last_prompt_turn_id") or "")
+    if item and turn_item_precedes_prompt(item, turn, newest_prompt_turn_id):
+        record_suppressed_clean_item(entry, item, "newer_prompt_already_visible")
+        item = None
+    prompt_hash = stream_text_hash(prompt_text) if prompt_turn_id and prompt_text else ""
+    prompt_already_sent = str(entry.get("last_prompt_turn_id") or "") == prompt_turn_id and (
+        not str(entry.get("last_prompt_hash") or "") or str(entry.get("last_prompt_hash") or "") == prompt_hash
+    )
+    if prompt_turn_id and not prompt_already_sent:
+        entry["pending_prompt_turn_id"] = prompt_turn_id
+        entry["pending_prompt_text"] = prompt_text
+        entry["pending_prompt_hash"] = prompt_hash
+    else:
+        entry.pop("pending_prompt_turn_id", None)
+        entry.pop("pending_prompt_text", None)
+        entry.pop("pending_prompt_hash", None)
+    stream_text = sanitize_text(str(turn.get("assistant_stream_text") or "").strip(), MAX_REPLY_CHARS)
+    stream_turn_id = ""
+    if stream_text and turn.get("complete") is False:
+        stream_turn_id = str(turn.get("turn_id") or "")
+    elif stream_text and turn.get("has_open_turn") is True and item:
+        item_semantic_hash = clean_feed_hash(item, include_render_version=False)
+        if str(item.get("kind") or "").lower() == "turn" and same_delivered_content(entry, item, item_semantic_hash):
+            item = None
+            stream_turn_id = str(turn.get("open_turn_id") or turn.get("turn_id") or "")
+    if not item and stream_turn_id:
+        entry["pending_stream_turn_id"] = stream_turn_id
+        entry["pending_stream_text"] = stream_text
+        entry["pending_stream_revision"] = str(turn.get("stream_revision") or stream_text_hash(stream_text))
+        entry["last_turn_id"] = stream_turn_id
+        return None
+    entry.pop("pending_stream_turn_id", None)
+    entry.pop("pending_stream_text", None)
+    entry.pop("pending_stream_revision", None)
     # Visible-screen prompt fallback: never scrape an actively-working pane — its
     # screen is its own in-progress output (spinner, tool noise, the echo of an
     # already-delivered reply), which produced the "Input needed" spam and
@@ -1768,13 +2783,34 @@ def extract_turn_feed_item(
     return item
 
 
+def clear_stream_state(entry: dict[str, Any]) -> None:
+    for key in (
+        "pending_stream_turn_id",
+        "pending_stream_text",
+        "pending_stream_revision",
+        "last_stream_hash",
+        "last_stream_turn_id",
+        "last_stream_draft_id",
+        "last_stream_message_id",
+        "last_stream_text",
+        "last_stream_sent_at",
+        "last_stream_error",
+        "last_stream_transport",
+        "last_stream_update_count",
+    ):
+        entry.pop(key, None)
+
+
 def item_plain_text(item: dict[str, Any]) -> str:
     if str(item.get("kind") or "").lower() == "turn":
         user_text = str(item.get("user_text") or "").strip()
+        worklog_text = str(item.get("worklog_text") or "").strip()
         assistant_final = str(item.get("assistant_final_text") or "").strip()
         parts: list[str] = []
         if user_text:
-            parts.extend(["You asked", user_text, ""])
+            parts.extend([USER_PROMPT_LABEL, user_text, ""])
+        if worklog_text:
+            parts.extend([WORKLOG_LABEL, worklog_text, ""])
         if assistant_final:
             parts.append(assistant_final)
         return sanitize_text("\n".join(parts).strip(), FINAL_REPLY_MAX_CHARS)
@@ -1785,7 +2821,7 @@ def item_plain_text(item: dict[str, Any]) -> str:
         options = list(item.get("options") or [])
         parts: list[str] = []
         if user_text:
-            parts.extend(["You asked", user_text, ""])
+            parts.extend([USER_PROMPT_LABEL, user_text, ""])
         if assistant_context:
             parts.extend([assistant_context, ""])
         if prompt:
@@ -2389,6 +3425,28 @@ def _blockquote_text(value: str, max_chars: int) -> str:
     return "<br>".join(_rich_inline(line, max_chars) for line in lines)
 
 
+def render_user_prompt_quote_html(user_text: str) -> str:
+    body = _blockquote_text(user_text, USER_PROMPT_MAX_CHARS).strip()
+    if not body:
+        return ""
+    return _rich_details_quote_html(USER_PROMPT_LABEL, body, summary_max_chars=20)
+
+
+def _rich_details_quote_html(
+    summary: str,
+    body_html: str,
+    *,
+    summary_max_chars: int = 80,
+    open_by_default: bool = True,
+) -> str:
+    body = str(body_html or "").strip()
+    if not body:
+        return ""
+    label = _html_text(summary, summary_max_chars)
+    open_attr = " open" if open_by_default else ""
+    return f"<details{open_attr}><summary><b>{label}</b></summary><blockquote>{body}</blockquote></details>"
+
+
 TURN_COLLAPSED_SECTION_KEYS = {"proof", "logs", "commands", "diff", "raw output", "raw"}
 TURN_KNOWN_HEADING_KEYS = {
     "implemented",
@@ -2921,40 +3979,78 @@ def _turn_fallback_body_html(assistant_final: str, reserved_chars: int) -> str:
     return _rich_paragraph(sanitize_text(assistant_final, 900))
 
 
+def render_assistant_response_quote_html(assistant_final: str) -> str:
+    clean = str(assistant_final or "").strip()
+    if not clean:
+        return ""
+    body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
+    return _rich_details_quote_html(RESPONSE_LABEL, body_html)
+
+
+def render_worklog_quote_html(worklog_text: str, *, response_available: bool) -> str:
+    clean = str(worklog_text or "").strip()
+    if not clean:
+        return ""
+    body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
+    return _rich_details_quote_html(WORKLOG_LABEL, body_html, open_by_default=not response_available)
+
+
 def render_turn_item_html(item: dict[str, Any]) -> str:
     user_text = str(item.get("user_text") or "").strip()
+    worklog_text = str(item.get("worklog_text") or item.get("assistant_stream_text") or "").strip()
     assistant_final = str(item.get("assistant_final_text") or "").strip()
     parts: list[str] = []
     if user_text:
-        parts.append(
-            "<blockquote>"
-            "<b>You asked</b><br>"
-            f"{_blockquote_text(user_text, USER_PROMPT_MAX_CHARS)}"
-            "</blockquote>"
-        )
-    body_html = render_final_reply_html(assistant_final)
-    if body_html:
-        parts.append(body_html)
-    elif assistant_final:
-        parts.append(_rich_paragraph(assistant_final))
+        parts.append(render_user_prompt_quote_html(user_text))
+    worklog_html = render_worklog_quote_html(worklog_text, response_available=bool(assistant_final))
+    if worklog_html:
+        parts.append(worklog_html)
+    response_html = render_assistant_response_quote_html(assistant_final)
+    if response_html:
+        parts.append(response_html)
     rendered = _join_blocks(parts).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
         quote_html = ""
         if user_text:
-            quote_html = (
-                "<blockquote><b>You asked</b><br>"
-                f"{_blockquote_text(user_text, USER_PROMPT_MAX_CHARS)}"
-                "</blockquote>"
-            )
-        body_html = _turn_fallback_body_html(assistant_final, len(quote_html))
-        if quote_html:
-            rendered = f"{quote_html}<br>{body_html}"
-        else:
-            rendered = body_html
+            quote_html = render_user_prompt_quote_html(user_text)
+        worklog_html = ""
+        if worklog_text:
+            worklog_body = _turn_fallback_body_html(worklog_text, len(quote_html) + 120)
+            worklog_html = _rich_details_quote_html(WORKLOG_LABEL, worklog_body, open_by_default=not bool(assistant_final))
+        response_html = ""
+        if assistant_final:
+            body_html = _turn_fallback_body_html(assistant_final, len(quote_html) + len(worklog_html) + 120)
+            response_html = _rich_details_quote_html(RESPONSE_LABEL, body_html)
+        rendered = _join_blocks([quote_html, worklog_html, response_html]).strip()
         if len(rendered) > MAX_RICH_HTML_CHARS:
-            body_html = _rich_paragraph(sanitize_text(assistant_final, 900))
-            return f"{quote_html}<br>{body_html}" if quote_html else body_html
+            worklog_html = ""
+            if worklog_text:
+                worklog_html = _rich_details_quote_html(
+                    WORKLOG_LABEL,
+                    _rich_paragraph(sanitize_text(worklog_text, 900)),
+                    open_by_default=not bool(assistant_final),
+                )
+            response_html = ""
+            if assistant_final:
+                body_html = _rich_paragraph(sanitize_text(assistant_final, 900))
+                response_html = _rich_details_quote_html(RESPONSE_LABEL, body_html)
+            return _join_blocks([quote_html, worklog_html, response_html]).strip()
     return rendered
+
+
+def render_stream_turn_html(user_text: str, worklog_text: str) -> str:
+    clean_user = sanitize_text(str(user_text or ""), USER_PROMPT_MAX_CHARS).strip()
+    clean_worklog = sanitize_text(str(worklog_text or ""), MAX_REPLY_CHARS).strip()
+    if clean_user:
+        return render_turn_item_html(
+            {
+                "kind": "turn",
+                "user_text": clean_user,
+                "worklog_text": clean_worklog,
+                "assistant_final_text": "",
+            }
+        )
+    return render_worklog_quote_html(clean_worklog, response_available=False)
 
 
 def render_decision_item_html(item: dict[str, Any]) -> str:
@@ -2964,14 +4060,9 @@ def render_decision_item_html(item: dict[str, Any]) -> str:
     options = list(item.get("options") or [])
     parts: list[str] = []
     if user_text:
-        parts.append(
-            "<blockquote>"
-            "<b>You asked</b><br>"
-            f"{_blockquote_text(user_text, USER_PROMPT_MAX_CHARS)}"
-            "</blockquote>"
-        )
+        parts.append(render_user_prompt_quote_html(user_text))
     if assistant_context:
-        context_html = render_final_reply_html(assistant_context)
+        context_html = render_assistant_response_quote_html(assistant_context)
         if context_html:
             parts.append(context_html)
     parts.append("<h3>Decision needed</h3>")
@@ -2996,14 +4087,9 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
     answers = item.get("answers") if isinstance(item.get("answers"), dict) else {}
     parts: list[str] = []
     if user_text:
-        parts.append(
-            "<blockquote>"
-            "<b>You asked</b><br>"
-            f"{_blockquote_text(user_text, USER_PROMPT_MAX_CHARS)}"
-            "</blockquote>"
-        )
+        parts.append(render_user_prompt_quote_html(user_text))
     if assistant_context:
-        context_html = render_final_reply_html(assistant_context)
+        context_html = render_assistant_response_quote_html(assistant_context)
         if context_html:
             parts.append(context_html)
     parts.append("<h3>Input needed</h3>")
@@ -3044,6 +4130,9 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
 
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
+    if kind == "prompt":
+        prompt = str(item.get("user_text") or item.get("summary") or "").strip()
+        return render_user_prompt_quote_html(prompt)
     if kind == "turn":
         return render_turn_item_html(item)
     if kind == "decision":
@@ -3415,6 +4504,7 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
         "interaction_id": item.get("interaction_id"),
         "interaction_revision": item.get("interaction_revision"),
         "user_text": item.get("user_text"),
+        "worklog_text": item.get("worklog_text"),
         "assistant_final_text": item.get("assistant_final_text"),
         "questions": item.get("questions") or [],
         "answers": item.get("answers") or {},
@@ -3538,6 +4628,11 @@ def clear_disabled_visible_choice_state(state: dict[str, Any]) -> bool:
             entry["last_visible_choice_cleared_at"] = utc_now()
             changed = True
         if awaiting_disabled:
+            entry["last_disabled_awaiting_detail"] = {
+                "user_id": str(awaiting.get("user_id") or ""),
+                "force_reply_message_id": str(awaiting.get("force_reply_message_id") or ""),
+                "cleared_at": utc_now(),
+            }
             entry.pop("awaiting_detail", None)
             entry["last_visible_choice_cleared_at"] = utc_now()
             changed = True
@@ -3575,6 +4670,41 @@ def clear_topic_mapping(entry: dict[str, Any], reason: str = "") -> None:
         entry["topic_missing_id"] = old_topic_id
     if reason:
         entry["topic_missing_reason"] = sanitize_text(reason, 500)
+
+
+def clear_space_topic_mapping(state: dict[str, Any], space_entry: dict[str, Any], reason: str = "") -> None:
+    old_topic_id = str(space_entry.get("topic_id") or "")
+    for key in (
+        "topic_id",
+        "last_topic_verified_at",
+        "last_topic_verify_attempt_at",
+        "last_topic_verify_error",
+        "last_topic_verify_error_at",
+        "topic_rename_pending_at",
+        "topic_rename_from",
+        "topic_rename_to",
+    ):
+        space_entry.pop(key, None)
+    space_entry["topic_missing_at"] = utc_now()
+    if old_topic_id:
+        space_entry["topic_missing_id"] = old_topic_id
+    if reason:
+        space_entry["topic_missing_reason"] = sanitize_text(reason, 500)
+
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    for pane_key_value in space_entry.get("pane_keys") or []:
+        entry = panes.get(str(pane_key_value))
+        if isinstance(entry, dict) and str(entry.get("topic_id") or "") == old_topic_id:
+            clear_topic_mapping(entry, reason)
+
+
+def clear_entry_topic_mapping(state: dict[str, Any], entry: dict[str, Any], reason: str = "") -> None:
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    space = spaces.get(str(entry.get("space_key") or ""))
+    if isinstance(space, dict) and str(space.get("topic_id") or "") == str(entry.get("topic_id") or ""):
+        clear_space_topic_mapping(state, space, reason)
+        return
+    clear_topic_mapping(entry, reason)
 
 
 def choice_needs_detail(option: dict[str, str]) -> bool:
@@ -3786,6 +4916,7 @@ def refresh_stale_visible_prompt(
         thread_id=topic_id,
         notify=bool(current_item.get("notify")),
         reply_markup=reply_markup,
+        api_token=managed_bot_token_for_entry(telegram, entry),
     )
     if result.get("ok"):
         if active_prompt:
@@ -4221,12 +5352,21 @@ def status_icon_custom_emoji_id(telegram: dict[str, Any], pane: dict[str, Any]) 
     return status_icon_id_for_keys(telegram, keys)
 
 
-def edit_topic_icon(chat_id: str, topic_id: str | int, icon_custom_emoji_id: str) -> bool:
+def edit_topic_icon(
+    chat_id: str,
+    topic_id: str | int,
+    icon_custom_emoji_id: str,
+    *,
+    name: str = "",
+) -> bool:
     payload: dict[str, Any] = {
         "chat_id": chat_id,
         "message_thread_id": str(topic_id),
         "icon_custom_emoji_id": icon_custom_emoji_id,
     }
+    title = clean_space_topic_title(str(name or ""), fallback="")
+    if title:
+        payload["name"] = title
     return bool(telegram_api("editForumTopic", payload).get("result"))
 
 
@@ -4258,7 +5398,7 @@ def update_topic_status_icon(
     entry["last_topic_status_icon_attempt_key"] = retry_key
     entry["last_topic_status_icon_attempt_at"] = utc_now()
     try:
-        ok = edit_topic_icon(chat_id, topic_id, icon_id)
+        ok = edit_topic_icon(chat_id, topic_id, icon_id, name=str(entry.get("topic_name") or ""))
     except RateLimited:
         raise
     except BridgeError as exc:
@@ -4348,6 +5488,9 @@ def send_to_pane(
         except OSError as exc:
             return False, f"Could not write inbound message file: {sanitize_text(str(exc), 300)}"
         outbound = pane_input_file_instruction(inbound_path, outbound)
+    clear_ok, clear_detail = clear_staged_pane_input_if_needed(pane_id, timeout=timeout)
+    if not clear_ok:
+        return False, clear_detail
     proc = run_cmd([herdr_bin(), "pane", "run", pane_id, outbound], timeout=timeout)
     if proc.returncode != 0:
         return False, sanitize_text(proc.stderr or proc.stdout, 800)
@@ -4359,17 +5502,34 @@ def send_to_pane(
 
 
 def pane_input_looks_staged(pane_id: str) -> bool:
-    raw = pane_output(pane_id, lines=12, max_chars=1200, source="visible")
+    raw = pane_output(pane_id, lines=16, max_chars=4000, source="recent-unwrapped")
     if not raw.strip():
         return False
-    lines = raw.splitlines()[-8:]
-    for line in lines:
+    lines = raw.splitlines()[-16:]
+    for line in reversed(lines):
         clean = ANSI_RE.sub("", str(line or "")).strip()
+        if PROMPT_PLACEHOLDER_RE.fullmatch(clean):
+            return False
         if PROMPT_WITH_TEXT_RE.match(clean):
             return True
+        if PROMPT_ONLY_RE.fullmatch(clean):
+            return False
         if re.search(r"\[Pasted text #\d+", clean, re.IGNORECASE):
             return True
     return False
+
+
+def clear_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:
+    if not pane_input_looks_staged(pane_id):
+        return True, ""
+    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "ctrl+u"], timeout=timeout)
+    if proc.returncode != 0:
+        return False, sanitize_text(proc.stderr or proc.stdout, 800)
+    for delay in (0.1, 0.2, 0.35):
+        time.sleep(delay)
+        if not pane_input_looks_staged(pane_id):
+            return True, ""
+    return False, "Could not clear existing staged pane input; refusing to append Telegram text."
 
 
 def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:
@@ -4741,14 +5901,16 @@ def dry_run_result(method: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "result": {"file_id": str(payload.get("file_id", "")), "file_path": "documents/file_0.bin", "file_size": 11}}
     if method in {"sendMessage", "sendRichMessage", "editMessageText"}:
         return {"ok": True, "result": {"message_id": now_id}}
+    if method in {"sendMessageDraft", "sendRichMessageDraft"}:
+        return {"ok": True, "result": True}
     return {"ok": True, "result": True}
 
 
-def telegram_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+def telegram_api(method: str, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
     if dry_run_enabled():
         return dry_run_result(method, payload)
-    token = telegram_token()
-    url = f"https://api.telegram.org/bot{token}/{method}"
+    api_token = token or telegram_token()
+    url = f"https://api.telegram.org/bot{api_token}/{method}"
     data = urllib.parse.urlencode(payload).encode("utf-8")
     request = urllib.request.Request(url, data=data, method="POST")
     try:
@@ -4779,6 +5941,85 @@ def telegram_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+def telegram_api_multipart(
+    method: str,
+    fields: dict[str, Any],
+    files: dict[str, Path],
+    *,
+    token: str | None = None,
+) -> dict[str, Any]:
+    if dry_run_enabled():
+        payload = dict(fields)
+        payload["files"] = {key: str(path) for key, path in files.items()}
+        return dry_run_result(method, payload)
+    api_token = token or telegram_token()
+    boundary = "------------------------" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+    chunks: list[bytes] = []
+    for key, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    for key, path in files.items():
+        file_path = Path(path)
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                (
+                    f'Content-Disposition: form-data; name="{key}"; '
+                    f'filename="{file_path.name}"\r\n'
+                    "Content-Type: image/jpeg\r\n\r\n"
+                ).encode("utf-8"),
+                file_path.read_bytes(),
+                b"\r\n",
+            ]
+        )
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(chunks)
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{api_token}/{method}",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            response_body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(response_body)
+        except Exception:
+            raise BridgeError(f"Telegram {method} failed: HTTP {exc.code}") from exc
+        params = parsed.get("parameters") or {}
+        if exc.code == 429 and params.get("retry_after"):
+            raise RateLimited(int(params["retry_after"])) from exc
+        desc = sanitize_text(str(parsed.get("description") or f"HTTP {exc.code}"), 500)
+        raise BridgeError(f"Telegram {method} failed: {desc}") from exc
+    except Exception as exc:
+        raise BridgeError(f"Telegram {method} failed: {exc}") from exc
+    parsed = json.loads(response_body)
+    if not parsed.get("ok"):
+        params = parsed.get("parameters") or {}
+        if params.get("retry_after"):
+            raise RateLimited(int(params["retry_after"]))
+        raise BridgeError(f"Telegram {method} failed: {sanitize_text(str(parsed.get('description')), 500)}")
+    return parsed
+
+
+def telegram_api_for_token(method: str, payload: dict[str, Any], api_token: str | None) -> dict[str, Any]:
+    if api_token:
+        return telegram_api(method, payload, token=api_token)
+    return telegram_api(method, payload)
+
+
 def telegram_message_id(response: dict[str, Any]) -> str | None:
     result = response.get("result") if isinstance(response, dict) else None
     if isinstance(result, dict) and result.get("message_id") is not None:
@@ -4790,6 +6031,15 @@ def classify_telegram_error(exc: Exception) -> str:
     text = str(exc).lower()
     if isinstance(exc, RateLimited):
         return "rate_limited"
+    if (
+        "forbidden" in text
+        or "bot was kicked" in text
+        or "bot is not a member" in text
+        or "chat not found" in text
+        or "not enough rights" in text
+        or "need administrator rights" in text
+    ):
+        return "bot_access"
     if (
         "message thread not found" in text
         or "message_thread_id_invalid" in text
@@ -4815,6 +6065,11 @@ def classify_telegram_error(exc: Exception) -> str:
         "message to edit not found" in text
         or "message_id_invalid" in text
         or "message can't be edited" in text
+        or "replied message not found" in text
+        or "reply message not found" in text
+        or "message to reply not found" in text
+        or "message to be replied not found" in text
+        or "reply_to_message_id_invalid" in text
     ):
         return "not_found"
     if (
@@ -4839,6 +6094,35 @@ def result_topic_missing(result: dict[str, Any] | None) -> bool:
     return isinstance(result, dict) and (
         bool(result.get("topic_missing")) or str(result.get("kind") or "") == "topic_not_found"
     )
+
+
+def result_pane_root_missing(result: dict[str, Any] | None) -> bool:
+    return isinstance(result, dict) and bool(result.get("not_found")) and str(result.get("kind") or "") == "not_found"
+
+
+def clear_pane_root_message(state: dict[str, Any], entry: dict[str, Any], reason: str = "") -> None:
+    old_message_id = str(entry.get("pane_root_message_id") or "")
+    for key in ("pane_root_message_id", "pane_root_message_sent_at", "pane_root_message_error"):
+        entry.pop(key, None)
+    entry["pane_root_message_missing_at"] = utc_now()
+    if old_message_id:
+        entry["pane_root_message_missing_id"] = old_message_id
+    if reason:
+        entry["pane_root_message_missing_reason"] = sanitize_text(reason, 500)
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    space = spaces.get(str(entry.get("space_key") or ""))
+    routes = space.get("message_routes") if isinstance(space, dict) and isinstance(space.get("message_routes"), dict) else {}
+    if old_message_id and isinstance(routes, dict):
+        routes.pop(old_message_id, None)
+
+
+def pane_root_reply_target(entry: dict[str, Any]) -> str | int | None:
+    if not PANE_ROOT_MESSAGES_ENABLED:
+        return None
+    target = entry.get("pane_root_message_id")
+    if isinstance(target, (str, int)):
+        return target
+    return None
 
 
 def topic_verify_due(entry: dict[str, Any], ttl_seconds: int = TOPIC_VERIFY_TTL_SECONDS) -> bool:
@@ -4909,6 +6193,11 @@ def rich_telegram_state(telegram: dict[str, Any] | None) -> dict[str, Any]:
     return rich
 
 
+def _rich_disabled_reason_is_capability(reason: str) -> bool:
+    text = str(reason or "").lower()
+    return any(marker in text for marker in ("method not found", "no such method", "does not exist", "http 404"))
+
+
 def rich_enabled(telegram: dict[str, Any] | None) -> bool:
     if not RICH_MESSAGES_ENABLED:
         return False
@@ -4931,6 +6220,7 @@ def mark_rich_disabled(telegram: dict[str, Any] | None, reason: str) -> None:
         rich["supported"] = "no"
         rich["disabled_reason"] = sanitize_text(reason, 300)
         rich["disabled_at"] = utc_now()
+        rich["disabled_render_version"] = RICH_RENDER_VERSION
 
 
 def note_rich_bad_request(telegram: dict[str, Any] | None, reason: str) -> None:
@@ -4947,6 +6237,109 @@ def note_rich_bad_request(telegram: dict[str, Any] | None, reason: str) -> None:
     rich["bad_request_streak"] = streak
     if streak >= RICH_BAD_REQUEST_LIMIT:
         mark_rich_disabled(telegram, f"repeated bad_request: {reason}")
+
+
+def telegram_streaming_state(telegram: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(telegram, dict):
+        return {}
+    streaming = telegram.setdefault("streaming_drafts", {})
+    if not isinstance(streaming, dict):
+        streaming = {}
+        telegram["streaming_drafts"] = streaming
+    streaming.setdefault("supported", "unknown")
+    return streaming
+
+
+def streaming_enabled(telegram: dict[str, Any] | None) -> bool:
+    if not STREAMING_DRAFTS_ENABLED:
+        return False
+    streaming = telegram_streaming_state(telegram)
+    return str(streaming.get("supported") or "unknown") != "no"
+
+
+def stream_config_enabled() -> bool:
+    return STREAMING_DRAFTS_ENABLED
+
+
+def mark_streaming_supported(telegram: dict[str, Any] | None) -> None:
+    streaming = telegram_streaming_state(telegram)
+    if streaming:
+        streaming["supported"] = "yes"
+        streaming["last_ok_at"] = utc_now()
+        streaming.pop("disabled_reason", None)
+
+
+def mark_streaming_disabled(telegram: dict[str, Any] | None, reason: str) -> None:
+    streaming = telegram_streaming_state(telegram)
+    if streaming:
+        streaming["supported"] = "no"
+        streaming["disabled_reason"] = sanitize_text(reason, 300)
+        streaming["disabled_at"] = utc_now()
+
+
+def stream_text_hash(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def stream_render_hash(text: str, user_text: str = "") -> str:
+    clean_user = sanitize_text(str(user_text or ""), USER_PROMPT_MAX_CHARS).strip()
+    clean_text = sanitize_text(str(text or ""), MAX_REPLY_CHARS).strip()
+    if clean_user:
+        return stream_text_hash(f"{clean_user}\n\n{clean_text}")
+    return stream_text_hash(clean_text)
+
+
+def stream_draft_id(chat_id: str, space_key_value: str, pane_key_value: str, turn_id: str) -> int:
+    raw = "|".join([str(chat_id), str(space_key_value), str(pane_key_value), str(turn_id)])
+    value = int(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:15], 16) % 2147483647
+    return value or 1
+
+
+def stream_throttle_reason(entry: dict[str, Any], turn_id: str) -> str:
+    if str(entry.get("last_stream_turn_id") or "") != str(turn_id):
+        return ""
+    try:
+        update_count = int(entry.get("last_stream_update_count") or 0)
+    except (TypeError, ValueError):
+        update_count = 0
+    if MAX_STREAM_DRAFTS > 0 and update_count >= MAX_STREAM_DRAFTS:
+        return "max_stream_updates"
+    if STREAM_MIN_INTERVAL_SECONDS > 0 and entry.get("last_stream_sent_at"):
+        try:
+            sent_at = _dt.datetime.fromisoformat(str(entry.get("last_stream_sent_at") or "").replace("Z", "+00:00"))
+            elapsed = (_dt.datetime.now(tz=_dt.timezone.utc) - sent_at).total_seconds()
+        except Exception:
+            elapsed = STREAM_MIN_INTERVAL_SECONDS
+        if elapsed < STREAM_MIN_INTERVAL_SECONDS:
+            return "below_min_interval"
+    return ""
+
+
+def record_stream_sent(
+    entry: dict[str, Any],
+    turn_id: str,
+    text_hash: str,
+    *,
+    draft_id: str = "",
+    transport: str = "",
+    text: str = "",
+) -> None:
+    same_turn = str(entry.get("last_stream_turn_id") or "") == str(turn_id)
+    try:
+        update_count = int(entry.get("last_stream_update_count") or 0) if same_turn else 0
+    except (TypeError, ValueError):
+        update_count = 0
+    entry["last_stream_hash"] = text_hash
+    entry["last_stream_turn_id"] = str(turn_id)
+    if text:
+        entry["last_stream_text"] = sanitize_text(text, MAX_REPLY_CHARS)
+    if draft_id:
+        entry["last_stream_draft_id"] = str(draft_id)
+    if transport:
+        entry["last_stream_transport"] = transport
+    entry["last_stream_sent_at"] = utc_now()
+    entry["last_stream_update_count"] = update_count + 1
+    entry.pop("last_stream_error", None)
 
 
 def html_to_plain(html_text: str) -> str:
@@ -4988,6 +6381,259 @@ def _message_common_payload(
     return payload
 
 
+def _reply_parameters_payload(reply_to_message_id: str | int | None) -> dict[str, str]:
+    if not reply_to_message_id:
+        return {}
+    try:
+        return {"reply_parameters": json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))}
+    except (TypeError, ValueError):
+        return {}
+
+
+def send_message_draft(
+    chat_id: str,
+    text: str,
+    *,
+    telegram: dict[str, Any] | None,
+    draft_id: str | int,
+    thread_id: str | int | None = None,
+    reply_to_message_id: str | int | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "draft_id": str(draft_id),
+        "text": sanitize_text(text, MAX_REPLY_CHARS),
+    }
+    payload.update(_thread_payload(thread_id))
+    payload.update(_reply_parameters_payload(reply_to_message_id))
+    try:
+        telegram_api_for_token("sendMessageDraft", payload, api_token)
+    except RateLimited:
+        raise
+    except BridgeError as exc:
+        kind = classify_telegram_error(exc)
+        if kind in {"capability", "bad_request"}:
+            mark_streaming_disabled(telegram, str(exc))
+        if kind == "not_found":
+            return {"ok": False, "format": "draft", "kind": kind, "not_found": True, "error": str(exc)}
+        return {"ok": False, "format": "draft", "kind": kind, "transient": kind == "transient", "error": str(exc)}
+    mark_streaming_supported(telegram)
+    return {"ok": True, "format": "draft", "draft_id": str(draft_id)}
+
+
+def send_rich_message_draft(
+    chat_id: str,
+    html_text: str,
+    *,
+    telegram: dict[str, Any] | None,
+    fallback_text: str = "",
+    draft_id: str | int,
+    thread_id: str | int | None = None,
+    reply_to_message_id: str | int | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
+    if not rich_enabled(telegram):
+        return send_message_draft(
+            chat_id,
+            fallback,
+            telegram=telegram,
+            draft_id=draft_id,
+            thread_id=thread_id,
+            reply_to_message_id=reply_to_message_id,
+            api_token=api_token,
+        )
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "draft_id": str(draft_id),
+        "rich_message": json.dumps(
+            {"html": sanitize_text(html_text, MAX_RICH_HTML_CHARS), "skip_entity_detection": True},
+            separators=(",", ":"),
+        ),
+    }
+    payload.update(_thread_payload(thread_id))
+    payload.update(_reply_parameters_payload(reply_to_message_id))
+    try:
+        telegram_api_for_token("sendRichMessageDraft", payload, api_token)
+    except RateLimited:
+        raise
+    except BridgeError as exc:
+        kind = classify_telegram_error(exc)
+        if kind in {"capability", "bad_request"}:
+            mark_streaming_disabled(telegram, str(exc))
+        if kind == "not_found":
+            return {"ok": False, "format": "rich-draft", "kind": kind, "not_found": True, "error": str(exc)}
+        return {"ok": False, "format": "rich-draft", "kind": kind, "transient": kind == "transient", "error": str(exc)}
+    mark_streaming_supported(telegram)
+    return {"ok": True, "format": "rich-draft", "draft_id": str(draft_id)}
+
+
+def send_stream_draft(
+    chat_id: str,
+    telegram: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    text: str,
+    user_text: str = "",
+) -> dict[str, Any]:
+    if not streaming_enabled(telegram):
+        return {"ok": False, "skipped": True, "reason": "streaming_disabled"}
+    clean_text = sanitize_text(str(text or "").strip(), MAX_REPLY_CHARS)
+    if not clean_text:
+        return {"ok": False, "skipped": True, "reason": "empty_stream"}
+    if STREAM_MIN_CHARS and len(clean_text) < STREAM_MIN_CHARS and entry.get("last_stream_hash"):
+        return {"ok": True, "skipped": True, "reason": "below_min_chars"}
+    text_hash = stream_render_hash(clean_text, user_text)
+    if entry.get("last_stream_hash") == text_hash and str(entry.get("last_stream_turn_id") or "") == str(turn_id):
+        return {"ok": True, "skipped": True, "reason": "unchanged_hash", "hash": text_hash}
+    throttle_reason = stream_throttle_reason(entry, str(turn_id))
+    if throttle_reason:
+        return {"ok": True, "skipped": True, "reason": throttle_reason, "hash": text_hash}
+    draft_id = stream_draft_id(
+        chat_id,
+        str(entry.get("space_key") or ""),
+        str(entry.get("pane_key") or ""),
+        str(turn_id),
+    )
+    html_text = render_stream_turn_html(user_text, clean_text)
+    result = send_rich_message_draft(
+        chat_id,
+        html_text,
+        telegram=telegram,
+        fallback_text=html_to_plain(html_text),
+        draft_id=draft_id,
+        thread_id=entry.get("topic_id"),
+        reply_to_message_id=pane_root_reply_target(entry),
+        api_token=managed_bot_token_for_entry(telegram, entry),
+    )
+    if result.get("ok"):
+        record_stream_sent(entry, str(turn_id), text_hash, draft_id=str(draft_id), text=clean_text)
+    else:
+        entry["last_stream_error"] = sanitize_text(str(result), 500)
+    result["hash"] = text_hash
+    result["draft_id"] = str(draft_id)
+    return result
+
+
+def send_stream_message(
+    chat_id: str,
+    telegram: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    text: str,
+    user_text: str = "",
+) -> dict[str, Any]:
+    if not stream_config_enabled():
+        return {"ok": False, "skipped": True, "reason": "streaming_disabled"}
+    clean_text = sanitize_text(str(text or "").strip(), MAX_REPLY_CHARS)
+    if not clean_text:
+        return {"ok": False, "skipped": True, "reason": "empty_stream"}
+    desired_bot_kind = desired_message_bot_kind(telegram, entry)
+    if managed_bot_access_retry_waiting(entry, "last_stream_bot_kind", desired_bot_kind):
+        return {"ok": True, "skipped": True, "reason": "managed_bot_access_pending", "format": "message"}
+    if STREAM_MIN_CHARS and len(clean_text) < STREAM_MIN_CHARS and entry.get("last_stream_hash"):
+        return {"ok": True, "skipped": True, "reason": "below_min_chars", "format": "message"}
+    text_hash = stream_render_hash(clean_text, user_text)
+    if (
+        entry.get("last_stream_hash") == text_hash
+        and str(entry.get("last_stream_turn_id") or "") == str(turn_id)
+        and not message_bot_reissue_due(entry, "last_stream_bot_kind", desired_bot_kind)
+    ):
+        return {"ok": True, "skipped": True, "reason": "unchanged_hash", "hash": text_hash, "format": "message"}
+    throttle_reason = stream_throttle_reason(entry, str(turn_id))
+    if throttle_reason:
+        return {"ok": True, "skipped": True, "reason": throttle_reason, "hash": text_hash, "format": "message"}
+
+    html_text = render_stream_turn_html(user_text, clean_text)
+    fallback_text = html_to_plain(html_text)
+    message_id = str(entry.get("last_stream_message_id") or "")
+    if not message_id:
+        message_id = turn_visible_anchor_message_id(entry, str(turn_id))
+    if (
+        message_id
+        and not entry.get("last_stream_bot_kind")
+        and message_id == str(entry.get("last_prompt_message_id") or "")
+        and entry.get("last_prompt_bot_kind")
+    ):
+        entry["last_stream_bot_kind"] = str(entry.get("last_prompt_bot_kind") or "")
+    if message_id and message_bot_reissue_due(entry, "last_stream_bot_kind", desired_bot_kind):
+        message_id = ""
+    if message_id:
+        result = edit_rich_message(
+            chat_id,
+            message_id,
+            html_text,
+            telegram=telegram,
+            fallback_text=fallback_text,
+            api_token=managed_bot_token_for_entry(telegram, entry),
+        )
+        if result.get("not_found"):
+            entry.pop("last_stream_message_id", None)
+            entry.pop("last_stream_bot_kind", None)
+            message_id = ""
+        elif result.get("ok"):
+            entry["last_stream_message_id"] = message_id
+            record_stream_sent(entry, str(turn_id), text_hash, transport="message", text=clean_text)
+            record_message_bot_kind(entry, "last_stream_bot_kind", sent_message_bot_kind(telegram, entry, None, result), desired_bot_kind)
+            result.update({"format": "message-edit", "hash": text_hash, "message_id": message_id})
+            return result
+        else:
+            if result.get("kind") == "bot_access":
+                note_managed_bot_access_required(entry, "last_stream_bot_kind", desired_bot_kind)
+            entry["last_stream_error"] = sanitize_text(str(result), 500)
+            result.update({"format": "message-edit", "hash": text_hash, "message_id": message_id})
+            return result
+
+    result = send_rich_message(
+        chat_id,
+        html_text,
+        telegram=telegram,
+        fallback_text=fallback_text,
+        thread_id=entry.get("topic_id"),
+        notify=False,
+        reply_to_message_id=pane_root_reply_target(entry),
+        api_token=managed_bot_token_for_entry(telegram, entry),
+    )
+    result["hash"] = text_hash
+    if result.get("ok"):
+        mid = str(result.get("message_id") or "")
+        if mid:
+            entry["last_stream_message_id"] = mid
+        record_message_bot_kind(entry, "last_stream_bot_kind", sent_message_bot_kind(telegram, entry, None, result), desired_bot_kind)
+        record_stream_sent(entry, str(turn_id), text_hash, transport="message", text=clean_text)
+        result["format"] = "message"
+        result["sent_message"] = True
+    elif result.get("kind") == "bot_access":
+        note_managed_bot_access_required(entry, "last_stream_bot_kind", desired_bot_kind)
+        entry["last_stream_error"] = sanitize_text(str(result), 500)
+    else:
+        entry["last_stream_error"] = sanitize_text(str(result), 500)
+    return result
+
+
+def send_stream_update(
+    chat_id: str,
+    telegram: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    text: str,
+    user_text: str = "",
+) -> dict[str, Any]:
+    if not stream_config_enabled():
+        return {"ok": False, "skipped": True, "reason": "streaming_disabled"}
+    if streaming_enabled(telegram):
+        draft_result = send_stream_draft(chat_id, telegram, entry, turn_id=turn_id, text=text, user_text=user_text)
+        if draft_result.get("ok") or draft_result.get("skipped") or draft_result.get("transient"):
+            return draft_result
+        if result_topic_missing(draft_result) or draft_result.get("kind") not in {"capability", "bad_request", "bot_access"}:
+            return draft_result
+    return send_stream_message(chat_id, telegram, entry, turn_id=turn_id, text=text, user_text=user_text)
+
+
 def send_message(
     chat_id: str,
     text: str,
@@ -4996,12 +6642,16 @@ def send_message(
     notify: bool = False,
     reply_markup: dict[str, Any] | None = None,
     reply_to_message_id: str | int | None = None,
+    api_token: str | None = None,
 ) -> str | None:
     payload = _message_common_payload(chat_id, thread_id=thread_id, notify=notify, reply_markup=reply_markup)
     payload["text"] = sanitize_text(text, MAX_REPLY_CHARS)
     if reply_to_message_id:
-        payload["reply_to_message_id"] = str(reply_to_message_id)
-    return telegram_message_id(telegram_api("sendMessage", payload))
+        try:
+            payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
+        except (TypeError, ValueError):
+            payload["reply_to_message_id"] = str(reply_to_message_id)
+    return telegram_message_id(telegram_api_for_token("sendMessage", payload, api_token))
 
 
 def send_legacy_message_result(
@@ -5012,6 +6662,8 @@ def send_legacy_message_result(
     notify: bool = False,
     reply_markup: dict[str, Any] | None = None,
     reply_to_message_id: str | int | None = None,
+    api_token: str | None = None,
+    allow_managed_bot_fallback: bool = False,
 ) -> dict[str, Any]:
     try:
         mid = send_message(
@@ -5021,6 +6673,7 @@ def send_legacy_message_result(
             notify=notify,
             reply_markup=reply_markup,
             reply_to_message_id=reply_to_message_id,
+            api_token=api_token,
         )
     except RateLimited:
         raise
@@ -5028,6 +6681,22 @@ def send_legacy_message_result(
         kind = classify_telegram_error(exc)
         if kind == "topic_not_found":
             return {"ok": False, "format": "legacy", "kind": kind, "topic_missing": True, "error": str(exc)}
+        if kind == "not_found":
+            return {"ok": False, "format": "legacy", "kind": kind, "not_found": True, "error": str(exc)}
+        if kind == "bot_access" and api_token and allow_managed_bot_fallback:
+            result = send_legacy_message_result(
+                chat_id,
+                text,
+                thread_id=thread_id,
+                notify=notify,
+                reply_markup=reply_markup,
+                reply_to_message_id=reply_to_message_id,
+                api_token=None,
+                allow_managed_bot_fallback=False,
+            )
+            result["fallback_reason"] = "managed_bot_access"
+            result["managed_bot_fallback"] = True
+            return result
         return {"ok": False, "format": "legacy", "kind": kind, "transient": kind == "transient", "error": str(exc)}
     return {"ok": True, "format": "legacy", "message_id": mid}
 
@@ -5038,6 +6707,7 @@ def edit_message_text(
     text: str,
     *,
     reply_markup: dict[str, Any] | None = None,
+    api_token: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "chat_id": chat_id,
@@ -5046,7 +6716,7 @@ def edit_message_text(
     }
     payload.update(_reply_markup_payload(reply_markup))
     try:
-        response = telegram_api("editMessageText", payload)
+        response = telegram_api_for_token("editMessageText", payload, api_token)
     except RateLimited:
         raise
     except BridgeError as exc:
@@ -5301,6 +6971,8 @@ def _send_rich_chunk(
     notify: bool,
     reply_markup: dict[str, Any] | None,
     reply_to_message_id: str | int | None,
+    api_token: str | None = None,
+    allow_managed_bot_fallback: bool = False,
 ) -> dict[str, Any]:
     if not rich_enabled(telegram):
         return send_legacy_message_result(
@@ -5310,6 +6982,8 @@ def _send_rich_chunk(
             notify=notify,
             reply_markup=reply_markup,
             reply_to_message_id=reply_to_message_id,
+            api_token=api_token,
+            allow_managed_bot_fallback=allow_managed_bot_fallback,
         )
 
     payload = _message_common_payload(chat_id, thread_id=thread_id, notify=notify, reply_markup=reply_markup)
@@ -5324,7 +6998,7 @@ def _send_rich_chunk(
             pass
 
     try:
-        response = telegram_api("sendRichMessage", payload)
+        response = telegram_api_for_token("sendRichMessage", payload, api_token)
     except RateLimited:
         raise
     except BridgeError as exc:
@@ -5338,6 +7012,8 @@ def _send_rich_chunk(
                 notify=notify,
                 reply_markup=reply_markup,
                 reply_to_message_id=reply_to_message_id,
+                api_token=api_token,
+                allow_managed_bot_fallback=allow_managed_bot_fallback,
             )
             result["fallback_reason"] = kind
             return result
@@ -5350,12 +7026,32 @@ def _send_rich_chunk(
                 notify=notify,
                 reply_markup=reply_markup,
                 reply_to_message_id=reply_to_message_id,
+                api_token=api_token,
+                allow_managed_bot_fallback=allow_managed_bot_fallback,
             )
             result["fallback_reason"] = kind
             return result
         if kind == "topic_not_found":
             return {"ok": False, "format": "rich", "kind": kind, "topic_missing": True, "error": str(exc)}
-        return {"ok": False, "format": "rich", "kind": kind, "transient": True, "error": str(exc)}
+        if kind == "not_found":
+            return {"ok": False, "format": "rich", "kind": kind, "not_found": True, "error": str(exc)}
+        if kind == "bot_access" and api_token and allow_managed_bot_fallback:
+            result = _send_rich_chunk(
+                chat_id,
+                html_text,
+                telegram=telegram,
+                fallback=fallback,
+                thread_id=thread_id,
+                notify=notify,
+                reply_markup=reply_markup,
+                reply_to_message_id=reply_to_message_id,
+                api_token=None,
+                allow_managed_bot_fallback=False,
+            )
+            result["fallback_reason"] = "managed_bot_access"
+            result["managed_bot_fallback"] = True
+            return result
+        return {"ok": False, "format": "rich", "kind": kind, "transient": kind == "transient", "error": str(exc)}
     mark_rich_supported(telegram)
     return {"ok": True, "format": "rich", "message_id": telegram_message_id(response)}
 
@@ -5370,6 +7066,8 @@ def send_rich_message(
     notify: bool = False,
     reply_markup: dict[str, Any] | None = None,
     reply_to_message_id: str | int | None = None,
+    api_token: str | None = None,
+    allow_managed_bot_fallback: bool = False,
 ) -> dict[str, Any]:
     fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
     if not rich_enabled(telegram):
@@ -5380,6 +7078,8 @@ def send_rich_message(
             notify=notify,
             reply_markup=reply_markup,
             reply_to_message_id=reply_to_message_id,
+            api_token=api_token,
+            allow_managed_bot_fallback=allow_managed_bot_fallback,
         )
 
     sanitized = sanitize_text(html_text, MAX_RICH_HTML_CHARS)
@@ -5395,6 +7095,8 @@ def send_rich_message(
             notify=notify,
             reply_markup=reply_markup,
             reply_to_message_id=reply_to_message_id,
+            api_token=api_token,
+            allow_managed_bot_fallback=allow_managed_bot_fallback,
         )
     # Oversize: deliver as sequential messages. The buttons (reply_markup) ride the
     # last chunk; reply_to ties the first. First chunk's result is the anchor.
@@ -5410,6 +7112,8 @@ def send_rich_message(
             notify=notify if idx == 0 else False,
             reply_markup=reply_markup if idx == last else None,
             reply_to_message_id=reply_to_message_id if idx == 0 else None,
+            api_token=api_token,
+            allow_managed_bot_fallback=allow_managed_bot_fallback,
         )
         if idx == 0:
             first_result = result
@@ -5432,9 +7136,46 @@ def edit_rich_message(
     telegram: dict[str, Any] | None = None,
     fallback_text: str = "",
     reply_markup: dict[str, Any] | None = None,
+    api_token: str | None = None,
 ) -> dict[str, Any]:
     fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
-    return edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup)
+    if not rich_enabled(telegram):
+        return edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup, api_token=api_token)
+
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": str(message_id),
+        "rich_message": json.dumps(
+            {"html": sanitize_text(html_text, MAX_RICH_HTML_CHARS), "skip_entity_detection": True},
+            separators=(",", ":"),
+        ),
+    }
+    payload.update(_reply_markup_payload(reply_markup))
+    try:
+        response = telegram_api_for_token("editMessageText", payload, api_token)
+    except RateLimited:
+        raise
+    except BridgeError as exc:
+        kind = classify_telegram_error(exc)
+        if kind == "not_modified":
+            return {"ok": True, "kind": kind}
+        if kind == "not_found":
+            return {"ok": False, "kind": kind, "not_found": True, "error": str(exc)}
+        if kind == "topic_not_found":
+            return {"ok": False, "kind": kind, "topic_missing": True, "error": str(exc)}
+        if kind == "capability":
+            mark_rich_disabled(telegram, str(exc))
+            legacy = edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup, api_token=api_token)
+            legacy["fallback_reason"] = kind
+            return legacy
+        if kind == "bad_request":
+            note_rich_bad_request(telegram, str(exc))
+            legacy = edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup, api_token=api_token)
+            legacy["fallback_reason"] = kind
+            return legacy
+        return {"ok": False, "kind": kind, "transient": kind == "transient", "error": str(exc)}
+    mark_rich_supported(telegram)
+    return {"ok": True, "kind": "edited", "message_id": telegram_message_id(response)}
 
 
 def send_feed_item(
@@ -5447,6 +7188,7 @@ def send_feed_item(
     reply_markup: dict[str, Any] | None = None,
     reply_to_message_id: str | int | None = None,
     live: bool = False,
+    api_token: str | None = None,
 ) -> dict[str, Any]:
     return send_rich_message(
         chat_id,
@@ -5457,6 +7199,7 @@ def send_feed_item(
         notify=notify,
         reply_markup=reply_markup,
         reply_to_message_id=reply_to_message_id,
+        api_token=api_token,
     )
 
 
@@ -5468,6 +7211,7 @@ def edit_feed_item(
     telegram: dict[str, Any] | None,
     reply_markup: dict[str, Any] | None = None,
     live: bool = False,
+    api_token: str | None = None,
 ) -> dict[str, Any]:
     return edit_rich_message(
         chat_id,
@@ -5476,6 +7220,7 @@ def edit_feed_item(
         telegram=telegram,
         fallback_text=item_plain_text(item),
         reply_markup=reply_markup,
+        api_token=api_token,
     )
 
 
@@ -5489,6 +7234,7 @@ def send_notice(
     notify: bool = False,
     reply_markup: dict[str, Any] | None = None,
     reply_to_message_id: str | int | None = None,
+    api_token: str | None = None,
 ) -> dict[str, Any]:
     plain = sanitize_text(f"{title}\n{body}".strip(), MAX_REPLY_CHARS)
     return send_rich_message(
@@ -5500,6 +7246,7 @@ def send_notice(
         notify=notify,
         reply_markup=reply_markup,
         reply_to_message_id=reply_to_message_id,
+        api_token=api_token,
     )
 
 
@@ -5510,6 +7257,7 @@ def update_live_card(
     *,
     telegram: dict[str, Any],
 ) -> dict[str, Any]:
+    api_token = managed_bot_token_for_entry(telegram, entry)
     html_text = render_feed_item_html(item, live=True)
     plain = item_plain_text(item)
     card_hash = hashlib.sha256(
@@ -5533,6 +7281,7 @@ def update_live_card(
             html_text,
             telegram=telegram,
             fallback_text=plain,
+            api_token=api_token,
         )
         if result.get("ok"):
             entry["card_hash"] = card_hash
@@ -5548,6 +7297,8 @@ def update_live_card(
         fallback_text=plain,
         thread_id=entry.get("topic_id"),
         notify=False,
+        reply_to_message_id=pane_root_reply_target(entry),
+        api_token=api_token,
     )
     if result.get("ok"):
         if result.get("message_id"):
@@ -5564,11 +7315,20 @@ def update_status_marker(
     *,
     telegram: dict[str, Any],
 ) -> dict[str, Any]:
+    api_token = managed_bot_token_for_entry(telegram, entry, pane)
+    desired_bot_kind = desired_message_bot_kind(telegram, entry, pane)
     marker_hash = status_marker_hash(pane)
-    if marker_hash == entry.get("status_marker_hash") and entry.get("status_marker_message_id"):
+    if managed_bot_access_retry_waiting(entry, "status_marker_bot_kind", desired_bot_kind):
+        return {"ok": True, "kind": "managed_bot_access_pending", "attempted": False}
+    if (
+        marker_hash == entry.get("status_marker_hash")
+        and entry.get("status_marker_message_id")
+        and not message_bot_reissue_due(entry, "status_marker_bot_kind", desired_bot_kind)
+    ):
         return {"ok": True, "kind": "unchanged", "attempted": False}
     title, body = status_marker_content(pane)
     old_message_id = str(entry.get("status_marker_message_id") or "")
+    old_bot_kind = str(entry.get("status_marker_bot_kind") or MANAGER_BOT_KIND)
     result = send_notice(
         chat_id,
         title,
@@ -5576,29 +7336,45 @@ def update_status_marker(
         telegram=telegram,
         thread_id=entry.get("topic_id"),
         notify=False,
+        reply_to_message_id=pane_root_reply_target(entry),
+        api_token=api_token,
     )
     if result.get("ok"):
         new_message_id = str(result.get("message_id") or "")
         if old_message_id and new_message_id and old_message_id != new_message_id and STATUS_MARKER_DELETE_OLD:
             try:
-                delete_message(chat_id, old_message_id)
+                if api_token and old_bot_kind == desired_bot_kind:
+                    delete_message(chat_id, old_message_id, api_token=api_token)
+                else:
+                    delete_message(chat_id, old_message_id)
             except Exception:
                 entry["last_status_marker_delete_error"] = utc_now()
         if new_message_id:
             entry["status_marker_message_id"] = new_message_id
+        record_message_bot_kind(
+            entry,
+            "status_marker_bot_kind",
+            sent_message_bot_kind(telegram, entry, pane, result),
+            desired_bot_kind,
+        )
         entry["status_marker_hash"] = marker_hash
         entry["status_marker_text"] = sanitize_text(f"{title}\n{body}", 500)
         entry["status_marker_sent_at"] = utc_now()
+    elif result.get("kind") == "bot_access":
+        note_managed_bot_access_required(entry, "status_marker_bot_kind", desired_bot_kind)
     return {**result, "attempted": True}
 
 
-def clear_status_marker_for_icon(chat_id: str, entry: dict[str, Any]) -> bool:
+def clear_status_marker_for_icon(chat_id: str, entry: dict[str, Any], *, api_token: str | None = None) -> bool:
     old_message_id = str(entry.get("status_marker_message_id") or "")
     if not old_message_id:
         return False
     if STATUS_MARKER_DELETE_OLD:
         try:
-            delete_message(chat_id, old_message_id)
+            if api_token:
+                delete_message(chat_id, old_message_id, api_token=api_token)
+            else:
+                delete_message(chat_id, old_message_id)
         except Exception:
             entry["last_status_marker_delete_error"] = utc_now()
     for key in (
@@ -5643,18 +7419,180 @@ def delete_topic(chat_id: str, topic_id: str | int) -> bool:
     return bool(telegram_api("deleteForumTopic", payload).get("result"))
 
 
-def delete_message(chat_id: str, message_id: str | int) -> bool:
+def delete_message(chat_id: str, message_id: str | int, *, api_token: str | None = None) -> bool:
     payload = {"chat_id": chat_id, "message_id": str(message_id)}
-    return bool(telegram_api("deleteMessage", payload).get("result"))
+    return bool(telegram_api_for_token("deleteMessage", payload, api_token).get("result"))
 
 
-def preflight(chat_id: str) -> None:
+def pin_chat_message(chat_id: str, message_id: str | int) -> dict[str, Any]:
+    payload = {
+        "chat_id": chat_id,
+        "message_id": str(message_id),
+        "disable_notification": "true",
+    }
+    try:
+        telegram_api_for_token("pinChatMessage", payload, None)
+    except RateLimited:
+        raise
+    except BridgeError as exc:
+        text = str(exc).lower()
+        if "already pinned" in text or "message is pinned" in text:
+            return {"ok": True, "kind": "unchanged"}
+        kind = classify_telegram_error(exc)
+        return {"ok": False, "kind": kind, "transient": kind == "transient", "error": str(exc)}
+    return {"ok": True, "kind": "pinned"}
+
+
+def space_pinned_status_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def record_space_pinned_status(
+    space_entry: dict[str, Any],
+    *,
+    message_id: str,
+    text: str,
+    text_hash: str,
+    sent: bool,
+) -> None:
+    space_entry["pinned_status_message_id"] = message_id
+    space_entry["pinned_status_text"] = text
+    space_entry["pinned_status_hash"] = text_hash
+    space_entry["pinned_status_updated_at"] = utc_now()
+    if sent:
+        space_entry["pinned_status_sent_at"] = utc_now()
+    space_entry.pop("pinned_status_error", None)
+
+
+def clear_space_pinned_status_message(space_entry: dict[str, Any], reason: str = "") -> None:
+    for key in (
+        "pinned_status_message_id",
+        "pinned_status_text",
+        "pinned_status_hash",
+        "pinned_status_sent_at",
+        "pinned_status_updated_at",
+        "pinned_status_pinned_at",
+    ):
+        space_entry.pop(key, None)
+    if reason:
+        space_entry["pinned_status_error"] = sanitize_text(reason, 500)
+
+
+def ensure_space_pinned_status(
+    chat_id: str,
+    space_entry: dict[str, Any],
+    panes: list[dict[str, Any]],
+    counters: dict[str, int],
+    max_sends: int,
+) -> dict[str, Any]:
+    topic_id = str(space_entry.get("topic_id") or "")
+    if not PINNED_STATUS_ENABLED or not topic_id:
+        return {"changed": False, "updated": False, "skipped": True}
+    text = space_pinned_status_text(panes)
+    if not text:
+        return {"changed": False, "updated": False, "skipped": True}
+    text_hash = space_pinned_status_hash(text)
+    message_id = str(space_entry.get("pinned_status_message_id") or "")
+    if message_id and space_entry.get("pinned_status_hash") == text_hash:
+        if space_entry.get("pinned_status_pinned_at"):
+            return {"changed": False, "updated": False, "skipped": True, "reason": "unchanged"}
+        pin_result = pin_chat_message(chat_id, message_id)
+        if pin_result.get("ok"):
+            space_entry["pinned_status_pinned_at"] = utc_now()
+            space_entry.pop("pinned_status_pin_error", None)
+            return {"changed": True, "updated": True, "pin": pin_result}
+        space_entry["pinned_status_pin_error"] = sanitize_text(str(pin_result), 500)
+        return {"changed": True, "updated": False, "pin": pin_result}
+
+    if message_id:
+        edit_result = edit_message_text(chat_id, message_id, text)
+        if edit_result.get("ok"):
+            record_space_pinned_status(
+                space_entry,
+                message_id=message_id,
+                text=text,
+                text_hash=text_hash,
+                sent=False,
+            )
+            return {"changed": True, "updated": True, "edit": edit_result}
+        if result_topic_missing(edit_result):
+            return {"changed": False, "updated": False, "topic_missing": True, "error": str(edit_result)}
+        if not edit_result.get("not_found"):
+            space_entry["pinned_status_error"] = sanitize_text(str(edit_result), 500)
+            return {"changed": True, "updated": False, "edit": edit_result}
+        clear_space_pinned_status_message(space_entry, str(edit_result))
+
+    if counters.get("sends", 0) >= max_sends:
+        return {"changed": False, "updated": False, "skipped": True, "reason": "send_cap"}
+    send_result = send_legacy_message_result(chat_id, text, thread_id=topic_id, notify=False)
+    if result_topic_missing(send_result):
+        return {"changed": False, "updated": False, "topic_missing": True, "error": str(send_result)}
+    if not send_result.get("ok"):
+        space_entry["pinned_status_error"] = sanitize_text(str(send_result), 500)
+        return {"changed": True, "updated": False, "send": send_result}
+    new_message_id = str(send_result.get("message_id") or "")
+    if not new_message_id:
+        space_entry["pinned_status_error"] = "Telegram returned no message id for pinned status"
+        return {"changed": True, "updated": False, "send": send_result}
+    counters["sends"] = counters.get("sends", 0) + 1
+    record_space_pinned_status(
+        space_entry,
+        message_id=new_message_id,
+        text=text,
+        text_hash=text_hash,
+        sent=True,
+    )
+    pin_result = pin_chat_message(chat_id, new_message_id)
+    if pin_result.get("ok"):
+        space_entry["pinned_status_pinned_at"] = utc_now()
+        space_entry.pop("pinned_status_pin_error", None)
+    else:
+        space_entry["pinned_status_pin_error"] = sanitize_text(str(pin_result), 500)
+    return {"changed": True, "updated": True, "send": send_result, "pin": pin_result}
+
+
+def sync_space_pinned_statuses(
+    state: dict[str, Any],
+    chat_id: str,
+    panes: list[dict[str, Any]],
+    counters: dict[str, int],
+    max_sends: int,
+) -> dict[str, Any]:
+    if not PINNED_STATUS_ENABLED:
+        return {"changed": False, "updated": 0}
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    grouped = open_panes_by_space(panes)
+    changed = False
+    updated = 0
+    for space_key_value, space_panes in grouped.items():
+        space_entry = spaces.get(space_key_value) if isinstance(spaces, dict) else None
+        if not isinstance(space_entry, dict):
+            continue
+        result = ensure_space_pinned_status(chat_id, space_entry, space_panes, counters, max_sends)
+        if result.get("topic_missing"):
+            clear_space_topic_mapping(state, space_entry, str(result.get("error") or result))
+            changed = True
+            continue
+        if result.get("changed"):
+            changed = True
+        if result.get("updated"):
+            updated += 1
+    return {"changed": changed, "updated": updated}
+
+
+def preflight(chat_id: str, telegram: dict[str, Any] | None = None) -> None:
     if not chat_id:
         raise BridgeError("HERDR_TELEGRAM_TOPICS_CHAT_ID is required")
     chat = telegram_api("getChat", {"chat_id": chat_id}).get("result") or {}
     if chat.get("type") != "supergroup" or not chat.get("is_forum"):
         raise BridgeError("Telegram chat must be a forum-enabled supergroup")
     me = telegram_api("getMe", {}).get("result") or {}
+    if telegram is not None:
+        username = str(me.get("username") or "").strip().lstrip("@")
+        if username:
+            telegram["bot_username"] = username
+        if "can_manage_bots" in me:
+            telegram["can_manage_bots"] = bool(me.get("can_manage_bots"))
     bot_id = me.get("id")
     if not bot_id:
         raise BridgeError("getMe returned no bot id")
@@ -5730,13 +7668,14 @@ def configure_telegram_state(state: dict[str, Any]) -> tuple[dict[str, Any], str
         [p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()],
     )
     telegram.setdefault("implicit_send_enabled", False)
+    telegram.setdefault("managed_bots", {})
     return telegram, chat_id
 
 
 def preflight_for_event(state: dict[str, Any], chat_id: str, telegram: dict[str, Any]) -> tuple[bool, str]:
     try:
         if not preflight_is_fresh(telegram):
-            preflight(chat_id)
+            preflight(chat_id, telegram)
             telegram["last_preflight_ok_at"] = utc_now()
         telegram.pop("last_preflight_error", None)
         telegram.pop("last_event_preflight_error", None)
@@ -5829,6 +7768,7 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
         "pane_id": str(pane.get("pane_id") or ""),
         "terminal_id": str(pane.get("terminal_id") or ""),
         "agent_session_id": pane_agent_session_id(pane),
+        "agent": str(pane.get("agent") or ""),
         "workspace": str(pane.get("workspace_id") or ""),
         "tab": str(pane.get("tab_id") or ""),
     })
@@ -5839,44 +7779,254 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
         label_topic_name = topic_name_from_pane_label(manual_label)
         entry["pane_label_raw"] = manual_label
         entry["pane_label_topic_name"] = label_topic_name
-        old_topic_name = str(entry.get("topic_name") or "")
-        if created or not entry.get("topic_name"):
-            entry["topic_name"] = label_topic_name
-            entry["topic_title_source"] = "pane-label"
-            if old_topic_name and old_topic_name != label_topic_name and old_topic_name.startswith("[OLD]"):
-                # Reusing a closed pane's topic — rename it back from "[OLD] …"
-                # now instead of leaving the stale title until a TTL verify.
-                entry["topic_rename_pending_at"] = utc_now()
-                entry["topic_rename_from"] = old_topic_name
-                entry["topic_rename_to"] = label_topic_name
-                entry.pop("last_topic_verified_at", None)
-        elif label_topic_name and old_topic_name != label_topic_name:
-            # Only rename when a label we have already seen actually changed;
-            # on first sight, baseline the existing (possibly owner-corrected)
-            # topic name without a surprise rename.
-            should_rename = bool(previous_label) and (
-                previous_label != manual_label
-                or previous_label_topic_name != label_topic_name
-                or str(entry.get("topic_title_source") or "") != "pane-label"
-            )
-            if should_rename:
-                entry["topic_name"] = label_topic_name
-                entry["topic_title_source"] = "pane-label"
-                entry["topic_rename_pending_at"] = utc_now()
-                entry["topic_rename_from"] = old_topic_name
-                entry["topic_rename_to"] = label_topic_name
-            elif not previous_label:
-                entry.setdefault("pane_label_baselined_at", utc_now())
-        elif not previous_label:
+        if not previous_label:
             entry.setdefault("pane_label_baselined_at", utc_now())
+        elif previous_label != manual_label or previous_label_topic_name != label_topic_name:
+            entry["pane_label_changed_at"] = utc_now()
     else:
         entry.pop("pane_label_topic_name", None)
         if previous_label:
             entry["pane_label_raw"] = ""
             entry["pane_label_cleared_at"] = utc_now()
-    if not entry.get("topic_name"):
-        entry["topic_name"] = topic_name_for_pane(pane)
+    key_for_space, space_entry, _space_changed = ensure_space_entry(state, pane)
+    entry["space_key"] = key_for_space
+    entry["pane_thread_name"] = pane_thread_name(pane)
+    if entry.get("topic_id") and not space_entry.get("topic_id"):
+        legacy_topic_name = str(entry.get("topic_name") or "")
+        space_topic_name = str(space_entry.get("topic_name") or space_name_for_pane(pane))
+        space_entry["topic_id"] = str(entry.get("topic_id") or "")
+        for verify_key in ("last_topic_verified_at", "last_topic_verify_attempt_at"):
+            verify_value = entry.get(verify_key)
+            if verify_value and not space_entry.get(verify_key):
+                space_entry[verify_key] = verify_value
+        space_entry.setdefault("topic_name", space_topic_name)
+        if legacy_topic_name and legacy_topic_name != space_topic_name:
+            space_entry["topic_rename_pending_at"] = utc_now()
+            space_entry["topic_rename_from"] = legacy_topic_name
+            space_entry["topic_rename_to"] = space_topic_name
+            space_entry.pop("last_topic_verified_at", None)
+    if space_entry.get("topic_id"):
+        entry["topic_id"] = str(space_entry.get("topic_id") or "")
+    space_topic_name = str(space_entry.get("topic_name") or space_name_for_pane(pane))
+    current_topic_name = str(entry.get("topic_name") or "")
+    if current_topic_name and current_topic_name != space_topic_name:
+        entry["legacy_topic_name"] = current_topic_name
+    if space_topic_name:
+        entry["topic_name"] = space_topic_name
+        entry["topic_title_source"] = "space"
+    for rename_key in ("topic_rename_pending_at", "topic_rename_from", "topic_rename_to"):
+        entry.pop(rename_key, None)
     return key, entry, created
+
+
+def pane_root_message_text(pane: dict[str, Any], entry: dict[str, Any]) -> str:
+    title = str(entry.get("pane_thread_name") or pane_thread_name(pane))
+    pane_id = str(pane.get("pane_id") or entry.get("pane_id") or "")
+    agent = str(pane.get("agent") or "")
+    cwd = compact_path(pane.get("cwd") or pane.get("foreground_cwd") or "")
+    lines = [
+        f"Pane thread: {title}",
+        f"Pane key: {entry.get('pane_key') or pane_key(pane)}",
+    ]
+    if pane_id:
+        lines.append(f"Pane id: {pane_id}")
+    if agent:
+        lines.append(f"Agent: {agent}")
+    if cwd:
+        lines.append(f"Cwd: {cwd}")
+    lines.append("")
+    lines.append(format_status(pane, include_commands=True))
+    return "\n".join(lines).strip()
+
+
+def pane_root_message_html(pane: dict[str, Any], entry: dict[str, Any]) -> str:
+    title = html.escape(str(entry.get("pane_thread_name") or pane_thread_name(pane)))
+    body = html.escape(pane_root_message_text(pane, entry)).replace("\n", "<br>")
+    return f"<b>{title}</b><br>{body}"
+
+
+def send_pane_root_message(
+    chat_id: str,
+    telegram: dict[str, Any],
+    pane: dict[str, Any],
+    entry: dict[str, Any],
+    thread_id: str | int,
+) -> dict[str, Any]:
+    return send_rich_message(
+        chat_id,
+        pane_root_message_html(pane, entry),
+        telegram=telegram,
+        fallback_text=pane_root_message_text(pane, entry),
+        thread_id=thread_id,
+        notify=False,
+        api_token=managed_bot_token_for_entry(telegram, entry, pane),
+    )
+
+
+def ensure_space_topic(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    pane: dict[str, Any],
+    counters: dict[str, int],
+    max_creates: int,
+) -> tuple[dict[str, Any], bool]:
+    key_for_space, space_entry, space_changed = ensure_space_entry(state, pane)
+    if space_entry.get("topic_id"):
+        return space_entry, space_changed
+    if counters.get("creates", 0) >= max_creates:
+        return space_entry, space_changed
+    topic_name = str(space_entry.get("topic_name") or space_name_for_pane(pane))
+    topic_id = create_topic(chat_id, topic_name)
+    counters["creates"] = counters.get("creates", 0) + 1
+    space_entry["space_key"] = key_for_space
+    space_entry["topic_id"] = topic_id
+    space_entry["topic_name"] = topic_name
+    space_entry["last_topic_verified_at"] = utc_now()
+    space_entry.pop("topic_missing_at", None)
+    space_entry.pop("topic_missing_id", None)
+    space_entry.pop("topic_missing_reason", None)
+    save_state(state)
+    return space_entry, True
+
+
+def ensure_pane_root_message(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    pane: dict[str, Any],
+    entry: dict[str, Any],
+    counters: dict[str, int],
+    max_sends: int,
+) -> tuple[bool, dict[str, Any]]:
+    topic_id = str(entry.get("topic_id") or "")
+    desired_bot_kind = desired_message_bot_kind(telegram, entry, pane)
+    if not topic_id:
+        return False, {"ok": True, "skipped": True}
+    if not PANE_ROOT_MESSAGES_ENABLED:
+        return False, {"ok": True, "skipped": True, "reason": "pane_root_messages_disabled"}
+    if managed_bot_access_retry_waiting(entry, "pane_root_bot_kind", desired_bot_kind):
+        return False, {"ok": True, "skipped": True, "reason": "managed_bot_access_pending"}
+    if entry.get("pane_root_message_id") and not message_bot_reissue_due(
+        entry,
+        "pane_root_bot_kind",
+        desired_bot_kind,
+    ):
+        return False, {"ok": True, "skipped": True}
+    if counters.get("sends", 0) >= max_sends:
+        return False, {"ok": False, "skipped": True, "reason": "send_cap"}
+    result = send_pane_root_message(chat_id, telegram, pane, entry, topic_id)
+    if result.get("ok"):
+        counters["sends"] = counters.get("sends", 0) + 1
+        if result.get("message_id"):
+            entry["pane_root_message_id"] = str(result["message_id"])
+            record_pane_message_route(
+                state,
+                str(entry.get("space_key") or ""),
+                str(entry.get("pane_key") or ""),
+                str(result["message_id"]),
+            )
+        record_message_bot_kind(
+            entry,
+            "pane_root_bot_kind",
+            sent_message_bot_kind(telegram, entry, pane, result),
+            desired_bot_kind,
+        )
+        entry["pane_root_message_sent_at"] = utc_now()
+        entry.pop("pane_root_message_error", None)
+        save_state(state)
+        return True, result
+    if result.get("kind") == "bot_access":
+        note_managed_bot_access_required(entry, "pane_root_bot_kind", desired_bot_kind)
+    entry["pane_root_message_error"] = sanitize_text(str(result), 500)
+    save_state(state)
+    return True, result
+
+
+def record_pane_message_route(state: dict[str, Any], space_key_value: str, pane_key_value: str, message_id: str | int) -> bool:
+    space = state.setdefault("spaces", {}).get(space_key_value)
+    if not isinstance(space, dict):
+        return False
+    panes = state.setdefault("panes", {})
+    entry = panes.get(pane_key_value)
+    if not isinstance(entry, dict):
+        return False
+    message_key = str(message_id or "").strip()
+    if not message_key:
+        return False
+    routes = space.get("message_routes")
+    if not isinstance(routes, dict):
+        routes = {}
+        space["message_routes"] = routes
+    routes[message_key] = pane_key_value
+    current_latest = str(entry.get("last_pane_message_id") or "")
+    if not current_latest or message_id_index(message_key) >= message_id_index(current_latest):
+        entry["last_pane_message_id"] = message_key
+        entry["last_pane_message_at"] = utc_now()
+    while len(routes) > 100:
+        oldest = next(iter(routes))
+        routes.pop(oldest, None)
+    return True
+
+
+def message_id_index(message_id: str | int) -> int:
+    try:
+        return int(str(message_id or "").strip())
+    except (TypeError, ValueError):
+        return -1
+
+
+def pane_message_is_latest(entry: dict[str, Any], message_id: str | int) -> bool:
+    message_key = str(message_id or "").strip()
+    if not message_key:
+        return False
+    latest = str(entry.get("last_pane_message_id") or "").strip()
+    return not latest or latest == message_key
+
+
+def turn_visible_anchor_message_id(entry: dict[str, Any], turn_id: str) -> str:
+    clean_turn_id = str(turn_id or "")
+    if not clean_turn_id:
+        return ""
+    stream_message_id = str(entry.get("last_stream_message_id") or "")
+    stream_turn_id = str(entry.get("last_stream_turn_id") or "")
+    if stream_message_id and stream_turn_id == clean_turn_id and pane_message_is_latest(entry, stream_message_id):
+        return stream_message_id
+    prompt_message_id = str(entry.get("last_prompt_message_id") or "")
+    prompt_turn_id = str(entry.get("last_prompt_turn_id") or "")
+    if prompt_message_id and prompt_turn_id == clean_turn_id and pane_message_is_latest(entry, prompt_message_id):
+        return prompt_message_id
+    return ""
+
+
+def route_message_to_pane(
+    state: dict[str, Any],
+    chat_id: str,
+    topic_id: str | int,
+    message_id: str | int,
+) -> tuple[str, dict[str, Any]] | None:
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    configured_chat = str(telegram.get("chat_id") or "")
+    if configured_chat and str(chat_id) != configured_chat:
+        return None
+    message_key = str(message_id or "").strip()
+    if not message_key:
+        return None
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    for space in spaces.values():
+        if not isinstance(space, dict) or str(space.get("topic_id") or "") != str(topic_id):
+            continue
+        routes = space.get("message_routes") if isinstance(space.get("message_routes"), dict) else {}
+        routed_key = str(routes.get(message_key) or "")
+        routed_entry = panes.get(routed_key)
+        if routed_key and isinstance(routed_entry, dict):
+            return routed_key, routed_entry
+        for pane_key_value in space.get("pane_keys") or []:
+            entry = panes.get(str(pane_key_value))
+            if isinstance(entry, dict) and str(entry.get("pane_root_message_id") or "") == message_key:
+                return str(pane_key_value), entry
+    return None
 
 
 def should_send_status(entry: dict[str, Any], obj_hash: str, pane: dict[str, Any], new_entry: bool) -> bool:
@@ -5894,6 +8044,102 @@ def should_send_status(entry: dict[str, Any], obj_hash: str, pane: dict[str, Any
         except Exception:
             return True
     return False
+
+
+def send_pending_prompt_message(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    entry: dict[str, Any],
+    counters: dict[str, int],
+    max_sends: int,
+    max_feed_sends: int,
+) -> dict[str, Any]:
+    turn_id = str(entry.get("pending_prompt_turn_id") or "")
+    prompt_text = sanitize_text(str(entry.get("pending_prompt_text") or ""), USER_PROMPT_MAX_CHARS).strip()
+    if not turn_id or not prompt_text:
+        return {"changed": False, "topic_missing": False}
+    prompt_hash = str(entry.get("pending_prompt_hash") or stream_text_hash(prompt_text))
+    last_prompt_hash = str(entry.get("last_prompt_hash") or "")
+    if str(entry.get("last_prompt_turn_id") or "") == turn_id and (
+        not last_prompt_hash or last_prompt_hash == prompt_hash
+    ):
+        entry.pop("pending_prompt_turn_id", None)
+        entry.pop("pending_prompt_text", None)
+        entry.pop("pending_prompt_hash", None)
+        return {"changed": True, "topic_missing": False}
+    if counters.get("sends", 0) >= max_sends or counters.get("feed_sends", 0) >= max_feed_sends:
+        return {"changed": False, "topic_missing": False, "skipped": True}
+    desired_bot_kind = desired_message_bot_kind(telegram, entry)
+    if managed_bot_access_retry_waiting(entry, "last_prompt_bot_kind", desired_bot_kind):
+        return {
+            "changed": False,
+            "topic_missing": False,
+            "skipped": True,
+            "reason": "managed_bot_access_pending",
+        }
+
+    item = make_prompt_feed_item(turn_id, prompt_text)
+    result = send_feed_item(
+        chat_id,
+        item,
+        telegram=telegram,
+        thread_id=entry["topic_id"],
+        notify=False,
+        reply_to_message_id=pane_root_reply_target(entry),
+        api_token=managed_bot_token_for_entry(telegram, entry),
+    )
+    if result_topic_missing(result):
+        return {"changed": False, "topic_missing": True, "error": str(result.get("error") or result)}
+    if result_pane_root_missing(result):
+        return {
+            "changed": False,
+            "topic_missing": False,
+            "pane_root_missing": True,
+            "error": str(result.get("error") or result),
+        }
+    if result.get("ok"):
+        counters["sends"] = counters.get("sends", 0) + 1
+        counters["feed_sends"] = counters.get("feed_sends", 0) + 1
+        entry["last_prompt_turn_id"] = turn_id
+        entry["last_prompt_hash"] = prompt_hash
+        entry["last_prompt_text"] = prompt_text
+        entry["last_prompt_sent_at"] = utc_now()
+        if result.get("message_id"):
+            entry["last_prompt_message_id"] = str(result["message_id"])
+            record_pane_message_route(
+                state,
+                str(entry.get("space_key") or ""),
+                str(entry.get("pane_key") or ""),
+                str(result["message_id"]),
+            )
+        record_message_bot_kind(
+            entry,
+            "last_prompt_bot_kind",
+            sent_message_bot_kind(telegram, entry, None, result),
+            desired_bot_kind,
+        )
+        entry.pop("pending_prompt_turn_id", None)
+        entry.pop("pending_prompt_text", None)
+        entry.pop("pending_prompt_hash", None)
+        entry.pop("last_prompt_error", None)
+        return {"changed": True, "topic_missing": False, "message_id": result.get("message_id")}
+
+    if result.get("kind") == "bot_access":
+        note_managed_bot_access_required(entry, "last_prompt_bot_kind", desired_bot_kind)
+    entry["last_prompt_error"] = sanitize_text(str(result), 500)
+    entry["last_prompt_error_at"] = utc_now()
+    return {"changed": True, "topic_missing": False}
+
+
+def entry_uses_space_topic(state: dict[str, Any], entry: dict[str, Any]) -> bool:
+    space_key_value = str(entry.get("space_key") or "")
+    topic_id = str(entry.get("topic_id") or "")
+    if not space_key_value or not topic_id:
+        return False
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    space = spaces.get(space_key_value)
+    return isinstance(space, dict) and str(space.get("topic_id") or "") == topic_id
 
 
 def sync_pane_once(
@@ -5916,62 +8162,66 @@ def sync_pane_once(
     max_marker_sends = int(caps.get("max_marker_sends", MAX_STATUS_MARKERS_PER_RUN))
     max_verifies = int(caps.get("max_verifies", MAX_TOPIC_VERIFIES_PER_RUN))
     feed_delivered_this_pane = False
+    stream_active_this_pane = False
+    pane_api_token = managed_bot_token_for_entry(telegram, entry, pane)
 
-    if not entry.get("topic_id") and counters.get("creates", 0) < max_creates:
-        topic_name = str(entry.get("topic_name") or topic_name_for_pane(pane))
-        topic_icon_id = ""
-        topic_icon_key = ""
-        topic_icon_emoji = ""
-        if STATUS_ICON_ENABLED:
-            topic_icon_id, topic_icon_key, topic_icon_emoji = status_icon_custom_emoji_id(telegram, pane)
-        create_kwargs = {"icon_custom_emoji_id": topic_icon_id} if topic_icon_id else {}
-        topic_id = create_topic(chat_id, topic_name, **create_kwargs)
-        counters["creates"] = counters.get("creates", 0) + 1
-        entry["topic_id"] = topic_id
-        entry["topic_name"] = topic_name
-        if topic_icon_id:
-            entry["topic_status_icon_key"] = topic_icon_key
-            entry["topic_status_icon_emoji"] = topic_icon_emoji
-            entry["topic_status_icon_custom_emoji_id"] = topic_icon_id
-            entry["topic_status_icon_updated_at"] = utc_now()
-        entry["last_topic_verified_at"] = utc_now()
+    space_entry, space_changed = ensure_space_topic(state, chat_id, telegram, pane, counters, max_creates)
+    if space_changed:
+        changed = True
+    if space_entry.get("topic_id"):
+        entry["topic_id"] = str(space_entry.get("topic_id") or "")
+        if space_entry.get("last_topic_verified_at"):
+            entry["last_topic_verified_at"] = str(space_entry.get("last_topic_verified_at") or "")
         entry.pop("topic_missing_at", None)
         entry.pop("topic_missing_id", None)
         entry.pop("topic_missing_reason", None)
-        entry.pop("topic_rename_pending_at", None)
-        entry.pop("topic_rename_from", None)
-        entry.pop("topic_rename_to", None)
-        save_state(state)
-        changed = True
-        if not CLEAN_FEED_ENABLED and counters.get("sends", 0) < max_sends:
-            send_message(
-                chat_id,
-                f"Linked Telegram topic to Herdr pane.\nPane key: {key}\n\n{format_status(pane, include_commands=True)}",
-                thread_id=topic_id,
-            )
-            counters["sends"] = counters.get("sends", 0) + 1
     if not entry.get("topic_id"):
         return changed
-
-    rename_pending = bool(entry.get("topic_rename_pending_at"))
-    if rename_pending or (counters.get("verifies", 0) < max_verifies and topic_verify_due(entry)):
-        verify_result = verify_topic_mapping(chat_id, entry)
-        if rename_pending:
-            counters["renames"] = counters.get("renames", 0) + 1
-        else:
-            counters["verifies"] = counters.get("verifies", 0) + 1
-        if verify_result.get("ok"):
+    if space_entry.get("topic_rename_pending_at"):
+        rename_result = verify_topic_mapping(chat_id, space_entry)
+        counters["renames"] = counters.get("renames", 0) + 1
+        if rename_result.get("ok"):
+            if space_entry.get("last_topic_verified_at"):
+                entry["last_topic_verified_at"] = str(space_entry.get("last_topic_verified_at") or "")
             changed = True
-        elif result_topic_missing(verify_result):
-            clear_topic_mapping(entry, str(verify_result.get("error") or verify_result))
+        elif result_topic_missing(rename_result):
+            clear_space_topic_mapping(state, space_entry, str(rename_result.get("error") or rename_result))
             save_state(state)
             return True
         else:
-            verify_error = sanitize_text(str(verify_result), 500)
-            if entry.get("last_topic_verify_error") != verify_error:
-                entry["last_topic_verify_error"] = verify_error
-                entry["last_topic_verify_error_at"] = utc_now()
-                changed = True
+            space_entry["last_topic_verify_error"] = sanitize_text(str(rename_result), 500)
+            space_entry["last_topic_verify_error_at"] = utc_now()
+            changed = True
+    elif counters.get("verifies", 0) < max_verifies and topic_verify_due(space_entry):
+        verify_result = verify_topic_mapping(chat_id, space_entry)
+        counters["verifies"] = counters.get("verifies", 0) + 1
+        if verify_result.get("ok"):
+            if space_entry.get("last_topic_verified_at"):
+                entry["last_topic_verified_at"] = str(space_entry.get("last_topic_verified_at") or "")
+            changed = True
+        elif result_topic_missing(verify_result):
+            clear_space_topic_mapping(state, space_entry, str(verify_result.get("error") or verify_result))
+            save_state(state)
+            return True
+        else:
+            space_entry["last_topic_verify_error"] = sanitize_text(str(verify_result), 500)
+            space_entry["last_topic_verify_error_at"] = utc_now()
+            changed = True
+    root_changed, root_result = ensure_pane_root_message(
+        state,
+        chat_id,
+        telegram,
+        pane,
+        entry,
+        counters,
+        max_sends,
+    )
+    if root_changed:
+        changed = True
+    if result_topic_missing(root_result):
+        clear_entry_topic_mapping(state, entry, str(root_result.get("error") or root_result))
+        save_state(state)
+        return True
 
     stable_obj_hash = status_hash(stable_status_object(pane))
     live_item = live_status_item(pane)
@@ -5983,11 +8233,22 @@ def sync_pane_once(
         if card_result.get("attempted"):
             counters["sends"] = counters.get("sends", 0) + 1
         if result_topic_missing(card_result):
-            clear_topic_mapping(entry, str(card_result.get("error") or card_result))
+            clear_entry_topic_mapping(state, entry, str(card_result.get("error") or card_result))
+            save_state(state)
+            return True
+        if result_pane_root_missing(card_result):
+            clear_pane_root_message(state, entry, str(card_result.get("error") or card_result))
             save_state(state)
             return True
         if card_result.get("ok"):
             entry["card_status_hash"] = live_card_hash
+            if card_result.get("message_id"):
+                record_pane_message_route(
+                    state,
+                    str(entry.get("space_key") or ""),
+                    str(entry.get("pane_key") or ""),
+                    str(card_result["message_id"]),
+                )
             changed = True
 
     if CLEAN_FEED_ENABLED:
@@ -6039,6 +8300,61 @@ def sync_pane_once(
                     allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
                 )
 
+        pending_stream_text = str(entry.get("pending_stream_text") or "")
+        pending_stream_turn_id = str(entry.get("pending_stream_turn_id") or "")
+        pending_stream_user_text = str(entry.get("pending_prompt_text") or entry.get("last_prompt_text") or "")
+        prompt_result = send_pending_prompt_message(
+            state,
+            chat_id,
+            telegram,
+            entry,
+            counters,
+            max_sends,
+            max_feed_sends,
+        )
+        if prompt_result.get("topic_missing"):
+            clear_entry_topic_mapping(state, entry, str(prompt_result.get("error") or prompt_result))
+            save_state(state)
+            return True
+        if prompt_result.get("pane_root_missing"):
+            clear_pane_root_message(state, entry, str(prompt_result.get("error") or prompt_result))
+            save_state(state)
+            return True
+        if prompt_result.get("changed"):
+            changed = True
+        if not item and pending_stream_text and pending_stream_turn_id and stream_config_enabled():
+            stream_result = send_stream_update(
+                chat_id,
+                telegram,
+                entry,
+                turn_id=pending_stream_turn_id,
+                text=pending_stream_text,
+                user_text=pending_stream_user_text,
+            )
+            if result_topic_missing(stream_result):
+                clear_entry_topic_mapping(state, entry, str(stream_result.get("error") or stream_result))
+                save_state(state)
+                return True
+            if result_pane_root_missing(stream_result):
+                clear_pane_root_message(state, entry, str(stream_result.get("error") or stream_result))
+                save_state(state)
+                return True
+            if stream_result.get("ok"):
+                stream_active_this_pane = True
+                if stream_result.get("sent_message"):
+                    counters["sends"] = counters.get("sends", 0) + 1
+                    if stream_result.get("message_id"):
+                        record_pane_message_route(
+                            state,
+                            str(entry.get("space_key") or ""),
+                            str(entry.get("pane_key") or ""),
+                            str(stream_result["message_id"]),
+                        )
+                changed = True
+            elif not stream_result.get("skipped"):
+                entry["last_stream_error"] = sanitize_text(str(stream_result), 500)
+                changed = True
+
         old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
         if item:
             item_render_hash = clean_feed_hash(item)
@@ -6048,20 +8364,73 @@ def sync_pane_once(
             render_changed = item_render_hash != previous_render_hash
             content_changed = not same_semantic
             should_deliver = old_clean_has_noise or content_changed or render_changed
-            if counters.get("feed_sends", 0) < max_feed_sends and should_deliver and not recent_attempt(entry, item_render_hash):
+            desired_bot_kind = desired_message_bot_kind(telegram, entry)
+            message_id = str(entry.get("last_clean_message_id") or "")
+            if same_semantic and render_changed and not content_changed and not old_clean_has_noise and not message_id:
+                entry["last_clean_render_hash"] = item_render_hash
+                entry["last_clean_hash"] = item_render_hash
+                entry["last_clean_semantic_hash"] = item_semantic_hash
+                entry["last_clean_text"] = item_plain_text(item)
+                entry["last_clean_item"] = item
+                entry["last_clean_render_only_skipped_at"] = utc_now()
+                entry.pop("last_clean_send_error", None)
+                changed = True
+                should_deliver = False
+            if (
+                counters.get("feed_sends", 0) < max_feed_sends
+                and should_deliver
+                and not recent_attempt(entry, item_render_hash)
+                and not managed_bot_access_retry_waiting(entry, "last_clean_bot_kind", desired_bot_kind)
+            ):
                 reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
                 entry["last_clean_attempt_hash"] = item_render_hash
                 entry["last_clean_attempt_at"] = utc_now()
                 changed = True
                 did_edit = False
-                message_id = str(entry.get("last_clean_message_id") or "")
-                if same_semantic and (render_changed or old_clean_has_noise) and message_id:
+                lifecycle_message_id = ""
+                if str(item.get("kind") or "").lower() == "turn":
+                    lifecycle_message_id = turn_visible_anchor_message_id(entry, str(item.get("turn_id") or ""))
+                if lifecycle_message_id and not entry.get("last_clean_bot_kind"):
+                    if lifecycle_message_id == str(entry.get("last_stream_message_id") or "") and entry.get("last_stream_bot_kind"):
+                        entry["last_clean_bot_kind"] = str(entry.get("last_stream_bot_kind") or "")
+                    elif lifecycle_message_id == str(entry.get("last_prompt_message_id") or "") and entry.get("last_prompt_bot_kind"):
+                        entry["last_clean_bot_kind"] = str(entry.get("last_prompt_bot_kind") or "")
+                if (
+                    lifecycle_message_id
+                    and not message_bot_reissue_due(entry, "last_clean_bot_kind", desired_bot_kind)
+                ):
+                    result = edit_feed_item(
+                        chat_id,
+                        lifecycle_message_id,
+                        item,
+                        telegram=telegram,
+                        reply_markup=reply_markup,
+                        api_token=pane_api_token,
+                    )
+                    if result.get("ok"):
+                        did_edit = True
+                        message_id = lifecycle_message_id
+                    elif result.get("not_found"):
+                        result = send_feed_item(
+                            chat_id,
+                            item,
+                            telegram=telegram,
+                            thread_id=entry["topic_id"],
+                            notify=bool(item.get("notify")),
+                            reply_markup=reply_markup,
+                            reply_to_message_id=pane_root_reply_target(entry),
+                            api_token=pane_api_token,
+                        )
+                    else:
+                        result = {**result, "edit_failed": True}
+                elif same_semantic and (render_changed or old_clean_has_noise) and message_id:
                     result = edit_feed_item(
                         chat_id,
                         message_id,
                         item,
                         telegram=telegram,
                         reply_markup=reply_markup,
+                        api_token=pane_api_token,
                     )
                     if result.get("ok"):
                         did_edit = True
@@ -6074,6 +8443,8 @@ def sync_pane_once(
                                 thread_id=entry["topic_id"],
                                 notify=bool(item.get("notify")),
                                 reply_markup=reply_markup,
+                                reply_to_message_id=pane_root_reply_target(entry),
+                                api_token=pane_api_token,
                             )
                         else:
                             entry["last_clean_render_hash"] = item_render_hash
@@ -6095,6 +8466,8 @@ def sync_pane_once(
                         thread_id=entry["topic_id"],
                         notify=bool(item.get("notify")),
                         reply_markup=reply_markup,
+                        reply_to_message_id=pane_root_reply_target(entry),
+                        api_token=pane_api_token,
                     )
                 if result.get("ok"):
                     counters["sends"] = counters.get("sends", 0) + 1
@@ -6110,12 +8483,40 @@ def sync_pane_once(
                         item_semantic_hash=item_semantic_hash,
                         fallback_message_id=message_id if did_edit else None,
                     )
+                    record_message_bot_kind(
+                        entry,
+                        "last_clean_bot_kind",
+                        sent_message_bot_kind(telegram, entry, None, result),
+                        desired_bot_kind,
+                    )
+                    route_id = str(result.get("message_id") or (message_id if did_edit else ""))
+                    if route_id:
+                        record_pane_message_route(
+                            state,
+                            str(entry.get("space_key") or ""),
+                            str(entry.get("pane_key") or ""),
+                            route_id,
+                        )
+                    if str(item.get("kind") or "").lower() == "turn":
+                        clear_stream_state(entry)
                     changed = True
                 elif result_topic_missing(result):
-                    clear_topic_mapping(entry, str(result.get("error") or result))
+                    clear_entry_topic_mapping(state, entry, str(result.get("error") or result))
+                    save_state(state)
+                    return True
+                elif result_pane_root_missing(result):
+                    clear_pane_root_message(state, entry, str(result.get("error") or result))
                     save_state(state)
                     return True
                 elif result.get("skipped_stale_repost"):
+                    changed = True
+                elif result.get("kind") == "bot_access":
+                    note_managed_bot_access_required(
+                        entry,
+                        "last_clean_bot_kind",
+                        desired_message_bot_kind(telegram, entry),
+                    )
+                    entry["last_clean_send_error"] = sanitize_text(str(result), 500)
                     changed = True
                 else:
                     entry["last_clean_send_error"] = sanitize_text(str(result), 500)
@@ -6132,24 +8533,55 @@ def sync_pane_once(
             format_status(pane, include_recent=include_recent),
             thread_id=entry["topic_id"],
             notify=pane_status in {"blocked", "error"},
+            reply_to_message_id=pane_root_reply_target(entry),
+            api_token=pane_api_token,
         )
         if status_result.get("ok"):
+            desired_bot_kind = desired_message_bot_kind(telegram, entry)
             counters["sends"] = counters.get("sends", 0) + 1
+            if status_result.get("message_id"):
+                record_pane_message_route(
+                    state,
+                    str(entry.get("space_key") or ""),
+                    str(entry.get("pane_key") or ""),
+                    str(status_result["message_id"]),
+                )
+            record_message_bot_kind(
+                entry,
+                "last_status_bot_kind",
+                sent_message_bot_kind(telegram, entry, None, status_result),
+                desired_bot_kind,
+            )
             entry["last_status_hash"] = stable_obj_hash
             entry["last_notified_status"] = pane_status
             entry["last_sent_at"] = utc_now()
             changed = True
         elif result_topic_missing(status_result):
-            clear_topic_mapping(entry, str(status_result.get("error") or status_result))
+            clear_entry_topic_mapping(state, entry, str(status_result.get("error") or status_result))
+            save_state(state)
+            return True
+        elif result_pane_root_missing(status_result):
+            clear_pane_root_message(state, entry, str(status_result.get("error") or status_result))
             save_state(state)
             return True
     # One-time ⚠️ warning when a pane's agent stalls on a model-API error.
     api_warn = apply_api_error_warning(chat_id, telegram, entry, counters, max_sends)
     if api_warn["topic_missing"]:
-        clear_topic_mapping(entry, "api-error notice: topic missing")
+        clear_entry_topic_mapping(state, entry, "api-error notice: topic missing")
+        save_state(state)
+        return True
+    if api_warn.get("pane_root_missing"):
+        clear_pane_root_message(state, entry, str(api_warn.get("error") or "api-error notice: pane root missing"))
         save_state(state)
         return True
     if api_warn["changed"]:
+        if api_warn.get("message_id"):
+            record_pane_message_route(
+                state,
+                str(entry.get("space_key") or ""),
+                str(entry.get("pane_key") or ""),
+                str(api_warn["message_id"]),
+            )
         changed = True
 
     status_icon_ok = False
@@ -6158,19 +8590,20 @@ def sync_pane_once(
         if icon_result.get("attempted"):
             counters["icon_updates"] = counters.get("icon_updates", 0) + 1
         if result_topic_missing(icon_result):
-            clear_topic_mapping(entry, str(icon_result.get("error") or icon_result))
+            clear_entry_topic_mapping(state, entry, str(icon_result.get("error") or icon_result))
             save_state(state)
             return True
         if icon_result.get("ok"):
             status_icon_ok = True
             if icon_result.get("attempted"):
                 changed = True
-            if STATUS_MARKER_SUPPRESS_WHEN_ICON_OK and clear_status_marker_for_icon(chat_id, entry):
+            if STATUS_MARKER_SUPPRESS_WHEN_ICON_OK and clear_status_marker_for_icon(chat_id, entry, api_token=pane_api_token):
                 changed = True
 
     if (
         STATUS_MARKER_ENABLED
         and not feed_delivered_this_pane
+        and not stream_active_this_pane
         and not (STATUS_MARKER_SUPPRESS_WHEN_ICON_OK and status_icon_ok)
         and entry.get("topic_id")
         and counters.get("marker_sends", 0) < max_marker_sends
@@ -6180,10 +8613,21 @@ def sync_pane_once(
             counters["sends"] = counters.get("sends", 0) + 1
             counters["marker_sends"] = counters.get("marker_sends", 0) + 1
         if result_topic_missing(marker_result):
-            clear_topic_mapping(entry, str(marker_result.get("error") or marker_result))
+            clear_entry_topic_mapping(state, entry, str(marker_result.get("error") or marker_result))
+            save_state(state)
+            return True
+        if result_pane_root_missing(marker_result):
+            clear_pane_root_message(state, entry, str(marker_result.get("error") or marker_result))
             save_state(state)
             return True
         if marker_result.get("ok") and marker_result.get("attempted"):
+            if marker_result.get("message_id"):
+                record_pane_message_route(
+                    state,
+                    str(entry.get("space_key") or ""),
+                    str(entry.get("pane_key") or ""),
+                    str(marker_result["message_id"]),
+                )
             changed = True
     return changed
 
@@ -6213,42 +8657,32 @@ def sync_once() -> dict[str, Any]:
             entry["closed_at"] = utc_now()
             changed = True
         topic_id = entry.get("topic_id")
-        # Finalize a closed pane's topic exactly once (also catches panes that
-        # were marked closed before this logic existed): mark the name "[OLD] …"
-        # and switch the status icon away from the stale live one (e.g. ⚡️) to
-        # the closed icon (📁), so it's obvious at a glance and not mistaken for
-        # a live topic.
-        if topic_id and not entry.get("closed_topic_finalized"):
-            current_name = str(entry.get("topic_name") or "").strip()
-            new_name = current_name
-            if current_name and not current_name.startswith("[OLD]"):
-                new_name = sanitize_text(f"[OLD] {current_name}", 120).strip()
-            closed_icon_id, _matched, _emoji = status_icon_id_for_keys(telegram, ["closed", "unknown"])
-            try:
-                if new_name != current_name:
-                    if edit_topic(chat_id, topic_id, new_name, icon_custom_emoji_id=closed_icon_id or None):
-                        entry["topic_name"] = new_name
-                        entry["status_icon_key"] = "closed"
-                        entry["closed_topic_finalized"] = True
-                        changed = True
-                elif closed_icon_id:
-                    if edit_topic_icon(chat_id, topic_id, closed_icon_id):
-                        entry["status_icon_key"] = "closed"
-                        entry["closed_topic_finalized"] = True
-                        changed = True
-                else:
-                    entry["closed_topic_finalized"] = True
-            except BridgeError:
-                pass
+        if topic_id and entry_uses_space_topic(state, entry) and not entry.get("closed_topic_finalized"):
+            entry["closed_topic_finalized"] = True
+            entry["closed_space_topic_preserved_at"] = utc_now()
+            changed = True
+        elif topic_id and not entry.get("closed_topic_finalized"):
+            entry["closed_topic_finalized"] = True
+            entry["closed_topic_preserved_at"] = utc_now()
+            changed = True
         if newly_closed and topic_id and sends < MAX_SENDS_PER_RUN:
-            send_notice(
+            closed_notice = send_notice(
                 chat_id,
                 "Closed",
                 "This Herdr pane is no longer live.",
                 telegram=telegram,
                 thread_id=topic_id,
                 notify=True,
+                reply_to_message_id=pane_root_reply_target(entry),
+                api_token=managed_bot_token_for_entry(telegram, entry),
             )
+            if closed_notice.get("ok") and closed_notice.get("message_id"):
+                record_pane_message_route(
+                    state,
+                    str(entry.get("space_key") or ""),
+                    str(entry.get("pane_key") or key),
+                    str(closed_notice["message_id"]),
+                )
             sends += 1
 
     if not panes:
@@ -6262,7 +8696,7 @@ def sync_once() -> dict[str, Any]:
 
     try:
         if not preflight_is_fresh(telegram):
-            preflight(chat_id)
+            preflight(chat_id, telegram)
             telegram["last_preflight_ok_at"] = utc_now()
         telegram.pop("last_preflight_error", None)
     except BridgeError as exc:
@@ -6311,6 +8745,10 @@ def sync_once() -> dict[str, Any]:
         "max_creates": MAX_CREATES_PER_RUN,
         "max_verifies": MAX_TOPIC_VERIFIES_PER_RUN,
     }
+    if ensure_managed_bot_setup_message(state, chat_id, telegram, counters, caps["max_sends"], panes):
+        changed = True
+    if ensure_managed_bot_group_access_message(state, chat_id, telegram, counters, caps["max_sends"], panes):
+        changed = True
     for pane in panes:
         if sync_pane_once(state, chat_id, telegram, pane, counters, caps):
             changed = True
@@ -6318,6 +8756,9 @@ def sync_once() -> dict[str, Any]:
         overview = sync_pinned_status_overview(state, "", chat_id, panes)
         if overview.get("changed"):
             changed = True
+    pinned_status_result = sync_space_pinned_statuses(state, chat_id, panes, counters, caps["max_sends"])
+    if pinned_status_result.get("changed"):
+        changed = True
     sends = counters["sends"]
     creates = counters["creates"]
     verifies = counters["verifies"]
@@ -6335,6 +8776,7 @@ def sync_once() -> dict[str, Any]:
         "feed_sent": counters["feed_sends"],
         "marker_sent": counters["marker_sends"],
         "icon_updated": counters["icon_updates"],
+        "pinned_status_updated": pinned_status_result.get("updated", 0),
     }
 
 
@@ -6387,7 +8829,7 @@ def cleanup_duplicates_once(*, delete: bool = False) -> dict[str, Any]:
     if not delete:
         return {"ok": True, "changed": False, "duplicates": records, "count": len(records)}
     try:
-        preflight(chat_id)
+        preflight(chat_id, telegram)
         telegram["last_preflight_ok_at"] = utc_now()
     except Exception as exc:
         save_state(state)
@@ -6613,16 +9055,114 @@ def parse_command(text: str) -> tuple[str, str]:
     return command, rest.strip()
 
 
-def topic_entry(state: dict[str, Any], chat_id: str, topic_id: str) -> dict[str, Any] | None:
+AMBIGUOUS_PANE_THREAD_REPLY = "Reply inside a pane thread so I know which Herdr pane to control."
+
+
+def topic_space_entry(state: dict[str, Any], chat_id: str, topic_id: str) -> tuple[str, dict[str, Any]] | None:
     telegram = state.get("telegram") or {}
     if str(telegram.get("chat_id")) != str(chat_id):
         return None
     if str(topic_id) == str(telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID)):
         return None
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    for space_key_value, space in spaces.items():
+        if isinstance(space, dict) and str(space.get("topic_id") or "") == str(topic_id):
+            return str(space_key_value), space
+    return None
+
+
+def live_entries_for_space(state: dict[str, Any], space: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for pane_key_value in space.get("pane_keys") or []:
+        key = str(pane_key_value)
+        entry = panes.get(key)
+        if isinstance(entry, dict) and str(entry.get("last_known_status") or "").lower() != "closed":
+            entries.append((key, entry))
+    return entries
+
+
+def resolve_topic_entry(
+    state: dict[str, Any],
+    chat_id: str,
+    topic_id: str,
+    *,
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    prefer_message_id: bool = False,
+    target_bot_kind: str = "",
+) -> tuple[str, dict[str, Any]] | None:
+    clean_target_bot_kind = str(target_bot_kind or "").strip().lower()
+    if prefer_message_id and message_id:
+        routed = route_message_to_pane(state, chat_id, topic_id, message_id)
+        if routed and entry_matches_managed_bot_kind(routed[1], clean_target_bot_kind):
+            return routed
+    if reply_to_message_id:
+        routed = route_message_to_pane(state, chat_id, topic_id, reply_to_message_id)
+        if routed and entry_matches_managed_bot_kind(routed[1], clean_target_bot_kind):
+            return routed
+    mapped_space = topic_space_entry(state, chat_id, topic_id)
+    if mapped_space:
+        _space_key_value, space = mapped_space
+        live_entries = [
+            candidate
+            for candidate in live_entries_for_space(state, space)
+            if entry_matches_managed_bot_kind(candidate[1], clean_target_bot_kind)
+        ]
+        if len(live_entries) == 1:
+            return live_entries[0]
+        return None
+    telegram = state.get("telegram") or {}
+    if str(telegram.get("chat_id")) != str(chat_id):
+        return None
+    if str(topic_id) == str(telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID)):
+        return None
+    matching_entries: list[tuple[str, dict[str, Any]]] = []
     for entry in (state.get("panes") or {}).values():
         if str(entry.get("topic_id") or "") == str(topic_id):
-            return entry
+            pane_key_value = str(entry.get("pane_key") or "")
+            if not clean_target_bot_kind:
+                return pane_key_value, entry
+            if entry_matches_managed_bot_kind(entry, clean_target_bot_kind):
+                matching_entries.append((pane_key_value, entry))
+    if len(matching_entries) == 1:
+        return matching_entries[0]
     return None
+
+
+def topic_entry(
+    state: dict[str, Any],
+    chat_id: str,
+    topic_id: str,
+    *,
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    prefer_message_id: bool = False,
+    target_bot_kind: str = "",
+) -> dict[str, Any] | None:
+    resolved = resolve_topic_entry(
+        state,
+        chat_id,
+        topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        prefer_message_id=prefer_message_id,
+        target_bot_kind=target_bot_kind,
+    )
+    if not resolved:
+        return None
+    _pane_key_value, entry = resolved
+    return entry
+
+
+def forward_text_to_pane_response(pane_id: str, text: str, *, usage: str = "") -> dict[str, Any]:
+    outbound = str(text or "").strip()
+    if not outbound:
+        return {"handled": True, "reply": usage}
+    ok, detail = send_to_pane(pane_id, outbound)
+    if not ok:
+        return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
+    return {"handled": True, "reply": ""}
 
 
 def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
@@ -6634,9 +9174,27 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     user_id = str(payload.get("user_id") or "")
     text = str(payload.get("text") or "")
     telegram = state.setdefault("telegram", {})
+    payload_target_bot_kind = str(payload.get("target_bot_kind") or "").strip().lower()
+    if payload_target_bot_kind not in managed_bot_specs():
+        payload_target_bot_kind = ""
+    mentioned_bot_kind = mentioned_managed_bot_kind(telegram, text)
+    if payload_target_bot_kind and mentioned_bot_kind and payload_target_bot_kind != mentioned_bot_kind:
+        return {"handled": True, "reply": "That message targets two different Herdr pane bots."}
+    target_bot_kind = payload_target_bot_kind or mentioned_bot_kind
+    if target_bot_kind:
+        text = strip_managed_bot_mentions(telegram, text)
 
-    entry = topic_entry(state, chat_id, topic_id)
+    entry = topic_entry(
+        state,
+        chat_id,
+        topic_id,
+        message_id=str(payload.get("message_id") or ""),
+        reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
+        target_bot_kind=target_bot_kind,
+    )
     if not entry:
+        if topic_space_entry(state, chat_id, topic_id):
+            return {"handled": True, "reply": AMBIGUOUS_PANE_THREAD_REPLY}
         return {"handled": False}
     if state_changed:
         save_state(state)
@@ -6656,6 +9214,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     pane_id = str(entry.get("pane_id") or "")
     if not pane_id or entry.get("last_known_status") == "closed":
         return {"handled": True, "reply": "This topic is mapped to a closed or unavailable Herdr pane."}
+    pane_api_token = managed_bot_token_for_entry(telegram, entry)
 
     attachment = payload.get("attachment")
     if isinstance(attachment, dict) and attachment.get("kind") in {"document", "photo"} and attachment.get("file_id"):
@@ -6679,7 +9238,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 save_state(state)
                 return {
                     "handled": True,
-                    "reply": "That choice prompt is no longer active from Telegram. Use /raw or answer in Herdr.",
+                    "reply": "That choice prompt is no longer safe from Telegram. Use /send or answer in Herdr.",
                 }
             try:
                 created_at = _dt.datetime.fromisoformat(str(awaiting.get("created_at", "")).replace("Z", "+00:00"))
@@ -6722,10 +9281,27 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             save_state(state)
             return {"handled": True, "reply": "Sent details."}
         implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
-        if implicit:
-            payload = dict(payload)
-            payload["text"] = "/send " + arg
-            return command_reply(payload)
+        if str(payload.get("reply_to_message_id") or "").strip():
+            disabled_awaiting = (
+                entry.get("last_disabled_awaiting_detail")
+                if isinstance(entry.get("last_disabled_awaiting_detail"), dict)
+                else {}
+            )
+            if (
+                disabled_awaiting
+                and str(disabled_awaiting.get("user_id") or "") == user_id
+                and str(disabled_awaiting.get("force_reply_message_id") or "")
+                == str(payload.get("reply_to_message_id") or "")
+            ):
+                entry.pop("last_disabled_awaiting_detail", None)
+                save_state(state)
+                return {
+                    "handled": True,
+                    "reply": "That choice prompt is no longer safe from Telegram. Use /send or answer in Herdr.",
+                }
+            return forward_text_to_pane_response(pane_id, arg)
+        if implicit or target_bot_kind:
+            return forward_text_to_pane_response(pane_id, arg)
         return {"handled": True, "reply": "This is a mapped Herdr pane topic. Use /send <text> to forward to this pane, or /help."}
 
     if command in {"help", "start"}:
@@ -6763,6 +9339,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     thread_id=topic_id,
                     notify=False,
                     reply_markup=reply_markup,
+                    reply_to_message_id=pane_root_reply_target(entry),
+                    api_token=pane_api_token,
                 )
                 if result.get("ok"):
                     record_delivered_feed_item(
@@ -6774,6 +9352,19 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                         item_render_hash=report_render_hash,
                         item_semantic_hash=report_semantic_hash,
                     )
+                    record_message_bot_kind(
+                        entry,
+                        "last_clean_bot_kind",
+                        sent_message_bot_kind(telegram, entry, None, result),
+                        desired_message_bot_kind(telegram, entry),
+                    )
+                    if result.get("message_id"):
+                        record_pane_message_route(
+                            state,
+                            str(entry.get("space_key") or ""),
+                            str(entry.get("pane_key") or ""),
+                            str(result["message_id"]),
+                        )
                     save_state(state)
                     return {"handled": True, "reply": ""}
                 entry["last_clean_send_error"] = sanitize_text(str(result), 500)
@@ -6790,8 +9381,17 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 thread_id=topic_id,
                 notify=False,
                 reply_markup=reply_markup,
+                reply_to_message_id=pane_root_reply_target(entry),
+                api_token=pane_api_token,
             )
             if result.get("ok"):
+                if result.get("message_id"):
+                    record_pane_message_route(
+                        state,
+                        str(entry.get("space_key") or ""),
+                        str(entry.get("pane_key") or ""),
+                        str(result["message_id"]),
+                    )
                 if pending_active_prompt:
                     bind_active_prompt_message(entry, pending_active_prompt, result.get("message_id"))
                 elif clear_active_prompt:
@@ -6829,7 +9429,16 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 thread_id=topic_id,
                 notify=True,
                 reply_markup=reply_markup,
+                reply_to_message_id=pane_root_reply_target(entry),
+                api_token=pane_api_token,
             )
+            if result.get("ok") and result.get("message_id"):
+                record_pane_message_route(
+                    state,
+                    str(entry.get("space_key") or ""),
+                    str(entry.get("pane_key") or ""),
+                    str(result["message_id"]),
+                )
             if result.get("ok") and pending_active_prompt:
                 bind_active_prompt_message(entry, pending_active_prompt, result.get("message_id"))
             elif result.get("ok") and clear_active_prompt:
@@ -6858,8 +9467,17 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             thread_id=topic_id,
             notify=True,
             reply_markup=choices_reply_markup(prompt_id, options),
+            reply_to_message_id=pane_root_reply_target(entry),
+            api_token=pane_api_token,
         )
         if result.get("ok"):
+            if result.get("message_id"):
+                record_pane_message_route(
+                    state,
+                    str(entry.get("space_key") or ""),
+                    str(entry.get("pane_key") or ""),
+                    str(result["message_id"]),
+                )
             bind_active_prompt_message(entry, prompt, result.get("message_id"))
         save_state(state)
         return {"handled": True, "reply": ""}
@@ -6875,12 +9493,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         pane = pane_by_id(pane_id)
         return {"handled": True, "reply": format_debug(pane, entry)}
     if command == "send":
-        if not arg:
-            return {"handled": True, "reply": "Usage: /send <instruction for this pane>"}
-        ok, detail = send_to_pane(pane_id, arg)
-        if not ok:
-            return {"handled": True, "reply": f"Send failed: {detail}"}
-        return {"handled": True, "reply": "Sent."}
+        return forward_text_to_pane_response(pane_id, arg, usage="Usage: /send <instruction for this pane>")
     if command == "keys":
         if not arg:
             return {"handled": True, "reply": "Usage: /keys <key> [key ...]"}
@@ -6921,10 +9534,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             # Pathological (e.g. an enormous state path): refuse rather than let
             # send_to_pane silently file-convert and drop the slash-command.
             return {"handled": True, "reply": f"Could not forward /{command}: the command reference is too long."}
-    ok, detail = send_to_pane(pane_id, forward_text)
-    if not ok:
-        return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
-    return {"handled": True, "reply": f"Sent /{command} to this pane."}
+    return forward_text_to_pane_response(pane_id, forward_text)
 
 
 def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
@@ -6940,7 +9550,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
 
     if not data.startswith("herdr:"):
         return {"handled": False}
-    entry = topic_entry(state, chat_id, topic_id)
+    entry = topic_entry(state, chat_id, topic_id, message_id=message_id, prefer_message_id=True)
     if not entry:
         return {"handled": False}
     if state_changed:
@@ -6994,6 +9604,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     pane_id = str(entry.get("pane_id") or "")
     if not pane_id or entry.get("last_known_status") == "closed":
         return {"handled": True, "answer": "This pane is no longer live.", "show_alert": True}
+    pane_api_token = managed_bot_token_for_entry(telegram, entry)
 
     option = next(
         (
@@ -7061,6 +9672,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 "input_field_placeholder": "Instruction for this pane" if not choice_text else f"Details for {choice_number}",
             },
             reply_to_message_id=message_id,
+            api_token=pane_api_token,
         )
         if notice.get("message_id"):
             entry["awaiting_detail"]["force_reply_message_id"] = str(notice["message_id"])
@@ -7118,6 +9730,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 "input_field_placeholder": f"Details for option {choice_number}",
             },
             reply_to_message_id=message_id,
+            api_token=pane_api_token,
         )
         if notice.get("message_id"):
             entry["awaiting_detail"]["force_reply_message_id"] = str(notice["message_id"])
@@ -7140,6 +9753,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         telegram=telegram,
         thread_id=topic_id,
         notify=False,
+        api_token=pane_api_token,
     )
     return {"handled": True, "answer": f"Selected {choice_number}."}
 
@@ -7198,6 +9812,7 @@ def main() -> int:
     cleanup.add_argument("--delete", action="store_true")
     sub.add_parser("command")
     sub.add_parser("callback")
+    sub.add_parser("managed-bot")
     probe = sub.add_parser("probe")
     probe.add_argument("--thread-id", default=None)
     args = parser.parse_args()
@@ -7218,6 +9833,9 @@ def main() -> int:
         elif args.cmd == "callback":
             payload = json.loads(sys.stdin.read() or "{}")
             result = with_lock(lambda: callback_reply(payload), blocking=True)
+        elif args.cmd == "managed-bot":
+            payload = json.loads(sys.stdin.read() or "{}")
+            result = with_lock(lambda: managed_bot_update(payload), blocking=True)
         else:
             result = with_lock(lambda: probe_rich(args.thread_id), blocking=True)
         print(json.dumps(result, sort_keys=True))

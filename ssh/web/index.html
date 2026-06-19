@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <title>herdres — minding the herd</title>
+
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+    <link
+      rel="preconnect"
+      href="https://fonts.gstatic.com"
+      crossorigin
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- Brand + connection state. The lantern dot is the link's heartbeat. -->
+      <header class="bar bar--top">
+        <span class="brand">
+          <span class="brand__mark" aria-hidden="true"></span>
+          herdres
+        </span>
+        <span id="link" class="link link--linking">
+          <span class="link__dot" aria-hidden="true"></span>
+          <span id="link-label" class="link__label">linking…</span>
+        </span>
+      </header>
+
+      <!-- The drove line: one marker per herdr pane, colored by agent status. -->
+      <nav id="drove" class="drove" aria-label="Herdr panes">
+        <span class="drove__empty">no panes yet</span>
+      </nav>
+
+      <!-- The mirror of the live herdr screen. -->
+      <main id="screen" class="screen"></main>
+
+      <!-- Touch control surface: keys a soft keyboard makes awkward. -->
+      <footer class="bar bar--keys" id="keys">
+        <button class="key" data-seq="">esc</button>
+        <button class="key" data-seq="\t">tab</button>
+        <button class="key key--mod" data-mod="ctrl" id="k-ctrl">ctrl</button>
+        <button class="key" data-seq="[A">↑</button>
+        <button class="key" data-seq="[B">↓</button>
+        <button class="key" data-seq="[D">←</button>
+        <button class="key" data-seq="[C">→</button>
+        <button class="key" data-seq="|">|</button>
+        <button class="key" data-seq="/">/</button>
+        <button class="key" data-seq="\r">⏎</button>
+      </footer>
+
+      <!-- Shown when the Mac host isn't connected, or auth/transport fails. -->
+      <div id="curtain" class="curtain" hidden>
+        <div class="curtain__card">
+          <span class="curtain__mark" aria-hidden="true"></span>
+          <h1 id="curtain-title" class="curtain__title">The herd is out of reach</h1>
+          <p id="curtain-body" class="curtain__body">
+            Start <code>herdr-share</code> on your Mac to bring the session in.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

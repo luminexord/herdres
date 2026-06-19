@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Keeps the cockpit server running so the Mini App can attach over the tailnet.
+     The PTY is only spawned while a viewer is connected, so this idles cheaply.
+     Replace __HOME__ with $HOME, set HERDRES_OWNER_ID, then bootstrap:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gaijinjoe.herdres-cockpit.plist
+     Separately (once): tailscale serve --bg https / http://127.0.0.1:8787 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gaijinjoe.herdres-cockpit</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>node</string>
+        <string>__HOME__/.local/share/herdres/ssh/server/server.js</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HERDRES_OWNER_ID</key>
+        <string>000000000</string>
+        <key>PORT</key>
+        <string>8787</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/share/herdres/cockpit.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/share/herdres/cockpit.err.log</string>
+</dict>
+</plist>

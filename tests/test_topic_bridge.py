@@ -68,6 +68,35 @@ class BridgeRoutingTests(unittest.TestCase):
             "panes": {"p": {"topic_id": "77", "pane_id": "pane-1"}},
         }
 
+    def _shared_state(self):
+        return {
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": ["p1", "p2"],
+                    "message_routes": {"1002": "p2"},
+                }
+            },
+            "panes": {
+                "p1": {
+                    "pane_key": "p1",
+                    "pane_id": "pane-1",
+                    "topic_id": "77",
+                    "pane_root_message_id": "1001",
+                    "last_known_status": "working",
+                },
+                "p2": {
+                    "pane_key": "p2",
+                    "pane_id": "pane-2",
+                    "topic_id": "77",
+                    "pane_root_message_id": "1002",
+                    "last_known_status": "working",
+                },
+            },
+        }
+
     def _run(self, message, state):
         captured = {}
 
@@ -135,6 +164,14 @@ class BridgeRoutingTests(unittest.TestCase):
         self.assertFalse(handled)
         self.assertIsNone(payload)
 
+    def test_foreign_chat_with_matching_legacy_topic_id_is_not_handled(self):
+        handled, payload = self._run(
+            _msg(text="hi", chat=types.SimpleNamespace(id=-999, is_forum=True), message_thread_id=77),
+            self._state(),
+        )
+        self.assertFalse(handled)
+        self.assertIsNone(payload)
+
     def test_owner_prefilter_drops_non_owner_without_spawning(self):
         state = self._state()
         state["telegram"]["owner_user_ids"] = ["42"]
@@ -161,6 +198,33 @@ class BridgeRoutingTests(unittest.TestCase):
         handled, payload = self._run(_msg(caption="look"), self._state())
         self.assertFalse(handled)
         self.assertIsNone(payload)
+
+    def test_shared_topic_reply_routes_to_pane_root(self):
+        reply_to = types.SimpleNamespace(message_id=1002)
+        handled, payload = self._run(_msg(text="/send hi", reply_to_message=reply_to), self._shared_state())
+
+        self.assertTrue(handled)
+        self.assertEqual(payload["pane_key"], "p2")
+        self.assertEqual(payload["reply_to_message_id"], "1002")
+
+    def test_shared_topic_top_level_message_is_ambiguous_and_not_spawned(self):
+        sent = []
+
+        async def fake_send(**kwargs):
+            sent.append(kwargs)
+
+        async def fake_script(payload, mode="command"):
+            raise AssertionError("ambiguous top-level text must not spawn herdres")
+
+        adapter = types.SimpleNamespace(_send_with_retry=fake_send)
+        with patch.object(bridge, "_load_state", Mock(return_value=self._shared_state())), patch.object(
+            bridge, "_run_command_script", fake_script
+        ):
+            handled = asyncio.run(bridge.maybe_handle_herdr_topic_message(adapter, _msg(text="/send hi")))
+
+        self.assertTrue(handled)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Reply inside a pane thread", sent[0]["content"])
 
 
 if __name__ == "__main__":

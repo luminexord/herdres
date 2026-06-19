@@ -14,12 +14,21 @@ from unittest.mock import Mock, patch
 import herdres_routing
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "herdres-gateway.py"
-SPEC = importlib.util.spec_from_file_location("herdres_gateway", MODULE_PATH)
-gateway = importlib.util.module_from_spec(SPEC)
-assert SPEC and SPEC.loader
-sys.modules[SPEC.name] = gateway
-SPEC.loader.exec_module(gateway)
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_gateway_module(filename: str, module_name: str):
+    module_path = ROOT / filename
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+gateway = load_gateway_module("herdres-gateway.py", "herdres_gateway_upstream")
+managed_gateway = load_gateway_module("herdres_gateway.py", "herdres_gateway_managed")
 
 
 def object_message(**overrides):
@@ -215,6 +224,230 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.offset_path.read_text(encoding="utf-8").strip(), "21")
         self.assertEqual(api.call_args.args[1], "sendMessage")
         self.assertIn("invalid output", api.call_args.args[2]["text"])
+
+
+class GatewayManagedBotTests(unittest.TestCase):
+    def test_managed_bot_tokens_reads_enabled_child_tokens(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {
+                "managed_bots": {
+                    "codex": {"token": "CODEX_TOKEN", "enabled": True},
+                    "claude": {"token": "CLAUDE_TOKEN", "enabled": False},
+                    "kimi": {"token": ""},
+                }
+            },
+        }
+
+        tokens = managed_gateway.managed_bot_tokens(state)
+
+        self.assertEqual(len(tokens), 1)
+        self.assertTrue(tokens[0][0].startswith("managed-codex-"))
+        self.assertEqual(tokens[0][1], "CODEX_TOKEN")
+
+    def test_handle_update_dispatches_managed_bot_created_message(self) -> None:
+        handler = Mock()
+        update = {
+            "update_id": 7,
+            "message": {
+                "from": {"id": 42},
+                "managed_bot_created": {"bot": {"id": 111, "username": "herdr_codex_bot"}},
+            },
+        }
+
+        with patch.object(managed_gateway, "handle_managed_bot_update", handler):
+            managed_gateway.handle_update(update, bot_token="MANAGER_TOKEN")
+
+        handler.assert_called_once_with({"message": update["message"]})
+
+    def test_offset_path_is_per_managed_bot(self) -> None:
+        manager_path = managed_gateway.offset_path_for("manager")
+        child_path = managed_gateway.offset_path_for("managed-codex-token")
+
+        self.assertEqual(manager_path, managed_gateway.OFFSET_PATH)
+        self.assertNotEqual(child_path, managed_gateway.OFFSET_PATH)
+        self.assertTrue(str(child_path).endswith("gateway_offset.managed-codex-token"))
+
+    def test_poll_timeout_plan_keeps_manager_poll_fast_with_child_bots(self) -> None:
+        child_bots = [
+            ("managed-codex-token", "CODEX_TOKEN"),
+            ("managed-kimi-token", "KIMI_TOKEN"),
+        ]
+
+        plan = managed_gateway.poll_timeout_plan(child_bots)
+
+        self.assertEqual(plan[0], ("manager", managed_gateway.TOKEN, 1))
+        self.assertEqual(
+            plan[1:],
+            [
+                ("managed-codex-token", "CODEX_TOKEN", 0),
+                ("managed-kimi-token", "KIMI_TOKEN", 0),
+            ],
+        )
+
+    def test_handle_message_dispatches_targeted_shared_topic_mention_without_child_token(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {
+                "chat_id": "-1001",
+                "general_thread_id": "1",
+                "owner_user_ids": ["42"],
+                "managed_bots": {
+                    "claude": {"username": "herdr_claude_bot", "enabled": True}
+                },
+            },
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": ["pane-1", "pane-2"],
+                }
+            },
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "last_known_status": "working",
+                    "agent": "codex",
+                },
+                "pane-2": {
+                    "pane_key": "pane-2",
+                    "pane_id": "pane-2",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "last_known_status": "working",
+                    "agent": "claude",
+                },
+            },
+        }
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        api = Mock()
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", api):
+            managed_gateway.handle_message(
+                {
+                    "message_id": 4000,
+                    "message_thread_id": 77,
+                    "chat": {"id": -1001, "is_forum": True},
+                    "from": {"id": 42, "is_bot": False},
+                    "text": "@herdr_claude_bot run tests",
+                },
+                bot_token="MANAGER_TOKEN",
+            )
+
+        api.assert_not_called()
+        run_script.assert_called_once()
+        payload = run_script.call_args.args[0]
+        self.assertEqual(payload["target_bot_kind"], "claude")
+        self.assertEqual(payload["text"], "@herdr_claude_bot run tests")
+
+    def test_manager_defers_reply_to_configured_child_bot(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {
+                "chat_id": "-1001",
+                "general_thread_id": "1",
+                "owner_user_ids": ["42"],
+                "managed_bots": {
+                    "codex": {"username": "herdr_codex_bot", "token": "CODEX_TOKEN", "enabled": True}
+                },
+            },
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": ["pane-1"],
+                }
+            },
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "last_known_status": "idle",
+                    "agent": "codex",
+                },
+            },
+        }
+        run_script = Mock(return_value={"handled": True, "reply": "Send failed"})
+        api = Mock()
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", api):
+            managed_gateway.handle_message(
+                {
+                    "message_id": 4000,
+                    "message_thread_id": 77,
+                    "chat": {"id": -1001, "is_forum": True},
+                    "from": {"id": 42, "is_bot": False},
+                    "reply_to_message": {
+                        "message_id": 3999,
+                        "from": {"id": 8873456652, "is_bot": True, "username": "herdr_codex_bot"},
+                    },
+                    "text": "okay create PoCs",
+                },
+                bot_token="MANAGER_TOKEN",
+                bot_key="manager",
+            )
+
+        run_script.assert_not_called()
+        api.assert_not_called()
+
+    def test_child_bot_update_sets_target_bot_kind(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": ["pane-1"],
+                }
+            },
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "last_known_status": "working",
+                    "agent": "claude",
+                }
+            },
+        }
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ):
+            managed_gateway.handle_update(
+                {
+                    "update_id": 7,
+                    "message": {
+                        "message_id": 4000,
+                        "message_thread_id": 77,
+                        "chat": {"id": -1001, "is_forum": True},
+                        "from": {"id": 42, "is_bot": False},
+                        "text": "run tests",
+                    },
+                },
+                bot_token="CLAUDE_TOKEN",
+                bot_key="managed-claude-deadbeef",
+            )
+
+        run_script.assert_called_once()
+        payload = run_script.call_args.args[0]
+        self.assertEqual(payload["target_bot_kind"], "claude")
 
 
 if __name__ == "__main__":
