@@ -3340,6 +3340,123 @@ Verification
         edit_message_text.assert_called_once_with("-1001", "501", "Codex 🟢")
         self.assertEqual(state["spaces"]["workspace:workspace-1"]["pinned_status_text"], "Codex 🟢")
 
+    def test_sync_updates_space_status_before_slow_pane_turn_sync(self) -> None:
+        codex = {
+            "pane_id": "pane-codex",
+            "terminal_id": "term-codex",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        codex_key = herdres.pane_key(codex)
+        claude_key = "pane-claude:old"
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": [codex_key, claude_key],
+                    "pinned_status_message_id": "501",
+                    "pinned_status_text": "Codex 🟢 | Claude 🟢",
+                    "pinned_status_hash": "old",
+                    "pinned_status_pinned_at": herdres.utc_now(),
+                }
+            },
+            "panes": {
+                codex_key: {"pane_key": codex_key, "pane_id": "pane-codex", "space_key": "workspace:workspace-1", "topic_id": "77"},
+                claude_key: {
+                    "pane_key": claude_key,
+                    "pane_id": "pane-claude",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "agent": "claude",
+                    "last_known_status": "idle",
+                },
+            },
+        }
+        calls = []
+
+        def edit_message_text(chat_id, message_id, text):
+            calls.append(("pinned_status", text))
+            return {"ok": True, "message_id": message_id}
+
+        def sync_pane_once(*_args, **_kwargs):
+            calls.append(("pane_sync", ""))
+            return False
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[codex]),
+            preflight_is_fresh=Mock(return_value=True),
+            sync_pane_once=Mock(side_effect=sync_pane_once),
+            ensure_managed_bot_setup_message=Mock(return_value=False),
+            ensure_managed_bot_group_access_message=Mock(return_value=False),
+            send_notice=Mock(return_value={"ok": True, "message_id": "900"}),
+            edit_message_text=Mock(side_effect=edit_message_text),
+            PINNED_STATUS_ENABLED=True,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["pinned_status_updated"], 1)
+        self.assertEqual(calls[0], ("pinned_status", "Codex 🟢"))
+        self.assertEqual(calls[1], ("pane_sync", ""))
+
+    def test_sync_edits_existing_space_status_to_no_active_panes_when_last_pane_deleted(self) -> None:
+        claude_key = "pane-claude:old"
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": [claude_key],
+                    "pinned_status_message_id": "501",
+                    "pinned_status_text": "Claude 🟢",
+                    "pinned_status_hash": "old",
+                    "pinned_status_pinned_at": herdres.utc_now(),
+                }
+            },
+            "panes": {
+                claude_key: {
+                    "pane_key": claude_key,
+                    "pane_id": "pane-claude",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "agent": "claude",
+                    "last_known_status": "idle",
+                },
+            },
+        }
+        edit_message_text = Mock(return_value={"ok": True, "message_id": "501"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[]),
+            send_notice=Mock(return_value={"ok": True, "message_id": "900"}),
+            edit_message_text=edit_message_text,
+            PINNED_STATUS_ENABLED=True,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["pinned_status_updated"], 1)
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["pane_keys"], [])
+        edit_message_text.assert_called_once_with("-1001", "501", "No active panes.")
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["pinned_status_text"], "No active panes.")
+
     def test_sync_sends_one_compact_closed_notice_for_duplicate_closed_entries(self) -> None:
         state = {
             "version": 1,
@@ -8039,6 +8156,61 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertFalse(result["changed"])
         self.assertEqual(result["pane_id"], "pane-missing")
         preflight_for_event.assert_not_called()
+        sync_pane_once.assert_not_called()
+
+    def test_event_for_deleted_pane_refreshes_space_status_without_full_turn_sync(self) -> None:
+        claude_key = "pane-claude:old"
+        state = {
+            "version": 1,
+            "enabled": True,
+            "plugin_event_enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": [claude_key],
+                    "pinned_status_message_id": "501",
+                    "pinned_status_text": "Claude 🟢",
+                    "pinned_status_hash": "old",
+                    "pinned_status_pinned_at": herdres.utc_now(),
+                }
+            },
+            "panes": {
+                claude_key: {
+                    "pane_key": claude_key,
+                    "pane_id": "pane-claude",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "agent": "claude",
+                    "last_known_status": "idle",
+                },
+            },
+        }
+        event_json = herdres.json.dumps({"pane_id": "pane-claude"})
+        edit_message_text = Mock(return_value={"ok": True, "message_id": "501"})
+        sync_pane_once = Mock(side_effect=AssertionError("deleted-pane event should not run full pane sync"))
+
+        with patch.dict(herdres.os.environ, {"HERDR_PLUGIN_EVENT_JSON": event_json}, clear=False), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=None),
+            pane_list=Mock(return_value=[]),
+            preflight_for_event=Mock(return_value=(True, "")),
+            send_notice=Mock(return_value={"ok": True, "message_id": "900"}),
+            edit_message_text=edit_message_text,
+            sync_pane_once=sync_pane_once,
+            PINNED_STATUS_ENABLED=True,
+        ):
+            result = herdres.event_once()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["pinned_status_updated"], 1)
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["pane_keys"], [])
+        edit_message_text.assert_called_once_with("-1001", "501", "No active panes.")
         sync_pane_once.assert_not_called()
 
     def test_event_pane_id_does_not_use_generic_resource_id(self) -> None:

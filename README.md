@@ -122,7 +122,9 @@ callbacks. Set `HERDRES_GATEWAY_BOT_TOKEN` in `~/.config/herdres/herdres.env`
 for a gateway-owned bot, or let it fall back to `TELEGRAM_BOT_TOKEN` during a
 single-token migration. For any one bot token, run either Hermes polling or
 `herdres-gateway.service`, never both, because Telegram permits only one active
-`getUpdates` consumer per bot token.
+`getUpdates` consumer per bot token. The gateway embeds the Herdres command
+runner by default so inbound messages avoid a Python cold start; set
+`HERDRES_GATEWAY_RUNNER=subprocess` to force the older subprocess path.
 
 ## Herdr Plugin Event Trigger
 
@@ -422,6 +424,7 @@ HERDRES_GATEWAY_LONG_POLL_SECONDS=50
 HERDRES_GATEWAY_NETWORK_ERROR_BACKOFF=0.5
 HERDRES_GATEWAY_DISPATCH_WORKERS=8
 HERDRES_GATEWAY_DISPATCH_QUEUE_LIMIT=128
+HERDRES_GATEWAY_RUNNER=embedded
 ```
 
 Optional profile images must be JPG files:
@@ -620,7 +623,9 @@ Notes:
   Tune `HERDRES_GATEWAY_LONG_POLL_SECONDS` if you need a different long-poll
   timeout. Handler work is dispatched through a small worker pool so slow Herdr
   command processing does not stop the bot token from polling for the next
-  update.
+  update. Inbound commands run through an embedded Herdres module by default;
+  set `HERDRES_GATEWAY_RUNNER=subprocess` only when you need to debug the older
+  cold-process path.
 - The gateway drains any backlog on first start so it never replays historical
   messages as live pane commands.
 - Top-level inbound plain-text -> pane is still gated by

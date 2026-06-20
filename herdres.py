@@ -583,6 +583,8 @@ def space_pinned_status_text(panes: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for pane in sorted(open_panes, key=pane_pinned_status_sort_key):
         parts.append(f"{pane_agent_status_label(pane)} {pane_pinned_status_emoji(pane)}")
+    if not parts:
+        return "No active panes."
     return sanitize_text(" | ".join(parts), MAX_REPLY_CHARS)
 
 
@@ -7719,9 +7721,11 @@ def sync_space_pinned_statuses(
     grouped = open_panes_by_space(panes)
     changed = False
     updated = 0
-    for space_key_value, space_panes in grouped.items():
-        space_entry = spaces.get(space_key_value) if isinstance(spaces, dict) else None
+    for space_key_value, space_entry in spaces.items():
         if not isinstance(space_entry, dict):
+            continue
+        space_panes = grouped.get(str(space_key_value), [])
+        if not space_panes and not space_entry.get("pinned_status_message_id"):
             continue
         result = ensure_space_pinned_status(chat_id, space_entry, space_panes, counters, max_sends)
         if result.get("topic_missing"):
@@ -7733,6 +7737,185 @@ def sync_space_pinned_statuses(
         if result.get("updated"):
             updated += 1
     return {"changed": changed, "updated": updated}
+
+
+def observed_agent_panes() -> list[dict[str, Any]]:
+    all_panes = pane_list()
+    include_shells = parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "")
+    return [pane for pane in all_panes if include_shells or pane.get("agent")]
+
+
+def state_has_pane_id(state: dict[str, Any], pane_id: str) -> bool:
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    for key, entry in panes.items():
+        if str(key) == pane_id:
+            return True
+        if isinstance(entry, dict) and str(entry.get("pane_id") or "") == pane_id:
+            return True
+    return False
+
+
+def sync_closed_pane_records(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    panes: list[dict[str, Any]],
+    *,
+    sends: int,
+    max_sends: int,
+) -> dict[str, Any]:
+    live_keys = {pane_key(pane) for pane in panes}
+    state_panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    changed = False
+    sent = sends
+    for key, entry in list(state_panes.items()):
+        if key in live_keys or not isinstance(entry, dict):
+            continue
+        if remove_pane_from_space_memberships(state, str(key)):
+            changed = True
+        newly_closed = entry.get("last_known_status") != "closed"
+        if newly_closed:
+            entry["last_known_status"] = "closed"
+            entry["closed_at"] = utc_now()
+            changed = True
+        topic_id = entry.get("topic_id")
+        if topic_id and entry_uses_space_topic(state, entry) and not entry.get("closed_topic_finalized"):
+            entry["closed_topic_finalized"] = True
+            entry["closed_space_topic_preserved_at"] = utc_now()
+            changed = True
+        elif topic_id and not entry.get("closed_topic_finalized"):
+            entry["closed_topic_finalized"] = True
+            entry["closed_topic_preserved_at"] = utc_now()
+            changed = True
+        if newly_closed and topic_id and sent < max_sends and not closed_notice_already_sent(state, str(key), entry):
+            closed_notice = send_notice(
+                chat_id,
+                "Closed by User",
+                "",
+                telegram=telegram,
+                thread_id=topic_id,
+                notify=True,
+                reply_to_message_id=pane_root_reply_target(entry),
+                api_token=managed_bot_token_for_entry(telegram, entry),
+            )
+            if closed_notice.get("ok") and closed_notice.get("message_id"):
+                entry["closed_notice_message_id"] = str(closed_notice["message_id"])
+                entry["closed_notice_sent_at"] = utc_now()
+                record_pane_message_route(
+                    state,
+                    str(entry.get("space_key") or ""),
+                    str(entry.get("pane_key") or key),
+                    str(closed_notice["message_id"]),
+                )
+            sent += 1
+    return {"changed": changed, "sent": sent}
+
+
+def make_sync_counters(*, sends: int = 0) -> dict[str, int]:
+    return {
+        "sends": sends,
+        "creates": 0,
+        "verifies": 0,
+        "renames": 0,
+        "feed_sends": 0,
+        "marker_sends": 0,
+        "icon_updates": 0,
+    }
+
+
+def make_sync_caps(*, event: bool = False) -> dict[str, int]:
+    if event:
+        return {
+            "max_sends": min(MAX_SENDS_PER_RUN, 2),
+            "max_feed_sends": min(MAX_SENDS_PER_RUN, 2),
+            "max_marker_sends": 1,
+            "max_creates": min(MAX_CREATES_PER_RUN, 1),
+            "max_verifies": min(MAX_TOPIC_VERIFIES_PER_RUN, 1),
+        }
+    return {
+        "max_sends": MAX_SENDS_PER_RUN,
+        "max_feed_sends": MAX_SENDS_PER_RUN,
+        "max_marker_sends": MAX_STATUS_MARKERS_PER_RUN,
+        "max_creates": MAX_CREATES_PER_RUN,
+        "max_verifies": MAX_TOPIC_VERIFIES_PER_RUN,
+    }
+
+
+def reconcile_pinned_status_views(
+    state: dict[str, Any],
+    chat_id: str,
+    panes: list[dict[str, Any]],
+    counters: dict[str, int],
+    max_sends: int,
+) -> dict[str, bool | int]:
+    result = sync_space_pinned_statuses(state, chat_id, panes, counters, max_sends)
+    changed = bool(result.get("changed"))
+    updated = int(result.get("updated") or 0)
+    if pinned_status_enabled():
+        overview = sync_pinned_status_overview(state, "", chat_id, panes)
+        changed = changed or bool(overview.get("changed"))
+    return {"changed": changed, "updated": updated}
+
+
+def add_pinned_reconcile_result(
+    changed: bool,
+    updated: int,
+    result: dict[str, bool | int],
+) -> tuple[bool, int]:
+    return changed or bool(result.get("changed")), updated + int(result.get("updated") or 0)
+
+
+def record_plugin_event_seen(state: dict[str, Any], pane_id: str) -> None:
+    state["last_plugin_event_at"] = utc_now()
+    state["last_plugin_event_pane_id"] = pane_id
+
+
+def reconcile_missing_event_pane(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    pane_id: str,
+) -> dict[str, Any]:
+    state["last_plugin_event_unknown_pane_at"] = utc_now()
+    state["last_plugin_event_unknown_pane_id"] = sanitize_text(pane_id, 120)
+    if not state_has_pane_id(state, pane_id):
+        save_state(state)
+        return {"ok": True, "changed": False, "pane_id": pane_id, "message": "pane not found or not an agent"}
+
+    preflight_ok, preflight_error = preflight_for_event(state, chat_id, telegram)
+    if not preflight_ok:
+        save_state(state)
+        return {
+            "ok": True,
+            "changed": False,
+            "pane_id": pane_id,
+            "message": "telegram preflight failed",
+            "error": preflight_error,
+        }
+
+    panes = observed_agent_panes()
+    caps = make_sync_caps(event=True)
+    closed_result = sync_closed_pane_records(
+        state,
+        chat_id,
+        telegram,
+        panes,
+        sends=0,
+        max_sends=caps["max_sends"],
+    )
+    counters = make_sync_counters(sends=int(closed_result.get("sent") or 0))
+    pinned_result = reconcile_pinned_status_views(state, chat_id, panes, counters, caps["max_sends"])
+    changed = bool(closed_result.get("changed") or pinned_result.get("changed"))
+    record_plugin_event_seen(state, pane_id)
+    save_state(state)
+    return {
+        "ok": True,
+        "changed": changed,
+        "pane_id": pane_id,
+        "sent": counters["sends"],
+        "pinned_status_updated": int(pinned_result.get("updated") or 0),
+        "message": "pane not found; reconciled stored pane state",
+    }
 
 
 def preflight(chat_id: str, telegram: dict[str, Any] | None = None) -> None:
@@ -8928,61 +9111,35 @@ def sync_once() -> dict[str, Any]:
         return {"ok": True, "changed": changed, "message": "disabled"}
     telegram, chat_id = configure_telegram_state(state)
 
-    all_panes = pane_list()
-    include_shells = parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "")
-    panes = [pane for pane in all_panes if include_shells or pane.get("agent")]
-    live_keys = {pane_key(pane) for pane in panes}
-    sends = 0
-
-    for key, entry in list(state.get("panes", {}).items()):
-        if key in live_keys:
-            continue
-        if remove_pane_from_space_memberships(state, str(key)):
-            changed = True
-        newly_closed = entry.get("last_known_status") != "closed"
-        if newly_closed:
-            entry["last_known_status"] = "closed"
-            entry["closed_at"] = utc_now()
-            changed = True
-        topic_id = entry.get("topic_id")
-        if topic_id and entry_uses_space_topic(state, entry) and not entry.get("closed_topic_finalized"):
-            entry["closed_topic_finalized"] = True
-            entry["closed_space_topic_preserved_at"] = utc_now()
-            changed = True
-        elif topic_id and not entry.get("closed_topic_finalized"):
-            entry["closed_topic_finalized"] = True
-            entry["closed_topic_preserved_at"] = utc_now()
-            changed = True
-        if newly_closed and topic_id and sends < MAX_SENDS_PER_RUN and not closed_notice_already_sent(state, str(key), entry):
-            closed_notice = send_notice(
-                chat_id,
-                "Closed by User",
-                "",
-                telegram=telegram,
-                thread_id=topic_id,
-                notify=True,
-                reply_to_message_id=pane_root_reply_target(entry),
-                api_token=managed_bot_token_for_entry(telegram, entry),
-            )
-            if closed_notice.get("ok") and closed_notice.get("message_id"):
-                entry["closed_notice_message_id"] = str(closed_notice["message_id"])
-                entry["closed_notice_sent_at"] = utc_now()
-                record_pane_message_route(
-                    state,
-                    str(entry.get("space_key") or ""),
-                    str(entry.get("pane_key") or key),
-                    str(closed_notice["message_id"]),
-                )
-            sends += 1
+    panes = observed_agent_panes()
+    closed_result = sync_closed_pane_records(
+        state,
+        chat_id,
+        telegram,
+        panes,
+        sends=0,
+        max_sends=MAX_SENDS_PER_RUN,
+    )
+    if closed_result.get("changed"):
+        changed = True
+    sends = int(closed_result.get("sent") or 0)
+    counters = make_sync_counters(sends=sends)
+    caps = make_sync_caps()
+    pinned_status_updated = 0
 
     if not panes:
-        if pinned_status_enabled():
-            overview = sync_pinned_status_overview(state, "", chat_id, panes)
-            if overview.get("changed"):
-                changed = True
+        pinned_result = reconcile_pinned_status_views(state, chat_id, panes, counters, caps["max_sends"])
+        changed, pinned_status_updated = add_pinned_reconcile_result(changed, pinned_status_updated, pinned_result)
         state["last_sync_empty_at"] = utc_now()
         save_state(state)
-        return {"ok": True, "changed": changed, "panes": 0, "sent": sends, "message": "no agent panes"}
+        return {
+            "ok": True,
+            "changed": changed,
+            "panes": 0,
+            "sent": counters["sends"],
+            "pinned_status_updated": pinned_status_updated,
+            "message": "no agent panes",
+        }
 
     try:
         if not preflight_is_fresh(telegram):
@@ -9019,22 +9176,8 @@ def sync_once() -> dict[str, Any]:
             telegram["last_preflight_error"] = error_text
             save_state(state)
             raise
-    counters = {
-        "sends": sends,
-        "creates": 0,
-        "verifies": 0,
-        "renames": 0,
-        "feed_sends": 0,
-        "marker_sends": 0,
-        "icon_updates": 0,
-    }
-    caps = {
-        "max_sends": MAX_SENDS_PER_RUN,
-        "max_feed_sends": MAX_SENDS_PER_RUN,
-        "max_marker_sends": MAX_STATUS_MARKERS_PER_RUN,
-        "max_creates": MAX_CREATES_PER_RUN,
-        "max_verifies": MAX_TOPIC_VERIFIES_PER_RUN,
-    }
+    pinned_result = reconcile_pinned_status_views(state, chat_id, panes, counters, caps["max_sends"])
+    changed, pinned_status_updated = add_pinned_reconcile_result(changed, pinned_status_updated, pinned_result)
     if ensure_managed_bot_setup_message(state, chat_id, telegram, counters, caps["max_sends"], panes):
         changed = True
     if ensure_managed_bot_group_access_message(state, chat_id, telegram, counters, caps["max_sends"], panes):
@@ -9042,13 +9185,8 @@ def sync_once() -> dict[str, Any]:
     for pane in panes:
         if sync_pane_once(state, chat_id, telegram, pane, counters, caps):
             changed = True
-    if pinned_status_enabled():
-        overview = sync_pinned_status_overview(state, "", chat_id, panes)
-        if overview.get("changed"):
-            changed = True
-    pinned_status_result = sync_space_pinned_statuses(state, chat_id, panes, counters, caps["max_sends"])
-    if pinned_status_result.get("changed"):
-        changed = True
+    pinned_result = reconcile_pinned_status_views(state, chat_id, panes, counters, caps["max_sends"])
+    changed, pinned_status_updated = add_pinned_reconcile_result(changed, pinned_status_updated, pinned_result)
     sends = counters["sends"]
     creates = counters["creates"]
     verifies = counters["verifies"]
@@ -9066,7 +9204,7 @@ def sync_once() -> dict[str, Any]:
         "feed_sent": counters["feed_sends"],
         "marker_sent": counters["marker_sends"],
         "icon_updated": counters["icon_updates"],
-        "pinned_status_updated": pinned_status_result.get("updated", 0),
+        "pinned_status_updated": pinned_status_updated,
     }
 
 
@@ -9251,10 +9389,7 @@ def event_once() -> dict[str, Any]:
 
     pane = pane_by_id(pane_id)
     if not pane or not pane.get("agent"):
-        state["last_plugin_event_unknown_pane_at"] = utc_now()
-        state["last_plugin_event_unknown_pane_id"] = sanitize_text(pane_id, 120)
-        save_state(state)
-        return {"ok": True, "changed": False, "pane_id": pane_id, "message": "pane not found or not an agent"}
+        return reconcile_missing_event_pane(state, chat_id, telegram, pane_id)
 
     preflight_ok, preflight_error = preflight_for_event(state, chat_id, telegram)
     if not preflight_ok:
@@ -9267,22 +9402,8 @@ def event_once() -> dict[str, Any]:
             "error": preflight_error,
         }
 
-    counters = {
-        "sends": 0,
-        "creates": 0,
-        "verifies": 0,
-        "renames": 0,
-        "feed_sends": 0,
-        "marker_sends": 0,
-        "icon_updates": 0,
-    }
-    caps = {
-        "max_sends": min(MAX_SENDS_PER_RUN, 2),
-        "max_feed_sends": min(MAX_SENDS_PER_RUN, 2),
-        "max_marker_sends": 1,
-        "max_creates": min(MAX_CREATES_PER_RUN, 1),
-        "max_verifies": min(MAX_TOPIC_VERIFIES_PER_RUN, 1),
-    }
+    counters = make_sync_counters()
+    caps = make_sync_caps(event=True)
     attempts = 0
     changed = False
     settle = should_settle_event(pane, context, event)
@@ -9312,8 +9433,7 @@ def event_once() -> dict[str, Any]:
         save_state(state)
         return {"ok": True, "changed": False, "pane_id": pane_id, "message": "event sync failed"}
 
-    state["last_plugin_event_at"] = utc_now()
-    state["last_plugin_event_pane_id"] = pane_id
+    record_plugin_event_seen(state, pane_id)
     save_state(state)
     return {
         "ok": True,

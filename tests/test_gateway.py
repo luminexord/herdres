@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import conftest  # noqa: F401
 import herdres_routing
 import herdres_gateway_upstream as gateway
 import herdres_gateway_managed as managed_gateway
@@ -570,7 +571,7 @@ class GatewayManagedBotTests(unittest.TestCase):
         run_script.assert_not_called()
         api.assert_not_called()
 
-    def test_single_pane_plain_message_is_owned_by_child_bot_once(self) -> None:
+    def test_single_pane_plain_message_is_owned_by_manager_once(self) -> None:
         state = {
             "version": 1,
             "enabled": True,
@@ -632,10 +633,10 @@ class GatewayManagedBotTests(unittest.TestCase):
                 bot_key="managed-claude-deadbeef",
             )
 
-        manager_run_script.assert_not_called()
-        child_run_script.assert_called_once()
-        payload = child_run_script.call_args.args[0]
-        self.assertEqual(payload["target_bot_kind"], "claude")
+        manager_run_script.assert_called_once()
+        child_run_script.assert_not_called()
+        payload = manager_run_script.call_args.args[0]
+        self.assertNotIn("target_bot_kind", payload)
         self.assertEqual(payload["pane_key"], "pane-1")
 
     def test_devin_mention_sets_target_bot_kind(self) -> None:
@@ -794,6 +795,72 @@ class GatewayManagedBotTests(unittest.TestCase):
         run_script.assert_called_once()
         payload = run_script.call_args.args[0]
         self.assertEqual(payload["target_bot_kind"], "claude")
+
+    def test_run_script_uses_embedded_herdres_without_subprocess(self) -> None:
+        calls = []
+
+        class FakeHerdres:
+            @staticmethod
+            def with_lock(fn, *, blocking=False):
+                calls.append(("lock", blocking))
+                return fn()
+
+            @staticmethod
+            def command_reply(payload):
+                calls.append(("command", payload))
+                return {"handled": True, "reply": "ok"}
+
+        payload = {"topic_id": "77", "text": "hi"}
+
+        with patch.object(managed_gateway, "load_herdres_module", Mock(return_value=FakeHerdres)), patch.object(
+            managed_gateway.subprocess,
+            "run",
+            Mock(side_effect=AssertionError("subprocess should not be used")),
+        ), patch.dict(os.environ, {"HERDRES_GATEWAY_RUNNER": "embedded"}, clear=False):
+            result = managed_gateway.run_script(payload, "command")
+
+        self.assertEqual(result, {"handled": True, "reply": "ok"})
+        self.assertEqual(calls, [("lock", True), ("command", payload)])
+
+    def test_embedded_runner_loads_extensionless_installed_script(self) -> None:
+        script_path = Path(self.tmp.name) / "herdres"
+        script_path.write_text(
+            "def with_lock(fn, *, blocking=False):\n"
+            "    return fn()\n"
+            "def command_reply(payload):\n"
+            "    return {'handled': True, 'reply': payload['text']}\n",
+            encoding="utf-8",
+        )
+        old_module = managed_gateway.HERDRES_MODULE
+        old_key = managed_gateway.HERDRES_MODULE_KEY
+        self.addCleanup(setattr, managed_gateway, "HERDRES_MODULE", old_module)
+        self.addCleanup(setattr, managed_gateway, "HERDRES_MODULE_KEY", old_key)
+
+        with patch.object(managed_gateway, "SCRIPT_PATH", script_path):
+            managed_gateway.HERDRES_MODULE = None
+            managed_gateway.HERDRES_MODULE_KEY = None
+            module = managed_gateway.load_herdres_module()
+
+        self.assertEqual(module.command_reply({"text": "ok"}), {"handled": True, "reply": "ok"})
+
+    def test_run_script_can_use_subprocess_runner_when_configured(self) -> None:
+        proc = subprocess.CompletedProcess(
+            ["herdres", "command"],
+            0,
+            stdout=json.dumps({"handled": True, "reply": "ok"}).encode("utf-8"),
+            stderr=b"",
+        )
+        runner = Mock(return_value=proc)
+
+        with patch.object(managed_gateway.subprocess, "run", runner), patch.dict(
+            os.environ,
+            {"HERDRES_GATEWAY_RUNNER": "subprocess"},
+            clear=False,
+        ):
+            result = managed_gateway.run_script({"topic_id": "77"}, "command")
+
+        self.assertEqual(result, {"handled": True, "reply": "ok"})
+        runner.assert_called_once()
 
     def test_same_message_id_dispatches_to_command_once(self) -> None:
         state = {

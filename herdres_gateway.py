@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -98,6 +100,9 @@ DISPATCH_EXECUTOR_LOCK = threading.Lock()
 DISPATCH_QUEUE_SEMAPHORE = threading.BoundedSemaphore(DISPATCH_QUEUE_LIMIT)
 ROUTE_LOCKS: dict[str, threading.Lock] = {}
 ROUTE_LOCKS_LOCK = threading.Lock()
+HERDRES_MODULE = None
+HERDRES_MODULE_KEY: tuple[str, int, int] | None = None
+HERDRES_MODULE_LOCK = threading.Lock()
 TRACE_PATH = Path(
     os.getenv("HERDRES_GATEWAY_TRACE", str(HOME / ".local/share/herdres/gateway.trace.log"))
 ).expanduser()
@@ -420,6 +425,27 @@ def message_owner_kind(
     return MANAGER_BOT_KIND
 
 
+def manager_can_share_implicit_space_message(
+    state: dict,
+    text: str,
+    message: dict,
+    chat_id: str,
+    thread_id: str | None,
+) -> bool:
+    if str(text or "").strip().startswith("/"):
+        return False
+    if targeted_managed_bot_kind(state, text, message):
+        return False
+    reply_to = message.get("reply_to_message") or {}
+    if str(reply_to.get("message_id") or "").strip():
+        return False
+    mapped_space = topic_space_entry(state, chat_id, thread_id)
+    if not mapped_space:
+        return False
+    _space_key, space = mapped_space
+    return len(live_entries_for_space(state, space)) == 1
+
+
 def target_bot_kind_for_message(state: dict, text: str, bot_key: str | None, message: dict | None = None) -> str:
     key_kind = managed_bot_kind_for_key(bot_key)
     if key_kind:
@@ -567,9 +593,58 @@ def answer_callback_query(bot_token: str | None, callback_query_id: str, result:
         log(f"answerCallbackQuery failed: {exc}")
 
 
-def run_script(payload: dict, mode: str) -> dict:
-    env = os.environ.copy()
-    env["HERDR_TELEGRAM_TOPICS_STATE"] = str(STATE_PATH)
+def gateway_runner_mode() -> str:
+    return os.getenv("HERDRES_GATEWAY_RUNNER", "embedded").strip().lower()
+
+
+def load_herdres_module():
+    global HERDRES_MODULE, HERDRES_MODULE_KEY
+    stat = SCRIPT_PATH.stat()
+    module_key = (str(SCRIPT_PATH), int(stat.st_mtime_ns), int(stat.st_size))
+    with HERDRES_MODULE_LOCK:
+        if HERDRES_MODULE is not None and HERDRES_MODULE_KEY == module_key:
+            return HERDRES_MODULE
+        loader = importlib.machinery.SourceFileLoader("_herdres_gateway_embedded", str(SCRIPT_PATH))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            raise RuntimeError(f"could not create import spec for {SCRIPT_PATH}")
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        HERDRES_MODULE = module
+        HERDRES_MODULE_KEY = module_key
+        return module
+
+
+def embedded_handler_name(mode: str) -> str:
+    return {
+        "command": "command_reply",
+        "callback": "callback_reply",
+        "managed-bot": "managed_bot_update",
+    }.get(mode, "")
+
+
+def run_embedded_herdres(payload: dict, mode: str) -> dict:
+    module = load_herdres_module()
+    handler_name = embedded_handler_name(mode)
+    if not handler_name:
+        return {"handled": True}
+    handler = getattr(module, handler_name)
+    try:
+        return module.with_lock(lambda: handler(payload), blocking=True)
+    except Exception as exc:
+        rate_limited = getattr(module, "RateLimited", None)
+        if rate_limited is not None and isinstance(exc, rate_limited):
+            return {
+                "ok": False,
+                "rate_limited": True,
+                "retry_after": getattr(exc, "retry_after", 1),
+                "error": str(exc),
+            }
+        log(f"{mode} embedded runner failed: {exc}")
+        return {"handled": True}
+
+
+def run_subprocess_herdres(payload: dict, mode: str, env: dict[str, str]) -> dict:
     try:
         proc = subprocess.run(
             [str(SCRIPT_PATH), mode],
@@ -592,6 +667,18 @@ def run_script(payload: dict, mode: str) -> dict:
         return json.loads(proc.stdout.decode("utf-8"))
     except Exception:
         return {"handled": True}
+
+
+def run_script(payload: dict, mode: str) -> dict:
+    env = os.environ.copy()
+    env["HERDR_TELEGRAM_TOPICS_STATE"] = str(STATE_PATH)
+    os.environ["HERDR_TELEGRAM_TOPICS_STATE"] = str(STATE_PATH)
+    if gateway_runner_mode() != "subprocess":
+        try:
+            return run_embedded_herdres(payload, mode)
+        except Exception as exc:
+            log(f"{mode} embedded runner unavailable: {exc}; using subprocess")
+    return run_subprocess_herdres(payload, mode, env)
 
 
 # ---------------------------------------------------------------------------
@@ -626,8 +713,12 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
     owner_kind = message_owner_kind(state, str(text or ""), message, chat_id, thread_id)
     current_kind = current_bot_owner_kind(bot_key)
     if current_kind != owner_kind:
-        dlog(f"ignored message owned by {owner_kind} on {current_kind}")
-        return
+        if not (
+            current_kind == MANAGER_BOT_KIND
+            and manager_can_share_implicit_space_message(state, str(text or ""), message, chat_id, thread_id)
+        ):
+            dlog(f"ignored message owned by {owner_kind} on {current_kind}")
+            return
     target_bot_kind = target_bot_kind_for_message(state, str(text or ""), bot_key, message)
     reply_to = message.get("reply_to_message") or {}
     resolved = resolve_mapped_entry(
