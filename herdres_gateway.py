@@ -32,6 +32,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from herdres_routing import attachment_payload_dict, is_forwarded_dict, message_thread_id_dict
+
 HOME = Path.home()
 STATE_PATH = Path(
     os.getenv("HERDR_TELEGRAM_TOPICS_STATE", str(HOME / ".local/share/herdres/state.json"))
@@ -426,12 +428,9 @@ def target_bot_kind_for_message(state: dict, text: str, bot_key: str | None, mes
 
 
 def thread_id_of(message: dict) -> str | None:
-    tid = message.get("message_thread_id")
-    if tid is not None:
-        return str(tid)
-    if (message.get("chat") or {}).get("is_forum"):
-        return GENERAL_THREAD_ID
-    return None
+    # Thin wrapper over the shared routing helper so this gateway keeps its
+    # env-configured GENERAL_THREAD_ID while reusing the deduplicated logic.
+    return message_thread_id_dict(message, GENERAL_THREAD_ID)
 
 
 def topic_space_entry(state: dict, chat_id: str, thread_id: str | None) -> tuple[str, dict] | None:
@@ -515,34 +514,57 @@ def mapped_entry(state: dict, chat_id: str, thread_id: str | None) -> dict | Non
 
 
 def attachment_of(message: dict) -> dict | None:
-    doc = message.get("document")
-    if isinstance(doc, dict) and doc.get("file_id"):
-        return {
-            "kind": "document",
-            "file_id": str(doc.get("file_id")),
-            "file_name": str(doc.get("file_name") or ""),
-            "mime_type": str(doc.get("mime_type") or ""),
-            "file_size": int(doc.get("file_size") or 0),
-        }
-    photo = message.get("photo")
-    if isinstance(photo, list) and photo:
-        largest = photo[-1]
-        if isinstance(largest, dict) and largest.get("file_id"):
-            return {
-                "kind": "photo",
-                "file_id": str(largest.get("file_id")),
-                "file_name": "",
-                "mime_type": "image/jpeg",
-                "file_size": int(largest.get("file_size") or 0),
-            }
-    return None
+    return attachment_payload_dict(message)
 
 
 def is_forwarded(message: dict) -> bool:
-    return any(
-        message.get(attr) is not None
-        for attr in ("forward_origin", "forward_from", "forward_sender_name", "forward_date")
-    )
+    return is_forwarded_dict(message)
+
+
+def owner_allowed(state: dict, user_id: str, from_bot: bool) -> bool:
+    """True when the sender is an owner (and not a bot).
+
+    Centralizes the owner pre-filter applied before dispatching to herdres
+    command/callback. command_reply re-applies the authoritative gate.
+    """
+    if from_bot:
+        return False
+    owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
+    return not owners or user_id in owners
+
+
+def send_reply(
+    bot_token: str | None,
+    chat_id: str,
+    thread_id: str | None,
+    text: str,
+    *,
+    reply_to_message_id: str = "",
+) -> None:
+    """Send a plain sendMessage reply in a mapped topic, logging failures."""
+    params: dict = {"chat_id": chat_id, "text": text}
+    if reply_to_message_id:
+        params["reply_to_message_id"] = reply_to_message_id
+    if thread_id:
+        params["message_thread_id"] = thread_id
+    try:
+        api("sendMessage", params, token=bot_token)
+    except Exception as exc:
+        log(f"sendMessage reply failed: {exc}")
+
+
+def answer_callback_query(bot_token: str | None, callback_query_id: str, result: dict) -> None:
+    """Answer a callback query with optional text/alert from the herdres result."""
+    params: dict = {"callback_query_id": callback_query_id}
+    answer = str(result.get("answer") or "").strip()
+    if answer:
+        params["text"] = answer
+    if result.get("show_alert"):
+        params["show_alert"] = "true"
+    try:
+        api("answerCallbackQuery", params, token=bot_token)
+    except Exception as exc:
+        log(f"answerCallbackQuery failed: {exc}")
 
 
 def run_script(payload: dict, mode: str) -> dict:
@@ -617,8 +639,7 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
     )
     if not resolved:
         if topic_space_entry(state, chat_id, thread_id):
-            owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
-            if from_bot or (owners and user_id not in owners):
+            if not owner_allowed(state, user_id, from_bot):
                 return
             route_key = processed_message_key(chat_id, thread_id, message)
             if target_bot_kind or is_space_level_command(str(text or "")):
@@ -627,17 +648,13 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
                 if not reserve_message_processing(route_key):
                     dlog(f"ignored already processed message {route_key}")
                     return
-                params = {
-                    "chat_id": chat_id,
-                    "text": AMBIGUOUS_PANE_THREAD_REPLY,
-                    "reply_to_message_id": str(message.get("message_id") or ""),
-                }
-                if thread_id:
-                    params["message_thread_id"] = thread_id
-                try:
-                    api("sendMessage", params, token=bot_token)
-                except Exception as exc:
-                    log(f"ambiguous shared-topic reply failed: {exc}")
+                send_reply(
+                    bot_token,
+                    chat_id,
+                    thread_id,
+                    AMBIGUOUS_PANE_THREAD_REPLY,
+                    reply_to_message_id=str(message.get("message_id") or ""),
+                )
                 return
         else:
             tg = state.get("telegram") or {}
@@ -650,7 +667,7 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
         pane_key, _entry = resolved
 
     owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
-    if from_bot or (owners and user_id not in owners):
+    if not owner_allowed(state, user_id, from_bot):
         dlog(f"filtered: from_bot={from_bot} owners={owners} user={user_id}")
         return  # cheap pre-filter; command_reply re-applies the authoritative gate
     route_key = processed_message_key(chat_id, thread_id, message)
@@ -689,17 +706,7 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
     reply = str(result.get("reply") or "").strip()
     if not reply:
         return
-    params = {
-        "chat_id": chat_id,
-        "text": reply,
-        "reply_to_message_id": payload["message_id"],
-    }
-    if thread_id:
-        params["message_thread_id"] = thread_id
-    try:
-        api("sendMessage", params, token=bot_token)
-    except Exception as exc:
-        log(f"sendMessage reply failed: {exc}")
+    send_reply(bot_token, chat_id, thread_id, reply, reply_to_message_id=payload["message_id"])
 
 
 def handle_callback(query: dict, *, bot_token: str | None = None) -> None:
@@ -738,16 +745,7 @@ def handle_callback(query: dict, *, bot_token: str | None = None) -> None:
     lock_key = f"pane:{pane_key}" if pane_key else f"topic:{chat_id}:{thread_id or ''}"
     with route_lock_for(lock_key):
         result = run_script(payload, "callback")
-    answer_params = {"callback_query_id": str(query.get("id") or "")}
-    answer = str(result.get("answer") or "").strip()
-    if answer:
-        answer_params["text"] = answer
-    if result.get("show_alert"):
-        answer_params["show_alert"] = "true"
-    try:
-        api("answerCallbackQuery", answer_params, token=bot_token)
-    except Exception as exc:
-        log(f"answerCallbackQuery failed: {exc}")
+    answer_callback_query(bot_token, str(query.get("id") or ""), result)
 
 
 def handle_managed_bot_update(payload: dict) -> None:
