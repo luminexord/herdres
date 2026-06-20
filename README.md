@@ -8,6 +8,8 @@ Herdres is a small stdlib-only Python bridge that maps each Herdr space to a Tel
 
 It does not patch Hermes or Herdr core files and routine sync uses no LLM calls.
 
+**Operate it from an AI agent:** the [`skills/herdres/`](skills/herdres/SKILL.md) Agent Skill (agentskills.io `SKILL.md`) teaches a skills-compatible agent (Claude Code, Codex, …) to install, configure, and drive this bridge — a guided, self-verifying setup plus the full operator command surface. That skill is for *operating* herdres; [`AGENTS.md`](AGENTS.md) is for *contributing* to it.
+
 ## What It Does
 
 - Creates or maintains one Telegram forum topic per Herdr space.
@@ -603,7 +605,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gaijinjoe.herdres-ga
 
 This provides:
 
-- `com.gaijinjoe.herdres` — launchd agent running `herdres sync` every 60s, the
+- `com.gaijinjoe.herdres` — launchd agent running `herdres sync` every 5s, the
   equivalent of the systemd reconcile timer (closed-pane detection, stale-mapping
   repair, missed-event coverage).
 - `com.gaijinjoe.herdres-gateway` — launchd agent running `herdres_gateway.py`, a
