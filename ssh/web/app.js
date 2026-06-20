@@ -306,6 +306,13 @@ import { installScrollJoystick } from './scroll-joystick.js';
       ctrlArmed ? disarmCtrl() : armCtrl();
       return;
     }
+    if (btn.dataset.action === 'paste') {
+      navigator.clipboard.readText().then((text) => {
+        if (text) sendInput(text);
+      }).catch(() => {});
+      focusTerminalIfAppropriate();
+      return;
+    }
     let out = seqFor(btn);
     if (ctrlArmed && out.length === 1) {
       const code = out.toLowerCase().charCodeAt(0);
