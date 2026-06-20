@@ -293,6 +293,69 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
         self.assertIn("Queued", result["reply"])
         self.assertNotIn("Send failed", result["reply"])
 
+    def test_send_bang_interrupts_busy_agent_then_delivers(self) -> None:
+        # E2E: "/send!" to a busy pane must halt the current turn (send Esc) and
+        # then deliver immediately — not queue. Only the Herdr CLI is mocked.
+        state = {
+            "version": 1,
+            "telegram": {"chat_id": "-1001", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": ["pane-1"],
+                    "message_routes": {"1001": "pane-1"},
+                }
+            },
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_root_message_id": "1001",
+                    "last_known_status": "working",
+                }
+            },
+        }
+        # After Esc the agent stops; send_to_pane then sees an idle pane and an
+        # empty box, so the message submits cleanly.
+        idle_pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        calls = []
+
+        def run_cmd(args, **kwargs):
+            calls.append(args)
+            return Mock(returncode=0, stdout="", stderr="")
+
+        with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=idle_pane),
+            clear_staged_pane_input_if_needed=Mock(return_value=(True, "")),
+            run_cmd=run_cmd,
+            pane_input_looks_staged=Mock(return_value=False),  # box clears -> delivered
+        ):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "4000",
+                    "reply_to_message_id": "1001",
+                    "user_id": "42",
+                    "text": "/send! deploy now",
+                }
+            )
+
+        # Esc was issued (interrupt) and the message was actually run into the pane.
+        self.assertTrue(any("send-keys" in a and "escape" in a for a in calls), calls)
+        self.assertTrue(any("run" in a for a in calls), calls)
+        self.assertTrue(result["handled"])
+        self.assertIn("Interrupted", result["reply"])
+        self.assertNotIn("Send failed", result["reply"])
+        self.assertNotIn("Queued", result["reply"])
+
     def test_group_access_markup_uses_child_bot_startgroup_links(self) -> None:
         telegram = {
             "managed_bots": {

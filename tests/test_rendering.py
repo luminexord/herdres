@@ -4204,6 +4204,30 @@ Verification
         self.assertTrue(ok)
         self.assertIn("Queued", detail)
 
+    def test_interrupt_and_send_sends_escape_before_message(self) -> None:
+        # /send! must halt the turn (Esc) BEFORE delivering, so the message runs
+        # now instead of queueing behind the current turn.
+        calls = []
+
+        def run_cmd(args, **kwargs):
+            calls.append(args)
+            return Mock(returncode=0, stdout="", stderr="")
+
+        idle_pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
+            herdres,
+            run_cmd=run_cmd,
+            pane_by_id=Mock(return_value=idle_pane),
+            clear_staged_pane_input_if_needed=Mock(return_value=(True, "")),
+            pane_input_looks_staged=Mock(return_value=False),
+        ):
+            ok, detail = herdres.interrupt_and_send_to_pane("pane-1", "go now")
+
+        self.assertTrue(ok)
+        esc_idx = next(i for i, a in enumerate(calls) if "send-keys" in a and "escape" in a)
+        run_idx = next(i for i, a in enumerate(calls) if "run" in a)
+        self.assertLess(esc_idx, run_idx)  # Esc precedes the message
+
     def test_visible_choice_selection_uses_numbers_by_default(self) -> None:
         with patch.object(herdres, "VISIBLE_CHOICE_SELECT_MODE", "number"), patch.object(
             herdres,

@@ -5263,7 +5263,7 @@ def format_status(
             lines.append(tail)
     if include_commands:
         lines.append("")
-        lines.append("Commands: /status, /read [lines], /send <text>, /keys <keys>")
+        lines.append("Commands: /status, /read [lines], /send <text>, /send! <text>, /keys <keys>")
     return sanitize_text("\n".join(lines), max_chars=MAX_STATUS_CHARS)
 
 
@@ -5845,6 +5845,32 @@ def send_to_pane(
             return False, submit_detail
         return True, submit_detail
     return True, ""
+
+
+def interrupt_and_send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, str]:
+    # Halt the agent's current turn (Esc) so the message runs now instead of
+    # queueing behind it, then deliver via the normal send path. Esc on an idle
+    # pane is a harmless no-op, so this is safe regardless of the pane's state.
+    run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "escape"], timeout=timeout)
+    for delay in (0.3, 0.5, 0.7, 1.0):
+        time.sleep(delay)
+        pane = pane_by_id(pane_id)
+        if not pane or str(pane.get("agent_status") or "").strip().lower() != "working":
+            break
+    return send_to_pane(pane_id, text, timeout=timeout)
+
+
+def interrupt_and_send_response(pane_id: str, text: str) -> dict[str, Any]:
+    outbound = str(text or "").strip()
+    if not outbound:
+        return {"handled": True, "reply": "Usage: /send! <instruction> — interrupts the current turn and sends now"}
+    ok, detail = interrupt_and_send_to_pane(pane_id, outbound)
+    if not ok:
+        return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
+    if detail:
+        # Esc didn't fully stop the turn — the message queued instead; say so.
+        return {"handled": True, "reply": sanitize_text(detail, 300)}
+    return {"handled": True, "reply": "⏹️ Interrupted the current turn and sent your message."}
 
 
 def pane_input_looks_staged(pane_id: str) -> bool:
@@ -10164,6 +10190,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 "/raw [lines] - sanitized raw visible output\n"
                 "/debug - technical mapping details\n"
                 "/send <text> - send instruction to this pane\n"
+                "/send! <text> - interrupt the current turn and send now\n"
                 "/keys <keys> - send explicit keys\n"
                 f"{plain_text_help}"
             ),
@@ -10338,6 +10365,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "reply": format_debug(pane, entry)}
     if command == "send":
         return forward_text_to_pane_response(pane_id, arg, usage="Usage: /send <instruction for this pane>")
+    if command in ("send!", "interrupt", "isend"):
+        return interrupt_and_send_response(pane_id, arg)
     if command == "keys":
         if not arg:
             return {"handled": True, "reply": "Usage: /keys <key> [key ...]"}
