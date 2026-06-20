@@ -5477,12 +5477,15 @@ def update_topic_status_icon(
         return {"ok": False, "attempted": False, "kind": "no_icon", "icon_key": icon_key, "emoji": emoji}
     if str(entry.get("topic_status_icon_custom_emoji_id") or "") == icon_id:
         return {"ok": True, "attempted": False, "kind": "unchanged", "icon_key": icon_key, "emoji": emoji}
-    retry_key = f"{icon_id}:{icon_key}"
-    if str(entry.get("last_topic_status_icon_attempt_key") or "") == retry_key:
-        last_attempt = str(entry.get("last_topic_status_icon_attempt_at") or "")
-        if last_attempt and cache_fresh(last_attempt, STATUS_ICON_RETRY_SECONDS):
-            return {"ok": False, "attempted": False, "kind": "retry_deferred", "icon_key": icon_key, "emoji": emoji}
-    entry["last_topic_status_icon_attempt_key"] = retry_key
+    # Per-pane cooldown: once we change the icon for this pane, suppress all
+    # further changes for STATUS_ICON_RETRY_SECONDS regardless of target icon.
+    # This prevents the ⚡️↔☕️ oscillation that happens when an agent briefly
+    # pauses to output text during a working session (herdr reports "idle"
+    # for those pauses, causing the icon to flip every sync cycle).
+    last_attempt = str(entry.get("last_topic_status_icon_attempt_at") or "")
+    if last_attempt and cache_fresh(last_attempt, STATUS_ICON_RETRY_SECONDS):
+        return {"ok": False, "attempted": False, "kind": "retry_deferred", "icon_key": icon_key, "emoji": emoji}
+    entry["last_topic_status_icon_attempt_key"] = f"{icon_id}:{icon_key}"
     entry["last_topic_status_icon_attempt_at"] = utc_now()
     try:
         ok = edit_topic_icon(chat_id, topic_id, icon_id, name=str(entry.get("topic_name") or ""))
