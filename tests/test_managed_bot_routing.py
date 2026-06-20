@@ -318,9 +318,9 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
                 }
             },
         }
-        # After Esc the agent stops; send_to_pane then sees an idle pane and an
-        # empty box, so the message submits cleanly.
-        idle_pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        # The pane is working, so /send! must interrupt (Esc). The box is empty
+        # (pane_input_looks_staged mocked False), so the message submits cleanly.
+        working_pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "working"}
         calls = []
 
         def run_cmd(args, **kwargs):
@@ -332,7 +332,7 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
             load_dotenv=Mock(),
             load_state=Mock(return_value=state),
             save_state=Mock(),
-            pane_by_id=Mock(return_value=idle_pane),
+            pane_by_id=Mock(return_value=working_pane),
             clear_staged_pane_input_if_needed=Mock(return_value=(True, "")),
             run_cmd=run_cmd,
             pane_input_looks_staged=Mock(return_value=False),  # box clears -> delivered

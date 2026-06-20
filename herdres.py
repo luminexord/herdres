@@ -5849,14 +5849,17 @@ def send_to_pane(
 
 def interrupt_and_send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, str]:
     # Halt the agent's current turn (Esc) so the message runs now instead of
-    # queueing behind it, then deliver via the normal send path. Esc on an idle
-    # pane is a harmless no-op, so this is safe regardless of the pane's state.
-    run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "escape"], timeout=timeout)
-    for delay in (0.3, 0.5, 0.7, 1.0):
-        time.sleep(delay)
-        pane = pane_by_id(pane_id)
-        if not pane or str(pane.get("agent_status") or "").strip().lower() != "working":
-            break
+    # queueing behind it, then deliver via the normal send path. Only interrupt a
+    # pane that is actually working — Esc on an idle pane is needless and, on
+    # Codex, pops its "edit previous message" recall preview.
+    pane = pane_by_id(pane_id)
+    if pane and str(pane.get("agent_status") or "").strip().lower() == "working":
+        run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "escape"], timeout=timeout)
+        for delay in (0.3, 0.5, 0.7, 1.0):
+            time.sleep(delay)
+            refreshed = pane_by_id(pane_id)
+            if not refreshed or str(refreshed.get("agent_status") or "").strip().lower() != "working":
+                break
     return send_to_pane(pane_id, text, timeout=timeout)
 
 
@@ -5873,19 +5876,45 @@ def interrupt_and_send_response(pane_id: str, text: str) -> dict[str, Any]:
     return {"handled": True, "reply": "⏹️ Interrupted the current turn and sent your message."}
 
 
+def pane_input_ansi(pane_id: str, *, lines: int = 16) -> str:
+    # Raw ANSI read (NOT via pane_output/sanitize_text, which strip escapes) so
+    # styling survives: Codex renders its empty-box placeholder suggestions in
+    # SGR "dim" (\x1b[2m), which is how we tell a placeholder from real input.
+    try:
+        raw = herdr_text(
+            ["pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", str(lines), "--format", "ansi"],
+            timeout=8,
+        )
+    except Exception:
+        return ""
+    try:
+        data = json.loads(raw)
+        return str(data.get("result", {}).get("text") or data.get("text") or raw)
+    except Exception:
+        return raw
+
+
 def pane_input_looks_staged(pane_id: str) -> bool:
-    raw = pane_output(pane_id, lines=16, max_chars=4000, source="recent-unwrapped")
-    if not raw.strip():
+    ansi_raw = pane_input_ansi(pane_id, lines=16)
+    if ansi_raw.strip():
+        ansi_lines = ansi_raw.splitlines()[-16:]
+    else:
+        # Fall back to the sanitized text read (no dim info) if ANSI is unavailable.
+        ansi_lines = pane_output(pane_id, lines=16, max_chars=4000, source="recent-unwrapped").splitlines()[-16:]
+    clean_lines = [ANSI_RE.sub("", str(line or "")).strip() for line in ansi_lines]
+    if not any(clean_lines):
         return False
-    lines = raw.splitlines()[-16:]
-    clean_lines = [ANSI_RE.sub("", str(line or "")).strip() for line in lines]
     if any(CODEX_GOAL_USAGE_FOOTER_RE.search(line) for line in clean_lines):
         return False
-    for line in reversed(lines):
-        clean = ANSI_RE.sub("", str(line or "")).strip()
+    for ansi_line, clean in zip(reversed(ansi_lines), reversed(clean_lines)):
         if PROMPT_PLACEHOLDER_RE.fullmatch(clean):
             return False
         if PROMPT_WITH_TEXT_RE.match(clean):
+            # A greyed placeholder suggestion (empty box) is rendered dim; real
+            # typed input is not. The truecolor background \x1b[48;2;…m is not the
+            # standalone dim code \x1b[2m, so this literal check is unambiguous.
+            if "\x1b[2m" in str(ansi_line):
+                return False
             return True
         if PROMPT_ONLY_RE.fullmatch(clean):
             return False

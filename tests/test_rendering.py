@@ -4050,6 +4050,7 @@ Verification
         with patch.multiple(
             herdres,
             pane_by_id=Mock(return_value=pane),
+            pane_input_ansi=Mock(return_value=current_composer),
             pane_output=Mock(return_value=current_composer),
             run_cmd=run_cmd,
         ):
@@ -4204,16 +4205,40 @@ Verification
         self.assertTrue(ok)
         self.assertIn("Queued", detail)
 
-    def test_interrupt_and_send_sends_escape_before_message(self) -> None:
-        # /send! must halt the turn (Esc) BEFORE delivering, so the message runs
-        # now instead of queueing behind the current turn.
+    def test_interrupt_and_send_sends_escape_before_message_when_working(self) -> None:
+        # /send! to a WORKING pane must halt the turn (Esc) BEFORE delivering, so
+        # the message runs now instead of queueing behind the current turn.
         calls = []
 
         def run_cmd(args, **kwargs):
             calls.append(args)
             return Mock(returncode=0, stdout="", stderr="")
 
-        idle_pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        working_pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "working"}
+        with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
+            herdres,
+            run_cmd=run_cmd,
+            pane_by_id=Mock(return_value=working_pane),
+            clear_staged_pane_input_if_needed=Mock(return_value=(True, "")),
+            pane_input_looks_staged=Mock(return_value=False),
+        ):
+            ok, detail = herdres.interrupt_and_send_to_pane("pane-1", "go now")
+
+        self.assertTrue(ok)
+        esc_idx = next(i for i, a in enumerate(calls) if "send-keys" in a and "escape" in a)
+        run_idx = next(i for i, a in enumerate(calls) if "run" in a)
+        self.assertLess(esc_idx, run_idx)  # Esc precedes the message
+
+    def test_interrupt_and_send_skips_escape_when_idle(self) -> None:
+        # No turn to interrupt on an idle pane: deliver without sending Esc
+        # (Esc on idle Codex pops its recall preview — a needless side effect).
+        calls = []
+
+        def run_cmd(args, **kwargs):
+            calls.append(args)
+            return Mock(returncode=0, stdout="", stderr="")
+
+        idle_pane = {"pane_id": "pane-1", "agent": "codex", "agent_status": "idle"}
         with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
             herdres,
             run_cmd=run_cmd,
@@ -4224,9 +4249,21 @@ Verification
             ok, detail = herdres.interrupt_and_send_to_pane("pane-1", "go now")
 
         self.assertTrue(ok)
-        esc_idx = next(i for i, a in enumerate(calls) if "send-keys" in a and "escape" in a)
-        run_idx = next(i for i, a in enumerate(calls) if "run" in a)
-        self.assertLess(esc_idx, run_idx)  # Esc precedes the message
+        self.assertFalse(any("escape" in a for a in calls))  # no interrupt on idle
+        self.assertTrue(any("run" in a for a in calls))  # still delivered
+
+    def test_pane_input_dim_codex_placeholder_is_not_staged(self) -> None:
+        # Codex shows a greyed (dim = \x1b[2m) example suggestion in an EMPTY box;
+        # that must NOT be treated as staged input.
+        dim_placeholder = "› \x1b[2mExplain this codebase\x1b[0m"
+        with patch.object(herdres, "pane_input_ansi", Mock(return_value=dim_placeholder)):
+            self.assertFalse(herdres.pane_input_looks_staged("pane-1"))
+
+    def test_pane_input_real_typed_text_is_staged(self) -> None:
+        # Real typed/queued input is not dim -> still detected as staged.
+        real_text = "❯ deploy when ready"
+        with patch.object(herdres, "pane_input_ansi", Mock(return_value=real_text)):
+            self.assertTrue(herdres.pane_input_looks_staged("pane-1"))
 
     def test_visible_choice_selection_uses_numbers_by_default(self) -> None:
         with patch.object(herdres, "VISIBLE_CHOICE_SELECT_MODE", "number"), patch.object(
