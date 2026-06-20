@@ -57,6 +57,7 @@
         <button class="key" data-seq="\t">tab</button>
         <button class="key key--mod" data-mod="ctrl" id="k-ctrl">ctrl</button>
         <button class="key" data-action="paste" id="k-paste" aria-label="Paste from clipboard">paste</button>
+        <button class="key" data-action="select" id="k-select" aria-label="Toggle text selection mode">select</button>
         <button class="key" data-seq="[A">↑</button>
         <button class="key" data-seq="[B">↓</button>
         <button class="key" data-seq="[D">←</button>
@@ -65,6 +66,12 @@
         <button class="key" data-seq="/">/</button>
         <button class="key" data-seq="\r">⏎</button>
       </footer>
+
+      <!-- Text input row: type and send, or tap to summon keyboard. -->
+      <div class="bar bar--input" id="input-row">
+        <input type="text" id="text-input" class="text-input" placeholder="type and send…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="send" />
+        <button class="key key--send" id="k-send" aria-label="Send text">send</button>
+      </div>
 
       <!-- Shown when the Mac host isn't connected, or auth/transport fails. -->
       <div id="curtain" class="curtain" hidden>
@@ -76,6 +83,15 @@
           </p>
         </div>
       </div>
+    </div>
+
+    <!-- Native text selection overlay (toggled by select button) -->
+    <div id="select-overlay" class="select-overlay" hidden>
+      <div class="select-overlay__header">
+        <span class="select-overlay__hint">Long-press to select text, then copy</span>
+        <button class="key key--small" id="k-select-done">done</button>
+      </div>
+      <pre id="select-text" class="select-overlay__text"></pre>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>

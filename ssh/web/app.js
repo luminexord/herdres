@@ -23,11 +23,22 @@ import { installScrollJoystick } from './scroll-joystick.js';
   const panesBar = $('drove');
   const screen = $('screen');
   const keys = $('keys');
+  const textInput = $('text-input');
+  const kSend = $('k-send');
+  const kSelect = $('k-select');
+  const selectOverlay = $('select-overlay');
+  const selectText = $('select-text');
+  const kSelectDone = $('k-select-done');
   let selectedSpace = '';
   let latestStatus = { spaces: [], panes: [] };
 
   function focusTerminalIfAppropriate() {
-    if (shouldAutoFocusTerminal({ coarsePointer: hasCoarsePointer(window) })) term.focus();
+    if (shouldAutoFocusTerminal({ coarsePointer: hasCoarsePointer(window) })) {
+      term.focus();
+    } else {
+      // On mobile, focus the text input so the keyboard appears.
+      textInput.focus();
+    }
   }
 
   // --- Telegram chrome ----------------------------------------------------
@@ -313,6 +324,10 @@ import { installScrollJoystick } from './scroll-joystick.js';
       focusTerminalIfAppropriate();
       return;
     }
+    if (btn.dataset.action === 'select') {
+      toggleSelectOverlay();
+      return;
+    }
     let out = seqFor(btn);
     if (ctrlArmed && out.length === 1) {
       const code = out.toLowerCase().charCodeAt(0);
@@ -322,6 +337,50 @@ import { installScrollJoystick } from './scroll-joystick.js';
     sendInput(out);
     focusTerminalIfAppropriate();
   });
+
+  // --- text input row -----------------------------------------------------
+  function sendTextInput() {
+    const text = textInput.value;
+    if (!text) return;
+    sendInput(text + '\r');
+    textInput.value = '';
+  }
+  kSend.addEventListener('click', sendTextInput);
+  textInput.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      sendTextInput();
+    }
+  });
+
+  // --- select overlay (native text copy) ----------------------------------
+  function toggleSelectOverlay() {
+    if (selectOverlay.hidden) {
+      selectText.textContent = term.buffer.active
+        ? serializeTerminal(term)
+        : '';
+      selectOverlay.hidden = false;
+      kSelect.classList.add('key--active');
+    } else {
+      selectOverlay.hidden = true;
+      kSelect.classList.remove('key--active');
+    }
+  }
+  kSelectDone.addEventListener('click', toggleSelectOverlay);
+
+  function serializeTerminal(t) {
+    const buf = t.buffer.active;
+    const lines = [];
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      if (!line) continue;
+      let text = line.translateToString(true);
+      if (text.trim()) lines.push(text.replace(/\s+$/, ''));
+    }
+    // Trim trailing empty lines
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+    return lines.join('\n');
+  }
 
   // --- go -----------------------------------------------------------------
   scheduleFit();

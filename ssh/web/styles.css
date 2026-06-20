@@ -36,7 +36,7 @@ body {
 
 #app {
   display: grid;
-  grid-template-rows: auto auto auto 1fr auto;
+  grid-template-rows: auto auto auto 1fr auto auto;
   height: 100dvh;
   width: 100vw;
 }
@@ -345,6 +345,96 @@ body {
   background: var(--lantern);
   border-color: var(--lantern);
   color: var(--field-deep);
+}
+.key--send {
+  flex: 0 0 auto;
+  min-width: 52px;
+  font-family: 'Space Mono', monospace;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.key--small {
+  flex: 0 0 auto;
+  min-width: 36px;
+  height: 28px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+.key--active {
+  background: var(--lantern);
+  border-color: var(--lantern);
+  color: var(--field-deep);
+}
+
+/* --- input bar ----------------------------------------------------------- */
+.bar--input {
+  gap: 6px;
+  padding: 6px 10px calc(var(--safe-b) + 6px);
+  border-top-width: 1px;
+}
+.text-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 36px;
+  padding: 0 10px;
+  background: var(--field-deep);
+  color: var(--bone);
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 14px;
+  -webkit-appearance: none;
+  appearance: none;
+  outline: none;
+}
+.text-input:focus {
+  border-color: var(--lantern);
+}
+.text-input::placeholder {
+  color: var(--done);
+}
+
+/* --- select overlay (native text copy) ----------------------------------- */
+.select-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  background: var(--field-deep);
+}
+.select-overlay[hidden] {
+  display: none;
+}
+.select-overlay__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: calc(var(--safe-t) + 8px) 14px 8px;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--edge);
+}
+.select-overlay__hint {
+  font-family: 'Space Mono', monospace;
+  font-size: 11px;
+  color: var(--bone-dim);
+}
+.select-overlay__text {
+  margin: 0;
+  padding: 12px 14px;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--bone);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+  touch-action: auto;
 }
 
 /* --- curtain (empty / error state) -------------------------------------- */
