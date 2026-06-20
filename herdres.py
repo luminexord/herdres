@@ -84,8 +84,20 @@ STREAMING_DRAFTS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STREAMING", "1"
 STREAM_MIN_INTERVAL_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_STREAM_MIN_INTERVAL", "2"))
 STREAM_MIN_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STREAM_MIN_CHARS", "80"))
 MAX_STREAM_DRAFTS = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_DRAFTS", "8"))
-MANAGED_BOTS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+MANAGED_BOTS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "0")
 MANAGER_BOT_KIND = "manager"
+MANAGER_BOT_COMMANDS = [
+    ("status", "Latest report or question"),
+    ("report", "Latest clean report"),
+    ("choices", "Resend active choices"),
+    ("raw", "Sanitized raw visible output"),
+    ("send", "Send text to a pane"),
+    ("keys", "Send explicit keystrokes"),
+    ("agents", "Pick which agent to address"),
+    ("new", "Start a new agent pane"),
+    ("debug", "Pane mapping details"),
+    ("help", "Show commands"),
+]
 MANAGED_BOT_ROUTE_KIND_FIELDS = (
     "pane_root_bot_kind",
     "status_marker_bot_kind",
@@ -125,6 +137,7 @@ INTERACTION_READONLY_WARNING_BODY = (
 )
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
 ACTIVE_PROMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PROMPT_TTL", "900"))
+ACTIVE_PANE_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PANE_TTL", "600"))
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
 PANE_INPUT_FILE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS", "1200"))
 PANE_INPUT_FILE_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES", "6"))
@@ -466,6 +479,7 @@ def normalize_state(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("spaces", {})
     data.setdefault("panes", {})
     migrate_legacy_pane_topics(data)
+    migrate_space_voice_mode(data)
     clear_disabled_visible_choice_state(data)
     return data
 
@@ -546,6 +560,31 @@ def managed_bot_specs() -> dict[str, dict[str, Any]]:
 
 def managed_bot_setup_enabled() -> bool:
     return MANAGED_BOTS_ENABLED
+
+
+def space_voice_mode(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> str:
+    if not isinstance(pane_or_entry, dict):
+        return "shared"
+    key = str(pane_or_entry.get("space_key") or "")
+    if not key:
+        key = space_key(pane_or_entry)
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    space = spaces.get(key)
+    if isinstance(space, dict):
+        return str(space.get("voice_mode") or "shared")
+    return "shared"
+
+
+def managed_voice_enabled_for_space(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> bool:
+    return space_voice_mode(state, pane_or_entry) == "per_agent"
+
+
+def refresh_entry_managed_voice(state: dict[str, Any], entry: dict[str, Any], pane: dict[str, Any] | None = None) -> None:
+    if isinstance(entry, dict):
+        entry["managed_voice_active"] = managed_voice_enabled_for_space(
+            state,
+            pane if isinstance(pane, dict) and pane.get("space_key") else entry,
+        )
 
 
 def managed_bot_newbot_url(manager_username: str, spec: dict[str, Any]) -> str:
@@ -771,7 +810,8 @@ def managed_bot_token_for_entry(
     entry: dict[str, Any],
     pane: dict[str, Any] | None = None,
 ) -> str | None:
-    if not managed_bot_setup_enabled() or not isinstance(telegram, dict):
+    enabled = entry.get("managed_voice_active") if isinstance(entry, dict) and "managed_voice_active" in entry else managed_bot_setup_enabled()
+    if not enabled or not isinstance(telegram, dict):
         return None
     kind = managed_bot_kind_for_entry(entry, pane)
     if not kind:
@@ -1487,7 +1527,9 @@ def ensure_space_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str
     entry = spaces.get(key)
     changed = False
     if not isinstance(entry, dict):
-        entry = {"space_key": key, "created_at": utc_now(), "pane_keys": []}
+        preserved = state.get("_preserved_voice_mode") if isinstance(state.get("_preserved_voice_mode"), dict) else {}
+        vm = preserved.pop(key, None) or "shared"
+        entry = {"space_key": key, "created_at": utc_now(), "pane_keys": [], "voice_mode": vm}
         spaces[key] = entry
         changed = True
     if entry.get("space_key") != key:
@@ -1603,6 +1645,30 @@ def migrate_legacy_pane_topics(state: dict[str, Any]) -> bool:
             if rename_key in entry:
                 entry.pop(rename_key, None)
                 changed = True
+    return changed
+
+
+def migrate_space_voice_mode(state: dict[str, Any]) -> bool:
+    changed = False
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    for space in spaces.values():
+        if not isinstance(space, dict) or space.get("voice_mode"):
+            continue
+        for pane_key_value in space.get("pane_keys") or []:
+            entry = panes.get(str(pane_key_value))
+            if not isinstance(entry, dict):
+                continue
+            kind = managed_bot_kind_for_entry(entry)
+            if not kind:
+                continue
+            record = bots.get(kind)
+            if isinstance(record, dict) and record.get("token") and record.get("enabled") is not False:
+                space["voice_mode"] = "per_agent"
+                changed = True
+                break
     return changed
 
 
@@ -4975,6 +5041,18 @@ def reset_topic_grouping(state: dict[str, Any], mode: str, reason: str = "") -> 
     next sync recreates topics for the new grouping. The old Telegram topics are
     left untouched on Telegram's side; Herdres simply forgets them.
     """
+    old_spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    preserved = {
+        k: s.get("voice_mode")
+        for k, s in old_spaces.items()
+        if isinstance(s, dict) and s.get("voice_mode")
+    }
+    if preserved:
+        preserved_voice = state.get("_preserved_voice_mode")
+        if not isinstance(preserved_voice, dict):
+            preserved_voice = {}
+            state["_preserved_voice_mode"] = preserved_voice
+        preserved_voice.update(preserved)
     state["spaces"] = {}
     panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
     for entry in panes.values():
@@ -5064,6 +5142,55 @@ def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[
         rows.append([{"text": button_text[:64], "callback_data": safe_callback_data(action, prompt_id, callback_id)}])
     if not has_custom_button:
         rows.append([{"text": "Tell me differently", "callback_data": safe_callback_data("d", prompt_id, "custom")}])
+    return {"inline_keyboard": rows}
+
+
+def onboarding_reply_markup(space_token: str, kinds: list[str], selected: list[str]) -> dict[str, Any]:
+    selected_set = set(selected)
+    rows: list[list[dict[str, str]]] = []
+    for kind in kinds:
+        label = str((managed_bot_specs().get(kind) or {}).get("label") or kind.title())
+        mark = "\u2705 " if kind in selected_set else "\u25ab\ufe0f "
+        rows.append([{"text": (mark + label)[:64], "callback_data": f"herdr:ob:{space_token}:{kind}"}])
+    rows.append([{"text": "Done", "callback_data": f"herdr:ob:{space_token}:_done"}])
+    return {"inline_keyboard": rows}
+
+
+def agent_picker_pane_tokens(live_entries: list[tuple[str, dict[str, Any]]]) -> dict[str, str]:
+    base_counts: dict[str, int] = {}
+    for pane_key_value, _entry in live_entries:
+        base = _callback_id(str(pane_key_value), "pane")[:24]
+        base_counts[base] = base_counts.get(base, 0) + 1
+    used: set[str] = set()
+    tokens: dict[str, str] = {}
+    for pane_key_value, _entry in live_entries:
+        pane_key_text = str(pane_key_value)
+        base = _callback_id(pane_key_text, "pane")[:24]
+        token = base
+        if base_counts.get(base, 0) > 1:
+            digest = hashlib.sha1(pane_key_text.encode("utf-8")).hexdigest()[:8]
+            token = f"{base[:23]}-{digest}"
+        attempt = 0
+        while token in used:
+            attempt += 1
+            digest = hashlib.sha1(f"{pane_key_text}:{attempt}".encode("utf-8")).hexdigest()[:8]
+            token = f"{base[:23]}-{digest}"
+        used.add(token)
+        tokens[pane_key_text] = token
+    return tokens
+
+
+def agents_picker_reply_markup(space_token: str, live_entries: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    rows: list[list[dict[str, str]]] = []
+    tokens = agent_picker_pane_tokens(live_entries[:12])
+    for pane_key_value, entry in live_entries[:12]:
+        kind = managed_bot_kind_for_entry(entry)
+        label = str((managed_bot_specs().get(kind) or {}).get("label") or entry.get("agent") or entry.get("pane_id") or "pane")
+        pane_token = tokens[str(pane_key_value)]
+        rows.append([{
+            "text": (str(label) + " — " + str(entry.get("pane_id") or ""))[:64],
+            "callback_data": f"herdr:ag:{space_token}:{pane_token}",
+        }])
     return {"inline_keyboard": rows}
 
 
@@ -8251,6 +8378,22 @@ def reconcile_missing_event_pane(
     }
 
 
+def ensure_manager_commands(telegram: dict[str, Any]) -> None:
+    payload_commands = [{"command": c, "description": d} for c, d in MANAGER_BOT_COMMANDS]
+    digest = hashlib.sha1(
+        json.dumps(payload_commands, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    if telegram.get("manager_commands_digest") == digest:
+        return
+    try:
+        telegram_api("setMyCommands", {"commands": json.dumps(payload_commands, separators=(",", ":"))})
+    except Exception as exc:
+        telegram["manager_commands_error"] = sanitize_text(str(exc), 300)
+        return
+    telegram["manager_commands_digest"] = digest
+    telegram.pop("manager_commands_error", None)
+
+
 def preflight(chat_id: str, telegram: dict[str, Any] | None = None) -> None:
     if not chat_id:
         raise BridgeError("HERDR_TELEGRAM_TOPICS_CHAT_ID is required")
@@ -8264,6 +8407,7 @@ def preflight(chat_id: str, telegram: dict[str, Any] | None = None) -> None:
             telegram["bot_username"] = username
         if "can_manage_bots" in me:
             telegram["can_manage_bots"] = bool(me.get("can_manage_bots"))
+        ensure_manager_commands(telegram)
     bot_id = me.get("id")
     if not bot_id:
         raise BridgeError("getMe returned no bot id")
@@ -8561,6 +8705,37 @@ def ensure_space_topic(
     space_entry.pop("topic_missing_at", None)
     space_entry.pop("topic_missing_id", None)
     space_entry.pop("topic_missing_reason", None)
+    # The "which agents work here?" onboarding card only makes sense in per-space
+    # grouping, where one topic holds several agents. In per-agent mode each topic
+    # IS a single agent, so the question is moot — skip the card entirely.
+    if not per_agent_topics_enabled():
+        live = live_entries_for_space(state, space_entry)
+        detected_kinds = []
+        seen_kinds: set[str] = set()
+        for _pk, live_entry in live:
+            k = managed_bot_kind_for_entry(live_entry)
+            if k and k not in seen_kinds:
+                seen_kinds.add(k)
+                detected_kinds.append(k)
+        pane_kind = managed_bot_kind_for_entry(pane if isinstance(pane, dict) else {}, pane)
+        if pane_kind and pane_kind not in seen_kinds:
+            detected_kinds.append(pane_kind)
+        space_entry["onboarding_selected"] = detected_kinds
+        space_entry["onboarding_status"] = "pending"
+        space_token = _callback_id(key_for_space, "space")[:16]
+        all_kinds = list(managed_bot_specs().keys())
+        try:
+            ob_message_id = send_message(
+                chat_id,
+                "Which agents work in this space? Tap to toggle, then Done. "
+                "(If you skip this, the detected agents are kept.)",
+                thread_id=topic_id,
+                reply_markup=onboarding_reply_markup(space_token, all_kinds, detected_kinds),
+            )
+            if ob_message_id:
+                space_entry["onboarding_message_id"] = str(ob_message_id)
+        except Exception as exc:
+            space_entry["onboarding_error"] = sanitize_text(str(exc), 300)
     save_state(state)
     return space_entry, True
 
@@ -9235,6 +9410,7 @@ def sync_pane_once(
 ) -> bool:
     key, entry, new_entry = ensure_pane_entry(state, pane)
     changed = bool(new_entry)
+    refresh_entry_managed_voice(state, entry, pane)
     entry["last_seen_at"] = utc_now()
     entry["last_known_status"] = str(pane.get("agent_status") or "unknown")
     max_creates = int(caps.get("max_creates", MAX_CREATES_PER_RUN))
@@ -9935,6 +10111,40 @@ def is_single_live_space_pane(state: dict[str, Any], chat_id: str, topic_id: str
     return len(live_entries_for_space(state, space)) == 1
 
 
+def set_active_pane(space: dict[str, Any], pane_key_value: str, user_id: str) -> None:
+    records = space.get("active_pane")
+    if not isinstance(records, dict):
+        records = {}
+        space["active_pane"] = records
+    records[str(user_id)] = {"pane_key": str(pane_key_value), "set_at": utc_now()}
+
+
+def get_active_pane_entry(state: dict[str, Any], space: dict[str, Any], user_id: str) -> tuple[str, dict[str, Any]] | None:
+    records = space.get("active_pane")
+    if not isinstance(records, dict):
+        return None
+    record = records.get(str(user_id))
+    if not isinstance(record, dict):
+        return None
+    age = _iso_age_seconds(str(record.get("set_at") or ""))
+    if age is None or age > ACTIVE_PANE_TTL_SECONDS:
+        records.pop(str(user_id), None)
+        return None
+    pane_key_value = str(record.get("pane_key") or "")
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    entry = panes.get(pane_key_value)
+    if not isinstance(entry, dict) or str(entry.get("last_known_status") or "").lower() == "closed":
+        records.pop(str(user_id), None)
+        return None
+    return pane_key_value, entry
+
+
+def clear_active_pane(space: dict[str, Any], user_id: str) -> None:
+    records = space.get("active_pane")
+    if isinstance(records, dict):
+        records.pop(str(user_id), None)
+
+
 def new_pane_usage() -> str:
     return "Usage: /new codex|claude|kimi|omp|devin"
 
@@ -10072,33 +10282,6 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         text = strip_managed_bot_mentions(telegram, text)
 
     command, arg = parse_command(text)
-    if command == "new":
-        owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
-        if not owners:
-            owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
-        if payload.get("edited") or payload.get("from_bot") or user_id not in owners:
-            return {"handled": True, "reply": ""}
-        if payload.get("forwarded"):
-            return {"handled": True, "reply": "Ignored non-direct owner message in pane topic."}
-        if state_changed:
-            save_state(state)
-        return new_agent_pane_response(state, chat_id, topic_id, payload, arg)
-
-    entry = topic_entry(
-        state,
-        chat_id,
-        topic_id,
-        message_id=str(payload.get("message_id") or ""),
-        reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
-        target_bot_kind=target_bot_kind,
-    )
-    if not entry:
-        if topic_space_entry(state, chat_id, topic_id):
-            return {"handled": True, "reply": AMBIGUOUS_PANE_THREAD_REPLY}
-        return {"handled": False}
-    if state_changed:
-        save_state(state)
-
     owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
     if not owners:
         owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
@@ -10111,10 +10294,59 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("forwarded"):
         return {"handled": True, "reply": "Ignored non-direct owner message in pane topic."}
 
+    if command == "new":
+        if state_changed:
+            save_state(state)
+        return new_agent_pane_response(state, chat_id, topic_id, payload, arg)
+
+    resolved_active_entry = False
+    entry = topic_entry(
+        state,
+        chat_id,
+        topic_id,
+        message_id=str(payload.get("message_id") or ""),
+        reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
+        target_bot_kind=target_bot_kind,
+    )
+    if not entry:
+        mapped_space = topic_space_entry(state, chat_id, topic_id)
+        if mapped_space:
+            _sk, space = mapped_space
+            live = live_entries_for_space(state, space)
+            if command != "agents" and not str(payload.get("reply_to_message_id") or "").strip():
+                resolved_active = get_active_pane_entry(state, space, user_id)
+                if resolved_active:
+                    save_state(state)
+                    entry = resolved_active[1]
+                    resolved_active_entry = True
+            if not entry:
+                if command in {"agents", "plain"}:
+                    if not live:
+                        return {"handled": True, "reply": "No live Herdr panes in this topic."}
+                    save_state(state)
+                    space_token = _callback_id(str(space.get("space_key") or ""), "space")[:16]
+                    send_message(
+                        chat_id,
+                        "Send to which agent? (Pick one; your next message routes there.)",
+                        thread_id=topic_id,
+                        reply_markup=agents_picker_reply_markup(space_token, live),
+                    )
+                    return {"handled": True, "reply": ""}
+                return {"handled": True, "reply": AMBIGUOUS_PANE_THREAD_REPLY}
+        if not entry:
+            return {"handled": False}
+    if state_changed:
+        save_state(state)
+    refresh_entry_managed_voice(state, entry, None)
+
     pane_id = str(entry.get("pane_id") or "")
     if not pane_id or entry.get("last_known_status") == "closed":
         return {"handled": True, "reply": "This topic is mapped to a closed or unavailable Herdr pane."}
     pane_api_token = managed_bot_token_for_entry(telegram, entry)
+    if command == "agents":
+        label = str((managed_bot_specs().get(managed_bot_kind_for_entry(entry)) or {}).get("label")
+                    or entry.get("agent") or entry.get("pane_id") or "pane")
+        return {"handled": True, "reply": f"Only one agent here ({label}) — your messages already route to it."}
 
     attachment = payload.get("attachment")
     if isinstance(attachment, dict) and attachment.get("kind") in {"document", "photo"} and attachment.get("file_id"):
@@ -10199,7 +10431,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     "reply": "That choice prompt is no longer safe from Telegram. Use /send or answer in Herdr.",
                 }
             return forward_text_to_pane_response(pane_id, arg)
-        if implicit or target_bot_kind or is_single_live_space_pane(state, chat_id, topic_id):
+        if resolved_active_entry or implicit or target_bot_kind or is_single_live_space_pane(state, chat_id, topic_id):
             return forward_text_to_pane_response(pane_id, arg)
         return {"handled": True, "reply": "This is a mapped Herdr pane topic. Use /send <text> to forward to this pane, or /help."}
 
@@ -10221,6 +10453,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 "/send <text> - send instruction to this pane\n"
                 "/send! <text> - interrupt the current turn and send now\n"
                 "/keys <keys> - send explicit keys\n"
+                "/agents - pick which agent to address in a shared topic\n"
                 f"{plain_text_help}"
             ),
         }
@@ -10439,6 +10672,75 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     return forward_text_to_pane_response(pane_id, forward_text)
 
 
+def handle_onboarding_callback(state, telegram, chat_id, topic_id, message_id, space, parts):
+    if len(parts) != 4:
+        return {"handled": True, "answer": "Unknown Herdr action."}
+    target = parts[3]
+    selected = [k for k in (space.get("onboarding_selected") or []) if isinstance(k, str)]
+    space_token = _callback_id(str(space.get("space_key") or ""), "space")[:16]
+    all_kinds = list(managed_bot_specs().keys())
+    if target == "_done":
+        space["onboarding_status"] = "committed"
+        save_state(state)
+        try:
+            telegram_api("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": int(message_id),
+                "text": "Agents set: " + (", ".join(
+                    str((managed_bot_specs().get(k) or {}).get("label") or k) for k in selected
+                ) or "none"),
+            })
+        except Exception:
+            pass
+        return {"handled": True, "answer": "Agents set."}
+    if target not in managed_bot_specs():
+        return {"handled": True, "answer": "Unknown agent."}
+    if target in selected:
+        selected = [k for k in selected if k != target]
+    else:
+        selected.append(target)
+    space["onboarding_selected"] = selected
+    save_state(state)
+    try:
+        telegram_api("editMessageReplyMarkup", {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "reply_markup": json.dumps(onboarding_reply_markup(space_token, all_kinds, selected), separators=(",", ":")),
+        })
+    except Exception:
+        pass
+    return {"handled": True, "answer": "Updated."}
+
+
+def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, user_id, space, parts):
+    if len(parts) != 4:
+        return {"handled": True, "answer": "Unknown Herdr action."}
+    pane_token = parts[3]
+    live = live_entries_for_space(state, space)
+    tokens = agent_picker_pane_tokens(live)
+    match = next(
+        (pk for pk, _e in live if tokens.get(str(pk)) == pane_token),
+        None,
+    )
+    if not match:
+        return {"handled": True, "answer": "That pane is no longer live.", "show_alert": True}
+    set_active_pane(space, match, user_id)
+    save_state(state)
+    panes = state.get("panes") or {}
+    entry = panes.get(match) if isinstance(panes, dict) else None
+    label = str((managed_bot_specs().get(managed_bot_kind_for_entry(entry or {})) or {}).get("label")
+                or (entry or {}).get("agent") or "pane")
+    try:
+        telegram_api("editMessageText", {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "text": f"Next message in this topic goes to {label}.",
+        })
+    except Exception:
+        pass
+    return {"handled": True, "answer": f"Sending to {label}."}
+
+
 def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     load_dotenv()
     state = load_state()
@@ -10452,6 +10754,20 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
 
     if not data.startswith("herdr:"):
         return {"handled": False}
+    if data.startswith("herdr:ob:") or data.startswith("herdr:ag:"):
+        owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
+        if not owners:
+            owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
+        if user_id not in owners:
+            return {"handled": True, "answer": "Not authorized.", "show_alert": True}
+        mapped_space = topic_space_entry(state, chat_id, topic_id)
+        if not mapped_space:
+            return {"handled": True, "answer": "This space is no longer active.", "show_alert": True}
+        space_key_value, space = mapped_space
+        parts = data.split(":")
+        if data.startswith("herdr:ob:"):
+            return handle_onboarding_callback(state, telegram, chat_id, topic_id, message_id, space, parts)
+        return handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, user_id, space, parts)
     entry = topic_entry(state, chat_id, topic_id, message_id=message_id, prefer_message_id=True)
     if not entry:
         return {"handled": False}
@@ -10463,6 +10779,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
     if user_id not in owners:
         return {"handled": True, "answer": "Not authorized.", "show_alert": True}
+    refresh_entry_managed_voice(state, entry, None)
 
     parts = data.split(":")
     if len(parts) != 4 or parts[1] not in {"c", "d"}:

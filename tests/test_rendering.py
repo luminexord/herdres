@@ -1485,6 +1485,7 @@ class ManagedBotTests(unittest.TestCase):
             "topic_id": "77",
             "pane_root_message_id": "1001",
             "agent": "claude",
+            "managed_voice_active": True,
         }
         calls: list[tuple[str, dict, str | None]] = []
 

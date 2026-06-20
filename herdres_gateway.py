@@ -709,21 +709,7 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
         if topic_space_entry(state, chat_id, thread_id):
             if not owner_allowed(state, user_id, from_bot):
                 return
-            route_key = processed_message_key(chat_id, thread_id, message)
-            if target_bot_kind or is_space_level_command(str(text or "")):
-                pane_key = ""
-            else:
-                if not reserve_message_processing(route_key):
-                    dlog(f"ignored already processed message {route_key}")
-                    return
-                send_reply(
-                    bot_token,
-                    chat_id,
-                    thread_id,
-                    AMBIGUOUS_PANE_THREAD_REPLY,
-                    reply_to_message_id=str(message.get("message_id") or ""),
-                )
-                return
+            pane_key = ""
         else:
             tg = state.get("telegram") or {}
             dlog(
@@ -798,8 +784,12 @@ def handle_callback(query: dict, *, bot_token: str | None = None) -> None:
         prefer_message_id=True,
     )
     if not resolved:
-        return
-    pane_key, _entry = resolved
+        if (data.startswith("herdr:ob:") or data.startswith("herdr:ag:")) and topic_space_entry(state, chat_id, thread_id):
+            pane_key = ""
+        else:
+            return
+    else:
+        pane_key, _entry = resolved
 
     user = query.get("from") or {}
     payload = {

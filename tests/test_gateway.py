@@ -49,6 +49,44 @@ def dict_message(**overrides):
     return defaults
 
 
+def managed_multi_pane_space_state() -> dict:
+    return {
+        "version": 1,
+        "enabled": True,
+        "telegram": {
+            "chat_id": "-1001",
+            "general_thread_id": "1",
+            "owner_user_ids": ["42"],
+        },
+        "spaces": {
+            "workspace:workspace-1": {
+                "space_key": "workspace:workspace-1",
+                "topic_id": "77",
+                "pane_keys": ["pane-1", "pane-2"],
+                "message_routes": {},
+            }
+        },
+        "panes": {
+            "pane-1": {
+                "pane_key": "pane-1",
+                "pane_id": "pane-1",
+                "space_key": "workspace:workspace-1",
+                "topic_id": "77",
+                "last_known_status": "working",
+                "agent": "codex",
+            },
+            "pane-2": {
+                "pane_key": "pane-2",
+                "pane_id": "pane-2",
+                "space_key": "workspace:workspace-1",
+                "topic_id": "77",
+                "last_known_status": "working",
+                "agent": "claude",
+            },
+        },
+    }
+
+
 class GatewayTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -211,6 +249,134 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.offset_path.read_text(encoding="utf-8").strip(), "21")
         self.assertEqual(api.call_args.args[1], "sendMessage")
         self.assertIn("invalid output", api.call_args.args[2]["text"])
+
+
+class GatewayUpstreamMultiPaneTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.state_path = root / "state.json"
+        self.offset_path = root / "gateway.offset"
+        self.config = gateway.GatewayConfig(
+            token="TOKEN",
+            state_path=self.state_path,
+            script_path=Path("/bin/echo"),
+            offset_path=self.offset_path,
+            long_poll_seconds=0,
+            error_backoff=0,
+        )
+        self.write_state()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def write_state(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {
+                "chat_id": "-1001",
+                "general_thread_id": "1",
+                "owner_user_ids": ["42"],
+            },
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": ["pane-1", "pane-2"],
+                    "message_routes": {},
+                }
+            },
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "last_known_status": "working",
+                    "agent": "codex",
+                },
+                "pane-2": {
+                    "pane_key": "pane-2",
+                    "pane_id": "pane-2",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "last_known_status": "working",
+                    "agent": "claude",
+                },
+            },
+        }
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    def test_upstream_multipane_command_agents(self) -> None:
+        run_herdres = Mock(return_value={"handled": True, "reply": ""})
+        send_message = Mock()
+        message = dict_message(text="/agents", message_id=9101, reply_to_message=None)
+
+        with patch.object(gateway, "run_herdres", run_herdres), patch.object(gateway, "send_message", send_message):
+            gateway.handle_message(self.config, message)
+
+        run_herdres.assert_called_once()
+        self.assertEqual(run_herdres.call_args.args[0], self.config)
+        self.assertEqual(run_herdres.call_args.args[1], "command")
+        self.assertEqual(run_herdres.call_args.args[2]["text"], "/agents")
+        send_message.assert_not_called()
+
+    def test_upstream_multipane_command_text(self) -> None:
+        run_herdres = Mock(return_value={"handled": True, "reply": ""})
+        send_message = Mock()
+        message = dict_message(text="hello", message_id=9102, reply_to_message=None)
+
+        with patch.object(gateway, "run_herdres", run_herdres), patch.object(gateway, "send_message", send_message):
+            gateway.handle_message(self.config, message)
+
+        run_herdres.assert_called_once()
+        self.assertEqual(run_herdres.call_args.args[0], self.config)
+        self.assertEqual(run_herdres.call_args.args[1], "command")
+        self.assertEqual(run_herdres.call_args.args[2]["text"], "hello")
+        send_message.assert_not_called()
+
+    def test_upstream_multipane_callback_ob(self) -> None:
+        run_herdres = Mock(return_value={"handled": True, "answer": "ok"})
+        answer_callback = Mock()
+        query = {
+            "id": "cb-ob",
+            "data": "herdr:ob:space-token:codex",
+            "from": {"id": 42},
+            "message": {"message_id": 9201, "message_thread_id": 77, "chat": {"id": -1001, "is_forum": True}},
+        }
+
+        with patch.object(gateway, "run_herdres", run_herdres), patch.object(
+            gateway, "answer_callback", answer_callback
+        ):
+            gateway.handle_callback(self.config, query)
+
+        run_herdres.assert_called_once()
+        self.assertEqual(run_herdres.call_args.args[0], self.config)
+        self.assertEqual(run_herdres.call_args.args[1], "callback")
+        self.assertEqual(run_herdres.call_args.args[2]["data"], "herdr:ob:space-token:codex")
+        answer_callback.assert_called_once()
+
+    def test_upstream_multipane_callback_ag(self) -> None:
+        run_herdres = Mock(return_value={"handled": True, "answer": "ok"})
+        answer_callback = Mock()
+        query = {
+            "id": "cb-ag",
+            "data": "herdr:ag:space-token:pane-token",
+            "from": {"id": 42},
+            "message": {"message_id": 9202, "message_thread_id": 77, "chat": {"id": -1001, "is_forum": True}},
+        }
+
+        with patch.object(gateway, "run_herdres", run_herdres), patch.object(
+            gateway, "answer_callback", answer_callback
+        ):
+            gateway.handle_callback(self.config, query)
+
+        run_herdres.assert_called_once()
+        self.assertEqual(run_herdres.call_args.args[0], self.config)
+        self.assertEqual(run_herdres.call_args.args[1], "callback")
+        self.assertEqual(run_herdres.call_args.args[2]["data"], "herdr:ag:space-token:pane-token")
+        answer_callback.assert_called_once()
 
 
 class GatewayManagedBotTests(unittest.TestCase):
@@ -511,6 +677,86 @@ class GatewayManagedBotTests(unittest.TestCase):
         payload = run_script.call_args.args[0]
         self.assertEqual(payload["pane_key"], "")
         self.assertEqual(payload["text"], "/new claude")
+
+    def test_handle_message_dispatches_agents_in_multi_pane_topic_without_inline_ambiguous_reply(self) -> None:
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        api = Mock()
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=managed_multi_pane_space_state())), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", api):
+            managed_gateway.handle_message(
+                {
+                    "message_id": 8101,
+                    "message_thread_id": 77,
+                    "chat": {"id": -1001, "is_forum": True},
+                    "from": {"id": 42, "is_bot": False},
+                    "text": "/agents",
+                },
+                bot_token="MANAGER_TOKEN",
+            )
+
+        api.assert_not_called()
+        run_script.assert_called_once()
+        payload, mode = run_script.call_args.args
+        self.assertEqual(mode, "command")
+        self.assertEqual(payload["pane_key"], "")
+        self.assertEqual(payload["text"], "/agents")
+
+    def test_handle_message_dispatches_plain_text_in_multi_pane_topic_without_inline_ambiguous_reply(self) -> None:
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        api = Mock()
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=managed_multi_pane_space_state())), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", api):
+            managed_gateway.handle_message(
+                {
+                    "message_id": 8102,
+                    "message_thread_id": 77,
+                    "chat": {"id": -1001, "is_forum": True},
+                    "from": {"id": 42, "is_bot": False},
+                    "text": "hello",
+                },
+                bot_token="MANAGER_TOKEN",
+            )
+
+        api.assert_not_called()
+        run_script.assert_called_once()
+        payload, mode = run_script.call_args.args
+        self.assertEqual(mode, "command")
+        self.assertEqual(payload["pane_key"], "")
+        self.assertEqual(payload["text"], "hello")
+
+    def test_handle_callback_dispatches_space_callbacks_in_multi_pane_topic_without_route(self) -> None:
+        run_script = Mock(return_value={"handled": True, "answer": "ok"})
+        answer_callback_query = Mock()
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=managed_multi_pane_space_state())), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "answer_callback_query", answer_callback_query):
+            for idx, data in enumerate(["herdr:ob:space-token:codex", "herdr:ag:space-token:pane-token"], start=1):
+                managed_gateway.handle_callback(
+                    {
+                        "id": f"cb-{idx}",
+                        "from": {"id": 42},
+                        "data": data,
+                        "message": {
+                            "message_id": 8200 + idx,
+                            "message_thread_id": 77,
+                            "chat": {"id": -1001, "is_forum": True},
+                        },
+                    },
+                    bot_token="MANAGER_TOKEN",
+                )
+
+        self.assertEqual(run_script.call_count, 2)
+        self.assertEqual(answer_callback_query.call_count, 2)
+        for call, data in zip(run_script.call_args_list, ["herdr:ob:space-token:codex", "herdr:ag:space-token:pane-token"]):
+            payload, mode = call.args
+            self.assertEqual(mode, "callback")
+            self.assertEqual(payload["pane_key"], "")
+            self.assertEqual(payload["data"], data)
 
     def test_child_bot_ignores_manager_owned_new_command(self) -> None:
         state = {

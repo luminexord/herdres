@@ -49,6 +49,7 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
             "topic_id": "77",
             "pane_root_message_id": "1001",
             "agent": "codex",
+            "managed_voice_active": True,
         }
         state = {
             "spaces": {"workspace:workspace-1": {"message_routes": {"1001": "pane-1"}}},
@@ -92,6 +93,7 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
             "pane_root_bot_kind": "manager",
             "pane_root_bot_kind_retry_kind": "codex",
             "pane_root_bot_kind_retry_at": herdres.utc_now(),
+            "managed_voice_active": True,
         }
         state = {
             "spaces": {"workspace:workspace-1": {"message_routes": {}}},
@@ -135,6 +137,7 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
             "agent": "codex",
             "status_marker_message_id": "1002",
             "status_marker_hash": herdres.status_marker_hash(pane),
+            "managed_voice_active": True,
         }
         telegram = {"managed_bots": {"codex": {"token": "CODEX_TOKEN", "enabled": True}}}
         send_notice = Mock(return_value={"ok": True, "message_id": "2002"})
@@ -166,6 +169,7 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
             "status_marker_bot_kind": "manager",
             "status_marker_bot_kind_retry_kind": "codex",
             "status_marker_bot_kind_retry_at": herdres.utc_now(),
+            "managed_voice_active": True,
         }
         telegram = {"managed_bots": {"codex": {"token": "CODEX_TOKEN", "enabled": True}}}
         send_notice = Mock(return_value={"ok": True, "message_id": "2002"})
@@ -397,7 +401,9 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
         send_notice = Mock(return_value={"ok": True, "message_id": "9001"})
         counters = {"sends": 0}
 
-        with patch.object(herdres, "send_notice", send_notice), patch.object(herdres, "save_state", Mock()):
+        with patch.object(herdres, "send_notice", send_notice), patch.object(
+            herdres, "save_state", Mock()
+        ), patch.object(herdres, "MANAGED_BOTS_ENABLED", True):
             changed = herdres.ensure_managed_bot_group_access_message(
                 state,
                 "-1001",
