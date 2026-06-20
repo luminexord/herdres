@@ -72,7 +72,7 @@ HERDR_TOPIC_ICON_COLOR = int(os.getenv("HERDR_TELEGRAM_TOPICS_ICON_COLOR", DEFAU
 HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_EMOJI_ID", "").strip()
 STATUS_ICON_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "1")
 STATUS_ICON_CACHE_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON_CACHE_TTL", "86400"))
-STATUS_ICON_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON_RETRY", "90"))
+STATUS_ICON_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON_RETRY", "30"))
 STATUS_MARKER_SUPPRESS_WHEN_ICON_OK = parse_bool_env(
     "HERDR_TELEGRAM_TOPICS_STATUS_MARKER_SUPPRESS_WHEN_ICON_OK", "1"
 )
@@ -5477,13 +5477,20 @@ def update_topic_status_icon(
         return {"ok": False, "attempted": False, "kind": "no_icon", "icon_key": icon_key, "emoji": emoji}
     if str(entry.get("topic_status_icon_custom_emoji_id") or "") == icon_id:
         return {"ok": True, "attempted": False, "kind": "unchanged", "icon_key": icon_key, "emoji": emoji}
-    # Per-pane cooldown: once we change the icon for this pane, suppress all
-    # further changes for STATUS_ICON_RETRY_SECONDS regardless of target icon.
-    # This prevents the ⚡️↔☕️ oscillation that happens when an agent briefly
-    # pauses to output text during a working session (herdr reports "idle"
-    # for those pauses, causing the icon to flip every sync cycle).
+    # Directional cooldown: when an agent briefly pauses to output text during
+    # a working session, herdr reports "idle" for those pauses.  That causes
+    # the icon to flip working→idle→working every sync cycle.  Suppress only
+    # that working→idle transition for STATUS_ICON_RETRY_SECONDS after the
+    # last icon change.  All other transitions (idle→working, working→done,
+    # done→idle, any→blocked) are allowed immediately.
+    current_key = str(entry.get("topic_status_icon_key") or "")
     last_attempt = str(entry.get("last_topic_status_icon_attempt_at") or "")
-    if last_attempt and cache_fresh(last_attempt, STATUS_ICON_RETRY_SECONDS):
+    if (
+        current_key in {"working", "workflow"}
+        and icon_key in {"idle", "goal"}
+        and last_attempt
+        and cache_fresh(last_attempt, STATUS_ICON_RETRY_SECONDS)
+    ):
         return {"ok": False, "attempted": False, "kind": "retry_deferred", "icon_key": icon_key, "emoji": emoji}
     entry["last_topic_status_icon_attempt_key"] = f"{icon_id}:{icon_key}"
     entry["last_topic_status_icon_attempt_at"] = utc_now()
