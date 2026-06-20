@@ -643,7 +643,7 @@ class SharedTopicCommandTests(unittest.TestCase):
                     "topic_id": "77",
                     "pane_root_message_id": "1001",
                     "last_known_status": "working",
-                    "active_prompt": test_active_prompt({
+                    "active_prompt": active_prompt({
                         "id": "prompt1",
                         "text": "Question\nRun old pane?",
                         "choice_source": "explicit_block",
@@ -657,7 +657,7 @@ class SharedTopicCommandTests(unittest.TestCase):
                     "topic_id": "77",
                     "pane_root_message_id": "1002",
                     "last_known_status": "working",
-                    "active_prompt": test_active_prompt({
+                    "active_prompt": active_prompt({
                         "id": "prompt2",
                         "text": "Question\nRun new pane?",
                         "choice_source": "explicit_block",
@@ -5781,7 +5781,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             "pane_key": key,
             "pane_id": "pane-1",
             "topic_id": "77",
-            "active_prompt": test_active_prompt({
+            "active_prompt": active_prompt({
                 "id": "decision1",
                 "choice_source": "pending_decision",
                 "options": [{"number": "1", "label": "Old", "send_text": "1"}],
@@ -5959,7 +5959,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_routes_decision_send_text(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
+        state["panes"]["pane-1"]["active_prompt"] = active_prompt({
             "id": "decision1",
             "choice_source": "pending_decision",
             "options": [
@@ -5978,7 +5978,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_custom_decision_option_sets_force_reply(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
+        state["panes"]["pane-1"]["active_prompt"] = active_prompt({
             "id": "decision1",
             "choice_source": "pending_decision",
             "options": [
@@ -6000,7 +6000,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_detail_choice_with_send_text_waits_for_reply(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
+        state["panes"]["pane-1"]["active_prompt"] = active_prompt({
             "id": "decision1",
             "choice_source": "pending_decision",
             "options": [
@@ -6020,7 +6020,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_visible_custom_choice_waits_for_in_question_detail(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
+        state["panes"]["pane-1"]["active_prompt"] = active_prompt({
             "id": "prompt1",
             "choice_source": "visible_scrape",
             "options": [
@@ -6046,7 +6046,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_rejects_leftover_visible_choice_buttons_when_disabled(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
+        state["panes"]["pane-1"]["active_prompt"] = active_prompt({
             "id": "prompt1",
             "choice_source": "visible_scrape",
             "item": {"kind": "choices", "turn_id": "visible-choice:prompt1", "choice_source": "visible_scrape"},
@@ -6070,7 +6070,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_rejects_legacy_clean_feed_choice_buttons_when_disabled(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
+        state["panes"]["pane-1"]["active_prompt"] = active_prompt({
             "id": "prompt1",
             "choice_source": "legacy_clean_feed",
             "item": {"kind": "choices", "choice_source": "legacy_clean_feed"},
@@ -6091,7 +6091,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_rejects_legacy_choice_when_legacy_disabled_even_if_visible_enabled(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
+        state["panes"]["pane-1"]["active_prompt"] = active_prompt({
             "id": "prompt1",
             "choice_source": "legacy_clean_feed",
             "item": {"kind": "choices", "choice_source": "legacy_clean_feed"},
@@ -6221,7 +6221,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_bound_active_prompt_with_detail_survives_cleanup_until_expired(self) -> None:
         entry = {
-            "active_prompt": test_active_prompt({
+            "active_prompt": active_prompt({
                 "id": "decision1",
                 "choice_source": "pending_decision",
                 "decision_id": "turn:decision1",
@@ -6244,7 +6244,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_stale_visible_choice_callback_refreshes_current_prompt(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
+        state["panes"]["pane-1"]["active_prompt"] = active_prompt({
             "id": "oldprompt",
             "item": {"kind": "choices", "turn_id": "visible-choice:oldprompt"},
             "options": [{"number": "1", "label": "Old option"}],
@@ -7342,7 +7342,7 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         entry = {
             "pane_id": "pane-1",
             "topic_id": "77",
-            "active_prompt": test_active_prompt({
+            "active_prompt": active_prompt({
                 "id": "decision1",
                 "text": "How should I proceed?\n1) Build",
                 "choice_source": "pending_decision",
@@ -7406,7 +7406,7 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         entry = {
             "pane_id": "pane-1",
             "topic_id": "77",
-            "active_prompt": test_active_prompt({
+            "active_prompt": active_prompt({
                 "id": "decision1",
                 "text": "How should I proceed?\n1) Build",
                 "choice_source": "pending_decision",
@@ -7467,7 +7467,7 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         entry = {
             "pane_id": "pane-1",
             "topic_id": "77",
-            "active_prompt": test_active_prompt({
+            "active_prompt": active_prompt({
                 "id": "decision1",
                 "text": "How should I proceed?\n1) Build",
                 "choice_source": "pending_decision",
@@ -7517,7 +7517,7 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         entry = {
             "pane_id": "pane-1",
             "topic_id": "77",
-            "active_prompt": test_active_prompt({
+            "active_prompt": active_prompt({
                 "id": "decision1",
                 "text": "How should I proceed?\n1) Build",
                 "choice_source": "pending_decision",
@@ -7763,7 +7763,7 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         entry = {
             "pane_id": "pane-1",
             "topic_id": "77",
-            "active_prompt": test_active_prompt({
+            "active_prompt": active_prompt({
                 "id": "decision1",
                 "choice_source": "pending_decision",
                 "options": [{"number": "1", "label": "Build", "send_text": "1"}],
@@ -8283,7 +8283,7 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertTrue(lock.call_args.kwargs["blocking"])
 
 
-def test_active_prompt(prompt: dict, *, message_id: str = "555") -> dict:
+def active_prompt(prompt: dict, *, message_id: str = "555") -> dict:
     prompt.setdefault("message_id", message_id)
     prompt.setdefault("created_at", herdres.utc_now())
     return prompt
@@ -8302,7 +8302,7 @@ def callback_state() -> dict:
                 "pane_id": "pane-1",
                 "topic_id": "77",
                 "last_known_status": "working",
-                "active_prompt": test_active_prompt({
+                "active_prompt": active_prompt({
                     "id": "prompt1",
                     "text": "Question\nRun sync now?\n\n1) Run sync now\n4) Other with details",
                     "choice_source": "explicit_block",

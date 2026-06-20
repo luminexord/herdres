@@ -38,6 +38,16 @@ DEFAULT_OWNER_ID = ""
 DEFAULT_HERDR_BIN = "herdr"
 DEFAULT_HERDR_TOPIC_ICON_COLOR = "9367192"  # 0x8EEE98, one of Telegram's allowed forum-topic colors.
 
+
+def parse_bool_env(key: str, default: str = "1") -> bool:
+    """Parse a boolean environment variable.
+
+    Accepts 1/true/yes/on (case-insensitive) as truthy; everything else is
+    falsy. Centralizes the pattern repeated across feature flags.
+    """
+    return os.getenv(key, default).lower() in {"1", "true", "yes", "on"}
+
+
 MAX_CREATES_PER_RUN = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_CREATES", "3"))
 MAX_SENDS_PER_RUN = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_SENDS", "8"))
 MAX_STATUS_MARKERS_PER_RUN = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_STATUS_MARKERS", "8"))
@@ -60,25 +70,19 @@ TOPIC_VERIFY_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_VERIFY_TTL", "90
 MAX_TOPIC_VERIFIES_PER_RUN = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_VERIFIES", "3"))
 HERDR_TOPIC_ICON_COLOR = int(os.getenv("HERDR_TELEGRAM_TOPICS_ICON_COLOR", DEFAULT_HERDR_TOPIC_ICON_COLOR))
 HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_EMOJI_ID", "").strip()
-STATUS_ICON_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "1").lower() in {"1", "true", "yes", "on"}
+STATUS_ICON_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "1")
 STATUS_ICON_CACHE_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON_CACHE_TTL", "86400"))
 STATUS_ICON_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON_RETRY", "90"))
-STATUS_MARKER_SUPPRESS_WHEN_ICON_OK = os.getenv(
-    "HERDR_TELEGRAM_TOPICS_STATUS_MARKER_SUPPRESS_WHEN_ICON_OK",
-    "1",
-).lower() in {"1", "true", "yes", "on"}
-CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
-TURN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_TURN_FEED", "1").lower() in {"1", "true", "yes", "on"}
-STREAMING_DRAFTS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STREAMING", "1").lower() in {"1", "true", "yes", "on"}
+STATUS_MARKER_SUPPRESS_WHEN_ICON_OK = parse_bool_env(
+    "HERDR_TELEGRAM_TOPICS_STATUS_MARKER_SUPPRESS_WHEN_ICON_OK", "1"
+)
+CLEAN_FEED_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1")
+TURN_FEED_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_TURN_FEED", "1")
+STREAMING_DRAFTS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STREAMING", "1")
 STREAM_MIN_INTERVAL_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_STREAM_MIN_INTERVAL", "2"))
 STREAM_MIN_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STREAM_MIN_CHARS", "80"))
 MAX_STREAM_DRAFTS = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_DRAFTS", "8"))
-MANAGED_BOTS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+MANAGED_BOTS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
 MANAGER_BOT_KIND = "manager"
 MANAGED_BOT_ROUTE_KIND_FIELDS = (
     "pane_root_bot_kind",
@@ -88,58 +92,18 @@ MANAGED_BOT_ROUTE_KIND_FIELDS = (
     "last_prompt_bot_kind",
 )
 MANAGED_BOT_REISSUE_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOT_REISSUE_RETRY_SECONDS", "300"))
-RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
+RICH_MESSAGES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1")
 RICH_BAD_REQUEST_LIMIT = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_BAD_REQUEST_LIMIT", "3"))
-LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "0").lower() in {"1", "true", "yes", "on"}
-STATUS_MARKER_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "0").lower() in {"1", "true", "yes", "on"}
-PANE_ROOT_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES", "0").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-PINNED_STATUS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_PINNED_STATUS", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-VISIBLE_CHOICE_BUTTONS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS", "0").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-VISIBLE_READONLY_PROMPTS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_READONLY_PROMPTS", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-LEGACY_CHOICES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES", "0").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-STRUCTURED_INTERACTIONS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STRUCTURED_INTERACTIONS", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-STATUS_MARKER_DELETE_OLD = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "0").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+LIVE_CARD_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "0")
+STATUS_MARKER_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "0")
+PANE_ROOT_MESSAGES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES", "0")
+PINNED_STATUS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_PINNED_STATUS", "1")
+VISIBLE_CHOICE_BUTTONS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS", "0")
+VISIBLE_READONLY_PROMPTS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_VISIBLE_READONLY_PROMPTS", "1")
+LEGACY_CHOICES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES", "0")
+STRUCTURED_INTERACTIONS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STRUCTURED_INTERACTIONS", "1")
+STATUS_MARKER_DELETE_OLD = parse_bool_env("HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD", "1")
+ALLOW_UNBOUNDED_REPORTS = parse_bool_env("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "0")
 RICH_RENDER_VERSION = 20
 USER_PROMPT_LABEL = "User:"
 WORKLOG_LABEL = "Worklog"
@@ -174,12 +138,7 @@ ATTACHMENT_READ_TIMEOUT = int(os.getenv("HERDR_TELEGRAM_TOPICS_ATTACHMENT_READ_T
 ATTACHMENT_CHUNK_BYTES = 65536
 ATTACHMENT_KEEP_PER_PANE = int(os.getenv("HERDR_TELEGRAM_TOPICS_ATTACHMENT_KEEP", "20"))
 VISIBLE_CHOICE_SELECT_MODE = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_SELECT_MODE", "number").strip().lower()
-VISIBLE_CHOICE_NUMBER_ENTER = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_NUMBER_ENTER", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+VISIBLE_CHOICE_NUMBER_ENTER = parse_bool_env("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_NUMBER_ENTER", "1")
 VISIBLE_CHOICE_VERIFY_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_VERIFY_SECONDS", "2.5"))
 EVENT_SETTLE_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_SECONDS", "4"))
 EVENT_SETTLE_INTERVAL_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_INTERVAL", "0.75"))
@@ -313,13 +272,7 @@ MANAGED_BOT_SPECS: dict[str, dict[str, Any]] = {
         "aliases": ("devin", "cognition"),
     },
 }
-NEW_PANE_AGENT_COMMANDS = {
-    "codex": "codex",
-    "claude": "claude",
-    "kimi": "kimi",
-    "omp": "omp",
-    "devin": "devin",
-}
+NEW_PANE_AGENT_COMMANDS = {kind: kind for kind in MANAGED_BOT_SPECS}
 CODE_FILE_EXTENSIONS = ("py", "json", "toml", "service", "timer", "sh", "md", "txt", "yaml", "yml")
 PATH_OR_SYMBOL_FILE_EXTENSIONS = (
     "py", "js", "ts", "tsx", "jsx", "json", "md", "txt", "yaml", "yml", "toml", "sh", "service", "timer"
@@ -469,8 +422,8 @@ def initial_state() -> dict[str, Any]:
     ]
     return {
         "version": 1,
-        "enabled": os.getenv("HERDR_TELEGRAM_TOPICS_ENABLED", "1").lower() in {"1", "true", "yes", "on"},
-        "plugin_event_enabled": os.getenv("HERDR_TELEGRAM_TOPICS_PLUGIN_EVENTS", "1").lower() in {"1", "true", "yes", "on"},
+        "enabled": parse_bool_env("HERDR_TELEGRAM_TOPICS_ENABLED", "1"),
+        "plugin_event_enabled": parse_bool_env("HERDR_TELEGRAM_TOPICS_PLUGIN_EVENTS", "1"),
         "telegram": {
             "chat_id": os.getenv("HERDR_TELEGRAM_TOPICS_CHAT_ID", DEFAULT_CHAT_ID),
             "general_thread_id": os.getenv("HERDR_TELEGRAM_TOPICS_GENERAL_THREAD_ID", DEFAULT_GENERAL_THREAD_ID),
@@ -6020,7 +5973,7 @@ def telegram_token() -> str:
 
 
 def dry_run_enabled() -> bool:
-    return os.getenv("HERDR_TELEGRAM_TOPICS_DRY_RUN", "").lower() in {"1", "true", "yes", "on"}
+    return parse_bool_env("HERDR_TELEGRAM_TOPICS_DRY_RUN", "")
 
 
 def dry_run_result(method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -6056,6 +6009,32 @@ def dry_run_result(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "result": True}
 
 
+def _parse_telegram_response(method: str, body: str, *, http_code: int | None = None) -> dict[str, Any]:
+    """Decode a Telegram API response body and raise on failure.
+
+    Shared by telegram_api and telegram_api_multipart so both paths classify
+    429 rate limits, surface description text, and reject non-ok payloads the
+    same way. When http_code is given the body came from an HTTPError.
+    """
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        if http_code is not None:
+            raise BridgeError(f"Telegram {method} failed: HTTP {http_code}") from None
+        raise BridgeError(f"Telegram {method} failed: invalid JSON") from None
+    params = parsed.get("parameters") or {}
+    if http_code == 429 and params.get("retry_after"):
+        raise RateLimited(int(params["retry_after"]))
+    if http_code is not None:
+        desc = sanitize_text(str(parsed.get("description") or f"HTTP {http_code}"), 500)
+        raise BridgeError(f"Telegram {method} failed: {desc}")
+    if not parsed.get("ok"):
+        if params.get("retry_after"):
+            raise RateLimited(int(params["retry_after"]))
+        raise BridgeError(f"Telegram {method} failed: {sanitize_text(str(parsed.get('description')), 500)}")
+    return parsed
+
+
 def telegram_api(method: str, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
     if dry_run_enabled():
         return dry_run_result(method, payload)
@@ -6068,27 +6047,10 @@ def telegram_api(method: str, payload: dict[str, Any], *, token: str | None = No
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(body)
-        except Exception:
-            raise BridgeError(f"Telegram {method} failed: HTTP {exc.code}") from exc
-        params = parsed.get("parameters") or {}
-        if exc.code == 429 and params.get("retry_after"):
-            raise RateLimited(int(params["retry_after"])) from exc
-        desc = sanitize_text(str(parsed.get("description") or f"HTTP {exc.code}"), 500)
-        raise BridgeError(f"Telegram {method} failed: {desc}") from exc
+        return _parse_telegram_response(method, body, http_code=exc.code)
     except Exception as exc:
         raise BridgeError(f"Telegram {method} failed: {exc}") from exc
-    try:
-        parsed = json.loads(body)
-    except Exception as exc:
-        raise BridgeError(f"Telegram {method} failed: invalid JSON") from exc
-    if not parsed.get("ok"):
-        params = parsed.get("parameters") or {}
-        if params.get("retry_after"):
-            raise RateLimited(int(params["retry_after"]))
-        raise BridgeError(f"Telegram {method} failed: {sanitize_text(str(parsed.get('description')), 500)}")
-    return parsed
+    return _parse_telegram_response(method, body)
 
 
 def telegram_api_multipart(
@@ -6144,24 +6106,10 @@ def telegram_api_multipart(
             response_body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         response_body = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(response_body)
-        except Exception:
-            raise BridgeError(f"Telegram {method} failed: HTTP {exc.code}") from exc
-        params = parsed.get("parameters") or {}
-        if exc.code == 429 and params.get("retry_after"):
-            raise RateLimited(int(params["retry_after"])) from exc
-        desc = sanitize_text(str(parsed.get("description") or f"HTTP {exc.code}"), 500)
-        raise BridgeError(f"Telegram {method} failed: {desc}") from exc
+        return _parse_telegram_response(method, response_body, http_code=exc.code)
     except Exception as exc:
         raise BridgeError(f"Telegram {method} failed: {exc}") from exc
-    parsed = json.loads(response_body)
-    if not parsed.get("ok"):
-        params = parsed.get("parameters") or {}
-        if params.get("retry_after"):
-            raise RateLimited(int(params["retry_after"]))
-        raise BridgeError(f"Telegram {method} failed: {sanitize_text(str(parsed.get('description')), 500)}")
-    return parsed
+    return _parse_telegram_response(method, response_body)
 
 
 def telegram_api_for_token(method: str, payload: dict[str, Any], api_token: str | None) -> dict[str, Any]:
@@ -8883,7 +8831,7 @@ def sync_once() -> dict[str, Any]:
     telegram, chat_id = configure_telegram_state(state)
 
     all_panes = pane_list()
-    include_shells = os.getenv("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "").lower() in {"1", "true", "yes", "on"}
+    include_shells = parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "")
     panes = [pane for pane in all_panes if include_shells or pane.get("agent")]
     live_keys = {pane_key(pane) for pane in panes}
     sends = 0
