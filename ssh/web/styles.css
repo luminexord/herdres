@@ -170,12 +170,13 @@ body {
 
 .head__status {
   flex: 0 0 auto;
-  display: none;
-  width: 8px;
-  height: 8px;
+  display: block;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--done);
   box-shadow: 0 0 0 2px rgba(94, 100, 114, 0.14);
+  flex-shrink: 0;
 }
 
 .head--green .head__status {
@@ -205,6 +206,41 @@ body {
   box-shadow: inset 0 -2px 0 var(--lantern);
 }
 
+/* agent badge — colored initial for quick visual identification */
+.head__agent {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 4px;
+  font-family: 'Space Mono', monospace;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+.agent--codex { background: rgba(110, 139, 181, 0.2); color: #8aa6cc; }
+.agent--claude { background: rgba(232, 161, 75, 0.18); color: var(--lantern); }
+.agent--devin { background: rgba(136, 160, 126, 0.18); color: #9db594; }
+.agent--kimi { background: rgba(176, 126, 160, 0.2); color: #c99bbc; }
+.agent--omp { background: rgba(121, 169, 162, 0.18); color: #96c2ba; }
+
+/* pane count on space buttons */
+.head__count {
+  flex: 0 0 auto;
+  font-family: 'Space Mono', monospace;
+  font-size: 10px;
+  color: var(--done);
+  margin-left: 2px;
+}
+.head--focused .head__count {
+  color: var(--bone-dim);
+}
+
 /* --- the screen ---------------------------------------------------------- */
 .screen {
   background: var(--field-deep);
@@ -220,10 +256,6 @@ body {
 }
 
 @media (pointer: coarse) {
-  .head__status {
-    display: block;
-  }
-
   .screen {
     padding-right: 52px;
   }

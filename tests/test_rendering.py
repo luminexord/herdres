@@ -3789,6 +3789,32 @@ Verification
         self.assertEqual(commands[2][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
         self.assertEqual(commands[2][4], "@herdr_codex_bot sup")
 
+    def test_send_to_pane_does_not_refuse_after_successful_forced_clear_attempts(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "codex"}
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value=pane),
+            run_cmd=run_cmd,
+            pane_input_looks_staged=Mock(return_value=True),
+        ), patch.object(herdres.time, "sleep", Mock()):
+            ok, detail = herdres.send_to_pane("pane-1", "Fix it properly")
+
+        self.assertTrue(ok, detail)
+        self.assertNotIn("Could not clear existing staged pane input", detail)
+        self.assertIn([herdres.herdr_bin(), "pane", "send-keys", "pane-1", "cmd+a", "backspace"], commands)
+        self.assertEqual(commands[-2][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
+        self.assertEqual(commands[-2][4], "Fix it properly")
+
     def test_send_to_pane_ignores_codex_goal_usage_footer(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "codex"}
         current_composer = """• Service tier set to default

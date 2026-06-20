@@ -4,6 +4,7 @@
 import { installTerminalTouchScrolling } from './touch-scroll.js';
 import { renderSpacePaneNavigation } from './navigation.js';
 import { hasCoarsePointer, shouldAutoFocusTerminal } from './focus-policy.js';
+import * as spacePanesModule from './space-panes.js';
 import { focusPaneInStatus } from './space-panes.js';
 import { recoverTerminalAfterFit } from './terminal-recovery.js';
 import { installScrollJoystick } from './scroll-joystick.js';
@@ -241,6 +242,43 @@ import { installScrollJoystick } from './scroll-joystick.js';
       },
     });
   }
+
+  // --- keyboard shortcuts (desktop) ---------------------------------------
+  function cyclePane(direction) {
+    const { panesForSpace, paneSpaceId } = spacePanesModule;
+    const panes = latestStatus.panes || [];
+    const visible = panes.filter((p) => paneSpaceId(p) === selectedSpace);
+    if (!visible.length) return;
+    const focusedIdx = visible.findIndex((p) => p.focused);
+    const nextIdx = (focusedIdx + direction + visible.length) % visible.length;
+    const target = visible[nextIdx];
+    if (target) {
+      latestStatus = focusPaneInStatus(latestStatus, target.id);
+      renderNavigation();
+      sendControl({ t: 'focus', id: target.id });
+    }
+  }
+
+  function focusSpaceByIndex(index) {
+    const { normalizeSpaces } = spacePanesModule;
+    const panes = latestStatus.panes || [];
+    const allSpaces = normalizeSpaces({ spaces: latestStatus.spaces || [], panes });
+    if (index >= 0 && index < allSpaces.length) {
+      const space = allSpaces[index];
+      selectedSpace = space.id;
+      sendControl({ t: 'focus_space', id: space.id });
+      renderNavigation();
+    }
+  }
+
+  document.addEventListener('keydown', (ev) => {
+    if (ev.target !== document.body && ev.target !== screen) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    if (ev.key === '[') { cyclePane(-1); ev.preventDefault(); return; }
+    if (ev.key === ']') { cyclePane(1); ev.preventDefault(); return; }
+    const digit = parseInt(ev.key, 10);
+    if (digit >= 1 && digit <= 9) { focusSpaceByIndex(digit - 1); ev.preventDefault(); return; }
+  });
 
   // --- key bar ------------------------------------------------------------
   function armCtrl() {
