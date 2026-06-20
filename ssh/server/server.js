@@ -248,6 +248,17 @@ wss.on('connection', (ws) => {
         runHerdrControl(['agent', 'focus', String(msg.id)]);
       } else if (msg.t === 'scroll') {
         scrollWriter.write(msg);
+      } else if (msg.t === 'image' && msg.data && msg.ext) {
+        const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        const filename = `cockpit-${id}.${String(msg.ext).replace(/[^a-z0-9]/gi, '')}`;
+        const filepath = path.join(os.tmpdir(), filename);
+        try {
+          fs.writeFileSync(filepath, Buffer.from(msg.data, 'base64'));
+          log(`image saved: ${filepath} (${msg.data.length} bytes b64)`);
+          if (term) term.write(filepath + '\r\n');
+        } catch (e) {
+          log('image save failed:', e.message);
+        }
       }
       return;
     }

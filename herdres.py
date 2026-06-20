@@ -5646,6 +5646,21 @@ def pane_input_file_instruction(path: Path, text: str) -> str:
     )
 
 
+def is_staged_input_refusal(detail: str) -> bool:
+    lower = str(detail or "").lower()
+    return "staged pane input" in lower or "refusing to append telegram text" in lower
+
+
+def send_text_and_enter_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, str]:
+    text_proc = run_cmd([herdr_bin(), "pane", "send-text", pane_id, text], timeout=timeout)
+    if text_proc.returncode != 0:
+        return False, sanitize_text(text_proc.stderr or text_proc.stdout, 800)
+    enter_proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "enter"], timeout=timeout)
+    if enter_proc.returncode != 0:
+        return False, sanitize_text(enter_proc.stderr or enter_proc.stdout, 800)
+    return True, ""
+
+
 def send_to_pane(
     pane_id: str,
     text: str,
@@ -5668,7 +5683,13 @@ def send_to_pane(
         return False, clear_detail
     proc = run_cmd([herdr_bin(), "pane", "run", pane_id, outbound], timeout=timeout)
     if proc.returncode != 0:
-        return False, sanitize_text(proc.stderr or proc.stdout, 800)
+        detail = sanitize_text(proc.stderr or proc.stdout, 800)
+        if not is_staged_input_refusal(detail):
+            return False, detail
+        clear_ok, clear_detail = clear_staged_pane_input(pane_id, timeout=timeout, verify=False)
+        if not clear_ok:
+            return False, clear_detail
+        return send_text_and_enter_to_pane(pane_id, outbound, timeout=timeout)
     if submit_staged:
         submit_ok, submit_detail = submit_staged_pane_input_if_needed(pane_id, timeout=timeout)
         if not submit_ok:
@@ -5712,9 +5733,7 @@ CLEAR_STAGED_INPUT_FORCE_KEY_SEQUENCES = (
 CLEAR_STAGED_INPUT_POLL_DELAYS = (0.1, 0.2, 0.35, 0.6)
 
 
-def clear_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:
-    if not pane_input_looks_staged(pane_id):
-        return True, ""
+def clear_staged_pane_input(pane_id: str, *, timeout: int = 8, verify: bool = True) -> tuple[bool, str]:
     last_error = ""
     successful_clear_attempt = False
     for keys in CLEAR_STAGED_INPUT_KEY_SEQUENCES + CLEAR_STAGED_INPUT_FORCE_KEY_SEQUENCES:
@@ -5723,13 +5742,20 @@ def clear_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tupl
             last_error = sanitize_text(proc.stderr or proc.stdout, 800)
             continue
         successful_clear_attempt = True
-        for delay in CLEAR_STAGED_INPUT_POLL_DELAYS:
-            time.sleep(delay)
-            if not pane_input_looks_staged(pane_id):
-                return True, ""
+        if verify:
+            for delay in CLEAR_STAGED_INPUT_POLL_DELAYS:
+                time.sleep(delay)
+                if not pane_input_looks_staged(pane_id):
+                    return True, ""
     if last_error and not successful_clear_attempt:
         return False, last_error
     return True, ""
+
+
+def clear_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:
+    if not pane_input_looks_staged(pane_id):
+        return True, ""
+    return clear_staged_pane_input(pane_id, timeout=timeout)
 
 
 def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:

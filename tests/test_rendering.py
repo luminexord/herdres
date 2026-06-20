@@ -3815,6 +3815,37 @@ Verification
         self.assertEqual(commands[-2][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
         self.assertEqual(commands[-2][4], "Fix it properly")
 
+    def test_send_to_pane_falls_back_when_pane_run_reports_staged_input(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "codex"}
+        commands = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            if args[:4] == [herdres.herdr_bin(), "pane", "run", "pane-1"]:
+                proc.returncode = 1
+                proc.stdout = ""
+                proc.stderr = "Could not clear existing staged pane input; refusing to append Telegram text."
+                return proc
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+            return proc
+
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value=pane),
+            run_cmd=run_cmd,
+            pane_input_looks_staged=Mock(return_value=False),
+        ), patch.object(herdres.time, "sleep", Mock()):
+            ok, detail = herdres.send_to_pane("pane-1", "Fix it properly")
+
+        self.assertTrue(ok, detail)
+        self.assertNotIn("Could not clear existing staged pane input", detail)
+        self.assertIn([herdres.herdr_bin(), "pane", "send-keys", "pane-1", "cmd+a", "backspace"], commands)
+        self.assertIn([herdres.herdr_bin(), "pane", "send-text", "pane-1", "Fix it properly"], commands)
+        self.assertEqual(commands[-1], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "enter"])
+
     def test_send_to_pane_ignores_codex_goal_usage_footer(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "codex"}
         current_composer = """• Service tier set to default

@@ -245,10 +245,17 @@ body {
 .screen {
   background: var(--field-deep);
   overflow: hidden;
-  padding: 4px 6px 0;
+  padding: 0;
+}
+.screen .xterm,
+.screen .xterm .xterm-viewport,
+.screen .xterm .xterm-screen {
+  padding: 0 !important;
+  margin: 0 !important;
 }
 .screen .xterm {
   height: 100%;
+  width: 100%;
 }
 
 .scroll-joy {
@@ -256,14 +263,10 @@ body {
 }
 
 @media (pointer: coarse) {
-  .screen {
-    padding-right: 52px;
-  }
-
   .scroll-joy {
     position: fixed;
     right: 8px;
-    bottom: calc(var(--safe-b) + 58px);
+    bottom: calc(var(--safe-b) + 78px);
     z-index: 4;
     display: grid;
     grid-template-rows: 42px 18px 42px;
@@ -354,6 +357,22 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+.key--icon {
+  flex: 0 0 auto;
+  display: none;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 36px;
+  text-align: center;
+  color: var(--bone);
+}
+.bar--input.keyboard-open .key--icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
 .key--small {
   flex: 0 0 auto;
   min-width: 36px;
@@ -372,6 +391,10 @@ body {
   gap: 6px;
   padding: 6px 10px calc(var(--safe-b) + 6px);
   border-top-width: 1px;
+  align-items: center;
+}
+.bar--input .text-input:focus + .key--send {
+  border-color: var(--lantern);
 }
 .text-input {
   flex: 1 1 auto;

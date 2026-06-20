@@ -25,7 +25,11 @@ import { installScrollJoystick } from './scroll-joystick.js';
   const keys = $('keys');
   const textInput = $('text-input');
   const kSend = $('k-send');
+  const kKeyboard = $('k-keyboard');
+  const inputRow = $('input-row');
   const kSelect = $('k-select');
+  const kImage = $('k-image');
+  const imageFile = $('image-file');
   const selectOverlay = $('select-overlay');
   const selectText = $('select-text');
   const kSelectDone = $('k-select-done');
@@ -317,15 +321,12 @@ import { installScrollJoystick } from './scroll-joystick.js';
       ctrlArmed ? disarmCtrl() : armCtrl();
       return;
     }
-    if (btn.dataset.action === 'paste') {
-      navigator.clipboard.readText().then((text) => {
-        if (text) sendInput(text);
-      }).catch(() => {});
-      focusTerminalIfAppropriate();
-      return;
-    }
     if (btn.dataset.action === 'select') {
       toggleSelectOverlay();
+      return;
+    }
+    if (btn.dataset.action === 'image') {
+      imageFile.click();
       return;
     }
     let out = seqFor(btn);
@@ -342,10 +343,19 @@ import { installScrollJoystick } from './scroll-joystick.js';
   function sendTextInput() {
     const text = textInput.value;
     if (!text) return;
-    sendInput(text + '\r');
+    sendInput(text + '\r\n');
     textInput.value = '';
+    focusTerminalIfAppropriate();
   }
   kSend.addEventListener('click', sendTextInput);
+  kKeyboard.addEventListener('click', () => {
+    textInput.blur();
+    if (tg && typeof tg.hideKeyboard === 'function') {
+      try { tg.hideKeyboard(); } catch {}
+    }
+  });
+  textInput.addEventListener('focus', () => inputRow.classList.add('keyboard-open'));
+  textInput.addEventListener('blur', () => inputRow.classList.remove('keyboard-open'));
   textInput.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') {
       ev.preventDefault();
@@ -353,12 +363,25 @@ import { installScrollJoystick } from './scroll-joystick.js';
     }
   });
 
+  // --- image upload --------------------------------------------------------
+  imageFile.addEventListener('change', () => {
+    const file = imageFile.files && imageFile.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const b64 = btoa(String.fromCharCode(...new Uint8Array(reader.result)));
+      const ext = file.name.split('.').pop() || 'jpg';
+      sendControl({ t: 'image', ext, data: b64 });
+    };
+    reader.readAsArrayBuffer(file);
+    imageFile.value = '';
+  });
+
   // --- select overlay (native text copy) ----------------------------------
   function toggleSelectOverlay() {
     if (selectOverlay.hidden) {
-      selectText.textContent = term.buffer.active
-        ? serializeTerminal(term)
-        : '';
+      const text = serializeTerminal(term);
+      selectText.textContent = text || '(terminal is empty)';
       selectOverlay.hidden = false;
       kSelect.classList.add('key--active');
     } else {
@@ -369,17 +392,26 @@ import { installScrollJoystick } from './scroll-joystick.js';
   kSelectDone.addEventListener('click', toggleSelectOverlay);
 
   function serializeTerminal(t) {
-    const buf = t.buffer.active;
-    const lines = [];
-    for (let i = 0; i < buf.length; i++) {
-      const line = buf.getLine(i);
-      if (!line) continue;
-      let text = line.translateToString(true);
-      if (text.trim()) lines.push(text.replace(/\s+$/, ''));
+    try {
+      const buf = t.buffer.active;
+      if (!buf || typeof buf.length !== 'number') return '';
+      const lines = [];
+      for (let i = 0; i < buf.length; i++) {
+        const line = buf.getLine(i);
+        if (!line) continue;
+        let text = '';
+        try {
+          text = line.translateToString(true);
+        } catch {
+          continue;
+        }
+        if (text.trim()) lines.push(text.replace(/\s+$/, ''));
+      }
+      while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+      return lines.join('\n');
+    } catch {
+      return '';
     }
-    // Trim trailing empty lines
-    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
-    return lines.join('\n');
   }
 
   // --- go -----------------------------------------------------------------
