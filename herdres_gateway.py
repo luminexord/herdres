@@ -30,6 +30,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 from herdres_routing import attachment_payload_dict, is_forwarded_dict, message_thread_id_dict
@@ -71,9 +72,6 @@ MANAGED_BOT_KEY_RE = re.compile(r"^managed-([a-z0-9_]+)-")
 MANAGED_BOT_MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,64})")
 
 LONG_POLL_SECONDS = int(os.getenv("HERDRES_GATEWAY_LONG_POLL_SECONDS", "50"))
-MANAGER_POLL_WITH_CHILDREN_SECONDS = int(
-    os.getenv("HERDRES_GATEWAY_MANAGER_POLL_SECONDS", "1")
-)
 CHILD_POLL_SECONDS = int(os.getenv("HERDRES_GATEWAY_CHILD_POLL_SECONDS", "0"))
 SOCKET_TIMEOUT = LONG_POLL_SECONDS + 15
 COMMAND_TIMEOUT = 30
@@ -107,10 +105,12 @@ TRACE_PATH = Path(
 
 def _emit(line: str) -> None:
     # stdout (may be block-buffered under launchd) + an always-flushed trace file.
-    print(line, flush=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stamped = f"[{ts}] {line}"
+    print(stamped, flush=True)
     try:
         with open(TRACE_PATH, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+            fh.write(stamped + "\n")
     except Exception:
         pass
 
