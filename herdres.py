@@ -100,6 +100,10 @@ LIVE_CARD_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "0")
 STATUS_MARKER_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "0")
 PANE_ROOT_MESSAGES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES", "0")
 PINNED_STATUS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_PINNED_STATUS", "1")
+# Per-agent topic grouping is read at runtime via per_agent_topics_enabled(),
+# NOT as an import-time constant: the Herdr plugin and bare CLI invocations have
+# no systemd EnvironmentFile, so the flag must be read after load_dotenv() runs
+# (see per_agent_topics_enabled()).
 VISIBLE_CHOICE_BUTTONS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS", "0")
 VISIBLE_READONLY_PROMPTS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_VISIBLE_READONLY_PROMPTS", "1")
 LEGACY_CHOICES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES", "0")
@@ -406,6 +410,19 @@ def _load_dotenv_file(path: Path) -> None:
                 os.environ[key] = value
     except OSError:
         return
+
+
+def per_agent_topics_enabled() -> bool:
+    """Whether to map one Telegram topic per Herdr agent (pane) instead of per space.
+
+    Read at call time rather than frozen as an import-time constant. Entry points
+    (sync_once/event_once/command/callback/...) call load_dotenv() before touching
+    grouping logic, so this reflects herdres.env even when the process has no
+    systemd EnvironmentFile (the Herdr plugin runs `herdres event` directly). A
+    module-level constant would be False under the plugin and would flip topic
+    grouping back to per-space, collapsing all agents onto one topic.
+    """
+    return os.getenv("HERDR_TELEGRAM_TOPICS_PER_AGENT", "0").lower() in {"1", "true", "yes", "on"}
 
 
 def state_path() -> Path:
@@ -1272,6 +1289,14 @@ def _space_component(value: str) -> str:
 
 
 def space_key(pane: dict[str, Any]) -> str:
+    if per_agent_topics_enabled():
+        # One topic per Herdr agent: group by the stable pane id (which both live
+        # panes and the reconstructed pane_like dicts in migrate carry), not by
+        # pane_key, whose digest folds in terminal_id that migrate does not have.
+        pane_id = _space_component(str(pane.get("pane_id") or ""))
+        if pane_id:
+            return f"agent:{pane_id}"
+        return f"agent:{pane_key(pane)}"
     explicit_space = _space_component(str(pane.get("space_id") or ""))
     if explicit_space:
         return f"space:{explicit_space}"
@@ -1291,7 +1316,29 @@ def clean_space_topic_title(value: str, *, fallback: str = "Herdr Space") -> str
     return text[:32].strip() or fallback
 
 
+def agent_topic_name_for_pane(pane: dict[str, Any]) -> str:
+    # Per-agent topic title. A manual pane label is the user's explicit intent,
+    # so it wins; otherwise name the topic "<agent> · <folder>".
+    manual = pane_manual_label(pane)
+    if manual:
+        labelled = topic_name_from_pane_label(manual)
+        if labelled:
+            return labelled
+    agent = str(pane.get("agent") or "").strip().lower()
+    cwd_value = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
+    folder = sanitize_text(Path(cwd_value).name if cwd_value else "", 40).strip()
+    if agent and folder:
+        return f"{agent} · {folder}"[:60]
+    if agent:
+        return agent
+    if folder:
+        return folder
+    return "Herdr Agent"
+
+
 def space_name_for_pane(pane: dict[str, Any]) -> str:
+    if per_agent_topics_enabled():
+        return agent_topic_name_for_pane(pane)
     explicit_name = clean_space_topic_title(
         str(pane.get("space_name") or pane.get("workspace_label") or pane.get("workspace_name") or ""),
         fallback="",
@@ -4868,6 +4915,99 @@ def clear_entry_topic_mapping(state: dict[str, Any], entry: dict[str, Any], reas
     clear_topic_mapping(entry, reason)
 
 
+# Topic-mapping fields cleared from a pane entry on a grouping-mode switch so
+# fresh topics are created from scratch (clean slate). Pane identity is kept.
+_GROUPING_RESET_ENTRY_FIELDS = (
+    "topic_id",
+    "space_key",
+    "topic_name",
+    "legacy_topic_name",
+    "topic_title_source",
+    "card_message_id",
+    "card_hash",
+    "card_status_hash",
+    "card_format",
+    "status_marker_message_id",
+    "status_marker_hash",
+    "status_marker_text",
+    "status_marker_sent_at",
+    "last_status_hash",
+    "last_notified_status",
+    "last_sent_at",
+    "last_topic_verified_at",
+    "last_topic_verify_attempt_at",
+    "last_topic_verify_error",
+    "last_topic_verify_error_at",
+    "topic_rename_pending_at",
+    "topic_rename_from",
+    "topic_rename_to",
+    "topic_missing_at",
+    "topic_missing_id",
+    "topic_missing_reason",
+    "pane_root_message_id",
+    "pane_root_message_sent_at",
+    "pane_root_message_error",
+    "pane_root_message_missing_at",
+    "pane_root_message_missing_id",
+    "pane_root_message_missing_reason",
+    # Status-icon cache: if left set, ensure_topic_status_icon() short-circuits
+    # as "unchanged" and the freshly created topic never gets its icon.
+    "topic_status_icon_key",
+    "topic_status_icon_emoji",
+    "topic_status_icon_custom_emoji_id",
+    "topic_status_icon_updated_at",
+    # Last-prompt / last-message caches reference message ids in the old topic;
+    # clearing them lets the new topic re-post the active prompt and re-anchor.
+    "last_prompt_message_id",
+    "last_prompt_hash",
+    "last_prompt_turn_id",
+    "last_prompt_bot_kind",
+    "last_pane_message_id",
+    "legacy_topic_id",
+)
+
+
+def reset_topic_grouping(state: dict[str, Any], mode: str, reason: str = "") -> None:
+    """Clean-slate reset when the topic grouping mode changes.
+
+    Drops every space->topic mapping (which also clears per-space pinned-status
+    message ids and message routes) and every pane entry's topic linkage, so the
+    next sync recreates topics for the new grouping. The old Telegram topics are
+    left untouched on Telegram's side; Herdres simply forgets them.
+    """
+    state["spaces"] = {}
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    for entry in panes.values():
+        if not isinstance(entry, dict):
+            continue
+        for field in _GROUPING_RESET_ENTRY_FIELDS:
+            entry.pop(field, None)
+        clear_clean_feed_state(entry)
+        clear_stream_state(entry)
+    state["topic_grouping_mode"] = mode
+    state["topic_grouping_reset_at"] = utc_now()
+    if reason:
+        state["topic_grouping_reset_reason"] = sanitize_text(reason, 200)
+
+
+def reconcile_topic_grouping(state: dict[str, Any]) -> bool:
+    """Ensure state matches the configured topic grouping mode; reset on change.
+
+    Called by every entry point that can create or adopt topics (sync_once and
+    event_once) so a flag flip is honored no matter which path observes it first.
+    Without this in event_once, a plugin-triggered event after a mode change would
+    keep cross-wiring topics until a sync happened to run. Returns True if a
+    clean-slate reset fired. Relies on load_dotenv() having run first.
+    """
+    desired = "agent" if per_agent_topics_enabled() else "space"
+    if (str(state.get("topic_grouping_mode") or "space")) != desired:
+        reset_topic_grouping(state, desired, reason=f"grouping mode -> {desired}")
+        return True
+    if state.get("topic_grouping_mode") != desired:
+        state["topic_grouping_mode"] = desired
+    return False
+
+
 def choice_needs_detail(option: dict[str, str]) -> bool:
     if _boolish(option.get("needs_detail")):
         return True
@@ -5123,7 +5263,7 @@ def format_status(
             lines.append(tail)
     if include_commands:
         lines.append("")
-        lines.append("Commands: /status, /read [lines], /send <text>, /keys <keys>")
+        lines.append("Commands: /status, /read [lines], /send <text>, /send! <text>, /keys <keys>")
     return sanitize_text("\n".join(lines), max_chars=MAX_STATUS_CHARS)
 
 
@@ -5698,25 +5838,83 @@ def send_to_pane(
             return False, clear_detail
         return send_text_and_enter_to_pane(pane_id, outbound, timeout=timeout)
     if submit_staged:
-        submit_ok, submit_detail = submit_staged_pane_input_if_needed(pane_id, timeout=timeout)
+        submit_ok, submit_detail = submit_staged_pane_input_if_needed(
+            pane_id, timeout=timeout, agent_status=str(pane.get("agent_status") or "")
+        )
         if not submit_ok:
             return False, submit_detail
+        return True, submit_detail
     return True, ""
 
 
+def interrupt_and_send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, str]:
+    # Halt the agent's current turn (Esc) so the message runs now instead of
+    # queueing behind it, then deliver via the normal send path. Only interrupt a
+    # pane that is actually working — Esc on an idle pane is needless and, on
+    # Codex, pops its "edit previous message" recall preview.
+    pane = pane_by_id(pane_id)
+    if pane and str(pane.get("agent_status") or "").strip().lower() == "working":
+        run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "escape"], timeout=timeout)
+        for delay in (0.3, 0.5, 0.7, 1.0):
+            time.sleep(delay)
+            refreshed = pane_by_id(pane_id)
+            if not refreshed or str(refreshed.get("agent_status") or "").strip().lower() != "working":
+                break
+    return send_to_pane(pane_id, text, timeout=timeout)
+
+
+def interrupt_and_send_response(pane_id: str, text: str) -> dict[str, Any]:
+    outbound = str(text or "").strip()
+    if not outbound:
+        return {"handled": True, "reply": "Usage: /send! <instruction> — interrupts the current turn and sends now"}
+    ok, detail = interrupt_and_send_to_pane(pane_id, outbound)
+    if not ok:
+        return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
+    if detail:
+        # Esc didn't fully stop the turn — the message queued instead; say so.
+        return {"handled": True, "reply": sanitize_text(detail, 300)}
+    return {"handled": True, "reply": "⏹️ Interrupted the current turn and sent your message."}
+
+
+def pane_input_ansi(pane_id: str, *, lines: int = 16) -> str:
+    # Raw ANSI read (NOT via pane_output/sanitize_text, which strip escapes) so
+    # styling survives: Codex renders its empty-box placeholder suggestions in
+    # SGR "dim" (\x1b[2m), which is how we tell a placeholder from real input.
+    try:
+        raw = herdr_text(
+            ["pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", str(lines), "--format", "ansi"],
+            timeout=8,
+        )
+    except Exception:
+        return ""
+    try:
+        data = json.loads(raw)
+        return str(data.get("result", {}).get("text") or data.get("text") or raw)
+    except Exception:
+        return raw
+
+
 def pane_input_looks_staged(pane_id: str) -> bool:
-    raw = pane_output(pane_id, lines=16, max_chars=4000, source="recent-unwrapped")
-    if not raw.strip():
+    ansi_raw = pane_input_ansi(pane_id, lines=16)
+    if ansi_raw.strip():
+        ansi_lines = ansi_raw.splitlines()[-16:]
+    else:
+        # Fall back to the sanitized text read (no dim info) if ANSI is unavailable.
+        ansi_lines = pane_output(pane_id, lines=16, max_chars=4000, source="recent-unwrapped").splitlines()[-16:]
+    clean_lines = [ANSI_RE.sub("", str(line or "")).strip() for line in ansi_lines]
+    if not any(clean_lines):
         return False
-    lines = raw.splitlines()[-16:]
-    clean_lines = [ANSI_RE.sub("", str(line or "")).strip() for line in lines]
     if any(CODEX_GOAL_USAGE_FOOTER_RE.search(line) for line in clean_lines):
         return False
-    for line in reversed(lines):
-        clean = ANSI_RE.sub("", str(line or "")).strip()
+    for ansi_line, clean in zip(reversed(ansi_lines), reversed(clean_lines)):
         if PROMPT_PLACEHOLDER_RE.fullmatch(clean):
             return False
         if PROMPT_WITH_TEXT_RE.match(clean):
+            # A greyed placeholder suggestion (empty box) is rendered dim; real
+            # typed input is not. The truecolor background \x1b[48;2;…m is not the
+            # standalone dim code \x1b[2m, so this literal check is unambiguous.
+            if "\x1b[2m" in str(ansi_line):
+                return False
             return True
         if PROMPT_ONLY_RE.fullmatch(clean):
             return False
@@ -5765,7 +5963,7 @@ def clear_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tupl
     return clear_staged_pane_input(pane_id, timeout=timeout)
 
 
-def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:
+def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8, agent_status: str = "") -> tuple[bool, str]:
     # `herdr pane run` is *supposed* to submit the input itself, but in some TUI
     # states it leaves the text staged in the input box (we observed an inbound
     # Telegram message sitting in the box, never sent). Press Enter when we can
@@ -5782,7 +5980,24 @@ def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tup
         return True, ""
     proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "enter"], timeout=timeout)
     if proc.returncode != 0:
-        return False, sanitize_text(proc.stderr or proc.stdout, 800)
+        fallback = run_cmd([herdr_bin(), "pane", "send-text", pane_id, "\r"], timeout=timeout)
+        if fallback.returncode != 0:
+            detail = sanitize_text(proc.stderr or proc.stdout or fallback.stderr or fallback.stdout, 800)
+            return False, detail
+    # A zero return code only means the keystroke was delivered, not that the TUI
+    # accepted it as a submit (a raw "\r" via send-text in particular is ignored
+    # in some states). Confirm the input box actually cleared, polling to absorb
+    # render lag, so we never report success while the text still sits unsent.
+    for delay in (0.15, 0.35, 0.6):
+        time.sleep(delay)
+        if not pane_input_looks_staged(pane_id):
+            return True, ""
+    # Still staged. A working agent queues typed input and won't accept Enter as a
+    # submit until its turn finishes, so tell the sender it's queued (not lost).
+    # Otherwise trust the delivered Enter rather than refusing — Herdres does not
+    # refuse after a delivered submit.
+    if str(agent_status or "").strip().lower() == "working":
+        return True, "Queued — the agent is busy; your message will run when the current turn finishes."
     return True, ""
 
 
@@ -8227,6 +8442,10 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
         "agent": str(pane.get("agent") or ""),
         "workspace": str(pane.get("workspace_id") or ""),
         "tab": str(pane.get("tab_id") or ""),
+        # Persist the cwd so migrate_legacy_pane_topics() can reconstruct a
+        # faithful pane_like; per-agent topic names ("<agent> · <folder>") are
+        # derived from it and would degrade to a bare "<agent>" without it.
+        "foreground_cwd": str(pane.get("foreground_cwd") or pane.get("cwd") or ""),
     })
     manual_label = pane_manual_label(pane)
     previous_label = str(entry.get("pane_label_raw") or "")
@@ -9230,6 +9449,11 @@ def sync_once() -> dict[str, Any]:
         return {"ok": True, "changed": changed, "message": "disabled"}
     telegram, chat_id = configure_telegram_state(state)
 
+    # Switch topic grouping (per-space vs per-agent) cleanly: when the mode
+    # changes, forget all existing topic mappings so fresh topics are created.
+    if reconcile_topic_grouping(state):
+        changed = True
+
     panes = observed_agent_panes()
     closed_result = sync_closed_pane_records(
         state,
@@ -9501,13 +9725,17 @@ def event_once() -> dict[str, Any]:
         return {"ok": True, "changed": False, "message": "plugin events disabled"}
 
     telegram, chat_id = configure_telegram_state(state)
+    # Honor a topic-grouping flag flip even when a plugin event observes it first,
+    # so this path can never cross-wire topics against a stale grouping mode. A
+    # reset mutates (and we persist) state, so it counts toward `changed`.
+    grouping_reset = reconcile_topic_grouping(state)
     context = parse_plugin_json_env("HERDR_PLUGIN_CONTEXT_JSON")
     event = parse_plugin_json_env("HERDR_PLUGIN_EVENT_JSON")
     pane_id = event_pane_id(context, event)
     if not pane_id:
         state["last_plugin_event_missing_pane_at"] = utc_now()
         save_state(state)
-        return {"ok": True, "changed": False, "message": "no pane id in plugin event"}
+        return {"ok": True, "changed": grouping_reset, "message": "no pane id in plugin event"}
 
     pane = pane_by_id(pane_id)
     if not pane or not pane.get("agent"):
@@ -9518,7 +9746,7 @@ def event_once() -> dict[str, Any]:
         save_state(state)
         return {
             "ok": True,
-            "changed": False,
+            "changed": grouping_reset,
             "pane_id": pane_id,
             "message": "telegram preflight failed",
             "error": preflight_error,
@@ -9527,7 +9755,7 @@ def event_once() -> dict[str, Any]:
     counters = make_sync_counters()
     caps = make_sync_caps(event=True)
     attempts = 0
-    changed = False
+    changed = grouping_reset
     settle = should_settle_event(pane, context, event)
     deadline = time.monotonic() + max(0.0, EVENT_SETTLE_SECONDS)
     try:
@@ -9694,7 +9922,9 @@ def forward_text_to_pane_response(pane_id: str, text: str, *, usage: str = "") -
     ok, detail = send_to_pane(pane_id, outbound)
     if not ok:
         return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
-    return {"handled": True, "reply": ""}
+    # On a normal submit `detail` is empty (silent success); when the agent was
+    # busy it carries the "Queued …" note, which we surface so the sender knows.
+    return {"handled": True, "reply": sanitize_text(detail, 300)}
 
 
 def is_single_live_space_pane(state: dict[str, Any], chat_id: str, topic_id: str) -> bool:
@@ -9989,6 +10219,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 "/raw [lines] - sanitized raw visible output\n"
                 "/debug - technical mapping details\n"
                 "/send <text> - send instruction to this pane\n"
+                "/send! <text> - interrupt the current turn and send now\n"
                 "/keys <keys> - send explicit keys\n"
                 f"{plain_text_help}"
             ),
@@ -10163,6 +10394,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "reply": format_debug(pane, entry)}
     if command == "send":
         return forward_text_to_pane_response(pane_id, arg, usage="Usage: /send <instruction for this pane>")
+    if command in ("send!", "interrupt", "isend"):
+        return interrupt_and_send_response(pane_id, arg)
     if command == "keys":
         if not arg:
             return {"handled": True, "reply": "Usage: /keys <key> [key ...]"}

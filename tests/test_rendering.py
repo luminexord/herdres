@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -9,6 +10,29 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import herdres
+
+
+# Keep the suite hermetic: the per-agent grouping flag is read from the
+# environment at runtime, so a stray HERDR_TELEGRAM_TOPICS_PER_AGENT (exported,
+# or leaked into os.environ by a load_dotenv() call reading this machine's
+# herdres.env) would silently flip the default per-space assertions. Pop it for
+# the duration of the module AND neutralize load_dotenv so no entry-point call
+# under test can re-populate it mid-suite. (56+ tests already pass
+# load_dotenv=Mock(); this just makes it impossible to forget.)
+_SAVED_PER_AGENT_ENV: str | None = None
+_LOAD_DOTENV_PATCH = patch.object(herdres, "load_dotenv", Mock())
+
+
+def setUpModule() -> None:
+    global _SAVED_PER_AGENT_ENV
+    _SAVED_PER_AGENT_ENV = os.environ.pop("HERDR_TELEGRAM_TOPICS_PER_AGENT", None)
+    _LOAD_DOTENV_PATCH.start()
+
+
+def tearDownModule() -> None:
+    _LOAD_DOTENV_PATCH.stop()
+    if _SAVED_PER_AGENT_ENV is not None:
+        os.environ["HERDR_TELEGRAM_TOPICS_PER_AGENT"] = _SAVED_PER_AGENT_ENV
 
 
 class DocumentationRenderTests(unittest.TestCase):
@@ -53,6 +77,95 @@ class SpaceTopicStateTests(unittest.TestCase):
             herdres.space_name_for_pane({"workspace_id": "workspace-1"}),
             "Workspace 1",
         )
+
+    def test_per_agent_mode_keys_per_pane_and_names_by_agent_and_folder(self) -> None:
+        with patch.object(herdres, "per_agent_topics_enabled", lambda: True):
+            # Grouping key is the stable pane id, regardless of workspace.
+            self.assertEqual(
+                herdres.space_key({"pane_id": "w6:p16", "workspace_id": "w6"}),
+                "agent:w6:p16",
+            )
+            # Two agents in the same workspace get distinct grouping keys.
+            self.assertNotEqual(
+                herdres.space_key({"pane_id": "w6:p1", "workspace_id": "w6"}),
+                herdres.space_key({"pane_id": "w6:p2", "workspace_id": "w6"}),
+            )
+            # Topic name is "<agent> · <folder>" when no manual label is set.
+            self.assertEqual(
+                herdres.space_name_for_pane({"agent": "claude", "foreground_cwd": "/root/herdres"}),
+                "claude · herdres",
+            )
+            # A manual pane label wins over the agent/folder name.
+            self.assertEqual(
+                herdres.space_name_for_pane(
+                    {"agent": "codex", "foreground_cwd": "/root/sawa", "label": "Deploy Bot"}
+                ),
+                "Deploy Bot",
+            )
+        # Flag off: per-space behavior is unchanged (patched off so this is
+        # deterministic regardless of any HERDR_TELEGRAM_TOPICS_PER_AGENT in env).
+        with patch.object(herdres, "per_agent_topics_enabled", lambda: False):
+            self.assertEqual(herdres.space_key({"workspace_id": "workspace-1"}), "workspace:workspace-1")
+
+    def test_reset_topic_grouping_clears_mappings_and_records_mode(self) -> None:
+        state = {
+            "version": 1,
+            "spaces": {"workspace:workspace-1": {"space_key": "workspace:workspace-1", "topic_id": "77"}},
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "w6:p1",
+                    "agent": "codex",
+                    "topic_id": "77",
+                    "space_key": "workspace:workspace-1",
+                    "topic_name": "Mars",
+                    "pane_root_message_id": "1001",
+                    "topic_status_icon_custom_emoji_id": "emoji-1",
+                    "last_prompt_message_id": "2002",
+                },
+            },
+        }
+
+        herdres.reset_topic_grouping(state, "agent", reason="switch")
+
+        self.assertEqual(state["spaces"], {})
+        self.assertEqual(state["topic_grouping_mode"], "agent")
+        self.assertIn("topic_grouping_reset_at", state)
+        entry = state["panes"]["pane-1"]
+        # Topic linkage AND the caches that would suppress re-applying the icon /
+        # re-posting the prompt on the fresh topic are all cleared.
+        for dropped in (
+            "topic_id",
+            "space_key",
+            "topic_name",
+            "pane_root_message_id",
+            "topic_status_icon_custom_emoji_id",
+            "last_prompt_message_id",
+        ):
+            self.assertNotIn(dropped, entry)
+        # Pane identity is preserved across the reset.
+        self.assertEqual(entry["pane_id"], "w6:p1")
+        self.assertEqual(entry["agent"], "codex")
+
+    def test_per_agent_pane_entry_persists_cwd_and_names_space_by_folder(self) -> None:
+        with patch.object(herdres, "per_agent_topics_enabled", lambda: True):
+            pane = {
+                "pane_id": "w6:p1",
+                "terminal_id": "t1",
+                "workspace_id": "w6",
+                "tab_id": "w6:t1",
+                "agent": "codex",
+                "foreground_cwd": "/workspace/alpha",
+            }
+            state = {"version": 1, "spaces": {}, "panes": {}}
+            _key, entry, _created = herdres.ensure_pane_entry(state, pane)
+            # The fix: cwd is persisted on the entry so migrate_legacy_pane_topics()
+            # can reconstruct a faithful pane_like instead of a folder-less one.
+            self.assertEqual(entry["foreground_cwd"], "/workspace/alpha")
+            # The per-agent space is keyed by pane id and named "<agent> · <folder>".
+            space = state["spaces"].get("agent:w6:p1")
+            self.assertIsNotNone(space)
+            self.assertEqual(space.get("topic_name"), "codex · alpha")
 
     def test_pane_list_adds_herdr_workspace_label_as_space_name(self) -> None:
         pane_payload = {
@@ -283,6 +396,60 @@ class SpaceTopicSyncTests(unittest.TestCase):
         self.assertEqual(state["spaces"]["workspace:workspace-2"]["topic_id"], "88")
         self.assertEqual([call.kwargs["thread_id"] for call in send_root.call_args_list], ["77", "88"])
 
+    def test_per_agent_mode_two_agents_same_workspace_create_two_topics(self) -> None:
+        state = {"version": 1, "telegram": {"chat_id": "-1001"}, "spaces": {}, "panes": {}}
+        telegram = state["telegram"]
+        pane_a = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-pane-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-workspace-1",
+            "agent": "codex",
+            "agent_status": "idle",
+            "cwd": "/workspace/alpha",
+        }
+        pane_b = {
+            "pane_id": "pane-2",
+            "terminal_id": "term-pane-2",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-workspace-1",
+            "agent": "claude",
+            "agent_status": "idle",
+            "cwd": "/workspace/beta",
+        }
+        counters, caps = self._sync_caps()
+        create_topic = Mock(side_effect=["77", "88"])
+        send_root = Mock(
+            side_effect=[
+                {"ok": True, "format": "rich", "message_id": "1001"},
+                {"ok": True, "format": "rich", "message_id": "1002"},
+            ],
+        )
+
+        with patch.multiple(
+            herdres,
+            create_topic=create_topic,
+            send_rich_message=send_root,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            STATUS_ICON_ENABLED=False,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            PANE_ROOT_MESSAGES_ENABLED=True,
+            TURN_FEED_ENABLED=False,
+            per_agent_topics_enabled=lambda: True,
+        ):
+            herdres.sync_pane_once(state, "-1001", telegram, pane_a, counters, caps, turn_only=True)
+            herdres.sync_pane_once(state, "-1001", telegram, pane_b, counters, caps, turn_only=True)
+
+        # Same workspace, but one topic per agent named "<agent> · <folder>".
+        self.assertEqual(create_topic.call_args_list[0].args, ("-1001", "codex · alpha"))
+        self.assertEqual(create_topic.call_args_list[1].args, ("-1001", "claude · beta"))
+        self.assertEqual(state["spaces"]["agent:pane-1"]["topic_id"], "77")
+        self.assertEqual(state["spaces"]["agent:pane-2"]["topic_id"], "88")
+        self.assertEqual(counters["creates"], 2)
+        self.assertEqual([call.kwargs["thread_id"] for call in send_root.call_args_list], ["77", "88"])
+
     def test_missing_pane_root_is_recreated_without_recreating_space_topic(self) -> None:
         pane = self._pane("pane-1", "workspace-1", "Build Runner")
         key = herdres.pane_key(pane)
@@ -474,6 +641,7 @@ class SpaceTopicSyncTests(unittest.TestCase):
 
         with patch.multiple(
             herdres,
+            load_dotenv=Mock(),
             load_state=Mock(return_value=state),
             pane_list=Mock(return_value=[live_pane]),
             preflight_is_fresh=Mock(return_value=True),
@@ -3882,6 +4050,7 @@ Verification
         with patch.multiple(
             herdres,
             pane_by_id=Mock(return_value=pane),
+            pane_input_ansi=Mock(return_value=current_composer),
             pane_output=Mock(return_value=current_composer),
             run_cmd=run_cmd,
         ):
@@ -3912,6 +4081,7 @@ Verification
         with patch.multiple(
             herdres,
             pane_by_id=Mock(return_value=pane),
+            pane_input_ansi=Mock(return_value=current_composer),
             pane_output=Mock(return_value=current_composer),
             run_cmd=run_cmd,
         ):
@@ -3971,7 +4141,8 @@ Verification
             herdres,
             pane_by_id=Mock(return_value=pane),
             run_cmd=run_cmd,
-            pane_input_looks_staged=Mock(side_effect=[False, True]),
+            # detect: not-staged then staged; after Enter the box clears.
+            pane_input_looks_staged=Mock(side_effect=[False, True, False]),
         ):
             ok, detail = herdres.send_to_pane("pane-1", "long pasted instruction", submit_staged=True)
 
@@ -3999,13 +4170,100 @@ Verification
             herdres,
             pane_by_id=Mock(return_value=pane),
             run_cmd=run_cmd,
-            pane_input_looks_staged=Mock(side_effect=[False, True]),
+            # detect: not-staged then staged; after Enter the box clears.
+            pane_input_looks_staged=Mock(side_effect=[False, True, False]),
         ):
             ok, detail = herdres.send_to_pane("pane-1", "Everything pushed on origin right?")
 
         self.assertTrue(ok, detail)
         self.assertEqual(commands[0][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
         self.assertEqual(commands[-1], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "enter"])
+
+    def test_submit_staged_input_trusts_delivered_submit_when_idle(self) -> None:
+        # IDLE agent with a still-staged box: Herdres does not refuse after a
+        # delivered Enter — it trusts the submit (returns success, no queued note).
+        with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
+            herdres,
+            run_cmd=Mock(return_value=Mock(returncode=0, stdout="", stderr="")),
+            pane_input_looks_staged=Mock(return_value=True),  # box never clears
+        ):
+            ok, detail = herdres.submit_staged_pane_input_if_needed("pane-1", timeout=1, agent_status="idle")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+
+    def test_submit_staged_input_queues_when_agent_working(self) -> None:
+        # WORKING agent: the box stays staged because a busy agent queues typed
+        # input until its turn ends — that is "queued", not a failure.
+        with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
+            herdres,
+            run_cmd=Mock(return_value=Mock(returncode=0, stdout="", stderr="")),
+            pane_input_looks_staged=Mock(return_value=True),  # box never clears (queued)
+        ):
+            ok, detail = herdres.submit_staged_pane_input_if_needed("pane-1", timeout=1, agent_status="working")
+
+        self.assertTrue(ok)
+        self.assertIn("Queued", detail)
+
+    def test_interrupt_and_send_sends_escape_before_message_when_working(self) -> None:
+        # /send! to a WORKING pane must halt the turn (Esc) BEFORE delivering, so
+        # the message runs now instead of queueing behind the current turn.
+        calls = []
+
+        def run_cmd(args, **kwargs):
+            calls.append(args)
+            return Mock(returncode=0, stdout="", stderr="")
+
+        working_pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "working"}
+        with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
+            herdres,
+            run_cmd=run_cmd,
+            pane_by_id=Mock(return_value=working_pane),
+            clear_staged_pane_input_if_needed=Mock(return_value=(True, "")),
+            pane_input_looks_staged=Mock(return_value=False),
+        ):
+            ok, detail = herdres.interrupt_and_send_to_pane("pane-1", "go now")
+
+        self.assertTrue(ok)
+        esc_idx = next(i for i, a in enumerate(calls) if "send-keys" in a and "escape" in a)
+        run_idx = next(i for i, a in enumerate(calls) if "run" in a)
+        self.assertLess(esc_idx, run_idx)  # Esc precedes the message
+
+    def test_interrupt_and_send_skips_escape_when_idle(self) -> None:
+        # No turn to interrupt on an idle pane: deliver without sending Esc
+        # (Esc on idle Codex pops its recall preview — a needless side effect).
+        calls = []
+
+        def run_cmd(args, **kwargs):
+            calls.append(args)
+            return Mock(returncode=0, stdout="", stderr="")
+
+        idle_pane = {"pane_id": "pane-1", "agent": "codex", "agent_status": "idle"}
+        with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
+            herdres,
+            run_cmd=run_cmd,
+            pane_by_id=Mock(return_value=idle_pane),
+            clear_staged_pane_input_if_needed=Mock(return_value=(True, "")),
+            pane_input_looks_staged=Mock(return_value=False),
+        ):
+            ok, detail = herdres.interrupt_and_send_to_pane("pane-1", "go now")
+
+        self.assertTrue(ok)
+        self.assertFalse(any("escape" in a for a in calls))  # no interrupt on idle
+        self.assertTrue(any("run" in a for a in calls))  # still delivered
+
+    def test_pane_input_dim_codex_placeholder_is_not_staged(self) -> None:
+        # Codex shows a greyed (dim = \x1b[2m) example suggestion in an EMPTY box;
+        # that must NOT be treated as staged input.
+        dim_placeholder = "› \x1b[2mExplain this codebase\x1b[0m"
+        with patch.object(herdres, "pane_input_ansi", Mock(return_value=dim_placeholder)):
+            self.assertFalse(herdres.pane_input_looks_staged("pane-1"))
+
+    def test_pane_input_real_typed_text_is_staged(self) -> None:
+        # Real typed/queued input is not dim -> still detected as staged.
+        real_text = "❯ deploy when ready"
+        with patch.object(herdres, "pane_input_ansi", Mock(return_value=real_text)):
+            self.assertTrue(herdres.pane_input_looks_staged("pane-1"))
 
     def test_visible_choice_selection_uses_numbers_by_default(self) -> None:
         with patch.object(herdres, "VISIBLE_CHOICE_SELECT_MODE", "number"), patch.object(
