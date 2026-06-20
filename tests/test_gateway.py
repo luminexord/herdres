@@ -1389,6 +1389,16 @@ class GatewayManagedBotTests(unittest.TestCase):
         self.assertEqual(result, {"handled": True, "reply": "ok"})
         runner.assert_called_once()
 
+    def test_subprocess_runner_uses_command_timeout(self) -> None:
+        # A command/callback subprocess must get a forgiving timeout so a legitimate
+        # send_to_pane chain or rate-limit backoff isn't killed mid-flight (was 30s).
+        self.assertGreaterEqual(managed_gateway.COMMAND_TIMEOUT, 60)
+        proc = subprocess.CompletedProcess(["herdres", "command"], 0, stdout=b'{"handled": true}', stderr=b"")
+        runner = Mock(return_value=proc)
+        with patch.object(managed_gateway.subprocess, "run", runner):
+            managed_gateway.run_subprocess_herdres({"topic_id": "77"}, "command", {})
+        self.assertEqual(runner.call_args.kwargs["timeout"], managed_gateway.COMMAND_TIMEOUT)
+
     def test_same_message_id_dispatches_to_command_once(self) -> None:
         state = {
             "version": 1,
