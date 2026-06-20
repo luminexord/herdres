@@ -230,6 +230,20 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
         self.assertEqual(result["reply"], "")
         send_to_pane.assert_called_once_with("pane-1", "Hey")
 
+    def test_devin_agent_uses_managed_bot_spec(self) -> None:
+        self.assertEqual(herdres.managed_bot_kind_for_agent("devin"), "devin")
+        self.assertEqual(herdres.managed_bot_kind_for_agent("Cognition Devin"), "devin")
+        self.assertEqual(herdres.managed_bot_kinds_for_panes([{"agent": "devin"}]), ["devin"])
+        self.assertEqual(herdres.pane_agent_status_label({"agent": "devin"}), "Devin")
+
+        keyboard = herdres.managed_bot_request_keyboard(kinds=["devin"])
+        first = keyboard["keyboard"][0][0]
+
+        self.assertEqual(first["text"], "Create Devin bot")
+        self.assertEqual(first["request_managed_bot"]["request_id"], 41005)
+        self.assertEqual(first["request_managed_bot"]["suggested_name"], "Herdr Devin")
+        self.assertEqual(first["request_managed_bot"]["suggested_username"], "herdr_devin_bot")
+
     def test_group_access_markup_uses_child_bot_startgroup_links(self) -> None:
         telegram = {
             "managed_bots": {

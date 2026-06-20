@@ -84,8 +84,9 @@ In the mapped space topic, reply to a routed pane message or optional pane-root 
 - `/debug` - show technical mapping details
 - `/send <text>` - send instruction to this pane
 - `/keys <keys>` - send explicit keys to this pane
+- `/new codex|claude|kimi|omp|devin` - split a new pane to the right in this space and launch that agent CLI
 
-Plain text replies under a routed pane message, ForceReply prompt, or optional pane-root message are forwarded directly to that pane without `/send`. Top-level owner messages in a shared space topic still fail closed with: `Reply to a Herdres pane message so I know which Herdr pane to control.` The General topic remains normal Hermes chat.
+Plain text replies under a routed pane message, ForceReply prompt, or optional pane-root message are forwarded directly to that pane without `/send`. Top-level owner messages in a shared space topic are also forwarded when that topic has exactly one live pane. Topics with multiple possible panes still fail closed with: `Reply inside a pane thread so I know which Herdr pane to control.` The General topic remains normal Hermes chat.
 
 Long or multiline Telegram inputs are not pasted into the terminal directly. Herdres writes the exact owner message to `~/.local/share/herdres/inbound/<pane>/...txt` with owner-only permissions and submits a short instruction telling the pane to read that file. This avoids Herdr/TUI bracketed-paste collapse such as `[Pasted text #1 ...]` being sent as the actual instruction.
 
@@ -408,17 +409,19 @@ HERDR_TELEGRAM_TOPICS_DRY_RUN=1 ~/.local/bin/herdres sync
 
 ## Managed Pane Bots
 
-When `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1`, Herdres posts managed-bot setup links in General only for AI types that currently have open panes and do not already have a stored child-bot token. Supported pane bots are Codex, Claude, Kimi, and OMP. After Telegram sends the manager bot a `managed_bot` update, Herdres calls `getManagedBotToken`, stores the child token under `telegram.managed_bots`, and updates the child bot profile.
+When `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1`, Herdres posts managed-bot setup links in General only for AI types that currently have open panes and do not already have a stored child-bot token. Supported pane bots are Codex, Claude, Kimi, OMP, and Devin. After Telegram sends the manager bot a `managed_bot` update, Herdres calls `getManagedBotToken`, stores the child token under `telegram.managed_bots`, and updates the child bot profile.
 
 Telegram still requires each child bot to have access to the forum group. If a child token is registered but Telegram rejects pane messages from it, Herdres posts add-to-group buttons in General and does not send that pane traffic as the manager bot.
 
 Pane output is sent by the matching child bot when configured. Add each child bot to the Telegram forum group so replies to that child bot are delivered to the gateway; if a child bot is not yet allowed to post, Herdres falls back to the manager bot for that send.
 
-The standalone gateway polls the manager bot and each registered child bot. Once child bots exist, the manager poll is intentionally short and child-bot polls are nonblocking so new user messages are not delayed behind every child token:
+The standalone gateway runs one long-poll worker for the manager bot and one worker for each registered child bot. Telegram returns a long poll immediately when a message arrives, and each child bot is isolated from other bot-token waits or reconnect backoff:
 
 ```bash
-HERDRES_GATEWAY_MANAGER_POLL_SECONDS=1
-HERDRES_GATEWAY_CHILD_POLL_SECONDS=0
+HERDRES_GATEWAY_LONG_POLL_SECONDS=50
+HERDRES_GATEWAY_NETWORK_ERROR_BACKOFF=0.5
+HERDRES_GATEWAY_DISPATCH_WORKERS=8
+HERDRES_GATEWAY_DISPATCH_QUEUE_LIMIT=128
 ```
 
 Optional profile images must be JPG files:
@@ -429,6 +432,7 @@ HERDR_TELEGRAM_TOPICS_MANAGED_BOT_CODEX_PHOTO=~/.config/herdres/managed-bots/cod
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_CLAUDE_PHOTO=~/.config/herdres/managed-bots/claude.jpg
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_KIMI_PHOTO=~/.config/herdres/managed-bots/kimi.jpg
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_OMP_PHOTO=~/.config/herdres/managed-bots/omp.jpg
+HERDR_TELEGRAM_TOPICS_MANAGED_BOT_DEVIN_PHOTO=~/.config/herdres/managed-bots/devin.jpg
 ```
 
 For local deployments that need this before Herdr exposes the endpoint upstream, Herdres includes `herdr_turn_adapter.py`. It is a wrapper, not a Herdr patch:
@@ -532,6 +536,7 @@ HERDR_TELEGRAM_TOPICS_MANAGED_BOT_CODEX_PHOTO=
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_CLAUDE_PHOTO=
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_KIMI_PHOTO=
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_OMP_PHOTO=
+HERDR_TELEGRAM_TOPICS_MANAGED_BOT_DEVIN_PHOTO=
 HERDR_TELEGRAM_TOPICS_TURN_FEED=1
 HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS=0
 HERDR_TELEGRAM_TOPICS_VISIBLE_READONLY_PROMPTS=1
@@ -545,6 +550,11 @@ HERDR_TELEGRAM_TOPICS_RICH_MESSAGES=1
 HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS=14000
 HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES=0
 HERDR_TELEGRAM_TOPICS_PINNED_STATUS=1
+HERDR_TELEGRAM_TOPICS_NEW_PANE_CODEX_COMMAND=codex
+HERDR_TELEGRAM_TOPICS_NEW_PANE_CLAUDE_COMMAND=claude
+HERDR_TELEGRAM_TOPICS_NEW_PANE_KIMI_COMMAND=kimi
+HERDR_TELEGRAM_TOPICS_NEW_PANE_OMP_COMMAND=omp
+HERDR_TELEGRAM_TOPICS_NEW_PANE_DEVIN_COMMAND=devin
 HERDR_TELEGRAM_TOPICS_LIVE_CARD=0
 HERDR_TELEGRAM_TOPICS_STATUS_ICON=1
 HERDR_TELEGRAM_TOPICS_STATUS_ICON_CACHE_TTL=86400
@@ -605,11 +615,14 @@ Notes:
 - Outbound `sync` / `event` only *send*; they never consume `getUpdates`, so they
   run safely alongside the gateway. Do not also run a Hermes poller on the same
   bot — Telegram allows only one `getUpdates` consumer per token.
-- When managed child bots are configured, the gateway defaults to a 1-second
-  manager poll and nonblocking child-bot polls. Tune
-  `HERDRES_GATEWAY_MANAGER_POLL_SECONDS` and `HERDRES_GATEWAY_CHILD_POLL_SECONDS`
-  if you need different latency/API-call tradeoffs.
+- When managed child bots are configured, the gateway runs one long-poll worker
+  per bot token so one token's wait or reconnect backoff does not delay another.
+  Tune `HERDRES_GATEWAY_LONG_POLL_SECONDS` if you need a different long-poll
+  timeout. Handler work is dispatched through a small worker pool so slow Herdr
+  command processing does not stop the bot token from polling for the next
+  update.
 - The gateway drains any backlog on first start so it never replays historical
   messages as live pane commands.
-- Inbound plain-text → pane is still gated by `telegram.implicit_send_enabled`;
-  use `/send <text>` until you enable it.
+- Top-level inbound plain-text -> pane is still gated by
+  `telegram.implicit_send_enabled` except in single-live-pane space topics. In
+  multi-pane topics, reply to a pane message or use `/send <text>`.

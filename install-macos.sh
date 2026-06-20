@@ -38,7 +38,7 @@ install_pinned herdr_turn_adapter.py herdr_turn_adapter.py
 install_pinned herdres_gateway.py    herdres-gateway
 
 if [ -d "$HERE/assets/managed-bots" ]; then
-    for photo in codex claude kimi omp; do
+    for photo in codex claude kimi omp devin; do
         if [ -f "$HERE/assets/managed-bots/$photo.jpg" ] && [ ! -f "$CFG/managed-bots/$photo.jpg" ]; then
             install -m 644 "$HERE/assets/managed-bots/$photo.jpg" "$CFG/managed-bots/$photo.jpg"
         fi

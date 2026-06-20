@@ -18,12 +18,14 @@ plugin: those only *send*, they never consume ``getUpdates``.
 
 from __future__ import annotations
 
-import json
+import concurrent.futures
 import hashlib
+import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -40,13 +42,28 @@ SCRIPT_PATH = Path(
 OFFSET_PATH = Path(
     os.getenv("HERDR_TELEGRAM_TOPICS_GATEWAY_OFFSET", str(HOME / ".local/share/herdres/gateway_offset"))
 ).expanduser()
+PROCESSED_PATH = Path(
+    os.getenv(
+        "HERDR_TELEGRAM_TOPICS_GATEWAY_PROCESSED",
+        str(HOME / ".local/share/herdres/gateway_processed_messages.json"),
+    )
+).expanduser()
 GENERAL_THREAD_ID = os.getenv("HERDR_TELEGRAM_TOPICS_GENERAL_THREAD_ID", "1")
 AMBIGUOUS_PANE_THREAD_REPLY = "Reply inside a pane thread so I know which Herdr pane to control."
+MANAGER_BOT_KIND = "manager"
 MANAGED_BOT_SUGGESTED_USERNAMES = {
     "codex": "herdr_codex_bot",
     "claude": "herdr_claude_bot",
     "kimi": "herdr_kimi_bot",
     "omp": "herdr_omp_bot",
+    "devin": "herdr_devin_bot",
+}
+MANAGED_BOT_ALIASES = {
+    "codex": ("codex", "gpt", "openai"),
+    "claude": ("claude", "anthropic"),
+    "kimi": ("kimi", "moonshot"),
+    "omp": ("omp",),
+    "devin": ("devin", "cognition"),
 }
 MANAGED_BOT_KEY_RE = re.compile(r"^managed-([a-z0-9_]+)-")
 MANAGED_BOT_MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,64})")
@@ -59,11 +76,28 @@ CHILD_POLL_SECONDS = int(os.getenv("HERDRES_GATEWAY_CHILD_POLL_SECONDS", "0"))
 SOCKET_TIMEOUT = LONG_POLL_SECONDS + 15
 COMMAND_TIMEOUT = 30
 ERROR_BACKOFF = 3
+NETWORK_ERROR_BACKOFF = float(os.getenv("HERDRES_GATEWAY_NETWORK_ERROR_BACKOFF", "0.5"))
+WORKER_RECONCILE_SECONDS = 1
 ALLOWED_UPDATES = json.dumps(["message", "callback_query", "managed_bot"])
+PROCESSED_MESSAGE_LIMIT = int(os.getenv("HERDRES_GATEWAY_PROCESSED_LIMIT", "2000"))
+DISPATCH_WORKERS = max(1, int(os.getenv("HERDRES_GATEWAY_DISPATCH_WORKERS", "8")))
+DISPATCH_QUEUE_LIMIT = max(
+    DISPATCH_WORKERS,
+    int(os.getenv("HERDRES_GATEWAY_DISPATCH_QUEUE_LIMIT", "128")),
+)
 
 TOKEN = ""
 DEBUG = os.getenv("HERDRES_GATEWAY_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
 CLEARED_WEBHOOK_KEYS: set[str] = set()
+CLEARED_WEBHOOK_LOCK = threading.Lock()
+PROCESSED_LOCK = threading.Lock()
+PROCESSED_MESSAGE_KEYS: set[str] | None = None
+PROCESSED_MESSAGE_ORDER: list[str] = []
+DISPATCH_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+DISPATCH_EXECUTOR_LOCK = threading.Lock()
+DISPATCH_QUEUE_SEMAPHORE = threading.BoundedSemaphore(DISPATCH_QUEUE_LIMIT)
+ROUTE_LOCKS: dict[str, threading.Lock] = {}
+ROUTE_LOCKS_LOCK = threading.Lock()
 TRACE_PATH = Path(
     os.getenv("HERDRES_GATEWAY_TRACE", str(HOME / ".local/share/herdres/gateway.trace.log"))
 ).expanduser()
@@ -86,6 +120,123 @@ def log(msg: str) -> None:
 def dlog(msg: str) -> None:
     if DEBUG:
         _emit(f"[herdres-gateway] DEBUG {msg}")
+
+
+def get_dispatch_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global DISPATCH_EXECUTOR
+    with DISPATCH_EXECUTOR_LOCK:
+        if DISPATCH_EXECUTOR is None:
+            DISPATCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=DISPATCH_WORKERS,
+                thread_name_prefix="herdres-gateway-dispatch",
+            )
+        return DISPATCH_EXECUTOR
+
+
+def dispatch_update(update: dict, *, bot_token: str | None = None, bot_key: str | None = None) -> None:
+    if not DISPATCH_QUEUE_SEMAPHORE.acquire(blocking=False):
+        log("dispatch queue full; handling update inline")
+        handle_update_guarded(update, bot_token=bot_token, bot_key=bot_key)
+        return
+    try:
+        future = get_dispatch_executor().submit(
+            handle_update_guarded,
+            update,
+            bot_token=bot_token,
+            bot_key=bot_key,
+        )
+    except Exception:
+        DISPATCH_QUEUE_SEMAPHORE.release()
+        raise
+    future.add_done_callback(finish_dispatched_update)
+
+
+def finish_dispatched_update(future: concurrent.futures.Future) -> None:
+    try:
+        future.result()
+    except Exception as exc:
+        log(f"dispatch worker failed: {exc}")
+    finally:
+        try:
+            DISPATCH_QUEUE_SEMAPHORE.release()
+        except ValueError:
+            pass
+
+
+def handle_update_guarded(
+    update: dict,
+    *,
+    bot_token: str | None = None,
+    bot_key: str | None = None,
+) -> None:
+    try:
+        handle_update(update, bot_token=bot_token, bot_key=bot_key)
+    except Exception as exc:
+        log(f"handler error for {bot_key or 'manager'}: {exc}")
+
+
+def route_lock_for(key: str) -> threading.Lock:
+    with ROUTE_LOCKS_LOCK:
+        lock = ROUTE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            ROUTE_LOCKS[key] = lock
+        return lock
+
+
+def processed_message_key(chat_id: str, thread_id: str | None, message: dict) -> str:
+    message_id = str(message.get("message_id") or "").strip()
+    if not chat_id or not message_id:
+        return ""
+    return "|".join([str(chat_id), str(thread_id or ""), message_id])
+
+
+def load_processed_messages_locked() -> None:
+    global PROCESSED_MESSAGE_KEYS, PROCESSED_MESSAGE_ORDER
+    if PROCESSED_MESSAGE_KEYS is not None:
+        return
+    keys: list[str] = []
+    try:
+        raw = json.loads(PROCESSED_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and isinstance(raw.get("messages"), list):
+            keys = [str(item) for item in raw["messages"] if str(item)]
+        elif isinstance(raw, list):
+            keys = [str(item) for item in raw if str(item)]
+    except Exception:
+        keys = []
+    if len(keys) > PROCESSED_MESSAGE_LIMIT:
+        keys = keys[-PROCESSED_MESSAGE_LIMIT:]
+    PROCESSED_MESSAGE_ORDER = keys
+    PROCESSED_MESSAGE_KEYS = set(keys)
+
+
+def save_processed_messages_locked() -> None:
+    try:
+        PROCESSED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PROCESSED_PATH.with_suffix(PROCESSED_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps({"messages": PROCESSED_MESSAGE_ORDER[-PROCESSED_MESSAGE_LIMIT:]}), encoding="utf-8")
+        tmp.replace(PROCESSED_PATH)
+    except Exception as exc:
+        log(f"processed message cache write failed: {exc}")
+
+
+def reserve_message_processing(key: str) -> bool:
+    if not key:
+        return True
+    with PROCESSED_LOCK:
+        load_processed_messages_locked()
+        assert PROCESSED_MESSAGE_KEYS is not None
+        if key in PROCESSED_MESSAGE_KEYS:
+            return False
+        PROCESSED_MESSAGE_KEYS.add(key)
+        PROCESSED_MESSAGE_ORDER.append(key)
+        if len(PROCESSED_MESSAGE_ORDER) > PROCESSED_MESSAGE_LIMIT:
+            stale = PROCESSED_MESSAGE_ORDER[:-PROCESSED_MESSAGE_LIMIT]
+            del PROCESSED_MESSAGE_ORDER[:-PROCESSED_MESSAGE_LIMIT]
+            for old_key in stale:
+                PROCESSED_MESSAGE_KEYS.discard(old_key)
+        save_processed_messages_locked()
+        return True
 
 
 def _token() -> str:
@@ -173,6 +324,25 @@ def managed_bot_kind_for_username(state: dict, username: str) -> str:
     return ""
 
 
+def managed_bot_kind_for_agent(value: str | None) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+    words = set(text.split())
+    for kind, aliases in MANAGED_BOT_ALIASES.items():
+        alias_set = {str(alias).lower() for alias in aliases}
+        if kind in words or alias_set.intersection(words):
+            return kind
+        if any(alias and alias in text for alias in alias_set):
+            return kind
+    return ""
+
+
+def managed_bot_kind_for_entry(entry: dict) -> str:
+    explicit = str(entry.get("managed_bot_kind") or "").strip().lower()
+    if explicit in MANAGED_BOT_SUGGESTED_USERNAMES:
+        return explicit
+    return managed_bot_kind_for_agent(str(entry.get("agent") or ""))
+
+
 def managed_bot_has_token(state: dict, kind: str) -> bool:
     telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
     bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
@@ -202,11 +372,50 @@ def targeted_managed_bot_kind(state: dict, text: str, message: dict | None = Non
     return replied_managed_bot_kind(state, message) or mentioned_managed_bot_kind(state, text)
 
 
-def manager_should_defer_to_child_bot(state: dict, text: str, message: dict, bot_key: str | None) -> bool:
-    if managed_bot_kind_for_key(bot_key):
+def is_space_level_command(text: str) -> bool:
+    stripped = str(text or "").strip()
+    if not stripped.startswith("/"):
         return False
-    kind = targeted_managed_bot_kind(state, text, message)
-    return bool(kind and managed_bot_has_token(state, kind))
+    command = stripped.split(None, 1)[0][1:].split("@", 1)[0].strip().lower().replace("_", "-")
+    return command == "new"
+
+
+def current_bot_owner_kind(bot_key: str | None) -> str:
+    return managed_bot_kind_for_key(bot_key) or MANAGER_BOT_KIND
+
+
+def owner_for_entry(state: dict, entry: dict) -> str:
+    kind = managed_bot_kind_for_entry(entry)
+    if kind and managed_bot_has_token(state, kind):
+        return kind
+    return MANAGER_BOT_KIND
+
+
+def message_owner_kind(
+    state: dict,
+    text: str,
+    message: dict,
+    chat_id: str,
+    thread_id: str | None,
+) -> str:
+    if is_space_level_command(text):
+        return MANAGER_BOT_KIND
+    targeted = targeted_managed_bot_kind(state, text, message)
+    if targeted and managed_bot_has_token(state, targeted):
+        return targeted
+
+    reply_to = message.get("reply_to_message") or {}
+    resolved = resolve_mapped_entry(
+        state,
+        chat_id,
+        thread_id,
+        message_id=message.get("message_id") or "",
+        reply_to_message_id=reply_to.get("message_id") or "",
+    )
+    if resolved:
+        _pane_key, entry = resolved
+        return owner_for_entry(state, entry)
+    return MANAGER_BOT_KIND
 
 
 def target_bot_kind_for_message(state: dict, text: str, bot_key: str | None, message: dict | None = None) -> str:
@@ -368,6 +577,7 @@ def run_script(payload: dict, mode: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str | None = None) -> None:
+    received_at = time.monotonic()
     text = message.get("text")
     attachment = attachment_of(message)
     if not (text or attachment):
@@ -381,12 +591,20 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
     user = message.get("from") or {}
     user_id = str(user.get("id") or "")
     from_bot = bool(user.get("is_bot"))
+    message_age = ""
+    if message.get("date"):
+        try:
+            message_age = f" age={max(0.0, time.time() - float(message['date'])):.3f}s"
+        except Exception:
+            message_age = ""
     dlog(
         f"message chat={chat_id} thread={thread_id} from={user_id} bot={from_bot} "
-        f"text={str(text or '')[:40]!r}"
+        f"text={str(text or '')[:40]!r}{message_age}"
     )
-    if manager_should_defer_to_child_bot(state, str(text or ""), message, bot_key):
-        dlog("deferred targeted message to managed child bot")
+    owner_kind = message_owner_kind(state, str(text or ""), message, chat_id, thread_id)
+    current_kind = current_bot_owner_kind(bot_key)
+    if current_kind != owner_kind:
+        dlog(f"ignored message owned by {owner_kind} on {current_kind}")
         return
     target_bot_kind = target_bot_kind_for_message(state, str(text or ""), bot_key, message)
     reply_to = message.get("reply_to_message") or {}
@@ -402,9 +620,13 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
             owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
             if from_bot or (owners and user_id not in owners):
                 return
-            if target_bot_kind:
+            route_key = processed_message_key(chat_id, thread_id, message)
+            if target_bot_kind or is_space_level_command(str(text or "")):
                 pane_key = ""
             else:
+                if not reserve_message_processing(route_key):
+                    dlog(f"ignored already processed message {route_key}")
+                    return
                 params = {
                     "chat_id": chat_id,
                     "text": AMBIGUOUS_PANE_THREAD_REPLY,
@@ -431,6 +653,10 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
     if from_bot or (owners and user_id not in owners):
         dlog(f"filtered: from_bot={from_bot} owners={owners} user={user_id}")
         return  # cheap pre-filter; command_reply re-applies the authoritative gate
+    route_key = processed_message_key(chat_id, thread_id, message)
+    if not reserve_message_processing(route_key):
+        dlog(f"ignored already processed message {route_key}")
+        return
     dlog(f"dispatching to herdres command (topic {thread_id})")
 
     payload = {
@@ -449,8 +675,15 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
     }
     if target_bot_kind:
         payload["target_bot_kind"] = target_bot_kind
-    result = run_script(payload, "command")
-    dlog(f"command result handled={result.get('handled')} reply_len={len(str(result.get('reply') or ''))}")
+    lock_key = f"pane:{pane_key}" if pane_key else f"space:{chat_id}:{thread_id or ''}"
+    with route_lock_for(lock_key):
+        result = run_script(payload, "command")
+    elapsed = time.monotonic() - received_at
+    dlog(
+        "command result "
+        f"handled={result.get('handled')} reply_len={len(str(result.get('reply') or ''))} "
+        f"elapsed={elapsed:.3f}s"
+    )
     if not result.get("handled", True):
         return
     reply = str(result.get("reply") or "").strip()
@@ -502,7 +735,9 @@ def handle_callback(query: dict, *, bot_token: str | None = None) -> None:
         "user_id": str(user.get("id") or ""),
         "data": data,
     }
-    result = run_script(payload, "callback")
+    lock_key = f"pane:{pane_key}" if pane_key else f"topic:{chat_id}:{thread_id or ''}"
+    with route_lock_for(lock_key):
+        result = run_script(payload, "callback")
     answer_params = {"callback_query_id": str(query.get("id") or "")}
     answer = str(result.get("answer") or "").strip()
     if answer:
@@ -569,13 +804,15 @@ def drain_backlog(key: str, bot_token: str) -> int | None:
 
 
 def clear_webhook(key: str, bot_token: str) -> None:
-    if key in CLEARED_WEBHOOK_KEYS:
-        return
+    with CLEARED_WEBHOOK_LOCK:
+        if key in CLEARED_WEBHOOK_KEYS:
+            return
     try:
         api("deleteWebhook", {"drop_pending_updates": "false"}, timeout=15, token=bot_token)
     except Exception:
         pass
-    CLEARED_WEBHOOK_KEYS.add(key)
+    with CLEARED_WEBHOOK_LOCK:
+        CLEARED_WEBHOOK_KEYS.add(key)
 
 
 def handle_update(update: dict, *, bot_token: str | None = None, bot_key: str | None = None) -> None:
@@ -609,6 +846,10 @@ def poll_once(key: str, bot_token: str, *, timeout_seconds: int) -> None:
         log(f"getUpdates HTTP {exc.code} for {key}; backing off")
         time.sleep(ERROR_BACKOFF)
         return
+    except urllib.error.URLError as exc:
+        log(f"getUpdates network error for {key}: {exc}; backing off")
+        time.sleep(NETWORK_ERROR_BACKOFF)
+        return
     except Exception as exc:
         log(f"getUpdates error for {key}: {exc}; backing off")
         time.sleep(ERROR_BACKOFF)
@@ -623,17 +864,51 @@ def poll_once(key: str, bot_token: str, *, timeout_seconds: int) -> None:
     for update in updates:
         offset = update["update_id"] + 1
         try:
-            handle_update(update, bot_token=bot_token, bot_key=key)
+            dispatch_update(update, bot_token=bot_token, bot_key=key)
         except Exception as exc:
-            log(f"handler error for {key}: {exc}")
+            log(f"dispatch submit error for {key}: {exc}")
         write_offset(offset, key)
 
 
-def poll_timeout_plan(child_bots: list[tuple[str, str]]) -> list[tuple[str, str, int]]:
-    manager_timeout = LONG_POLL_SECONDS if not child_bots else MANAGER_POLL_WITH_CHILDREN_SECONDS
-    plan = [("manager", TOKEN, manager_timeout)]
-    plan.extend((key, bot_token, CHILD_POLL_SECONDS) for key, bot_token in child_bots)
+def poll_worker_specs(child_bots: list[tuple[str, str]]) -> list[tuple[str, str, int]]:
+    child_timeout = CHILD_POLL_SECONDS if CHILD_POLL_SECONDS > 0 else LONG_POLL_SECONDS
+    plan = [("manager", TOKEN, LONG_POLL_SECONDS)]
+    plan.extend((key, bot_token, child_timeout) for key, bot_token in child_bots)
     return plan
+
+
+def poll_worker(key: str, bot_token: str, timeout_seconds: int, stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        poll_once(key, bot_token, timeout_seconds=timeout_seconds)
+
+
+def reconcile_poll_workers(
+    workers: dict[str, dict[str, object]],
+    specs: list[tuple[str, str, int]],
+) -> None:
+    desired = {key: (bot_token, timeout_seconds) for key, bot_token, timeout_seconds in specs}
+    for key, worker in list(workers.items()):
+        if key in desired and worker.get("token") == desired[key][0]:
+            continue
+        stop_event = worker.get("stop")
+        if hasattr(stop_event, "set"):
+            stop_event.set()
+        workers.pop(key, None)
+        log(f"poll worker stopped: {key}")
+
+    for key, (bot_token, timeout_seconds) in desired.items():
+        if key in workers:
+            continue
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=poll_worker,
+            args=(key, bot_token, timeout_seconds, stop_event),
+            name=f"herdres-gateway-{key}",
+            daemon=True,
+        )
+        workers[key] = {"token": bot_token, "stop": stop_event, "thread": thread}
+        thread.start()
+        log(f"poll worker started: {key}")
 
 
 def main() -> int:
@@ -645,11 +920,12 @@ def main() -> int:
         return 1
 
     log("started; polling getUpdates for manager and managed pane bots")
+    workers: dict[str, dict[str, object]] = {}
     while True:
         state = load_state()
         child_bots = managed_bot_tokens(state)
-        for key, bot_token, timeout_seconds in poll_timeout_plan(child_bots):
-            poll_once(key, bot_token, timeout_seconds=timeout_seconds)
+        reconcile_poll_workers(workers, poll_worker_specs(child_bots))
+        time.sleep(WORKER_RECONCILE_SECONDS)
 
 
 if __name__ == "__main__":

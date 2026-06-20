@@ -303,6 +303,22 @@ MANAGED_BOT_SPECS: dict[str, dict[str, Any]] = {
         "short_description": "OMP panes in Herdr.",
         "aliases": ("omp",),
     },
+    "devin": {
+        "request_id": MANAGED_BOT_REQUEST_BASE_ID + 5,
+        "label": "Devin",
+        "name": "Herdr Devin",
+        "suggested_username": "herdr_devin_bot",
+        "description": "Herdr Devin pane bot for Herdres.",
+        "short_description": "Devin panes in Herdr.",
+        "aliases": ("devin", "cognition"),
+    },
+}
+NEW_PANE_AGENT_COMMANDS = {
+    "codex": "codex",
+    "claude": "claude",
+    "kimi": "kimi",
+    "omp": "omp",
+    "devin": "devin",
 }
 CODE_FILE_EXTENSIONS = ("py", "json", "toml", "service", "timer", "sh", "md", "txt", "yaml", "yml")
 PATH_OR_SYMBOL_FILE_EXTENSIONS = (
@@ -2689,6 +2705,20 @@ def record_suppressed_clean_item(entry: dict[str, Any], item: dict[str, Any], re
     entry.pop("last_clean_send_error", None)
 
 
+def should_baseline_new_pane_turn(entry: dict[str, Any], item: dict[str, Any] | None, new_entry: bool) -> bool:
+    if not new_entry or not item:
+        return False
+    if str(item.get("kind") or "").lower() != "turn":
+        return False
+    if not str(item.get("turn_id") or "").strip():
+        return False
+    if entry.get("last_clean_hash") or entry.get("last_clean_item"):
+        return False
+    if entry.get("last_prompt_message_id") or entry.get("last_stream_message_id"):
+        return False
+    return True
+
+
 def attach_stream_worklog(item: dict[str, Any] | None, entry: dict[str, Any], turn: dict[str, Any]) -> dict[str, Any] | None:
     if not item or str(item.get("kind") or "").lower() != "turn":
         return item
@@ -2865,11 +2895,8 @@ def extract_turn_feed_item(
     return item
 
 
-def clear_stream_state(entry: dict[str, Any]) -> None:
+def clear_delivered_stream_state(entry: dict[str, Any]) -> None:
     for key in (
-        "pending_stream_turn_id",
-        "pending_stream_text",
-        "pending_stream_revision",
         "last_stream_hash",
         "last_stream_turn_id",
         "last_stream_draft_id",
@@ -2879,8 +2906,21 @@ def clear_stream_state(entry: dict[str, Any]) -> None:
         "last_stream_error",
         "last_stream_transport",
         "last_stream_update_count",
+        "last_stream_bot_kind",
+        "last_stream_bot_kind_retry_kind",
+        "last_stream_bot_kind_retry_at",
     ):
         entry.pop(key, None)
+
+
+def clear_stream_state(entry: dict[str, Any]) -> None:
+    for key in (
+        "pending_stream_turn_id",
+        "pending_stream_text",
+        "pending_stream_revision",
+    ):
+        entry.pop(key, None)
+    clear_delivered_stream_state(entry)
 
 
 def item_plain_text(item: dict[str, Any]) -> str:
@@ -4291,7 +4331,11 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
 
 
 def render_notice_html(title: str, body: str) -> str:
-    return f"<h3>{_html_text(title, 80)}</h3><br>{_rich_lines_block(body, max_chars=900)}"
+    title_html = f"<h3>{_html_text(title, 80)}</h3>"
+    clean_body = str(body or "").strip()
+    if not clean_body:
+        return title_html
+    return f"{title_html}<br>{_rich_lines_block(clean_body, max_chars=900)}"
 
 
 def contains_marker(text: str, markers: tuple[str, ...]) -> bool:
@@ -6428,8 +6472,15 @@ def stream_draft_id(chat_id: str, space_key_value: str, pane_key_value: str, tur
     return value or 1
 
 
-def stream_throttle_reason(entry: dict[str, Any], turn_id: str, *, max_updates: int | None = None) -> str:
+def reusable_stream_state_for_turn(entry: dict[str, Any], turn_id: str) -> bool:
     if str(entry.get("last_stream_turn_id") or "") != str(turn_id):
+        return False
+    message_id = str(entry.get("last_stream_message_id") or "")
+    return not message_id or pane_message_is_latest(entry, message_id)
+
+
+def stream_throttle_reason(entry: dict[str, Any], turn_id: str, *, max_updates: int | None = None) -> str:
+    if not reusable_stream_state_for_turn(entry, turn_id):
         return ""
     try:
         update_count = int(entry.get("last_stream_update_count") or 0)
@@ -6619,7 +6670,7 @@ def send_stream_draft(
     if STREAM_MIN_CHARS and len(clean_text) < STREAM_MIN_CHARS and entry.get("last_stream_hash"):
         return {"ok": True, "skipped": True, "reason": "below_min_chars"}
     text_hash = stream_render_hash(clean_text, user_text)
-    if entry.get("last_stream_hash") == text_hash and str(entry.get("last_stream_turn_id") or "") == str(turn_id):
+    if entry.get("last_stream_hash") == text_hash and reusable_stream_state_for_turn(entry, str(turn_id)):
         return {"ok": True, "skipped": True, "reason": "unchanged_hash", "hash": text_hash}
     throttle_reason = stream_throttle_reason(entry, str(turn_id), max_updates=MAX_STREAM_DRAFTS)
     if throttle_reason:
@@ -6672,7 +6723,7 @@ def send_stream_message(
     text_hash = stream_render_hash(clean_text, user_text)
     if (
         entry.get("last_stream_hash") == text_hash
-        and str(entry.get("last_stream_turn_id") or "") == str(turn_id)
+        and reusable_stream_state_for_turn(entry, str(turn_id))
         and not message_bot_reissue_due(entry, "last_stream_bot_kind", desired_bot_kind)
     ):
         return {"ok": True, "skipped": True, "reason": "unchanged_hash", "hash": text_hash, "format": "message"}
@@ -6682,7 +6733,10 @@ def send_stream_message(
 
     html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)))
     fallback_text = html_to_plain(html_text)
-    message_id = str(entry.get("last_stream_message_id") or "")
+    message_id = ""
+    stream_message_id = str(entry.get("last_stream_message_id") or "")
+    if stream_message_id and reusable_stream_state_for_turn(entry, str(turn_id)):
+        message_id = stream_message_id
     if not message_id:
         message_id = turn_visible_anchor_message_id(entry, str(turn_id))
     if (
@@ -8263,6 +8317,7 @@ def send_pending_prompt_message(
             sent_message_bot_kind(telegram, entry, None, result),
             desired_bot_kind,
         )
+        clear_delivered_stream_state(entry)
         entry.pop("pending_prompt_turn_id", None)
         entry.pop("pending_prompt_text", None)
         entry.pop("pending_prompt_hash", None)
@@ -8284,6 +8339,43 @@ def entry_uses_space_topic(state: dict[str, Any], entry: dict[str, Any]) -> bool
     spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
     space = spaces.get(space_key_value)
     return isinstance(space, dict) and str(space.get("topic_id") or "") == topic_id
+
+
+def remove_pane_from_space_memberships(state: dict[str, Any], pane_key_value: str) -> bool:
+    changed = False
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    for space in spaces.values():
+        if not isinstance(space, dict):
+            continue
+        pane_keys = space.get("pane_keys")
+        if not isinstance(pane_keys, list) or pane_key_value not in pane_keys:
+            continue
+        space["pane_keys"] = [str(key) for key in pane_keys if str(key) != pane_key_value]
+        changed = True
+    return changed
+
+
+def closed_notice_identity(entry: dict[str, Any], fallback_key: str) -> str:
+    for field in ("agent_session_id", "pane_id", "terminal_id"):
+        value = str(entry.get(field) or "").strip()
+        if value:
+            return f"{field}:{value}"
+    return f"pane_key:{fallback_key}"
+
+
+def closed_notice_already_sent(state: dict[str, Any], current_key: str, entry: dict[str, Any]) -> bool:
+    if entry.get("closed_notice_sent_at"):
+        return True
+    identity = closed_notice_identity(entry, current_key)
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    for key, other in panes.items():
+        if str(key) == str(current_key) or not isinstance(other, dict):
+            continue
+        if not other.get("closed_notice_sent_at"):
+            continue
+        if closed_notice_identity(other, str(key)) == identity:
+            return True
+    return False
 
 
 def sync_pane_once(
@@ -8500,6 +8592,10 @@ def sync_pane_once(
                 changed = True
 
         old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
+        if should_baseline_new_pane_turn(entry, item, new_entry):
+            record_suppressed_clean_item(entry, item, "new_pane_initial_turn_baseline")
+            item = None
+            changed = True
         if item:
             item_render_hash = clean_feed_hash(item)
             item_semantic_hash = clean_feed_hash(item, include_render_version=False)
@@ -8795,6 +8891,8 @@ def sync_once() -> dict[str, Any]:
     for key, entry in list(state.get("panes", {}).items()):
         if key in live_keys:
             continue
+        if remove_pane_from_space_memberships(state, str(key)):
+            changed = True
         newly_closed = entry.get("last_known_status") != "closed"
         if newly_closed:
             entry["last_known_status"] = "closed"
@@ -8809,11 +8907,11 @@ def sync_once() -> dict[str, Any]:
             entry["closed_topic_finalized"] = True
             entry["closed_topic_preserved_at"] = utc_now()
             changed = True
-        if newly_closed and topic_id and sends < MAX_SENDS_PER_RUN:
+        if newly_closed and topic_id and sends < MAX_SENDS_PER_RUN and not closed_notice_already_sent(state, str(key), entry):
             closed_notice = send_notice(
                 chat_id,
-                "Closed",
-                "This Herdr pane is no longer live.",
+                "Closed by User",
+                "",
                 telegram=telegram,
                 thread_id=topic_id,
                 notify=True,
@@ -8821,6 +8919,8 @@ def sync_once() -> dict[str, Any]:
                 api_token=managed_bot_token_for_entry(telegram, entry),
             )
             if closed_notice.get("ok") and closed_notice.get("message_id"):
+                entry["closed_notice_message_id"] = str(closed_notice["message_id"])
+                entry["closed_notice_sent_at"] = utc_now()
                 record_pane_message_route(
                     state,
                     str(entry.get("space_key") or ""),
@@ -9309,6 +9409,131 @@ def forward_text_to_pane_response(pane_id: str, text: str, *, usage: str = "") -
     return {"handled": True, "reply": ""}
 
 
+def is_single_live_space_pane(state: dict[str, Any], chat_id: str, topic_id: str) -> bool:
+    mapped_space = topic_space_entry(state, chat_id, topic_id)
+    if not mapped_space:
+        return False
+    _space_key_value, space = mapped_space
+    return len(live_entries_for_space(state, space)) == 1
+
+
+def new_pane_usage() -> str:
+    return "Usage: /new codex|claude|kimi|omp|devin"
+
+
+def new_pane_agent_kind(arg: str) -> str:
+    first = str(arg or "").strip().split(None, 1)[0] if str(arg or "").strip() else ""
+    kind = managed_bot_kind_for_agent(first)
+    return kind if kind in NEW_PANE_AGENT_COMMANDS else ""
+
+
+def new_pane_agent_command(kind: str) -> str:
+    env_name = f"HERDR_TELEGRAM_TOPICS_NEW_PANE_{kind.upper()}_COMMAND"
+    configured = os.getenv(env_name, "").strip()
+    return configured or NEW_PANE_AGENT_COMMANDS.get(kind, "")
+
+
+def split_result_pane_id(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in ("pane_id", "new_pane_id"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return ""
+    for key in ("pane_id", "new_pane_id"):
+        value = str(result.get(key) or "").strip()
+        if value:
+            return value
+    for key in ("pane", "new_pane"):
+        pane = result.get(key)
+        if isinstance(pane, dict):
+            value = str(pane.get("pane_id") or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def new_pane_anchor_entry(
+    state: dict[str, Any],
+    chat_id: str,
+    topic_id: str,
+    *,
+    message_id: str = "",
+    reply_to_message_id: str = "",
+) -> dict[str, Any] | None:
+    resolved = resolve_topic_entry(
+        state,
+        chat_id,
+        topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+    )
+    if resolved:
+        _pane_key_value, entry = resolved
+        return entry
+    mapped_space = topic_space_entry(state, chat_id, topic_id)
+    if not mapped_space:
+        return None
+    _space_key_value, space = mapped_space
+    live_entries = live_entries_for_space(state, space)
+    if not live_entries:
+        return None
+    _pane_key_value, entry = live_entries[0]
+    return entry
+
+
+def new_agent_pane_response(
+    state: dict[str, Any],
+    chat_id: str,
+    topic_id: str,
+    payload: dict[str, Any],
+    arg: str,
+) -> dict[str, Any]:
+    kind = new_pane_agent_kind(arg)
+    if not kind:
+        return {"handled": True, "reply": new_pane_usage()}
+    command = new_pane_agent_command(kind)
+    if not command:
+        return {"handled": True, "reply": f"No command configured for {kind}."}
+    anchor = new_pane_anchor_entry(
+        state,
+        chat_id,
+        topic_id,
+        message_id=str(payload.get("message_id") or ""),
+        reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
+    )
+    if not anchor:
+        return {"handled": True, "reply": "No open Herdr pane found in this space."}
+    anchor_pane_id = str(anchor.get("pane_id") or "").strip()
+    if not anchor_pane_id:
+        return {"handled": True, "reply": "No open Herdr pane found in this space."}
+    split_args = [herdr_bin(), "pane", "split", anchor_pane_id, "--direction", "right"]
+    cwd = str(anchor.get("foreground_cwd") or anchor.get("cwd") or "").strip()
+    if cwd:
+        split_args.extend(["--cwd", cwd])
+    split_args.append("--focus")
+    split_proc = run_cmd(split_args, timeout=10)
+    if split_proc.returncode != 0:
+        detail = sanitize_text(split_proc.stderr or split_proc.stdout, 500)
+        return {"handled": True, "reply": f"New pane failed: {detail}"}
+    try:
+        split_data = json.loads(split_proc.stdout)
+    except json.JSONDecodeError:
+        split_data = {}
+    new_pane_id = split_result_pane_id(split_data)
+    if not new_pane_id:
+        return {"handled": True, "reply": "New pane failed: Herdr did not return the new pane id."}
+    run_proc = run_cmd([herdr_bin(), "pane", "run", new_pane_id, command], timeout=10)
+    if run_proc.returncode != 0:
+        detail = sanitize_text(run_proc.stderr or run_proc.stdout, 500)
+        return {"handled": True, "reply": f"Started pane {new_pane_id}, but launching {kind} failed: {detail}"}
+    label = str((managed_bot_specs().get(kind) or {}).get("label") or kind.title())
+    return {"handled": True, "reply": f"Started {label} in pane {new_pane_id}."}
+
+
 def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     load_dotenv()
     state = load_state()
@@ -9327,6 +9552,19 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     target_bot_kind = payload_target_bot_kind or mentioned_bot_kind
     if target_bot_kind:
         text = strip_managed_bot_mentions(telegram, text)
+
+    command, arg = parse_command(text)
+    if command == "new":
+        owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
+        if not owners:
+            owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
+        if payload.get("edited") or payload.get("from_bot") or user_id not in owners:
+            return {"handled": True, "reply": ""}
+        if payload.get("forwarded"):
+            return {"handled": True, "reply": "Ignored non-direct owner message in pane topic."}
+        if state_changed:
+            save_state(state)
+        return new_agent_pane_response(state, chat_id, topic_id, payload, arg)
 
     entry = topic_entry(
         state,
@@ -9372,7 +9610,6 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
         return {"handled": True, "reply": "Sent attachment to this pane."}
 
-    command, arg = parse_command(text)
     if command == "plain":
         awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
         if awaiting and str(awaiting.get("user_id") or "") == user_id:
@@ -9444,7 +9681,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     "reply": "That choice prompt is no longer safe from Telegram. Use /send or answer in Herdr.",
                 }
             return forward_text_to_pane_response(pane_id, arg)
-        if implicit or target_bot_kind:
+        if implicit or target_bot_kind or is_single_live_space_pane(state, chat_id, topic_id):
             return forward_text_to_pane_response(pane_id, arg)
         return {"handled": True, "reply": "This is a mapped Herdr pane topic. Use /send <text> to forward to this pane, or /help."}
 
