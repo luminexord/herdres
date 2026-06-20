@@ -228,7 +228,7 @@ class OneSpaceOneVoiceManagerCommandsTests(unittest.TestCase):
 
         self.assertEqual(
             registered,
-            {"status", "report", "choices", "raw", "send", "keys", "agents", "new", "debug", "help"},
+            {"status", "report", "choices", "raw", "send", "keys", "agents", "voice", "new", "debug", "help"},
         )
         for command in registered - {"agents"}:
             self.assertIn(command, source)
@@ -628,12 +628,329 @@ class OneSpaceOneVoiceAgentsTests(unittest.TestCase):
 
 
 class OneSpaceOneVoiceCallbackDataTests(unittest.TestCase):
+    def test_multibot_offer_callback_data_within_64_bytes(self) -> None:
+        token = herdres._callback_id("workspace:one", "space")[:16]
+        for action in ("up", "no"):
+            self.assertLessEqual(len(f"herdr:mb:{token}:{action}".encode("utf-8")), 64)
+
     def test_onboarding_callback_data_within_64_bytes(self) -> None:
         markup = herdres.onboarding_reply_markup("x" * 16, list(herdres.managed_bot_specs().keys()), ["codex"])
 
         for row in markup["inline_keyboard"]:
             for button in row:
                 self.assertLessEqual(len(button["callback_data"].encode("utf-8")), 64)
+
+
+class Increment2OfferTests(unittest.TestCase):
+    def test_offer_signal_recorded_on_ambiguous_multi_kind(self) -> None:
+        state = osov_state()
+
+        with command_patches(state), patch.object(herdres, "per_agent_topics_enabled", Mock(return_value=False)):
+            result = herdres.command_reply({"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/status"})
+
+        space = state["spaces"]["workspace:one"]
+        self.assertEqual(result["reply"], herdres.AMBIGUOUS_PANE_THREAD_REPLY)
+        self.assertEqual(space["multibot_offer_signal"], 1)
+        self.assertIn("multibot_offer_last_signal_at", space)
+
+    def test_offer_signal_suppressed_when_per_agent_mode_or_voice_or_dismissed_or_single_kind(self) -> None:
+        for name, mutate in (
+            ("per-agent topics", lambda state: None),
+            ("voice", lambda state: state["spaces"]["workspace:one"].update({"voice_mode": "per_agent"})),
+            ("dismissed", lambda state: state["spaces"]["workspace:one"].update({"multibot_offer_dismissed": True})),
+            ("single kind", lambda state: state["panes"]["pane-2"].update({"agent": "codex"})),
+        ):
+            with self.subTest(name=name):
+                state = osov_state()
+                mutate(state)
+                per_agent_topics = name == "per-agent topics"
+                with command_patches(state), patch.object(
+                    herdres, "per_agent_topics_enabled", Mock(return_value=per_agent_topics)
+                ):
+                    herdres.command_reply({"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/status"})
+                self.assertNotIn("multibot_offer_signal", state["spaces"]["workspace:one"])
+
+    def test_ensure_multibot_offer_message_posts_once_idempotent(self) -> None:
+        state = osov_state()
+        telegram = state["telegram"]
+        telegram["can_manage_bots"] = True
+        state["spaces"]["workspace:one"]["multibot_offer_signal"] = 1
+        send_notice = Mock(return_value={"ok": True, "message_id": "9001"})
+        panes = list(state["panes"].values())
+        counters = {"sends": 0}
+
+        with patch.object(herdres, "managed_bot_setup_enabled", Mock(return_value=True)), patch.object(
+            herdres, "per_agent_topics_enabled", Mock(return_value=False)
+        ), patch.object(herdres, "send_notice", send_notice), patch.object(herdres, "save_state", Mock()):
+            self.assertTrue(herdres.ensure_multibot_offer_message(state, "-1001", telegram, counters, 5, panes))
+            self.assertFalse(herdres.ensure_multibot_offer_message(state, "-1001", telegram, counters, 5, panes))
+
+        self.assertEqual(state["spaces"]["workspace:one"]["multibot_offer_message_id"], "9001")
+        self.assertEqual(send_notice.call_count, 1)
+        self.assertEqual(counters["sends"], 1)
+
+    def test_multibot_offer_failure_cooldown_suppresses_refire(self) -> None:
+        # A send failure (deleted topic / kicked bot -> ok=False, no raise) must not
+        # re-fire and burn a send slot every sync; the cooldown suppresses retries.
+        state = osov_state()
+        telegram = state["telegram"]
+        telegram["can_manage_bots"] = True
+        state["spaces"]["workspace:one"]["multibot_offer_signal"] = 1
+        send_notice = Mock(return_value={"ok": False})
+        panes = list(state["panes"].values())
+
+        with patch.object(herdres, "managed_bot_setup_enabled", Mock(return_value=True)), patch.object(
+            herdres, "per_agent_topics_enabled", Mock(return_value=False)
+        ), patch.object(herdres, "send_notice", send_notice), patch.object(herdres, "save_state", Mock()):
+            counters = {"sends": 0}
+            self.assertTrue(herdres.ensure_multibot_offer_message(state, "-1001", telegram, counters, 5, panes))
+            counters2 = {"sends": 0}
+            self.assertFalse(herdres.ensure_multibot_offer_message(state, "-1001", telegram, counters2, 5, panes))
+
+        self.assertEqual(send_notice.call_count, 1)
+        self.assertEqual(counters2["sends"], 0)
+        self.assertNotIn("multibot_offer_message_id", state["spaces"]["workspace:one"])
+        self.assertTrue(state["spaces"]["workspace:one"].get("multibot_offer_error_at"))
+
+    def test_ensure_multibot_offer_suppressed_cases(self) -> None:
+        for name, mutate, max_sends in (
+            ("cannot manage", lambda state: state["telegram"].update({"can_manage_bots": False}), 5),
+            ("no signal", lambda state: state["telegram"].update({"can_manage_bots": True}), 5),
+            ("single kind", lambda state: (state["telegram"].update({"can_manage_bots": True}), state["spaces"]["workspace:one"].update({"multibot_offer_signal": 1}), state["panes"]["pane-2"].update({"agent": "codex"})), 5),
+            ("budget", lambda state: (state["telegram"].update({"can_manage_bots": True}), state["spaces"]["workspace:one"].update({"multibot_offer_signal": 1})), 0),
+        ):
+            with self.subTest(name=name):
+                state = osov_state()
+                mutate(state)
+                send_notice = Mock(return_value={"ok": True, "message_id": "9001"})
+                with patch.object(herdres, "managed_bot_setup_enabled", Mock(return_value=True)), patch.object(
+                    herdres, "per_agent_topics_enabled", Mock(return_value=False)
+                ), patch.object(herdres, "send_notice", send_notice), patch.object(herdres, "save_state", Mock()):
+                    changed = herdres.ensure_multibot_offer_message(
+                        state, "-1001", state["telegram"], {"sends": 0}, max_sends, list(state["panes"].values())
+                    )
+                self.assertFalse(changed)
+                send_notice.assert_not_called()
+
+    def test_mb_offer_upgrade_flips_voice_per_agent_and_emits_scoped_markup(self) -> None:
+        state = osov_state(panes=2)
+        state["telegram"]["bot_username"] = "manager_bot"
+        state["spaces"]["workspace:two"] = {
+            "space_key": "workspace:two",
+            "topic_id": "88",
+            "pane_keys": ["pane-x"],
+        }
+        state["panes"]["pane-x"] = {
+            "pane_key": "pane-x",
+            "pane_id": "pane-x",
+            "agent": "devin",
+            "space_key": "workspace:two",
+            "topic_id": "88",
+            "last_known_status": "working",
+        }
+        token = herdres._callback_id("workspace:one", "space")[:16]
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with callback_patches(state, api=api):
+            result = herdres.callback_reply(callback_payload(f"herdr:mb:{token}:up"))
+
+        self.assertEqual(result["answer"], "Per-agent voice enabled.")
+        self.assertEqual(state["spaces"]["workspace:one"]["voice_mode"], "per_agent")
+        self.assertTrue(state["panes"]["pane-1"]["managed_voice_active"])
+        self.assertTrue(state["panes"]["pane-2"]["managed_voice_active"])
+        self.assertNotIn("managed_voice_active", state["panes"]["pane-x"])
+        markup_call = [call for call in api.call_args_list if call.args[0] == "editMessageReplyMarkup"][0]
+        markup = markup_call.args[1]["reply_markup"]
+        self.assertIn("Codex", markup)
+        self.assertIn("Claude", markup)
+        self.assertNotIn("Devin", markup)
+
+    def test_mb_dismiss_sets_dismissed_and_edits_card(self) -> None:
+        state = osov_state()
+        space = state["spaces"]["workspace:one"]
+        space["multibot_offer_signal"] = 2
+        token = herdres._callback_id("workspace:one", "space")[:16]
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with callback_patches(state, api=api):
+            result = herdres.callback_reply(callback_payload(f"herdr:mb:{token}:no"))
+
+        self.assertEqual(result["answer"], "Dismissed.")
+        self.assertTrue(space["multibot_offer_dismissed"])
+        self.assertNotIn("multibot_offer_signal", space)
+        self.assertEqual(api.call_args.args[0], "editMessageText")
+
+    def test_mb_callback_nonowner_denied_and_stale_space(self) -> None:
+        state = osov_state()
+        token = herdres._callback_id("workspace:one", "space")[:16]
+
+        with callback_patches(state):
+            denied = herdres.callback_reply(callback_payload(f"herdr:mb:{token}:up", user_id="99"))
+            stale = herdres.callback_reply(callback_payload(f"herdr:mb:{token}:up", topic_id="88"))
+
+        self.assertEqual(denied["answer"], "Not authorized.")
+        self.assertTrue(denied["show_alert"])
+        self.assertEqual(stale["answer"], "This space is no longer active.")
+        self.assertTrue(stale["show_alert"])
+
+    def test_mb_offer_startgroup_only_for_captured(self) -> None:
+        pane1 = {"pane_id": "pane-1", "workspace_id": "one", "agent": "codex", "agent_status": "working"}
+        pane2 = {"pane_id": "pane-2", "workspace_id": "one", "agent": "claude", "agent_status": "working"}
+        key1 = herdres.pane_key(pane1)
+        key2 = herdres.pane_key(pane2)
+        state = {
+            "telegram": {
+                "general_thread_id": "1",
+                "managed_bots": {
+                    "codex": {"username": "herdr_codex_bot", "token": "CODEX_TOKEN", "enabled": True}
+                },
+            },
+            "panes": {
+                key1: {
+                    "pane_key": key1,
+                    "agent": "codex",
+                    "pane_root_bot_kind_retry_kind": "codex",
+                    "pane_root_bot_kind_retry_at": herdres.utc_now(),
+                },
+                key2: {
+                    "pane_key": key2,
+                    "agent": "claude",
+                    "pane_root_bot_kind_retry_kind": "claude",
+                    "pane_root_bot_kind_retry_at": herdres.utc_now(),
+                },
+            },
+        }
+        send_notice = Mock(return_value={"ok": True, "message_id": "9001"})
+
+        with patch.object(herdres, "send_notice", send_notice), patch.object(
+            herdres, "save_state", Mock()
+        ), patch.object(herdres, "MANAGED_BOTS_ENABLED", True):
+            changed = herdres.ensure_managed_bot_group_access_message(
+                state, "-1001", state["telegram"], {"sends": 0}, 5, [pane1, pane2]
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(state["telegram"]["managed_bot_group_access_kinds"], ["codex"])
+        self.assertIn("herdr_codex_bot", json.dumps(send_notice.call_args.kwargs["reply_markup"]))
+        self.assertNotIn("herdr_claude_bot", json.dumps(send_notice.call_args.kwargs["reply_markup"]))
+
+    def test_managed_bot_update_captures_token_kind_keyed(self) -> None:
+        state = {"version": 1, "telegram": {}}
+        payload = {
+            "message": {
+                "from": {"id": 42},
+                "managed_bot_created": {"bot": {"id": 111, "username": "herdr_codex_bot", "first_name": "Codex"}},
+            }
+        }
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            telegram_api=Mock(return_value={"ok": True, "result": "CODEX_TOKEN"}),
+            configure_managed_bot_profile=Mock(return_value={"ok": True}),
+        ):
+            result = herdres.managed_bot_update(payload)
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(state["telegram"]["managed_bots"]["codex"]["token"], "CODEX_TOKEN")
+
+    def test_per_agent_space_without_child_uses_manager_outbound(self) -> None:
+        telegram = {"managed_bots": {}}
+        entry = {"agent": "codex", "managed_voice_active": True}
+
+        self.assertIsNone(herdres.managed_bot_token_for_entry(telegram, entry))
+
+    def test_per_agent_space_without_child_manager_owns_inbound(self) -> None:
+        state = osov_state(panes=1)
+        state["spaces"]["workspace:one"]["voice_mode"] = "per_agent"
+        entry = state["panes"]["pane-1"]
+
+        self.assertEqual(managed_gateway.owner_for_entry(state, entry), "manager")
+        owners = managed_gateway.message_owner_kinds(
+            state,
+            "hello",
+            {
+                "message_id": 1,
+                "message_thread_id": 77,
+                "chat": {"id": -1001, "is_forum": True},
+                "from": {"id": 42, "is_bot": False},
+            },
+            "-1001",
+            "77",
+        )
+        self.assertEqual(owners, {"manager"})
+
+    def test_voice_shared_reverts_routing_to_manager_no_teardown(self) -> None:
+        state = osov_state()
+        state["telegram"]["managed_bots"] = {"codex": {"token": "CODEX_TOKEN", "enabled": True}}
+        state["spaces"]["workspace:one"]["voice_mode"] = "per_agent"
+        for entry in state["panes"].values():
+            herdres.refresh_entry_managed_voice(state, entry)
+
+        with command_patches(state):
+            result = herdres.command_reply({"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/voice shared"})
+
+        self.assertIn("shared manager bot", result["reply"])
+        self.assertEqual(state["spaces"]["workspace:one"]["voice_mode"], "shared")
+        self.assertFalse(state["panes"]["pane-1"]["managed_voice_active"])
+        self.assertIn("codex", state["telegram"]["managed_bots"])
+
+    def test_voice_mode_survives_grouping_reset(self) -> None:
+        state = osov_state(panes=1)
+        state["spaces"]["workspace:one"]["voice_mode"] = "per_agent"
+        state["panes"]["pane-1"]["workspace_id"] = "one"
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ", {"HERDR_TELEGRAM_TOPICS_STATE": str(Path(tmp) / "state.json")}
+        ):
+            herdres.reset_topic_grouping(state, "agent", reason="test")
+            herdres.ensure_space_entry(state, state["panes"]["pane-1"])
+            herdres.save_state(state)
+            loaded = herdres.load_state()
+
+        self.assertEqual(loaded["spaces"]["workspace:one"]["voice_mode"], "per_agent")
+
+    def test_downgrade_one_space_does_not_remove_kind_record_or_stop_other_spaces_worker(self) -> None:
+        state = osov_state()
+        state["telegram"]["managed_bots"] = {"codex": {"token": "CODEX_TOKEN", "enabled": True}}
+        before = managed_gateway.managed_bot_tokens(state)
+
+        with command_patches(state):
+            herdres.command_reply({"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/voice shared"})
+
+        self.assertEqual(managed_gateway.managed_bot_tokens(state), before)
+
+    def test_offer_to_upgrade_to_capture_to_poller_birth(self) -> None:
+        state = osov_state()
+        state["telegram"].update({"can_manage_bots": True, "bot_username": "manager_bot"})
+        with command_patches(state), patch.object(herdres, "per_agent_topics_enabled", Mock(return_value=False)):
+            herdres.command_reply({"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/status"})
+        with patch.object(herdres, "managed_bot_setup_enabled", Mock(return_value=True)), patch.object(
+            herdres, "per_agent_topics_enabled", Mock(return_value=False)
+        ), patch.object(herdres, "send_notice", Mock(return_value={"ok": True, "message_id": "9001"})), patch.object(
+            herdres, "save_state", Mock()
+        ):
+            self.assertTrue(
+                herdres.ensure_multibot_offer_message(
+                    state, "-1001", state["telegram"], {"sends": 0}, 5, list(state["panes"].values())
+                )
+            )
+        token = herdres._callback_id("workspace:one", "space")[:16]
+        with callback_patches(state):
+            herdres.callback_reply(callback_payload(f"herdr:mb:{token}:up"))
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            telegram_api=Mock(return_value={"ok": True, "result": "CODEX_TOKEN"}),
+            configure_managed_bot_profile=Mock(return_value={"ok": True}),
+        ):
+            herdres.managed_bot_update({"bot": {"id": 111, "username": "herdr_codex_bot"}})
+
+        self.assertEqual(state["spaces"]["workspace:one"]["voice_mode"], "per_agent")
+        self.assertTrue(any(key.startswith("managed-codex-") for key, _token in managed_gateway.managed_bot_tokens(state)))
 
     def test_agents_callback_data_within_64_bytes(self) -> None:
         live = [(f"pane-key-{idx}-" + "x" * 80, {"agent": "codex", "pane_id": "pane-" + "y" * 80}) for idx in range(12)]

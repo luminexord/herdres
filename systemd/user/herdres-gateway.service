@@ -10,6 +10,7 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HERDR_TELEGRAM_TOPICS_STATE=%h/.local/share/herdres/state.json
 Environment=HERDR_TELEGRAM_TOPICS_SCRIPT=%h/.local/bin/herdres
 Environment=HERDR_TELEGRAM_TOPICS_GATEWAY_OFFSET=%h/.local/share/herdres/gateway.offset
+Environment=HERDRES_GATEWAY_RUNNER=subprocess
 # herdres command/callback shells out to herdr to drive the pane, so the gateway
 # subprocess needs the same herdr binaries the timer service has on its env.
 Environment=HERDR_REAL_BIN=%h/.local/bin/herdr

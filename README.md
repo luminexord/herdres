@@ -116,15 +116,17 @@ systemctl --user restart hermes-gateway.service
 
 Standalone inbound gateway:
 
-Herdres also includes `herdres-gateway.py`, a stdlib-only `getUpdates` daemon
-that can replace the Hermes inbound bridge for pane-topic commands and
-callbacks. Set `HERDRES_GATEWAY_BOT_TOKEN` in `~/.config/herdres/herdres.env`
-for a gateway-owned bot, or let it fall back to `TELEGRAM_BOT_TOKEN` during a
-single-token migration. For any one bot token, run either Hermes polling or
+Herdres also includes a stdlib-only `getUpdates` daemon installed as
+`herdres-gateway` from `herdres_gateway.py`. It can replace the Hermes inbound
+bridge for pane-topic commands and callbacks, and when managed child bots are
+enabled it polls the manager token plus one worker per child bot token. Set
+`TELEGRAM_BOT_TOKEN` in `~/.config/herdres/herdres.env`; if an older deployment
+only set `HERDRES_GATEWAY_BOT_TOKEN`, add the `TELEGRAM_BOT_TOKEN` line before
+switching. For any one bot token, run either Hermes polling or
 `herdres-gateway.service`, never both, because Telegram permits only one active
-`getUpdates` consumer per bot token. The gateway embeds the Herdres command
-runner by default so inbound messages avoid a Python cold start; set
-`HERDRES_GATEWAY_RUNNER=subprocess` to force the older subprocess path.
+`getUpdates` consumer per bot token. The Linux systemd unit pins
+`HERDRES_GATEWAY_RUNNER=subprocess` to preserve the prior subprocess execution
+model; embedded mode can be enabled later after operational validation.
 
 ## Herdr Plugin Event Trigger
 

@@ -92,6 +92,8 @@ TOKEN = ""
 DEBUG = os.getenv("HERDRES_GATEWAY_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
 CLEARED_WEBHOOK_KEYS: set[str] = set()
 CLEARED_WEBHOOK_LOCK = threading.Lock()
+QUARANTINED_KEYS: set[str] = set()
+QUARANTINED_KEYS_LOCK = threading.Lock()
 PROCESSED_LOCK = threading.Lock()
 PROCESSED_MESSAGE_KEYS: set[str] | None = None
 PROCESSED_MESSAGE_ORDER: list[str] = []
@@ -106,6 +108,12 @@ HERDRES_MODULE_LOCK = threading.Lock()
 TRACE_PATH = Path(
     os.getenv("HERDRES_GATEWAY_TRACE", str(HOME / ".local/share/herdres/gateway.trace.log"))
 ).expanduser()
+
+
+class WorkerStop(Exception):
+    def __init__(self, code: int):
+        super().__init__(str(code))
+        self.code = code
 
 
 def _emit(line: str) -> None:
@@ -784,7 +792,11 @@ def handle_callback(query: dict, *, bot_token: str | None = None) -> None:
         prefer_message_id=True,
     )
     if not resolved:
-        if (data.startswith("herdr:ob:") or data.startswith("herdr:ag:")) and topic_space_entry(state, chat_id, thread_id):
+        if (
+            data.startswith("herdr:ob:")
+            or data.startswith("herdr:ag:")
+            or data.startswith("herdr:mb:")
+        ) and topic_space_entry(state, chat_id, thread_id):
             pane_key = ""
         else:
             return
@@ -899,6 +911,8 @@ def poll_once(key: str, bot_token: str, *, timeout_seconds: int) -> None:
     try:
         resp = api("getUpdates", params, timeout=max(timeout_seconds + 15, 20), token=bot_token)
     except urllib.error.HTTPError as exc:
+        if exc.code in (401, 404) and key != "manager":
+            raise WorkerStop(exc.code) from exc
         log(f"getUpdates HTTP {exc.code} for {key}; backing off")
         time.sleep(ERROR_BACKOFF)
         return
@@ -934,8 +948,15 @@ def poll_worker_specs(child_bots: list[tuple[str, str]]) -> list[tuple[str, str,
 
 
 def poll_worker(key: str, bot_token: str, timeout_seconds: int, stop_event: threading.Event) -> None:
+    """Poll one bot token until stopped; stop is cooperative after any in-flight long-poll returns."""
     while not stop_event.is_set():
-        poll_once(key, bot_token, timeout_seconds=timeout_seconds)
+        try:
+            poll_once(key, bot_token, timeout_seconds=timeout_seconds)
+        except WorkerStop as exc:
+            with QUARANTINED_KEYS_LOCK:
+                QUARANTINED_KEYS.add(key)
+            log(f"child token {key} revoked (HTTP {exc.code}); stopping worker")
+            return
 
 
 def reconcile_poll_workers(
@@ -946,6 +967,8 @@ def reconcile_poll_workers(
     for key, worker in list(workers.items()):
         if key in desired and worker.get("token") == desired[key][0]:
             continue
+        with QUARANTINED_KEYS_LOCK:
+            QUARANTINED_KEYS.discard(key)
         stop_event = worker.get("stop")
         if hasattr(stop_event, "set"):
             stop_event.set()
@@ -955,6 +978,9 @@ def reconcile_poll_workers(
     for key, (bot_token, timeout_seconds) in desired.items():
         if key in workers:
             continue
+        with QUARANTINED_KEYS_LOCK:
+            if key in QUARANTINED_KEYS:
+                continue
         stop_event = threading.Event()
         thread = threading.Thread(
             target=poll_worker,
@@ -974,13 +1000,31 @@ def main() -> int:
     if not TOKEN:
         log("no TELEGRAM_BOT_TOKEN found; refusing to start")
         return 1
+    try:
+        info = api("getWebhookInfo", token=TOKEN)
+        result = info.get("result") if isinstance(info, dict) else {}
+        webhook_url = str((result or {}).get("url") or "").strip()
+        if webhook_url:
+            log("WARNING: manager token has a webhook configured; run this gateway OR another Telegram consumer, never both")
+    except Exception as exc:
+        log(f"getWebhookInfo startup check failed: {exc}")
 
     log("started; polling getUpdates for manager and managed pane bots")
     workers: dict[str, dict[str, object]] = {}
     while True:
-        state = load_state()
-        child_bots = managed_bot_tokens(state)
-        reconcile_poll_workers(workers, poll_worker_specs(child_bots))
+        try:
+            state = load_state()
+            if state is None:
+                # Transient unreadable/partial state (e.g. read mid-write). Do NOT
+                # reconcile against an empty token set — that would stop every child
+                # poller and force a 409 window when they restart next tick while the
+                # old long-poll is still draining. Keep the existing workers as-is.
+                time.sleep(WORKER_RECONCILE_SECONDS)
+                continue
+            child_bots = managed_bot_tokens(state)
+            reconcile_poll_workers(workers, poll_worker_specs(child_bots))
+        except Exception as exc:
+            log(f"worker reconcile failed; keeping existing workers: {exc}")
         time.sleep(WORKER_RECONCILE_SECONDS)
 
 

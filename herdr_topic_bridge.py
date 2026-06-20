@@ -371,10 +371,18 @@ async def maybe_handle_herdr_topic_callback(adapter: Any, query: Any) -> bool:
         prefer_message_id=True,
     )
     if not resolved:
-        return False
+        if (
+            data.startswith("herdr:ob:")
+            or data.startswith("herdr:ag:")
+            or data.startswith("herdr:mb:")
+        ) and _topic_space_entry(state, chat_id, thread_id):
+            pane_key = ""
+        else:
+            return False
+    else:
+        pane_key, _entry = resolved
     if _stand_down():
         return True
-    pane_key, _entry = resolved
 
     user = getattr(query, "from_user", None)
     payload = {

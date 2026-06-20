@@ -9,6 +9,7 @@ import threading
 import time
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -391,8 +392,12 @@ class GatewayManagedBotTests(unittest.TestCase):
         self.addCleanup(offset_patch.stop)
         managed_gateway.PROCESSED_MESSAGE_KEYS = None
         managed_gateway.PROCESSED_MESSAGE_ORDER = []
+        if hasattr(managed_gateway, "QUARANTINED_KEYS"):
+            managed_gateway.QUARANTINED_KEYS.clear()
         self.addCleanup(setattr, managed_gateway, "PROCESSED_MESSAGE_KEYS", None)
         self.addCleanup(setattr, managed_gateway, "PROCESSED_MESSAGE_ORDER", [])
+        if hasattr(managed_gateway, "QUARANTINED_KEYS"):
+            self.addCleanup(managed_gateway.QUARANTINED_KEYS.clear)
         if hasattr(managed_gateway, "DISPATCH_QUEUE_SEMAPHORE"):
             old_semaphore = managed_gateway.DISPATCH_QUEUE_SEMAPHORE
             managed_gateway.DISPATCH_QUEUE_SEMAPHORE = threading.BoundedSemaphore(128)
@@ -459,6 +464,216 @@ class GatewayManagedBotTests(unittest.TestCase):
                 ("managed-kimi-token", "KIMI_TOKEN", 50),
             ],
         )
+
+    def test_zero_children_runs_only_manager_worker(self) -> None:
+        with patch.object(managed_gateway, "TOKEN", "MANAGER_TOKEN"), patch.object(managed_gateway, "LONG_POLL_SECONDS", 50):
+            self.assertEqual(managed_gateway.poll_worker_specs([]), [("manager", "MANAGER_TOKEN", 50)])
+
+    def test_allowed_updates_includes_managed_bot(self) -> None:
+        self.assertIn("managed_bot", json.loads(managed_gateway.ALLOWED_UPDATES))
+
+    def test_handle_update_routes_managed_bot_and_created(self) -> None:
+        handler = Mock()
+        with patch.object(managed_gateway, "handle_managed_bot_update", handler):
+            managed_gateway.handle_update({"update_id": 1, "managed_bot": {"id": 1}}, bot_token="MANAGER_TOKEN")
+            managed_gateway.handle_update(
+                {
+                    "update_id": 2,
+                    "message": {
+                        "from": {"id": 42},
+                        "managed_bot_created": {"bot": {"id": 2, "username": "herdr_codex_bot"}},
+                    },
+                },
+                bot_token="MANAGER_TOKEN",
+            )
+
+        self.assertEqual(handler.call_count, 2)
+
+    def test_reconcile_starts_stops_rotates_workers(self) -> None:
+        started: list[str] = []
+
+        class FakeThread:
+            def __init__(self, *, target, args, name, daemon):
+                self.name = name
+
+            def start(self):
+                started.append(self.name)
+
+        workers: dict[str, dict[str, object]] = {}
+        with patch.object(managed_gateway.threading, "Thread", FakeThread):
+            managed_gateway.reconcile_poll_workers(workers, [("manager", "MANAGER", 50), ("managed-codex-a", "A", 50)])
+            old_stop = workers["managed-codex-a"]["stop"]
+            managed_gateway.reconcile_poll_workers(workers, [("manager", "MANAGER", 50), ("managed-codex-b", "B", 50)])
+
+        self.assertIn("manager", workers)
+        self.assertIn("managed-codex-b", workers)
+        self.assertNotIn("managed-codex-a", workers)
+        self.assertTrue(old_stop.is_set())
+        self.assertIn("herdres-gateway-managed-codex-b", started)
+
+    def test_child_callback_answered_with_child_token(self) -> None:
+        state = managed_multi_pane_space_state()
+        run_script = Mock(return_value={"handled": True, "answer": "ok"})
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", api):
+            managed_gateway.handle_callback(
+                {
+                    "id": "cb-child",
+                    "from": {"id": 42},
+                    "data": "herdr:mb:space-token:up",
+                    "message": {
+                        "message_id": 8201,
+                        "message_thread_id": 77,
+                        "chat": {"id": -1001, "is_forum": True},
+                    },
+                },
+                bot_token="CHILD_TOKEN",
+            )
+
+        run_script.assert_called_once()
+        api.assert_called_once()
+        self.assertEqual(api.call_args.kwargs["token"], "CHILD_TOKEN")
+
+    def test_child_message_replies_with_child_token(self) -> None:
+        state = managed_multi_pane_space_state()
+        state["telegram"]["managed_bots"] = {"codex": {"token": "CHILD_TOKEN", "enabled": True}}
+        run_script = Mock(return_value={"handled": True, "reply": "done"})
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", api):
+            managed_gateway.handle_message(
+                {
+                    "message_id": 4000,
+                    "message_thread_id": 77,
+                    "chat": {"id": -1001, "is_forum": True},
+                    "from": {"id": 42, "is_bot": False},
+                    "text": "@herdr_codex_bot run tests",
+                },
+                bot_token="CHILD_TOKEN",
+                bot_key="managed-codex-deadbeef",
+            )
+
+        api.assert_called_once()
+        self.assertEqual(api.call_args.kwargs["token"], "CHILD_TOKEN")
+
+    def test_manager_path_unchanged_when_children_absent(self) -> None:
+        state = managed_multi_pane_space_state()
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", Mock()):
+            managed_gateway.handle_message(
+                {
+                    "message_id": 4100,
+                    "message_thread_id": 77,
+                    "chat": {"id": -1001, "is_forum": True},
+                    "from": {"id": 42, "is_bot": False},
+                    "text": "/new codex",
+                },
+                bot_token="MANAGER_TOKEN",
+                bot_key="manager",
+            )
+
+        run_script.assert_called_once()
+        self.assertEqual(run_script.call_args.args[0]["pane_key"], "")
+
+    def test_409_conflict_backs_off_and_retains_worker(self) -> None:
+        managed_gateway.offset_path_for("managed-codex-a").write_text("10\n", encoding="utf-8")
+        exc = urllib.error.HTTPError("url", 409, "Conflict", hdrs=None, fp=None)
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(
+            managed_gateway, "api", Mock(side_effect=exc)
+        ), patch.object(managed_gateway.time, "sleep") as sleep:
+            managed_gateway.poll_once("managed-codex-a", "TOKEN", timeout_seconds=0)
+
+        sleep.assert_called_once_with(managed_gateway.ERROR_BACKOFF)
+        self.assertNotIn("managed-codex-a", managed_gateway.QUARANTINED_KEYS)
+
+    def test_child_401_404_quarantines_worker_no_restart(self) -> None:
+        managed_gateway.offset_path_for("managed-codex-a").write_text("10\n", encoding="utf-8")
+        exc = urllib.error.HTTPError("url", 401, "Unauthorized", hdrs=None, fp=None)
+        stop_event = threading.Event()
+
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(managed_gateway, "api", Mock(side_effect=exc)):
+            managed_gateway.poll_worker("managed-codex-a", "TOKEN", 0, stop_event)
+
+        self.assertIn("managed-codex-a", managed_gateway.QUARANTINED_KEYS)
+        started: list[str] = []
+
+        class FakeThread:
+            def __init__(self, *, target, args, name, daemon):
+                self.name = name
+
+            def start(self):
+                started.append(self.name)
+
+        with patch.object(managed_gateway.threading, "Thread", FakeThread):
+            managed_gateway.reconcile_poll_workers({}, [("managed-codex-a", "TOKEN", 0)])
+            managed_gateway.reconcile_poll_workers({}, [("managed-codex-b", "ROTATED", 0)])
+
+        self.assertNotIn("herdres-gateway-managed-codex-a", started)
+        self.assertIn("herdres-gateway-managed-codex-b", started)
+
+    def test_supervisor_survives_malformed_state_tick(self) -> None:
+        valid = {"version": 1, "enabled": True, "telegram": {}}
+        reconciles = []
+
+        def reconcile(workers, specs):
+            reconciles.append(specs)
+
+        with patch.object(managed_gateway, "_token", Mock(return_value="MANAGER_TOKEN")), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": {"url": ""}})
+        ), patch.object(managed_gateway, "load_state", Mock(side_effect=[valid, RuntimeError("bad state")])), patch.object(
+            managed_gateway, "reconcile_poll_workers", reconcile
+        ), patch.object(managed_gateway.time, "sleep", Mock(side_effect=[None, KeyboardInterrupt])):
+            with self.assertRaises(KeyboardInterrupt):
+                managed_gateway.main()
+
+        self.assertEqual(len(reconciles), 1)
+
+    def test_supervisor_keeps_workers_on_none_state_tick(self) -> None:
+        # load_state() returns None (not raises) on a transient/partial read; that
+        # tick must be skipped, NOT reconciled to an empty token set (which would
+        # tear down every child poller). Exercises the real None path.
+        valid = {"version": 1, "enabled": True, "telegram": {}}
+        reconciles = []
+
+        def reconcile(workers, specs):
+            reconciles.append(specs)
+
+        with patch.object(managed_gateway, "_token", Mock(return_value="MANAGER_TOKEN")), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": {"url": ""}})
+        ), patch.object(managed_gateway, "load_state", Mock(side_effect=[valid, None])), patch.object(
+            managed_gateway, "reconcile_poll_workers", reconcile
+        ), patch.object(managed_gateway.time, "sleep", Mock(side_effect=[None, KeyboardInterrupt])):
+            with self.assertRaises(KeyboardInterrupt):
+                managed_gateway.main()
+
+        self.assertEqual(len(reconciles), 1)  # the None tick must NOT reconcile
+
+    def test_child_first_poll_drains_and_clears_webhook(self) -> None:
+        calls = []
+
+        def api(method, params=None, timeout=30, *, token=None):
+            calls.append(method)
+            if method == "getUpdates":
+                return {"ok": True, "result": [{"update_id": 5}]}
+            return {"ok": True, "result": True}
+
+        with patch.object(managed_gateway, "api", api):
+            managed_gateway.poll_once("managed-codex-a", "TOKEN", timeout_seconds=0)
+
+        self.assertEqual(calls[:2], ["deleteWebhook", "getUpdates"])
+        self.assertEqual(managed_gateway.offset_path_for("managed-codex-a").read_text(encoding="utf-8").strip(), "6")
+
+    def test_runner_mode_subprocess_pinned_when_env_set(self) -> None:
+        with patch.dict(os.environ, {"HERDRES_GATEWAY_RUNNER": "subprocess"}, clear=False):
+            self.assertEqual(managed_gateway.gateway_runner_mode(), "subprocess")
 
     def test_poll_once_queues_update_handlers_without_waiting_for_commands(self) -> None:
         class QueuedExecutor:

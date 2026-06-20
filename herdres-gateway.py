@@ -308,7 +308,15 @@ def handle_callback(config: GatewayConfig, query: dict[str, Any]) -> None:
     chat_id = str(chat.get("id") or "")
     thread_id = message_thread_id_dict(message)
     if not mapped_topic_entry(state, chat_id, thread_id):
-        return
+        if not (
+            data.startswith("herdr:ob:")
+            or data.startswith("herdr:ag:")
+            or data.startswith("herdr:mb:")
+        ):
+            return
+        spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+        if not any(isinstance(space, dict) and str(space.get("topic_id") or "") == str(thread_id) for space in spaces.values()):
+            return
     # Do NOT owner-prefilter callbacks: herdres callback_reply enforces auth and
     # returns the answer text. Dropping non-owner callbacks here would leave the
     # Telegram button spinner spinning forever (no answerCallbackQuery).

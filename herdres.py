@@ -94,6 +94,7 @@ MANAGER_BOT_COMMANDS = [
     ("send", "Send text to a pane"),
     ("keys", "Send explicit keystrokes"),
     ("agents", "Pick which agent to address"),
+    ("voice", "Switch shared/per-agent voice"),
     ("new", "Start a new agent pane"),
     ("debug", "Pane mapping details"),
     ("help", "Show commands"),
@@ -138,6 +139,9 @@ INTERACTION_READONLY_WARNING_BODY = (
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
 ACTIVE_PROMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PROMPT_TTL", "900"))
 ACTIVE_PANE_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PANE_TTL", "600"))
+# Cooldown before re-attempting a failed multibot-offer card, so an undeliverable
+# space (deleted topic / kicked bot) can't burn a send slot every sync.
+MULTIBOT_OFFER_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_MULTIBOT_OFFER_RETRY", "3600"))
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
 PANE_INPUT_FILE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS", "1200"))
 PANE_INPUT_FILE_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES", "6"))
@@ -1086,6 +1090,74 @@ def ensure_managed_bot_group_access_message(
         telegram["managed_bot_group_access_message_error"] = sanitize_text(str(result), 500)
     save_state(state)
     return True
+
+
+def ensure_multibot_offer_message(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    counters: dict[str, int],
+    max_sends: int,
+    panes: list[dict[str, Any]],
+) -> bool:
+    if not managed_bot_setup_enabled() or not chat_id:
+        return False
+    if telegram.get("can_manage_bots") is not True or per_agent_topics_enabled():
+        return False
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    changed = False
+    for space_key_value, space in spaces.items():
+        if not isinstance(space, dict):
+            continue
+        if (
+            str(space.get("voice_mode") or "shared") == "per_agent"
+            or space.get("multibot_offer_dismissed")
+            or space.get("multibot_offer_message_id")
+            or int(space.get("multibot_offer_signal") or 0) < 1
+        ):
+            continue
+        last_err_at = str(space.get("multibot_offer_error_at") or "")
+        if last_err_at:
+            err_age = _iso_age_seconds(last_err_at)
+            if err_age is not None and err_age < MULTIBOT_OFFER_RETRY_SECONDS:
+                continue
+        space_open_panes = [
+            pane
+            for pane in panes
+            if str(pane.get("space_key") or space_key(pane)) == str(space_key_value)
+            and str(pane.get("agent_status") or "").strip().lower() != "closed"
+        ]
+        kinds = managed_bot_kinds_for_panes(space_open_panes)
+        if len(kinds) < 2:
+            continue
+        if counters.get("sends", 0) >= max_sends:
+            return False
+        space_token = _callback_id(str(space.get("space_key") or space_key_value), "space")[:16]
+        reply_markup = {"inline_keyboard": [[
+            {"text": "Upgrade", "callback_data": f"herdr:mb:{space_token}:up"},
+            {"text": "Dismiss", "callback_data": f"herdr:mb:{space_token}:no"},
+        ]]}
+        result = send_notice(
+            chat_id,
+            "Give each agent its own bot (optional)",
+            "This space can use a separate Telegram bot voice for each agent. It is optional and reversible with /voice.",
+            telegram=telegram,
+            thread_id=space.get("topic_id"),
+            notify=True,
+            reply_markup=reply_markup,
+        )
+        counters["sends"] = counters.get("sends", 0) + 1
+        changed = True
+        if result.get("ok") and result.get("message_id"):
+            space["multibot_offer_message_id"] = str(result["message_id"])
+            space["multibot_offer_sent_at"] = utc_now()
+            space.pop("multibot_offer_error", None)
+        else:
+            space["multibot_offer_error"] = sanitize_text(str(result), 500)
+            space["multibot_offer_error_at"] = utc_now()
+        save_state(state)
+        return True
+    return changed
 
 
 def ensure_managed_bot_setup_message(
@@ -9701,6 +9773,8 @@ def sync_once() -> dict[str, Any]:
         changed = True
     if ensure_managed_bot_group_access_message(state, chat_id, telegram, counters, caps["max_sends"], panes):
         changed = True
+    if ensure_multibot_offer_message(state, chat_id, telegram, counters, caps["max_sends"], panes):
+        changed = True
     if TURN_FEED_ENABLED:
         prefetch_pane_turns([str(p.get("pane_id") or "") for p in panes if p.get("pane_id")])
     for pane in panes:
@@ -10262,6 +10336,21 @@ def new_agent_pane_response(
     return {"handled": True, "reply": f"Started {label} in pane {new_pane_id}."}
 
 
+def voice_mode_response(state: dict[str, Any], space: dict[str, Any], live: list[tuple[str, dict[str, Any]]], arg: str) -> dict[str, Any]:
+    requested = str(arg or "").strip().lower().replace("-", "_")
+    if requested in {"", "status"}:
+        mode = str(space.get("voice_mode") or "shared")
+        return {"handled": True, "reply": f"Voice mode for this space is {mode}."}
+    if requested not in {"shared", "per_agent"}:
+        return {"handled": True, "reply": "Usage: /voice shared|per_agent"}
+    space["voice_mode"] = requested
+    for _key, entry in live:
+        refresh_entry_managed_voice(state, entry, None)
+    save_state(state)
+    label = "shared manager bot" if requested == "shared" else "per-agent bots"
+    return {"handled": True, "reply": f"Voice mode for this space is now {label}."}
+
+
 def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     load_dotenv()
     state = load_state()
@@ -10313,7 +10402,17 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         if mapped_space:
             _sk, space = mapped_space
             live = live_entries_for_space(state, space)
+            if command == "voice":
+                return voice_mode_response(state, space, live, arg)
             if command != "agents" and not str(payload.get("reply_to_message_id") or "").strip():
+                if (
+                    not per_agent_topics_enabled()
+                    and str(space.get("voice_mode") or "shared") != "per_agent"
+                    and not space.get("multibot_offer_dismissed")
+                    and len(managed_bot_kinds_for_panes([e for _k, e in live])) >= 2
+                ):
+                    space["multibot_offer_signal"] = int(space.get("multibot_offer_signal") or 0) + 1
+                    space["multibot_offer_last_signal_at"] = utc_now()
                 resolved_active = get_active_pane_entry(state, space, user_id)
                 if resolved_active:
                     save_state(state)
@@ -10332,12 +10431,20 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                         reply_markup=agents_picker_reply_markup(space_token, live),
                     )
                     return {"handled": True, "reply": ""}
+                save_state(state)
                 return {"handled": True, "reply": AMBIGUOUS_PANE_THREAD_REPLY}
         if not entry:
             return {"handled": False}
     if state_changed:
         save_state(state)
     refresh_entry_managed_voice(state, entry, None)
+    if command == "voice":
+        spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+        entry_space_key = str(entry.get("space_key") or "")
+        space = spaces.get(entry_space_key) if isinstance(spaces, dict) else None
+        if isinstance(space, dict):
+            return voice_mode_response(state, space, live_entries_for_space(state, space), arg)
+        return {"handled": True, "reply": "This pane has no shared space voice setting."}
 
     pane_id = str(entry.get("pane_id") or "")
     if not pane_id or entry.get("last_known_status") == "closed":
@@ -10454,6 +10561,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 "/send! <text> - interrupt the current turn and send now\n"
                 "/keys <keys> - send explicit keys\n"
                 "/agents - pick which agent to address in a shared topic\n"
+                "/voice shared|per_agent - switch this space's Telegram voice\n"
                 f"{plain_text_help}"
             ),
         }
@@ -10741,6 +10849,57 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
     return {"handled": True, "answer": f"Sending to {label}."}
 
 
+def handle_multibot_offer_callback(state, telegram, chat_id, topic_id, message_id, space, parts):
+    if len(parts) != 4:
+        return {"handled": True, "answer": "Unknown Herdr action."}
+    action = parts[3]
+    if action == "no":
+        space["multibot_offer_dismissed"] = True
+        space.pop("multibot_offer_signal", None)
+        save_state(state)
+        try:
+            telegram_api("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": int(message_id),
+                "text": "Kept shared voice. You can upgrade later with /voice.",
+            })
+        except Exception:
+            pass
+        return {"handled": True, "answer": "Dismissed."}
+    if action == "up":
+        live = live_entries_for_space(state, space)
+        space["voice_mode"] = "per_agent"
+        for _key, entry in live:
+            refresh_entry_managed_voice(state, entry, None)
+        scoped_kinds = managed_bot_kinds_for_panes([entry for _key, entry in live])
+        try:
+            manager_username = manager_bot_username(telegram)
+        except Exception as exc:
+            space["multibot_offer_error"] = sanitize_text(str(exc), 500)
+            save_state(state)
+            return {"handled": True, "answer": "Could not start upgrade — try again."}
+        try:
+            telegram_api("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": int(message_id),
+                "text": "Per-agent voice on for this space. Create a bot for each agent (BotFather opens in Telegram); I'll wire each one as you finish.",
+            })
+            telegram_api("editMessageReplyMarkup", {
+                "chat_id": chat_id,
+                "message_id": int(message_id),
+                "reply_markup": json.dumps(
+                    managed_bot_setup_reply_markup(manager_username, kinds=scoped_kinds),
+                    separators=(",", ":"),
+                ),
+            })
+        except Exception:
+            pass
+        space["multibot_offer_status"] = "upgrading"
+        save_state(state)
+        return {"handled": True, "answer": "Per-agent voice enabled."}
+    return {"handled": True, "answer": "Unknown Herdr action."}
+
+
 def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     load_dotenv()
     state = load_state()
@@ -10754,7 +10913,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
 
     if not data.startswith("herdr:"):
         return {"handled": False}
-    if data.startswith("herdr:ob:") or data.startswith("herdr:ag:"):
+    if data.startswith("herdr:ob:") or data.startswith("herdr:ag:") or data.startswith("herdr:mb:"):
         owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
         if not owners:
             owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
@@ -10765,6 +10924,8 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return {"handled": True, "answer": "This space is no longer active.", "show_alert": True}
         space_key_value, space = mapped_space
         parts = data.split(":")
+        if data.startswith("herdr:mb:"):
+            return handle_multibot_offer_callback(state, telegram, chat_id, topic_id, message_id, space, parts)
         if data.startswith("herdr:ob:"):
             return handle_onboarding_callback(state, telegram, chat_id, topic_id, message_id, space, parts)
         return handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, user_id, space, parts)
