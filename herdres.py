@@ -146,6 +146,15 @@ CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_T
 PANE_INPUT_FILE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS", "1200"))
 PANE_INPUT_FILE_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES", "6"))
 PANE_INPUT_FILE_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_MAX_CHARS", "120000"))
+# Wall-time budget for one send_to_pane() call. Kept well under the gateway
+# COMMAND_TIMEOUT (herdres_gateway.py: 60s) so the function self-bounds and
+# returns a real reply before the gateway SIGKILLs the subprocess. Invariant:
+# BUDGET + PER_CALL_CAP <= COMMAND_TIMEOUT - margin (40 + 5 = 45 <= 60 - 15).
+SEND_TO_PANE_BUDGET_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_SEND_BUDGET", "40"))
+SEND_TO_PANE_PER_CALL_CAP = float(os.getenv("HERDR_TELEGRAM_TOPICS_SEND_CALL_CAP", "5"))
+# Never START a new herdr call (esp. the main `pane run`) with less than this many
+# seconds left — reserve enough for one full-cap call so the actual delivery runs.
+SEND_TO_PANE_MIN_CALL_SECONDS = SEND_TO_PANE_PER_CALL_CAP
 # Inbound Telegram attachments (documents/photos). 20MB is the Bot API getFile
 # hard ceiling; the download timeout is kept under the bridge's 25s subprocess
 # kill so a slow/huge fetch fails cleanly instead of wedging the state lock.
@@ -1229,6 +1238,37 @@ def run_cmd(args: list[str], *, timeout: int = 10, input_text: str | None = None
     )
 
 
+def _send_deadline(deadline: float | None) -> float:
+    """Resolve a deadline, defaulting to now + the send budget when unset."""
+    if deadline is not None:
+        return deadline
+    return time.monotonic() + SEND_TO_PANE_BUDGET_SECONDS
+
+
+def _remaining(deadline: float | None) -> float:
+    if deadline is None:
+        return float("inf")
+    return deadline - time.monotonic()
+
+
+def _bounded_timeout(deadline: float | None, cap: float = SEND_TO_PANE_PER_CALL_CAP) -> int:
+    """Per-call herdr timeout = min(cap, remaining), floored at 1s, int for run_cmd."""
+    if deadline is None:
+        return int(cap)
+    rem = _remaining(deadline)
+    return max(1, int(min(cap, rem)))
+
+
+def _deadline_sleep(seconds: float, deadline: float | None) -> bool:
+    """Sleep at most `seconds`, clamped to remaining budget. Returns True if
+    budget remains afterward (caller may continue), False if exhausted."""
+    rem = _remaining(deadline)
+    if rem <= 0:
+        return False
+    time.sleep(min(seconds, rem))
+    return _remaining(deadline) > 0
+
+
 def herdr_bin() -> str:
     return os.getenv("HERDR_BIN", DEFAULT_HERDR_BIN)
 
@@ -1250,9 +1290,11 @@ def herdr_text(args: list[str], *, timeout: int = 10) -> str:
     return proc.stdout
 
 
-def workspace_label_map() -> dict[str, str]:
+def workspace_label_map(deadline: float | None = None) -> dict[str, str]:
+    if deadline is not None and _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return {}
     try:
-        data = herdr_json(["workspace", "list"], timeout=8)
+        data = herdr_json(["workspace", "list"], timeout=(8 if deadline is None else _bounded_timeout(deadline)))
     except BridgeError:
         return {}
     if not isinstance(data, dict):
@@ -1271,12 +1313,14 @@ def workspace_label_map() -> dict[str, str]:
     return labels
 
 
-def pane_list() -> list[dict[str, Any]]:
-    data = herdr_json(["pane", "list"], timeout=8)
+def pane_list(deadline: float | None = None) -> list[dict[str, Any]]:
+    if deadline is not None and _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        raise BridgeError("herdr pane list skipped because send budget is exhausted")
+    data = herdr_json(["pane", "list"], timeout=(8 if deadline is None else _bounded_timeout(deadline)))
     if isinstance(data, dict):
         panes = data.get("result", {}).get("panes")
         if isinstance(panes, list):
-            labels = workspace_label_map()
+            labels = workspace_label_map(deadline=deadline)
             if not labels:
                 return panes
             enriched: list[dict[str, Any]] = []
@@ -1293,8 +1337,10 @@ def pane_list() -> list[dict[str, Any]]:
     raise BridgeError("unexpected herdr pane list response")
 
 
-def pane_by_id(pane_id: str) -> dict[str, Any] | None:
-    for pane in pane_list():
+def pane_by_id(pane_id: str, deadline: float | None = None) -> dict[str, Any] | None:
+    if deadline is not None and _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return None
+    for pane in pane_list(deadline=deadline):
         if str(pane.get("pane_id")) == str(pane_id):
             return pane
     return None
@@ -1774,11 +1820,12 @@ def pane_output(
     lines: int = READ_LINES_STATUS,
     max_chars: int = 700,
     source: str = "visible",
+    deadline: float | None = None,
 ) -> str:
     try:
         raw = herdr_text(
             ["pane", "read", pane_id, "--source", source, "--lines", str(lines), "--format", "text"],
-            timeout=8,
+            timeout=(8 if deadline is None else _bounded_timeout(deadline)),
         )
     except Exception:
         return ""
@@ -5997,11 +6044,23 @@ def is_staged_input_refusal(detail: str) -> bool:
     return "staged pane input" in lower or "refusing to append telegram text" in lower
 
 
-def send_text_and_enter_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, str]:
-    text_proc = run_cmd([herdr_bin(), "pane", "send-text", pane_id, text], timeout=timeout)
+def send_text_and_enter_to_pane(
+    pane_id: str,
+    text: str,
+    *,
+    timeout: int = 8,
+    deadline: float | None = None,
+) -> tuple[bool, str]:
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return False, "Send timed out before delivery (staged input could not be cleared)."
+    call_timeout = timeout if deadline is None else _bounded_timeout(deadline)
+    text_proc = run_cmd([herdr_bin(), "pane", "send-text", pane_id, text], timeout=call_timeout)
     if text_proc.returncode != 0:
         return False, sanitize_text(text_proc.stderr or text_proc.stdout, 800)
-    enter_proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "enter"], timeout=timeout)
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return False, "Send timed out before delivery (staged input could not be cleared)."
+    call_timeout = timeout if deadline is None else _bounded_timeout(deadline)
+    enter_proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "enter"], timeout=call_timeout)
     if enter_proc.returncode != 0:
         return False, sanitize_text(enter_proc.stderr or enter_proc.stdout, 800)
     return True, ""
@@ -6013,8 +6072,14 @@ def send_to_pane(
     *,
     timeout: int = 8,
     submit_staged: bool = True,
+    deadline: float | None = None,
 ) -> tuple[bool, str]:
-    pane = pane_by_id(pane_id)
+    deadline = _send_deadline(deadline)
+    # Telegram prompt fragments over 4096 chars arrive as independent gateway
+    # subprocesses with fresh deadlines; reassembly/order is out of scope here.
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return False, "Send timed out before delivery (pane busy or unresponsive)."
+    pane = pane_by_id(pane_id, deadline=deadline)
     if not pane:
         return False, "Herdr pane is not currently live."
     outbound = str(text or "")
@@ -6024,21 +6089,32 @@ def send_to_pane(
         except OSError as exc:
             return False, f"Could not write inbound message file: {sanitize_text(str(exc), 300)}"
         outbound = pane_input_file_instruction(inbound_path, outbound)
-    clear_ok, clear_detail = clear_staged_pane_input_if_needed(pane_id, timeout=timeout)
+    window = max(16, outbound.count("\n") + 8)
+    clear_ok, clear_detail = clear_staged_pane_input_if_needed(pane_id, timeout=timeout, deadline=deadline, window=window)
     if not clear_ok:
         return False, clear_detail
-    proc = run_cmd([herdr_bin(), "pane", "run", pane_id, outbound], timeout=timeout)
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return False, "Send timed out before delivery (pane busy or unresponsive)."
+    proc = run_cmd([herdr_bin(), "pane", "run", pane_id, outbound], timeout=_bounded_timeout(deadline))
     if proc.returncode != 0:
         detail = sanitize_text(proc.stderr or proc.stdout, 800)
         if not is_staged_input_refusal(detail):
             return False, detail
-        clear_ok, clear_detail = clear_staged_pane_input(pane_id, timeout=timeout, verify=False)
+        clear_ok, clear_detail = clear_staged_pane_input(
+            pane_id, timeout=timeout, verify=False, deadline=deadline, window=window
+        )
         if not clear_ok:
             return False, clear_detail
-        return send_text_and_enter_to_pane(pane_id, outbound, timeout=timeout)
+        if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+            return False, "Send timed out before delivery (staged input could not be cleared)."
+        return send_text_and_enter_to_pane(pane_id, outbound, timeout=timeout, deadline=deadline)
     if submit_staged:
         submit_ok, submit_detail = submit_staged_pane_input_if_needed(
-            pane_id, timeout=timeout, agent_status=str(pane.get("agent_status") or "")
+            pane_id,
+            timeout=timeout,
+            agent_status=str(pane.get("agent_status") or ""),
+            deadline=deadline,
+            window=window,
         )
         if not submit_ok:
             return False, submit_detail
@@ -6047,19 +6123,24 @@ def send_to_pane(
 
 
 def interrupt_and_send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, str]:
+    deadline = _send_deadline(None)
     # Halt the agent's current turn (Esc) so the message runs now instead of
     # queueing behind it, then deliver via the normal send path. Only interrupt a
     # pane that is actually working — Esc on an idle pane is needless and, on
     # Codex, pops its "edit previous message" recall preview.
-    pane = pane_by_id(pane_id)
+    pane = pane_by_id(pane_id, deadline=deadline)
     if pane and str(pane.get("agent_status") or "").strip().lower() == "working":
-        run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "escape"], timeout=timeout)
+        if _remaining(deadline) > SEND_TO_PANE_MIN_CALL_SECONDS:
+            run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "escape"], timeout=_bounded_timeout(deadline))
         for delay in (0.3, 0.5, 0.7, 1.0):
-            time.sleep(delay)
-            refreshed = pane_by_id(pane_id)
+            if not _deadline_sleep(delay, deadline):
+                break
+            if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+                break
+            refreshed = pane_by_id(pane_id, deadline=deadline)
             if not refreshed or str(refreshed.get("agent_status") or "").strip().lower() != "working":
                 break
-    return send_to_pane(pane_id, text, timeout=timeout)
+    return send_to_pane(pane_id, text, timeout=timeout, deadline=deadline)
 
 
 def interrupt_and_send_response(pane_id: str, text: str) -> dict[str, Any]:
@@ -6075,14 +6156,14 @@ def interrupt_and_send_response(pane_id: str, text: str) -> dict[str, Any]:
     return {"handled": True, "reply": "⏹️ Interrupted the current turn and sent your message."}
 
 
-def pane_input_ansi(pane_id: str, *, lines: int = 16) -> str:
+def pane_input_ansi(pane_id: str, *, lines: int = 16, deadline: float | None = None) -> str:
     # Raw ANSI read (NOT via pane_output/sanitize_text, which strip escapes) so
     # styling survives: Codex renders its empty-box placeholder suggestions in
     # SGR "dim" (\x1b[2m), which is how we tell a placeholder from real input.
     try:
         raw = herdr_text(
             ["pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", str(lines), "--format", "ansi"],
-            timeout=8,
+            timeout=(8 if deadline is None else _bounded_timeout(deadline)),
         )
     except Exception:
         return ""
@@ -6093,13 +6174,16 @@ def pane_input_ansi(pane_id: str, *, lines: int = 16) -> str:
         return raw
 
 
-def pane_input_looks_staged(pane_id: str) -> bool:
-    ansi_raw = pane_input_ansi(pane_id, lines=16)
+def pane_input_looks_staged(pane_id: str, *, deadline: float | None = None, window: int = 16) -> bool:
+    window = max(16, int(window))
+    ansi_raw = pane_input_ansi(pane_id, lines=window, deadline=deadline)
     if ansi_raw.strip():
-        ansi_lines = ansi_raw.splitlines()[-16:]
+        ansi_lines = ansi_raw.splitlines()[-window:]
     else:
         # Fall back to the sanitized text read (no dim info) if ANSI is unavailable.
-        ansi_lines = pane_output(pane_id, lines=16, max_chars=4000, source="recent-unwrapped").splitlines()[-16:]
+        ansi_lines = pane_output(
+            pane_id, lines=window, max_chars=4000, source="recent-unwrapped", deadline=deadline
+        ).splitlines()[-window:]
     clean_lines = [ANSI_RE.sub("", str(line or "")).strip() for line in ansi_lines]
     if not any(clean_lines):
         return False
@@ -6137,32 +6221,60 @@ CLEAR_STAGED_INPUT_FORCE_KEY_SEQUENCES = (
 CLEAR_STAGED_INPUT_POLL_DELAYS = (0.1, 0.2, 0.35, 0.6)
 
 
-def clear_staged_pane_input(pane_id: str, *, timeout: int = 8, verify: bool = True) -> tuple[bool, str]:
+def clear_staged_pane_input(
+    pane_id: str,
+    *,
+    timeout: int = 8,
+    verify: bool = True,
+    deadline: float | None = None,
+    window: int = 16,
+) -> tuple[bool, str]:
     last_error = ""
     successful_clear_attempt = False
     for keys in CLEAR_STAGED_INPUT_KEY_SEQUENCES + CLEAR_STAGED_INPUT_FORCE_KEY_SEQUENCES:
-        proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, *keys], timeout=timeout)
+        if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+            break
+        call_timeout = timeout if deadline is None else _bounded_timeout(deadline)
+        proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, *keys], timeout=call_timeout)
         if proc.returncode != 0:
             last_error = sanitize_text(proc.stderr or proc.stdout, 800)
             continue
         successful_clear_attempt = True
         if verify:
             for delay in CLEAR_STAGED_INPUT_POLL_DELAYS:
-                time.sleep(delay)
-                if not pane_input_looks_staged(pane_id):
+                if not _deadline_sleep(delay, deadline):
+                    break
+                if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+                    break
+                if not pane_input_looks_staged(pane_id, deadline=deadline, window=window):
                     return True, ""
     if last_error and not successful_clear_attempt:
         return False, last_error
     return True, ""
 
 
-def clear_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tuple[bool, str]:
-    if not pane_input_looks_staged(pane_id):
+def clear_staged_pane_input_if_needed(
+    pane_id: str,
+    *,
+    timeout: int = 8,
+    deadline: float | None = None,
+    window: int = 16,
+) -> tuple[bool, str]:
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
         return True, ""
-    return clear_staged_pane_input(pane_id, timeout=timeout)
+    if not pane_input_looks_staged(pane_id, deadline=deadline, window=window):
+        return True, ""
+    return clear_staged_pane_input(pane_id, timeout=timeout, deadline=deadline, window=window)
 
 
-def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8, agent_status: str = "") -> tuple[bool, str]:
+def submit_staged_pane_input_if_needed(
+    pane_id: str,
+    *,
+    timeout: int = 8,
+    agent_status: str = "",
+    deadline: float | None = None,
+    window: int = 16,
+) -> tuple[bool, str]:
     # `herdr pane run` is *supposed* to submit the input itself, but in some TUI
     # states it leaves the text staged in the input box (we observed an inbound
     # Telegram message sitting in the box, never sent). Press Enter when we can
@@ -6171,15 +6283,25 @@ def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8, agent_
     # Poll briefly to tolerate terminal render lag before giving up.
     staged = False
     for delay in (0.15, 0.35, 0.6):
-        time.sleep(delay)
-        if pane_input_looks_staged(pane_id):
+        if not _deadline_sleep(delay, deadline):
+            break
+        if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+            break
+        if pane_input_looks_staged(pane_id, deadline=deadline, window=window):
             staged = True
             break
     if not staged:
         return True, ""
-    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "enter"], timeout=timeout)
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return True, "Sent — but I couldn't confirm it submitted within the time budget. Check the pane."
+    call_timeout = timeout if deadline is None else _bounded_timeout(deadline)
+    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "enter"], timeout=call_timeout)
     if proc.returncode != 0:
-        fallback = run_cmd([herdr_bin(), "pane", "send-text", pane_id, "\r"], timeout=timeout)
+        if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+            detail = sanitize_text(proc.stderr or proc.stdout, 800)
+            return False, detail
+        call_timeout = timeout if deadline is None else _bounded_timeout(deadline)
+        fallback = run_cmd([herdr_bin(), "pane", "send-text", pane_id, "\r"], timeout=call_timeout)
         if fallback.returncode != 0:
             detail = sanitize_text(proc.stderr or proc.stdout or fallback.stderr or fallback.stdout, 800)
             return False, detail
@@ -6188,8 +6310,11 @@ def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8, agent_
     # in some states). Confirm the input box actually cleared, polling to absorb
     # render lag, so we never report success while the text still sits unsent.
     for delay in (0.15, 0.35, 0.6):
-        time.sleep(delay)
-        if not pane_input_looks_staged(pane_id):
+        if not _deadline_sleep(delay, deadline):
+            break
+        if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+            break
+        if not pane_input_looks_staged(pane_id, deadline=deadline, window=window):
             return True, ""
     # Still staged. A working agent queues typed input and won't accept Enter as a
     # submit until its turn finishes, so tell the sender it's queued (not lost).
@@ -6197,6 +6322,8 @@ def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8, agent_
     # refuse after a delivered submit.
     if str(agent_status or "").strip().lower() == "working":
         return True, "Queued — the agent is busy; your message will run when the current turn finishes."
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return True, "Sent — but I couldn't confirm it submitted within the time budget. Check the pane."
     return True, ""
 
 
@@ -6464,18 +6591,30 @@ def visible_prompt_matches_awaiting(entry: dict[str, Any], awaiting: dict[str, A
     return True
 
 
-def send_choice_detail_to_pane(pane_id: str, choice: str, detail_text: str, *, timeout: int = 8) -> tuple[bool, str]:
+def send_choice_detail_to_pane(
+    pane_id: str,
+    choice: str,
+    detail_text: str,
+    *,
+    timeout: int = 8,
+    deadline: float | None = None,
+) -> tuple[bool, str]:
+    deadline = _send_deadline(deadline)
     choice = str(choice or "").strip()
     if not choice:
-        return send_to_pane(pane_id, detail_text, timeout=timeout)
-    pane = pane_by_id(pane_id)
+        return send_to_pane(pane_id, detail_text, timeout=timeout, deadline=deadline)
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return False, "Send timed out before delivery (pane busy or unresponsive)."
+    pane = pane_by_id(pane_id, deadline=deadline)
     if not pane:
         return False, "Herdr pane is not currently live."
-    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, choice, "enter"], timeout=timeout)
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return False, "Send timed out before delivery (pane busy or unresponsive)."
+    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, choice, "enter"], timeout=_bounded_timeout(deadline))
     if proc.returncode != 0:
         return False, sanitize_text(proc.stderr or proc.stdout, 800)
-    time.sleep(0.2)
-    return send_to_pane(pane_id, detail_text, timeout=timeout)
+    _deadline_sleep(0.2, deadline)
+    return send_to_pane(pane_id, detail_text, timeout=timeout, deadline=deadline)
 
 
 def send_visible_choice_detail_to_pane(
@@ -6484,15 +6623,21 @@ def send_visible_choice_detail_to_pane(
     detail_text: str,
     *,
     timeout: int = 8,
+    deadline: float | None = None,
 ) -> tuple[bool, str]:
+    deadline = _send_deadline(deadline)
     choice = str(choice or "").strip()
     if not choice:
         return False, "This custom option is no longer mapped to a visible choice."
-    pane = pane_by_id(pane_id)
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return False, "Send timed out before delivery (pane busy or unresponsive)."
+    pane = pane_by_id(pane_id, deadline=deadline)
     if not pane:
         return False, "Herdr pane is not currently live."
     keys = visible_choice_selection_keys(choice)
-    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, *keys], timeout=timeout)
+    if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
+        return False, "Send timed out before delivery (pane busy or unresponsive)."
+    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, *keys], timeout=_bounded_timeout(deadline))
     if proc.returncode != 0:
         return False, sanitize_text(proc.stderr or proc.stdout, 800)
     if not wait_for_visible_custom_detail_field(pane_id):
@@ -6501,7 +6646,7 @@ def send_visible_choice_detail_to_pane(
             "I selected the custom option, but Herdr did not show a custom-answer field. "
             "I did not send your text to avoid answering the wrong prompt.",
         )
-    return send_to_pane(pane_id, detail_text, timeout=timeout, submit_staged=True)
+    return send_to_pane(pane_id, detail_text, timeout=timeout, submit_staged=True, deadline=deadline)
 
 
 def telegram_token() -> str:

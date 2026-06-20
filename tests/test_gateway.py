@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import conftest  # noqa: F401
+import herdres
 import herdres_routing
 import herdres_gateway_upstream as gateway
 import herdres_gateway_managed as managed_gateway
@@ -1398,6 +1399,89 @@ class GatewayManagedBotTests(unittest.TestCase):
         with patch.object(managed_gateway.subprocess, "run", runner):
             managed_gateway.run_subprocess_herdres({"topic_id": "77"}, "command", {})
         self.assertEqual(runner.call_args.kwargs["timeout"], managed_gateway.COMMAND_TIMEOUT)
+
+    def test_command_returns_before_command_timeout_under_all_hang(self) -> None:
+        state = {
+            "version": 1,
+            "telegram": {"chat_id": "-1001", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": ["pane-1"],
+                    "message_routes": {"1001": "pane-1"},
+                }
+            },
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_root_message_id": "1001",
+                    "last_known_status": "idle",
+                }
+            },
+        }
+        now = 100.0
+
+        def monotonic() -> float:
+            return now
+
+        def sleep(seconds: float) -> None:
+            nonlocal now
+            now += max(0.0, float(seconds))
+
+        def run_cmd(args: list[str], *, timeout: int = 10, input_text: str | None = None):
+            sleep(timeout)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stderr = ""
+            proc.stdout = ""
+            if args[1:3] == ["pane", "list"]:
+                proc.stdout = json.dumps({
+                    "result": {
+                        "panes": [{
+                            "pane_id": "pane-1",
+                            "workspace_id": "workspace-1",
+                            "agent": "codex",
+                            "agent_status": "idle",
+                        }]
+                    }
+                })
+            elif args[1:3] == ["workspace", "list"]:
+                proc.stdout = json.dumps({"result": {"workspaces": []}})
+            elif args[1:3] == ["pane", "read"]:
+                proc.stdout = "❯ staged input"
+            return proc
+
+        payload = {
+            "chat_id": "-1001",
+            "topic_id": "77",
+            "message_id": "4000",
+            "reply_to_message_id": "1001",
+            "user_id": "42",
+            "text": "deploy when ready",
+        }
+
+        with patch.object(managed_gateway, "load_herdres_module", Mock(return_value=herdres)), patch.object(
+            herdres,
+            "with_lock",
+            lambda fn, *, blocking=False: fn(),
+        ), patch.object(herdres.time, "monotonic", monotonic), patch.object(
+            herdres.time, "sleep", sleep
+        ), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            run_cmd=run_cmd,
+        ):
+            result = managed_gateway.run_embedded_herdres(payload, "command")
+
+        self.assertTrue(result["handled"])
+        self.assertIn("reply", result)
+        self.assertLess(now - 100.0, managed_gateway.COMMAND_TIMEOUT)
 
     def test_same_message_id_dispatches_to_command_once(self) -> None:
         state = {

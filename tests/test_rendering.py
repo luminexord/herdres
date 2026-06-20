@@ -4373,7 +4373,12 @@ Write your custom answer now:
             )
 
         self.assertTrue(ok, detail)
-        send_to_pane.assert_called_once_with("pane-1", "custom text", timeout=8, submit_staged=True)
+        self.assertEqual(send_to_pane.call_count, 1)
+        args, kwargs = send_to_pane.call_args
+        self.assertEqual(args, ("pane-1", "custom text"))
+        self.assertEqual(kwargs["timeout"], 8)
+        self.assertTrue(kwargs["submit_staged"])
+        self.assertIsInstance(kwargs["deadline"], float)
 
     def test_visible_prompt_matches_awaiting_requires_current_prompt_identity(self) -> None:
         entry = {"pane_id": "pane-1"}
