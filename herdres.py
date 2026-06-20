@@ -19,11 +19,13 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import http.client
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -1169,23 +1171,77 @@ def pane_by_id(pane_id: str) -> dict[str, Any] | None:
     return None
 
 
+_turn_cache: dict[str, dict[str, Any]] = {}
+_turn_cache_lock = threading.Lock()
+
+# Per-sync ephemeral cache for pane read output (visible-screen scrapes).
+_pane_read_cache: dict[str, str] = {}
+_pane_read_cache_lock = threading.Lock()
+
+
 def pane_turn(pane_id: str) -> dict[str, Any]:
+    cached = _turn_cache.get(pane_id)
+    if cached is not None:
+        return cached
     # Upgrade-safe optional interface: Herdres can consume this when Herdr
     # exposes it, but never scrapes pane output as a substitute.
     try:
         data = herdr_json(["pane", "turn", pane_id, "--last", "--format", "json"], timeout=8)
     except BridgeError as exc:
-        return {
+        result = {
             "available": False,
             "reason": "no_structured_turn_source",
             "detail": sanitize_text(str(exc), 300),
         }
+        with _turn_cache_lock:
+            _turn_cache[pane_id] = result
+        return result
     if isinstance(data, dict):
         result_turn = data.get("result", {}).get("turn")
         if isinstance(result_turn, dict):
+            with _turn_cache_lock:
+                _turn_cache[pane_id] = result_turn
             return result_turn
+        with _turn_cache_lock:
+            _turn_cache[pane_id] = data
         return data
-    return {"available": False, "reason": "unexpected_turn_response"}
+    result = {"available": False, "reason": "unexpected_turn_response"}
+    with _turn_cache_lock:
+        _turn_cache[pane_id] = result
+    return result
+
+
+def prefetch_pane_turns(pane_ids: list[str], max_workers: int = 6) -> None:
+    """Fetch all pane turns in parallel and populate _turn_cache."""
+    uncached = [pid for pid in pane_ids if pid and pid not in _turn_cache]
+    if not uncached:
+        return
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(uncached))) as pool:
+        futures = {pool.submit(pane_turn, pid): pid for pid in uncached}
+        for future in as_completed(futures):
+            try:
+                result = future.result(timeout=12)
+                if isinstance(result, dict):
+                    with _turn_cache_lock:
+                        _turn_cache[futures[future]] = result
+            except Exception:
+                pass
+
+
+def cached_pane_turn(pane_id: str) -> dict[str, Any]:
+    """Check the per-sync turn cache before calling pane_turn."""
+    cached = _turn_cache.get(pane_id)
+    if cached is not None:
+        return cached
+    return pane_turn(pane_id)
+
+
+def clear_sync_caches() -> None:
+    """Clear per-sync ephemeral caches. Called at the start of each sync."""
+    with _turn_cache_lock:
+        _turn_cache.clear()
+    with _pane_read_cache_lock:
+        _pane_read_cache.clear()
 
 
 def pane_agent_session_id(pane: dict[str, Any]) -> str:
@@ -1550,6 +1606,10 @@ def pane_output(
 
 
 def pane_feed_output(pane_id: str, *, manual: bool = False) -> str:
+    cache_key = f"{pane_id}:{manual}"
+    cached = _pane_read_cache.get(cache_key)
+    if cached is not None:
+        return cached
     sources = MANUAL_FEED_SOURCES if manual else AUTO_FEED_SOURCES
     for source in sources:
         text = pane_output(
@@ -1559,8 +1619,13 @@ def pane_feed_output(pane_id: str, *, manual: bool = False) -> str:
             source=source,
         )
         if text.strip():
+            with _pane_read_cache_lock:
+                _pane_read_cache[cache_key] = text
             return text
-    return ""
+    result = ""
+    with _pane_read_cache_lock:
+        _pane_read_cache[cache_key] = result
+    return result
 
 
 def recent_tail(pane_id: str, lines: int = READ_LINES_STATUS, max_chars: int = 700) -> str:
@@ -2765,7 +2830,7 @@ def apply_api_error_warning(
 def extract_turn_feed_item(
     pane: dict[str, Any], entry: dict[str, Any], *, allow_visible_fallback: bool = True
 ) -> dict[str, Any] | None:
-    turn = pane_turn(str(pane.get("pane_id") or ""))
+    turn = cached_pane_turn(str(pane.get("pane_id") or ""))
     available = bool(turn.get("available", True))
     reason = sanitize_text(str(turn.get("reason") or ""), 300)
     if entry.get("last_turn_available") != available or str(entry.get("last_turn_reason") or "") != reason:
@@ -5160,7 +5225,7 @@ def revalidate_pending_decision_prompt(
     if not pane_id or not decision_id:
         return "unknown", None
 
-    turn = pane_turn(pane_id)
+    turn = cached_pane_turn(pane_id)
     if turn.get("available") is not True:
         return "unknown", None
 
@@ -5459,6 +5524,28 @@ def edit_topic_icon(
     return bool(telegram_api("editForumTopic", payload).get("result"))
 
 
+# Fire-and-forget icon updates: the next sync retries on failure.
+_icon_fire_threads: list[threading.Thread] = []
+
+
+def edit_topic_icon_async(
+    chat_id: str,
+    topic_id: str | int,
+    icon_custom_emoji_id: str,
+    *,
+    name: str = "",
+) -> None:
+    def _fire() -> None:
+        try:
+            edit_topic_icon(chat_id, topic_id, icon_custom_emoji_id, name=name)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_fire, daemon=True)
+    _icon_fire_threads.append(t)
+    t.start()
+
+
 def update_topic_status_icon(
     chat_id: str,
     entry: dict[str, Any],
@@ -5496,29 +5583,18 @@ def update_topic_status_icon(
         return {"ok": False, "attempted": False, "kind": "retry_deferred", "icon_key": icon_key, "emoji": emoji}
     entry["last_topic_status_icon_attempt_key"] = f"{icon_id}:{icon_key}"
     entry["last_topic_status_icon_attempt_at"] = utc_now()
-    try:
-        ok = edit_topic_icon(chat_id, topic_id, icon_id, name=str(entry.get("topic_name") or ""))
-    except RateLimited:
-        raise
-    except BridgeError as exc:
-        kind = classify_telegram_error(exc)
-        entry["last_topic_status_icon_error"] = sanitize_text(str(exc), 500)
-        entry["last_topic_status_icon_error_at"] = utc_now()
-        result = {"ok": False, "attempted": True, "kind": kind, "error": str(exc), "icon_key": icon_key, "emoji": emoji}
-        if kind == "topic_not_found":
-            result["topic_missing"] = True
-        return result
-    if ok:
-        entry["topic_status_icon_key"] = icon_key
-        entry["topic_status_icon_emoji"] = emoji
-        entry["topic_status_icon_custom_emoji_id"] = icon_id
-        entry["topic_status_icon_updated_at"] = utc_now()
-        entry.pop("last_topic_status_icon_error", None)
-        entry.pop("last_topic_status_icon_error_at", None)
-        entry.pop("last_topic_status_icon_missing", None)
-        entry.pop("last_topic_status_icon_missing_emoji", None)
-        entry.pop("last_topic_status_icon_missing_at", None)
-    return {"ok": bool(ok), "attempted": True, "kind": "updated" if ok else "failed", "icon_key": icon_key, "emoji": emoji}
+    # Fire-and-forget: update state optimistically, let the next sync retry on failure.
+    edit_topic_icon_async(chat_id, topic_id, icon_id, name=str(entry.get("topic_name") or ""))
+    entry["topic_status_icon_key"] = icon_key
+    entry["topic_status_icon_emoji"] = emoji
+    entry["topic_status_icon_custom_emoji_id"] = icon_id
+    entry["topic_status_icon_updated_at"] = utc_now()
+    entry.pop("last_topic_status_icon_error", None)
+    entry.pop("last_topic_status_icon_error_at", None)
+    entry.pop("last_topic_status_icon_missing", None)
+    entry.pop("last_topic_status_icon_missing_emoji", None)
+    entry.pop("last_topic_status_icon_missing_at", None)
+    return {"ok": True, "attempted": True, "kind": "updated", "icon_key": icon_key, "emoji": emoji}
 
 
 def pane_input_needs_file(text: str) -> bool:
@@ -9104,6 +9180,7 @@ def sync_pane_once(
 def sync_once() -> dict[str, Any]:
     load_dotenv()
     state = load_state()
+    clear_sync_caches()
     changed = clear_disabled_visible_choice_state(state)
     if not state.get("enabled", True):
         if changed:
@@ -9182,6 +9259,8 @@ def sync_once() -> dict[str, Any]:
         changed = True
     if ensure_managed_bot_group_access_message(state, chat_id, telegram, counters, caps["max_sends"], panes):
         changed = True
+    if TURN_FEED_ENABLED:
+        prefetch_pane_turns([str(p.get("pane_id") or "") for p in panes if p.get("pane_id")])
     for pane in panes:
         if sync_pane_once(state, chat_id, telegram, pane, counters, caps):
             changed = True
@@ -9373,6 +9452,7 @@ def plugin_enable_once(enabled: bool) -> dict[str, Any]:
 def event_once() -> dict[str, Any]:
     load_dotenv()
     state = load_state()
+    clear_sync_caches()
     if not state.get("enabled", True):
         return {"ok": True, "changed": False, "message": "disabled"}
     if not state.get("plugin_event_enabled", True):

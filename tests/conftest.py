@@ -17,6 +17,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -69,3 +71,12 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     Extracted from test_turn_adapter.py's ``write_jsonl()`` helper.
     """
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _clear_herdres_caches():
+    """Clear per-sync caches before each test to prevent cross-test leakage."""
+    herdres = sys.modules.get("herdres")
+    if herdres and hasattr(herdres, "clear_sync_caches"):
+        herdres.clear_sync_caches()
+    yield

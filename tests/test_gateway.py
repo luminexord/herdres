@@ -687,7 +687,70 @@ class GatewayManagedBotTests(unittest.TestCase):
         self.assertEqual(payload["target_bot_kind"], "devin")
         self.assertEqual(payload["text"], "@herdr_devin_bot run analysis")
 
-    def test_manager_defers_reply_to_configured_child_bot(self) -> None:
+    def test_manager_is_fallback_for_targeted_child_bot_mention(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {
+                "chat_id": "-1001",
+                "general_thread_id": "1",
+                "owner_user_ids": ["42"],
+                "managed_bots": {
+                    "codex": {"username": "herdr_codex_bot", "token": "CODEX_TOKEN", "enabled": True}
+                },
+            },
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": ["pane-1", "pane-2"],
+                }
+            },
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "last_known_status": "working",
+                    "agent": "codex",
+                },
+                "pane-2": {
+                    "pane_key": "pane-2",
+                    "pane_id": "pane-2",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "last_known_status": "working",
+                    "agent": "claude",
+                },
+            },
+        }
+        manager_run_script = Mock(return_value={"handled": True, "reply": ""})
+        child_run_script = Mock(return_value={"handled": True, "reply": ""})
+        message = {
+            "message_id": 4000,
+            "message_thread_id": 77,
+            "chat": {"id": -1001, "is_forum": True},
+            "from": {"id": 42, "is_bot": False},
+            "text": "@herdr_codex_bot how are you now",
+        }
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", manager_run_script
+        ), patch.object(managed_gateway, "api", Mock()):
+            managed_gateway.handle_message(message, bot_token="MANAGER_TOKEN", bot_key="manager")
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", child_run_script
+        ), patch.object(managed_gateway, "api", Mock()):
+            managed_gateway.handle_message(message, bot_token="CODEX_TOKEN", bot_key="managed-codex-deadbeef")
+
+        manager_run_script.assert_called_once()
+        child_run_script.assert_not_called()
+        payload = manager_run_script.call_args.args[0]
+        self.assertEqual(payload["target_bot_kind"], "codex")
+        self.assertEqual(payload["pane_key"], "")
+
+    def test_manager_is_fallback_for_reply_to_configured_child_bot(self) -> None:
         state = {
             "version": 1,
             "enabled": True,
@@ -717,7 +780,7 @@ class GatewayManagedBotTests(unittest.TestCase):
                 },
             },
         }
-        run_script = Mock(return_value={"handled": True, "reply": "Send failed"})
+        run_script = Mock(return_value={"handled": True, "reply": ""})
         api = Mock()
 
         with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
@@ -739,7 +802,10 @@ class GatewayManagedBotTests(unittest.TestCase):
                 bot_key="manager",
             )
 
-        run_script.assert_not_called()
+        run_script.assert_called_once()
+        payload = run_script.call_args.args[0]
+        self.assertEqual(payload["target_bot_kind"], "codex")
+        self.assertEqual(payload["pane_key"], "pane-1")
         api.assert_not_called()
 
     def test_child_bot_update_sets_target_bot_kind(self) -> None:

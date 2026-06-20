@@ -398,18 +398,20 @@ def owner_for_entry(state: dict, entry: dict) -> str:
     return MANAGER_BOT_KIND
 
 
-def message_owner_kind(
+def message_owner_kinds(
     state: dict,
     text: str,
     message: dict,
     chat_id: str,
     thread_id: str | None,
-) -> str:
+) -> set[str]:
+    owners = {MANAGER_BOT_KIND}
     if is_space_level_command(text):
-        return MANAGER_BOT_KIND
+        return owners
     targeted = targeted_managed_bot_kind(state, text, message)
     if targeted and managed_bot_has_token(state, targeted):
-        return targeted
+        owners.add(targeted)
+        return owners
 
     reply_to = message.get("reply_to_message") or {}
     resolved = resolve_mapped_entry(
@@ -421,29 +423,8 @@ def message_owner_kind(
     )
     if resolved:
         _pane_key, entry = resolved
-        return owner_for_entry(state, entry)
-    return MANAGER_BOT_KIND
-
-
-def manager_can_share_implicit_space_message(
-    state: dict,
-    text: str,
-    message: dict,
-    chat_id: str,
-    thread_id: str | None,
-) -> bool:
-    if str(text or "").strip().startswith("/"):
-        return False
-    if targeted_managed_bot_kind(state, text, message):
-        return False
-    reply_to = message.get("reply_to_message") or {}
-    if str(reply_to.get("message_id") or "").strip():
-        return False
-    mapped_space = topic_space_entry(state, chat_id, thread_id)
-    if not mapped_space:
-        return False
-    _space_key, space = mapped_space
-    return len(live_entries_for_space(state, space)) == 1
+        owners.add(owner_for_entry(state, entry))
+    return owners
 
 
 def target_bot_kind_for_message(state: dict, text: str, bot_key: str | None, message: dict | None = None) -> str:
@@ -710,15 +691,11 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
         f"message chat={chat_id} thread={thread_id} from={user_id} bot={from_bot} "
         f"text={str(text or '')[:40]!r}{message_age}"
     )
-    owner_kind = message_owner_kind(state, str(text or ""), message, chat_id, thread_id)
+    owner_kinds = message_owner_kinds(state, str(text or ""), message, chat_id, thread_id)
     current_kind = current_bot_owner_kind(bot_key)
-    if current_kind != owner_kind:
-        if not (
-            current_kind == MANAGER_BOT_KIND
-            and manager_can_share_implicit_space_message(state, str(text or ""), message, chat_id, thread_id)
-        ):
-            dlog(f"ignored message owned by {owner_kind} on {current_kind}")
-            return
+    if current_kind not in owner_kinds:
+        dlog(f"ignored message owned by {','.join(sorted(owner_kinds))} on {current_kind}")
+        return
     target_bot_kind = target_bot_kind_for_message(state, str(text or ""), bot_key, message)
     reply_to = message.get("reply_to_message") or {}
     resolved = resolve_mapped_entry(

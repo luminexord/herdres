@@ -158,6 +158,71 @@ def claude_session_path(session_id: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def devin_transcripts_dir() -> Path:
+    return Path(os.getenv("DEVIN_TRANSCRIPTS_DIR", str(Path.home() / ".local/share/devin/cli/transcripts"))).expanduser()
+
+
+def devin_bin() -> str:
+    """Return the devin CLI path, falling back to ~/.local/bin/devin.
+
+    The launchd environment has a minimal PATH that doesn't include
+    ~/.local/bin, so shutil.which() fails under launchd.
+    """
+    explicit = os.getenv("DEVIN_BIN")
+    if explicit:
+        return explicit
+    for candidate in ("devin", str(Path.home() / ".local/bin/devin")):
+        try:
+            if subprocess.run([candidate, "--version"], capture_output=True, timeout=2).returncode == 0:
+                return candidate
+        except Exception:
+            continue
+    return str(Path.home() / ".local/bin/devin")
+
+
+def devin_resolve_session_id(pane: dict[str, Any]) -> str:
+    """Resolve the Devin session ID for a pane when agent_session is None.
+
+    Uses `devin list --format json` and matches by working directory.
+    Only returns sessions whose transcript file exists (Devin writes
+    transcripts lazily, so in-progress sessions may not have one yet).
+    """
+    cwd = str(pane.get("cwd") or pane.get("foreground_cwd") or "")
+    try:
+        proc = subprocess.run(
+            [devin_bin(), "list", "--format", "json"],
+            cwd=cwd or None,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            entries = json.loads(proc.stdout)
+            if isinstance(entries, list):
+                cwd_real = os.path.realpath(cwd) if cwd else ""
+                matching = [
+                    e for e in entries
+                    if isinstance(e, dict)
+                    and os.path.realpath(str(e.get("working_directory") or "")) == cwd_real
+                ]
+                if matching:
+                    matching.sort(key=lambda e: int(e.get("last_activity_at") or 0), reverse=True)
+                    transcripts_dir = devin_transcripts_dir()
+                    for e in matching:
+                        sid = str(e.get("id") or "")
+                        if sid and (transcripts_dir / f"{sid}.json").exists():
+                            return sid
+    except Exception:
+        pass
+    return ""
+
+
+def devin_session_path(session_id: str) -> Path | None:
+    path = devin_transcripts_dir() / f"{session_id}.json"
+    return path if path.exists() else None
+
+
 def claude_project_dir_for_cwd(cwd: str) -> Path | None:
     base = Path(os.getenv("CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude/projects"))).expanduser()
     if not base.exists() or not cwd:
@@ -613,6 +678,130 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
     return result
 
 
+def is_internal_devin_user_text(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith((
+        "<system_info>",
+        "<rules",
+        "<available_skills>",
+        "<user-prompt-submit-hook>",
+        "<subagent_completion_notification>",
+        "<system_guidance>",
+    ))
+
+
+def extract_devin_turn(path: Path, pane_id: str, session_id: str) -> dict[str, Any]:
+    """Extract the latest turn from a Devin CLI transcript (ATIF JSON format).
+
+    Devin transcripts are a single JSON object with a ``steps`` array.  Each
+    step has ``source`` (system/user/agent), ``message`` (text), and optional
+    ``tool_calls``.  A turn is a user message followed by agent steps; the
+    turn is "complete" when the agent emits a step with non-empty ``message``
+    text and no tool calls (the final summary), or when a new user prompt
+    arrives (marking the previous turn complete by implication).
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return {"available": False, "reason": "transcript_read_error", "pane_id": pane_id, "agent": "devin"}
+    steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+    if not steps:
+        return {"available": False, "reason": "no_steps", "pane_id": pane_id, "agent": "devin"}
+
+    completed: list[dict[str, Any]] = []
+    current_turn_id = ""
+    current_started_at: Any = None
+    current_user_text = ""
+    last_agent_text = ""
+    open_turn = False
+
+    for step in steps:
+        source = str(step.get("source") or "")
+        msg = str(step.get("message") or "")
+        step_id = step.get("step_id")
+        timestamp = step.get("timestamp")
+        tool_calls = step.get("tool_calls") or []
+
+        if source == "user" and msg.strip() and not is_internal_devin_user_text(msg):
+            # New user prompt: close out any open turn
+            if open_turn and current_user_text and last_agent_text:
+                completed.append({
+                    "available": True,
+                    "pane_id": pane_id,
+                    "agent": "devin",
+                    "agent_session_id": session_id,
+                    "turn_id": str(current_turn_id),
+                    "turn_index": None,
+                    "complete": True,
+                    "complete_reason": "done",
+                    "started_at": current_started_at,
+                    "completed_at": timestamp,
+                    "user_text": current_user_text,
+                    "assistant_final_text": last_agent_text,
+                })
+            current_turn_id = str(step_id)
+            current_started_at = timestamp
+            current_user_text = sanitize_text(msg)
+            last_agent_text = ""
+            open_turn = True
+            continue
+
+        if source == "agent" and open_turn:
+            if msg.strip():
+                last_agent_text = sanitize_text(msg)
+            # If the agent step has text but no tool calls, it's likely a final response
+            if msg.strip() and not tool_calls:
+                if current_user_text and last_agent_text:
+                    completed.append({
+                        "available": True,
+                        "pane_id": pane_id,
+                        "agent": "devin",
+                        "agent_session_id": session_id,
+                        "turn_id": str(current_turn_id),
+                        "turn_index": None,
+                        "complete": True,
+                        "complete_reason": "done",
+                        "started_at": current_started_at,
+                        "completed_at": timestamp,
+                        "user_text": current_user_text,
+                        "assistant_final_text": last_agent_text,
+                    })
+                    open_turn = False
+            continue
+
+    if completed:
+        recent = completed[-RECENT_TURNS:]
+        latest = dict(recent[-1])
+        if open_turn:
+            latest["has_open_turn"] = True
+            latest["open_turn_id"] = current_turn_id
+            if current_user_text:
+                latest["open_user_text"] = current_user_text
+            add_stream_fields(latest, last_agent_text, "devin")
+        latest["recent_turns"] = recent
+        return latest
+    if open_turn:
+        turn = {
+            "available": True,
+            "pane_id": pane_id,
+            "agent": "devin",
+            "agent_session_id": session_id,
+            "complete": False,
+            "turn_id": current_turn_id,
+            "user_text": current_user_text,
+            "assistant_final_text": "",
+        }
+        return add_stream_fields(turn, last_agent_text, "devin")
+    return {
+        "available": True,
+        "pane_id": pane_id,
+        "agent": "devin",
+        "agent_session_id": session_id,
+        "complete": False,
+        "reason": "no_completed_turn",
+    }
+
+
 def pane_from_list(pane_id: str) -> dict[str, Any] | None:
     try:
         data = run_real_herdr_json(["pane", "list"])
@@ -639,7 +828,12 @@ def pane_turn(pane_id: str) -> dict[str, Any]:
     if not session_id:
         if agent == "claude":
             return infer_claude_turn_from_visible_pane(pane, pane_id)
-        return unavailable("no_agent_session_id", pane_id=pane_id, agent=agent or None)
+        if agent == "devin":
+            session_id = devin_resolve_session_id(pane)
+            if not session_id:
+                return unavailable("no_agent_session_id", pane_id=pane_id, agent=agent)
+        else:
+            return unavailable("no_agent_session_id", pane_id=pane_id, agent=agent or None)
 
     if agent == "codex":
         path = codex_session_path(session_id)
@@ -652,6 +846,12 @@ def pane_turn(pane_id: str) -> dict[str, Any]:
         if not path:
             return unavailable("session_file_not_found", pane_id=pane_id, agent=agent, agent_session_id=session_id)
         return result_turn(extract_claude_turn(path, pane_id, session_id))
+
+    if agent == "devin":
+        path = devin_session_path(session_id)
+        if not path:
+            return unavailable("session_file_not_found", pane_id=pane_id, agent=agent, agent_session_id=session_id)
+        return result_turn(extract_devin_turn(path, pane_id, session_id))
 
     return unavailable("unsupported_agent", pane_id=pane_id, agent=agent or None)
 
