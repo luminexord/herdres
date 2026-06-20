@@ -6075,8 +6075,8 @@ def send_to_pane(
     deadline: float | None = None,
 ) -> tuple[bool, str]:
     deadline = _send_deadline(deadline)
-    # Telegram prompt fragments over 4096 chars arrive as independent gateway
-    # subprocesses with fresh deadlines; reassembly/order is out of scope here.
+    # Reassembly of split Telegram prompts is handled upstream in
+    # herdres_gateway.py (buffer_or_assemble); text is already a whole prompt here.
     if _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
         return False, "Send timed out before delivery (pane busy or unresponsive)."
     pane = pane_by_id(pane_id, deadline=deadline)

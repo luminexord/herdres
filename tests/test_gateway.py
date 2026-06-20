@@ -391,6 +391,9 @@ class GatewayManagedBotTests(unittest.TestCase):
         offset_patch = patch.object(managed_gateway, "OFFSET_PATH", Path(self.tmp.name) / "gateway_offset")
         offset_patch.start()
         self.addCleanup(offset_patch.stop)
+        reassembly_patch = patch.object(managed_gateway, "REASSEMBLY_PATH", Path(self.tmp.name) / "gateway_reassembly.json")
+        reassembly_patch.start()
+        self.addCleanup(reassembly_patch.stop)
         managed_gateway.PROCESSED_MESSAGE_KEYS = None
         managed_gateway.PROCESSED_MESSAGE_ORDER = []
         if hasattr(managed_gateway, "QUARANTINED_KEYS"):
@@ -403,6 +406,21 @@ class GatewayManagedBotTests(unittest.TestCase):
             old_semaphore = managed_gateway.DISPATCH_QUEUE_SEMAPHORE
             managed_gateway.DISPATCH_QUEUE_SEMAPHORE = threading.BoundedSemaphore(128)
             self.addCleanup(setattr, managed_gateway, "DISPATCH_QUEUE_SEMAPHORE", old_semaphore)
+
+    def single_pane_space_state(self) -> dict:
+        state = managed_multi_pane_space_state()
+        state["spaces"]["workspace:workspace-1"]["pane_keys"] = ["pane-1"]
+        state["panes"] = {"pane-1": state["panes"]["pane-1"]}
+        return state
+
+    def reassembly_message(self, message_id: int, text: str) -> dict:
+        return {
+            "message_id": message_id,
+            "message_thread_id": 77,
+            "chat": {"id": -1001, "is_forum": True},
+            "from": {"id": 42, "is_bot": False},
+            "text": text,
+        }
 
     def test_managed_bot_tokens_reads_enabled_child_tokens(self) -> None:
         state = {
@@ -583,6 +601,115 @@ class GatewayManagedBotTests(unittest.TestCase):
 
         run_script.assert_called_once()
         self.assertEqual(run_script.call_args.args[0]["pane_key"], "")
+
+    def test_handle_message_reassembles_two_split_fragments_once(self) -> None:
+        state = self.single_pane_space_state()
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        first = "a" * 4041
+        second = "b" * 2408
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", Mock()):
+            managed_gateway.handle_message(self.reassembly_message(5000, first), bot_token="MANAGER_TOKEN", bot_key="manager")
+            self.assertEqual(run_script.call_count, 0)
+            managed_gateway.handle_message(self.reassembly_message(5001, second), bot_token="MANAGER_TOKEN", bot_key="manager")
+
+        run_script.assert_called_once()
+        self.assertEqual(run_script.call_args.args[0]["text"], first + second)
+
+    def test_handle_message_normal_short_dispatches_immediately_without_buffer(self) -> None:
+        state = self.single_pane_space_state()
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        text = "x" * 3796
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", Mock()):
+            managed_gateway.handle_message(self.reassembly_message(5010, text), bot_token="MANAGER_TOKEN", bot_key="manager")
+
+        run_script.assert_called_once()
+        self.assertEqual(run_script.call_args.args[0]["text"], text)
+        self.assertFalse(managed_gateway.REASSEMBLY_PATH.exists())
+
+    def test_main_sweep_flushes_stale_buffer_with_origin_bot_routing(self) -> None:
+        now = time.time()
+        managed_gateway.REASSEMBLY_PATH.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "buffers": {
+                        "-1001|77|42": {
+                            "first_at": now - 30,
+                            "updated_at": now - 30,
+                            "fragments": [{"message_id": 5020, "text": "a" * 4041}],
+                            "sample": {
+                                "chat_id": "-1001",
+                                "thread_id": "77",
+                                "pane_key": "pane-1",
+                                "user_id": "42",
+                                "reply_to_message_id": "",
+                                "from_bot": False,
+                                "forwarded": False,
+                                "edited": False,
+                                "bot_token": "CHILD_TOKEN",
+                                "bot_key": "managed-codex-deadbeef",
+                            },
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        run_script = Mock(return_value={"handled": True, "reply": "done"})
+        send_reply = Mock()
+
+        with patch.object(managed_gateway, "_token", Mock(return_value="MANAGER_TOKEN")), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": {"url": ""}})
+        ), patch.object(managed_gateway, "load_state", Mock(return_value=None)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "send_reply", send_reply), patch.object(
+            managed_gateway.time, "sleep", Mock(side_effect=KeyboardInterrupt)
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                managed_gateway.main()
+
+        run_script.assert_called_once()
+        self.assertEqual(run_script.call_args.args[0]["text"], "a" * 4041)
+        send_reply.assert_called_once_with("CHILD_TOKEN", "-1001", "77", "done", reply_to_message_id=None)
+
+    def test_handle_message_chain_break_flushes_old_and_processes_new(self) -> None:
+        state = self.single_pane_space_state()
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        first = "a" * 4041
+        breaker = "new prompt"
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", Mock()):
+            managed_gateway.handle_message(self.reassembly_message(5030, first), bot_token="MANAGER_TOKEN", bot_key="manager")
+            managed_gateway.handle_message(self.reassembly_message(5033, breaker), bot_token="MANAGER_TOKEN", bot_key="manager")
+
+        self.assertEqual(run_script.call_count, 2)
+        self.assertEqual([call.args[0]["text"] for call in run_script.call_args_list], [first, breaker])
+
+    def test_handle_message_out_of_order_fragments_concatenate_by_message_id(self) -> None:
+        state = self.single_pane_space_state()
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        first = "a" * 4041
+        second = "b" * 4041
+        terminal = "c" * 128
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", Mock()):
+            managed_gateway.handle_message(self.reassembly_message(5041, second), bot_token="MANAGER_TOKEN", bot_key="manager")
+            managed_gateway.handle_message(self.reassembly_message(5040, first), bot_token="MANAGER_TOKEN", bot_key="manager")
+            self.assertEqual(run_script.call_count, 0)
+            managed_gateway.handle_message(self.reassembly_message(5042, terminal), bot_token="MANAGER_TOKEN", bot_key="manager")
+
+        run_script.assert_called_once()
+        self.assertEqual(run_script.call_args.args[0]["text"], first + second + terminal)
 
     def test_409_conflict_backs_off_and_retains_worker(self) -> None:
         managed_gateway.offset_path_for("managed-codex-a").write_text("10\n", encoding="utf-8")

@@ -87,6 +87,17 @@ DISPATCH_QUEUE_LIMIT = max(
     DISPATCH_WORKERS,
     int(os.getenv("HERDRES_GATEWAY_DISPATCH_QUEUE_LIMIT", "128")),
 )
+REASSEMBLY_HIGH_THRESHOLD = int(os.getenv("HERDRES_GATEWAY_REASSEMBLY_THRESHOLD", "4000"))
+REASSEMBLY_WINDOW_SECONDS = float(os.getenv("HERDRES_GATEWAY_REASSEMBLY_WINDOW", "20"))
+REASSEMBLY_HARD_CAP_SECONDS = float(os.getenv("HERDRES_GATEWAY_REASSEMBLY_HARD_CAP", "60"))
+REASSEMBLY_MAX_FRAGMENTS = int(os.getenv("HERDRES_GATEWAY_REASSEMBLY_MAX_FRAGMENTS", "8"))
+REASSEMBLY_PATH = Path(
+    os.getenv(
+        "HERDR_TELEGRAM_TOPICS_GATEWAY_REASSEMBLY",
+        str(HOME / ".local/share/herdres/gateway_reassembly.json"),
+    )
+).expanduser()
+REASSEMBLY_LOCK = threading.Lock()
 
 TOKEN = ""
 DEBUG = os.getenv("HERDRES_GATEWAY_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
@@ -252,6 +263,117 @@ def reserve_message_processing(key: str) -> bool:
                 PROCESSED_MESSAGE_KEYS.discard(old_key)
         save_processed_messages_locked()
         return True
+
+
+def reassembly_key(chat_id: str, thread_id: str | None, user_id: str) -> str:
+    return "|".join([str(chat_id), str(thread_id or ""), str(user_id)])
+
+
+def _load_reassembly_locked() -> dict:
+    try:
+        raw = json.loads(REASSEMBLY_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and isinstance(raw.get("buffers"), dict):
+            return raw["buffers"]
+    except Exception:
+        pass
+    return {}
+
+
+def _save_reassembly_locked(buffers: dict) -> None:
+    try:
+        REASSEMBLY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = REASSEMBLY_PATH.with_suffix(REASSEMBLY_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps({"version": 1, "buffers": buffers}), encoding="utf-8")
+        tmp.replace(REASSEMBLY_PATH)
+    except Exception as exc:
+        log(f"reassembly cache write failed: {exc}")
+
+
+def _concat_fragments(entry: dict) -> str:
+    fragments = sorted(entry.get("fragments") or [], key=lambda frag: int(frag.get("message_id") or 0))
+    return "".join(str(frag.get("text") or "") for frag in fragments)
+
+
+def buffer_or_assemble(
+    key: str,
+    message_id: int,
+    text: str,
+    *,
+    is_command: bool,
+    sample: dict,
+    now: float,
+) -> tuple[list[str], bool]:
+    is_high = len(text) >= REASSEMBLY_HIGH_THRESHOLD
+    with REASSEMBLY_LOCK:
+        buffers = _load_reassembly_locked()
+        entry = buffers.get(key)
+        if entry is None and not is_high:
+            return [text], False
+        if entry is None:
+            buffers[key] = {
+                "first_at": now,
+                "updated_at": now,
+                "fragments": [{"message_id": message_id, "text": text}],
+                "sample": sample,
+            }
+            _save_reassembly_locked(buffers)
+            return [], True
+
+        fragments = entry.get("fragments") or []
+        ids = [int(frag.get("message_id") or 0) for frag in fragments]
+        min_id = min(ids) if ids else message_id
+        max_id = max(ids) if ids else message_id
+        adjacent = message_id == max_id + 1 or message_id == min_id - 1
+        in_window = (now - float(entry.get("updated_at") or 0)) <= REASSEMBLY_WINDOW_SECONDS
+        capped = (now - float(entry.get("first_at") or 0)) >= REASSEMBLY_HARD_CAP_SECONDS
+        breaks_chain = is_command or not adjacent or not in_window or capped
+        if breaks_chain:
+            assembled_old = _concat_fragments(entry)
+            del buffers[key]
+            dispatch_now = [assembled_old]
+            if is_high and not is_command:
+                buffers[key] = {
+                    "first_at": now,
+                    "updated_at": now,
+                    "fragments": [{"message_id": message_id, "text": text}],
+                    "sample": sample,
+                }
+                _save_reassembly_locked(buffers)
+                return dispatch_now, True
+            _save_reassembly_locked(buffers)
+            dispatch_now.append(text)
+            return dispatch_now, False
+
+        fragments.append({"message_id": message_id, "text": text})
+        entry["fragments"] = fragments
+        entry["updated_at"] = now
+        reached_cap = len(fragments) >= REASSEMBLY_MAX_FRAGMENTS
+        terminal = not is_high
+        if terminal or reached_cap:
+            assembled = _concat_fragments(entry)
+            del buffers[key]
+            _save_reassembly_locked(buffers)
+            return [assembled], False
+        _save_reassembly_locked(buffers)
+        return [], True
+
+
+def sweep_stale_reassembly(now: float) -> list[tuple[str, str, dict]]:
+    flushed: list[tuple[str, str, dict]] = []
+    with REASSEMBLY_LOCK:
+        buffers = _load_reassembly_locked()
+        if not buffers:
+            return []
+        for key in list(buffers.keys()):
+            entry = buffers[key]
+            stale = (now - float(entry.get("updated_at") or 0)) >= REASSEMBLY_WINDOW_SECONDS
+            capped = (now - float(entry.get("first_at") or 0)) >= REASSEMBLY_HARD_CAP_SECONDS
+            if stale or capped:
+                flushed.append((key, _concat_fragments(entry), dict(entry.get("sample") or {})))
+                del buffers[key]
+        if flushed:
+            _save_reassembly_locked(buffers)
+    return flushed
 
 
 def _token() -> str:
@@ -738,37 +860,73 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
         return
     dlog(f"dispatching to herdres command (topic {thread_id})")
 
-    payload = {
-        "chat_id": chat_id,
-        "topic_id": thread_id,
-        "pane_key": pane_key,
-        "message_id": str(message.get("message_id") or ""),
-        "reply_to_message_id": str(reply_to.get("message_id") or ""),
-        "user_id": user_id,
-        "from_bot": from_bot,
-        "forwarded": is_forwarded(message),
-        "edited": bool(message.get("edit_date")),
-        "text": str(text or ""),
-        "caption": str(message.get("caption") or ""),
-        "attachment": attachment,
-    }
-    if target_bot_kind:
-        payload["target_bot_kind"] = target_bot_kind
-    lock_key = f"pane:{pane_key}" if pane_key else f"space:{chat_id}:{thread_id or ''}"
-    with route_lock_for(lock_key):
-        result = run_script(payload, "command")
-    elapsed = time.monotonic() - received_at
-    dlog(
-        "command result "
-        f"handled={result.get('handled')} reply_len={len(str(result.get('reply') or ''))} "
-        f"elapsed={elapsed:.3f}s"
-    )
-    if not result.get("handled", True):
-        return
-    reply = str(result.get("reply") or "").strip()
-    if not reply:
-        return
-    send_reply(bot_token, chat_id, thread_id, reply, reply_to_message_id=payload["message_id"])
+    if attachment:
+        reassembly_dispatch = [str(text or "")]
+    else:
+        try:
+            msg_id = int(message.get("message_id") or 0)
+        except Exception:
+            msg_id = 0
+        stripped = str(text or "").lstrip()
+        is_command = stripped.startswith("/") or bool(MANAGED_BOT_MENTION_RE.match(stripped))
+        sample = {
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "pane_key": pane_key,
+            "user_id": user_id,
+            "reply_to_message_id": str(reply_to.get("message_id") or ""),
+            "from_bot": from_bot,
+            "forwarded": is_forwarded(message),
+            "edited": bool(message.get("edit_date")),
+            "bot_token": bot_token,
+            "bot_key": bot_key,
+        }
+        if target_bot_kind:
+            sample["target_bot_kind"] = target_bot_kind
+        reassembly_dispatch, hold = buffer_or_assemble(
+            reassembly_key(chat_id, thread_id, user_id),
+            msg_id,
+            str(text or ""),
+            is_command=is_command,
+            sample=sample,
+            now=time.time(),
+        )
+        if hold and not reassembly_dispatch:
+            dlog(f"buffered fragment chat={chat_id} thread={thread_id} user={user_id} msg={msg_id}")
+            return
+
+    for dispatch_text in reassembly_dispatch:
+        payload = {
+            "chat_id": chat_id,
+            "topic_id": thread_id,
+            "pane_key": pane_key,
+            "message_id": str(message.get("message_id") or ""),
+            "reply_to_message_id": str(reply_to.get("message_id") or ""),
+            "user_id": user_id,
+            "from_bot": from_bot,
+            "forwarded": is_forwarded(message),
+            "edited": bool(message.get("edit_date")),
+            "text": dispatch_text,
+            "caption": str(message.get("caption") or ""),
+            "attachment": attachment,
+        }
+        if target_bot_kind:
+            payload["target_bot_kind"] = target_bot_kind
+        lock_key = f"pane:{pane_key}" if pane_key else f"space:{chat_id}:{thread_id or ''}"
+        with route_lock_for(lock_key):
+            result = run_script(payload, "command")
+        elapsed = time.monotonic() - received_at
+        dlog(
+            "command result "
+            f"handled={result.get('handled')} reply_len={len(str(result.get('reply') or ''))} "
+            f"elapsed={elapsed:.3f}s"
+        )
+        if not result.get("handled", True):
+            continue
+        reply = str(result.get("reply") or "").strip()
+        if not reply:
+            continue
+        send_reply(bot_token, chat_id, thread_id, reply, reply_to_message_id=payload["message_id"])
 
 
 def handle_callback(query: dict, *, bot_token: str | None = None) -> None:
@@ -1012,6 +1170,36 @@ def main() -> int:
     log("started; polling getUpdates for manager and managed pane bots")
     workers: dict[str, dict[str, object]] = {}
     while True:
+        try:
+            for _key, assembled, sample in sweep_stale_reassembly(time.time()):
+                payload = {
+                    "chat_id": sample.get("chat_id", ""),
+                    "topic_id": sample.get("thread_id"),
+                    "pane_key": sample.get("pane_key", ""),
+                    "message_id": "",
+                    "reply_to_message_id": sample.get("reply_to_message_id", ""),
+                    "user_id": sample.get("user_id", ""),
+                    "from_bot": sample.get("from_bot", False),
+                    "forwarded": sample.get("forwarded", False),
+                    "edited": sample.get("edited", False),
+                    "text": assembled,
+                    "caption": "",
+                    "attachment": None,
+                }
+                if sample.get("target_bot_kind"):
+                    payload["target_bot_kind"] = sample["target_bot_kind"]
+                lock_key = (
+                    f"pane:{payload['pane_key']}"
+                    if payload["pane_key"]
+                    else f"space:{payload['chat_id']}:{payload['topic_id'] or ''}"
+                )
+                with route_lock_for(lock_key):
+                    result = run_script(payload, "command")
+                reply = str(result.get("reply") or "").strip()
+                if result.get("handled", True) and reply and sample.get("bot_token"):
+                    send_reply(sample["bot_token"], payload["chat_id"], payload["topic_id"], reply, reply_to_message_id=None)
+        except Exception as exc:
+            log(f"reassembly sweep failed: {exc}")
         try:
             state = load_state()
             if state is None:
