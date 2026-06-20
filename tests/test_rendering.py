@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import re
 import tempfile
@@ -9,12 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-
-MODULE_PATH = Path(__file__).resolve().parents[1] / "herdres.py"
-SPEC = importlib.util.spec_from_file_location("herdres", MODULE_PATH)
-herdres = importlib.util.module_from_spec(SPEC)
-assert SPEC and SPEC.loader
-SPEC.loader.exec_module(herdres)
+import herdres
 
 
 class DocumentationRenderTests(unittest.TestCase):
@@ -7958,11 +7952,7 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertIn("invalid JSON", str(ctx.exception))
 
     def test_bridge_defaults_match_canonical_herdres_paths(self) -> None:
-        module_path = Path(__file__).resolve().parents[1] / "herdr_topic_bridge.py"
-        spec = importlib.util.spec_from_file_location("herdr_topic_bridge", module_path)
-        bridge = importlib.util.module_from_spec(spec)
-        assert spec and spec.loader
-        spec.loader.exec_module(bridge)
+        import herdr_topic_bridge as bridge
 
         self.assertEqual(bridge.DEFAULT_STATE, Path.home() / ".local/share/herdres/state.json")
         self.assertEqual(bridge.DEFAULT_SCRIPT, Path.home() / ".local/bin/herdres")

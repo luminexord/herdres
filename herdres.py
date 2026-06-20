@@ -8326,6 +8326,373 @@ def closed_notice_already_sent(state: dict[str, Any], current_key: str, entry: d
     return False
 
 
+def _sync_pane_clean_feed(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    pane: dict[str, Any],
+    entry: dict[str, Any],
+    counters: dict[str, int],
+    *,
+    pane_api_token: str | None,
+    turn_only: bool,
+    new_entry: bool,
+    max_sends: int,
+    max_feed_sends: int,
+    stable_obj_hash: str,
+    changed: bool,
+) -> dict[str, Any]:
+    """Clean-feed delivery for one pane: turn feed, pending prompt, stream,
+    and clean-feed item delivery.
+
+    Extracted from sync_pane_once. Mutates state/entry/counters in place.
+    Returns {"early_return", "changed", "feed_delivered", "stream_active"}.
+    early_return is True when the topic or pane-root went missing (caller
+    must return True immediately); None means continue.
+    """
+    feed_delivered_this_pane = False
+    stream_active_this_pane = False
+    item = None
+    if TURN_FEED_ENABLED:
+        before_turn_state = (
+            entry.get("last_turn_available"),
+            entry.get("last_turn_reason"),
+            entry.get("last_turn_id"),
+        )
+        # The plugin/event path (turn_only) must never scrape the visible
+        # screen: a status-change event can fire before the turn is flushed,
+        # and scraping a transiently-done/idle pane sends a malformed blob and
+        # breaks the settle loop. Visible prompts surface on the timer path.
+        item = extract_turn_feed_item(pane, entry, allow_visible_fallback=not turn_only)
+        after_turn_state = (
+            entry.get("last_turn_available"),
+            entry.get("last_turn_reason"),
+            entry.get("last_turn_id"),
+        )
+        if before_turn_state != after_turn_state:
+            changed = True
+    elif not turn_only and str(pane.get("agent_status") or "").strip().lower() not in ACTIVE_AGENT_STATUSES:
+        raw = pane_feed_output(str(pane.get("pane_id") or ""))
+        bounded_report = extract_bounded_report_from_raw(raw)
+        if bounded_report:
+            if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
+                changed = True
+            item = extract_clean_feed_item(
+                pane,
+                entry,
+                raw,
+                allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
+            )
+        elif has_resume_control_noise(raw):
+            if entry.get("last_clean_hash") or not entry.get("suppress_auto_feed_until_bounded_report"):
+                clear_clean_feed_state(entry)
+                changed = True
+            if not entry.get("suppress_auto_feed_until_bounded_report"):
+                entry["suppress_auto_feed_until_bounded_report"] = True
+                changed = True
+        else:
+            if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
+                changed = True
+            item = extract_clean_feed_item(
+                pane,
+                entry,
+                raw,
+                allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
+            )
+
+    pending_stream_text = str(entry.get("pending_stream_text") or "")
+    pending_stream_turn_id = str(entry.get("pending_stream_turn_id") or "")
+    pending_stream_user_text = str(entry.get("pending_prompt_text") or entry.get("last_prompt_text") or "")
+    prompt_result = send_pending_prompt_message(
+        state,
+        chat_id,
+        telegram,
+        entry,
+        counters,
+        max_sends,
+        max_feed_sends,
+    )
+    if prompt_result.get("topic_missing"):
+        clear_entry_topic_mapping(state, entry, str(prompt_result.get("error") or prompt_result))
+        save_state(state)
+        return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
+    if prompt_result.get("pane_root_missing"):
+        clear_pane_root_message(state, entry, str(prompt_result.get("error") or prompt_result))
+        save_state(state)
+        return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
+    if prompt_result.get("changed"):
+        changed = True
+    if not item and pending_stream_text and pending_stream_turn_id and stream_config_enabled():
+        stream_result = send_stream_update(
+            chat_id,
+            telegram,
+            entry,
+            turn_id=pending_stream_turn_id,
+            text=pending_stream_text,
+            user_text=pending_stream_user_text,
+        )
+        if result_topic_missing(stream_result):
+            clear_entry_topic_mapping(state, entry, str(stream_result.get("error") or stream_result))
+            save_state(state)
+            return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
+        if result_pane_root_missing(stream_result):
+            clear_pane_root_message(state, entry, str(stream_result.get("error") or stream_result))
+            save_state(state)
+            return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
+        if stream_result.get("ok"):
+            stream_active_this_pane = True
+            if stream_result.get("sent_message"):
+                counters["sends"] = counters.get("sends", 0) + 1
+                if stream_result.get("message_id"):
+                    record_pane_message_route(
+                        state,
+                        str(entry.get("space_key") or ""),
+                        str(entry.get("pane_key") or ""),
+                        str(stream_result["message_id"]),
+                    )
+            changed = True
+        elif not stream_result.get("skipped"):
+            entry["last_stream_error"] = sanitize_text(str(stream_result), 500)
+            changed = True
+
+    old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
+    if should_baseline_new_pane_turn(entry, item, new_entry):
+        record_suppressed_clean_item(entry, item, "new_pane_initial_turn_baseline")
+        item = None
+        changed = True
+    if item:
+        item_render_hash = clean_feed_hash(item)
+        item_semantic_hash = clean_feed_hash(item, include_render_version=False)
+        previous_render_hash = str(entry.get("last_clean_render_hash") or entry.get("last_clean_hash") or "")
+        same_semantic = same_delivered_content(entry, item, item_semantic_hash)
+        render_changed = item_render_hash != previous_render_hash
+        content_changed = not same_semantic
+        should_deliver = old_clean_has_noise or content_changed or render_changed
+        desired_bot_kind = desired_message_bot_kind(telegram, entry)
+        message_id = str(entry.get("last_clean_message_id") or "")
+        if same_semantic and render_changed and not content_changed and not old_clean_has_noise and not message_id:
+            entry["last_clean_render_hash"] = item_render_hash
+            entry["last_clean_hash"] = item_render_hash
+            entry["last_clean_semantic_hash"] = item_semantic_hash
+            entry["last_clean_text"] = item_plain_text(item)
+            entry["last_clean_item"] = item
+            entry["last_clean_render_only_skipped_at"] = utc_now()
+            entry.pop("last_clean_send_error", None)
+            changed = True
+            should_deliver = False
+        if (
+            counters.get("feed_sends", 0) < max_feed_sends
+            and should_deliver
+            and not recent_attempt(entry, item_render_hash)
+            and not managed_bot_access_retry_waiting(entry, "last_clean_bot_kind", desired_bot_kind)
+        ):
+            reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
+            entry["last_clean_attempt_hash"] = item_render_hash
+            entry["last_clean_attempt_at"] = utc_now()
+            changed = True
+            did_edit = False
+            lifecycle_message_id = ""
+            if str(item.get("kind") or "").lower() == "turn":
+                lifecycle_message_id = turn_visible_anchor_message_id(entry, str(item.get("turn_id") or ""))
+            if lifecycle_message_id and not entry.get("last_clean_bot_kind"):
+                if lifecycle_message_id == str(entry.get("last_stream_message_id") or "") and entry.get("last_stream_bot_kind"):
+                    entry["last_clean_bot_kind"] = str(entry.get("last_stream_bot_kind") or "")
+                elif lifecycle_message_id == str(entry.get("last_prompt_message_id") or "") and entry.get("last_prompt_bot_kind"):
+                    entry["last_clean_bot_kind"] = str(entry.get("last_prompt_bot_kind") or "")
+            if (
+                lifecycle_message_id
+                and not message_bot_reissue_due(entry, "last_clean_bot_kind", desired_bot_kind)
+            ):
+                result = edit_feed_item(
+                    chat_id,
+                    lifecycle_message_id,
+                    item,
+                    telegram=telegram,
+                    reply_markup=reply_markup,
+                    api_token=pane_api_token,
+                )
+                if result.get("ok"):
+                    did_edit = True
+                    message_id = lifecycle_message_id
+                elif result.get("not_found"):
+                    result = send_feed_item(
+                        chat_id,
+                        item,
+                        telegram=telegram,
+                        thread_id=entry["topic_id"],
+                        notify=bool(item.get("notify")),
+                        reply_markup=reply_markup,
+                        reply_to_message_id=pane_root_reply_target(entry),
+                        api_token=pane_api_token,
+                    )
+                else:
+                    result = {**result, "edit_failed": True}
+            elif same_semantic and (render_changed or old_clean_has_noise) and message_id:
+                result = edit_feed_item(
+                    chat_id,
+                    message_id,
+                    item,
+                    telegram=telegram,
+                    reply_markup=reply_markup,
+                    api_token=pane_api_token,
+                )
+                if result.get("ok"):
+                    did_edit = True
+                elif result.get("not_found"):
+                    if content_changed:
+                        result = send_feed_item(
+                            chat_id,
+                            item,
+                            telegram=telegram,
+                            thread_id=entry["topic_id"],
+                            notify=bool(item.get("notify")),
+                            reply_markup=reply_markup,
+                            reply_to_message_id=pane_root_reply_target(entry),
+                            api_token=pane_api_token,
+                        )
+                    else:
+                        entry["last_clean_render_hash"] = item_render_hash
+                        entry["last_clean_hash"] = item_render_hash
+                        entry["last_clean_semantic_hash"] = item_semantic_hash
+                        entry["last_clean_text"] = item_plain_text(item)
+                        entry["last_clean_item"] = item
+                        entry["last_clean_message_missing_at"] = utc_now()
+                        entry.pop("last_clean_send_error", None)
+                        changed = True
+                        result = {"ok": False, "kind": "not_found", "skipped_stale_repost": True}
+                else:
+                    result = {**result, "edit_failed": True}
+            else:
+                result = send_feed_item(
+                    chat_id,
+                    item,
+                    telegram=telegram,
+                    thread_id=entry["topic_id"],
+                    notify=bool(item.get("notify")),
+                    reply_markup=reply_markup,
+                    reply_to_message_id=pane_root_reply_target(entry),
+                    api_token=pane_api_token,
+                )
+            if result.get("ok"):
+                counters["sends"] = counters.get("sends", 0) + 1
+                counters["feed_sends"] = counters.get("feed_sends", 0) + 1
+                feed_delivered_this_pane = True
+                record_delivered_feed_item(
+                    entry,
+                    item,
+                    result,
+                    pending_active_prompt=pending_active_prompt,
+                    clear_active_prompt=clear_active_prompt,
+                    item_render_hash=item_render_hash,
+                    item_semantic_hash=item_semantic_hash,
+                    fallback_message_id=message_id if did_edit else None,
+                )
+                record_message_bot_kind(
+                    entry,
+                    "last_clean_bot_kind",
+                    sent_message_bot_kind(telegram, entry, None, result),
+                    desired_bot_kind,
+                )
+                route_id = str(result.get("message_id") or (message_id if did_edit else ""))
+                if route_id:
+                    record_pane_message_route(
+                        state,
+                        str(entry.get("space_key") or ""),
+                        str(entry.get("pane_key") or ""),
+                        route_id,
+                    )
+                if str(item.get("kind") or "").lower() == "turn":
+                    clear_stream_state(entry)
+                changed = True
+            elif result_topic_missing(result):
+                clear_entry_topic_mapping(state, entry, str(result.get("error") or result))
+                save_state(state)
+                return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
+            elif result_pane_root_missing(result):
+                clear_pane_root_message(state, entry, str(result.get("error") or result))
+                save_state(state)
+                return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
+            elif result.get("skipped_stale_repost"):
+                changed = True
+            elif result.get("kind") == "bot_access":
+                note_managed_bot_access_required(
+                    entry,
+                    "last_clean_bot_kind",
+                    desired_message_bot_kind(telegram, entry),
+                )
+                entry["last_clean_send_error"] = sanitize_text(str(result), 500)
+                changed = True
+            else:
+                entry["last_clean_send_error"] = sanitize_text(str(result), 500)
+                changed = True
+    elif old_clean_has_noise:
+        clear_clean_feed_state(entry)
+        changed = True
+    entry["last_status_hash"] = stable_obj_hash
+    return {"early_return": None, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
+
+
+def _sync_pane_legacy_status(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    pane: dict[str, Any],
+    entry: dict[str, Any],
+    counters: dict[str, int],
+    *,
+    pane_api_token: str | None,
+    new_entry: bool,
+    max_sends: int,
+    stable_obj_hash: str,
+    changed: bool,
+) -> dict[str, Any]:
+    """Legacy status-message delivery for one pane (when clean feed is off).
+
+    Extracted from sync_pane_once. Mutates state/entry/counters in place.
+    Returns {"early_return", "changed"}. early_return is True when the topic
+    or pane-root went missing (caller must return True immediately).
+    """
+    pane_status = str(pane.get("agent_status") or "").lower()
+    include_recent = pane_status in {"blocked", "unknown"}
+    status_result = send_legacy_message_result(
+        chat_id,
+        format_status(pane, include_recent=include_recent),
+        thread_id=entry["topic_id"],
+        notify=pane_status in {"blocked", "error"},
+        reply_to_message_id=pane_root_reply_target(entry),
+        api_token=pane_api_token,
+    )
+    if status_result.get("ok"):
+        desired_bot_kind = desired_message_bot_kind(telegram, entry)
+        counters["sends"] = counters.get("sends", 0) + 1
+        if status_result.get("message_id"):
+            record_pane_message_route(
+                state,
+                str(entry.get("space_key") or ""),
+                str(entry.get("pane_key") or ""),
+                str(status_result["message_id"]),
+            )
+        record_message_bot_kind(
+            entry,
+            "last_status_bot_kind",
+            sent_message_bot_kind(telegram, entry, None, status_result),
+            desired_bot_kind,
+        )
+        entry["last_status_hash"] = stable_obj_hash
+        entry["last_notified_status"] = pane_status
+        entry["last_sent_at"] = utc_now()
+        changed = True
+    elif result_topic_missing(status_result):
+        clear_entry_topic_mapping(state, entry, str(status_result.get("error") or status_result))
+        save_state(state)
+        return {"early_return": True, "changed": changed}
+    elif result_pane_root_missing(status_result):
+        clear_pane_root_message(state, entry, str(status_result.get("error") or status_result))
+        save_state(state)
+        return {"early_return": True, "changed": changed}
+    return {"early_return": None, "changed": changed}
+
+
 def sync_pane_once(
     state: dict[str, Any],
     chat_id: str,
@@ -8436,322 +8803,43 @@ def sync_pane_once(
             changed = True
 
     if CLEAN_FEED_ENABLED:
-        item = None
-        if TURN_FEED_ENABLED:
-            before_turn_state = (
-                entry.get("last_turn_available"),
-                entry.get("last_turn_reason"),
-                entry.get("last_turn_id"),
-            )
-            # The plugin/event path (turn_only) must never scrape the visible
-            # screen: a status-change event can fire before the turn is flushed,
-            # and scraping a transiently-done/idle pane sends a malformed blob and
-            # breaks the settle loop. Visible prompts surface on the timer path.
-            item = extract_turn_feed_item(pane, entry, allow_visible_fallback=not turn_only)
-            after_turn_state = (
-                entry.get("last_turn_available"),
-                entry.get("last_turn_reason"),
-                entry.get("last_turn_id"),
-            )
-            if before_turn_state != after_turn_state:
-                changed = True
-        elif not turn_only and str(pane.get("agent_status") or "").strip().lower() not in ACTIVE_AGENT_STATUSES:
-            raw = pane_feed_output(str(pane.get("pane_id") or ""))
-            bounded_report = extract_bounded_report_from_raw(raw)
-            if bounded_report:
-                if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
-                    changed = True
-                item = extract_clean_feed_item(
-                    pane,
-                    entry,
-                    raw,
-                    allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
-                )
-            elif has_resume_control_noise(raw):
-                if entry.get("last_clean_hash") or not entry.get("suppress_auto_feed_until_bounded_report"):
-                    clear_clean_feed_state(entry)
-                    changed = True
-                if not entry.get("suppress_auto_feed_until_bounded_report"):
-                    entry["suppress_auto_feed_until_bounded_report"] = True
-                    changed = True
-            else:
-                if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
-                    changed = True
-                item = extract_clean_feed_item(
-                    pane,
-                    entry,
-                    raw,
-                    allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
-                )
-
-        pending_stream_text = str(entry.get("pending_stream_text") or "")
-        pending_stream_turn_id = str(entry.get("pending_stream_turn_id") or "")
-        pending_stream_user_text = str(entry.get("pending_prompt_text") or entry.get("last_prompt_text") or "")
-        prompt_result = send_pending_prompt_message(
+        feed_result = _sync_pane_clean_feed(
             state,
             chat_id,
             telegram,
+            pane,
             entry,
             counters,
-            max_sends,
-            max_feed_sends,
+            pane_api_token=pane_api_token,
+            turn_only=turn_only,
+            new_entry=new_entry,
+            max_sends=max_sends,
+            max_feed_sends=max_feed_sends,
+            stable_obj_hash=stable_obj_hash,
+            changed=changed,
         )
-        if prompt_result.get("topic_missing"):
-            clear_entry_topic_mapping(state, entry, str(prompt_result.get("error") or prompt_result))
-            save_state(state)
-            return True
-        if prompt_result.get("pane_root_missing"):
-            clear_pane_root_message(state, entry, str(prompt_result.get("error") or prompt_result))
-            save_state(state)
-            return True
-        if prompt_result.get("changed"):
-            changed = True
-        if not item and pending_stream_text and pending_stream_turn_id and stream_config_enabled():
-            stream_result = send_stream_update(
-                chat_id,
-                telegram,
-                entry,
-                turn_id=pending_stream_turn_id,
-                text=pending_stream_text,
-                user_text=pending_stream_user_text,
-            )
-            if result_topic_missing(stream_result):
-                clear_entry_topic_mapping(state, entry, str(stream_result.get("error") or stream_result))
-                save_state(state)
-                return True
-            if result_pane_root_missing(stream_result):
-                clear_pane_root_message(state, entry, str(stream_result.get("error") or stream_result))
-                save_state(state)
-                return True
-            if stream_result.get("ok"):
-                stream_active_this_pane = True
-                if stream_result.get("sent_message"):
-                    counters["sends"] = counters.get("sends", 0) + 1
-                    if stream_result.get("message_id"):
-                        record_pane_message_route(
-                            state,
-                            str(entry.get("space_key") or ""),
-                            str(entry.get("pane_key") or ""),
-                            str(stream_result["message_id"]),
-                        )
-                changed = True
-            elif not stream_result.get("skipped"):
-                entry["last_stream_error"] = sanitize_text(str(stream_result), 500)
-                changed = True
-
-        old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
-        if should_baseline_new_pane_turn(entry, item, new_entry):
-            record_suppressed_clean_item(entry, item, "new_pane_initial_turn_baseline")
-            item = None
-            changed = True
-        if item:
-            item_render_hash = clean_feed_hash(item)
-            item_semantic_hash = clean_feed_hash(item, include_render_version=False)
-            previous_render_hash = str(entry.get("last_clean_render_hash") or entry.get("last_clean_hash") or "")
-            same_semantic = same_delivered_content(entry, item, item_semantic_hash)
-            render_changed = item_render_hash != previous_render_hash
-            content_changed = not same_semantic
-            should_deliver = old_clean_has_noise or content_changed or render_changed
-            desired_bot_kind = desired_message_bot_kind(telegram, entry)
-            message_id = str(entry.get("last_clean_message_id") or "")
-            if same_semantic and render_changed and not content_changed and not old_clean_has_noise and not message_id:
-                entry["last_clean_render_hash"] = item_render_hash
-                entry["last_clean_hash"] = item_render_hash
-                entry["last_clean_semantic_hash"] = item_semantic_hash
-                entry["last_clean_text"] = item_plain_text(item)
-                entry["last_clean_item"] = item
-                entry["last_clean_render_only_skipped_at"] = utc_now()
-                entry.pop("last_clean_send_error", None)
-                changed = True
-                should_deliver = False
-            if (
-                counters.get("feed_sends", 0) < max_feed_sends
-                and should_deliver
-                and not recent_attempt(entry, item_render_hash)
-                and not managed_bot_access_retry_waiting(entry, "last_clean_bot_kind", desired_bot_kind)
-            ):
-                reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
-                entry["last_clean_attempt_hash"] = item_render_hash
-                entry["last_clean_attempt_at"] = utc_now()
-                changed = True
-                did_edit = False
-                lifecycle_message_id = ""
-                if str(item.get("kind") or "").lower() == "turn":
-                    lifecycle_message_id = turn_visible_anchor_message_id(entry, str(item.get("turn_id") or ""))
-                if lifecycle_message_id and not entry.get("last_clean_bot_kind"):
-                    if lifecycle_message_id == str(entry.get("last_stream_message_id") or "") and entry.get("last_stream_bot_kind"):
-                        entry["last_clean_bot_kind"] = str(entry.get("last_stream_bot_kind") or "")
-                    elif lifecycle_message_id == str(entry.get("last_prompt_message_id") or "") and entry.get("last_prompt_bot_kind"):
-                        entry["last_clean_bot_kind"] = str(entry.get("last_prompt_bot_kind") or "")
-                if (
-                    lifecycle_message_id
-                    and not message_bot_reissue_due(entry, "last_clean_bot_kind", desired_bot_kind)
-                ):
-                    result = edit_feed_item(
-                        chat_id,
-                        lifecycle_message_id,
-                        item,
-                        telegram=telegram,
-                        reply_markup=reply_markup,
-                        api_token=pane_api_token,
-                    )
-                    if result.get("ok"):
-                        did_edit = True
-                        message_id = lifecycle_message_id
-                    elif result.get("not_found"):
-                        result = send_feed_item(
-                            chat_id,
-                            item,
-                            telegram=telegram,
-                            thread_id=entry["topic_id"],
-                            notify=bool(item.get("notify")),
-                            reply_markup=reply_markup,
-                            reply_to_message_id=pane_root_reply_target(entry),
-                            api_token=pane_api_token,
-                        )
-                    else:
-                        result = {**result, "edit_failed": True}
-                elif same_semantic and (render_changed or old_clean_has_noise) and message_id:
-                    result = edit_feed_item(
-                        chat_id,
-                        message_id,
-                        item,
-                        telegram=telegram,
-                        reply_markup=reply_markup,
-                        api_token=pane_api_token,
-                    )
-                    if result.get("ok"):
-                        did_edit = True
-                    elif result.get("not_found"):
-                        if content_changed:
-                            result = send_feed_item(
-                                chat_id,
-                                item,
-                                telegram=telegram,
-                                thread_id=entry["topic_id"],
-                                notify=bool(item.get("notify")),
-                                reply_markup=reply_markup,
-                                reply_to_message_id=pane_root_reply_target(entry),
-                                api_token=pane_api_token,
-                            )
-                        else:
-                            entry["last_clean_render_hash"] = item_render_hash
-                            entry["last_clean_hash"] = item_render_hash
-                            entry["last_clean_semantic_hash"] = item_semantic_hash
-                            entry["last_clean_text"] = item_plain_text(item)
-                            entry["last_clean_item"] = item
-                            entry["last_clean_message_missing_at"] = utc_now()
-                            entry.pop("last_clean_send_error", None)
-                            changed = True
-                            result = {"ok": False, "kind": "not_found", "skipped_stale_repost": True}
-                    else:
-                        result = {**result, "edit_failed": True}
-                else:
-                    result = send_feed_item(
-                        chat_id,
-                        item,
-                        telegram=telegram,
-                        thread_id=entry["topic_id"],
-                        notify=bool(item.get("notify")),
-                        reply_markup=reply_markup,
-                        reply_to_message_id=pane_root_reply_target(entry),
-                        api_token=pane_api_token,
-                    )
-                if result.get("ok"):
-                    counters["sends"] = counters.get("sends", 0) + 1
-                    counters["feed_sends"] = counters.get("feed_sends", 0) + 1
-                    feed_delivered_this_pane = True
-                    record_delivered_feed_item(
-                        entry,
-                        item,
-                        result,
-                        pending_active_prompt=pending_active_prompt,
-                        clear_active_prompt=clear_active_prompt,
-                        item_render_hash=item_render_hash,
-                        item_semantic_hash=item_semantic_hash,
-                        fallback_message_id=message_id if did_edit else None,
-                    )
-                    record_message_bot_kind(
-                        entry,
-                        "last_clean_bot_kind",
-                        sent_message_bot_kind(telegram, entry, None, result),
-                        desired_bot_kind,
-                    )
-                    route_id = str(result.get("message_id") or (message_id if did_edit else ""))
-                    if route_id:
-                        record_pane_message_route(
-                            state,
-                            str(entry.get("space_key") or ""),
-                            str(entry.get("pane_key") or ""),
-                            route_id,
-                        )
-                    if str(item.get("kind") or "").lower() == "turn":
-                        clear_stream_state(entry)
-                    changed = True
-                elif result_topic_missing(result):
-                    clear_entry_topic_mapping(state, entry, str(result.get("error") or result))
-                    save_state(state)
-                    return True
-                elif result_pane_root_missing(result):
-                    clear_pane_root_message(state, entry, str(result.get("error") or result))
-                    save_state(state)
-                    return True
-                elif result.get("skipped_stale_repost"):
-                    changed = True
-                elif result.get("kind") == "bot_access":
-                    note_managed_bot_access_required(
-                        entry,
-                        "last_clean_bot_kind",
-                        desired_message_bot_kind(telegram, entry),
-                    )
-                    entry["last_clean_send_error"] = sanitize_text(str(result), 500)
-                    changed = True
-                else:
-                    entry["last_clean_send_error"] = sanitize_text(str(result), 500)
-                    changed = True
-        elif old_clean_has_noise:
-            clear_clean_feed_state(entry)
-            changed = True
-        entry["last_status_hash"] = stable_obj_hash
+        if feed_result["early_return"] is not None:
+            return feed_result["early_return"]
+        changed = feed_result["changed"]
+        feed_delivered_this_pane = feed_result["feed_delivered"]
+        stream_active_this_pane = feed_result["stream_active"]
     elif counters.get("sends", 0) < max_sends and should_send_status(entry, stable_obj_hash, pane, new_entry):
-        pane_status = str(pane.get("agent_status") or "").lower()
-        include_recent = pane_status in {"blocked", "unknown"}
-        status_result = send_legacy_message_result(
+        status_result = _sync_pane_legacy_status(
+            state,
             chat_id,
-            format_status(pane, include_recent=include_recent),
-            thread_id=entry["topic_id"],
-            notify=pane_status in {"blocked", "error"},
-            reply_to_message_id=pane_root_reply_target(entry),
-            api_token=pane_api_token,
+            telegram,
+            pane,
+            entry,
+            counters,
+            pane_api_token=pane_api_token,
+            new_entry=new_entry,
+            max_sends=max_sends,
+            stable_obj_hash=stable_obj_hash,
+            changed=changed,
         )
-        if status_result.get("ok"):
-            desired_bot_kind = desired_message_bot_kind(telegram, entry)
-            counters["sends"] = counters.get("sends", 0) + 1
-            if status_result.get("message_id"):
-                record_pane_message_route(
-                    state,
-                    str(entry.get("space_key") or ""),
-                    str(entry.get("pane_key") or ""),
-                    str(status_result["message_id"]),
-                )
-            record_message_bot_kind(
-                entry,
-                "last_status_bot_kind",
-                sent_message_bot_kind(telegram, entry, None, status_result),
-                desired_bot_kind,
-            )
-            entry["last_status_hash"] = stable_obj_hash
-            entry["last_notified_status"] = pane_status
-            entry["last_sent_at"] = utc_now()
-            changed = True
-        elif result_topic_missing(status_result):
-            clear_entry_topic_mapping(state, entry, str(status_result.get("error") or status_result))
-            save_state(state)
-            return True
-        elif result_pane_root_missing(status_result):
-            clear_pane_root_message(state, entry, str(status_result.get("error") or status_result))
-            save_state(state)
-            return True
+        if status_result["early_return"] is not None:
+            return status_result["early_return"]
+        changed = status_result["changed"]
     # One-time ⚠️ warning when a pane's agent stalls on a model-API error.
     api_warn = apply_api_error_warning(chat_id, telegram, entry, counters, max_sends)
     if api_warn["topic_missing"]:

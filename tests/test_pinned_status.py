@@ -1,30 +1,9 @@
-import importlib.util
 import os
 import unittest
-from pathlib import Path
 from unittest.mock import Mock, patch
 
-
-MODULE_PATH = Path(__file__).resolve().parents[1] / "herdres.py"
-SPEC = importlib.util.spec_from_file_location("herdres", MODULE_PATH)
-herdres = importlib.util.module_from_spec(SPEC)
-assert SPEC and SPEC.loader
-SPEC.loader.exec_module(herdres)
-
-
-def pane(name: str, status: str, **extra):
-    data = {
-        "name": name,
-        "label": name,
-        "pane_id": name.lower(),
-        "terminal_id": "term",
-        "workspace_id": "work",
-        "tab_id": "tab",
-        "agent_status": status,
-        "_goal_active": False,
-    }
-    data.update(extra)
-    return data
+import herdres
+from conftest import make_pane as pane
 
 
 class PinnedStatusTests(unittest.TestCase):

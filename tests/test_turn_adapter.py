@@ -1,20 +1,11 @@
-import importlib.util
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-
-MODULE_PATH = Path(__file__).resolve().parents[1] / "herdr_turn_adapter.py"
-SPEC = importlib.util.spec_from_file_location("herdr_turn_adapter", MODULE_PATH)
-adapter = importlib.util.module_from_spec(SPEC)
-assert SPEC and SPEC.loader
-SPEC.loader.exec_module(adapter)
-
-
-def write_jsonl(path: Path, rows: list[dict]) -> None:
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+import herdr_turn_adapter as adapter
+from conftest import write_jsonl
 
 
 class TurnAdapterTests(unittest.TestCase):

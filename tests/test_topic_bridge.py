@@ -1,16 +1,9 @@
 import asyncio
-import importlib.util
 import types
 import unittest
-from pathlib import Path
 from unittest.mock import Mock, patch
 
-
-MODULE_PATH = Path(__file__).resolve().parents[1] / "herdr_topic_bridge.py"
-SPEC = importlib.util.spec_from_file_location("herdr_topic_bridge", MODULE_PATH)
-bridge = importlib.util.module_from_spec(SPEC)
-assert SPEC and SPEC.loader
-SPEC.loader.exec_module(bridge)
+import herdr_topic_bridge as bridge
 
 
 def _msg(**kw):

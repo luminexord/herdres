@@ -1,16 +1,9 @@
 from __future__ import annotations
 
-import importlib.util
 import unittest
-from pathlib import Path
 from unittest.mock import Mock, patch
 
-
-MODULE_PATH = Path(__file__).resolve().parents[1] / "herdres.py"
-SPEC = importlib.util.spec_from_file_location("herdres", MODULE_PATH)
-assert SPEC and SPEC.loader
-herdres = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(herdres)
+import herdres
 
 
 class ManagedBotRoutingRepairTests(unittest.TestCase):

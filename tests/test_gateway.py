@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import subprocess
@@ -14,23 +13,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import herdres_routing
-
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def load_gateway_module(filename: str, module_name: str):
-    module_path = ROOT / filename
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-gateway = load_gateway_module("herdres-gateway.py", "herdres_gateway_upstream")
-managed_gateway = load_gateway_module("herdres_gateway.py", "herdres_gateway_managed")
+import herdres_gateway_upstream as gateway
+import herdres_gateway_managed as managed_gateway
 
 
 def object_message(**overrides):
