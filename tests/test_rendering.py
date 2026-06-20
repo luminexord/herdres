@@ -1563,7 +1563,12 @@ class StreamingIntegrationTests(unittest.TestCase):
         self.assertEqual(entry["last_clean_message_id"], "2001")
         self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", final_html)
         self.assertIn("<details><summary><b>Worklog (1m)</b></summary><blockquote>", final_html)
-        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", final_html)
+        response_prefix = "<details open><summary><b>Response</b></summary>"
+        response_body = "<p>Profile complete.</p>"
+        self.assertIn(response_prefix + response_body, final_html)
+        response_start = final_html.index(response_prefix)
+        response_body_start = final_html.index(response_body, response_start)
+        self.assertNotIn("<blockquote>", final_html[response_start:response_body_start])
         self.assertLess(final_html.index("<b>User:</b>"), final_html.index("<b>Worklog (1m)</b>"))
         self.assertLess(final_html.index("<b>Worklog (1m)</b>"), final_html.index("<b>Response</b>"))
 
@@ -1746,7 +1751,12 @@ class StreamingIntegrationTests(unittest.TestCase):
         self.assertEqual(len(edit_calls), 0)
         final_html = json.loads(send_calls[0][1]["rich_message"])["html"]
         self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", final_html)
-        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", final_html)
+        response_prefix = "<details open><summary><b>Response</b></summary>"
+        response_body = "<p>Profile complete.</p>"
+        self.assertIn(response_prefix + response_body, final_html)
+        response_start = final_html.index(response_prefix)
+        response_body_start = final_html.index(response_body, response_start)
+        self.assertNotIn("<blockquote>", final_html[response_start:response_body_start])
         self.assertEqual(entry["last_clean_message_id"], "2003")
         self.assertEqual(entry["last_pane_message_id"], "2003")
 
@@ -2046,7 +2056,12 @@ class StreamingIntegrationTests(unittest.TestCase):
         self.assertEqual(edited_item["worklog_text"], "Partial answer.")
         edited_html = herdres.render_turn_item_html(edited_item)
         self.assertIn("<details><summary><b>Worklog</b></summary><blockquote>", edited_html)
-        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", edited_html)
+        response_prefix = "<details open><summary><b>Response</b></summary>"
+        response_body = "<p>Final answer.</p>"
+        self.assertIn(response_prefix + response_body, edited_html)
+        response_start = edited_html.index(response_prefix)
+        response_body_start = edited_html.index(response_body, response_start)
+        self.assertNotIn("<blockquote>", edited_html[response_start:response_body_start])
         send_feed_item.assert_not_called()
         self.assertEqual(entry["last_clean_message_id"], "3001")
         self.assertNotIn("last_stream_message_id", entry)
@@ -6664,7 +6679,12 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         html = herdres.render_feed_item_html(item)
 
         self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
-        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", html)
+        response_prefix = "<details open><summary><b>Response</b></summary>"
+        response_body = "<h3>Likely cause</h3>"
+        self.assertIn(response_prefix + response_body, html)
+        response_start = html.index(response_prefix)
+        response_body_start = html.index(response_body, response_start)
+        self.assertNotIn("<blockquote>", html[response_start:response_body_start])
         self.assertIn("<b>User:</b>", html)
         self.assertNotIn("You asked", html)
         self.assertIn("Why did the bot freeze?", html)
@@ -6686,7 +6706,12 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
         self.assertIn("<details><summary><b>Worklog</b></summary><blockquote>", html)
-        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", html)
+        response_prefix = "<details open><summary><b>Response</b></summary>"
+        response_body = "<p>Profile complete.</p>"
+        self.assertIn(response_prefix + response_body, html)
+        response_start = html.index(response_prefix)
+        response_body_start = html.index(response_body, response_start)
+        self.assertNotIn("<blockquote>", html[response_start:response_body_start])
         self.assertLess(html.index("<b>User:</b>"), html.index("<b>Worklog</b>"))
         self.assertLess(html.index("<b>Worklog</b>"), html.index("<b>Response</b>"))
 
@@ -6736,7 +6761,12 @@ Verification
         html = herdres.render_turn_item_html(item)
 
         self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
-        self.assertIn("<details open><summary><b>Response</b></summary><blockquote>", html)
+        response_prefix = "<details open><summary><b>Response</b></summary>"
+        response_body = "<h3>Implemented</h3>"
+        self.assertIn(response_prefix + response_body, html)
+        response_start = html.index(response_prefix)
+        response_body_start = html.index(response_body, response_start)
+        self.assertNotIn("<blockquote>", html[response_start:response_body_start])
         self.assertIn("<h3>Implemented</h3>", html)
         self.assertIn("<b>Pushed</b>", html)
         self.assertIn("<b>Verification</b>", html)

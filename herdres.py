@@ -3580,13 +3580,18 @@ def _rich_details_quote_html(
     *,
     summary_max_chars: int = 80,
     open_by_default: bool = True,
+    quote: bool = True,
 ) -> str:
     body = str(body_html or "").strip()
     if not body:
         return ""
     label = _html_text(summary, summary_max_chars)
     open_attr = " open" if open_by_default else ""
-    return f"<details{open_attr}><summary><b>{label}</b></summary><blockquote>{body}</blockquote></details>"
+    # quote=True wraps the body in a <blockquote> (the blue quote) — used for the
+    # user prompt and worklog. quote=False keeps the body un-flattened so rich
+    # content (headings/tables/code) renders properly — used for the response.
+    inner = f"<blockquote>{body}</blockquote>" if quote else body
+    return f"<details{open_attr}><summary><b>{label}</b></summary>{inner}</details>"
 
 
 TURN_COLLAPSED_SECTION_KEYS = {"proof", "logs", "commands", "diff", "raw output", "raw"}
@@ -4126,7 +4131,9 @@ def render_assistant_response_quote_html(assistant_final: str) -> str:
     if not clean:
         return ""
     body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
-    return _rich_details_quote_html(RESPONSE_LABEL, body_html)
+    # Collapsible (open) like before, but NOT blockquoted — the blue quote bar
+    # flattened the rich response. Prompt + worklog keep their blockquote.
+    return _rich_details_quote_html(RESPONSE_LABEL, body_html, quote=False)
 
 
 def render_worklog_quote_html(
