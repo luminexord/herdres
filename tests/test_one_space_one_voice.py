@@ -54,13 +54,14 @@ def command_patches(state: dict, *, send_message: Mock | None = None, send_to_pa
     )
 
 
-def callback_patches(state: dict, *, api: Mock | None = None):
+def callback_patches(state: dict, *, api: Mock | None = None, send_to_pane: Mock | None = None):
     return patch.multiple(
         herdres,
         load_dotenv=Mock(),
         load_state=Mock(return_value=state),
         save_state=Mock(),
         telegram_api=api or Mock(return_value={"ok": True, "result": True}),
+        send_to_pane=send_to_pane or Mock(return_value=(True, "")),
     )
 
 
@@ -405,6 +406,144 @@ class OneSpaceOneVoiceAgentsTests(unittest.TestCase):
         self.assertEqual(space["active_pane"]["42"]["pane_key"], "pane-2")
         self.assertEqual(result["answer"], "Sending to Claude.")
         self.assertEqual(api.call_args.args[0], "editMessageText")
+
+    def test_plain_pick_delivers_original_message(self) -> None:
+        state = osov_state()
+        space = state["spaces"]["workspace:one"]
+        space_token = herdres._callback_id("workspace:one", "space")[:16]
+        pane_token = herdres._callback_id("pane-1", "pane")[:24]
+        send_message = Mock(return_value="901")
+        api = Mock(return_value={"ok": True, "result": True})
+        send_to_pane = Mock(return_value=(True, "Queued for pane."))
+
+        with command_patches(state, send_message=send_message):
+            result = herdres.command_reply({"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "hello"})
+
+        self.assertEqual(result["reply"], "")
+        self.assertEqual(space["pending_pick"]["42"]["text"], "hello")
+        self.assertIn("10 min", send_message.call_args.args[1])
+
+        with callback_patches(state, api=api, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(f"herdr:ag:{space_token}:{pane_token}"))
+
+        send_to_pane.assert_called_once_with("pane-1", "hello")
+        self.assertEqual(space["active_pane"]["42"]["pane_key"], "pane-1")
+        self.assertNotIn("42", space["pending_pick"])
+        self.assertEqual(result["answer"], "Sent to Codex.")
+        body = api.call_args.args[1]["text"]
+        self.assertIn("Sent to Codex.", body)
+        self.assertIn("10 min", body)
+        self.assertIn("no reply or @ needed", body)
+        self.assertIn("Queued for pane.", body)
+
+    def test_pick_delivery_send_failure_is_nonfatal(self) -> None:
+        # send_to_pane shells out (subprocess timeout) and can RAISE on a stalled
+        # pane. The callback must not crash: it must still set+persist the active
+        # pane, consume pending, and answer the button.
+        import subprocess
+        state = osov_state()
+        space = state["spaces"]["workspace:one"]
+        space["pending_pick"] = {"42": {"text": "hello", "set_at": herdres.utc_now()}}
+        space_token = herdres._callback_id("workspace:one", "space")[:16]
+        pane_token = herdres._callback_id("pane-1", "pane")[:24]
+        api = Mock(return_value={"ok": True, "result": True})
+        send_to_pane = Mock(side_effect=subprocess.TimeoutExpired(cmd=["herdr"], timeout=8))
+
+        with callback_patches(state, api=api, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(f"herdr:ag:{space_token}:{pane_token}"))
+
+        self.assertIsInstance(result, dict)
+        send_to_pane.assert_called_once_with("pane-1", "hello")
+        self.assertEqual(space["active_pane"]["42"]["pane_key"], "pane-1")
+        self.assertNotIn("42", space["pending_pick"])
+        self.assertEqual(result["answer"], "Sending to Codex.")
+        self.assertIn("Messages here go to Codex", api.call_args.args[1]["text"])
+
+    def test_agents_command_pick_delivers_nothing(self) -> None:
+        state = osov_state()
+        space = state["spaces"]["workspace:one"]
+        space_token = herdres._callback_id("workspace:one", "space")[:16]
+        pane_token = herdres._callback_id("pane-1", "pane")[:24]
+        send_to_pane = Mock(return_value=(True, ""))
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with command_patches(state):
+            result = herdres.command_reply({"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/agents"})
+
+        self.assertEqual(result["reply"], "")
+        self.assertNotIn("pending_pick", space)
+
+        with callback_patches(state, api=api, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(f"herdr:ag:{space_token}:{pane_token}"))
+
+        send_to_pane.assert_not_called()
+        self.assertEqual(result["answer"], "Sending to Codex.")
+        self.assertIn("Messages here go to Codex for 10 min", api.call_args.args[1]["text"])
+
+    def test_pending_pick_expires_not_delivered(self) -> None:
+        state = osov_state()
+        space = state["spaces"]["workspace:one"]
+        space["pending_pick"] = {"42": {"text": "hello", "set_at": "2000-01-01T00:00:00+00:00"}}
+        space_token = herdres._callback_id("workspace:one", "space")[:16]
+        pane_token = herdres._callback_id("pane-1", "pane")[:24]
+        send_to_pane = Mock(return_value=(True, ""))
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with callback_patches(state, api=api, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(f"herdr:ag:{space_token}:{pane_token}"))
+
+        send_to_pane.assert_not_called()
+        self.assertEqual(space["active_pane"]["42"]["pane_key"], "pane-1")
+        self.assertNotIn("42", space["pending_pick"])
+        self.assertEqual(result["answer"], "Sending to Codex.")
+        self.assertIn("Messages here go to Codex for 10 min", api.call_args.args[1]["text"])
+
+    def test_pick_closed_pane_keeps_pending(self) -> None:
+        state = osov_state()
+        space = state["spaces"]["workspace:one"]
+        space["pending_pick"] = {"42": {"text": "hello", "set_at": herdres.utc_now()}}
+        state["panes"]["pane-1"]["last_known_status"] = "closed"
+        space_token = herdres._callback_id("workspace:one", "space")[:16]
+        pane_token = herdres._callback_id("pane-1", "pane")[:24]
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(f"herdr:ag:{space_token}:{pane_token}"))
+
+        self.assertEqual(result["answer"], "That pane is no longer live.")
+        self.assertTrue(result["show_alert"])
+        self.assertEqual(space["pending_pick"]["42"]["text"], "hello")
+        self.assertNotIn("active_pane", space)
+        send_to_pane.assert_not_called()
+
+    def test_pick_confirmation_states_window(self) -> None:
+        state = osov_state()
+        space_token = herdres._callback_id("workspace:one", "space")[:16]
+        pane_token = herdres._callback_id("pane-2", "pane")[:24]
+        api = Mock(return_value={"ok": True, "result": True})
+        mins = max(1, herdres.ACTIVE_PANE_TTL_SECONDS // 60)
+
+        with callback_patches(state, api=api):
+            result = herdres.callback_reply(callback_payload(f"herdr:ag:{space_token}:{pane_token}"))
+
+        self.assertEqual(result["answer"], "Sending to Claude.")
+        body = api.call_args.args[1]["text"]
+        self.assertIn(f"for {mins} min", body)
+        self.assertIn("no reply or @ needed", body)
+
+    def test_plain_after_pick_still_routes(self) -> None:
+        state = osov_state()
+        space_token = herdres._callback_id("workspace:one", "space")[:16]
+        pane_token = herdres._callback_id("pane-2", "pane")[:24]
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state):
+            herdres.callback_reply(callback_payload(f"herdr:ag:{space_token}:{pane_token}"))
+        with command_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply({"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "later"})
+
+        self.assertEqual(result["reply"], "")
+        send_to_pane.assert_called_once_with("pane-2", "later")
 
     def test_active_pane_routes_next_plain_text(self) -> None:
         state = osov_state()

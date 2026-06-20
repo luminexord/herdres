@@ -10422,11 +10422,16 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 if command in {"agents", "plain"}:
                     if not live:
                         return {"handled": True, "reply": "No live Herdr panes in this topic."}
+                    if command == "plain" and arg.strip():
+                        pend = space.setdefault("pending_pick", {})
+                        if isinstance(pend, dict):
+                            pend[str(user_id)] = {"text": arg, "set_at": utc_now()}
                     save_state(state)
                     space_token = _callback_id(str(space.get("space_key") or ""), "space")[:16]
+                    mins = max(1, ACTIVE_PANE_TTL_SECONDS // 60)
                     send_message(
                         chat_id,
-                        "Send to which agent? (Pick one; your next message routes there.)",
+                        f"Send to which agent? Tap one — this topic then routes to them for {mins} min (no need to reply or @).",
                         thread_id=topic_id,
                         reply_markup=agents_picker_reply_markup(space_token, live),
                     )
@@ -10833,20 +10838,49 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
     if not match:
         return {"handled": True, "answer": "That pane is no longer live.", "show_alert": True}
     set_active_pane(space, match, user_id)
-    save_state(state)
     panes = state.get("panes") or {}
     entry = panes.get(match) if isinstance(panes, dict) else None
+    pane_id = str((entry or {}).get("pane_id") or "")
+    delivered = False
+    deliver_note = ""
+    pend = space.get("pending_pick") if isinstance(space.get("pending_pick"), dict) else {}
+    rec = pend.get(str(user_id)) if isinstance(pend, dict) else None
+    if isinstance(rec, dict):
+        pend.pop(str(user_id), None)
+        text = str(rec.get("text") or "").strip()
+        age = _iso_age_seconds(str(rec.get("set_at") or ""))
+        if text and pane_id and (age is None or age <= ACTIVE_PANE_TTL_SECONDS):
+            try:
+                ok, detail = send_to_pane(pane_id, text)
+            except Exception as exc:
+                # send_to_pane shells out (subprocess timeout=8) and can RAISE, e.g.
+                # TimeoutExpired on a stalled pane. Treat a raise as a failed send so
+                # save_state still runs (active pane persists; pending stays consumed)
+                # and the callback still answers (the inline button clears).
+                ok, detail = False, sanitize_text(str(exc), 200)
+            delivered = ok
+            deliver_note = sanitize_text(detail, 200) if ok else ""
+    save_state(state)
     label = str((managed_bot_specs().get(managed_bot_kind_for_entry(entry or {})) or {}).get("label")
                 or (entry or {}).get("agent") or "pane")
+    mins = max(1, ACTIVE_PANE_TTL_SECONDS // 60)
+    if delivered:
+        body = f"Sent to {label}. Messages here go to {label} for {mins} min (no reply or @ needed)."
+        ans = f"Sent to {label}."
+    else:
+        body = f"Messages here go to {label} for {mins} min (no reply or @ needed)."
+        ans = f"Sending to {label}."
+    if deliver_note:
+        body = f"{body}\n\n{deliver_note}"
     try:
         telegram_api("editMessageText", {
             "chat_id": chat_id,
             "message_id": int(message_id),
-            "text": f"Next message in this topic goes to {label}.",
+            "text": body,
         })
     except Exception:
         pass
-    return {"handled": True, "answer": f"Sending to {label}."}
+    return {"handled": True, "answer": ans}
 
 
 def handle_multibot_offer_callback(state, telegram, chat_id, topic_id, message_id, space, parts):
