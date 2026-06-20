@@ -5993,12 +5993,12 @@ def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8, agent_
         if not pane_input_looks_staged(pane_id):
             return True, ""
     # Still staged. A working agent queues typed input and won't accept Enter as a
-    # submit until its turn finishes, so the text legitimately sits in the box
-    # (queued, not lost) — report that rather than a hard failure. Only when the
-    # agent is idle does a still-staged box mean the keystroke was truly ignored.
+    # submit until its turn finishes, so tell the sender it's queued (not lost).
+    # Otherwise trust the delivered Enter rather than refusing — Herdres does not
+    # refuse after a delivered submit.
     if str(agent_status or "").strip().lower() == "working":
         return True, "Queued — the agent is busy; your message will run when the current turn finishes."
-    return False, "submitted Enter but the pane input still shows staged text"
+    return True, ""
 
 
 def telegram_get_file(file_id: str) -> dict[str, Any]:

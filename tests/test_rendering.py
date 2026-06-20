@@ -4081,6 +4081,7 @@ Verification
         with patch.multiple(
             herdres,
             pane_by_id=Mock(return_value=pane),
+            pane_input_ansi=Mock(return_value=current_composer),
             pane_output=Mock(return_value=current_composer),
             run_cmd=run_cmd,
         ):
@@ -4178,10 +4179,9 @@ Verification
         self.assertEqual(commands[0][:4], [herdres.herdr_bin(), "pane", "run", "pane-1"])
         self.assertEqual(commands[-1], [herdres.herdr_bin(), "pane", "send-keys", "pane-1", "enter"])
 
-    def test_submit_staged_input_reports_failure_when_box_never_clears(self) -> None:
-        # IDLE agent: the submit keystroke "succeeds" (returncode 0) but the TUI
-        # never accepts it (e.g. a raw \\r it ignores) and the text stays staged.
-        # We must report failure, not a false "sent" that silently drops it.
+    def test_submit_staged_input_trusts_delivered_submit_when_idle(self) -> None:
+        # IDLE agent with a still-staged box: Herdres does not refuse after a
+        # delivered Enter — it trusts the submit (returns success, no queued note).
         with patch.object(herdres.time, "sleep", lambda *_: None), patch.multiple(
             herdres,
             run_cmd=Mock(return_value=Mock(returncode=0, stdout="", stderr="")),
@@ -4189,8 +4189,8 @@ Verification
         ):
             ok, detail = herdres.submit_staged_pane_input_if_needed("pane-1", timeout=1, agent_status="idle")
 
-        self.assertFalse(ok)
-        self.assertIn("staged", detail)
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
 
     def test_submit_staged_input_queues_when_agent_working(self) -> None:
         # WORKING agent: the box stays staged because a busy agent queues typed
