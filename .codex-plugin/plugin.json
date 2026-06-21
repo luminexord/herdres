@@ -1,0 +1,21 @@
+{
+  "name": "herdres",
+  "version": "0.1.0",
+  "description": "Operate the Herdr-to-Telegram bridge: per-agent topics, send/interrupt/queue, status, managed bots, cockpit, maintenance.",
+  "author": { "name": "jerryfane", "url": "https://github.com/jerryfane" },
+  "homepage": "https://github.com/luminexord/herdres",
+  "repository": "https://github.com/luminexord/herdres",
+  "license": "MIT",
+  "keywords": ["telegram", "herdr", "bridge", "agents", "operations"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Herdres",
+    "shortDescription": "Operate Herdr agents over Telegram",
+    "longDescription": "Install and operate the Herdr-to-Telegram bridge: set up per-agent forum topics, send/interrupt/queue messages to agent panes, read status and reports, manage child bots, drive the macOS cockpit, and run maintenance.",
+    "developerName": "jerryfane",
+    "category": "Productivity",
+    "capabilities": ["Instructions"],
+    "websiteURL": "https://github.com/luminexord/herdres",
+    "defaultPrompt": ["Set up herdres so I can control my Herdr agents from Telegram."]
+  }
+}

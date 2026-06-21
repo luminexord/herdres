@@ -22,6 +22,19 @@ Verify: the file's frontmatter says `name: herdres`.
 
 The packaged `skills/herdres/` (this file + `references/`) is the canonical, progressive-disclosure version; the root `SKILL.md` is the install-anywhere entrypoint.
 
+## Install By Name (Marketplace)
+
+Beyond copying files, herdres ships as a plugin you can add **by name** from a marketplace (closes the [#6](https://github.com/luminexord/herdres/issues/6) gap). The manifests bundle the canonical `skills/herdres/`.
+
+Claude Code:
+
+```text
+/plugin marketplace add luminexord/herdres
+/plugin install herdres@herdres
+```
+
+Codex (or any skills-compatible agent that reads `.codex-plugin/`): add the same repo as a marketplace, then install the `herdres` plugin. Both manifests pin the bundled skill via `"source": "."` and `"skills": "./skills/"`, so the operator skill resolves from the plugin root.
+
 ## What It Does
 
 - Creates or maintains one Telegram forum topic per Herdr space.
