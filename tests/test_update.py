@@ -342,6 +342,34 @@ class EdgeApplyTests(UpdateTestBase):
         self.assertLess(disable_idx, enable_idx)
 
 
+class NoRestartTests(UpdateTestBase):
+    def test_no_restart_skips_services_and_warns(self):
+        self._seed_installed()
+        env_path = self.tmp / "herdres.env"
+        env_path.write_text("TELEGRAM_BOT_TOKEN=secret\n", encoding="utf-8")
+        with patch.object(herdres, "DEFAULT_ENV", env_path):
+            result = herdres.update_once(_args(repo=str(self.repo), no_restart=True))
+
+        self.assertTrue(result["ok"], result)
+        # Files were still replaced (the update happened)...
+        self.assertIn('HERDRES_VERSION = "9.9.9"', (self.bin / "herdres").read_text())
+        # ...but NO systemctl/launchctl calls were issued (restart fully skipped).
+        for call in self.router.calls:
+            self.assertNotIn(call[0], {"systemctl", "launchctl"})
+        # The result warns the operator to restart manually.
+        self.assertIn("warnings", result)
+        self.assertTrue(any("no-restart" in w for w in result["warnings"]), result["warnings"])
+        # herdres.env is still untouched.
+        self.assertEqual(env_path.read_text(), "TELEGRAM_BOT_TOKEN=secret\n")
+
+    def test_no_restart_via_env(self):
+        self._seed_installed()
+        with patch.dict(os.environ, {"HERDRES_UPDATE_SKIP_RESTART": "1"}):
+            herdres.update_once(_args(repo=str(self.repo)))
+        for call in self.router.calls:
+            self.assertNotIn(call[0], {"systemctl", "launchctl"})
+
+
 class RollbackOnFailureTests(UpdateTestBase):
     def test_verify_failure_restores_backup(self):
         self._seed_installed()

@@ -12927,6 +12927,12 @@ def update_once(args: Any) -> dict[str, Any]:
     if channel != "edge":
         raise BridgeError(f"herdres update: unknown channel {channel!r} (use edge)")
 
+    # --no-restart (or HERDRES_UPDATE_SKIP_RESTART=1): swap files but skip the service
+    # restart — useful for "update now, restart later" and for sandboxed e2e tests
+    # (systemctl/launchctl are not HOME-scoped, so skipping them keeps the test isolated).
+    no_restart = bool(getattr(args, "no_restart", False)) or \
+        os.environ.get("HERDRES_UPDATE_SKIP_RESTART") == "1"
+
     # --rollback short-circuits: restore the latest backup and restart, no git.
     if getattr(args, "rollback", False):
         backup = _latest_backup()
@@ -12936,10 +12942,13 @@ def update_once(args: Any) -> dict[str, Any]:
         # _restart_services re-checks gateway health and raises if a gateway that was
         # active can't be brought back, surfacing a clear error if rollback can't
         # restore inbound.
-        try:
-            actions = _restart_services()
-        except BridgeError as exc:
-            raise BridgeError(f"herdres rollback restored files but {exc}") from exc
+        if no_restart:
+            actions = ["(restart skipped: --no-restart)"]
+        else:
+            try:
+                actions = _restart_services()
+            except BridgeError as exc:
+                raise BridgeError(f"herdres rollback restored files but {exc}") from exc
         return {
             "ok": True,
             "action": "rollback",
@@ -13019,14 +13028,18 @@ def update_once(args: Any) -> dict[str, Any]:
 
     # Snapshot gateway liveness before we touch anything so verify can assert it
     # comes back (a dead inbound after the restart means we must roll back).
-    gateway_was_active = _gateway_is_active()
+    gateway_was_active = False if no_restart else _gateway_is_active()
 
     backup = _backup_install_set()
     try:
         written = _apply_install_set(repo)
         # _restart_services raises if a previously-active gateway can't be brought
-        # back; that propagates here and rolls back.
-        service_actions = _restart_services()
+        # back; that propagates here and rolls back. (--no-restart skips it; the
+        # operator restarts manually later.)
+        if no_restart:
+            service_actions = ["(restart skipped: --no-restart)"]
+        else:
+            service_actions = _restart_services()
         verify = _verify_install(available, gateway_was_active)
     except Exception as exc:
         # Roll back when: a file replace errors, the new binary fails to run / version
@@ -13034,7 +13047,8 @@ def update_once(args: Any) -> dict[str, Any]:
         # only warns and never reaches here.)
         try:
             _restore_backup(backup)
-            _restart_services()
+            if not no_restart:
+                _restart_services()
         except Exception as restore_exc:  # pragma: no cover - best-effort restore
             raise BridgeError(
                 f"herdres update FAILED and rollback also failed: {exc}; rollback: {restore_exc}"
@@ -13053,8 +13067,14 @@ def update_once(args: Any) -> dict[str, Any]:
         "services": service_actions,
         "head": _git_rev(repo, "HEAD"),
     }
-    if verify["warnings"]:
-        result["warnings"] = verify["warnings"]
+    warnings = list(verify["warnings"])
+    if no_restart:
+        warnings.append(
+            "services not restarted (--no-restart): run 'systemctl --user daemon-reload "
+            "&& systemctl --user restart herdres.timer' and re-enable the gateway to apply"
+        )
+    if warnings:
+        result["warnings"] = warnings
     return result
 
 
@@ -13084,10 +13104,12 @@ def main() -> int:
     sub.add_parser("version")
     update = sub.add_parser("update")
     update.add_argument("--channel", default="edge")
+    update.add_argument("--edge", action="store_const", const="edge", dest="channel")
     update.add_argument("--repo", default="")
     update.add_argument("--check", action="store_true")
     update.add_argument("--rollback", action="store_true")
     update.add_argument("--dry-run", dest="dry_run", action="store_true")
+    update.add_argument("--no-restart", dest="no_restart", action="store_true")
     args = parser.parse_args()
     try:
         if args.cmd == "sync":
