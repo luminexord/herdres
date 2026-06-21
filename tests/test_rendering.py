@@ -2043,6 +2043,45 @@ class StreamingIntegrationTests(unittest.TestCase):
         send_stream.assert_called_once()
         self.assertEqual(send_stream.call_args.kwargs["turn_id"], "turn-2")
 
+    def test_sync_stream_does_not_inherit_stale_prompt_from_different_turn(self) -> None:
+        state, pane, _key, entry = self._state()
+        entry.update({
+            "last_prompt_turn_id": "old-turn",
+            "last_prompt_text": "--yolo",
+            "last_prompt_message_id": "2001",
+            "last_pane_message_id": "2001",
+        })
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "turn_id": "current-visible",
+                "user_text": "",
+                "assistant_final_text": "",
+                "assistant_stream_text": "Current visible Devin worklog.",
+            }
+        )
+        send_stream = Mock(return_value={"ok": True, "message_id": "3001", "sent_message": True})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_stream_update=send_stream,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_stream.assert_called_once()
+        self.assertEqual(send_stream.call_args.kwargs["turn_id"], "current-visible")
+        self.assertEqual(send_stream.call_args.kwargs["user_text"], "")
+
     def test_sync_does_not_repost_render_only_change_without_message_id(self) -> None:
         state, pane, _key, entry = self._state()
         counters, caps = self._caps()

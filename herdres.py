@@ -2728,6 +2728,17 @@ def worklog_label_for_turn(entry: dict[str, Any], turn_id: str) -> str:
     return f"{WORKLOG_LABEL} ({elapsed})"
 
 
+def stream_user_text_for_turn(entry: dict[str, Any], turn_id: str) -> str:
+    clean_turn_id = str(turn_id or "")
+    if not clean_turn_id:
+        return ""
+    if str(entry.get("pending_prompt_turn_id") or "") == clean_turn_id:
+        return sanitize_text(str(entry.get("pending_prompt_text") or ""), USER_PROMPT_MAX_CHARS).strip()
+    if str(entry.get("last_prompt_turn_id") or "") == clean_turn_id:
+        return sanitize_text(str(entry.get("last_prompt_text") or ""), USER_PROMPT_MAX_CHARS).strip()
+    return ""
+
+
 def apply_worklog_label(item: dict[str, Any] | None, entry: dict[str, Any]) -> dict[str, Any] | None:
     if not item or str(item.get("kind") or "").lower() != "turn":
         return item
@@ -9324,7 +9335,7 @@ def _sync_pane_clean_feed(
 
     pending_stream_text = str(entry.get("pending_stream_text") or "")
     pending_stream_turn_id = str(entry.get("pending_stream_turn_id") or "")
-    pending_stream_user_text = str(entry.get("pending_prompt_text") or entry.get("last_prompt_text") or "")
+    pending_stream_user_text = stream_user_text_for_turn(entry, pending_stream_turn_id)
     prompt_result = send_pending_prompt_message(
         state,
         chat_id,
