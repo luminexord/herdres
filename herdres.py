@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
+HERDRES_VERSION = "0.2.0"
+
 DEFAULT_STATE = Path.home() / ".local/share/herdres/state.json"
 DEFAULT_ENV = Path(os.getenv("HERDRES_ENV", str(Path.home() / ".config/herdres/herdres.env"))).expanduser()
 DEFAULT_HERMES_ENV = Path.home() / ".hermes/.env"
@@ -12451,6 +12453,455 @@ def setup_write_env(updates: dict[str, str]) -> Path:
     return path
 
 
+# ---------------------------------------------------------------------------
+# `herdres update` — env-safe self-update (Issue #13 Phase 1+2, edge channel)
+# ---------------------------------------------------------------------------
+
+# Cross-task source marker (see GOALS/issue-13/GOAL.md): the installers write the
+# absolute checkout path here so `update --edge` knows where to `git pull`.
+SOURCE_MARKER = Path.home() / ".local/share/herdres/source"
+
+# Install destination roots. Module-level so tests can monkeypatch them onto a
+# temp filesystem without touching the real ~/.local or ~/.config.
+INSTALL_BIN_DIR = Path.home() / ".local/bin"
+INSTALL_SHARE_DIR = Path.home() / ".local/share/herdres"
+INSTALL_SYSTEMD_DIR = Path.home() / ".config/systemd/user"
+BACKUP_DIR = Path.home() / ".local/share/herdres/backups"
+KEEP_BACKUPS = 5
+
+# launchd labels (macOS); only restarted if currently loaded.
+LAUNCHD_LABELS = ("com.gaijinjoe.herdres", "com.gaijinjoe.herdres-gateway")
+
+
+def _installed_bin() -> Path:
+    """Absolute path of the installed `herdres` launcher (for verify + plugin sed)."""
+    return INSTALL_BIN_DIR / "herdres"
+
+
+def _update_files_plan() -> list[dict[str, Any]]:
+    """The install-user.sh code set: which source file maps to which dest + mode.
+
+    Returns a list of plan entries. ``transform`` (optional) is applied to the
+    source text before writing (used to sed the absolute herdres path into the
+    plugin manifest). ``glob`` entries fan out to every match under the source
+    systemd dir. ``herdres.env`` is intentionally NOT in this set.
+    """
+    return [
+        {"src": "herdres.py", "dest": _installed_bin(), "mode": 0o755},
+        {"src": "herdres_gateway.py", "dest": INSTALL_BIN_DIR / "herdres-gateway", "mode": 0o755},
+        {"src": "herdres_routing.py", "dest": INSTALL_BIN_DIR / "herdres_routing.py", "mode": 0o644},
+        {"src": "herdr_topic_bridge.py", "dest": INSTALL_SHARE_DIR / "herdr_topic_bridge.py", "mode": 0o644},
+        {
+            "src": "herdres-plugin/herdr-plugin.toml",
+            "dest": INSTALL_SHARE_DIR / "herdres-plugin" / "herdr-plugin.toml",
+            "mode": 0o644,
+            "transform": _plugin_manifest_transform,
+        },
+        # systemd units: each herdres*.{service,timer} -> ~/.config/systemd/user/.
+        {"src": "systemd/user/herdres.service", "dest": INSTALL_SYSTEMD_DIR / "herdres.service", "mode": 0o644},
+        {"src": "systemd/user/herdres.timer", "dest": INSTALL_SYSTEMD_DIR / "herdres.timer", "mode": 0o644},
+        {
+            "src": "systemd/user/herdres-gateway.service",
+            "dest": INSTALL_SYSTEMD_DIR / "herdres-gateway.service",
+            "mode": 0o644,
+        },
+    ]
+
+
+def _plugin_manifest_transform(text: str) -> str:
+    """Rewrite the plugin manifest's bare ``["herdres", `` to the absolute path.
+
+    Mirrors install-user.sh: ``sed 's#\\["herdres", #\\["$HOME/.local/bin/herdres", #g'``.
+    """
+    return text.replace('["herdres", ', f'["{_installed_bin()}", ')
+
+
+def _atomic_install(dest: Path, text: str, mode: int) -> None:
+    """Write ``text`` to ``dest`` via a temp file in the dest dir + os.replace.
+
+    Mirrors the save_state/setup_write_env pattern so a dest is never half-written.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=dest.name + ".", suffix=".tmp", dir=str(dest.parent))
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp_name, dest)
+    os.chmod(dest, mode)
+
+
+def _read_version_from(path: Path) -> str | None:
+    """Parse ``HERDRES_VERSION = "..."`` from a herdres.py source file."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r'^HERDRES_VERSION\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def _resolve_source(args: Any) -> Path:
+    """Resolve the source checkout: --repo > HERDRES_SRC > marker > error."""
+    repo = str(getattr(args, "repo", "") or "").strip()
+    if not repo:
+        repo = (os.environ.get("HERDRES_SRC") or "").strip()
+    if not repo and SOURCE_MARKER.exists():
+        repo = SOURCE_MARKER.read_text(encoding="utf-8").strip()
+    if not repo:
+        raise BridgeError(
+            "herdres update: source checkout not found; pass --repo or set HERDRES_SRC"
+        )
+    path = Path(repo).expanduser()
+    if not (path / "herdres.py").exists():
+        raise BridgeError(f"herdres update: {compact_path(str(path))} is not a herdres checkout")
+    return path
+
+
+def _run_git(repo: Path, *git_args: str) -> subprocess.CompletedProcess:
+    """Run ``git -C <repo> <args>`` capturing output; never raises on nonzero."""
+    return subprocess.run(
+        ["git", "-C", str(repo), *git_args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _git_rev(repo: Path, ref: str = "HEAD") -> str:
+    proc = _run_git(repo, "rev-parse", "--short", ref)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _platform_is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def _systemd_unit_active(unit: str) -> bool:
+    """True if a systemd --user unit is enabled or loaded (so we should restart it)."""
+    proc = subprocess.run(
+        ["systemctl", "--user", "is-enabled", unit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    state = proc.stdout.strip()
+    # enabled / static / linked all mean "the operator wants this unit"; a missing
+    # or disabled unit we leave alone rather than force-enabling it.
+    return state in {"enabled", "static", "linked", "enabled-runtime"}
+
+
+def _launchd_label_loaded(label: str) -> bool:
+    uid = os.getuid()
+    proc = subprocess.run(
+        ["launchctl", "print", f"gui/{uid}/{label}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def _restart_services() -> list[str]:
+    """Reload + restart the timer and re-lease the gateway. Returns actions taken.
+
+    Linux/systemd: daemon-reload; restart herdres.timer; gateway is disabled then
+    re-enabled (disable --now then enable --now) so the single getUpdates lease is
+    released before the new process grabs it. macOS/launchd: bootout then bootstrap
+    the herdres + gateway agents. Only units currently active/loaded are touched.
+    """
+    actions: list[str] = []
+    if _platform_is_macos():
+        uid = os.getuid()
+        for label in LAUNCHD_LABELS:
+            if not _launchd_label_loaded(label):
+                continue
+            plist = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{uid}/{label}"],
+                capture_output=True, text=True, check=False,
+            )
+            subprocess.run(
+                ["launchctl", "bootstrap", f"gui/{uid}", str(plist)],
+                capture_output=True, text=True, check=False,
+            )
+            actions.append(f"launchctl re-bootstrap {label}")
+        return actions
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True, check=False)
+    actions.append("systemctl --user daemon-reload")
+    if _systemd_unit_active("herdres.timer"):
+        subprocess.run(
+            ["systemctl", "--user", "restart", "herdres.timer"],
+            capture_output=True, text=True, check=False,
+        )
+        actions.append("systemctl --user restart herdres.timer")
+    if _systemd_unit_active("herdres-gateway.service"):
+        # disable --now releases the getUpdates lease, enable --now re-acquires it.
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", "herdres-gateway.service"],
+            capture_output=True, text=True, check=False,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", "herdres-gateway.service"],
+            capture_output=True, text=True, check=False,
+        )
+        actions.append("systemctl --user disable->enable herdres-gateway.service")
+    return actions
+
+
+def _backup_install_set() -> Path:
+    """Copy the currently-installed code set into backups/<UTC-ts>/, prune to KEEP_BACKUPS.
+
+    The backup dir mirrors the dest filename per entry plus a manifest mapping each
+    backed-up file back to its install destination (so --rollback can restore it).
+    """
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest_dir = BACKUP_DIR / ts
+    # Avoid clobbering a same-second backup.
+    suffix = 0
+    while dest_dir.exists():
+        suffix += 1
+        dest_dir = BACKUP_DIR / f"{ts}-{suffix}"
+    dest_dir.mkdir(parents=True)
+
+    manifest: dict[str, str] = {}
+    for idx, entry in enumerate(_update_files_plan()):
+        installed = entry["dest"]
+        if not installed.exists():
+            continue
+        # Flat, index-prefixed names keep distinct dirs' same-named files apart.
+        backup_name = f"{idx:02d}_{installed.name}"
+        (dest_dir / backup_name).write_bytes(installed.read_bytes())
+        try:
+            os.chmod(dest_dir / backup_name, installed.stat().st_mode & 0o777)
+        except OSError:
+            pass
+        manifest[backup_name] = str(installed)
+    (dest_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    _prune_backups()
+    return dest_dir
+
+
+def _prune_backups() -> None:
+    if not BACKUP_DIR.exists():
+        return
+    backups = sorted(
+        (p for p in BACKUP_DIR.iterdir() if p.is_dir()),
+        key=lambda p: p.name,
+    )
+    for old in backups[:-KEEP_BACKUPS]:
+        for child in sorted(old.iterdir(), reverse=True):
+            try:
+                child.unlink()
+            except OSError:
+                pass
+        try:
+            old.rmdir()
+        except OSError:
+            pass
+
+
+def _restore_backup(backup_dir: Path) -> None:
+    """Restore every file recorded in a backup dir's manifest to its dest (atomic)."""
+    manifest_path = backup_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise BridgeError(f"herdres update: backup {compact_path(str(backup_dir))} has no manifest")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for backup_name, dest_str in manifest.items():
+        src = backup_dir / backup_name
+        if not src.exists():
+            continue
+        dest = Path(dest_str)
+        mode = src.stat().st_mode & 0o777
+        _atomic_install(dest, src.read_text(encoding="utf-8"), mode)
+
+
+def _latest_backup() -> Path | None:
+    if not BACKUP_DIR.exists():
+        return None
+    backups = sorted(
+        (p for p in BACKUP_DIR.iterdir() if p.is_dir() and (p / "manifest.json").exists()),
+        key=lambda p: p.name,
+    )
+    return backups[-1] if backups else None
+
+
+def _apply_install_set(repo: Path) -> list[str]:
+    """Atomically replace each install-set file from the source checkout.
+
+    Returns the list of dest paths written. Raises (caller rolls back) on failure.
+    """
+    written: list[str] = []
+    for entry in _update_files_plan():
+        src = repo / entry["src"]
+        if not src.exists():
+            raise BridgeError(f"herdres update: source file missing: {entry['src']}")
+        text = src.read_text(encoding="utf-8")
+        transform = entry.get("transform")
+        if transform is not None:
+            text = transform(text)
+        _atomic_install(entry["dest"], text, entry["mode"])
+        written.append(str(entry["dest"]))
+    return written
+
+
+def _verify_install() -> str:
+    """Run the installed `herdres version` + a dry-run sync; return the new version.
+
+    Raises BridgeError if either probe fails (caller rolls back).
+    """
+    binary = _installed_bin()
+    ver = subprocess.run(
+        [str(binary), "version"],
+        capture_output=True, text=True, check=False,
+    )
+    if ver.returncode != 0:
+        raise BridgeError(f"herdres update: verify failed (`herdres version` exit {ver.returncode})")
+    new_version = ""
+    try:
+        new_version = json.loads(ver.stdout or "{}").get("version", "")
+    except (ValueError, AttributeError):
+        pass
+
+    sync_env = dict(os.environ)
+    sync_env["HERDR_TELEGRAM_TOPICS_DRY_RUN"] = "1"
+    syn = subprocess.run(
+        [str(binary), "sync"],
+        capture_output=True, text=True, check=False, env=sync_env,
+    )
+    if syn.returncode != 0:
+        raise BridgeError(f"herdres update: verify failed (`herdres sync` exit {syn.returncode})")
+    return new_version
+
+
+def update_once(args: Any) -> dict[str, Any]:
+    """Self-update entry point. Returns the standard ``{"ok": ...}`` dict."""
+    channel = str(getattr(args, "channel", "edge") or "edge").strip()
+    if channel == "stable":
+        raise BridgeError("stable channel needs releases (#13 Phase 3)")
+    if channel != "edge":
+        raise BridgeError(f"herdres update: unknown channel {channel!r} (use edge)")
+
+    # --rollback short-circuits: restore the latest backup and restart, no git.
+    if getattr(args, "rollback", False):
+        backup = _latest_backup()
+        if backup is None:
+            raise BridgeError("herdres update: no backup to roll back to")
+        _restore_backup(backup)
+        actions = _restart_services()
+        return {
+            "ok": True,
+            "action": "rollback",
+            "restored_from": str(backup),
+            "services": actions,
+        }
+
+    repo = _resolve_source(args)
+    current = HERDRES_VERSION
+    available = _read_version_from(repo / "herdres.py") or current
+
+    # --check: fetch + compare versions, apply nothing.
+    if getattr(args, "check", False):
+        fetch = _run_git(repo, "fetch")
+        # Re-read after fetch in case the working tree is the fetched ref; for a
+        # plain checkout the working file version is the comparison anchor.
+        available = _read_version_from(repo / "herdres.py") or available
+        local_rev = _git_rev(repo, "HEAD")
+        remote_rev = _git_rev(repo, "@{u}") or _git_rev(repo, "origin/HEAD")
+        return {
+            "ok": True,
+            "action": "check",
+            "channel": channel,
+            "source": str(repo),
+            "current_version": current,
+            "available_version": available,
+            "local_rev": local_rev,
+            "remote_rev": remote_rev,
+            "update_available": bool(remote_rev and local_rev and remote_rev != local_rev),
+            "fetch_ok": fetch.returncode == 0,
+        }
+
+    # --dry-run: describe the plan, change nothing.
+    if getattr(args, "dry_run", False):
+        files = [str(entry["dest"]) for entry in _update_files_plan()]
+        service_actions = (
+            ["launchctl bootout+bootstrap herdres + gateway agents"]
+            if _platform_is_macos()
+            else [
+                "systemctl --user daemon-reload",
+                "systemctl --user restart herdres.timer",
+                "systemctl --user disable --now then enable --now herdres-gateway.service",
+            ]
+        )
+        return {
+            "ok": True,
+            "action": "dry-run",
+            "channel": channel,
+            "source": str(repo),
+            "current_version": current,
+            "target_version": available,
+            "files": files,
+            "services": service_actions,
+        }
+
+    # --- edge apply ---
+    pull = _run_git(repo, "pull", "--ff-only")
+    if pull.returncode != 0:
+        detail = (pull.stderr or pull.stdout or "").strip()
+        raise BridgeError(
+            "herdres update: `git pull --ff-only` failed (dirty or diverged checkout?): "
+            + sanitize_text(detail, 400)
+        )
+    # Re-read the target version after the fast-forward.
+    available = _read_version_from(repo / "herdres.py") or available
+
+    backup = _backup_install_set()
+    try:
+        written = _apply_install_set(repo)
+        service_actions = _restart_services()
+        new_version = _verify_install()
+    except Exception as exc:
+        # Rollback on ANY failure in replace/restart/verify.
+        try:
+            _restore_backup(backup)
+            _restart_services()
+        except Exception as restore_exc:  # pragma: no cover - best-effort restore
+            raise BridgeError(
+                f"herdres update FAILED and rollback also failed: {exc}; rollback: {restore_exc}"
+            ) from exc
+        raise BridgeError(f"herdres update failed (rolled back): {exc}") from exc
+
+    return {
+        "ok": True,
+        "action": "update",
+        "channel": channel,
+        "source": str(repo),
+        "previous_version": current,
+        "version": new_version or available,
+        "backup": str(backup),
+        "files": written,
+        "services": service_actions,
+        "head": _git_rev(repo, "HEAD"),
+    }
+
+
+def version_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
+    return {"ok": True, "version": HERDRES_VERSION}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -12470,6 +12921,13 @@ def main() -> int:
     setup.add_argument("--chat-id", default="")
     setup.add_argument("--allowed-users", default="")
     setup.add_argument("--reuse-hermes-token", action="store_true")
+    sub.add_parser("version")
+    update = sub.add_parser("update")
+    update.add_argument("--channel", default="edge")
+    update.add_argument("--repo", default="")
+    update.add_argument("--check", action="store_true")
+    update.add_argument("--rollback", action="store_true")
+    update.add_argument("--dry-run", dest="dry_run", action="store_true")
     args = parser.parse_args()
     try:
         if args.cmd == "sync":
@@ -12493,6 +12951,10 @@ def main() -> int:
             result = with_lock(lambda: managed_bot_update(payload), blocking=True)
         elif args.cmd == "setup":
             result = setup_once(args)
+        elif args.cmd == "version":
+            result = version_once(args)
+        elif args.cmd == "update":
+            result = update_once(args)
         else:
             result = with_lock(lambda: probe_rich(args.thread_id), blocking=True)
         print(json.dumps(result, sort_keys=True))
