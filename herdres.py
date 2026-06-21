@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 DEFAULT_STATE = Path.home() / ".local/share/herdres/state.json"
@@ -794,36 +794,10 @@ def pane_agent_status_label(pane: dict[str, Any]) -> str:
     return agent or pane_thread_name(pane)
 
 
-def pane_pinned_status_emoji(pane: dict[str, Any]) -> str:
-    status = str(pane.get("agent_status") or "").strip().lower().replace("-", "_")
-    if status in {"blocked", "waiting", "error", "failed", "failure"}:
-        return "🔴"
-    if status in ACTIVE_AGENT_STATUSES or status in {"working", "busy", "workflow"}:
-        return "🟡"
-    if status in {"idle", "done", "complete", "completed", "success", "succeeded"}:
-        return "🟢"
-    return "⚪"
-
-
-PINNED_STATUS_SORT_ORDER = {"🔴": 0, "🟡": 1, "🟢": 2, "⚪": 3}
-
-
-def pane_pinned_status_sort_key(pane: dict[str, Any]) -> int:
-    return PINNED_STATUS_SORT_ORDER.get(pane_pinned_status_emoji(pane), 3)
-
-
-def space_pinned_status_text(panes: list[dict[str, Any]]) -> str:
-    open_panes = [
-        pane
-        for pane in panes
-        if str(pane.get("agent_status") or "").strip().lower() != "closed"
-    ]
-    parts: list[str] = []
-    for pane in sorted(open_panes, key=pane_pinned_status_sort_key):
-        parts.append(f"{pane_agent_status_label(pane)} {pane_pinned_status_emoji(pane)}")
-    if not parts:
-        return "No active panes."
-    return sanitize_text(" | ".join(parts), MAX_REPLY_CHARS)
+# NOTE: the per-space pin and the global dashboard now share render_pinned_status()
+# (defined later, with the canonical severity dot/sort). The old divergent helpers
+# pane_pinned_status_emoji / PINNED_STATUS_SORT_ORDER / pane_pinned_status_sort_key /
+# space_pinned_status_text were removed in favor of that single renderer.
 
 
 def open_panes_by_space(panes: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -5437,6 +5411,19 @@ def clear_space_topic_mapping(state: dict[str, Any], space_entry: dict[str, Any]
         "topic_rename_pending_at",
         "topic_rename_from",
         "topic_rename_to",
+        # Aggregate topic-icon state lives on the space record now; drop it so a
+        # remap to a new topic id re-applies the icon instead of dedup-skipping it.
+        "topic_status_icon_key",
+        "topic_status_icon_emoji",
+        "topic_status_icon_custom_emoji_id",
+        "topic_status_icon_updated_at",
+        "last_topic_status_icon_attempt_key",
+        "last_topic_status_icon_attempt_at",
+        "last_topic_status_icon_missing",
+        "last_topic_status_icon_missing_emoji",
+        "last_topic_status_icon_missing_at",
+        "last_topic_status_icon_error",
+        "last_topic_status_icon_error_at",
     ):
         space_entry.pop(key, None)
     space_entry["topic_missing_at"] = utc_now()
@@ -5496,8 +5483,10 @@ _GROUPING_RESET_ENTRY_FIELDS = (
     "pane_root_message_missing_at",
     "pane_root_message_missing_id",
     "pane_root_message_missing_reason",
-    # Status-icon cache: if left set, ensure_topic_status_icon() short-circuits
-    # as "unchanged" and the freshly created topic never gets its icon.
+    # Legacy per-pane status-icon cache. The aggregate topic icon now lives on the
+    # SPACE record (update_topic_status_icon dedups against it; clear_space_topic_mapping
+    # clears it on remap), so these per-entry pops are harmless no-ops kept for cleanup of
+    # any pre-migration state.
     "topic_status_icon_key",
     "topic_status_icon_emoji",
     "topic_status_icon_custom_emoji_id",
@@ -6134,16 +6123,47 @@ def pane_goal_active(pane: dict[str, Any]) -> bool:
 
 
 def status_icon_key(pane: dict[str, Any]) -> str:
-    status = str(pane.get("agent_status") or "unknown").lower()
-    if status == "working" and workflow_summary(pane):
-        return "workflow"
-    # An idle pane that's still pursuing a goal should read as "on a goal" (🧠),
-    # not a coffee break (☕️).
-    if status == "idle" and pane_goal_active(pane):
-        return "goal"
-    if status in {"working", "idle", "done", "blocked", "error"}:
-        return status
+    """Canonical pane-status classifier (alias-folding). The single source of the
+    status key consumed by the topic-aggregate icon AND the pinned-status dot/sort."""
+    status = str(pane.get("agent_status") or "unknown").lower().replace("-", "_")
+    if pane.get("closed") or pane.get("exited") or pane.get("process_exited") or status in {"closed", "exited"}:
+        return "closed"
+    if status in {"error", "failed", "failure"}:
+        return "error"
+    if status in {"blocked", "waiting"}:
+        return "blocked"
+    if status in {"working", "busy"} or status in ACTIVE_AGENT_STATUSES:
+        # A tracked multi-step run reads as "workflow" (📈); ad-hoc work as ⚡️.
+        return "workflow" if workflow_summary(pane) else "working"
+    if status == "idle":
+        # An idle pane still pursuing a goal reads as "on a goal" (🧠), not a break.
+        return "goal" if pane_goal_active(pane) else "idle"
+    if status in {"done", "complete", "completed", "success", "succeeded"}:
+        return "done"
     return "unknown"
+
+
+# Canonical status severity (higher = worse / needs more attention). ONE ordering
+# shared by the topic-aggregate icon, the pinned-status dot, and the pin sort — so the
+# icon a topic shows, the dot a pane gets, and the order they sort can never disagree.
+STATUS_SEVERITY = {
+    "error": 8, "blocked": 7, "workflow": 6, "working": 5,
+    "goal": 4, "idle": 3, "done": 2, "unknown": 1, "closed": 0,
+}
+
+
+def status_severity(key: str) -> int:
+    return STATUS_SEVERITY.get(str(key or "unknown"), STATUS_SEVERITY["unknown"])
+
+
+def topic_status_key(open_panes: list[dict[str, Any]]) -> str:
+    """Aggregate status key for a (possibly shared) topic: the worst-severity status
+    among its open panes — so panes in one topic no longer fight over the icon. Returns
+    "closed" when the topic has no open panes."""
+    keys = [status_icon_key(p) for p in open_panes if pinned_status_pane_open(p)]
+    if not keys:
+        return "closed"
+    return max(keys, key=status_severity)
 
 
 def status_icon_emoji(key: str) -> str:
@@ -6168,9 +6188,11 @@ def pinned_status_enabled() -> bool:
 
 
 def pinned_status_dot(pane: dict[str, Any]) -> str:
-    if pane_goal_active(pane):
-        return "🧠"
-    return PINNED_STATUS_DOTS.get(status_icon_key(pane), "🟡")
+    # Derive PURELY from the canonical classifier so the dot, the topic icon, and the
+    # sort all agree. status_icon_key already maps an idle pane pursuing a goal to
+    # "goal" (🧠); a WORKING pane stays "working" (🟡) even if a goal is active — the
+    # old goal-first check wrongly showed 🧠 for working panes and re-read the pane.
+    return PINNED_STATUS_DOTS.get(status_icon_key(pane), "⬜")
 
 
 def pinned_status_pane_open(pane: dict[str, Any]) -> bool:
@@ -6194,15 +6216,33 @@ def pinned_status_pane_label(state: dict[str, Any], pane: dict[str, Any]) -> str
     return sanitize_text(label or "pane", 80)
 
 
-def render_pinned_status_overview(state: dict[str, Any], panes: list[dict[str, Any]]) -> str:
-    parts: list[str] = []
+def render_pinned_status(
+    state: dict[str, Any],
+    panes: list[dict[str, Any]],
+    *,
+    label_fn: Callable[[dict[str, Any]], str] | None = None,
+) -> str:
+    """Unified pinned-status renderer for BOTH surfaces. One row per open pane:
+    "<label> <dot>", sorted worst-severity first then label. Dot and sort both derive
+    from the canonical status severity, so a pane's dot, its topic icon (A), and its
+    sort order can never disagree. No elapsed time — the pin is a glance board, and
+    including it would force an edit every tick.
+
+    The DOT/sort/structure are unified; only the label differs by surface: the per-space
+    topic pin uses the agent label (default) so panes sharing one topic stay
+    distinguishable, while the global dashboard passes the topic label."""
+    if label_fn is None:
+        label_fn = pane_agent_status_label
+    rows: list[tuple[int, str, str]] = []
     for pane in panes:
         if not pinned_status_pane_open(pane):
             continue
-        parts.append(f"{pinned_status_pane_label(state, pane)} {pinned_status_dot(pane)}")
-    if not parts:
+        label = label_fn(pane)
+        rows.append((status_severity(status_icon_key(pane)), label, f"{label} {pinned_status_dot(pane)}"))
+    if not rows:
         return "No active panes."
-    return sanitize_text(" | ".join(parts), MAX_REPLY_CHARS)
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    return sanitize_text(" | ".join(r[2] for r in rows), MAX_REPLY_CHARS)
 
 
 def status_icon_explicit_id(key: str) -> str:
@@ -6272,13 +6312,16 @@ def status_icon_id_for_keys(telegram: dict[str, Any], keys: list[str]) -> tuple[
     return "", primary, status_icon_emoji(primary)
 
 
-def status_icon_custom_emoji_id(telegram: dict[str, Any], pane: dict[str, Any]) -> tuple[str, str, str]:
-    key = status_icon_key(pane)
+def status_icon_id_for_status_key(telegram: dict[str, Any], key: str) -> tuple[str, str, str]:
     keys = [key]
     if key == "workflow":
         keys.append("working")
     keys.append("unknown")
     return status_icon_id_for_keys(telegram, keys)
+
+
+def status_icon_custom_emoji_id(telegram: dict[str, Any], pane: dict[str, Any]) -> tuple[str, str, str]:
+    return status_icon_id_for_status_key(telegram, status_icon_key(pane))
 
 
 def edit_topic_icon(
@@ -6323,53 +6366,75 @@ def edit_topic_icon_async(
 
 def update_topic_status_icon(
     chat_id: str,
-    entry: dict[str, Any],
-    pane: dict[str, Any],
+    space_record: dict[str, Any],
+    open_panes: list[dict[str, Any]],
     *,
     telegram: dict[str, Any],
 ) -> dict[str, Any]:
+    """Set a topic's forum icon from the AGGREGATE status of all open panes sharing
+    that topic (worst-severity wins), tracked on the shared space record — so panes in
+    one topic no longer fight over the icon. Escalations apply immediately; a
+    de-escalation (toward a less-severe status) is coalesced for
+    STATUS_ICON_RETRY_SECONDS to absorb the working→idle→working flicker herdr reports
+    during brief output pauses."""
     if not STATUS_ICON_ENABLED:
         return {"ok": False, "attempted": False, "kind": "disabled"}
-    topic_id = str(entry.get("topic_id") or "")
+    topic_id = str(space_record.get("topic_id") or "")
     if not topic_id:
         return {"ok": False, "attempted": False, "kind": "missing_topic"}
-    icon_id, icon_key, emoji = status_icon_custom_emoji_id(telegram, pane)
+    icon_key = topic_status_key(open_panes)
+    if icon_key == "closed":
+        # No open panes — leave the icon alone (topic-close cleanup owns closed topics).
+        return {"ok": True, "attempted": False, "kind": "no_open_panes"}
+    icon_id, icon_key, emoji = status_icon_id_for_status_key(telegram, icon_key)
     if not icon_id:
-        entry["last_topic_status_icon_missing"] = icon_key
-        entry["last_topic_status_icon_missing_emoji"] = emoji
-        entry["last_topic_status_icon_missing_at"] = utc_now()
+        space_record["last_topic_status_icon_missing"] = icon_key
+        space_record["last_topic_status_icon_missing_emoji"] = emoji
+        space_record["last_topic_status_icon_missing_at"] = utc_now()
         return {"ok": False, "attempted": False, "kind": "no_icon", "icon_key": icon_key, "emoji": emoji}
-    if str(entry.get("topic_status_icon_custom_emoji_id") or "") == icon_id:
+    if str(space_record.get("topic_status_icon_custom_emoji_id") or "") == icon_id:
         return {"ok": True, "attempted": False, "kind": "unchanged", "icon_key": icon_key, "emoji": emoji}
-    # Directional cooldown: when an agent briefly pauses to output text during
-    # a working session, herdr reports "idle" for those pauses.  That causes
-    # the icon to flip working→idle→working every sync cycle.  Suppress only
-    # that working→idle transition for STATUS_ICON_RETRY_SECONDS after the
-    # last icon change.  All other transitions (idle→working, working→done,
-    # done→idle, any→blocked) are allowed immediately.
-    current_key = str(entry.get("topic_status_icon_key") or "")
-    last_attempt = str(entry.get("last_topic_status_icon_attempt_at") or "")
-    if (
-        current_key in {"working", "workflow"}
-        and icon_key in {"idle", "goal"}
-        and last_attempt
-        and cache_fresh(last_attempt, STATUS_ICON_RETRY_SECONDS)
-    ):
+    current_key = str(space_record.get("topic_status_icon_key") or "")
+    last_attempt = str(space_record.get("last_topic_status_icon_attempt_at") or "")
+    is_deescalation = bool(current_key) and status_severity(icon_key) < status_severity(current_key)
+    if is_deescalation and last_attempt and cache_fresh(last_attempt, STATUS_ICON_RETRY_SECONDS):
         return {"ok": False, "attempted": False, "kind": "retry_deferred", "icon_key": icon_key, "emoji": emoji}
-    entry["last_topic_status_icon_attempt_key"] = f"{icon_id}:{icon_key}"
-    entry["last_topic_status_icon_attempt_at"] = utc_now()
+    space_record["last_topic_status_icon_attempt_key"] = f"{icon_id}:{icon_key}"
+    space_record["last_topic_status_icon_attempt_at"] = utc_now()
     # Fire-and-forget: update state optimistically, let the next sync retry on failure.
-    edit_topic_icon_async(chat_id, topic_id, icon_id, name=str(entry.get("topic_name") or ""))
-    entry["topic_status_icon_key"] = icon_key
-    entry["topic_status_icon_emoji"] = emoji
-    entry["topic_status_icon_custom_emoji_id"] = icon_id
-    entry["topic_status_icon_updated_at"] = utc_now()
-    entry.pop("last_topic_status_icon_error", None)
-    entry.pop("last_topic_status_icon_error_at", None)
-    entry.pop("last_topic_status_icon_missing", None)
-    entry.pop("last_topic_status_icon_missing_emoji", None)
-    entry.pop("last_topic_status_icon_missing_at", None)
+    edit_topic_icon_async(chat_id, topic_id, icon_id, name=str(space_record.get("topic_name") or ""))
+    space_record["topic_status_icon_key"] = icon_key
+    space_record["topic_status_icon_emoji"] = emoji
+    space_record["topic_status_icon_custom_emoji_id"] = icon_id
+    space_record["topic_status_icon_updated_at"] = utc_now()
+    for stale in (
+        "last_topic_status_icon_error", "last_topic_status_icon_error_at",
+        "last_topic_status_icon_missing", "last_topic_status_icon_missing_emoji",
+        "last_topic_status_icon_missing_at",
+    ):
+        space_record.pop(stale, None)
     return {"ok": True, "attempted": True, "kind": "updated", "icon_key": icon_key, "emoji": emoji}
+
+
+def update_topic_icons_for_spaces(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    panes: list[dict[str, Any]],
+    counters: dict[str, Any],
+) -> None:
+    """Per-topic icon pass: one aggregate icon update per space/topic (replaces the old
+    per-pane updates that let same-topic panes fight). Call after the pane sync loop."""
+    if not STATUS_ICON_ENABLED:
+        return
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    for space_key_value, space_panes in open_panes_by_space(panes).items():
+        space_record = spaces.get(str(space_key_value))
+        if not isinstance(space_record, dict) or not space_record.get("topic_id"):
+            continue
+        result = update_topic_status_icon(chat_id, space_record, space_panes, telegram=telegram)
+        if result.get("attempted"):
+            counters["icon_updates"] = counters.get("icon_updates", 0) + 1
 
 
 def pane_input_needs_file(text: str) -> bool:
@@ -8025,7 +8090,8 @@ def sync_pinned_status_overview(
         return {"ok": True, "changed": False, "skipped": "disabled"}
     if panes is None:
         panes = pane_list()
-    text = render_pinned_status_overview(state, panes)
+    # Global dashboard: label rows by topic (distinguishes panes across spaces).
+    text = render_pinned_status(state, panes, label_fn=lambda p: pinned_status_pane_label(state, p))
     telegram = state.setdefault("telegram", {})
     if not isinstance(telegram, dict):
         return {"ok": False, "changed": False, "error": "telegram state is not a dict"}
@@ -8849,6 +8915,7 @@ def clear_space_pinned_status_message(space_entry: dict[str, Any], reason: str =
 
 
 def ensure_space_pinned_status(
+    state: dict[str, Any],
     chat_id: str,
     space_entry: dict[str, Any],
     panes: list[dict[str, Any]],
@@ -8858,7 +8925,7 @@ def ensure_space_pinned_status(
     topic_id = str(space_entry.get("topic_id") or "")
     if not PINNED_STATUS_ENABLED or not topic_id:
         return {"changed": False, "updated": False, "skipped": True}
-    text = space_pinned_status_text(panes)
+    text = render_pinned_status(state, panes)
     if not text:
         return {"changed": False, "updated": False, "skipped": True}
     text_hash = space_pinned_status_hash(text)
@@ -8940,7 +9007,7 @@ def sync_space_pinned_statuses(
         space_panes = grouped.get(str(space_key_value), [])
         if not space_panes and not space_entry.get("pinned_status_message_id"):
             continue
-        result = ensure_space_pinned_status(chat_id, space_entry, space_panes, counters, max_sends)
+        result = ensure_space_pinned_status(state, chat_id, space_entry, space_panes, counters, max_sends)
         if result.get("topic_missing"):
             clear_space_topic_mapping(state, space_entry, str(result.get("error") or result))
             changed = True
@@ -10389,21 +10456,17 @@ def sync_pane_once(
             )
         changed = True
 
+    # The topic status icon is now set once per topic (aggregate of ALL open panes) in
+    # update_topic_icons_for_spaces after the pane loop — not per pane — so same-topic
+    # panes no longer fight over it. Here we only read whether the topic already has an
+    # icon, to drive the status-marker suppression below.
     status_icon_ok = False
     if STATUS_ICON_ENABLED and entry.get("topic_id"):
-        icon_result = update_topic_status_icon(chat_id, entry, pane, telegram=telegram)
-        if icon_result.get("attempted"):
-            counters["icon_updates"] = counters.get("icon_updates", 0) + 1
-        if result_topic_missing(icon_result):
-            clear_entry_topic_mapping(state, entry, str(icon_result.get("error") or icon_result))
-            save_state(state)
-            return True
-        if icon_result.get("ok"):
-            status_icon_ok = True
-            if icon_result.get("attempted"):
-                changed = True
-            if STATUS_MARKER_SUPPRESS_WHEN_ICON_OK and clear_status_marker_for_icon(chat_id, entry, api_token=pane_api_token):
-                changed = True
+        _space_rec = (state.get("spaces") or {}).get(str(entry.get("space_key") or ""))
+        status_icon_ok = bool(isinstance(_space_rec, dict) and _space_rec.get("topic_status_icon_custom_emoji_id"))
+        # When the topic icon already conveys status, retire any leftover text marker.
+        if status_icon_ok and STATUS_MARKER_SUPPRESS_WHEN_ICON_OK and clear_status_marker_for_icon(chat_id, entry, api_token=pane_api_token):
+            changed = True
 
     if (
         STATUS_MARKER_ENABLED
@@ -10518,6 +10581,9 @@ def sync_once() -> dict[str, Any]:
             telegram["last_preflight_error"] = error_text
             save_state(state)
             raise
+    # Reconcile pinned status BEFORE the (possibly slow) per-pane turn loop so a
+    # working/blocked status surfaces promptly, then again AFTER for the authoritative
+    # post-sync view. (Status events also reconcile in event_once for immediacy.)
     pinned_result = reconcile_pinned_status_views(state, chat_id, panes, counters, caps["max_sends"])
     changed, pinned_status_updated = add_pinned_reconcile_result(changed, pinned_status_updated, pinned_result)
     if ensure_managed_bot_setup_message(state, chat_id, telegram, counters, caps["max_sends"], panes):
@@ -10528,6 +10594,12 @@ def sync_once() -> dict[str, Any]:
         changed = True
     if TURN_FEED_ENABLED:
         prefetch_pane_turns([str(p.get("pane_id") or "") for p in panes if p.get("pane_id")])
+    # One aggregate topic-icon update per topic (worst-severity of its open panes),
+    # BEFORE the per-pane loop so the per-pane status-marker suppression sees this sync's
+    # icon for already-mapped topics. (A brand-new topic is created inside the loop, so
+    # its icon lands this sync but one cycle after its first marker — self-corrects next
+    # sync.) Agent statuses don't change during the loop, so pre-loop is accurate.
+    update_topic_icons_for_spaces(state, chat_id, telegram, panes, counters)
     for pane in panes:
         if sync_pane_once(state, chat_id, telegram, pane, counters, caps):
             changed = True
@@ -10792,6 +10864,15 @@ def event_once() -> dict[str, Any]:
         save_state(state)
         return {"ok": True, "changed": False, "pane_id": pane_id, "message": "event sync failed"}
 
+    # Reflect this status event in the topic icon + pinned status NOW, instead of
+    # waiting for the next timer sync — so a working/blocked/idle transition shows
+    # promptly (Codex cadence fix). One pane-list read drives both aggregate passes.
+    try:
+        event_panes = observed_agent_panes()
+        update_topic_icons_for_spaces(state, chat_id, telegram, event_panes, counters)
+        reconcile_pinned_status_views(state, chat_id, event_panes, counters, caps["max_sends"])
+    except Exception:
+        pass
     record_plugin_event_seen(state, pane_id)
     save_state(state)
     return {

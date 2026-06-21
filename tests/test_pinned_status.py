@@ -19,8 +19,12 @@ class PinnedStatusTests(unittest.TestCase):
         self.assertEqual(herdres.pinned_status_dot(pane("Blocked", "blocked")), "🔴")
         self.assertEqual(herdres.pinned_status_dot(pane("Error", "error")), "🔴")
 
-    def test_goal_overrides_dot(self):
-        self.assertEqual(herdres.pinned_status_dot(pane("Blocked", "blocked", _goal_active=True)), "🧠")
+    def test_goal_dot_only_when_idle(self):
+        # The 🧠 goal dot shows only for an IDLE pane pursuing a goal — a more urgent
+        # status (blocked/working) must NOT be masked by the goal marker (council finding 3).
+        self.assertEqual(herdres.pinned_status_dot(pane("Idle", "idle", _goal_active=True)), "🧠")
+        self.assertEqual(herdres.pinned_status_dot(pane("Blocked", "blocked", _goal_active=True)), "🔴")
+        self.assertEqual(herdres.pinned_status_dot(pane("Working", "working", _goal_active=True)), "🟡")
 
     def test_render_overview_text(self):
         panes = [
@@ -29,9 +33,10 @@ class PinnedStatusTests(unittest.TestCase):
             pane("herdres", "error"),
             pane("Closed", "closed"),
         ]
+        state = {"panes": {}}
         self.assertEqual(
-            herdres.render_pinned_status_overview({"panes": {}}, panes),
-            "Codex 🟢 | Claude 🟡 | herdres 🔴",
+            herdres.render_pinned_status(state, panes, label_fn=lambda p: herdres.pinned_status_pane_label(state, p)),
+            "herdres 🔴 | Claude 🟡 | Codex 🟢",
         )
 
     def test_second_sync_no_resend(self):

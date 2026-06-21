@@ -1314,7 +1314,8 @@ class SharedTopicCommandTests(unittest.TestCase):
         )
 
     def test_pinned_status_uses_devin_model_label(self) -> None:
-        text = herdres.space_pinned_status_text(
+        text = herdres.render_pinned_status(
+            {},
             [
                 {"agent": "devin", "agent_status": "idle", "label": "GLM Devin"},
                 {"agent": "codex", "agent_status": "working", "label": "Codex"},
@@ -3922,7 +3923,7 @@ Verification
             {"agent": "omp", "agent_status": "closed"},
         ]
 
-        self.assertEqual(herdres.space_pinned_status_text(panes), "Kimi 🔴 | Claude 🟡 | Codex 🟢")
+        self.assertEqual(herdres.render_pinned_status({}, panes), "Kimi 🔴 | Claude 🟡 | Codex 🟢")
 
     def test_sync_creates_and_pins_space_status_for_open_panes_only(self) -> None:
         pane_a = {
@@ -4383,9 +4384,11 @@ Verification
             "agent_status": "working",
         }
         key = herdres.pane_key(pane)
+        skey = herdres.space_key(pane)
         entry = {
             "pane_key": key,
             "pane_id": "pane-1",
+            "space_key": skey,
             "topic_id": "77",
             "status_marker_message_id": "10",
             "status_marker_hash": "old",
@@ -4396,6 +4399,7 @@ Verification
             "enabled": True,
             "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
             "panes": {key: entry},
+            "spaces": {skey: {"space_key": skey, "topic_id": "77", "topic_name": "Workspace 1", "pane_keys": [key]}},
         }
         calls = []
 
@@ -4432,12 +4436,15 @@ Verification
         self.assertTrue(result["changed"])
         self.assertEqual(result["icon_updated"], 1)
         self.assertEqual(result["marker_sent"], 0)
-        self.assertEqual(entry["topic_status_icon_custom_emoji_id"], "icon-working")
-        self.assertEqual(entry["topic_status_icon_key"], "working")
-        self.assertNotIn("status_marker_message_id", entry)
-        self.assertEqual(calls[-1][0], "editForumTopic")
-        self.assertEqual(calls[-1][1]["icon_custom_emoji_id"], "icon-working")
-        self.assertEqual(calls[-1][1]["name"], "Workspace 1")
+        space = state["spaces"][skey]
+        self.assertEqual(space["topic_status_icon_custom_emoji_id"], "icon-working")
+        self.assertEqual(space["topic_status_icon_key"], "working")
+        for t in herdres._icon_fire_threads:
+            t.join(timeout=2)
+        icon_edits = [p for m, p in calls if m == "editForumTopic" and p.get("icon_custom_emoji_id")]
+        self.assertTrue(icon_edits, "icon editForumTopic was not called")
+        self.assertEqual(icon_edits[-1]["icon_custom_emoji_id"], "icon-working")
+        self.assertEqual(icon_edits[-1]["name"], "Workspace 1")
         send_notice.assert_not_called()
         delete_message.assert_called_once_with("-1001", "10")
 
