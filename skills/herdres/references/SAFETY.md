@@ -51,9 +51,14 @@ token, make it an explicit, informed choice and ensure only one consumer polls i
 Running non-interactively with a required secret missing? You **MUST** stop and
 report what's needed — **do not guess.**
 
-> A `SKILL.md` instruction can only *bias* a probabilistic agent; it cannot
-> *guarantee* this. The enforcing fix is an interactive **setup wizard** — the
-> binary, not the agent, does the asking (tracked in #7).
+**The enforcing mechanism is `herdres setup`.** A `SKILL.md` instruction can only
+*bias* a probabilistic agent; it cannot *guarantee* the rule above. `herdres
+setup` makes the **binary** do the asking: it prompts for each secret (token with
+no echo), validates it, runs preflight, and only then writes `herdres.env` at
+mode `0600`. It **refuses** to run unattended unless `--bot-token`/`--chat-id`/
+`--allowed-users` are passed, and it **never** adopts the Hermes
+`TELEGRAM_BOT_TOKEN` silently — that requires `--reuse-hermes-token` or an
+interactive, typed `reuse` confirmation. Prefer it over hand-editing the env.
 
 ---
 

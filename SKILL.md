@@ -37,7 +37,7 @@ the headline path. do not skip preflight, do not write Telegram state until veri
 3. **run the installer** from the repo checkout: Linux `./install-user.sh`; macOS `./install-macos.sh`. This installs the `herdres` CLI, the gateway, the env file (copied from `.env.example`, never clobbering an existing one), the Herdr plugin manifest, and the service units / launchd agents.
    - the CLI lands at `~/.local/bin/herdres` and the installer does **not** edit `PATH`. if `herdres` is "command not found" next, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile and re-open the shell, or call it as `~/.local/bin/herdres`. the service and plugin use absolute paths, so this only affects you typing `herdres`.
 
-4. **write the three required env vars** in `~/.config/herdres/herdres.env`:
+4. **write the three required env vars** in `~/.config/herdres/herdres.env`. **Fastest and safest: run `herdres setup`** — it prompts for the token (no echo), chat ID, and allowed users, validates each, runs preflight, and only then writes the file at mode `0600`. It **refuses** to run unattended without `--bot-token/--chat-id/--allowed-users`, and it **never** silently reuses the Hermes token (it demands `--reuse-hermes-token` or a typed `reuse` confirmation). If you write the file by hand instead:
    ```bash
    TELEGRAM_BOT_TOKEN=123456:ABC-yourBotToken
    HERDR_TELEGRAM_TOPICS_CHAT_ID=-1001234567890
