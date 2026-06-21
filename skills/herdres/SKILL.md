@@ -62,7 +62,7 @@ Full install depth — service files, the standalone gateway, the turn-adapter f
 
 - **confirm config + service.** `~/.config/herdres/herdres.env` exists with the three required vars, and the timer/launchd agent is enabled (it is the slow repair path; keep it on even with plugin events). if anything is missing, go to **Quick install**.
 - **identify the topic mode.** read `HERDR_TELEGRAM_TOPICS_PER_AGENT`: `1` = **one topic per pane** (recommended; unambiguous), `0` = **one topic per space** (multiple panes can share a thread). the flag is read at runtime by every entry point, so set it in `herdres.env` — the one file all contexts load. switching modes is a clean-slate reset of topic mappings. details in [references/TOPICS.md](references/TOPICS.md).
-- **reply inside the pane thread.** to control a pane, reply **inside its topic** — text routes to that exact pane with no `/send` prefix. in per-space mode a top-level message only routes when the topic has **exactly one** live pane; otherwise herdres **fails closed** (`Reply inside a pane thread so I know which Herdr pane to control.`). never assume a top-level message in a multi-pane topic reached a pane.
+- **reply inside the pane thread.** to control a pane, reply **inside its topic** — text routes to that exact pane with no `/send` prefix. in per-space mode a top-level message only routes when the topic has **exactly one** live pane (or you picked one with `/agents`); otherwise herdres **fails closed** (`Reply inside a pane thread so I know which Herdr pane to control.`). never assume a top-level message in a multi-pane topic reached a pane.
 
 ## Core operations
 
@@ -75,6 +75,8 @@ these are the highest-frequency commands, typed **inside a pane's forum topic**.
 - `/raw [lines]` — sanitized raw visible pane output (default 80, max 160) when the clean report is not enough.
 - `/choices` — resend the active decision prompt and its inline buttons.
 - `/new <codex|claude|kimi|omp|devin>` — split a new pane in this space and launch that agent.
+- `/agents` — in a per-space topic, pick which agent your messages address (sets a ~10-min active pane); replies `Only one agent here` in per-agent mode.
+- `/voice shared|per_agent` — switch this space's Telegram voice (single shared bot vs per-agent bots); per-space and reversible.
 - `/debug` — show the topic↔pane mapping (pane id, topic, route) for troubleshooting.
 - any **other** `/command` (e.g. `/goal`, `/clear`, `/model`) is forwarded to the agent CLI as-is. Long/multiline input is staged to an owner-only inbound file so the full text reaches the pane.
 
@@ -82,11 +84,11 @@ Full table, idle-vs-busy semantics, plain-text routing, and the inbound-file rul
 
 ## Topics, turn feed, managed bots, cockpit
 
-**Topics.** Topic granularity is one env var. Per-agent (`=1`) gives each pane its own clean thread, status icon, and unambiguous reply target; per-space (`=0`) collapses a workspace into one thread and forces the multi-pane fail-closed rule. Topic status shows as a per-topic icon (⚡️ working, ☕️ idle, ✅ done, ❗️ blocked, ‼️ error, 🧠 idle-but-still-on-a-`/goal`). Backfill many topics in one shot with `HERDR_TELEGRAM_TOPICS_MAX_CREATES=20 herdres sync`. See [references/TOPICS.md](references/TOPICS.md).
+**Topics.** Topic granularity is one env var. Per-agent (`=1`) gives each pane its own clean thread, status icon, and unambiguous reply target; per-space (`=0`) collapses a workspace into one thread (multiple agents share it, `/agents` picks which to address) and forces the multi-pane fail-closed rule. Topic status shows as a per-topic icon (⚡️ working, ☕️ idle, ✅ done, ❗️ blocked, ‼️ error, 🧠 idle-but-still-on-a-`/goal`). Backfill many topics in one shot with `HERDR_TELEGRAM_TOPICS_MAX_CREATES=20 herdres sync`. See [references/TOPICS.md](references/TOPICS.md).
 
 **Turn feed.** `HERDR_TELEGRAM_TOPICS_TURN_FEED=1` (default) renders only Herdr's structured last-turn (the submitted instruction + final answer) via `herdr pane turn <pane_id> --last --format json` — no TUI chrome, spinners, or thinking leak through. It supports live streaming drafts and structured `pending_decision` buttons, and ships a `herdr_turn_adapter.py` fallback for Herdr builds without `pane turn`. When the turn is unavailable, herdres sends **nothing** (it never scrapes the terminal). See [references/TURN_FEED.md](references/TURN_FEED.md).
 
-**Managed bots.** `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1` (default) gives each agent type its own Telegram identity (Herdr Codex, Herdr Claude, …) instead of one manager bot. herdres suggests child-bot creation in General for open pane types, captures tokens via Telegram's managed-bot handshake, and the gateway runs one long-poll worker per token. You must add each child bot to the forum group; on access rejection herdres falls back to the manager bot and re-prompts. See [references/MANAGED_BOTS.md](references/MANAGED_BOTS.md).
+**Managed bots / One Space, One Voice.** By default a space speaks with **one voice**: a single manager bot posts for every agent, and you address a specific agent by replying to its message or with `/agents`. Per-agent bot identities (Herdr Codex, Herdr Claude, …) are an **opt-in, per-space, reversible** upgrade governed by `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS`: its code default is `0`, but the shipped `.env.example` sets `=1`, so a standard install has the feature on (with the "give each agent its own bot" offer); set `=0` for pure shared voice. `/voice shared|per_agent` is the per-space control; `voice_mode` persists across resets, and existing multibot deployments auto-migrate to `per_agent`. When on, the gateway runs one long-poll worker per token and you add each child bot to the forum group. See [references/MANAGED_BOTS.md](references/MANAGED_BOTS.md).
 
 **Cockpit (macOS only).** A launchd + `tailscale serve` Mini App that mirrors the live `herdr` TUI (xterm.js, touch key bar, drove line) into Telegram — the hands-on companion to the ambient bot. Fail-closed on tailnet + Telegram `initData` for the owner id only. See [references/COCKPIT.md](references/COCKPIT.md).
 
