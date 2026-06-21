@@ -19,6 +19,16 @@ class StatusSeverityTests(unittest.TestCase):
         self.assertEqual(sev, sorted(sev, reverse=True), "severity must strictly decrease in this order")
         self.assertEqual(herdres.status_severity("nonsense"), herdres.status_severity("unknown"))
 
+    def test_done_with_active_goal_reads_as_goal(self) -> None:
+        # A finished turn that still has a committed /goal reads as "on a goal" 🧠
+        # (work continues in the background), not a plain done/✅.
+        self.assertEqual(herdres.status_icon_key(_pane("done", _goal_active=True)), "goal")
+        self.assertEqual(herdres.status_icon_key(_pane("done", _goal_active=False)), "done")
+        # The reported X-topic scenario: one done+goal pane among idle/done panes ->
+        # the aggregate surfaces the goal (🧠), not a coffee break (☕️).
+        panes = [_pane("done", _goal_active=True), _pane("idle"), _pane("idle"), _pane("done")]
+        self.assertEqual(herdres.topic_status_key(panes), "goal")
+
     def test_status_icon_key_alias_folding(self) -> None:
         self.assertEqual(herdres.status_icon_key(_pane("failed")), "error")
         self.assertEqual(herdres.status_icon_key(_pane("waiting")), "blocked")

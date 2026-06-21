@@ -6103,8 +6103,8 @@ STATUS_ICON_DEFAULT_EMOJI = {key: emoji for key, _env_key, _emoji_env_key, emoji
 def pane_goal_active(pane: dict[str, Any]) -> bool:
     """True when the pane footer shows an active goal (e.g. "◎ /goal active").
 
-    Read once per pane per sync (memoised on the pane dict) and only consulted
-    for idle panes, so the cost is at most one small visible read per idle pane.
+    Read once per pane per sync (memoised on the pane dict) and only consulted for
+    idle/done panes, so the cost is at most one small visible read per idle-or-done pane.
     """
     if "_goal_active" in pane:
         return bool(pane["_goal_active"])
@@ -6139,7 +6139,11 @@ def status_icon_key(pane: dict[str, Any]) -> str:
         # An idle pane still pursuing a goal reads as "on a goal" (🧠), not a break.
         return "goal" if pane_goal_active(pane) else "idle"
     if status in {"done", "complete", "completed", "success", "succeeded"}:
-        return "done"
+        # A finished turn that still has a committed /goal also reads as "on a goal"
+        # (🧠): the agent ended its turn — often while background work it kicked off is
+        # still running — but the goal marks the work as ongoing. herdr only sees the
+        # agent's generate-state (done), so the goal is the signal that work continues.
+        return "goal" if pane_goal_active(pane) else "done"
     return "unknown"
 
 
