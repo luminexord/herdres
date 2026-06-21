@@ -8,6 +8,7 @@ import * as spacePanesModule from './space-panes.js';
 import { focusPaneInStatus } from './space-panes.js';
 import { recoverTerminalAfterFit } from './terminal-recovery.js';
 import { installScrollJoystick } from './scroll-joystick.js';
+import { focusPayloadForPane, textSubmitPayload } from './app-state.js';
 
 (() => {
   'use strict';
@@ -197,6 +198,7 @@ import { installScrollJoystick } from './scroll-joystick.js';
   }
 
   function sendControl(obj) {
+    if (!obj) return;
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }
 
@@ -253,7 +255,7 @@ import { installScrollJoystick } from './scroll-joystick.js';
       onPane: (id) => {
         latestStatus = focusPaneInStatus(latestStatus, id);
         renderNavigation();
-        sendControl({ t: 'focus', id });
+        sendControl(focusPayloadForPane((latestStatus.panes || []).find((pane) => pane.id === id)));
       },
     });
   }
@@ -270,7 +272,7 @@ import { installScrollJoystick } from './scroll-joystick.js';
     if (target) {
       latestStatus = focusPaneInStatus(latestStatus, target.id);
       renderNavigation();
-      sendControl({ t: 'focus', id: target.id });
+      sendControl(focusPayloadForPane(target));
     }
   }
 
@@ -343,7 +345,9 @@ import { installScrollJoystick } from './scroll-joystick.js';
   function sendTextInput() {
     const text = textInput.value;
     if (!text) return;
-    sendInput(text + '\r\n');
+    const payload = textSubmitPayload({ status: latestStatus, selectedSpace, text });
+    if (payload) sendControl(payload);
+    else sendInput(text + '\r\n');
     textInput.value = '';
     focusTerminalIfAppropriate();
   }

@@ -2946,6 +2946,8 @@ def turn_item_precedes_prompt(item: dict[str, Any], turn: dict[str, Any], prompt
     prompt_id = str(prompt_turn_id or "")
     if not item_turn_id or not prompt_id or item_turn_id == prompt_id:
         return False
+    if turn.get("has_open_turn") is True and prompt_id == str(turn.get("open_turn_id") or ""):
+        return True
     recent = turn.get("recent_turns") if isinstance(turn, dict) else None
     if not isinstance(recent, list):
         return False
@@ -2966,6 +2968,104 @@ def record_suppressed_clean_item(entry: dict[str, Any], item: dict[str, Any], re
     entry["last_clean_suppressed_reason"] = sanitize_text(reason, 120)
     entry["last_clean_suppressed_at"] = utc_now()
     entry.pop("last_clean_send_error", None)
+
+
+def native_session_turn_owner_key(state: dict[str, Any], entry: dict[str, Any]) -> str:
+    current_key = str(entry.get("pane_key") or "")
+    space_key_value = str(entry.get("space_key") or "").strip()
+    topic_id = str(entry.get("topic_id") or "").strip()
+    agent = str(entry.get("agent") or "").strip().lower()
+    session_id = str(entry.get("agent_session_id") or "").strip()
+    if not (current_key and space_key_value and topic_id and agent and session_id):
+        return current_key
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    space = spaces.get(space_key_value) if isinstance(spaces.get(space_key_value), dict) else {}
+    ordered_keys: list[str] = []
+    for key in space.get("pane_keys") or []:
+        clean_key = str(key)
+        if clean_key and clean_key not in ordered_keys:
+            ordered_keys.append(clean_key)
+    for key in sorted(str(key) for key in panes):
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+    for key in ordered_keys:
+        other = panes.get(key)
+        if not isinstance(other, dict):
+            continue
+        if str(other.get("last_known_status") or "").lower() == "closed":
+            continue
+        if str(other.get("space_key") or "").strip() != space_key_value:
+            continue
+        if str(other.get("topic_id") or "").strip() != topic_id:
+            continue
+        if str(other.get("agent") or "").strip().lower() != agent:
+            continue
+        if str(other.get("agent_session_id") or "").strip() != session_id:
+            continue
+        return key
+    return current_key
+
+
+def duplicate_native_session_owner_key(state: dict[str, Any], entry: dict[str, Any]) -> str:
+    current_key = str(entry.get("pane_key") or "")
+    owner_key = native_session_turn_owner_key(state, entry)
+    if owner_key and current_key and owner_key != current_key:
+        return owner_key
+    return ""
+
+
+def suppress_duplicate_native_session_prompt(entry: dict[str, Any], owner_key: str) -> bool:
+    turn_id = str(entry.get("pending_prompt_turn_id") or "")
+    if not turn_id:
+        return False
+    prompt_text = sanitize_text(str(entry.get("pending_prompt_text") or ""), USER_PROMPT_MAX_CHARS).strip()
+    prompt_hash = str(entry.get("pending_prompt_hash") or (stream_text_hash(prompt_text) if prompt_text else ""))
+    entry["last_prompt_turn_id"] = turn_id
+    if prompt_hash:
+        entry["last_prompt_hash"] = prompt_hash
+    if prompt_text:
+        entry["last_prompt_text"] = prompt_text
+    entry["last_prompt_suppressed_reason"] = f"duplicate_native_session:{owner_key}"
+    entry["last_prompt_suppressed_at"] = utc_now()
+    for key in ("pending_prompt_turn_id", "pending_prompt_text", "pending_prompt_hash", "last_prompt_message_id"):
+        entry.pop(key, None)
+    return True
+
+
+def suppress_duplicate_native_session_stream(entry: dict[str, Any], owner_key: str) -> bool:
+    turn_id = str(entry.get("pending_stream_turn_id") or "")
+    if not turn_id:
+        return False
+    stream_text = sanitize_text(str(entry.get("pending_stream_text") or ""), MAX_REPLY_CHARS).strip()
+    user_text = stream_user_text_for_turn(entry, turn_id)
+    stream_hash = stream_render_hash(stream_text, user_text) if stream_text else str(entry.get("pending_stream_revision") or "")
+    same_turn = str(entry.get("last_stream_turn_id") or "") == turn_id
+    try:
+        update_count = int(entry.get("last_stream_update_count") or 0) if same_turn else 0
+    except (TypeError, ValueError):
+        update_count = 0
+    entry["last_stream_turn_id"] = turn_id
+    if stream_hash:
+        entry["last_stream_hash"] = stream_hash
+    if stream_text:
+        entry["last_stream_text"] = stream_text
+    entry["last_stream_update_count"] = update_count + 1
+    entry["last_stream_suppressed_reason"] = f"duplicate_native_session:{owner_key}"
+    entry["last_stream_suppressed_at"] = utc_now()
+    for key in ("pending_stream_turn_id", "pending_stream_text", "pending_stream_revision", "last_stream_message_id", "last_stream_draft_id"):
+        entry.pop(key, None)
+    return True
+
+
+def suppress_duplicate_native_session_item(entry: dict[str, Any], item: dict[str, Any] | None, owner_key: str) -> bool:
+    if not item or str(item.get("kind") or "").lower() != "turn":
+        return False
+    if not str(item.get("turn_id") or "").strip():
+        return False
+    record_suppressed_clean_item(entry, item, f"duplicate_native_session:{owner_key}")
+    clear_stream_state(entry)
+    return True
 
 
 def should_baseline_new_pane_turn(entry: dict[str, Any], item: dict[str, Any] | None, new_entry: bool) -> bool:
@@ -3111,9 +3211,11 @@ def extract_turn_feed_item(
         prompt_turn_id = ""
         prompt_text = ""
     newest_prompt_turn_id = prompt_turn_id or str(entry.get("last_prompt_turn_id") or "")
+    item_suppressed_for_newer_prompt = False
     if item and turn_item_precedes_prompt(item, turn, newest_prompt_turn_id):
         record_suppressed_clean_item(entry, item, "newer_prompt_already_visible")
         item = None
+        item_suppressed_for_newer_prompt = True
     prompt_hash = stream_text_hash(prompt_text) if prompt_turn_id and prompt_text else ""
     if prompt_turn_id and prompt_text:
         ensure_request_started(entry, prompt_turn_id)
@@ -3132,11 +3234,14 @@ def extract_turn_feed_item(
     stream_turn_id = ""
     if stream_text and turn.get("complete") is False:
         stream_turn_id = str(turn.get("turn_id") or "")
-    elif stream_text and turn.get("has_open_turn") is True and item:
-        item_semantic_hash = clean_feed_hash(item, include_render_version=False)
-        if str(item.get("kind") or "").lower() == "turn" and same_delivered_content(entry, item, item_semantic_hash):
-            item = None
+    elif stream_text and turn.get("has_open_turn") is True:
+        if not item and item_suppressed_for_newer_prompt:
             stream_turn_id = str(turn.get("open_turn_id") or turn.get("turn_id") or "")
+        elif item:
+            item_semantic_hash = clean_feed_hash(item, include_render_version=False)
+            if str(item.get("kind") or "").lower() == "turn" and same_delivered_content(entry, item, item_semantic_hash):
+                item = None
+                stream_turn_id = str(turn.get("open_turn_id") or turn.get("turn_id") or "")
     if not item and stream_turn_id:
         entry["pending_stream_turn_id"] = stream_turn_id
         entry["pending_stream_text"] = stream_text
@@ -9333,6 +9438,15 @@ def _sync_pane_clean_feed(
                 allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
             )
 
+    duplicate_owner_key = duplicate_native_session_owner_key(state, entry)
+    if duplicate_owner_key:
+        if suppress_duplicate_native_session_item(entry, item, duplicate_owner_key):
+            item = None
+            changed = True
+        if suppress_duplicate_native_session_prompt(entry, duplicate_owner_key):
+            changed = True
+        if suppress_duplicate_native_session_stream(entry, duplicate_owner_key):
+            changed = True
     pending_stream_text = str(entry.get("pending_stream_text") or "")
     pending_stream_turn_id = str(entry.get("pending_stream_turn_id") or "")
     pending_stream_user_text = stream_user_text_for_turn(entry, pending_stream_turn_id)

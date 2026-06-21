@@ -2043,6 +2043,60 @@ class StreamingIntegrationTests(unittest.TestCase):
         send_stream.assert_called_once()
         self.assertEqual(send_stream.call_args.kwargs["turn_id"], "turn-2")
 
+    def test_sync_does_not_send_completed_turn_when_newer_open_prompt_is_visible(self) -> None:
+        state, pane, _key, entry = self._state()
+        entry.update({
+            "last_prompt_turn_id": "turn-fix",
+            "last_prompt_text": "fix all of these yourself",
+            "last_prompt_message_id": "2002",
+        })
+        counters, caps = self._caps()
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-review",
+                "user_text": "review\nAll tasks complete.",
+                "assistant_final_text": "Old review response that should not attach to the newer prompt.",
+                "has_open_turn": True,
+                "open_turn_id": "turn-fix",
+                "open_user_text": "fix all of these yourself",
+                "assistant_stream_text": "Current fix worklog.",
+                "recent_turns": [
+                    {
+                        "available": True,
+                        "complete": True,
+                        "turn_id": "turn-review",
+                        "user_text": "review\nAll tasks complete.",
+                        "assistant_final_text": "Old review response that should not attach to the newer prompt.",
+                    },
+                ],
+            }
+        )
+        send_stream = Mock(return_value={"ok": True, "draft_id": "123", "hash": "abc"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_stream_update=send_stream,
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_feed_item.assert_not_called()
+        send_stream.assert_called_once()
+        self.assertEqual(send_stream.call_args.kwargs["turn_id"], "turn-fix")
+        self.assertEqual(entry["last_clean_suppressed_reason"], "newer_prompt_already_visible")
+        self.assertEqual(entry["last_clean_item"]["turn_id"], "turn-review")
+
     def test_sync_stream_does_not_inherit_stale_prompt_from_different_turn(self) -> None:
         state, pane, _key, entry = self._state()
         entry.update({
@@ -2081,6 +2135,63 @@ class StreamingIntegrationTests(unittest.TestCase):
         send_stream.assert_called_once()
         self.assertEqual(send_stream.call_args.kwargs["turn_id"], "current-visible")
         self.assertEqual(send_stream.call_args.kwargs["user_text"], "")
+
+    def test_sync_suppresses_duplicate_native_session_open_turn_in_same_space(self) -> None:
+        state, pane_a, key_a, entry_a = self._state()
+        pane_a.update({"agent": "devin", "agent_session": {"value": "oval-panda"}})
+        entry_a.update({"agent": "devin", "agent_session_id": "oval-panda"})
+        pane_b = {
+            **pane_a,
+            "pane_id": "pane-2",
+            "terminal_id": "term-2",
+            "label": "Duplicate Devin",
+        }
+        key_b = herdres.pane_key(pane_b)
+        entry_b = {
+            **entry_a,
+            "pane_key": key_b,
+            "pane_id": "pane-2",
+            "pane_root_message_id": "1002",
+            "pane_thread_name": "Duplicate Devin",
+        }
+        state["panes"][key_b] = entry_b
+        state["spaces"]["workspace:workspace-1"]["pane_keys"] = [key_a, key_b]
+        turn = {
+            "available": True,
+            "complete": False,
+            "turn_id": "4807",
+            "user_text": "OFFENSIVE - two under-probed surfaces",
+            "assistant_final_text": "",
+            "assistant_stream_text": "This is the gRPC client side. Let me find the server side.",
+        }
+        counters, caps = self._caps()
+        pane_turn = Mock(return_value=turn)
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "6411"})
+        send_stream = Mock(return_value={"ok": True, "message_id": "6412", "sent_message": True})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=pane_turn,
+            send_feed_item=send_feed_item,
+            send_stream_update=send_stream,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            duplicate_changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane_b, counters, caps)
+            owner_changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane_a, counters, caps)
+
+        self.assertTrue(duplicate_changed)
+        self.assertTrue(owner_changed)
+        send_feed_item.assert_called_once()
+        send_stream.assert_called_once()
+        self.assertEqual(entry_b["last_prompt_turn_id"], "4807")
+        self.assertEqual(entry_b["last_stream_turn_id"], "4807")
+        self.assertEqual(entry_b["last_prompt_suppressed_reason"], f"duplicate_native_session:{key_a}")
+        self.assertEqual(entry_b["last_stream_suppressed_reason"], f"duplicate_native_session:{key_a}")
 
     def test_sync_does_not_repost_render_only_change_without_message_id(self) -> None:
         state, pane, _key, entry = self._state()

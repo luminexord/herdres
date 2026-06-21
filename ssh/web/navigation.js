@@ -25,6 +25,11 @@ function headClassName(tone, focused, extra = '') {
   return ['head', `head--${tone}`, focused ? 'head--focused' : '', extra].filter(Boolean).join(' ');
 }
 
+function bindHead(el, item, onClick) {
+  el.dataset.id = item.id || '';
+  el.onclick = onClick || null;
+}
+
 function createSpaceHead({ item, paneCount, focused, onClick }) {
   const el = document.createElement('button');
   const tone = statusTone(item.status);
@@ -33,14 +38,15 @@ function createSpaceHead({ item, paneCount, focused, onClick }) {
     (paneCount > 0 ? '<span class="head__count"></span>' : '');
   el.querySelector('.head__name').textContent = item.label;
   if (paneCount > 0) el.querySelector('.head__count').textContent = String(paneCount);
-  el.addEventListener('click', onClick);
+  bindHead(el, item, onClick);
   return el;
 }
 
-function updateSpaceHead(el, { item, paneCount, focused }) {
+function updateSpaceHead(el, { item, paneCount, focused, onClick }) {
   const tone = statusTone(item.status);
   const cls = headClassName(tone, focused);
   if (el.className !== cls) el.className = cls;
+  bindHead(el, item, onClick);
   const nameEl = el.querySelector('.head__name');
   if (nameEl && nameEl.textContent !== item.label) nameEl.textContent = item.label;
   const countEl = el.querySelector('.head__count');
@@ -67,15 +73,16 @@ function createPaneHead({ item, focused, className = '', onClick }) {
     (badge ? `<span class="head__agent ${badge.cls}" aria-hidden="true">${badge.initial}</span>` : '') +
     '<span class="head__name"></span>';
   el.querySelector('.head__name').textContent = item.label;
-  el.addEventListener('click', onClick);
+  bindHead(el, item, onClick);
   return el;
 }
 
-function updatePaneHead(el, { item, focused, className = '' }) {
+function updatePaneHead(el, { item, focused, className = '', onClick }) {
   const tone = statusTone(item.status);
   const badge = agentBadge(item.agent);
   const cls = headClassName(tone, focused, className);
   if (el.className !== cls) el.className = cls;
+  bindHead(el, item, onClick);
   const nameEl = el.querySelector('.head__name');
   if (nameEl && nameEl.textContent !== item.label) nameEl.textContent = item.label;
   const existingBadge = el.querySelector('.head__agent');

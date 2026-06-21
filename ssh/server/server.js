@@ -28,6 +28,7 @@ import { WebSocketServer } from 'ws';
 import { cleanHerdrPtyEnv } from './herdr-env.js';
 import { collectStatus, runHerdrJson } from './status.js';
 import { createScrollWriter } from './scroll-control.js';
+import { focusPaneCommands, sendTextArgs } from './herdr-control.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OWNER_ID = (process.env.HERDRES_OWNER_ID || '').trim();
@@ -177,17 +178,27 @@ function pollStatus() {
 }
 statusTimer = setInterval(pollStatus, STATUS_INTERVAL_MS);
 
-function runHerdrControl(args) {
+function runHerdrControl(args, after) {
   let done = false;
   const finish = (err) => {
     if (err) log(`${HERDR_BIN} ${args.join(' ')} failed:`, err.message);
     if (done) return;
     done = true;
-    pollStatus();
+    if (after) after();
+    else pollStatus();
   };
   const p = spawnProc(HERDR_BIN, args, { stdio: 'ignore', timeout: 4000 });
   p.once('error', finish);
   p.once('close', () => finish(null));
+}
+
+function runHerdrControlSequence(commands) {
+  const [first, ...rest] = commands;
+  if (!first) {
+    pollStatus();
+    return;
+  }
+  runHerdrControl(first, () => runHerdrControlSequence(rest));
 }
 
 // --- static serving -------------------------------------------------------
@@ -245,7 +256,13 @@ wss.on('connection', (ws) => {
         runHerdrControl(['workspace', 'focus', String(msg.id)]);
       } else if (msg.t === 'focus' && msg.id) {
         scrollWriter.invalidate();
-        runHerdrControl(['agent', 'focus', String(msg.id)]);
+        runHerdrControlSequence(focusPaneCommands({ paneId: msg.id, spaceId: msg.spaceId }));
+      } else if (msg.t === 'send_text') {
+        const args = sendTextArgs({ paneId: msg.id, text: msg.text });
+        if (args) {
+          scrollWriter.invalidate();
+          runHerdrControl(args);
+        }
       } else if (msg.t === 'scroll') {
         scrollWriter.write(msg);
       } else if (msg.t === 'image' && msg.data && msg.ext) {
