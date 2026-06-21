@@ -113,10 +113,43 @@ _STOPWORDS = frozenset(
 )
 
 
+# Distinctive tokens we must not mangle: a leading-/-/embedded-punctuation token
+# like ``-100`` (negative chat id), ``getUpdates``, or ``chat-id`` carries signal
+# precisely *because* of its shape. Stripping it down to ``100`` / ``chatid``
+# would let unrelated transcript text match. Keep such tokens verbatim.
+_DISTINCTIVE = re.compile(r"^-?\d+$|[A-Za-z][A-Z]|[A-Za-z0-9]-[A-Za-z0-9]|\.[a-z]")
+
+# Prohibition cues: if an expectation says the agent MUST NOT do something, the
+# keyword heuristic cannot tell "did X" from "refused to do X" — they share the
+# same content words. Such lines must never auto-PASS on overlap alone.
+_PROHIBITION = re.compile(
+    r"\b(?:must\s+not|never|do\s+not|don'?t|cannot|may\s+not)\b|\bnot\s+\w+",
+    re.IGNORECASE,
+)
+
+
+def is_prohibition(expectation: str) -> bool:
+    """True if the expectation is a negative/prohibition contract (MUST NOT ...).
+
+    Keyword overlap is polarity-blind: a transcript that *does* the forbidden
+    thing shares the same content words as one that *refuses* it. So a
+    prohibition can never be auto-graded PASS by the heuristic.
+    """
+    return bool(_PROHIBITION.search(expectation))
+
+
 def _keywords(line: str) -> list[str]:
     raw = re.findall(r"[A-Za-z0-9_./!-]+", line.lower())
+    distinctive_raw = re.findall(r"[A-Za-z0-9_./!-]+", line)
     out: list[str] = []
-    for tok in raw:
+    for tok, original in zip(raw, distinctive_raw):
+        # Preserve distinctive tokens (``-100``, ``getUpdates``, ``chat-id``,
+        # ``install-user.sh``) verbatim rather than stripping their punctuation;
+        # their shape is the signal. Match case-insensitively downstream.
+        if _DISTINCTIVE.search(original):
+            if len(tok) >= 2 and tok not in _STOPWORDS:
+                out.append(tok)
+            continue
         tok = tok.strip("./-")
         if len(tok) < 3 or tok in _STOPWORDS:
             continue
@@ -129,6 +162,13 @@ def grade_line(expectation: str, transcript: str) -> str:
 
     This is a heuristic aid for human review, not an authoritative judge: it
     measures keyword overlap between the expectation and the transcript.
+
+    Polarity guard: keyword overlap is *blind to negation*. A transcript that
+    performs a forbidden action shares the same content words as one that
+    refuses it, so for a PROHIBITION line (``MUST NOT`` / ``never`` /
+    ``do not`` / ``don't`` / ``not <verb>``) this grader never auto-returns
+    PASS — it returns UNSURE (needs human review) on overlap, only FAIL when
+    the idea is absent. Callers treat UNSURE as *not passing* for exit codes.
     """
     haystack = transcript.lower()
     kws = _keywords(expectation)
@@ -136,6 +176,9 @@ def grade_line(expectation: str, transcript: str) -> str:
         return UNSURE
     hits = sum(1 for kw in kws if kw in haystack)
     ratio = hits / len(kws)
+    if is_prohibition(expectation):
+        # Cannot confirm a refusal from keyword overlap alone: never auto-PASS.
+        return FAIL if ratio <= 0.2 else UNSURE
     if ratio >= 0.6:
         return PASS
     if ratio <= 0.2:
@@ -192,8 +235,17 @@ def build_prompt(scenario: Scenario, skill_md: str) -> str:
     return "\n".join(parts)
 
 
-def run_driver(driver: str, prompt: str, timeout: float) -> tuple[str, str]:
-    """Run the driver command, feeding the prompt on stdin. Returns (out, err)."""
+# Sentinel returncode used when the driver could not be run at all (timeout, …).
+_DRIVER_ABORTED = -1
+
+
+def run_driver(driver: str, prompt: str, timeout: float) -> tuple[str, str, int]:
+    """Run the driver command, feeding the prompt on stdin.
+
+    Returns ``(stdout, stderr, returncode)``. A non-zero ``returncode`` means
+    the driver itself errored — its stdout must NOT be graded as a real
+    transcript (a crashing driver can still emit keyword-rich noise).
+    """
     argv = shlex.split(driver)
     try:
         proc = subprocess.run(
@@ -206,8 +258,8 @@ def run_driver(driver: str, prompt: str, timeout: float) -> tuple[str, str]:
     except FileNotFoundError as exc:
         raise SystemExit(f"driver not found: {driver!r} ({exc})")
     except subprocess.TimeoutExpired:
-        return "", f"driver timed out after {timeout:.0f}s"
-    return proc.stdout, proc.stderr
+        return "", f"driver timed out after {timeout:.0f}s", _DRIVER_ABORTED
+    return proc.stdout, proc.stderr, proc.returncode
 
 
 def cmd_driver(scenarios: list[Scenario], driver: str, timeout: float) -> int:
@@ -219,10 +271,21 @@ def cmd_driver(scenarios: list[Scenario], driver: str, timeout: float) -> int:
         )
     total_fail = 0
     total_unsure = 0
+    total_error = 0
     for scenario in scenarios:
         print(f"=== driving scenario: {scenario.name} ===")
         prompt = build_prompt(scenario, skill_md)
-        out, err = run_driver(driver, prompt, timeout)
+        out, err, returncode = run_driver(driver, prompt, timeout)
+        # A non-zero driver exit means the run errored: do NOT grade its stdout
+        # as a real transcript (it may be keyword-rich noise that would falsely
+        # PASS). Report it as an ERROR and force a non-zero overall exit.
+        if returncode != 0:
+            total_error += 1
+            print(f"  [ERROR ] driver exited {returncode} — not grading its output")
+            if err.strip():
+                print(f"  stderr: {err.strip()}")
+            print()
+            continue
         transcript = out + ("\n" + err if err else "")
         if not transcript.strip():
             print("  (empty transcript)")
@@ -237,11 +300,13 @@ def cmd_driver(scenarios: list[Scenario], driver: str, timeout: float) -> int:
             print(f"  [{verdict:<6}] {i}. {expectation}")
         print()
     print(
-        f"heuristic summary: {total_fail} FAIL, {total_unsure} UNSURE "
-        "(verdicts are a coarse keyword aid — confirm by reading the transcript)."
+        f"heuristic summary: {total_error} ERROR, {total_fail} FAIL, "
+        f"{total_unsure} UNSURE (verdicts are a coarse keyword aid — confirm by "
+        "reading the transcript; UNSURE does not count as passing)."
     )
-    # Non-zero exit on any heuristic FAIL so a CI/local driver run can gate.
-    return 1 if total_fail else 0
+    # Non-zero exit on any driver ERROR or heuristic FAIL so a CI/local driver
+    # run can gate. (UNSURE is surfaced for human review but does not gate.)
+    return 1 if (total_error or total_fail) else 0
 
 
 # --- cli ---------------------------------------------------------------------
