@@ -73,6 +73,10 @@ HERDR_TELEGRAM_TOPICS_DRY_RUN=1 ~/.local/bin/herdres sync
 ~/.local/bin/herdres probe --thread-id 123
 ```
 
+### Version and self-update
+
+`herdres version` prints `HERDRES_VERSION`; `herdres update` does an env-safe self-update (`--channel edge` default, plus `--check`/`--rollback`/`--dry-run`/`--repo`), never overwriting `herdres.env`.
+
 ## Architecture invariants — respect these when editing
 
 1. **Stdlib-only Python.** No third-party imports in any `.py` at the repo root or in `herdres_routing.py` / gateways / bridge / turn adapter. The only non-stdlib code is the Node cockpit under `ssh/`.

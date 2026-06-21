@@ -110,6 +110,29 @@ TELEGRAM_ALLOWED_USERS=123456789
 
 Get your chat ID from Telegram bot updates or another admin tool. Owner user IDs are comma-separated.
 
+## Updating herdres
+
+Once installed, update in place with one command instead of hand-copying files:
+
+```bash
+herdres update
+```
+
+This updates from your local checkout on the `edge` channel (the default for now: it tracks `main`). It runs `git pull --ff-only`, backs up the current install, then atomically replaces the installed code **preserving your `~/.config/herdres/herdres.env`** (that file is never touched). It then restarts the user timer and the gateway — disabling and re-enabling the gateway so it releases its single Telegram `getUpdates` lease — and **rolls back automatically if anything fails**.
+
+Other commands:
+
+```bash
+herdres update --check       # git fetch, then report current vs available version (equal on a plain checkout until you pull); change nothing
+herdres update --rollback    # restore the previous install from the latest backup
+herdres update --dry-run     # print the plan (source, version, files, services); change nothing
+herdres version              # print the installed version
+```
+
+`herdres update` finds your source checkout from the `~/.local/share/herdres/source` marker that the installer writes; override it with `HERDRES_SRC` or `--repo <path>`.
+
+Channels: today the only path is the default `--channel edge` (track `main`). Versioned `stable` releases are coming in Phase 3 of [#13](https://github.com/luminexord/herdres/issues/13).
+
 ## Pane Thread Commands
 
 In the mapped space topic, reply to a routed pane message or optional pane-root card:
