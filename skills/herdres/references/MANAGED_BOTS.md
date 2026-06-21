@@ -11,7 +11,7 @@ A **space** (a Herdr workspace, mapped to one forum topic in per-space mode) can
 - **`voice_mode` is per-space**, stored on the space entry (`space["voice_mode"]`) and **persists across state resets** (including a per-agent⇄per-space topic-mode flip, via `_preserved_voice_mode`).
   - `"shared"` (**default**) — one manager bot speaks for the whole space.
   - `"per_agent"` (opt-in) — each agent **type** gets its own managed child bot, when one is available.
-- **`/voice shared|per_agent`** is the reversible per-space setter (`/voice` with no arg prints the current mode). It needs a resolved space; it does not apply in per-agent topic mode, where each topic is already a single pane.
+- **`/voice shared|per_agent`** is the reversible per-space setter (`/voice` with no arg prints the current mode). It works wherever the topic resolves to a space (including per-agent topic mode); it only no-ops when no space record can be resolved.
 - **`/agents`** (per-space mode only) shows an inline picker; tapping an agent sets a TTL'd per-user **active pane** (~600s, `HERDR_TELEGRAM_TOPICS_ACTIVE_PANE_TTL`) so subsequent commands in that topic route to it without a reply/@. Reply-to-message and a single live pane still take priority. In per-agent mode `/agents` replies `Only one agent here…`.
 - **`managed_voice_active`** on each pane entry is the **single source of truth** for whether that pane sends via a child bot. `refresh_entry_managed_voice` (run during sync and command handling) reconciles it from `space["voice_mode"]`, **overriding** the env flag. `managed_bot_token_for_entry` reads `managed_voice_active` if present, else falls back to `MANAGED_BOTS_ENABLED`.
 - **Auto-migration:** existing deployments with a live child-bot token registered for a pane are migrated to `voice_mode="per_agent"` on first load (`migrate_space_voice_mode`), preserving multibot behavior so the `1→0` default flip never silently downgrades them. The migration is idempotent and only touches spaces lacking a `voice_mode` that have a live child bot.
@@ -61,7 +61,7 @@ Managed bots are **opt-in**. Set in `~/.config/herdres/herdres.env`:
 HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1
 ```
 
-Default is **`0`** (off) — by default a space speaks with the single shared manager bot and no setup links or child-bot sends ever happen. Set it to `1` to enable the feature **and** the per-agent upgrade offer card above. The env flag only gates the *feature*: which spaces actually use child bots is decided per-space by `voice_mode` / each entry's `managed_voice_active`, so you can leave `=1` and still keep most spaces on the shared voice. Existing deployments with live child bots are auto-migrated to `per_agent` on first load regardless of the flag.
+The **code default when the variable is unset is `0`** (off). **But the shipped `.env.example` sets `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1`** and the installers copy it verbatim, so a **standard install has the feature ON** — the per-agent "give each agent its own bot" offer card can appear once a space has ≥2 agent kinds. Set it to `0` in your `herdres.env` for the pure shared-voice model with no offers. The flag only gates the *feature*: which spaces actually use child bots is decided per-space by `voice_mode` / each entry's `managed_voice_active`, so you can leave `=1` and still keep most spaces on the shared voice. Existing deployments with live child bots are auto-migrated to `per_agent` on first load regardless of the flag.
 
 ## How Herdres suggests child bots
 
@@ -73,7 +73,7 @@ Conditions and behavior:
 
 | Condition | Behavior |
 |---|---|
-| `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=0` (default) | Feature off — no offer card, no setup message, no child-bot sends. |
+| `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=0` | Feature off — no offer card, no setup message, no child-bot sends. (Code default when *unset*; the shipped `.env.example` sets `=1`.) |
 | Manager bot lacks `can_manage_bots` | No setup message (Herdres checks `getMe`; managed-bot creation is unavailable on that bot). |
 | No open panes for any supported type | No setup message. |
 | A type already has a stored token | That type is omitted from the suggestion. |
@@ -158,7 +158,7 @@ Photos are cosmetic. Names and short/long descriptions are always set from the f
 
 ## Quick checklist
 
-1. Set `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1` (default is `0`) and (optionally) the `*_PHOTO` paths.
+1. Ensure `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1` (the shipped `.env.example` already sets this; the code default when *unset* is `0`) and (optionally) the `*_PHOTO` paths.
 2. Make sure the manager bot can manage bots (Herdres skips setup links otherwise).
 3. Open ≥ 2 agent kinds in a space, then run `sync` — the "Give each agent its own bot (optional)" card appears in that space's topic. Tap **Upgrade** (or run `/voice per_agent`) to flip the space to per-agent voice.
 4. Tap the "Create … bot" buttons and complete Telegram's flow.
