@@ -12,6 +12,7 @@ Invoke as `herdres <subcommand>` (the actual binary lands wherever SETUP.md plac
 
 | Subcommand | Purpose |
 |---|---|
+| `setup` | Interactive credential wizard (run **once**, by a human in a terminal). Prompts for the bot token (no echo), forum chat ID, and allowed user IDs; validates each; runs preflight; then writes `~/.config/herdres/herdres.env` at mode `0600`, preserving any other keys. **Refuses** to run unattended unless you pass `--bot-token`/`--chat-id`/`--allowed-users`, and **never** silently reuses another app's (e.g. Hermes's) bot token — that needs `--reuse-hermes-token` or a typed `reuse` confirmation. This is the enforcing credential gate (see SAFETY.md). |
 | `sync` | One reconciliation pass: create/update forum topics, post pending pane reports/cards. Non-blocking lock (skips if another run holds it). Driven by the timer. |
 | `event` | Process a single Herdr plugin event (a pane changed). Blocking lock. This is the path the Herdr plugin calls on each agent turn. |
 | `plugin-enable` | Flip the stored flag so `event` runs actually do work. Run once after linking the Herdr plugin. |

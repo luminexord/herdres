@@ -18,9 +18,9 @@ This file covers **install + config + services + plugin linking only**. For the 
 
 ### In the Telegram app (the human must do this once)
 
-1. **Create a bot.** Message **@BotFather**, run `/newbot`, and copy the **bot token** (looks like `123456:ABC-...`). This is `TELEGRAM_BOT_TOKEN`.
+1. **Create a bot.** Message **@BotFather**, run `/newbot`, and copy the **bot token** (looks like `123456:ABC-...`). This is `TELEGRAM_BOT_TOKEN`. Then **turn Group Privacy OFF** for the bot (`/setprivacy` in @BotFather → pick the bot → **Disable**) — required so the bot sees plain-text topic replies, not just `/commands`/mentions; with privacy *on*, the bot also won't surface group messages in `getUpdates`, which makes fetching the chat ID hard.
 2. **Create a SUPERGROUP with forum Topics ENABLED.** Create a group, open Group Settings, and turn on **Topics** (this converts it to a forum supergroup). Herdres refuses to run unless the chat is a forum-enabled supergroup.
-3. **Add the bot as an ADMIN with Manage Topics.** Add the bot to the group, promote it to **Administrator**, and grant **Manage Topics** (and pin-message rights if you plan to use pinned space status). Herdres preflight fails closed if the bot is not an administrator or lacks `can_manage_topics`.
+3. **Add the bot as an ADMIN with Manage Topics.** Add the bot to the group, promote it to **Administrator**, and grant **Manage Topics** (and pin-message rights if you plan to use pinned space status). Grant **both at the same time** — Herdres preflight checks them in order and fails closed first on admin, then on `can_manage_topics`, so granting one at a time means two separate failures.
 4. **Get the numeric chat ID** of that supergroup (the negative `-100…` form). This is `HERDR_TELEGRAM_TOPICS_CHAT_ID`.
 5. **Get your own Telegram user ID** (a positive integer). This is the first entry of `TELEGRAM_ALLOWED_USERS`.
 
@@ -187,6 +187,7 @@ A successful run prints a JSON result object. Herdres preflight will surface, as
 - `Telegram chat must be a forum-enabled supergroup` — Topics is off, or the chat is not a supergroup.
 - `bot is not an administrator in the Telegram forum group` — promote the bot to admin.
 - `bot lacks can_manage_topics in the Telegram forum group` — grant Manage Topics.
+- **Bot not visible in `getUpdates` / can't fetch the chat ID** — the bot's **Group Privacy** is still on. Disable it in @BotFather (`/setprivacy` → **Disable**), then send one message in the group.
 
 If the run is clean, open the supergroup: with Herdr panes running you should see space (or per-agent) topics appear and pane traffic posted into them. To control a pane, reply inside its topic (see COMMANDS.md).
 

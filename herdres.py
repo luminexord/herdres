@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import fcntl
+import getpass
 import hashlib
 import html
 import json
@@ -12074,6 +12075,228 @@ def with_lock(fn, *, blocking: bool = False):
         return fn()
 
 
+# --- setup wizard ------------------------------------------------------------
+#
+# `herdres setup` is the real credential gate. A SKILL.md instruction can only
+# *bias* an agent; here the binary itself does the asking, validates each value,
+# verifies it against Telegram, and only then writes herdres.env at 0o600. It
+# refuses to run unattended without explicit flags and never silently adopts
+# another app's bot token (e.g. Hermes's), which would break the one-getUpdates-
+# consumer-per-token rule.
+
+SETUP_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{30,}$")
+SETUP_CHAT_ID_RE = re.compile(r"^-100\d+$")
+SETUP_ALLOWED_USERS_RE = re.compile(r"^\s*\d+(\s*,\s*\d+)*\s*$")
+
+
+def _read_env_value(path: Path, key: str) -> str:
+    """Return the bare value of ``key`` in a dotenv file, or '' if absent."""
+    if not path.exists():
+        return ""
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip() == key:
+                return value.strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def _setup_resolve(
+    *,
+    label: str,
+    flag_value: str,
+    validator: re.Pattern[str],
+    interactive: bool,
+    secret: bool,
+    invalid_hint: str,
+) -> str:
+    """Resolve one setup value: flag wins, else prompt (interactive only).
+
+    Re-prompts on invalid input in a TTY; raises BridgeError on an invalid flag
+    or on a missing value when not interactive.
+    """
+    value = str(flag_value or "").strip()
+    if value:
+        if not validator.match(value):
+            raise BridgeError(f"invalid {label}: {invalid_hint}")
+        return value
+    if not interactive:
+        raise BridgeError(
+            "herdres setup needs an interactive terminal, or pass "
+            "--bot-token/--chat-id/--allowed-users"
+        )
+    while True:
+        if secret:
+            entered = getpass.getpass(f"{label}: ", stream=sys.stderr).strip()
+        else:
+            print(f"{label}: ", end="", file=sys.stderr, flush=True)
+            entered = input().strip()
+        if validator.match(entered):
+            return entered
+        print(f"  invalid {label}: {invalid_hint}", file=sys.stderr)
+
+
+def _setup_confirm_hermes_reuse(interactive: bool) -> bool:
+    """Require an explicit, typed confirmation before reusing the Hermes token."""
+    print(
+        "WARNING: this bot token is already configured for Hermes "
+        f"({compact_path(str(DEFAULT_HERMES_ENV))}).\n"
+        "Telegram allows only ONE getUpdates consumer per bot token, so sharing "
+        "it with Hermes can make inbound commands land randomly on either "
+        "process. A dedicated bot for herdres is strongly recommended.",
+        file=sys.stderr,
+    )
+    if not interactive:
+        return False
+    print("Type 'reuse' to share the Hermes token anyway: ", end="", file=sys.stderr, flush=True)
+    return input().strip().lower() == "reuse"
+
+
+def setup_once(args: Any) -> dict[str, Any]:
+    """Interactive credential wizard. Validates, preflights, then writes 0o600."""
+    load_dotenv()
+    interactive = sys.stdin.isatty()
+    hermes_token = _read_env_value(DEFAULT_HERMES_ENV, "TELEGRAM_BOT_TOKEN")
+    reuse_hermes = bool(getattr(args, "reuse_hermes_token", False))
+    bot_flag = str(getattr(args, "bot_token", "") or "").strip()
+
+    # A blank --bot-token together with --reuse-hermes-token is the explicit
+    # "adopt the Hermes token" path: seed it from the Hermes env (still validated
+    # below). Without that flag we never default to it — no silent scavenging.
+    if not bot_flag and reuse_hermes and hermes_token:
+        bot_flag = hermes_token
+
+    token = _setup_resolve(
+        label="Telegram bot token",
+        flag_value=bot_flag,
+        validator=SETUP_TOKEN_RE,
+        interactive=interactive,
+        secret=True,
+        invalid_hint="expected <digits>:<30+ token chars>, e.g. 123456:ABC...",
+    )
+    chat_id = _setup_resolve(
+        label="Forum supergroup chat id",
+        flag_value=str(getattr(args, "chat_id", "") or "").strip(),
+        validator=SETUP_CHAT_ID_RE,
+        interactive=interactive,
+        secret=False,
+        invalid_hint="expected a -100... supergroup id",
+    )
+    allowed_users = _setup_resolve(
+        label="Allowed user ids (comma-separated)",
+        flag_value=str(getattr(args, "allowed_users", "") or "").strip(),
+        validator=SETUP_ALLOWED_USERS_RE,
+        interactive=interactive,
+        secret=False,
+        invalid_hint="expected numeric id(s), e.g. 123456789 or 123,456",
+    )
+    # Normalize to bare comma-joined ids ("123, 456" -> "123,456") so the stored
+    # value matches what downstream split-on-comma parsers expect.
+    allowed_users = ",".join(part.strip() for part in allowed_users.split(",") if part.strip())
+
+    # No scavenging: if the resolved token is the Hermes token, require explicit
+    # opt-in (the --reuse-hermes-token flag or an interactive 'reuse' confirm).
+    if hermes_token and token == hermes_token and not reuse_hermes:
+        if not _setup_confirm_hermes_reuse(interactive):
+            raise BridgeError(
+                "refusing to reuse the Hermes bot token without --reuse-hermes-token; "
+                "use a dedicated bot for herdres (only one getUpdates consumer per token)"
+            )
+
+    # Verify before write: set the env in-process so preflight() uses these
+    # exact values, then run getChat/getMe/getChatMember. Surface its error.
+    saved_env = {
+        key: os.environ.get(key)
+        for key in ("TELEGRAM_BOT_TOKEN", "HERDRES_OUTBOUND_BOT_TOKEN", "HERDR_TELEGRAM_TOPICS_CHAT_ID")
+    }
+    os.environ["TELEGRAM_BOT_TOKEN"] = token
+    os.environ["HERDRES_OUTBOUND_BOT_TOKEN"] = token
+    os.environ["HERDR_TELEGRAM_TOPICS_CHAT_ID"] = chat_id
+    try:
+        preflight(chat_id)
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    path = setup_write_env(
+        {
+            "TELEGRAM_BOT_TOKEN": token,
+            "HERDR_TELEGRAM_TOPICS_CHAT_ID": chat_id,
+            "TELEGRAM_ALLOWED_USERS": allowed_users,
+        }
+    )
+
+    print(
+        "\nWrote " + compact_path(str(path)) + " (mode 0600). Next steps:\n"
+        "  - enable the service: systemctl --user enable --now herdres.timer "
+        "(Linux) or bootstrap the launchd agent (macOS)\n"
+        "  - link the Herdr plugin: herdr plugin link "
+        "~/.local/share/herdres/herdres-plugin && herdres plugin-enable\n"
+        "  - verify: herdres sync",
+        file=sys.stderr,
+    )
+    # Never echo the token back.
+    return {
+        "ok": True,
+        "result": {
+            "env_path": str(path),
+            "chat_id": chat_id,
+            "allowed_users": allowed_users,
+            "preflight": "ok",
+            "reused_hermes_token": bool(hermes_token and token == hermes_token),
+        },
+    }
+
+
+def setup_write_env(updates: dict[str, str]) -> Path:
+    """Atomically write the 3 target keys into herdres.env at 0o600.
+
+    Preserves every existing non-target key/line in the file. Drops ALL existing
+    lines for a target key (so a stale duplicate of e.g. TELEGRAM_BOT_TOKEN can't
+    survive) and appends each new value exactly once. Writes via a temp file in
+    the same dir + os.replace so the file is never half-written.
+    """
+    path = DEFAULT_ENV
+    path.parent.mkdir(parents=True, exist_ok=True)
+    targets = set(updates)
+    lines: list[str] = []
+    if path.exists():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            stripped = raw.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+                # Drop every existing line for a target key (even duplicates), so a
+                # stale second copy can't survive; the new values are appended below.
+                if key in targets:
+                    continue
+            lines.append(raw)
+    for key, value in updates.items():
+        lines.append(f"{key}={value}")
+    payload = "\n".join(lines).rstrip("\n") + "\n"
+
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        os.unlink(tmp_name)
+        raise
+    os.replace(tmp_name, path)
+    os.chmod(path, 0o600)
+    return path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -12088,6 +12311,11 @@ def main() -> int:
     sub.add_parser("managed-bot")
     probe = sub.add_parser("probe")
     probe.add_argument("--thread-id", default=None)
+    setup = sub.add_parser("setup")
+    setup.add_argument("--bot-token", default="")
+    setup.add_argument("--chat-id", default="")
+    setup.add_argument("--allowed-users", default="")
+    setup.add_argument("--reuse-hermes-token", action="store_true")
     args = parser.parse_args()
     try:
         if args.cmd == "sync":
@@ -12109,6 +12337,8 @@ def main() -> int:
         elif args.cmd == "managed-bot":
             payload = json.loads(sys.stdin.read() or "{}")
             result = with_lock(lambda: managed_bot_update(payload), blocking=True)
+        elif args.cmd == "setup":
+            result = setup_once(args)
         else:
             result = with_lock(lambda: probe_rich(args.thread_id), blocking=True)
         print(json.dumps(result, sort_keys=True))
