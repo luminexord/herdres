@@ -12651,7 +12651,7 @@ def setup_write_env(updates: dict[str, str]) -> Path:
 # absolute checkout path here so `update --edge` knows where to `git pull`.
 SOURCE_MARKER = Path.home() / ".local/share/herdres/source"
 
-# GitHub "owner/repo" the stable channel pulls signed release tarballs from. The
+# GitHub "owner/repo" the stable channel pulls SHA256-verified release tarballs from. The
 # RELEASE-ASSET contract (Issue #13 Phase 3): each release publishes
 # `herdres-<tag>.tar.gz` + `herdres-<tag>.tar.gz.sha256`; the tarball expands to a
 # source checkout (a tree containing herdres.py + the install-set files). Overridable
@@ -12761,6 +12761,38 @@ def _read_version_from(path: Path) -> str | None:
     except OSError:
         return None
     return _parse_version(text)
+
+
+def _strip_v(tag: str) -> str:
+    """Drop a single leading ``v`` from a release tag (``v0.3.0`` -> ``0.3.0``).
+
+    Unlike ``str.lstrip("v")`` this strips at most one leading ``v`` and never eats
+    characters from the middle, so an odd tag like ``v0.3.0`` is handled exactly.
+    """
+    text = str(tag or "")
+    return text[1:] if text[:1] == "v" else text
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    """A numeric, orderable key for a dotted version (``0.3.0`` -> ``(0, 3, 0)``).
+
+    Leading digits of each dot-separated component are taken; a non-numeric or
+    pre-release suffix stops that component (``0.3.0-rc1`` -> ``(0, 3, 0)``). This is
+    a released-components compare — enough for the stable channel to refuse a
+    downgrade — not a full PEP 440 / semver ordering.
+    """
+    parts: list[int] = []
+    for chunk in _strip_v(version).strip().split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
 
 
 def _read_remote_version(repo: Path) -> str | None:
@@ -13117,7 +13149,7 @@ def _verify_install(expected_version: str, gateway_was_active: bool) -> dict[str
 
 
 # ---------------------------------------------------------------------------
-# stable channel — signed GitHub-release tarballs (Issue #13 Phase 3)
+# stable channel — SHA256-verified GitHub-release tarballs (Issue #13 Phase 3)
 # ---------------------------------------------------------------------------
 
 # RELEASE-ASSET contract: a release publishes exactly these two assets, named off
@@ -13161,7 +13193,9 @@ def _release_metadata(tag: str | None) -> dict[str, Any]:
     Returns the parsed release object (which carries ``tag_name`` + ``assets``).
     """
     base = f"https://api.github.com/repos/{HERDRES_REPO}/releases"
-    url = f"{base}/tags/{tag}" if tag else f"{base}/latest"
+    # Percent-encode the (user-supplied via --version) tag so an odd tag can't break
+    # out of the path or inject query params into the API URL.
+    url = f"{base}/tags/{urllib.parse.quote(str(tag), safe='')}" if tag else f"{base}/latest"
     body = _http_get(url, accept="application/vnd.github+json")
     try:
         data = json.loads(body.decode("utf-8"))
@@ -13219,7 +13253,11 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
         if target != dest and dest not in target.parents:
             raise BridgeError(f"herdres update: refusing unsafe tar member {member.name!r}")
         if member.issym() or member.islnk():
-            link_target = (target.parent / member.linkname).resolve()
+            # A symlink's linkname is relative to the link's own directory; a hardlink's
+            # linkname is a path relative to the archive root (dest). Resolve each
+            # against the correct base before checking it stays inside dest.
+            base = target.parent if member.issym() else dest
+            link_target = (base / member.linkname).resolve()
             if link_target != dest and dest not in link_target.parents:
                 raise BridgeError(f"herdres update: refusing unsafe tar link {member.name!r}")
     # filter="data" (Python 3.12+) is the hardened extraction filter: it strips
@@ -13343,7 +13381,7 @@ def _apply_from_source(
 
 
 def _update_stable(args: Any, *, no_restart: bool) -> dict[str, Any]:
-    """The stable channel: --check / --dry-run / apply against a signed release.
+    """The stable channel: --check / --dry-run / apply against a checksum-verified release.
 
     ``--version <tag>`` pins a release; otherwise "latest" is used. The release
     tarball is fetched + sha256-verified + extracted to a temp dir, then the SAME
@@ -13355,7 +13393,7 @@ def _update_stable(args: Any, *, no_restart: bool) -> dict[str, Any]:
     # --check: resolve the release version only; download nothing, apply nothing.
     if getattr(args, "check", False):
         release = _release_metadata(pinned)
-        available_version = str(release["tag_name"]).lstrip("v")
+        available_version = _strip_v(str(release["tag_name"]))
         return {
             "ok": True,
             "action": "check",
@@ -13364,7 +13402,8 @@ def _update_stable(args: Any, *, no_restart: bool) -> dict[str, Any]:
             "current_version": current,
             "available_version": available_version,
             "tag": str(release["tag_name"]),
-            "update_available": available_version != current,
+            # Numeric semver compare: only a strictly-newer release is an update.
+            "update_available": _version_key(available_version) > _version_key(current),
             "needs_upstream": False,
             "fetch_ok": True,
         }
@@ -13389,7 +13428,7 @@ def _update_stable(args: Any, *, no_restart: bool) -> dict[str, Any]:
             "channel": "stable",
             "source": HERDRES_REPO,
             "current_version": current,
-            "target_version": str(release["tag_name"]).lstrip("v"),
+            "target_version": _strip_v(str(release["tag_name"])),
             "tag": str(release["tag_name"]),
             "files": files,
             "services": service_actions,
@@ -13399,7 +13438,22 @@ def _update_stable(args: Any, *, no_restart: bool) -> dict[str, Any]:
     # dir is removed once the install-set files have been copied into place.
     with tempfile.TemporaryDirectory(prefix="herdres-stable-") as work:
         repo, resolved_tag = _fetch_stable(pinned, Path(work))
-        available = _read_version_from(repo / "herdres.py") or resolved_tag.lstrip("v")
+        available = _read_version_from(repo / "herdres.py") or _strip_v(resolved_tag)
+        # Refuse to go backwards on an unpinned "latest" update: if the installed
+        # version is already >= the latest release, apply nothing (a yanked/older
+        # "latest", or a box already ahead, must not be silently downgraded). A
+        # --version pin is an explicit, intentional target (incl. a deliberate
+        # downgrade), so it bypasses this guard.
+        if pinned is None and _version_key(available) <= _version_key(current):
+            return {
+                "ok": True,
+                "action": "up-to-date",
+                "channel": "stable",
+                "source": HERDRES_REPO,
+                "current_version": current,
+                "available_version": available,
+                "tag": resolved_tag,
+            }
         return _apply_from_source(
             repo,
             channel="stable",
@@ -13413,6 +13467,12 @@ def _update_stable(args: Any, *, no_restart: bool) -> dict[str, Any]:
 def update_once(args: Any) -> dict[str, Any]:
     """Self-update entry point. Returns the standard ``{"ok": ...}`` dict."""
     channel = str(getattr(args, "channel", "edge") or "edge").strip()
+    # A pinned --version tag can only be honored by the stable channel (edge tracks a
+    # local checkout, which can't fetch an arbitrary release), so --version implies
+    # --stable. Without this, `herdres update --version vX` would silently run an edge
+    # git-pull and drop the pin.
+    if str(getattr(args, "version", "") or "").strip():
+        channel = "stable"
     if channel not in {"edge", "stable"}:
         raise BridgeError(f"herdres update: unknown channel {channel!r} (use edge or stable)")
 
@@ -13445,7 +13505,7 @@ def update_once(args: Any) -> dict[str, Any]:
             "services": actions,
         }
 
-    # stable channel: source is a signed GitHub release, not a local git checkout.
+    # stable channel: source is a SHA256-verified GitHub release, not a local git checkout.
     if channel == "stable":
         return _update_stable(args, no_restart=no_restart)
 

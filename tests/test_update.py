@@ -664,7 +664,9 @@ class _FakeHTTP:
                 raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
             body = self._release_json()
         elif url.endswith(".sha256"):
-            body = (self.sha + "  herdres-stable.tar.gz\n").encode("utf-8")
+            # `sha256sum`-format line naming the real tarball asset (the verifier
+            # parses the leading digest; the filename mirrors what CI publishes).
+            body = (self.sha + f"  herdres-{self.tag}.tar.gz\n").encode("utf-8")
         elif url.endswith(".tar.gz"):
             body = self.tarball
         else:  # pragma: no cover - unexpected URL in a test
@@ -823,6 +825,54 @@ class StableChannelTests(UpdateTestBase):
         for call in self.router.calls:
             self.assertNotIn(call[0], {"systemctl", "launchctl"})
 
+    @staticmethod
+    def _old_release(version: str):
+        """An in-memory release tarball whose herdres.py reports ``version``."""
+        files = dict(SOURCE_FILES)
+        files["herdres.py"] = f'#!/usr/bin/env python3\nHERDRES_VERSION = "{version}"\n'
+        return _build_release_tarball(prefix=f"herdres-{version}", files=files)
+
+    def test_stable_unpinned_not_newer_is_up_to_date_no_apply(self):
+        """An unpinned 'latest' that is <= the installed version applies nothing — no
+        silent downgrade — even though the tarball was fetched + sha-verified."""
+        self._seed_installed()
+        self._patch_http(_FakeHTTP(tag="v0.1.0", tarball=self._old_release("0.1.0")))
+        before = _snapshot_install(self)
+        result = herdres.update_once(_args(channel="stable"))
+        self.assertEqual(result["action"], "up-to-date")
+        self.assertEqual(result["channel"], "stable")
+        self.assertEqual(result["available_version"], "0.1.0")
+        self.assertEqual(result["current_version"], herdres.HERDRES_VERSION)
+        self.assertNotIn("backup", result)  # nothing was applied
+        self.assertEqual(_snapshot_install(self), before)
+        for call in self.router.calls:
+            self.assertNotIn(call[0], {"systemctl", "launchctl"})
+
+    def test_version_pin_implies_stable_channel(self):
+        """--version routes to stable even when --channel is left at the edge default,
+        so the pin is honored instead of silently running an edge git-pull."""
+        self._seed_installed()
+        http = self._patch_http(_FakeHTTP(tag="v9.9.9"))
+        # channel defaults to 'edge'; ONLY --version is supplied.
+        result = herdres.update_once(_args(version="v9.9.9"))
+        self.assertEqual(result["channel"], "stable")
+        self.assertEqual(result["action"], "update")
+        self.assertTrue(
+            any(u.endswith("/releases/tags/v9.9.9") for u in http.calls), http.calls
+        )
+        self.assertIn('HERDRES_VERSION = "9.9.9"', (self.bin / "herdres").read_text())
+
+    def test_stable_pinned_downgrade_bypasses_up_to_date_guard(self):
+        """A --version pin is an explicit, intentional target: it applies even when
+        older than the installed version, unlike an unpinned 'latest'."""
+        self._seed_installed()
+        self._patch_http(_FakeHTTP(tag="v0.1.0", tarball=self._old_release("0.1.0")))
+        self.router.new_version = "0.1.0"  # the freshly-installed binary now reports 0.1.0
+        result = herdres.update_once(_args(version="v0.1.0"))
+        self.assertEqual(result["action"], "update")
+        self.assertEqual(result["version"], "0.1.0")
+        self.assertIn('HERDRES_VERSION = "0.1.0"', (self.bin / "herdres").read_text())
+
 
 class StableFetchHelperTests(UpdateTestBase):
     """Direct unit tests for the fetch building blocks (verify + safe-extract)."""
@@ -837,6 +887,23 @@ class StableFetchHelperTests(UpdateTestBase):
         blob = b"world"
         digest = hashlib.sha256(blob).hexdigest()
         self.assertEqual(herdres._verify_sha256(blob, digest, "x"), digest)
+
+    def test_strip_v_drops_one_leading_v_only(self):
+        self.assertEqual(herdres._strip_v("v0.3.0"), "0.3.0")
+        self.assertEqual(herdres._strip_v("0.3.0"), "0.3.0")
+        # Only ONE leading v, and nothing from the middle (unlike str.lstrip("v")).
+        self.assertEqual(herdres._strip_v("v1.2.3-victory"), "1.2.3-victory")
+
+    def test_version_key_orders_numerically(self):
+        key = herdres._version_key
+        self.assertEqual(key("0.3.0"), (0, 3, 0))
+        self.assertEqual(key("v0.3.0"), (0, 3, 0))
+        # Pre-release suffix stops the component; compares by released parts.
+        self.assertEqual(key("0.3.0-rc1"), (0, 3, 0))
+        # 0.10.0 must sort ABOVE 0.9.0 (numeric, not lexical).
+        self.assertGreater(key("0.10.0"), key("0.9.0"))
+        self.assertGreater(key("1.0.0"), key("0.99.0"))
+        self.assertLess(key("0.2.0"), key("0.3.0"))
 
     def test_safe_extract_rejects_traversal(self):
         evil = io.BytesIO()
