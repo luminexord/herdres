@@ -141,17 +141,17 @@ herdres update --edge               # track main from your local checkout
 
 - **`--stable`** downloads the latest GitHub **Release** (asset `herdres-<tag>.tar.gz`), **verifies its SHA256** against the published `herdres-<tag>.tar.gz.sha256`, then applies it through the same backup → atomic env-preserving replace → restart → rollback engine. This is the recommended path once releases exist. The repo is public, so no token is needed; point at a fork with `HERDRES_REPO=<owner>/<repo>`.
 - **`--version vX.Y.Z`** pins to a specific release tag (and implies `--stable`); without it, `--stable` takes the newest release and does nothing if you are already at or ahead of it.
-- **`--edge`** tracks `main` via your local checkout (the source marker above). This is the **default today**; the default flips from `edge` to `stable` once the first release is published.
+- **`--edge`** tracks `main` via your local checkout (the source marker above). This is the **default today**; we'll flip the default to `stable` in a follow-up once the first release is published.
 
 ### Cutting a release (maintainers)
 
 ```bash
 # bump HERDRES_VERSION in herdres.py to X.Y.Z, commit, then:
 git tag vX.Y.Z && git push origin vX.Y.Z
-# CI runs the tests, builds herdres-vX.Y.Z.tar.gz + .sha256, and publishes the GitHub Release.
+# CI runs the tests, builds herdres-vX.Y.Z.tar.gz + herdres-vX.Y.Z.tar.gz.sha256, and publishes the GitHub Release.
 ```
 
-The tag must match `HERDRES_VERSION` (`v0.3.0` ⟺ `0.3.0`) or the release workflow fails. Pre-release tags (e.g. `v0.3.0-rc1`) publish as pre-releases.
+The tag must exactly match `HERDRES_VERSION` (`v0.3.0` ⟺ `0.3.0`) or the release workflow fails, so cut releases from plain semver tags.
 
 ## Pane Thread Commands
 
