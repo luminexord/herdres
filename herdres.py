@@ -214,6 +214,12 @@ FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "16000"))
 FINAL_REPLY_MAX_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES", "140"))
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
+# Default per-space prompt-collapse threshold (see space_prompt_collapse_chars):
+# 0 = never collapse, 1 = always collapse, N>1 = collapse when the prompt exceeds N
+# chars. Default to a threshold so long agent-to-agent echoes collapse while short
+# human one-liners stay expanded.
+PROMPT_COLLAPSE_CHARS_DEFAULT = int(os.getenv("HERDR_TELEGRAM_TOPICS_PROMPT_COLLAPSE_CHARS", "200"))
+PROMPT_PREVIEW_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PROMPT_PREVIEW_CHARS", "60"))
 INTERACTION_READONLY_WARNING_TITLE = "⚠️ Manual action required"
 INTERACTION_READONLY_WARNING_BODY = (
     "This structured prompt cannot be answered from Telegram yet. Open Herdr and answer it there."
@@ -716,6 +722,26 @@ def space_voice_mode(state: dict[str, Any], pane_or_entry: dict[str, Any] | None
 
 def managed_voice_enabled_for_space(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> bool:
     return space_voice_mode(state, pane_or_entry) == "per_agent"
+
+
+def space_prompt_collapse_chars(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> int:
+    """Per-space threshold controlling whether the echoed "User:" prompt block is
+    collapsed by default in a turn message: 0 = never collapse (always expanded),
+    1 = always collapse, N>1 = collapse only when the prompt is longer than N chars.
+    Defaults to PROMPT_COLLAPSE_CHARS_DEFAULT (a threshold) so long agent-to-agent
+    prompt echoes collapse while short human one-liners stay expanded."""
+    default = PROMPT_COLLAPSE_CHARS_DEFAULT
+    if not isinstance(pane_or_entry, dict):
+        return default
+    key = str(pane_or_entry.get("space_key") or "") or space_key(pane_or_entry)
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    space = spaces.get(key)
+    if isinstance(space, dict) and space.get("prompt_collapse_chars") is not None:
+        try:
+            return max(0, int(space.get("prompt_collapse_chars")))
+        except (TypeError, ValueError):
+            return default
+    return default
 
 
 def refresh_entry_managed_voice(state: dict[str, Any], entry: dict[str, Any], pane: dict[str, Any] | None = None) -> None:
@@ -4091,11 +4117,45 @@ def _blockquote_text(value: str, max_chars: int) -> str:
     return "<br>".join(_rich_inline(line, max_chars) for line in lines)
 
 
-def render_user_prompt_quote_html(user_text: str) -> str:
+def _prompt_should_collapse(user_text: str, collapse_chars: int) -> bool:
+    if collapse_chars <= 0:
+        return False  # 0 (or negative) = never collapse
+    if collapse_chars == 1:
+        return True   # 1 = always collapse
+    return len(str(user_text or "")) > collapse_chars  # N>1 = threshold
+
+
+def _item_prompt_collapse_chars(item: dict[str, Any]) -> int:
+    try:
+        return max(0, int(item.get("prompt_collapse_chars") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _prompt_preview(user_text: str) -> str:
+    # First non-empty line of the prompt, trimmed to a short scannable preview.
+    for line in str(user_text or "").splitlines():
+        line = line.strip()
+        if line:
+            return line[:PROMPT_PREVIEW_CHARS]
+    return ""
+
+
+def render_user_prompt_quote_html(user_text: str, collapse_chars: int = 0) -> str:
     body = _blockquote_text(user_text, USER_PROMPT_MAX_CHARS).strip()
     if not body:
         return ""
-    return _rich_details_quote_html(USER_PROMPT_LABEL, body, summary_max_chars=20)
+    collapse = _prompt_should_collapse(user_text, collapse_chars)
+    # When collapsed, surface a short preview in the summary so the prompt is
+    # recognizable without expanding (e.g. "User: look into the emoji…").
+    preview = _prompt_preview(user_text) if collapse else ""
+    return _rich_details_quote_html(
+        USER_PROMPT_LABEL,
+        body,
+        summary_max_chars=20,
+        open_by_default=not collapse,
+        preview=preview,
+    )
 
 
 def _rich_details_quote_html(
@@ -4105,17 +4165,24 @@ def _rich_details_quote_html(
     summary_max_chars: int = 80,
     open_by_default: bool = True,
     quote: bool = True,
+    preview: str = "",
 ) -> str:
     body = str(body_html or "").strip()
     if not body:
         return ""
     label = _html_text(summary, summary_max_chars)
     open_attr = " open" if open_by_default else ""
+    # An optional preview rides AFTER the bold label inside the summary so a
+    # collapsed block is recognizable at a glance: <summary><b>User:</b> preview…</summary>
+    preview_html = ""
+    preview = str(preview or "").strip()
+    if preview:
+        preview_html = " " + _html_text(preview, PROMPT_PREVIEW_CHARS + 6)
     # quote=True wraps the body in a <blockquote> (the blue quote) — used for the
     # user prompt and worklog. quote=False keeps the body un-flattened so rich
     # content (headings/tables/code) renders properly — used for the response.
     inner = f"<blockquote>{body}</blockquote>" if quote else body
-    return f"<details{open_attr}><summary><b>{label}</b></summary>{inner}</details>"
+    return f"<details{open_attr}><summary><b>{label}</b>{preview_html}</summary>{inner}</details>"
 
 
 TURN_COLLAPSED_SECTION_KEYS = {"proof", "logs", "commands", "diff", "raw output", "raw"}
@@ -4678,9 +4745,10 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     worklog_text = str(item.get("worklog_text") or item.get("assistant_stream_text") or "").strip()
     worklog_label = str(item.get("worklog_label") or WORKLOG_LABEL).strip() or WORKLOG_LABEL
     assistant_final = str(item.get("assistant_final_text") or "").strip()
+    collapse_chars = _item_prompt_collapse_chars(item)
     parts: list[str] = []
     if user_text:
-        parts.append(render_user_prompt_quote_html(user_text))
+        parts.append(render_user_prompt_quote_html(user_text, collapse_chars))
     worklog_html = render_worklog_quote_html(worklog_text, response_available=bool(assistant_final), label=worklog_label)
     if worklog_html:
         parts.append(worklog_html)
@@ -4691,7 +4759,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     if len(rendered) > MAX_RICH_HTML_CHARS:
         quote_html = ""
         if user_text:
-            quote_html = render_user_prompt_quote_html(user_text)
+            quote_html = render_user_prompt_quote_html(user_text, collapse_chars)
         worklog_html = ""
         if worklog_text:
             worklog_body = _turn_fallback_body_html(worklog_text, len(quote_html) + 120)
@@ -4717,7 +4785,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     return rendered
 
 
-def render_stream_turn_html(user_text: str, worklog_text: str, *, worklog_label: str = WORKLOG_LABEL) -> str:
+def render_stream_turn_html(user_text: str, worklog_text: str, *, worklog_label: str = WORKLOG_LABEL, collapse_chars: int = 0) -> str:
     clean_user = sanitize_text(str(user_text or ""), USER_PROMPT_MAX_CHARS).strip()
     clean_worklog = sanitize_text(str(worklog_text or ""), MAX_REPLY_CHARS).strip()
     if clean_user:
@@ -4728,6 +4796,7 @@ def render_stream_turn_html(user_text: str, worklog_text: str, *, worklog_label:
                 "worklog_text": clean_worklog,
                 "worklog_label": worklog_label,
                 "assistant_final_text": "",
+                "prompt_collapse_chars": collapse_chars,
             }
         )
     return render_worklog_quote_html(clean_worklog, response_available=False, label=worklog_label)
@@ -4740,7 +4809,7 @@ def render_decision_item_html(item: dict[str, Any]) -> str:
     options = list(item.get("options") or [])
     parts: list[str] = []
     if user_text:
-        parts.append(render_user_prompt_quote_html(user_text))
+        parts.append(render_user_prompt_quote_html(user_text, _item_prompt_collapse_chars(item)))
     if assistant_context:
         context_html = render_assistant_response_quote_html(assistant_context)
         if context_html:
@@ -4767,7 +4836,7 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
     answers = item.get("answers") if isinstance(item.get("answers"), dict) else {}
     parts: list[str] = []
     if user_text:
-        parts.append(render_user_prompt_quote_html(user_text))
+        parts.append(render_user_prompt_quote_html(user_text, _item_prompt_collapse_chars(item)))
     if assistant_context:
         context_html = render_assistant_response_quote_html(assistant_context)
         if context_html:
@@ -4812,7 +4881,7 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
     if kind == "prompt":
         prompt = str(item.get("user_text") or item.get("summary") or "").strip()
-        return render_user_prompt_quote_html(prompt)
+        return render_user_prompt_quote_html(prompt, _item_prompt_collapse_chars(item))
     if kind == "turn":
         return render_turn_item_html(item)
     if kind == "decision":
@@ -7631,7 +7700,7 @@ def send_stream_draft(
         str(entry.get("pane_key") or ""),
         str(turn_id),
     )
-    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)))
+    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
     result = send_rich_message_draft(
         chat_id,
         html_text,
@@ -7681,7 +7750,7 @@ def send_stream_message(
     if throttle_reason:
         return {"ok": True, "skipped": True, "reason": throttle_reason, "hash": text_hash, "format": "message"}
 
-    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)))
+    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
     fallback_text = html_to_plain(html_text)
     message_id = ""
     stream_message_id = str(entry.get("last_stream_message_id") or "")
@@ -9798,6 +9867,11 @@ def _sync_pane_clean_feed(
         # and scraping a transiently-done/idle pane sends a malformed blob and
         # breaks the settle loop. Visible prompts surface on the timer path.
         item = extract_turn_feed_item(pane, entry, allow_visible_fallback=not turn_only)
+        if isinstance(item, dict):
+            # Carry the per-space prompt-collapse setting (resolved onto the entry in
+            # sync_pane_once) onto the feed item so the renderer collapses the echoed
+            # prompt accordingly.
+            item["prompt_collapse_chars"] = int(entry.get("prompt_collapse_chars") or 0)
         after_turn_state = (
             entry.get("last_turn_available"),
             entry.get("last_turn_reason"),
@@ -10159,6 +10233,7 @@ def sync_pane_once(
     key, entry, new_entry = ensure_pane_entry(state, pane)
     changed = bool(new_entry)
     refresh_entry_managed_voice(state, entry, pane)
+    entry["prompt_collapse_chars"] = space_prompt_collapse_chars(state, entry)
     entry["last_seen_at"] = utc_now()
     entry["last_known_status"] = str(pane.get("agent_status") or "unknown")
     max_creates = int(caps.get("max_creates", MAX_CREATES_PER_RUN))
