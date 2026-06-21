@@ -19,6 +19,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import http.client
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-HERDRES_VERSION = "0.2.0"
+HERDRES_VERSION = "0.3.0"
 
 DEFAULT_STATE = Path.home() / ".local/share/herdres/state.json"
 DEFAULT_ENV = Path(os.getenv("HERDRES_ENV", str(Path.home() / ".config/herdres/herdres.env"))).expanduser()
@@ -12650,6 +12651,13 @@ def setup_write_env(updates: dict[str, str]) -> Path:
 # absolute checkout path here so `update --edge` knows where to `git pull`.
 SOURCE_MARKER = Path.home() / ".local/share/herdres/source"
 
+# GitHub "owner/repo" the stable channel pulls SHA256-verified release tarballs from. The
+# RELEASE-ASSET contract (Issue #13 Phase 3): each release publishes
+# `herdres-<tag>.tar.gz` + `herdres-<tag>.tar.gz.sha256`; the tarball expands to a
+# source checkout (a tree containing herdres.py + the install-set files). Overridable
+# via HERDRES_REPO so a fork can self-host releases.
+HERDRES_REPO = os.getenv("HERDRES_REPO", "luminexord/herdres")
+
 # Install destination roots. Module-level so tests can monkeypatch them onto a
 # temp filesystem without touching the real ~/.local or ~/.config.
 INSTALL_BIN_DIR = Path.home() / ".local/bin"
@@ -12753,6 +12761,38 @@ def _read_version_from(path: Path) -> str | None:
     except OSError:
         return None
     return _parse_version(text)
+
+
+def _strip_v(tag: str) -> str:
+    """Drop a single leading ``v`` from a release tag (``v0.3.0`` -> ``0.3.0``).
+
+    Unlike ``str.lstrip("v")`` this strips at most one leading ``v`` and never eats
+    characters from the middle, so an odd tag like ``v0.3.0`` is handled exactly.
+    """
+    text = str(tag or "")
+    return text[1:] if text[:1] == "v" else text
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    """A numeric, orderable key for a dotted version (``0.3.0`` -> ``(0, 3, 0)``).
+
+    Leading digits of each dot-separated component are taken; a non-numeric or
+    pre-release suffix stops that component (``0.3.0-rc1`` -> ``(0, 3, 0)``). This is
+    a released-components compare — enough for the stable channel to refuse a
+    downgrade — not a full PEP 440 / semver ordering.
+    """
+    parts: list[int] = []
+    for chunk in _strip_v(version).strip().split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
 
 
 def _read_remote_version(repo: Path) -> str | None:
@@ -13108,13 +13148,333 @@ def _verify_install(expected_version: str, gateway_was_active: bool) -> dict[str
     return {"version": new_version, "warnings": warnings}
 
 
+# ---------------------------------------------------------------------------
+# stable channel — SHA256-verified GitHub-release tarballs (Issue #13 Phase 3)
+# ---------------------------------------------------------------------------
+
+# RELEASE-ASSET contract: a release publishes exactly these two assets, named off
+# the tag, so the fetcher and the release CI agree on the names.
+def _release_tarball_name(tag: str) -> str:
+    return f"herdres-{tag}.tar.gz"
+
+
+def _release_sha_name(tag: str) -> str:
+    return f"{_release_tarball_name(tag)}.sha256"
+
+
+def _http_get(url: str, *, accept: str = "application/octet-stream") -> bytes:
+    """GET a URL, returning the raw body. stdlib-only; raises BridgeError on failure.
+
+    A User-Agent is required by the GitHub API (it 403s a missing one); an optional
+    GITHUB_TOKEN is forwarded so rate-limited / private-fork fetches still work.
+    """
+    req = urllib.request.Request(url, headers={
+        "Accept": accept,
+        "User-Agent": f"herdres/{HERDRES_VERSION}",
+    })
+    token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        raise BridgeError(
+            f"herdres update: GET {url} failed (HTTP {exc.code} {exc.reason})"
+        ) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise BridgeError(f"herdres update: GET {url} failed ({exc})") from exc
+
+
+def _release_metadata(tag: str | None) -> dict[str, Any]:
+    """Fetch a release's JSON from the GitHub Releases API.
+
+    ``tag`` pins a specific release (``--version``); ``None`` resolves "latest".
+    Returns the parsed release object (which carries ``tag_name`` + ``assets``).
+    """
+    base = f"https://api.github.com/repos/{HERDRES_REPO}/releases"
+    # Percent-encode the (user-supplied via --version) tag so an odd tag can't break
+    # out of the path or inject query params into the API URL.
+    url = f"{base}/tags/{urllib.parse.quote(str(tag), safe='')}" if tag else f"{base}/latest"
+    body = _http_get(url, accept="application/vnd.github+json")
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BridgeError(f"herdres update: bad release JSON from {url} ({exc})") from exc
+    if not isinstance(data, dict) or not data.get("tag_name"):
+        raise BridgeError(
+            f"herdres update: no release found ({'tag ' + tag if tag else 'latest'}) "
+            f"for {HERDRES_REPO}"
+        )
+    return data
+
+
+def _asset_url(release: dict[str, Any], name: str) -> str:
+    """The browser_download_url for an asset named ``name`` in ``release``.
+
+    Falls back to the conventional release-download URL if the API listing does not
+    surface the asset (so a correctly-named-but-unlisted asset still resolves).
+    """
+    for asset in release.get("assets") or []:
+        if isinstance(asset, dict) and asset.get("name") == name and asset.get("browser_download_url"):
+            return str(asset["browser_download_url"])
+    tag = release["tag_name"]
+    return f"https://github.com/{HERDRES_REPO}/releases/download/{tag}/{name}"
+
+
+def _verify_sha256(blob: bytes, sha_text: str, name: str) -> str:
+    """Verify ``blob``'s sha256 against the ``.sha256`` asset; return the digest.
+
+    The .sha256 asset is a ``sha256sum`` line (``<hex>  <filename>``) or a bare hex
+    digest. Raises BridgeError on mismatch so a corrupted/tampered tarball is never
+    extracted.
+    """
+    expected = (sha_text or "").strip().split()[0].lower() if sha_text.strip() else ""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise BridgeError(f"herdres update: malformed sha256 for {name}: {sha_text!r}")
+    actual = hashlib.sha256(blob).hexdigest()
+    if actual != expected:
+        raise BridgeError(
+            f"herdres update: sha256 mismatch for {name} "
+            f"(expected {expected}, got {actual}) — refusing to install"
+        )
+    return actual
+
+
+def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
+    """Extract a tarball, refusing any member that escapes ``dest`` (zip-slip guard).
+
+    Rejects absolute paths, ``..`` traversal, and symlink/hardlink members pointing
+    outside the destination, so a hostile tarball cannot write outside the temp dir.
+    """
+    dest = dest.resolve()
+    for member in tar.getmembers():
+        target = (dest / member.name).resolve()
+        if target != dest and dest not in target.parents:
+            raise BridgeError(f"herdres update: refusing unsafe tar member {member.name!r}")
+        if member.issym() or member.islnk():
+            # A symlink's linkname is relative to the link's own directory; a hardlink's
+            # linkname is a path relative to the archive root (dest). Resolve each
+            # against the correct base before checking it stays inside dest.
+            base = target.parent if member.issym() else dest
+            link_target = (base / member.linkname).resolve()
+            if link_target != dest and dest not in link_target.parents:
+                raise BridgeError(f"herdres update: refusing unsafe tar link {member.name!r}")
+    # filter="data" (Python 3.12+) is the hardened extraction filter: it strips
+    # setuid/dev/absolute paths as defense-in-depth on top of the checks above. Fall
+    # back to a bare extractall on older interpreters that lack the keyword.
+    try:
+        tar.extractall(dest, filter="data")
+    except TypeError:  # pragma: no cover - only on Python < 3.12
+        tar.extractall(dest)
+
+
+def _source_root(extract_dir: Path) -> Path:
+    """Locate the checkout root inside an extracted tarball (the dir with herdres.py).
+
+    A release tarball commonly wraps everything in a single top-level prefix dir
+    (e.g. ``herdres-0.3.0/``); accept either that or a flat layout.
+    """
+    if (extract_dir / "herdres.py").exists():
+        return extract_dir
+    for child in sorted(extract_dir.iterdir()):
+        if child.is_dir() and (child / "herdres.py").exists():
+            return child
+    raise BridgeError("herdres update: release tarball does not contain herdres.py")
+
+
+def _fetch_stable(tag: str | None, work_dir: Path) -> tuple[Path, str]:
+    """Download + verify + extract a stable release into ``work_dir``.
+
+    Resolves the release (pinned ``tag`` or latest), downloads the
+    ``herdres-<tag>.tar.gz`` + ``.sha256`` assets, verifies the SHA256, and extracts
+    the tarball under ``work_dir``. Returns ``(source_root, resolved_tag)`` where
+    ``source_root`` is a checkout the edge apply path can consume unchanged.
+    """
+    release = _release_metadata(tag)
+    resolved_tag = str(release["tag_name"])
+    tarball_name = _release_tarball_name(resolved_tag)
+    sha_name = _release_sha_name(resolved_tag)
+
+    tarball = _http_get(_asset_url(release, tarball_name))
+    sha_blob = _http_get(_asset_url(release, sha_name))
+    _verify_sha256(tarball, sha_blob.decode("utf-8", "replace"), tarball_name)
+
+    tar_path = work_dir / tarball_name
+    tar_path.write_bytes(tarball)
+    extract_dir = work_dir / "extract"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(tar_path, "r:gz") as tar:
+            _safe_extract(tar, extract_dir)
+    except tarfile.TarError as exc:
+        raise BridgeError(f"herdres update: cannot read release tarball {tarball_name} ({exc})") from exc
+    return _source_root(extract_dir), resolved_tag
+
+
+def _apply_from_source(
+    repo: Path,
+    *,
+    channel: str,
+    current: str,
+    available: str,
+    no_restart: bool,
+    head: str,
+) -> dict[str, Any]:
+    """Backup -> apply -> restart -> verify, rolling back on any failure.
+
+    Shared by the edge (git checkout) and stable (extracted release) apply paths:
+    once a source ``repo`` dir exists, the env-safe replace + service re-lease +
+    verify + rollback are identical. ``head`` is the source revision/tag recorded in
+    the result. Returns the standard update result dict.
+    """
+    # Snapshot gateway liveness before we touch anything so verify can assert it
+    # comes back (a dead inbound after the restart means we must roll back).
+    gateway_was_active = False if no_restart else _gateway_is_active()
+
+    backup = _backup_install_set()
+    try:
+        written = _apply_install_set(repo)
+        # _restart_services raises if a previously-active gateway can't be brought
+        # back; that propagates here and rolls back. (--no-restart skips it; the
+        # operator restarts manually later.)
+        if no_restart:
+            service_actions = ["(restart skipped: --no-restart)"]
+        else:
+            service_actions = _restart_services()
+        verify = _verify_install(available, gateway_was_active)
+    except Exception as exc:
+        # Roll back when: a file replace errors, the new binary fails to run / version
+        # mismatches, or the gateway fails to come back. (A soft dry-run sync failure
+        # only warns and never reaches here.)
+        try:
+            _restore_backup(backup)
+            if not no_restart:
+                _restart_services()
+        except Exception as restore_exc:  # pragma: no cover - best-effort restore
+            raise BridgeError(
+                f"herdres update FAILED and rollback also failed: {exc}; rollback: {restore_exc}"
+            ) from exc
+        raise BridgeError(f"herdres update failed (rolled back): {exc}") from exc
+
+    result = {
+        "ok": True,
+        "action": "update",
+        "channel": channel,
+        "source": str(repo),
+        "previous_version": current,
+        "version": verify["version"] or available,
+        "backup": str(backup),
+        "files": written,
+        "services": service_actions,
+        "head": head,
+    }
+    warnings = list(verify["warnings"])
+    if no_restart:
+        warnings.append(
+            "services not restarted (--no-restart): run 'systemctl --user daemon-reload "
+            "&& systemctl --user restart herdres.timer' and re-enable the gateway to apply"
+        )
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
+def _update_stable(args: Any, *, no_restart: bool) -> dict[str, Any]:
+    """The stable channel: --check / --dry-run / apply against a checksum-verified release.
+
+    ``--version <tag>`` pins a release; otherwise "latest" is used. The release
+    tarball is fetched + sha256-verified + extracted to a temp dir, then the SAME
+    env-safe apply/restart/verify/rollback as edge runs against it.
+    """
+    current = HERDRES_VERSION
+    pinned = str(getattr(args, "version", "") or "").strip() or None
+
+    # --check: resolve the release version only; download nothing, apply nothing.
+    if getattr(args, "check", False):
+        release = _release_metadata(pinned)
+        available_version = _strip_v(str(release["tag_name"]))
+        return {
+            "ok": True,
+            "action": "check",
+            "channel": "stable",
+            "source": HERDRES_REPO,
+            "current_version": current,
+            "available_version": available_version,
+            "tag": str(release["tag_name"]),
+            # Numeric semver compare: only a strictly-newer release is an update.
+            "update_available": _version_key(available_version) > _version_key(current),
+            "needs_upstream": False,
+            "fetch_ok": True,
+        }
+
+    # --dry-run: describe the plan (resolve the tag so the operator sees the target),
+    # but download/extract/apply nothing.
+    if getattr(args, "dry_run", False):
+        release = _release_metadata(pinned)
+        files = [str(entry["dest"]) for entry in _update_files_plan()]
+        service_actions = (
+            ["launchctl bootout+bootstrap herdres + gateway + cockpit agents"]
+            if _platform_is_macos()
+            else [
+                "systemctl --user daemon-reload",
+                "systemctl --user restart herdres.timer",
+                "systemctl --user disable --now then enable --now herdres-gateway.service",
+            ]
+        )
+        return {
+            "ok": True,
+            "action": "dry-run",
+            "channel": "stable",
+            "source": HERDRES_REPO,
+            "current_version": current,
+            "target_version": _strip_v(str(release["tag_name"])),
+            "tag": str(release["tag_name"]),
+            "files": files,
+            "services": service_actions,
+        }
+
+    # --- stable apply: fetch + verify + extract into a temp dir, then apply. The temp
+    # dir is removed once the install-set files have been copied into place.
+    with tempfile.TemporaryDirectory(prefix="herdres-stable-") as work:
+        repo, resolved_tag = _fetch_stable(pinned, Path(work))
+        available = _read_version_from(repo / "herdres.py") or _strip_v(resolved_tag)
+        # Refuse to go backwards on an unpinned "latest" update: if the installed
+        # version is already >= the latest release, apply nothing (a yanked/older
+        # "latest", or a box already ahead, must not be silently downgraded). A
+        # --version pin is an explicit, intentional target (incl. a deliberate
+        # downgrade), so it bypasses this guard.
+        if pinned is None and _version_key(available) <= _version_key(current):
+            return {
+                "ok": True,
+                "action": "up-to-date",
+                "channel": "stable",
+                "source": HERDRES_REPO,
+                "current_version": current,
+                "available_version": available,
+                "tag": resolved_tag,
+            }
+        return _apply_from_source(
+            repo,
+            channel="stable",
+            current=current,
+            available=available,
+            no_restart=no_restart,
+            head=resolved_tag,
+        )
+
+
 def update_once(args: Any) -> dict[str, Any]:
     """Self-update entry point. Returns the standard ``{"ok": ...}`` dict."""
     channel = str(getattr(args, "channel", "edge") or "edge").strip()
-    if channel == "stable":
-        raise BridgeError("stable channel needs releases (#13 Phase 3)")
-    if channel != "edge":
-        raise BridgeError(f"herdres update: unknown channel {channel!r} (use edge)")
+    # A pinned --version tag can only be honored by the stable channel (edge tracks a
+    # local checkout, which can't fetch an arbitrary release), so --version implies
+    # --stable. Without this, `herdres update --version vX` would silently run an edge
+    # git-pull and drop the pin.
+    if str(getattr(args, "version", "") or "").strip():
+        channel = "stable"
+    if channel not in {"edge", "stable"}:
+        raise BridgeError(f"herdres update: unknown channel {channel!r} (use edge or stable)")
 
     # --no-restart (or HERDRES_UPDATE_SKIP_RESTART=1): swap files but skip the service
     # restart — useful for "update now, restart later" and for sandboxed e2e tests
@@ -13145,6 +13505,11 @@ def update_once(args: Any) -> dict[str, Any]:
             "services": actions,
         }
 
+    # stable channel: source is a SHA256-verified GitHub release, not a local git checkout.
+    if channel == "stable":
+        return _update_stable(args, no_restart=no_restart)
+
+    # --- edge channel: source is a local git checkout we `git pull --ff-only`. ---
     repo = _resolve_source(args)
     current = HERDRES_VERSION
     available = _read_version_from(repo / "herdres.py") or current
@@ -13215,56 +13580,14 @@ def update_once(args: Any) -> dict[str, Any]:
     # Re-read the target version after the fast-forward.
     available = _read_version_from(repo / "herdres.py") or available
 
-    # Snapshot gateway liveness before we touch anything so verify can assert it
-    # comes back (a dead inbound after the restart means we must roll back).
-    gateway_was_active = False if no_restart else _gateway_is_active()
-
-    backup = _backup_install_set()
-    try:
-        written = _apply_install_set(repo)
-        # _restart_services raises if a previously-active gateway can't be brought
-        # back; that propagates here and rolls back. (--no-restart skips it; the
-        # operator restarts manually later.)
-        if no_restart:
-            service_actions = ["(restart skipped: --no-restart)"]
-        else:
-            service_actions = _restart_services()
-        verify = _verify_install(available, gateway_was_active)
-    except Exception as exc:
-        # Roll back when: a file replace errors, the new binary fails to run / version
-        # mismatches, or the gateway fails to come back. (A soft dry-run sync failure
-        # only warns and never reaches here.)
-        try:
-            _restore_backup(backup)
-            if not no_restart:
-                _restart_services()
-        except Exception as restore_exc:  # pragma: no cover - best-effort restore
-            raise BridgeError(
-                f"herdres update FAILED and rollback also failed: {exc}; rollback: {restore_exc}"
-            ) from exc
-        raise BridgeError(f"herdres update failed (rolled back): {exc}") from exc
-
-    result = {
-        "ok": True,
-        "action": "update",
-        "channel": channel,
-        "source": str(repo),
-        "previous_version": current,
-        "version": verify["version"] or available,
-        "backup": str(backup),
-        "files": written,
-        "services": service_actions,
-        "head": _git_rev(repo, "HEAD"),
-    }
-    warnings = list(verify["warnings"])
-    if no_restart:
-        warnings.append(
-            "services not restarted (--no-restart): run 'systemctl --user daemon-reload "
-            "&& systemctl --user restart herdres.timer' and re-enable the gateway to apply"
-        )
-    if warnings:
-        result["warnings"] = warnings
-    return result
+    return _apply_from_source(
+        repo,
+        channel="edge",
+        current=current,
+        available=available,
+        no_restart=no_restart,
+        head=_git_rev(repo, "HEAD"),
+    )
 
 
 def version_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
@@ -13294,6 +13617,9 @@ def main() -> int:
     update = sub.add_parser("update")
     update.add_argument("--channel", default="edge")
     update.add_argument("--edge", action="store_const", const="edge", dest="channel")
+    update.add_argument("--stable", action="store_const", const="stable", dest="channel")
+    update.add_argument("--version", dest="version", default="",
+                        help="(stable channel) pin a release tag instead of latest")
     update.add_argument("--repo", default="")
     update.add_argument("--check", action="store_true")
     update.add_argument("--rollback", action="store_true")
