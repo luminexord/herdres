@@ -21,6 +21,10 @@ from unittest.mock import patch
 
 import herdres
 
+# The real load_dotenv, captured before setUp patches the module global with a
+# no-op. One test (the load_dotenv precedence test) re-installs it on purpose.
+_REAL_LOAD_DOTENV = herdres.load_dotenv
+
 # A token that satisfies SETUP_TOKEN_RE (^\d+:[A-Za-z0-9_-]{30,}$).
 GOOD_TOKEN = "123456:" + "A" * 35
 HERMES_TOKEN = "999999:" + "H" * 35
@@ -208,6 +212,81 @@ class SetupWizardTests(unittest.TestCase):
         self.assertEqual(
             sum(1 for ln in text.splitlines() if ln.startswith("TELEGRAM_BOT_TOKEN=")), 1
         )
+
+    def test_duplicate_target_key_lines_are_all_dropped(self):
+        # A file with TWO stale TELEGRAM_BOT_TOKEN lines: both must be replaced by
+        # a single new line, with no stale copy surviving on disk.
+        self.env_path.write_text(
+            "TELEGRAM_BOT_TOKEN=old1:tokenoldoldoldoldoldoldoldoldoldold\n"
+            "HERDR_BIN=herdr\n"
+            "TELEGRAM_BOT_TOKEN=old2:tokenoldoldoldoldoldoldoldoldoldold\n",
+            encoding="utf-8",
+        )
+        with patch.object(herdres.sys.stdin, "isatty", return_value=False), \
+             patch.object(herdres, "telegram_api", side_effect=_preflight_ok):
+            herdres.setup_once(_args(
+                bot_token=GOOD_TOKEN, chat_id=GOOD_CHAT_ID, allowed_users=GOOD_USERS,
+            ))
+        text = self.env_path.read_text()
+        self.assertNotIn("old1:token", text)
+        self.assertNotIn("old2:token", text, "second stale token line must not survive")
+        self.assertIn("HERDR_BIN=herdr", text)
+        self.assertEqual(
+            sum(1 for ln in text.splitlines() if ln.startswith("TELEGRAM_BOT_TOKEN=")),
+            1,
+            "exactly one TELEGRAM_BOT_TOKEN line must remain",
+        )
+        self.assertIn(f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}", text)
+
+    def test_allowed_users_with_spaces_is_accepted_and_normalized(self):
+        # "123, 456" (spaces after commas) is valid and stored without spaces.
+        with patch.object(herdres.sys.stdin, "isatty", return_value=False), \
+             patch.object(herdres, "telegram_api", side_effect=_preflight_ok):
+            out = herdres.setup_once(_args(
+                bot_token=GOOD_TOKEN, chat_id=GOOD_CHAT_ID, allowed_users="123, 456",
+            ))
+        self.assertEqual(out["result"]["allowed_users"], "123,456")
+        self.assertIn("TELEGRAM_ALLOWED_USERS=123,456", self.env_path.read_text())
+
+    # --- real load_dotenv precedence -----------------------------------------
+
+    def test_injected_token_survives_load_dotenv_during_preflight(self):
+        # Fix #3: with the REAL load_dotenv (not mocked), a token already in
+        # os.environ before preflight must NOT be clobbered by a stale on-disk
+        # herdres.env/.hermes value — _load_dotenv_file's "key not in os.environ"
+        # guard must hold, so preflight verifies the NEW token.
+        stale = "111111:" + "S" * 35
+        # On-disk files carry the STALE token for BOTH keys telegram_token() reads
+        # (HERDRES_OUTBOUND_BOT_TOKEN is preferred, then TELEGRAM_BOT_TOKEN); the
+        # resolved NEW token is GOOD_TOKEN. If the load_dotenv guard failed for
+        # either key, the stale disk value would surface here.
+        self.env_path.write_text(
+            f"HERDRES_OUTBOUND_BOT_TOKEN={stale}\nTELEGRAM_BOT_TOKEN={stale}\n",
+            encoding="utf-8",
+        )
+        self._write_hermes(stale)
+
+        seen_tokens: list[str] = []
+
+        def api(method, payload, **kwargs):
+            # telegram_api is mocked, so resolve the token the real code path would
+            # use (which calls the real load_dotenv) and record it.
+            seen_tokens.append(herdres.telegram_token())
+            return _preflight_ok(method, payload, **kwargs)
+
+        # Restore the REAL load_dotenv for this test only (setUp neutralized it).
+        with patch.object(herdres, "load_dotenv", _REAL_LOAD_DOTENV), \
+             patch.object(herdres.sys.stdin, "isatty", return_value=False), \
+             patch.object(herdres, "telegram_api", side_effect=api):
+            out = herdres.setup_once(_args(
+                bot_token=GOOD_TOKEN, chat_id=GOOD_CHAT_ID, allowed_users=GOOD_USERS,
+            ))
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(seen_tokens, "preflight should have called the Telegram API")
+        # Every preflight call used the injected NEW token, never the stale disk one.
+        self.assertTrue(all(tok == GOOD_TOKEN for tok in seen_tokens), seen_tokens)
+        self.assertNotIn(stale, seen_tokens)
 
     # --- invalid non-interactive values --------------------------------------
 

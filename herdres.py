@@ -10715,7 +10715,7 @@ def with_lock(fn, *, blocking: bool = False):
 
 SETUP_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{30,}$")
 SETUP_CHAT_ID_RE = re.compile(r"^-100\d+$")
-SETUP_ALLOWED_USERS_RE = re.compile(r"^\d+(,\d+)*$")
+SETUP_ALLOWED_USERS_RE = re.compile(r"^\s*\d+(\s*,\s*\d+)*\s*$")
 
 
 def _read_env_value(path: Path, key: str) -> str:
@@ -10824,6 +10824,9 @@ def setup_once(args: Any) -> dict[str, Any]:
         secret=False,
         invalid_hint="expected numeric id(s), e.g. 123456789 or 123,456",
     )
+    # Normalize to bare comma-joined ids ("123, 456" -> "123,456") so the stored
+    # value matches what downstream split-on-comma parsers expect.
+    allowed_users = ",".join(part.strip() for part in allowed_users.split(",") if part.strip())
 
     # No scavenging: if the resolved token is the Hermes token, require explicit
     # opt-in (the --reuse-hermes-token flag or an interactive 'reuse' confirm).
@@ -10885,24 +10888,26 @@ def setup_once(args: Any) -> dict[str, Any]:
 def setup_write_env(updates: dict[str, str]) -> Path:
     """Atomically write the 3 target keys into herdres.env at 0o600.
 
-    Preserves every existing non-target key/line in the file (parse, update the
-    target keys in place, append any that were missing) and writes via a temp
-    file in the same dir + os.replace so the file is never half-written.
+    Preserves every existing non-target key/line in the file. Drops ALL existing
+    lines for a target key (so a stale duplicate of e.g. TELEGRAM_BOT_TOKEN can't
+    survive) and appends each new value exactly once. Writes via a temp file in
+    the same dir + os.replace so the file is never half-written.
     """
     path = DEFAULT_ENV
     path.parent.mkdir(parents=True, exist_ok=True)
-    pending = dict(updates)
+    targets = set(updates)
     lines: list[str] = []
     if path.exists():
         for raw in path.read_text(encoding="utf-8").splitlines():
             stripped = raw.strip()
             if stripped and not stripped.startswith("#") and "=" in stripped:
                 key = stripped.split("=", 1)[0].strip()
-                if key in pending:
-                    lines.append(f"{key}={pending.pop(key)}")
+                # Drop every existing line for a target key (even duplicates), so a
+                # stale second copy can't survive; the new values are appended below.
+                if key in targets:
                     continue
             lines.append(raw)
-    for key, value in pending.items():
+    for key, value in updates.items():
         lines.append(f"{key}={value}")
     payload = "\n".join(lines).rstrip("\n") + "\n"
 
