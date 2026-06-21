@@ -75,7 +75,9 @@ HERDR_TELEGRAM_TOPICS_DRY_RUN=1 ~/.local/bin/herdres sync
 
 ### Version and self-update
 
-`herdres version` prints `HERDRES_VERSION`; `herdres update` does an env-safe self-update (`--channel edge` default, plus `--check`/`--rollback`/`--dry-run`/`--repo`), never overwriting `herdres.env`.
+`herdres version` prints `HERDRES_VERSION`; `herdres update` does an env-safe self-update (`--channel edge` default, plus `--check`/`--rollback`/`--dry-run`/`--repo`), never overwriting `herdres.env`. `herdres update --stable` (or `--version vX.Y.Z`) consumes a GitHub Release: it downloads `herdres-<tag>.tar.gz`, verifies its `.sha256`, and applies it through the same engine.
+
+Releases are cut from manual `vX.Y.Z` tags: pushing a tag triggers `.github/workflows/release.yml`, which runs the tests, checks the tag matches `HERDRES_VERSION` (`v0.3.0` ⟺ `0.3.0`), builds `herdres-<tag>.tar.gz` + `.sha256`, and publishes the GitHub Release.
 
 ## Architecture invariants — respect these when editing
 
