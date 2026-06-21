@@ -1,13 +1,45 @@
-# Managed Pane Bots
+# Managed Pane Bots & "One Space, One Voice"
 
-Managed pane bots give each agent type its own Telegram bot identity, so pane traffic in the forum shows up as "Herdr Codex", "Herdr Claude", and so on instead of all coming from the single manager bot. This reference covers enabling the feature, the setup handshake, token storage, group access, gateway workers, and optional profile photos.
+By **default a space speaks with one voice**: a single **manager bot** posts for every agent in that space, and you address a specific agent by **replying to its message** or with the **`/agents`** picker (per-space topic mode only). Giving each agent type its own Telegram bot identity — so traffic shows up as "Herdr Codex", "Herdr Claude", and so on — is an **opt-in, per-space, reversible upgrade**. This reference covers the voice model, enabling the upgrade, the setup handshake, token storage, group access, gateway workers, and optional profile photos.
 
 For general install and service wiring see SETUP.md. For the command list see COMMANDS.md. For the topic model see TOPICS.md.
 
+## One Space, One Voice (the default)
+
+A **space** (a Herdr workspace, mapped to one forum topic in per-space mode) can hold multiple agents. By default they all share the **manager bot** voice.
+
+- **`voice_mode` is per-space**, stored on the space entry (`space["voice_mode"]`) and **persists across state resets** (including a per-agent⇄per-space topic-mode flip, via `_preserved_voice_mode`).
+  - `"shared"` (**default**) — one manager bot speaks for the whole space.
+  - `"per_agent"` (opt-in) — each agent **type** gets its own managed child bot, when one is available.
+- **`/voice shared|per_agent`** is the reversible per-space setter (`/voice` with no arg prints the current mode). It needs a resolved space; it does not apply in per-agent topic mode, where each topic is already a single pane.
+- **`/agents`** (per-space mode only) shows an inline picker; tapping an agent sets a TTL'd per-user **active pane** (~600s, `HERDR_TELEGRAM_TOPICS_ACTIVE_PANE_TTL`) so subsequent commands in that topic route to it without a reply/@. Reply-to-message and a single live pane still take priority. In per-agent mode `/agents` replies `Only one agent here…`.
+- **`managed_voice_active`** on each pane entry is the **single source of truth** for whether that pane sends via a child bot. `refresh_entry_managed_voice` (run during sync and command handling) reconciles it from `space["voice_mode"]`, **overriding** the env flag. `managed_bot_token_for_entry` reads `managed_voice_active` if present, else falls back to `MANAGED_BOTS_ENABLED`.
+- **Auto-migration:** existing deployments with a live child-bot token registered for a pane are migrated to `voice_mode="per_agent"` on first load (`migrate_space_voice_mode`), preserving multibot behavior so the `1→0` default flip never silently downgrades them. The migration is idempotent and only touches spaces lacking a `voice_mode` that have a live child bot.
+
+## The per-agent upgrade offer (increment 2)
+
+When managed bots are enabled (`HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1`), Herdres posts a **lazy, dismissible** "Give each agent its own bot (optional)" card **once per space** in that space's topic. It is emitted only when **all** hold:
+
+| Condition | Required value |
+|---|---|
+| Managed bots enabled | `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1` |
+| Manager bot can manage bots | `can_manage_bots = true` |
+| Topic mode | per-space (`HERDR_TELEGRAM_TOPICS_PER_AGENT=0`) |
+| Space voice mode | not already `per_agent` |
+| Not dismissed | `multibot_offer_dismissed` unset |
+| Multi-kind space | **≥ 2** distinct agent kinds with open panes |
+| No recent send error | older than `HERDR_TELEGRAM_TOPICS_MULTIBOT_OFFER_RETRY` (default 3600s) |
+
+- **Dismiss** sets `multibot_offer_dismissed=true` and clears the signal — the card never returns for that space.
+- **Upgrade** (`herdr:mb:<space>:up` callback) sets `voice_mode="per_agent"`, refreshes every entry in the space, and shows BotFather links **scoped to that space's agent kinds**. From there it is the same child-bot setup handshake below.
+- You can always switch back later with `/voice shared`.
+
+`MULTIBOT_OFFER_RETRY_SECONDS` is a cooldown before re-attempting a failed offer send, so an undeliverable space (deleted topic, kicked bot) does not burn a send slot every sync.
+
 ## What managed bots are
 
-- The **manager bot** is the single `TELEGRAM_BOT_TOKEN` that runs Herdres. It always exists.
-- A **managed (child) bot** is a separate Telegram bot, one per agent type, created through Telegram's managed-bot API and owned by your manager bot account.
+- The **manager bot** is the single `TELEGRAM_BOT_TOKEN` that runs Herdres. It always exists and is the only voice in `shared` mode.
+- A **managed (child) bot** is a separate Telegram bot, one per agent type, created through Telegram's managed-bot API and owned by your manager bot account. It is used only when the space is in `per_agent` voice mode.
 - Supported agent types: **codex, claude, kimi, omp, devin**. Each maps to a fixed identity:
 
   | Type | Display name | Suggested username |
@@ -23,13 +55,13 @@ For general install and service wiring see SETUP.md. For the command list see CO
 
 ## Enable
 
-Set in `~/.config/herdres/herdres.env`:
+Managed bots are **opt-in**. Set in `~/.config/herdres/herdres.env`:
 
 ```bash
 HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1
 ```
 
-This is the only required toggle. Default is `1` (enabled). Set it to `0` to disable the entire feature: no setup links, no child-bot sends, all traffic stays on the manager bot.
+Default is **`0`** (off) — by default a space speaks with the single shared manager bot and no setup links or child-bot sends ever happen. Set it to `1` to enable the feature **and** the per-agent upgrade offer card above. The env flag only gates the *feature*: which spaces actually use child bots is decided per-space by `voice_mode` / each entry's `managed_voice_active`, so you can leave `=1` and still keep most spaces on the shared voice. Existing deployments with live child bots are auto-migrated to `per_agent` on first load regardless of the flag.
 
 ## How Herdres suggests child bots
 
@@ -41,7 +73,7 @@ Conditions and behavior:
 
 | Condition | Behavior |
 |---|---|
-| `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=0` | No setup message ever posted. |
+| `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=0` (default) | Feature off — no offer card, no setup message, no child-bot sends. |
 | Manager bot lacks `can_manage_bots` | No setup message (Herdres checks `getMe`; managed-bot creation is unavailable on that bot). |
 | No open panes for any supported type | No setup message. |
 | A type already has a stored token | That type is omitted from the suggestion. |
@@ -126,13 +158,13 @@ Photos are cosmetic. Names and short/long descriptions are always set from the f
 
 ## Quick checklist
 
-1. Set `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1` and (optionally) the `*_PHOTO` paths.
+1. Set `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1` (default is `0`) and (optionally) the `*_PHOTO` paths.
 2. Make sure the manager bot can manage bots (Herdres skips setup links otherwise).
-3. Open a pane for each agent type you want a dedicated bot for, then run `sync`.
-4. Tap the "Create … bot" buttons in General and complete Telegram's flow.
+3. Open ≥ 2 agent kinds in a space, then run `sync` — the "Give each agent its own bot (optional)" card appears in that space's topic. Tap **Upgrade** (or run `/voice per_agent`) to flip the space to per-agent voice.
+4. Tap the "Create … bot" buttons and complete Telegram's flow.
 5. Add each new child bot to the forum group.
 6. Confirm the gateway is running (it adds a worker per child token automatically).
-7. Future pane output for that type is sent by its child bot; on any access rejection Herdres falls back to the manager bot and re-prompts you to add the bot to the group.
+7. Future pane output for that type is sent by its child bot; on any access rejection Herdres falls back to the manager bot and re-prompts you to add the bot to the group. Revert anytime with `/voice shared`.
 
 ## Gaps / verify against your deployment
 

@@ -64,6 +64,8 @@ An agent runs **one turn at a time**. So a command issued while the agent is `wo
 | `/raw [lines]` | Sanitized raw visible pane output (default 80 lines, max 160) | Same |
 | `/choices` | Resend the active decision prompt / inline buttons | Same |
 | `/new <kind>` | Split a new pane in this space and launch an agent | Same (operates on the space, not the busy turn) |
+| `/agents` | Inline picker to choose which agent this topic addresses (per-space mode only) | Same |
+| `/voice shared\|per_agent` | Switch this space's Telegram voice (per-space, reversible) | Same |
 | `/debug` | Technical mapping details (pane id, topic, route) | Same |
 | `/help` (alias `/start`) | List these pane commands | Same |
 
@@ -122,7 +124,15 @@ Aliases are accepted (e.g. `gpt`/`openai` → codex, `anthropic` → claude, `mo
 /new codex
 ```
 
-### 2.5 Forwarded agent CLI commands
+### 2.5 Addressing an agent & space voice (`/agents`, `/voice`)
+
+These exist because, by default, a **space speaks with one voice**: in per-space topic mode several agents share one topic and one manager bot. See MANAGED_BOTS.md and TOPICS.md.
+
+**`/agents`** — Show an inline picker of the live agents in this topic. Tapping one sets a **per-user, per-space active pane** with a TTL (`HERDR_TELEGRAM_TOPICS_ACTIVE_PANE_TTL`, default **~600s / 10 min**); for that window, **all** subsequent commands you send in this topic route to that agent — no reply or `@` needed. Replying to a specific pane message and a topic with exactly one live pane still take priority over the active pane. Calling `/agents` again re-shows the picker; the active pane expires silently and does not persist across state resets. `/agents` exists **only in per-space topic mode**; on a single-agent (per-agent) topic it replies `Only one agent here (<label>) — your messages already route to it.` It is also suppressed when the topic has no resolvable space.
+
+**`/voice shared|per_agent`** — Set this **space's** Telegram voice. `shared` (default) means one manager bot speaks for every agent in the space; `per_agent` means each agent **type** gets its own managed child bot (if available — see MANAGED_BOTS.md). `/voice` with no argument prints the current mode. The setting is per-space, persistent across resets, and reversible. It requires a resolved space; in per-agent topic mode (one pane per topic) there is no shared-space voice to set.
+
+### 2.6 Forwarded agent CLI commands
 
 Any `/command` that is **not** one of herdres' own meta-commands above is **forwarded to the pane as-is**, so the agent CLI's own slash-commands reach it intact:
 
@@ -135,17 +145,17 @@ Any `/command` that is **not** one of herdres' own meta-commands above is **forw
 
 herdres only strips a trailing `@botname` (which Telegram adds to commands in groups) before forwarding — `/goal@herdr_codex_bot …` becomes `/goal …`. The agent then handles the command itself. herdres does not validate these against the agent; an unknown one is the agent's problem, not herdres'.
 
-### 2.6 Plain text (no slash)
+### 2.7 Plain text (no slash)
 
 Plain text (no leading `/`) typed in a pane topic is handled by context:
 
 - If the agent just asked a **detail question** and you are replying to that prompt, your text is sent as the detail answer.
-- If **implicit send** is enabled (`implicit_send_enabled` in state), if you addressed a managed pane bot, if you **reply** to a pane message, or if the topic maps to exactly one live pane, your text is **forwarded to the pane** (same idle-vs-working behavior as `/send`).
+- If **implicit send** is enabled (`implicit_send_enabled` in state), if you addressed a managed pane bot, if you **reply** to a pane message, if you have a live **active pane** from `/agents`, or if the topic maps to exactly one live pane, your text is **forwarded to the pane** (same idle-vs-working behavior as `/send`).
 - Otherwise herdres replies: *"This is a mapped Herdr pane topic. Use /send <text> to forward to this pane, or /help."* (so a stray message isn't silently injected).
 
 Plain text follows the same queue/interrupt rules as `/send` — to a busy agent it queues.
 
-### 2.7 Long / multiline input → inbound file
+### 2.8 Long / multiline input → inbound file
 
 Both forwarded text and forwarded slash-commands have a length guard. When the forwarded payload is **long or multiline** — at or above **~1200 chars** (`HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS`) **or 6+ lines** (`HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES`) — herdres does **not** type the whole blob into the pane (a long paste would collapse into an opaque `[Pasted text]` block and a slash-command token would be lost). Instead it:
 
@@ -176,6 +186,8 @@ This means: you can paste a long brief or a multi-paragraph goal into a pane top
 | Re-surface the last report/question | `/status` |
 | Re-show decision buttons | `/choices` |
 | Spin up another agent here | `/new <codex\|claude\|kimi\|omp\|devin>` |
+| Pick which agent a shared topic addresses | `/agents` (per-space mode) |
+| Switch this space's bot voice | `/voice shared\|per_agent` |
 | Run an agent's own slash-command | Just type it (e.g. `/goal …`, `/clear`) |
 | Send raw keys | `/keys <keys>` |
 | Inspect the topic↔pane mapping | `/debug` |

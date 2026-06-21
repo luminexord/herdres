@@ -31,6 +31,21 @@ Use per-space only when an operator specifically wants every agent in a workspac
 
 ---
 
+## Voice mode is orthogonal to topic granularity
+
+A second, **per-space** setting — `voice_mode` (`shared` or `per_agent`) — controls *which bot* posts for the agents in a space. It is independent of `HERDR_TELEGRAM_TOPICS_PER_AGENT`, which controls *how many topics* there are.
+
+| `PER_AGENT` | Topics | Addressing | Voice |
+|---|---|---|---|
+| `1` (per-agent) | one topic **per pane** | unambiguous — every reply hits the single pane; **no `/agents`** | each pane stands alone; voice applies at the topic level |
+| `0` (per-space) | one topic **per space** (multiple agents share it) | reply to a pane's message, or use the **`/agents`** picker to set a TTL'd active pane | `voice_mode` decides: `shared` = one manager bot for all; `per_agent` = each kind gets its own child bot |
+
+- **`/agents`** exists **only** in per-space mode; it shows an inline picker and routes your next commands (for ~10 min, `HERDR_TELEGRAM_TOPICS_ACTIVE_PANE_TTL`) to the chosen pane without a reply or `@`. In per-agent mode it replies `Only one agent here…`.
+- **`/voice shared|per_agent`** is the per-space voice setter; it persists across resets (including a `PER_AGENT` flip, via `_preserved_voice_mode`). See MANAGED_BOTS.md.
+- The **"which agents work here?" onboarding card** is shown **only in per-space mode** — it is suppressed when `PER_AGENT=1`, since each topic is already a single agent.
+
+---
+
 ## The flag is read at runtime
 
 `HERDR_TELEGRAM_TOPICS_PER_AGENT` is read **at call time**, not frozen at import. This matters because herdres runs in three contexts and only some inject env before Python starts:
