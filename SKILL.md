@@ -1,11 +1,14 @@
 ---
 name: herdres
 description: "Use Herdres to operate the Herdr-to-Telegram bridge: install and configure it, set up per-agent forum topics, send/interrupt/queue messages to agent panes, read status and reports, manage child bots, drive the macOS cockpit, and run maintenance like cleanup-duplicates. Use when a user wants to control or set up Herdr agents over Telegram. This is herdres (the Telegram bridge), NOT herdr (the terminal multiplexer)."
-version: 0.1.0
 license: MIT
 compatibility: "Requires the herdres CLI, Python 3.11+, a Telegram bot + forum supergroup, and a running Herdr 0.7.0+ multiplexer."
+allowed-tools: Bash Read Edit
 metadata:
+  version: "0.1.0"
+  author: luminexord
   source: luminexord/herdres
+  tags: [telegram, herdr, bridge, operations, agents]
 ---
 
 # herdres — operator skill
@@ -20,11 +23,11 @@ before doing anything, confirm `~/.config/herdres/herdres.env` exists and `herdr
 
 ## Quick install
 
-the headline path. do not skip preflight, do not write Telegram state until verify passes, and **never invent or scavenge credentials — the bot token, chat ID, and allowed-user IDs come from the user.**
+the headline path. do not skip preflight, do not write Telegram state until verify passes, and **you MUST NOT invent or scavenge credentials — the bot token, chat ID, and allowed-user IDs come from the user.**
 
 1. **preflight.** detect the OS: Linux uses **systemd** (`systemctl --user`), macOS uses **launchd** (no user systemd). check `python3 --version` is **>= 3.11**. confirm Herdr is running (`herdr --version`; `herdr` must be on `PATH` or set `HERDR_BIN`); **0.7.0+ is recommended** — older herdr still works in degraded mode (timer-only, no instant plugin trigger; see step 5). check whether `~/.config/herdres/herdres.env` already exists — if so, do not clobber it; just edit it and skip the installer's copy step.
 
-2. **guided Telegram setup — pause here and ask the user.** the bot token, chat ID, and allowed-user IDs are **user-supplied secrets**: do not invent them, and do not copy them from another app's config (e.g. an existing **Hermes** bot token) unless the user explicitly approves — reusing a token another process already long-polls breaks the one-`getUpdates`-consumer rule (see **Safety rules**). prefer a **dedicated** bot for herdres. if you cannot ask the user (non-interactive), STOP and report what is needed rather than guessing. walk the user through these steps and validate what they paste back:
+2. **guided Telegram setup — you MUST pause and ask the user.** the bot token, chat ID, and allowed-user IDs are **user-supplied secrets**: you **MUST NOT** invent them, and you **MUST NOT** copy them from another app's config (e.g. an existing **Hermes** bot token) without the user's explicit approval — reusing a token another process already long-polls breaks the one-`getUpdates`-consumer rule (see **Safety rules**). **Always** prefer a **dedicated** bot for herdres. if you cannot ask the user (non-interactive), you **MUST** stop and report what is needed rather than guessing. walk the user through these steps and validate what they paste back:
    - **a.** message **@BotFather**, run `/newbot`, copy the **bot token** → `TELEGRAM_BOT_TOKEN`. Validate: shape is `<digits>:<base64-ish>`, e.g. `123456:ABC-...`.
    - **b.** create a **group**, open Group Settings, and turn on **Topics** (this makes it a forum supergroup). herdres refuses any chat that is not a forum-enabled supergroup.
    - **c.** add the bot to the group, promote it to **Administrator**, and grant **Manage Topics**. Preflight fails closed without admin + `can_manage_topics`.

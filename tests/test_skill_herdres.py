@@ -100,9 +100,23 @@ def test_skill_files_exist():
 
 def test_frontmatter_required_fields():
     fm, _ = _frontmatter_and_body(SKILL_MD.read_text(encoding="utf-8"))
-    for key in ("name", "description", "version", "license"):
-        assert re.search(rf"^{key}\s*:", fm, re.M), f"frontmatter missing '{key}'"
+    for key in ("name", "description", "license", "compatibility", "allowed-tools"):
+        assert re.search(rf"^{key}\s*:", fm, re.M), f"frontmatter missing top-level '{key}'"
     assert re.search(r"^name\s*:\s*herdres\s*$", fm, re.M), "frontmatter name must be 'herdres'"
+    # agentskills.io spec: there is NO top-level `version`; it lives under metadata
+    assert not re.search(r"^version\s*:", fm, re.M), "version must live under metadata, not top-level"
+    assert re.search(r"^\s+version\s*:", fm, re.M), "metadata.version is required"
+
+
+def test_frontmatter_spec_constraints():
+    """agentskills.io spec: name regex + matches dir; description 1-1024; no reserved words."""
+    fm, _ = _frontmatter_and_body(SKILL_MD.read_text(encoding="utf-8"))
+    name = re.search(r"^name\s*:\s*(\S+)", fm, re.M).group(1)
+    assert re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name), f"name '{name}' must be lowercase/hyphen (no leading/trailing/double hyphen)"
+    assert name == SKILL_DIR.name, f"name '{name}' must match the skill directory '{SKILL_DIR.name}'"
+    assert "anthropic" not in name and "claude" not in name, "name must not contain reserved words"
+    desc = re.search(r'^description\s*:\s*"?(.*?)"?\s*$', fm, re.M).group(1)
+    assert 0 < len(desc) <= 1024, f"description must be 1-1024 chars (got {len(desc)})"
 
 
 def test_body_within_word_budget():
@@ -158,6 +172,9 @@ def test_root_single_file_entrypoint_is_self_contained():
     fm, body = _frontmatter_and_body(text)
     assert re.search(r"^name\s*:\s*herdres\s*$", fm, re.M), "root SKILL.md name must be 'herdres'"
     assert re.search(r"^description\s*:", fm, re.M), "root SKILL.md missing description"
+    # keep the root entrypoint spec-aligned & in sync with the packaged copy
+    assert not re.search(r"^version\s*:", fm, re.M), "root SKILL.md: version must be under metadata"
+    assert re.search(r"^allowed-tools\s*:", fm, re.M), "root SKILL.md missing allowed-tools"
     broken = re.findall(r"\]\((?:\./|references/|skills/)[^)]+\)", text)
     assert not broken, f"root SKILL.md has hard relative links (breaks single-file install): {broken}"
 
