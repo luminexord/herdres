@@ -422,6 +422,13 @@ class GatewayManagedBotTests(unittest.TestCase):
             "text": text,
         }
 
+    def poll_update(self, update_id: int, message: dict) -> dict:
+        return {"update_id": update_id, "message": message}
+
+    def read_reassembly_buffers(self) -> dict:
+        raw = json.loads(managed_gateway.REASSEMBLY_PATH.read_text(encoding="utf-8"))
+        return raw.get("buffers") or {}
+
     def test_managed_bot_tokens_reads_enabled_child_tokens(self) -> None:
         state = {
             "version": 1,
@@ -711,6 +718,341 @@ class GatewayManagedBotTests(unittest.TestCase):
         run_script.assert_called_once()
         self.assertEqual(run_script.call_args.args[0]["text"], first + second + terminal)
 
+    def test_terminal_before_body_deterministic(self) -> None:
+        class FakeFuture:
+            def __init__(self) -> None:
+                self.callbacks = []
+                self.done = False
+                self.error = None
+
+            def add_done_callback(self, callback):
+                self.callbacks.append(callback)
+                if self.done:
+                    callback(self)
+
+            def result(self):
+                if self.error:
+                    raise self.error
+
+            def finish(self, error=None):
+                self.error = error
+                self.done = True
+                for callback in list(self.callbacks):
+                    callback(self)
+
+        class TailFirstExecutor:
+            def __init__(self) -> None:
+                self.tasks = []
+
+            def submit(self, fn, *args, **kwargs):
+                future = FakeFuture()
+                self.tasks.append((fn, args, kwargs, future))
+                if len(self.tasks) == 2:
+                    second = self.tasks.pop()
+                    first = self.tasks.pop()
+                    self.run_task(second)
+                    self.run_task(first)
+                return future
+
+            def run_task(self, task):
+                fn, args, kwargs, future = task
+                error = None
+                try:
+                    fn(*args, **kwargs)
+                except Exception as exc:
+                    error = exc
+                future.finish(error)
+
+            def flush_remaining(self):
+                while self.tasks:
+                    self.run_task(self.tasks.pop(0))
+
+        state = self.single_pane_space_state()
+        executor = TailFirstExecutor()
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        body = "a" * 4041
+        tail = "b" * 128
+        updates = [
+            self.poll_update(100, self.reassembly_message(6000, body)),
+            self.poll_update(101, self.reassembly_message(6001, tail)),
+        ]
+        managed_gateway.offset_path_for("manager").write_text("100\n", encoding="utf-8")
+
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": updates})
+        ), patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "get_dispatch_executor", Mock(return_value=executor)
+        ), patch.object(managed_gateway, "run_script", run_script):
+            managed_gateway.poll_once("manager", "TOKEN", timeout_seconds=0)
+            executor.flush_remaining()
+
+        run_script.assert_called_once()
+        self.assertEqual(run_script.call_args.args[0]["text"], body + tail)
+        self.assertEqual(managed_gateway.offset_path_for("manager").read_text(encoding="utf-8").strip(), "102")
+        self.assertEqual(self.read_reassembly_buffers(), {})
+
+        managed_gateway.PROCESSED_MESSAGE_KEYS = None
+        managed_gateway.PROCESSED_MESSAGE_ORDER = []
+        if managed_gateway.PROCESSED_PATH.exists():
+            managed_gateway.PROCESSED_PATH.unlink()
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)):
+            first_ready = managed_gateway.prepare_message(
+                self.reassembly_message(6100, body), bot_token="MANAGER_TOKEN", bot_key="manager"
+            )
+            second_ready = managed_gateway.prepare_message(
+                self.reassembly_message(6101, tail), bot_token="MANAGER_TOKEN", bot_key="manager"
+            )
+        self.assertIsNone(first_ready)
+        self.assertIsNotNone(second_ready)
+        self.assertEqual(second_ready.dispatch_texts, [body + tail])
+
+    def test_normal_short_message_zero_delay_and_pooled(self) -> None:
+        class QueuedExecutor:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def submit(self, fn, *args, **kwargs):
+                future = Mock()
+                future.add_done_callback = Mock()
+                self.calls.append((fn, args, kwargs, future))
+                return future
+
+        state = self.single_pane_space_state()
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        executor = QueuedExecutor()
+        text = "short prompt"
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "get_dispatch_executor", Mock(return_value=executor)):
+            ready = managed_gateway.prepare_message(self.reassembly_message(6200, text), bot_token="MANAGER_TOKEN", bot_key="manager")
+            self.assertIsNotNone(ready)
+            self.assertEqual(ready.dispatch_texts, [text])
+            self.assertFalse(managed_gateway.REASSEMBLY_PATH.exists())
+            managed_gateway.dispatch_ready(ready)
+
+        self.assertEqual(len(executor.calls), 1)
+        run_script.assert_not_called()
+
+    def test_duplicate_fragment_is_noop(self) -> None:
+        key = "-1001|77|42"
+        sample = {"chat_id": "-1001", "thread_id": "77", "pane_key": "pane-1", "user_id": "42"}
+        body = "a" * 4041
+        tail = "b" * 128
+        now = time.time()
+
+        self.assertEqual(
+            managed_gateway.buffer_or_assemble(key, 6300, body, is_command=False, sample=sample, now=now),
+            ([], True),
+        )
+        self.assertEqual(
+            managed_gateway.buffer_or_assemble(key, 6300, body, is_command=False, sample=sample, now=now + 1),
+            ([], True),
+        )
+        buffers = self.read_reassembly_buffers()
+        self.assertEqual(len(buffers[key]["fragments"]), 1)
+        dispatch, hold = managed_gateway.buffer_or_assemble(
+            key, 6301, tail, is_command=False, sample=sample, now=now + 2
+        )
+        self.assertFalse(hold)
+        self.assertEqual(dispatch, [body + tail])
+
+    def test_duplicate_tail_after_completion(self) -> None:
+        state = self.single_pane_space_state()
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        body = "a" * 4041
+        tail = "b" * 128
+        updates = [
+            self.poll_update(100, self.reassembly_message(6400, body)),
+            self.poll_update(101, self.reassembly_message(6401, tail)),
+        ]
+        duplicate_tail = [self.poll_update(102, self.reassembly_message(6401, tail))]
+        managed_gateway.offset_path_for("manager").write_text("100\n", encoding="utf-8")
+
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": updates})
+        ), patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "dispatch_ready", lambda ready: managed_gateway.execute_dispatch(ready)
+        ), patch.object(managed_gateway, "run_script", run_script):
+            managed_gateway.poll_once("manager", "TOKEN", timeout_seconds=0)
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": duplicate_tail})
+        ), patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "dispatch_ready", lambda ready: managed_gateway.execute_dispatch(ready)
+        ), patch.object(managed_gateway, "run_script", run_script):
+            managed_gateway.poll_once("manager", "TOKEN", timeout_seconds=0)
+
+        run_script.assert_called_once()
+        self.assertEqual(run_script.call_args.args[0]["text"], body + tail)
+
+    def test_break_chain_emits_single_deduped_update(self) -> None:
+        state = self.single_pane_space_state()
+        key = "-1001|77|42"
+        sample = {"chat_id": "-1001", "thread_id": "77", "pane_key": "pane-1", "user_id": "42"}
+        first = "a" * 4041
+        breaker = "/send now"
+        managed_gateway.buffer_or_assemble(key, 6500, first, is_command=False, sample=sample, now=time.time())
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "reserve_message_processing", Mock(return_value=True)
+        ) as reserve, patch.object(managed_gateway, "run_script", run_script):
+            ready = managed_gateway.prepare_message(
+                self.reassembly_message(6502, breaker), bot_token="MANAGER_TOKEN", bot_key="manager"
+            )
+            self.assertIsNotNone(ready)
+            self.assertEqual(ready.dispatch_texts, [first, breaker])
+            reserve.assert_called_once()
+            managed_gateway.execute_dispatch(ready)
+
+        self.assertEqual(run_script.call_count, 2)
+        self.assertEqual([call.args[0]["text"] for call in run_script.call_args_list], [first, breaker])
+
+    def test_held_fragment_persists_before_offset(self) -> None:
+        state = self.single_pane_space_state()
+        body = "a" * 4041
+        updates = [self.poll_update(100, self.reassembly_message(6600, body))]
+        managed_gateway.offset_path_for("manager").write_text("100\n", encoding="utf-8")
+        order = []
+
+        def write_offset(offset, key="manager"):
+            order.append("offset")
+            self.assertTrue(managed_gateway.REASSEMBLY_PATH.exists())
+            buffers = self.read_reassembly_buffers()
+            self.assertIn("-1001|77|42", buffers)
+
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": updates})
+        ), patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "dispatch_ready", Mock()
+        ) as dispatch_ready, patch.object(managed_gateway, "write_offset", write_offset):
+            managed_gateway.poll_once("manager", "TOKEN", timeout_seconds=0)
+
+        dispatch_ready.assert_not_called()
+        self.assertEqual(order, ["offset"])
+
+    def test_crash_replay_held_fragment_no_dup(self) -> None:
+        state = self.single_pane_space_state()
+        body = "a" * 4041
+        tail = "b" * 128
+        first_update = [self.poll_update(100, self.reassembly_message(6700, body))]
+        replay_update = [self.poll_update(100, self.reassembly_message(6700, body))]
+        tail_update = [self.poll_update(101, self.reassembly_message(6701, tail))]
+        run_script = Mock(return_value={"handled": True, "reply": ""})
+        managed_gateway.offset_path_for("manager").write_text("100\n", encoding="utf-8")
+
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": first_update})
+        ), patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "write_offset", Mock()
+        ), patch.object(managed_gateway, "dispatch_ready", Mock()):
+            managed_gateway.poll_once("manager", "TOKEN", timeout_seconds=0)
+        managed_gateway.PROCESSED_MESSAGE_KEYS = None
+        managed_gateway.PROCESSED_MESSAGE_ORDER = []
+        if managed_gateway.PROCESSED_PATH.exists():
+            managed_gateway.PROCESSED_PATH.unlink()
+
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": replay_update})
+        ), patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "write_offset", Mock()
+        ), patch.object(managed_gateway, "dispatch_ready", Mock()):
+            managed_gateway.poll_once("manager", "TOKEN", timeout_seconds=0)
+        buffers = self.read_reassembly_buffers()
+        self.assertEqual(len(buffers["-1001|77|42"]["fragments"]), 1)
+
+        managed_gateway.offset_path_for("manager").write_text("101\n", encoding="utf-8")
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": tail_update})
+        ), patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "dispatch_ready", lambda ready: managed_gateway.execute_dispatch(ready)
+        ), patch.object(managed_gateway, "run_script", run_script):
+            managed_gateway.poll_once("manager", "TOKEN", timeout_seconds=0)
+
+        run_script.assert_called_once()
+        self.assertEqual(run_script.call_args.args[0]["text"], body + tail)
+
+    def test_attachment_skips_buffering(self) -> None:
+        state = self.single_pane_space_state()
+        message = self.reassembly_message(6800, "caption text")
+        message["document"] = {"file_id": "file-1", "file_name": "report.txt", "mime_type": "text/plain", "file_size": 12}
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "buffer_or_assemble", Mock(side_effect=AssertionError("buffered attachment"))
+        ):
+            ready = managed_gateway.prepare_message(message, bot_token="MANAGER_TOKEN", bot_key="manager")
+
+        self.assertIsNotNone(ready)
+        self.assertEqual(ready.dispatch_texts, ["caption text"])
+        self.assertEqual(ready.attachment["kind"], "document")
+        self.assertFalse(managed_gateway.REASSEMBLY_PATH.exists())
+
+    def test_callback_and_managed_bot_bypass_prepare(self) -> None:
+        updates = [
+            {"update_id": 100, "callback_query": {"id": "cb-1", "data": "herdr:x"}},
+            {"update_id": 101, "managed_bot": {"id": 1}},
+            {"update_id": 102, "message": {"managed_bot_created": {"bot": {"id": 2}}}},
+        ]
+        managed_gateway.offset_path_for("manager").write_text("100\n", encoding="utf-8")
+
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(
+            managed_gateway, "api", Mock(return_value={"ok": True, "result": updates})
+        ), patch.object(managed_gateway, "prepare_message", Mock()) as prepare, patch.object(
+            managed_gateway, "dispatch_update", Mock()
+        ) as dispatch_update:
+            managed_gateway.poll_once("manager", "TOKEN", timeout_seconds=0)
+
+        prepare.assert_not_called()
+        self.assertEqual(dispatch_update.call_count, 3)
+
+    def test_non_owner_fragment_does_not_open_chain(self) -> None:
+        state = self.single_pane_space_state()
+        message = self.reassembly_message(6900, "a" * 4041)
+        message["from"] = {"id": 99, "is_bot": False}
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)):
+            ready = managed_gateway.prepare_message(message, bot_token="MANAGER_TOKEN", bot_key="manager")
+
+        self.assertIsNone(ready)
+        self.assertFalse(managed_gateway.REASSEMBLY_PATH.exists())
+
+    def test_unmapped_chat_fragment_not_buffered(self) -> None:
+        state = self.single_pane_space_state()
+        message = self.reassembly_message(7000, "a" * 4041)
+        message["chat"] = {"id": -2002, "is_forum": True}
+        message["message_thread_id"] = 999
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)):
+            ready = managed_gateway.prepare_message(message, bot_token="MANAGER_TOKEN", bot_key="manager")
+
+        self.assertIsNone(ready)
+        self.assertFalse(managed_gateway.REASSEMBLY_PATH.exists())
+
+    def test_sweep_unchanged_recovers_orphan(self) -> None:
+        key = "-1001|77|42"
+        sample = {"chat_id": "-1001", "thread_id": "77", "pane_key": "pane-1", "user_id": "42"}
+        body = "a" * 4041
+        now = time.time()
+
+        managed_gateway.buffer_or_assemble(key, 7100, body, is_command=False, sample=sample, now=now)
+        flushed = managed_gateway.sweep_stale_reassembly(now + managed_gateway.REASSEMBLY_WINDOW_SECONDS + 1)
+
+        self.assertEqual(flushed, [(key, body, sample)])
+        self.assertEqual(self.read_reassembly_buffers(), {})
+
+    def test_inline_overflow_runs_execute_on_caller(self) -> None:
+        semaphore = threading.BoundedSemaphore(1)
+        self.assertTrue(semaphore.acquire(blocking=False))
+        ready = managed_gateway.ReadyDispatch(bot_key="manager")
+
+        with patch.object(managed_gateway, "DISPATCH_QUEUE_SEMAPHORE", semaphore), patch.object(
+            managed_gateway, "execute_dispatch_guarded", Mock()
+        ) as execute_dispatch_guarded, patch.object(managed_gateway, "get_dispatch_executor", Mock()) as get_executor:
+            managed_gateway.dispatch_ready(ready)
+
+        execute_dispatch_guarded.assert_called_once_with(ready)
+        get_executor.assert_not_called()
+
     def test_409_conflict_backs_off_and_retains_worker(self) -> None:
         managed_gateway.offset_path_for("managed-codex-a").write_text("10\n", encoding="utf-8")
         exc = urllib.error.HTTPError("url", 409, "Conflict", hdrs=None, fp=None)
@@ -824,6 +1166,8 @@ class GatewayManagedBotTests(unittest.TestCase):
         with patch.object(managed_gateway, "clear_webhook"), patch.object(
             managed_gateway, "api", Mock(return_value={"ok": True, "result": updates})
         ), patch.object(managed_gateway, "get_dispatch_executor", Mock(return_value=executor)), patch.object(
+            managed_gateway, "load_state", Mock(return_value=self.single_pane_space_state())
+        ), patch.object(
             managed_gateway, "handle_update", Mock(side_effect=AssertionError("handler ran inline"))
         ):
             managed_gateway.poll_once("manager", "TOKEN", timeout_seconds=50)

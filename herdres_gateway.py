@@ -177,6 +177,34 @@ def dispatch_update(update: dict, *, bot_token: str | None = None, bot_key: str 
     future.add_done_callback(finish_dispatched_update)
 
 
+def prepare_message_guarded(message: dict, *, bot_token: str | None = None, bot_key: str | None = None) -> "ReadyDispatch | None":
+    try:
+        return prepare_message(message, bot_token=bot_token, bot_key=bot_key)
+    except Exception as exc:
+        log(f"prepare error for {bot_key or 'manager'}: {exc}")
+        return None
+
+
+def dispatch_ready(ready: "ReadyDispatch") -> None:
+    if not DISPATCH_QUEUE_SEMAPHORE.acquire(blocking=False):
+        log("dispatch queue full; running execute inline")
+        execute_dispatch_guarded(ready)
+        return
+    try:
+        future = get_dispatch_executor().submit(execute_dispatch_guarded, ready)
+    except Exception:
+        DISPATCH_QUEUE_SEMAPHORE.release()
+        raise
+    future.add_done_callback(finish_dispatched_update)
+
+
+def execute_dispatch_guarded(ready: "ReadyDispatch") -> None:
+    try:
+        execute_dispatch(ready)
+    except Exception as exc:
+        log(f"execute error for {ready.bot_key or 'manager'}: {exc}")
+
+
 def finish_dispatched_update(future: concurrent.futures.Future) -> None:
     try:
         future.result()
@@ -307,6 +335,10 @@ def buffer_or_assemble(
     with REASSEMBLY_LOCK:
         buffers = _load_reassembly_locked()
         entry = buffers.get(key)
+        if entry is not None:
+            existing_ids = {int(frag.get("message_id") or 0) for frag in (entry.get("fragments") or [])}
+            if message_id in existing_ids:
+                return [], True
         if entry is None and not is_high:
             return [text], False
         if entry is None:
@@ -796,15 +828,37 @@ def run_script(payload: dict, mode: str) -> dict:
 # Update handlers
 # ---------------------------------------------------------------------------
 
-def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str | None = None) -> None:
+class ReadyDispatch:
+    __slots__ = (
+        "message",
+        "bot_token",
+        "bot_key",
+        "received_at",
+        "dispatch_texts",
+        "pane_key",
+        "thread_id",
+        "chat_id",
+        "user_id",
+        "from_bot",
+        "target_bot_kind",
+        "reply_to_message_id",
+        "attachment",
+    )
+
+    def __init__(self, **kw):
+        for key in self.__slots__:
+            setattr(self, key, kw.get(key))
+
+
+def prepare_message(message: dict, *, bot_token: str | None = None, bot_key: str | None = None) -> ReadyDispatch | None:
     received_at = time.monotonic()
     text = message.get("text")
     attachment = attachment_of(message)
     if not (text or attachment):
-        return
+        return None
     state = load_state()
     if not state:
-        return
+        return None
     chat = message.get("chat") or {}
     chat_id = str(chat.get("id") or "")
     thread_id = thread_id_of(message)
@@ -825,7 +879,7 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
     current_kind = current_bot_owner_kind(bot_key)
     if current_kind not in owner_kinds:
         dlog(f"ignored message owned by {','.join(sorted(owner_kinds))} on {current_kind}")
-        return
+        return None
     target_bot_kind = target_bot_kind_for_message(state, str(text or ""), bot_key, message)
     reply_to = message.get("reply_to_message") or {}
     resolved = resolve_mapped_entry(
@@ -838,7 +892,7 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
     if not resolved:
         if topic_space_entry(state, chat_id, thread_id):
             if not owner_allowed(state, user_id, from_bot):
-                return
+                return None
             pane_key = ""
         else:
             tg = state.get("telegram") or {}
@@ -846,18 +900,18 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
                 f"NOT mapped (state chat={tg.get('chat_id')} general={tg.get('general_thread_id')} "
                 f"topics={[str(e.get('topic_id')) for e in (state.get('panes') or {}).values()][:12]})"
             )
-            return  # not a mapped pane topic (General chat / other chats pass through)
+            return None  # not a mapped pane topic (General chat / other chats pass through)
     else:
         pane_key, _entry = resolved
 
     owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
     if not owner_allowed(state, user_id, from_bot):
         dlog(f"filtered: from_bot={from_bot} owners={owners} user={user_id}")
-        return  # cheap pre-filter; command_reply re-applies the authoritative gate
+        return None  # cheap pre-filter; command_reply re-applies the authoritative gate
     route_key = processed_message_key(chat_id, thread_id, message)
     if not reserve_message_processing(route_key):
         dlog(f"ignored already processed message {route_key}")
-        return
+        return None
     dlog(f"dispatching to herdres command (topic {thread_id})")
 
     if attachment:
@@ -893,29 +947,47 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
         )
         if hold and not reassembly_dispatch:
             dlog(f"buffered fragment chat={chat_id} thread={thread_id} user={user_id} msg={msg_id}")
-            return
+            return None
 
-    for dispatch_text in reassembly_dispatch:
+    return ReadyDispatch(
+        message=message,
+        bot_token=bot_token,
+        bot_key=bot_key,
+        received_at=received_at,
+        dispatch_texts=reassembly_dispatch,
+        pane_key=pane_key,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        from_bot=from_bot,
+        target_bot_kind=target_bot_kind,
+        reply_to_message_id=str(reply_to.get("message_id") or ""),
+        attachment=attachment,
+    )
+
+
+def execute_dispatch(ready: ReadyDispatch) -> None:
+    for dispatch_text in ready.dispatch_texts:
         payload = {
-            "chat_id": chat_id,
-            "topic_id": thread_id,
-            "pane_key": pane_key,
-            "message_id": str(message.get("message_id") or ""),
-            "reply_to_message_id": str(reply_to.get("message_id") or ""),
-            "user_id": user_id,
-            "from_bot": from_bot,
-            "forwarded": is_forwarded(message),
-            "edited": bool(message.get("edit_date")),
+            "chat_id": ready.chat_id,
+            "topic_id": ready.thread_id,
+            "pane_key": ready.pane_key,
+            "message_id": str(ready.message.get("message_id") or ""),
+            "reply_to_message_id": ready.reply_to_message_id,
+            "user_id": ready.user_id,
+            "from_bot": ready.from_bot,
+            "forwarded": is_forwarded(ready.message),
+            "edited": bool(ready.message.get("edit_date")),
             "text": dispatch_text,
-            "caption": str(message.get("caption") or ""),
-            "attachment": attachment,
+            "caption": str(ready.message.get("caption") or ""),
+            "attachment": ready.attachment,
         }
-        if target_bot_kind:
-            payload["target_bot_kind"] = target_bot_kind
-        lock_key = f"pane:{pane_key}" if pane_key else f"space:{chat_id}:{thread_id or ''}"
+        if ready.target_bot_kind:
+            payload["target_bot_kind"] = ready.target_bot_kind
+        lock_key = f"pane:{ready.pane_key}" if ready.pane_key else f"space:{ready.chat_id}:{ready.thread_id or ''}"
         with route_lock_for(lock_key):
             result = run_script(payload, "command")
-        elapsed = time.monotonic() - received_at
+        elapsed = time.monotonic() - ready.received_at
         dlog(
             "command result "
             f"handled={result.get('handled')} reply_len={len(str(result.get('reply') or ''))} "
@@ -926,7 +998,13 @@ def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str 
         reply = str(result.get("reply") or "").strip()
         if not reply:
             continue
-        send_reply(bot_token, chat_id, thread_id, reply, reply_to_message_id=payload["message_id"])
+        send_reply(ready.bot_token, ready.chat_id, ready.thread_id, reply, reply_to_message_id=payload["message_id"])
+
+
+def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str | None = None) -> None:
+    ready = prepare_message(message, bot_token=bot_token, bot_key=bot_key)
+    if ready is not None:
+        execute_dispatch(ready)
 
 
 def handle_callback(query: dict, *, bot_token: str | None = None) -> None:
@@ -1092,7 +1170,18 @@ def poll_once(key: str, bot_token: str, *, timeout_seconds: int) -> None:
     for update in updates:
         offset = update["update_id"] + 1
         try:
-            dispatch_update(update, bot_token=bot_token, bot_key=key)
+            message = update.get("message") if isinstance(update, dict) else None
+            is_plain_message = (
+                isinstance(message, dict)
+                and "managed_bot" not in update
+                and not isinstance(message.get("managed_bot_created"), dict)
+            )
+            if is_plain_message:
+                ready = prepare_message_guarded(message, bot_token=bot_token, bot_key=key)
+                if ready is not None:
+                    dispatch_ready(ready)
+            else:
+                dispatch_update(update, bot_token=bot_token, bot_key=key)
         except Exception as exc:
             log(f"dispatch submit error for {key}: {exc}")
         write_offset(offset, key)
