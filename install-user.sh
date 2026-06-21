@@ -15,8 +15,10 @@ install -d "$HOME/.local/share/herdres/herdres-plugin"
 sed "s#\\[\"herdres\", #\\[\"$HOME/.local/bin/herdres\", #g" \
     herdres-plugin/herdr-plugin.toml > "$HOME/.local/share/herdres/herdres-plugin/herdr-plugin.toml"
 # Record this checkout's absolute path so `herdres update --edge` can git pull it.
+# Use $PWD: the installs above are cwd-relative (e.g. `install -Dm755 herdres.py`),
+# so this script must be run from the checkout root and $PWD *is* that checkout.
 install -d "$HOME/.local/share/herdres"
-printf '%s\n' "$(cd "$(dirname "$0")" && pwd)" > "$HOME/.local/share/herdres/source"
+printf '%s\n' "$PWD" > "$HOME/.local/share/herdres/source"
 mkdir -p "$HOME/.config/systemd/user"
 cp systemd/user/herdres.service systemd/user/herdres.timer systemd/user/herdres-gateway.service "$HOME/.config/systemd/user/"
 

@@ -45,32 +45,115 @@ def _logical_lines(text: str) -> list[str]:
     return joined.splitlines()
 
 
+def _env_install(line: str) -> bool:
+    """Does this line copy ``.env.example`` onto the live ``herdres.env``?"""
+    return "install" in line and ".env.example" in line and "herdres.env" in line
+
+
+def _env_install_logical_lines(text: str) -> list[str]:
+    """Logical lines that copy ``.env.example`` onto the live ``herdres.env``."""
+    return [line for line in _logical_lines(text) if _env_install(line)]
+
+
+def _form_a_guarded(physical: list[str], i: int) -> bool:
+    """Form A: ``[ -f … ] || install …``.
+
+    The guard and the ``install`` may sit on separate physical lines joined by a
+    trailing ``\\``; fold the env-copy line together with any continuation lines
+    immediately above it, then look for the ``[ -f … ]`` / ``[ ! -f … ]`` test.
+    """
+    start = i
+    while start > 0 and physical[start - 1].rstrip().endswith("\\"):
+        start -= 1
+    logical = " ".join(p.rstrip("\\") for p in physical[start : i + 1])
+    return "[ -f" in logical or "[ ! -f" in logical
+
+
+def _form_b_guarded(physical: list[str], i: int) -> bool:
+    """Form B: the env copy sits inside an ``if [ ! -f … herdres.env … ]`` block.
+
+    Scan upward for the nearest still-open ``if`` (matching intervening
+    ``fi``s) and require it to be the file-existence guard for ``herdres.env``.
+    """
+    depth = 0
+    for j in range(i - 1, -1, -1):
+        stripped = physical[j].strip()
+        if stripped == "fi" or stripped.startswith("fi "):
+            depth += 1
+        elif stripped.startswith("if "):
+            if depth == 0:
+                return (
+                    ("[ ! -f" in physical[j] or "[ -f" in physical[j])
+                    and "herdres.env" in physical[j]
+                )
+            depth -= 1
+    return False
+
+
+def _guards_env_install(text: str) -> bool:
+    """Is *every* ``.env.example -> herdres.env`` copy behind an existence guard?
+
+    Accepts BOTH guard shapes and fails (returns ``False``) if any copy is
+    unguarded — i.e. removing the guard must make this return ``False``.
+    """
+    physical = text.splitlines()
+    install_idx = [i for i, line in enumerate(physical) if _env_install(line)]
+    if not install_idx:
+        return False
+    return all(
+        _form_a_guarded(physical, i) or _form_b_guarded(physical, i)
+        for i in install_idx
+    )
+
+
+def _checkout_dir_expr(text: str) -> str | None:
+    """Return the shell expression a marker write uses for the checkout dir.
+
+    Both installers must record the *same* expression (``$PWD``); the other
+    installs are cwd-relative so the script is run from the checkout root.
+    Returns the right-hand side of the ``printf … > "…/source"`` write.
+    """
+    for line in _logical_lines(text):
+        if '> "' in line and SOURCE_MARKER in line and "printf" in line:
+            return line
+    return None
+
+
 def test_user_installer_does_not_clobber_env() -> None:
     text = _read(USER_INSTALLER)
 
-    # Every statement that installs .env.example onto herdres.env must be guarded
-    # by a `[ -f ... ]` / `if [ ! -f ... ]` existence check — no unconditional copy.
-    env_lines = [
-        line
-        for line in _logical_lines(text)
-        if "install" in line and ".env.example" in line and "herdres.env" in line
-    ]
-    assert env_lines, "install-user.sh no longer copies .env.example to herdres.env?"
-    for line in env_lines:
-        assert "[ -f" in line or "[ ! -f" in line, (
-            "install-user.sh writes herdres.env unconditionally (would clobber "
-            f"live credentials): {line.strip()!r}"
-        )
+    # The .env.example -> herdres.env copy must exist and be guarded by an
+    # existence check, in EITHER the `[ -f … ] || install …` short-circuit form
+    # or an `if [ ! -f … ]; then … fi` block. Deleting the guard must flip this.
+    assert _env_install_logical_lines(text), (
+        "install-user.sh no longer copies .env.example to herdres.env?"
+    )
+    assert _guards_env_install(text), (
+        "install-user.sh writes herdres.env unconditionally (would clobber live "
+        "credentials): the copy is not behind a `[ -f … ]` / `if [ ! -f … ]` guard"
+    )
 
     # And the guard must reference the real config file, not just any path.
     assert ".config/herdres/herdres.env" in text
 
 
 def test_macos_installer_guards_env() -> None:
-    # Regression guard for the installer we mirror: macOS already protects the
-    # config behind `if [ ! -f "$CFG/herdres.env" ]`.
+    # Regression guard for the installer we mirror: macOS protects the config
+    # behind `if [ ! -f "$CFG/herdres.env" ]; then … install … fi`. Assert the
+    # env-install line lives *inside* that guard block, so this fails outright
+    # if the `if [ ! -f … ]` guard (or its `fi`) is deleted — not just two
+    # independent substring checks that survive removing the guard.
     text = _read(MACOS_INSTALLER)
-    assert "[ ! -f" in text and "herdres.env" in text
+
+    # There must be an env copy at all (it lives on its own physical line).
+    assert _env_install_logical_lines(text), (
+        "install-macos.sh no longer copies .env.example to herdres.env?"
+    )
+    # And it must be enclosed by the `if [ ! -f … herdres.env … ]` guard block.
+    assert _guards_env_install(text), (
+        "install-macos.sh writes herdres.env unconditionally (would clobber live "
+        "credentials): the copy is not inside an `if [ ! -f … ]` guard block"
+    )
 
 
 @pytest.mark.parametrize("path", [USER_INSTALLER, MACOS_INSTALLER])
@@ -81,13 +164,23 @@ def test_installer_writes_source_marker(path: Path) -> None:
     )
     # The marker line must redirect *into* the source file (a write), not merely
     # mention the path in a comment.
-    marker_writes = [
-        line
-        for line in _logical_lines(text)
-        if '> "' in line and SOURCE_MARKER in line
-    ]
-    assert marker_writes, (
+    marker_line = _checkout_dir_expr(text)
+    assert marker_line is not None, (
         f'{path.name} mentions {SOURCE_MARKER} but never writes to it (no `> "…/source"`)'
+    )
+
+    # Fix 3+4: the write must record the *checkout dir*, not an arbitrary string.
+    # Both installers use the same consistent expression, $PWD (the cwd), because
+    # their other installs are cwd-relative (`install -Dm755 herdres.py …`), so
+    # the script is run from the checkout root and $PWD *is* the checkout.
+    assert '"$PWD"' in marker_line, (
+        f"{path.name} must write $PWD (the checkout dir) to the source marker, "
+        f"not just any path: {marker_line.strip()!r}"
+    )
+    # Guard against the stale script-dir form so the two installers stay in sync.
+    assert "dirname" not in marker_line, (
+        f"{path.name} source-marker write should use $PWD, not a script-dir "
+        f"`$(cd \"$(dirname \"$0\")\" && pwd)` expression: {marker_line.strip()!r}"
     )
 
 

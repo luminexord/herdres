@@ -32,7 +32,9 @@ echo "Using interpreter: $PY ($("$PY" --version 2>&1))"
 mkdir -p "$BIN" "$CFG" "$CFG/managed-bots" "$SHARE/herdres-plugin" "$SHARE/inbound" "$SHARE/ssh/server" "$SHARE/ssh/web" "$LA"
 
 # Record this checkout's absolute path so `herdres update --edge` can git pull it.
-printf '%s\n' "$HERE" > "$HOME/.local/share/herdres/source"
+# Use $PWD (the cwd) for parity with install-user.sh, which records the same
+# expression; this installer is run from the checkout root.
+printf '%s\n' "$PWD" > "$HOME/.local/share/herdres/source"
 
 # 2. Install scripts, pinning the shebang to the chosen interpreter
 install_pinned() { install -m 755 "$HERE/$1" "$BIN/$2"; /usr/bin/sed -i '' "1s|.*|#!$PY|" "$BIN/$2"; }
