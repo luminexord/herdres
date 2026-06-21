@@ -71,7 +71,18 @@ class _SubprocessRouter:
         self.calls: list[list[str]] = []
         self.version_returncode = 0
         self.pull_returncode = 0
+        self.sync_returncode = 0
         self.new_version = "9.9.9"
+        # Version reported by `git show <ref>:herdres.py` for --check; None => the
+        # `git show` "fails" (no upstream), exercising the needs-upstream path.
+        self.remote_version = "9.9.9"
+        # `systemctl --user is-active herdres-gateway.service` result. "active" by
+        # default; flip to "inactive" to simulate a silently-failed re-enable.
+        self.gateway_active = "active"
+        # When set, the FIRST gateway `enable --now` flips gateway_active to
+        # "inactive" (one-shot), simulating a re-enable that silently fails on the
+        # apply restart while leaving the rollback restart able to recover.
+        self.flip_gateway_inactive_on_enable = False
 
     def __call__(self, argv, *a, **kw):  # noqa: ANN001 - mimics subprocess.run
         self.calls.append(list(argv))
@@ -85,18 +96,35 @@ class _SubprocessRouter:
                 stdout = "abc1234\n"
             elif sub == "fetch":
                 rc = 0
+            elif sub == "show":
+                # `git show <ref>:herdres.py` -> remote source (for --check version).
+                if self.remote_version is None:
+                    rc = 1
+                else:
+                    stdout = f'HERDRES_VERSION = "{self.remote_version}"\n'
         elif argv[0].endswith("herdres") or argv[0].endswith("/herdres"):
             # the installed-binary verify probes: `herdres version` / `herdres sync`
             if argv[-1] == "version":
                 rc = self.version_returncode
                 stdout = json.dumps({"ok": True, "version": self.new_version})
             elif argv[-1] == "sync":
-                rc = 0
+                rc = self.sync_returncode
         elif argv[0] in {"systemctl", "launchctl"}:
             # is-enabled -> "enabled" so the unit is treated as active.
             if "is-enabled" in argv:
                 stdout = "enabled\n"
-            rc = 0
+            elif "is-active" in argv:
+                stdout = self.gateway_active + "\n"
+                rc = 0 if self.gateway_active == "active" else 3
+            elif (
+                self.flip_gateway_inactive_on_enable
+                and "enable" in argv
+                and "herdres-gateway.service" in argv
+            ):
+                # One-shot: the apply restart's re-enable silently fails.
+                self.gateway_active = "inactive"
+                self.flip_gateway_inactive_on_enable = False
+            # Every other systemctl/launchctl mutation "succeeds" (rc stays 0).
         return subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr="")
 
 
@@ -208,19 +236,43 @@ class SourceResolutionTests(UpdateTestBase):
 class CheckTests(UpdateTestBase):
     def test_check_applies_nothing(self):
         self._seed_installed()
+        self.router.remote_version = "9.9.9"
         before = _snapshot(self.tmp)
         result = herdres.update_once(_args(repo=str(self.repo), check=True))
         self.assertTrue(result["ok"])
         self.assertEqual(result["action"], "check")
         self.assertEqual(result["current_version"], herdres.HERDRES_VERSION)
+        # available_version is read from the REMOTE source (git show), not local.
         self.assertEqual(result["available_version"], "9.9.9")
+        self.assertTrue(result["update_available"])  # 9.9.9 != local HERDRES_VERSION
+        self.assertFalse(result["needs_upstream"])
         # No file changed.
         self.assertEqual(_snapshot(self.tmp), before)
-        # No service mutation was issued (only git fetch / rev-parse allowed).
+        # Side-effect-free except the fetch: only git fetch/rev-parse/show ran, no
+        # service mutation.
         for call in self.router.calls:
             self.assertNotIn(call[0], {"systemctl", "launchctl"})
             if call[0] == "git":
-                self.assertIn(call[3], {"fetch", "rev-parse"})
+                self.assertIn(call[3], {"fetch", "rev-parse", "show"})
+
+    def test_check_reports_no_update_when_remote_matches_local(self):
+        self._seed_installed()
+        # Remote reports the SAME version the running binary is -> no update.
+        self.router.remote_version = herdres.HERDRES_VERSION
+        result = herdres.update_once(_args(repo=str(self.repo), check=True))
+        self.assertEqual(result["available_version"], herdres.HERDRES_VERSION)
+        self.assertFalse(result["update_available"])
+        self.assertFalse(result["needs_upstream"])
+
+    def test_check_missing_upstream_reports_unknown(self):
+        self._seed_installed()
+        # `git show <ref>:herdres.py` fails -> no upstream version known.
+        self.router.remote_version = None
+        result = herdres.update_once(_args(repo=str(self.repo), check=True))
+        self.assertEqual(result["available_version"], "unknown")
+        self.assertTrue(result["needs_upstream"])
+        # Must NOT silently claim no update is available.
+        self.assertFalse(result["update_available"])
 
 
 class DryRunTests(UpdateTestBase):
@@ -319,6 +371,64 @@ class RollbackOnFailureTests(UpdateTestBase):
         # Nothing replaced (pull failed before backup/replace).
         self.assertEqual(_snapshot_install(self), before)
 
+    def test_version_mismatch_rolls_back(self):
+        """The new binary runs but reports a DIFFERENT version -> code didn't land."""
+        self._seed_installed()
+        # version probe exits 0 but reports a stale version != pulled 9.9.9.
+        self.router.new_version = "0.1.0"
+        with self.assertRaises(herdres.BridgeError) as ctx:
+            herdres.update_once(_args(repo=str(self.repo)))
+        self.assertIn("rolled back", str(ctx.exception))
+        self.assertEqual((self.bin / "herdres").read_text(), 'HERDRES_VERSION = "0.1.0"\n')
+
+
+class SoftSyncTests(UpdateTestBase):
+    def test_sync_failure_warns_but_does_not_roll_back(self):
+        """A post-install dry-run `herdres sync` failure is environmental -> SOFT.
+
+        The version probe proves the code update; a nonzero sync only attaches a
+        warning. The good update must STAY applied (no rollback).
+        """
+        self._seed_installed()
+        self.router.sync_returncode = 7  # environmental failure
+        result = herdres.update_once(_args(repo=str(self.repo)))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "update")
+        self.assertEqual(result["version"], "9.9.9")
+        # New code stayed in place.
+        self.assertIn('HERDRES_VERSION = "9.9.9"', (self.bin / "herdres").read_text())
+        # A warning was surfaced.
+        self.assertIn("warnings", result)
+        self.assertTrue(any("sync" in w for w in result["warnings"]))
+
+
+class GatewayHealthTests(UpdateTestBase):
+    def test_dead_gateway_after_restart_rolls_back(self):
+        """Gateway active before but inactive after re-enable -> roll back.
+
+        The router starts "active" (so the pre-restart snapshot sees it up) and the
+        gateway `enable --now` call flips it to "inactive" (a silently-failed
+        re-enable), so the post-restart health check fails and the update rolls back.
+        """
+        self._seed_installed()
+        self.router.flip_gateway_inactive_on_enable = True
+        with self.assertRaises(herdres.BridgeError) as ctx:
+            herdres.update_once(_args(repo=str(self.repo)))
+        self.assertIn("rolled back", str(ctx.exception))
+        self.assertIn("gateway", str(ctx.exception).lower())
+        # Files rolled back to the pre-update content.
+        self.assertEqual((self.bin / "herdres").read_text(), 'HERDRES_VERSION = "0.1.0"\n')
+
+    def test_gateway_inactive_before_is_not_asserted(self):
+        """If the gateway was NOT active before, we never force it / never raise."""
+        self._seed_installed()
+        self.router.gateway_active = "inactive"
+        # is-enabled still says enabled (so the disable/enable dance runs), but the
+        # gateway was never active, so a still-inactive gateway must not raise.
+        result = herdres.update_once(_args(repo=str(self.repo)))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "update")
+
 
 class RollbackCommandTests(UpdateTestBase):
     def test_rollback_restores_latest_backup(self):
@@ -337,6 +447,85 @@ class RollbackCommandTests(UpdateTestBase):
         with self.assertRaises(herdres.BridgeError) as ctx:
             herdres.update_once(_args(rollback=True))
         self.assertIn("no backup", str(ctx.exception))
+
+
+class FullRollbackTests(UpdateTestBase):
+    def test_rollback_deletes_newly_created_dest(self):
+        """A dest that did NOT exist pre-apply is DELETED on rollback (not orphaned).
+
+        Seed every dest except herdr_topic_bridge.py, so the apply creates it fresh.
+        Rolling back must remove that newly-created file, fully reverting the apply.
+        """
+        self._seed_installed()
+        # Remove one dest so it is genuinely absent at backup time.
+        new_dest = self.share / "herdr_topic_bridge.py"
+        new_dest.unlink()
+        self.assertFalse(new_dest.exists())
+
+        # Apply: this creates herdr_topic_bridge.py for the first time.
+        herdres.update_once(_args(repo=str(self.repo)))
+        self.assertTrue(new_dest.exists())
+        self.assertEqual(new_dest.read_text(), "# bridge\n")
+
+        # Roll back: the newly-created file must be gone, others restored.
+        herdres.update_once(_args(rollback=True))
+        self.assertFalse(new_dest.exists())
+        self.assertEqual((self.bin / "herdres").read_text(), 'HERDRES_VERSION = "0.1.0"\n')
+
+    def test_failed_apply_rollback_deletes_newly_created_dest(self):
+        """Same, but via the inline rollback when verify fails mid-apply."""
+        self._seed_installed()
+        new_dest = self.share / "herdr_topic_bridge.py"
+        new_dest.unlink()
+        self.router.version_returncode = 1  # force verify failure -> inline rollback
+        with self.assertRaises(herdres.BridgeError):
+            herdres.update_once(_args(repo=str(self.repo)))
+        # The file created during the partial apply was removed by rollback.
+        self.assertFalse(new_dest.exists())
+
+
+class EnvUntouchedTests(UpdateTestBase):
+    """Make the env-untouched guarantee REAL: a real herdres.env under the patched
+    config dir must be byte-identical after an edge apply AND after a rollback. If
+    update_once ever wrote to herdres.env, these would fail.
+    """
+
+    ENV_BODY = "TELEGRAM_BOT_TOKEN=supersecret\nTELEGRAM_CHAT_ID=123\nHERDR_OSOV=1\n"
+
+    def _seed_env(self) -> Path:
+        # Place herdres.env under a patched config dir that update_once would write
+        # to if it were buggy. Point DEFAULT_ENV at it for the whole test.
+        config_dir = self.tmp / "config" / "herdres"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        env_path = config_dir / "herdres.env"
+        env_path.write_bytes(self.ENV_BODY.encode("utf-8"))
+        self.enterContext(patch.object(herdres, "DEFAULT_ENV", env_path))
+        return env_path
+
+    def test_env_unchanged_after_apply_and_rollback(self):
+        self._seed_installed()
+        env_path = self._seed_env()
+        before = env_path.read_bytes()
+
+        # Edge apply.
+        herdres.update_once(_args(repo=str(self.repo)))
+        self.assertTrue(env_path.exists())
+        self.assertEqual(env_path.read_bytes(), before)
+
+        # Rollback.
+        herdres.update_once(_args(rollback=True))
+        self.assertTrue(env_path.exists())
+        self.assertEqual(env_path.read_bytes(), before)
+
+    def test_env_unchanged_on_failed_apply_rollback(self):
+        self._seed_installed()
+        env_path = self._seed_env()
+        before = env_path.read_bytes()
+        self.router.version_returncode = 1  # verify fails -> inline rollback
+        with self.assertRaises(herdres.BridgeError):
+            herdres.update_once(_args(repo=str(self.repo)))
+        self.assertTrue(env_path.exists())
+        self.assertEqual(env_path.read_bytes(), before)
 
 
 class ChannelTests(UpdateTestBase):
@@ -358,13 +547,41 @@ class BackupPruneTests(UpdateTestBase):
             for i in range(4):
                 # Distinct timestamps via the suffix-on-collision path is fragile;
                 # create dirs directly to control names deterministically.
-                d = self.backups / f"2026010{i}T000000Z"
+                d = self.backups / f"2026010{i}T000000.000000Z"
                 d.mkdir(parents=True)
                 (d / "manifest.json").write_text("{}", encoding="utf-8")
                 made.append(d)
             herdres._prune_backups()
         remaining = sorted(p.name for p in self.backups.iterdir() if p.is_dir())
-        self.assertEqual(remaining, ["20260102T000000Z", "20260103T000000Z"])
+        self.assertEqual(
+            remaining,
+            ["20260102T000000.000000Z", "20260103T000000.000000Z"],
+        )
+
+    def test_latest_backup_is_chronological_not_lexical(self):
+        """Microsecond-precision names make lexical order == chronological order.
+
+        The old same-second suffixes -1..-10 sorted -10 before -2 lexically, so the
+        "latest" pick was wrong. With microsecond timestamps the 10th-of-a-second
+        backup is still the newest by both string sort and wall clock.
+        """
+        self._seed_installed()
+        # Two same-second backups differing only in microseconds; the later one
+        # (larger microseconds) must be picked as latest.
+        earlier = self.backups / "20260101T000000.000002Z"
+        later = self.backups / "20260101T000000.000010Z"
+        for d in (earlier, later):
+            d.mkdir(parents=True)
+            (d / "manifest.json").write_text(
+                json.dumps({"files": {}, "created": []}), encoding="utf-8"
+            )
+        self.assertEqual(herdres._latest_backup(), later)
+
+    def test_backup_dir_name_has_microsecond_precision(self):
+        self._seed_installed()
+        backup = herdres._backup_install_set()
+        # Name like 20260101T000000.123456Z — a dot + 6 digits before the Z.
+        self.assertRegex(backup.name, r"^\d{8}T\d{6}\.\d{6}Z$")
 
 
 def _snapshot(root: Path) -> dict[str, str]:

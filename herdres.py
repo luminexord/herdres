@@ -12469,8 +12469,20 @@ INSTALL_SYSTEMD_DIR = Path.home() / ".config/systemd/user"
 BACKUP_DIR = Path.home() / ".local/share/herdres/backups"
 KEEP_BACKUPS = 5
 
-# launchd labels (macOS); only restarted if currently loaded.
-LAUNCHD_LABELS = ("com.gaijinjoe.herdres", "com.gaijinjoe.herdres-gateway")
+# launchd labels (macOS); only restarted if currently loaded. The cockpit label is
+# included so a macOS update does not leave a stale cockpit running on old code.
+# NOTE: this restart only re-leases already-loaded agents onto the new scripts. A
+# macOS *deep* update (re-pinning the python shebang on the installed launchers, or
+# refreshing the cockpit npm deps under ssh/server) is NOT done here — re-run
+# install-macos.sh for that.
+LAUNCHD_LABELS = (
+    "com.gaijinjoe.herdres",
+    "com.gaijinjoe.herdres-gateway",
+    "com.gaijinjoe.herdres-cockpit",
+)
+# The gateway launchd label, kept distinct for the active-before/active-after health
+# check that guards against a silently-failed re-enable (dead inbound).
+GATEWAY_LAUNCHD_LABEL = "com.gaijinjoe.herdres-gateway"
 
 
 def _installed_bin() -> Path:
@@ -12539,14 +12551,35 @@ def _atomic_install(dest: Path, text: str, mode: int) -> None:
     os.chmod(dest, mode)
 
 
+def _parse_version(text: str) -> str | None:
+    """Pull ``HERDRES_VERSION = "..."`` out of herdres.py source text."""
+    match = re.search(r'^HERDRES_VERSION\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
 def _read_version_from(path: Path) -> str | None:
     """Parse ``HERDRES_VERSION = "..."`` from a herdres.py source file."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return None
-    match = re.search(r'^HERDRES_VERSION\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
-    return match.group(1) if match else None
+    return _parse_version(text)
+
+
+def _read_remote_version(repo: Path) -> str | None:
+    """Read HERDRES_VERSION from the upstream herdres.py without touching the tree.
+
+    Tries the tracked upstream branch first, then origin/HEAD, via
+    ``git show <ref>:herdres.py``. Returns None when there is no upstream (so the
+    caller can report "unknown" rather than pretend no update is available).
+    """
+    for ref in ("@{u}", "origin/HEAD"):
+        proc = _run_git(repo, "show", f"{ref}:herdres.py")
+        if proc.returncode == 0:
+            version = _parse_version(proc.stdout)
+            if version:
+                return version
+    return None
 
 
 def _resolve_source(args: Any) -> Path:
@@ -12610,14 +12643,41 @@ def _launchd_label_loaded(label: str) -> bool:
     return proc.returncode == 0
 
 
+def _gateway_is_active() -> bool:
+    """True if the inbound gateway is currently running.
+
+    Linux: ``systemctl --user is-active herdres-gateway.service`` returns 0/"active".
+    macOS: the gateway launchd label is loaded. Used to detect a silently-failed
+    re-enable (a dead inbound) so the updater can roll back instead of leaving the
+    gateway stopped.
+    """
+    if _platform_is_macos():
+        return _launchd_label_loaded(GATEWAY_LAUNCHD_LABEL)
+    proc = subprocess.run(
+        ["systemctl", "--user", "is-active", "herdres-gateway.service"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0 and proc.stdout.strip() == "active"
+
+
 def _restart_services() -> list[str]:
     """Reload + restart the timer and re-lease the gateway. Returns actions taken.
 
     Linux/systemd: daemon-reload; restart herdres.timer; gateway is disabled then
     re-enabled (disable --now then enable --now) so the single getUpdates lease is
     released before the new process grabs it. macOS/launchd: bootout then bootstrap
-    the herdres + gateway agents. Only units currently active/loaded are touched.
+    the herdres + gateway + cockpit agents. Only units currently active/loaded are
+    touched.
+
+    Gateway-health guard: if the gateway was active BEFORE the restart but is not
+    active after it (e.g. a silently-failed re-enable), raise BridgeError so callers
+    roll back instead of leaving a dead inbound. If it was not active to begin with,
+    no health assertion is made.
     """
+    # Capture the gateway's pre-restart liveness so we can assert it returns.
+    gateway_was_active = _gateway_is_active()
     actions: list[str] = []
     if _platform_is_macos():
         uid = os.getuid()
@@ -12634,6 +12694,7 @@ def _restart_services() -> list[str]:
                 capture_output=True, text=True, check=False,
             )
             actions.append(f"launchctl re-bootstrap {label}")
+        _assert_gateway_health(gateway_was_active)
         return actions
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True, check=False)
@@ -12650,34 +12711,64 @@ def _restart_services() -> list[str]:
             ["systemctl", "--user", "disable", "--now", "herdres-gateway.service"],
             capture_output=True, text=True, check=False,
         )
-        subprocess.run(
+        enable = subprocess.run(
             ["systemctl", "--user", "enable", "--now", "herdres-gateway.service"],
             capture_output=True, text=True, check=False,
         )
         actions.append("systemctl --user disable->enable herdres-gateway.service")
+        # A nonzero enable means the re-enable silently failed; the gateway is now
+        # disabled+stopped. The is-active check below catches both that and a unit
+        # that enabled but failed to start.
+        if enable.returncode != 0:
+            actions.append(f"WARNING: gateway enable exited {enable.returncode}")
+    _assert_gateway_health(gateway_was_active)
     return actions
+
+
+def _assert_gateway_health(was_active: bool) -> None:
+    """Raise if the gateway was active before a restart but isn't active after.
+
+    Only asserts when the gateway was up to begin with — we never force-start a
+    gateway the operator had stopped. A failure here means inbound is dead, so the
+    caller should roll back (apply path) or surface a clear error (rollback path).
+    """
+    if was_active and not _gateway_is_active():
+        raise BridgeError(
+            "herdres update: gateway failed to come back active after restart "
+            "(inbound is down); the gateway re-enable did not take"
+        )
 
 
 def _backup_install_set() -> Path:
     """Copy the currently-installed code set into backups/<UTC-ts>/, prune to KEEP_BACKUPS.
 
-    The backup dir mirrors the dest filename per entry plus a manifest mapping each
-    backed-up file back to its install destination (so --rollback can restore it).
+    The backup dir mirrors the dest filename per entry plus a manifest. The manifest
+    records both the backed-up files (mapping each to its install destination, so
+    --rollback can restore it) and the planned dests that did NOT exist pre-apply
+    (so rollback can delete files newly created during a partial apply rather than
+    leaving them behind). The dir name is a microsecond-precision UTC timestamp so
+    lexical order == chronological order and same-second collisions can't happen.
     """
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    ts = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # Microsecond precision: lexical sort == chronological, collisions effectively
+    # impossible, so _latest_backup/_prune_backups stay chronologically correct.
+    ts = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     dest_dir = BACKUP_DIR / ts
-    # Avoid clobbering a same-second backup.
+    # Defensive: a duplicate microsecond would be a clock anomaly; still don't clobber.
     suffix = 0
     while dest_dir.exists():
         suffix += 1
         dest_dir = BACKUP_DIR / f"{ts}-{suffix}"
     dest_dir.mkdir(parents=True)
 
-    manifest: dict[str, str] = {}
+    files: dict[str, str] = {}
+    created: list[str] = []
     for idx, entry in enumerate(_update_files_plan()):
         installed = entry["dest"]
         if not installed.exists():
+            # Dest absent pre-apply: a successful apply will create it, so record it
+            # for deletion on rollback (otherwise the new file is orphaned).
+            created.append(str(installed))
             continue
         # Flat, index-prefixed names keep distinct dirs' same-named files apart.
         backup_name = f"{idx:02d}_{installed.name}"
@@ -12686,7 +12777,8 @@ def _backup_install_set() -> Path:
             os.chmod(dest_dir / backup_name, installed.stat().st_mode & 0o777)
         except OSError:
             pass
-        manifest[backup_name] = str(installed)
+        files[backup_name] = str(installed)
+    manifest = {"files": files, "created": created}
     (dest_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -12695,14 +12787,27 @@ def _backup_install_set() -> Path:
     return dest_dir
 
 
-def _prune_backups() -> None:
+def _backup_dirs() -> list[Path]:
+    """Backup dirs sorted chronologically (microsecond UTC names sort lexically)."""
     if not BACKUP_DIR.exists():
-        return
-    backups = sorted(
+        return []
+    return sorted(
         (p for p in BACKUP_DIR.iterdir() if p.is_dir()),
         key=lambda p: p.name,
     )
-    for old in backups[:-KEEP_BACKUPS]:
+
+
+def _read_manifest(backup_dir: Path) -> dict[str, Any]:
+    """Load a backup manifest, tolerating the legacy flat ``{name: dest}`` form."""
+    manifest = json.loads((backup_dir / "manifest.json").read_text(encoding="utf-8"))
+    if "files" in manifest or "created" in manifest:
+        return {"files": manifest.get("files", {}), "created": manifest.get("created", [])}
+    # Legacy: the whole dict was the name->dest map, with no created tracking.
+    return {"files": manifest, "created": []}
+
+
+def _prune_backups() -> None:
+    for old in _backup_dirs()[:-KEEP_BACKUPS]:
         for child in sorted(old.iterdir(), reverse=True):
             try:
                 child.unlink()
@@ -12715,27 +12820,31 @@ def _prune_backups() -> None:
 
 
 def _restore_backup(backup_dir: Path) -> None:
-    """Restore every file recorded in a backup dir's manifest to its dest (atomic)."""
-    manifest_path = backup_dir / "manifest.json"
-    if not manifest_path.exists():
+    """Fully revert an apply: restore backed-up dests AND delete newly-created ones.
+
+    Restores every file recorded in the manifest to its dest (atomic) and deletes
+    any dest that did not exist before the apply (so a partial apply that created a
+    brand-new file is fully reverted rather than leaving the new file behind).
+    """
+    if not (backup_dir / "manifest.json").exists():
         raise BridgeError(f"herdres update: backup {compact_path(str(backup_dir))} has no manifest")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    for backup_name, dest_str in manifest.items():
+    manifest = _read_manifest(backup_dir)
+    for backup_name, dest_str in manifest["files"].items():
         src = backup_dir / backup_name
         if not src.exists():
             continue
         dest = Path(dest_str)
         mode = src.stat().st_mode & 0o777
         _atomic_install(dest, src.read_text(encoding="utf-8"), mode)
+    for dest_str in manifest["created"]:
+        try:
+            Path(dest_str).unlink()
+        except OSError:
+            pass
 
 
 def _latest_backup() -> Path | None:
-    if not BACKUP_DIR.exists():
-        return None
-    backups = sorted(
-        (p for p in BACKUP_DIR.iterdir() if p.is_dir() and (p / "manifest.json").exists()),
-        key=lambda p: p.name,
-    )
+    backups = [p for p in _backup_dirs() if (p / "manifest.json").exists()]
     return backups[-1] if backups else None
 
 
@@ -12758,10 +12867,19 @@ def _apply_install_set(repo: Path) -> list[str]:
     return written
 
 
-def _verify_install() -> str:
-    """Run the installed `herdres version` + a dry-run sync; return the new version.
+def _verify_install(expected_version: str, gateway_was_active: bool) -> dict[str, Any]:
+    """Verify the applied update; return ``{"version": ..., "warnings": [...]}``.
 
-    Raises BridgeError if either probe fails (caller rolls back).
+    HARD success criterion (raises BridgeError -> caller rolls back): the new binary
+    runs (`herdres version` exits 0) AND reports the expected NEW HERDRES_VERSION.
+    That proves the code update actually landed and is loadable.
+
+    Gateway-health (hard): if the gateway was active before the update, assert it is
+    active again now (a silently-failed re-enable means inbound is dead -> roll back).
+
+    SOFT check (warning only, never rolls back): a dry-run `herdres sync`. A nonzero
+    sync can fail for ENVIRONMENTAL reasons (corrupt state, a pane probe, disk) that
+    do not mean the code update is bad, so we record a warning and keep the update.
     """
     binary = _installed_bin()
     ver = subprocess.run(
@@ -12775,7 +12893,16 @@ def _verify_install() -> str:
         new_version = json.loads(ver.stdout or "{}").get("version", "")
     except (ValueError, AttributeError):
         pass
+    if not new_version or new_version != expected_version:
+        raise BridgeError(
+            "herdres update: verify failed (new binary reports version "
+            f"{new_version!r}, expected {expected_version!r}); update did not take"
+        )
 
+    # Hard: the gateway must be back if it was up before (catches a dead inbound).
+    _assert_gateway_health(gateway_was_active)
+
+    warnings: list[str] = []
     sync_env = dict(os.environ)
     sync_env["HERDR_TELEGRAM_TOPICS_DRY_RUN"] = "1"
     syn = subprocess.run(
@@ -12783,8 +12910,13 @@ def _verify_install() -> str:
         capture_output=True, text=True, check=False, env=sync_env,
     )
     if syn.returncode != 0:
-        raise BridgeError(f"herdres update: verify failed (`herdres sync` exit {syn.returncode})")
-    return new_version
+        # Soft: a dry-run sync can fail for environmental reasons that don't
+        # invalidate the code update. Warn, but do NOT roll back a good update.
+        warnings.append(
+            f"post-update dry-run `herdres sync` exited {syn.returncode} "
+            "(environmental? not rolled back; check state/panes)"
+        )
+    return {"version": new_version, "warnings": warnings}
 
 
 def update_once(args: Any) -> dict[str, Any]:
@@ -12801,7 +12933,13 @@ def update_once(args: Any) -> dict[str, Any]:
         if backup is None:
             raise BridgeError("herdres update: no backup to roll back to")
         _restore_backup(backup)
-        actions = _restart_services()
+        # _restart_services re-checks gateway health and raises if a gateway that was
+        # active can't be brought back, surfacing a clear error if rollback can't
+        # restore inbound.
+        try:
+            actions = _restart_services()
+        except BridgeError as exc:
+            raise BridgeError(f"herdres rollback restored files but {exc}") from exc
         return {
             "ok": True,
             "action": "rollback",
@@ -12813,24 +12951,35 @@ def update_once(args: Any) -> dict[str, Any]:
     current = HERDRES_VERSION
     available = _read_version_from(repo / "herdres.py") or current
 
-    # --check: fetch + compare versions, apply nothing.
+    # --check: fetch + compare the LOCAL version against the REMOTE version, apply
+    # nothing. Side-effect-free except the `git fetch` (which is required to learn
+    # the upstream version). A missing upstream is reported, not silently ignored.
     if getattr(args, "check", False):
         fetch = _run_git(repo, "fetch")
-        # Re-read after fetch in case the working tree is the fetched ref; for a
-        # plain checkout the working file version is the comparison anchor.
-        available = _read_version_from(repo / "herdres.py") or available
         local_rev = _git_rev(repo, "HEAD")
         remote_rev = _git_rev(repo, "@{u}") or _git_rev(repo, "origin/HEAD")
+        remote_version = _read_remote_version(repo)
+        if remote_version is None:
+            # No upstream / couldn't read origin's herdres.py: don't pretend there's
+            # nothing newer — report "unknown" and flag that upstream is needed.
+            available_version = "unknown"
+            update_available = False
+            needs_upstream = True
+        else:
+            available_version = remote_version
+            update_available = remote_version != current
+            needs_upstream = False
         return {
             "ok": True,
             "action": "check",
             "channel": channel,
             "source": str(repo),
             "current_version": current,
-            "available_version": available,
+            "available_version": available_version,
             "local_rev": local_rev,
             "remote_rev": remote_rev,
-            "update_available": bool(remote_rev and local_rev and remote_rev != local_rev),
+            "update_available": update_available,
+            "needs_upstream": needs_upstream,
             "fetch_ok": fetch.returncode == 0,
         }
 
@@ -12838,7 +12987,7 @@ def update_once(args: Any) -> dict[str, Any]:
     if getattr(args, "dry_run", False):
         files = [str(entry["dest"]) for entry in _update_files_plan()]
         service_actions = (
-            ["launchctl bootout+bootstrap herdres + gateway agents"]
+            ["launchctl bootout+bootstrap herdres + gateway + cockpit agents"]
             if _platform_is_macos()
             else [
                 "systemctl --user daemon-reload",
@@ -12868,13 +13017,21 @@ def update_once(args: Any) -> dict[str, Any]:
     # Re-read the target version after the fast-forward.
     available = _read_version_from(repo / "herdres.py") or available
 
+    # Snapshot gateway liveness before we touch anything so verify can assert it
+    # comes back (a dead inbound after the restart means we must roll back).
+    gateway_was_active = _gateway_is_active()
+
     backup = _backup_install_set()
     try:
         written = _apply_install_set(repo)
+        # _restart_services raises if a previously-active gateway can't be brought
+        # back; that propagates here and rolls back.
         service_actions = _restart_services()
-        new_version = _verify_install()
+        verify = _verify_install(available, gateway_was_active)
     except Exception as exc:
-        # Rollback on ANY failure in replace/restart/verify.
+        # Roll back when: a file replace errors, the new binary fails to run / version
+        # mismatches, or the gateway fails to come back. (A soft dry-run sync failure
+        # only warns and never reaches here.)
         try:
             _restore_backup(backup)
             _restart_services()
@@ -12884,18 +13041,21 @@ def update_once(args: Any) -> dict[str, Any]:
             ) from exc
         raise BridgeError(f"herdres update failed (rolled back): {exc}") from exc
 
-    return {
+    result = {
         "ok": True,
         "action": "update",
         "channel": channel,
         "source": str(repo),
         "previous_version": current,
-        "version": new_version or available,
+        "version": verify["version"] or available,
         "backup": str(backup),
         "files": written,
         "services": service_actions,
         "head": _git_rev(repo, "HEAD"),
     }
+    if verify["warnings"]:
+        result["warnings"] = verify["warnings"]
+    return result
 
 
 def version_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
