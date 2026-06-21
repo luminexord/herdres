@@ -13,7 +13,7 @@ This file covers **install + config + services + plugin linking only**. For the 
 | Requirement | Notes |
 | --- | --- |
 | Python **>= 3.11** | stdlib-only; no pip deps. macOS installer auto-picks `python3.11`..`python3.14`. |
-| **Herdr >= 0.7.0** | Provides local plugin events (`pane.agent_status_changed`) and the `herdr pane turn` structured-turn endpoint. `herdr` must be on `PATH`, or set `HERDR_BIN`. |
+| **Herdr >= 0.7.0** (recommended) | Provides local plugin events (`pane.agent_status_changed`) and the `herdr pane turn` structured-turn endpoint. `herdr` must be on `PATH`, or set `HERDR_BIN`. Older herdr (e.g. 0.6.x) still runs in **degraded mode** — timer-only reconcile, no instant plugin trigger; set `HERDR_BIN` to the bundled `herdr_turn_adapter.py` for the turn feed. |
 | Linux: user systemd | For the reconcile timer (`systemctl --user`). macOS uses launchd instead (no user systemd). |
 
 ### In the Telegram app (the human must do this once)
@@ -81,6 +81,8 @@ This installs to the user prefix:
 - `~/.config/herdres/herdres.env` — config (copied from `.env.example`)
 - `~/.local/share/herdres/herdres-plugin/herdr-plugin.toml` — plugin manifest with an absolute `herdres` path baked in
 - `~/.config/systemd/user/herdres.{service,timer}` and `herdres-gateway.service`
+
+> **PATH gotcha:** the installer puts `herdres` at `~/.local/bin/herdres` but does **not** edit your `PATH`. If `herdres` is later "command not found", `~/.local/bin` is not on `PATH` — add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile (`~/.bashrc`/`~/.zshrc`) and re-open the shell, or invoke it by full path. The systemd/launchd units and the plugin manifest bake in absolute paths, so the **service** runs regardless; this only affects typing `herdres` yourself.
 
 Then edit the config and enable the reconcile timer:
 

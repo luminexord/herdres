@@ -22,7 +22,7 @@ before doing anything, confirm `~/.config/herdres/herdres.env` exists and `herdr
 
 the headline path. do not skip preflight, and do not write Telegram state until verify passes.
 
-1. **preflight.** detect the OS: Linux uses **systemd** (`systemctl --user`), macOS uses **launchd** (no user systemd). check `python3 --version` is **>= 3.11**. confirm Herdr is running and `>= 0.7.0` (`herdr --version`; `herdr` must be on `PATH` or set `HERDR_BIN`). check whether `~/.config/herdres/herdres.env` already exists — if so, do not clobber it; just edit it and skip the installer's copy step.
+1. **preflight.** detect the OS: Linux uses **systemd** (`systemctl --user`), macOS uses **launchd** (no user systemd). check `python3 --version` is **>= 3.11**. confirm Herdr is running (`herdr --version`; `herdr` must be on `PATH` or set `HERDR_BIN`); **0.7.0+ is recommended** — older herdr still works in degraded mode (timer-only, no instant plugin trigger; see step 5). check whether `~/.config/herdres/herdres.env` already exists — if so, do not clobber it; just edit it and skip the installer's copy step.
 
 2. **guided Telegram setup** (the human does this once in the Telegram app — give them these exact steps, then validate what they paste back):
    - **a.** message **@BotFather**, run `/newbot`, copy the **bot token** → `TELEGRAM_BOT_TOKEN`. Validate: shape is `<digits>:<base64-ish>`, e.g. `123456:ABC-...`.
@@ -32,6 +32,7 @@ the headline path. do not skip preflight, and do not write Telegram state until 
    - **e.** get **your own user ID** (a positive integer) → first entry of `TELEGRAM_ALLOWED_USERS`. Validate: numeric, positive.
 
 3. **run the installer** from the repo checkout: Linux `./install-user.sh`; macOS `./install-macos.sh`. This installs the `herdres` CLI, the gateway, the env file (copied from `.env.example`, never clobbering an existing one), the Herdr plugin manifest, and the service units / launchd agents.
+   - the CLI lands at `~/.local/bin/herdres` and the installer does **not** edit `PATH`. if `herdres` is "command not found" next, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile and re-open the shell, or call it as `~/.local/bin/herdres`. the service and plugin use absolute paths, so this only affects you typing `herdres`.
 
 4. **write the three required env vars** in `~/.config/herdres/herdres.env`:
    ```bash
@@ -44,7 +45,7 @@ the headline path. do not skip preflight, and do not write Telegram state until 
 5. **enable the service + link the plugin.**
    - Linux: `systemctl --user daemon-reload && systemctl --user enable --now herdres.timer`
    - macOS: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gaijinjoe.herdres.plist` (plus the gateway and, if wanted, cockpit plists)
-   - both: `herdr plugin link ~/.local/share/herdres/herdres-plugin` then `herdres plugin-enable`
+   - both: `herdr plugin link ~/.local/share/herdres/herdres-plugin` then `herdres plugin-enable` — **needs herdr 0.7.0+**. on older herdr, skip this (the timer still reconciles, just at its interval) and set `HERDR_BIN` to the bundled `herdr_turn_adapter.py` if `herdr pane turn` is missing; upgrading herdr is recommended.
 
 6. **verify** (non-destructive first):
    ```bash
