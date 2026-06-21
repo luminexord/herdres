@@ -184,8 +184,8 @@ def devin_resolve_session_id(pane: dict[str, Any]) -> str:
     """Resolve the Devin session ID for a pane when agent_session is None.
 
     Uses `devin list --format json` and matches by working directory.
-    Only returns sessions whose transcript file exists (Devin writes
-    transcripts lazily, so in-progress sessions may not have one yet).
+    Prefers sessions that have either a transcript JSON file or rows in
+    sessions.db (most active sessions store data in the DB).
     """
     cwd = str(pane.get("cwd") or pane.get("foreground_cwd") or "")
     try:
@@ -209,9 +209,14 @@ def devin_resolve_session_id(pane: dict[str, Any]) -> str:
                 if matching:
                     matching.sort(key=lambda e: int(e.get("last_activity_at") or 0), reverse=True)
                     transcripts_dir = devin_transcripts_dir()
+                    db_path = devin_sessions_db()
                     for e in matching:
                         sid = str(e.get("id") or "")
-                        if sid and (transcripts_dir / f"{sid}.json").exists():
+                        if not sid:
+                            continue
+                        if (transcripts_dir / f"{sid}.json").exists():
+                            return sid
+                        if devin_db_has_session(db_path, sid):
                             return sid
     except Exception:
         pass
@@ -221,6 +226,140 @@ def devin_resolve_session_id(pane: dict[str, Any]) -> str:
 def devin_session_path(session_id: str) -> Path | None:
     path = devin_transcripts_dir() / f"{session_id}.json"
     return path if path.exists() else None
+
+
+def devin_sessions_db() -> Path:
+    return Path(os.getenv("DEVIN_SESSIONS_DB", str(Path.home() / ".local/share/devin/cli/sessions.db"))).expanduser()
+
+
+def devin_db_has_session(db_path: Path, session_id: str) -> bool:
+    if not db_path.exists():
+        return False
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
+        cur = conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,))
+        found = cur.fetchone() is not None
+        conn.close()
+        return found
+    except Exception:
+        return False
+
+
+def extract_devin_turn_from_db(db_path: Path, pane_id: str, session_id: str) -> dict[str, Any]:
+    """Extract the latest turn from Devin's sessions.db (SQLite).
+
+    Mirrors extract_devin_turn but reads message_nodes rows instead of
+    transcript JSON steps. Each chat_message is JSON with role/content/tool_calls.
+    """
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        rows = conn.execute(
+            "SELECT node_id, chat_message, created_at FROM message_nodes "
+            "WHERE session_id = ? ORDER BY node_id ASC",
+            (session_id,),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return {"available": False, "reason": "db_read_error", "pane_id": pane_id, "agent": "devin"}
+
+    if not rows:
+        return {"available": False, "reason": "no_steps", "pane_id": pane_id, "agent": "devin"}
+
+    completed: list[dict[str, Any]] = []
+    current_turn_id = ""
+    current_started_at: Any = None
+    current_user_text = ""
+    last_agent_text = ""
+    open_turn = False
+
+    for node_id, chat_message_json, created_at in rows:
+        try:
+            msg = json.loads(chat_message_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        role = str(msg.get("role") or "")
+        content = str(msg.get("content") or "")
+        tool_calls = msg.get("tool_calls") or []
+        timestamp = created_at
+
+        if role == "user" and content.strip() and not is_internal_devin_user_text(content):
+            if open_turn and current_user_text and last_agent_text:
+                completed.append({
+                    "available": True,
+                    "pane_id": pane_id,
+                    "agent": "devin",
+                    "agent_session_id": session_id,
+                    "turn_id": str(current_turn_id),
+                    "turn_index": None,
+                    "complete": True,
+                    "complete_reason": "done",
+                    "started_at": current_started_at,
+                    "completed_at": timestamp,
+                    "user_text": current_user_text,
+                    "assistant_final_text": last_agent_text,
+                })
+            current_turn_id = str(node_id)
+            current_started_at = timestamp
+            current_user_text = sanitize_text(content)
+            last_agent_text = ""
+            open_turn = True
+            continue
+
+        if role == "assistant" and open_turn:
+            if content.strip():
+                last_agent_text = sanitize_text(content)
+            if content.strip() and not tool_calls:
+                if current_user_text and last_agent_text:
+                    completed.append({
+                        "available": True,
+                        "pane_id": pane_id,
+                        "agent": "devin",
+                        "agent_session_id": session_id,
+                        "turn_id": str(current_turn_id),
+                        "turn_index": None,
+                        "complete": True,
+                        "complete_reason": "done",
+                        "started_at": current_started_at,
+                        "completed_at": timestamp,
+                        "user_text": current_user_text,
+                        "assistant_final_text": last_agent_text,
+                    })
+                    open_turn = False
+            continue
+
+    if completed:
+        recent = completed[-RECENT_TURNS:]
+        latest = dict(recent[-1])
+        if open_turn:
+            latest["has_open_turn"] = True
+            latest["open_turn_id"] = current_turn_id
+            if current_user_text:
+                latest["open_user_text"] = current_user_text
+            add_stream_fields(latest, last_agent_text, "devin")
+        latest["recent_turns"] = recent
+        return latest
+    if open_turn:
+        turn = {
+            "available": True,
+            "pane_id": pane_id,
+            "agent": "devin",
+            "agent_session_id": session_id,
+            "complete": False,
+            "turn_id": current_turn_id,
+            "user_text": current_user_text,
+            "assistant_final_text": "",
+        }
+        return add_stream_fields(turn, last_agent_text, "devin")
+    return {
+        "available": True,
+        "pane_id": pane_id,
+        "agent": "devin",
+        "agent_session_id": session_id,
+        "complete": False,
+        "reason": "no_completed_turn",
+    }
 
 
 def claude_project_dir_for_cwd(cwd: str) -> Path | None:
@@ -849,9 +988,12 @@ def pane_turn(pane_id: str) -> dict[str, Any]:
 
     if agent == "devin":
         path = devin_session_path(session_id)
-        if not path:
-            return unavailable("session_file_not_found", pane_id=pane_id, agent=agent, agent_session_id=session_id)
-        return result_turn(extract_devin_turn(path, pane_id, session_id))
+        if path:
+            return result_turn(extract_devin_turn(path, pane_id, session_id))
+        db_path = devin_sessions_db()
+        if db_path.exists() and devin_db_has_session(db_path, session_id):
+            return result_turn(extract_devin_turn_from_db(db_path, pane_id, session_id))
+        return unavailable("session_file_not_found", pane_id=pane_id, agent=agent, agent_session_id=session_id)
 
     return unavailable("unsupported_agent", pane_id=pane_id, agent=agent or None)
 
