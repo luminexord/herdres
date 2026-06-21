@@ -114,7 +114,7 @@ This updates from your local checkout on the `edge` channel (the default for now
 Other commands:
 
 ```bash
-herdres update --check       # show current vs available version; change nothing
+herdres update --check       # git fetch, then report current vs available version (equal on a plain checkout until you pull); change nothing
 herdres update --rollback    # restore the previous install from the latest backup
 herdres update --dry-run     # print the plan (source, version, files, services); change nothing
 herdres version              # print the installed version
