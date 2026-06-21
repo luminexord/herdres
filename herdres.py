@@ -9328,12 +9328,19 @@ def record_pane_message_route(state: dict[str, Any], space_key_value: str, pane_
     space = state.setdefault("spaces", {}).get(space_key_value)
     if not isinstance(space, dict):
         return False
+    message_key = str(message_id or "").strip()
+    if not message_key:
+        return False
+    # Topic-scoped high-water mark: the newest message id seen in this space's shared
+    # topic, across ALL panes. Unlike last_pane_message_id this is not per-pane, so a
+    # sibling pane posting can be detected as having buried another pane's turn anchor.
+    # Advanced independent of the pane entry — a closed/removed sibling's message still
+    # buries. (Inbound owner messages do NOT pass through here — they only carry the
+    # bot's own outbound ids — so command_reply advances the mark for those separately.)
+    note_topic_high_water_mark(space, message_key)
     panes = state.setdefault("panes", {})
     entry = panes.get(pane_key_value)
     if not isinstance(entry, dict):
-        return False
-    message_key = str(message_id or "").strip()
-    if not message_key:
         return False
     routes = space.get("message_routes")
     if not isinstance(routes, dict):
@@ -9363,6 +9370,42 @@ def pane_message_is_latest(entry: dict[str, Any], message_id: str | int) -> bool
         return False
     latest = str(entry.get("last_pane_message_id") or "").strip()
     return not latest or latest == message_key
+
+
+def topic_message_is_latest(space: dict[str, Any] | None, message_id: str | int) -> bool:
+    """Is `message_id` still the newest message in the space's shared topic?
+
+    In a shared topic (per_agent voice, or any topic grouping several panes) a turn's
+    edit-in-place anchor is only safe to edit when nothing — another pane's message or
+    an inbound owner message — has been posted after it; otherwise Telegram keeps the
+    edited message at its original (now buried) position. When the space is unknown we
+    degrade to True so callers fall back to the pane-scoped check (no regression for
+    single-pane topics or pre-existing state without a high-water mark)."""
+    if not isinstance(space, dict):
+        return True
+    message_key = str(message_id or "").strip()
+    if not message_key:
+        return False
+    latest = str(space.get("last_topic_message_id") or "").strip()
+    return not latest or message_id_index(message_key) >= message_id_index(latest)
+
+
+def note_topic_high_water_mark(space: dict[str, Any] | None, message_id: str | int) -> bool:
+    """Advance the space's shared-topic high-water mark (the newest message id seen in the
+    topic) if `message_id` is newer than the current mark. Fed by both outbound pane
+    messages (record_pane_message_route) and inbound owner messages (command_reply) so the
+    turn-finalize gate can detect when an in-place anchor has been buried. Returns True if
+    the mark advanced (so callers can decide whether to persist state)."""
+    if not isinstance(space, dict):
+        return False
+    message_key = str(message_id or "").strip()
+    if not message_key:
+        return False
+    latest = str(space.get("last_topic_message_id") or "").strip()
+    if latest and message_id_index(message_key) <= message_id_index(latest):
+        return False
+    space["last_topic_message_id"] = message_key
+    return True
 
 
 def turn_visible_anchor_message_id(entry: dict[str, Any], turn_id: str) -> str:
@@ -9739,6 +9782,16 @@ def _sync_pane_clean_feed(
             lifecycle_message_id = ""
             if str(item.get("kind") or "").lower() == "turn":
                 lifecycle_message_id = turn_visible_anchor_message_id(entry, str(item.get("turn_id") or ""))
+                if lifecycle_message_id:
+                    space_entry = (state.get("spaces") or {}).get(str(entry.get("space_key") or ""))
+                    if not topic_message_is_latest(space_entry, lifecycle_message_id):
+                        # A sibling pane (or the owner) posted to this shared topic after the
+                        # turn's anchor was placed. Editing it in place would leave the final
+                        # completion buried mid-feed where the owner never sees it (the actual
+                        # bug: a long codex turn finalized into a 17-min-old message that the
+                        # newly-added Devin pane's messages had since buried). Drop the anchor
+                        # so the turn is sent as a fresh message at the bottom of the topic.
+                        lifecycle_message_id = ""
             if lifecycle_message_id and not entry.get("last_clean_bot_kind"):
                 if lifecycle_message_id == str(entry.get("last_stream_message_id") or "") and entry.get("last_stream_bot_kind"):
                     entry["last_clean_bot_kind"] = str(entry.get("last_stream_bot_kind") or "")
@@ -11105,6 +11158,30 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     user_id = str(payload.get("user_id") or "")
     text = str(payload.get("text") or "")
     telegram = state.setdefault("telegram", {})
+    owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
+    if not owners:
+        owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
+    # Advance the shared-topic high-water mark for ANY new owner message that lands in a
+    # mapped pane topic — INCLUDING forwarded or bot-mismatch messages that are rejected
+    # by the gates below — because the message physically occupies a feed position and
+    # buries any in-place turn anchor placed before it, so the next finalize must re-anchor
+    # to the bottom instead of editing a now-buried message. Edited messages are skipped
+    # (they create no new feed position); from_bot is skipped (the bot's own outbound sends
+    # are tracked via record_pane_message_route). Owner inbound ids never reach
+    # record_pane_message_route, so advance + persist here (many branches below return
+    # without a trailing save_state).
+    inbound_message_id = str(payload.get("message_id") or "")
+    if (
+        inbound_message_id
+        and topic_id
+        and user_id in owners
+        and not payload.get("edited")
+        and not payload.get("from_bot")
+    ):
+        mapped_topic_space = topic_space_entry(state, chat_id, topic_id)
+        if mapped_topic_space and note_topic_high_water_mark(mapped_topic_space[1], inbound_message_id):
+            save_state(state)
+            state_changed = False
     payload_target_bot_kind = str(payload.get("target_bot_kind") or "").strip().lower()
     if payload_target_bot_kind not in managed_bot_specs():
         payload_target_bot_kind = ""
@@ -11116,9 +11193,6 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         text = strip_managed_bot_mentions(telegram, text)
 
     command, arg = parse_command(text)
-    owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
-    if not owners:
-        owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
     if payload.get("edited"):
         return {"handled": True, "reply": ""}
     if payload.get("from_bot"):

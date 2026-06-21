@@ -10366,5 +10366,257 @@ class SpinnerAndWorkingPaneTests(unittest.TestCase):
         self.assertEqual(item["turn_id"], "visible-readonly:x")
 
 
+class TopicLatestAnchorTests(unittest.TestCase):
+    """A turn's edit-in-place anchor must only be reused while it is still the newest
+    message in the shared topic. Otherwise a sibling pane (or an inbound owner message)
+    posting afterward leaves an edited completion buried mid-feed where the owner never
+    sees it — the real incident (a long codex turn finalized into a stale message that a
+    newly-added Devin pane had since buried)."""
+
+    def _state(self) -> tuple[dict, dict, str, dict]:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "working",
+            "label": "Build Runner",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+            "pane_thread_name": "Build Runner",
+            "last_known_status": "working",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workspace 1",
+                    "pane_keys": [key],
+                }
+            },
+            "panes": {key: entry},
+        }
+        return state, pane, key, entry
+
+    def _caps(self) -> tuple[dict, dict]:
+        counters = {"creates": 0, "sends": 0, "feed_sends": 0, "marker_sends": 0, "verifies": 0, "renames": 0, "icon_updates": 0}
+        caps = {"max_creates": 0, "max_sends": 10, "max_feed_sends": 10, "max_marker_sends": 10, "max_verifies": 0}
+        return counters, caps
+
+    def test_topic_message_is_latest_predicate(self) -> None:
+        # No space context => degrade to True so callers fall back to the pane check.
+        self.assertTrue(herdres.topic_message_is_latest(None, "2001"))
+        # No high-water mark yet => anything is "latest".
+        self.assertTrue(herdres.topic_message_is_latest({}, "2001"))
+        space = {"last_topic_message_id": "2050"}
+        self.assertFalse(herdres.topic_message_is_latest(space, "2001"))  # buried
+        self.assertTrue(herdres.topic_message_is_latest(space, "2050"))   # is the latest
+        self.assertTrue(herdres.topic_message_is_latest(space, "2099"))   # newer than mark
+        self.assertFalse(herdres.topic_message_is_latest(space, ""))      # empty id
+
+    def test_record_pane_message_route_advances_topic_high_water_mark(self) -> None:
+        state, _pane, key, _entry = self._state()
+        # A second pane sharing the same topic.
+        other = dict(state["panes"][key])
+        other["pane_key"] = "workspace:workspace-1:p2"
+        other["pane_id"] = "pane-2"
+        state["panes"]["workspace:workspace-1:p2"] = other
+        sk = "workspace:workspace-1"
+
+        herdres.record_pane_message_route(state, sk, key, "2001")
+        self.assertEqual(state["spaces"][sk]["last_topic_message_id"], "2001")
+        # A sibling pane posts a newer message -> topic mark advances (pane marks stay separate).
+        herdres.record_pane_message_route(state, sk, "workspace:workspace-1:p2", "2005")
+        self.assertEqual(state["spaces"][sk]["last_topic_message_id"], "2005")
+        self.assertEqual(state["panes"][key]["last_pane_message_id"], "2001")
+        self.assertEqual(other["last_pane_message_id"], "2005")
+        # An older id never regresses the mark.
+        herdres.record_pane_message_route(state, sk, key, "2002")
+        self.assertEqual(state["spaces"][sk]["last_topic_message_id"], "2005")
+        # pane p1's own anchor (2001) is no longer topic-latest -> would re-anchor.
+        self.assertTrue(herdres.pane_message_is_latest(state["panes"][key], "2002"))
+        self.assertFalse(herdres.topic_message_is_latest(state["spaces"][sk], "2001"))
+
+    def _run_lifecycle_until_final(self, state, pane):
+        user_text = "make sure you run glm with full permissions"
+        worklog_text = "Wiring the seat provisioning."
+        response_text = "Implemented and deployed."
+        pane_turn = Mock(
+            side_effect=[
+                {"available": True, "complete": False, "turn_id": "turn-1", "user_text": user_text,
+                 "assistant_final_text": "", "assistant_stream_text": ""},
+                {"available": True, "complete": False, "turn_id": "turn-1", "user_text": user_text,
+                 "assistant_final_text": "", "assistant_stream_text": worklog_text},
+                {"available": True, "complete": True, "turn_id": "turn-1", "user_text": user_text,
+                 "assistant_final_text": response_text},
+            ]
+        )
+        api_calls = []
+        next_message_id = 2000
+
+        def telegram_api(method, payload, *, token=None):
+            nonlocal next_message_id
+            api_calls.append((method, dict(payload)))
+            if method == "sendRichMessage":
+                next_message_id += 1
+                return {"ok": True, "result": {"message_id": str(next_message_id)}}
+            return {"ok": True, "result": True}
+
+        patch_args = {
+            "pane_turn": pane_turn, "telegram_api": telegram_api, "save_state": Mock(),
+            "apply_api_error_warning": Mock(return_value={"topic_missing": False, "changed": False}),
+            "TURN_FEED_ENABLED": True, "CLEAN_FEED_ENABLED": True, "LIVE_CARD_ENABLED": False,
+            "STATUS_MARKER_ENABLED": False, "STATUS_ICON_ENABLED": False,
+            "STREAMING_DRAFTS_ENABLED": True, "STREAM_MIN_INTERVAL_SECONDS": 0, "STREAM_MIN_CHARS": 0,
+        }
+        return user_text, worklog_text, response_text, pane_turn, api_calls, patch_args
+
+    def test_final_turn_edits_in_place_when_anchor_still_latest(self) -> None:
+        # Positive control: no sibling activity -> the final turn edits its anchor (2001) as before.
+        state, pane, _key, entry = self._state()
+        state["telegram"]["rich_messages"] = {"supported": "yes"}
+        state["telegram"]["streaming_drafts"] = {"supported": "no"}
+        _u, _w, _r, _pt, api_calls, patch_args = self._run_lifecycle_until_final(state, pane)
+        with patch.multiple(herdres, **patch_args):
+            for _ in range(3):
+                counters, caps = self._caps()
+                herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+        send_calls = [c for c in api_calls if c[0] == "sendRichMessage"]
+        edit_calls = [c for c in api_calls if c[0] == "editMessageText"]
+        self.assertEqual(len(send_calls), 1)           # only the original prompt send
+        self.assertGreaterEqual(len(edit_calls), 1)
+        self.assertEqual(edit_calls[-1][1]["message_id"], "2001")  # final edited in place
+        self.assertEqual(entry["last_clean_message_id"], "2001")
+
+    def test_final_turn_reanchors_when_sibling_buried_the_anchor(self) -> None:
+        # The fix: a sibling pane posts to the shared topic mid-turn, burying the anchor.
+        # The final completion must be SENT fresh at the bottom, not edited into the buried msg.
+        state, pane, _key, entry = self._state()
+        state["telegram"]["rich_messages"] = {"supported": "yes"}
+        state["telegram"]["streaming_drafts"] = {"supported": "no"}
+        _u, _w, _r, _pt, api_calls, patch_args = self._run_lifecycle_until_final(state, pane)
+        with patch.multiple(herdres, **patch_args):
+            # 1) prompt send (2001), 2) worklog edit (2001)
+            for _ in range(2):
+                counters, caps = self._caps()
+                herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+            self.assertEqual(entry["last_pane_message_id"], "2001")
+            # A SIBLING pane posts a newer message into the same topic (the Devin "KIMI_OK" case).
+            herdres.record_pane_message_route(state, "workspace:workspace-1", "workspace:workspace-1:sibling", "2043")
+            self.assertEqual(state["spaces"]["workspace:workspace-1"]["last_topic_message_id"], "2043")
+            # 3) final turn -> anchor 2001 is buried under 2043 -> must send a NEW message.
+            counters, caps = self._caps()
+            herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        send_calls = [c for c in api_calls if c[0] == "sendRichMessage"]
+        edit_calls = [c for c in api_calls if c[0] == "editMessageText"]
+        final_edit_to_2001 = [c for c in edit_calls if c[1].get("message_id") == "2001" and "Implemented and deployed" in c[1].get("rich_message", "")]
+        self.assertEqual(len(final_edit_to_2001), 0, "final completion must NOT be edited into the buried anchor 2001")
+        self.assertEqual(len(send_calls), 2, "final completion must be sent as a fresh bottom-of-topic message")
+        # The new bottom message carries the completion and becomes the clean anchor, and is
+        # itself route-recorded (so the topic high-water mark tracks it too). The mock assigns
+        # 2002 sequentially — below the injected sibling 2043 — so the max mark stays 2043.
+        self.assertEqual(entry["last_clean_message_id"], "2002")
+        self.assertIn("Implemented and deployed", send_calls[1][1]["rich_message"])
+        self.assertIn("2002", state["spaces"]["workspace:workspace-1"].get("message_routes", {}))
+
+
+    def test_note_topic_high_water_mark_advances_only_forward(self) -> None:
+        space = {}
+        self.assertTrue(herdres.note_topic_high_water_mark(space, "2001"))
+        self.assertEqual(space["last_topic_message_id"], "2001")
+        self.assertFalse(herdres.note_topic_high_water_mark(space, "2001"))  # equal -> no advance
+        self.assertFalse(herdres.note_topic_high_water_mark(space, "1999"))  # older -> no advance
+        self.assertEqual(space["last_topic_message_id"], "2001")
+        self.assertTrue(herdres.note_topic_high_water_mark(space, "2050"))   # newer -> advance
+        self.assertEqual(space["last_topic_message_id"], "2050")
+        self.assertFalse(herdres.note_topic_high_water_mark(None, "9999"))   # no space
+        self.assertFalse(herdres.note_topic_high_water_mark(space, ""))      # empty id
+
+    def test_command_reply_owner_message_advances_topic_high_water_mark(self) -> None:
+        # The owner posting in the shared topic buries an in-place anchor just like a
+        # sibling pane does. Owner inbound ids never reach record_pane_message_route, so
+        # command_reply must advance the topic high-water mark itself (and persist it).
+        state, _pane, _key, entry = self._state()
+        entry["last_pane_message_id"] = "2001"
+        state["spaces"]["workspace:workspace-1"]["last_topic_message_id"] = "2001"
+        saved = []
+        payload = {"chat_id": "-1001", "topic_id": "77", "user_id": "42",
+                   "message_id": "2043", "text": "/help"}
+        with patch.multiple(
+            herdres,
+            load_state=Mock(return_value=state),
+            save_state=Mock(side_effect=lambda s: saved.append(True)),
+            load_dotenv=Mock(),
+        ):
+            herdres.command_reply(payload)
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["last_topic_message_id"], "2043")
+        self.assertTrue(saved, "command_reply must persist the advanced topic high-water mark")
+        # The pane's anchor 2001 is now buried under the owner's 2043 -> finalize will re-anchor.
+        self.assertFalse(herdres.topic_message_is_latest(state["spaces"]["workspace:workspace-1"], "2001"))
+
+    def test_command_reply_forwarded_owner_message_still_advances_mark(self) -> None:
+        # GLM finding: a forwarded owner message creates a real message that physically
+        # buries the anchor, even though command_reply rejects its CONTENT ("Ignored ...").
+        # The high-water mark must still advance (the advance is before the forwarded gate).
+        state, _pane, _key, entry = self._state()
+        entry["last_pane_message_id"] = "2001"
+        state["spaces"]["workspace:workspace-1"]["last_topic_message_id"] = "2001"
+        saved = []
+        payload = {"chat_id": "-1001", "topic_id": "77", "user_id": "42",
+                   "message_id": "2044", "text": "fwd", "forwarded": True}
+        with patch.multiple(
+            herdres,
+            load_state=Mock(return_value=state),
+            save_state=Mock(side_effect=lambda s: saved.append(True)),
+            load_dotenv=Mock(),
+        ):
+            result = herdres.command_reply(payload)
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["last_topic_message_id"], "2044")
+        self.assertTrue(saved, "forwarded owner message must still persist the advanced mark")
+        # content is still rejected
+        self.assertIn("Ignored", result.get("reply", ""))
+
+    def test_command_reply_edited_owner_message_does_not_advance_mark(self) -> None:
+        # An edited message does NOT create a new feed position, so it must NOT advance.
+        state, _pane, _key, _entry = self._state()
+        state["spaces"]["workspace:workspace-1"]["last_topic_message_id"] = "2001"
+        payload = {"chat_id": "-1001", "topic_id": "77", "user_id": "42",
+                   "message_id": "2044", "text": "x", "edited": True}
+        with patch.multiple(
+            herdres,
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            load_dotenv=Mock(),
+        ):
+            herdres.command_reply(payload)
+        self.assertEqual(state["spaces"]["workspace:workspace-1"]["last_topic_message_id"], "2001")
+
+    def test_command_reply_owner_message_in_general_does_not_create_mark(self) -> None:
+        # A message in the General thread (not a mapped pane topic) must not fabricate a mark.
+        state, _pane, _key, _entry = self._state()
+        payload = {"chat_id": "-1001", "topic_id": "1", "user_id": "42",
+                   "message_id": "2043", "text": "/help"}
+        with patch.multiple(
+            herdres,
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            load_dotenv=Mock(),
+        ):
+            herdres.command_reply(payload)
+        self.assertNotIn("last_topic_message_id", state["spaces"]["workspace:workspace-1"])
+
+
 if __name__ == "__main__":
     unittest.main()
