@@ -704,6 +704,26 @@ class OneSpaceOneVoiceAgentsTests(unittest.TestCase):
 
         send_to_pane.assert_called_once_with("pane-2", "reply")
 
+    def test_reply_to_nonanchor_honors_active_pane(self) -> None:
+        # Replying to a NON-pane message (e.g. the bot's own picker/confirmation,
+        # which has no message_routes anchor) must still route to the active pane,
+        # not re-show the "which agent?" picker. Regression for the 10-min-window bug.
+        state = osov_state()
+        herdres.set_active_pane(state["spaces"]["workspace:one"], "pane-2", "42")
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with command_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply({
+                "chat_id": "-1001",
+                "topic_id": "77",
+                "user_id": "42",
+                "reply_to_message_id": "777777",  # not in message_routes -> unresolved reply
+                "text": "go",
+            })
+
+        self.assertEqual(result["reply"], "")
+        send_to_pane.assert_called_once_with("pane-2", "go")
+
     def test_single_live_pane_implicit_routing_unchanged(self) -> None:
         state = osov_state(panes=1)
         send_to_pane = Mock(return_value=(True, ""))

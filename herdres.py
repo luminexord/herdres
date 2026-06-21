@@ -10560,15 +10560,21 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             live = live_entries_for_space(state, space)
             if command == "voice":
                 return voice_mode_response(state, space, live, arg)
-            if command != "agents" and not str(payload.get("reply_to_message_id") or "").strip():
-                if (
-                    not per_agent_topics_enabled()
-                    and str(space.get("voice_mode") or "shared") != "per_agent"
-                    and not space.get("multibot_offer_dismissed")
-                    and len(managed_bot_kinds_for_panes([e for _k, e in live])) >= 2
-                ):
-                    space["multibot_offer_signal"] = int(space.get("multibot_offer_signal") or 0) + 1
-                    space["multibot_offer_last_signal_at"] = utc_now()
+            if command != "agents":
+                if not str(payload.get("reply_to_message_id") or "").strip():
+                    if (
+                        not per_agent_topics_enabled()
+                        and str(space.get("voice_mode") or "shared") != "per_agent"
+                        and not space.get("multibot_offer_dismissed")
+                        and len(managed_bot_kinds_for_panes([e for _k, e in live])) >= 2
+                    ):
+                        space["multibot_offer_signal"] = int(space.get("multibot_offer_signal") or 0) + 1
+                        space["multibot_offer_last_signal_at"] = utc_now()
+                # Consult the active pane even when this is a reply. A reply to a real
+                # pane message already routed via topic_entry above (entry set, so this
+                # branch is unreached); only an UNRESOLVED reply — e.g. replying to the
+                # bot's own picker/confirmation message — falls through here, and it must
+                # honor the active pane instead of re-showing the "which agent?" picker.
                 resolved_active = get_active_pane_entry(state, space, user_id)
                 if resolved_active:
                     save_state(state)
