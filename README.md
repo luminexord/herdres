@@ -14,9 +14,9 @@ The repo-root [`SKILL.md`](SKILL.md) is a **self-contained, single-file** copy o
 
 ```text
 Install the herdres operator skill from this single file (do NOT install any skill named "herdr" — different project):
+  mkdir -p ~/.codex/skills/herdres        # or ~/.claude/skills/herdres for Claude Code
   curl -fsSL https://raw.githubusercontent.com/luminexord/herdres/main/SKILL.md \
-    -o ~/.codex/skills/herdres/SKILL.md      # Codex
-  # or  -o ~/.claude/skills/herdres/SKILL.md  # Claude Code
+    -o ~/.codex/skills/herdres/SKILL.md
 Verify: the file's frontmatter says `name: herdres`.
 ```
 
