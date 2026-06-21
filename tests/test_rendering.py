@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import herdres
@@ -938,6 +939,385 @@ class SharedTopicCommandTests(unittest.TestCase):
         )
         self.assertEqual(commands[1], [herdres.herdr_bin(), "pane", "run", "pane-new", "claude"])
 
+    def test_devin_glm_seat_command_defaults_to_dangerous_glm(self) -> None:
+        with patch.dict(
+            herdres.os.environ,
+            {
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_COMMAND": "",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_EXTRA_ARGS": "",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_MODEL": "glm-5.2",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE": "dangerous",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                herdres.devin_glm_seat_command(),
+                "devin --model glm-5.2 --permission-mode dangerous",
+            )
+
+    def test_ensure_devin_glm_space_seats_splits_and_runs_devin(self) -> None:
+        state = {
+            "version": 1,
+            "telegram": {},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "pane_keys": ["pane-1"],
+                }
+            },
+            "panes": {},
+        }
+        panes = [
+            {
+                "pane_id": "pane-1",
+                "pane_key": "pane-1",
+                "workspace_id": "workspace-1",
+                "agent": "codex",
+                "agent_status": "idle",
+                "foreground_cwd": "/tmp/project",
+            }
+        ]
+        commands: list[list[str]] = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stderr = ""
+            proc.stdout = (
+                herdres.json.dumps({"result": {"pane": {"pane_id": "pane-devin"}}})
+                if args[1:3] == ["pane", "split"]
+                else ""
+            )
+            return proc
+
+        with patch.dict(
+            herdres.os.environ,
+            {
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT": "1",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN": "3",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_MODEL": "glm-5.2",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE": "dangerous",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_COMMAND": "",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_EXTRA_ARGS": "",
+            },
+            clear=False,
+        ), patch.object(herdres, "pane_list", Mock(return_value=panes)), patch.object(herdres, "run_cmd", run_cmd):
+            result = herdres.ensure_devin_glm_space_seats(state, panes)
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["started"], 1)
+        space = state["spaces"]["workspace:workspace-1"]
+        self.assertEqual(space["devin_glm_seat_pane_id"], "pane-devin")
+        self.assertEqual(space["devin_glm_seat_model"], "glm-5.2")
+        self.assertEqual(space["devin_glm_seat_permission_mode"], "dangerous")
+        self.assertEqual(
+            commands[0],
+            [
+                herdres.herdr_bin(),
+                "pane",
+                "split",
+                "pane-1",
+                "--direction",
+                "right",
+                "--cwd",
+                "/tmp/project",
+                "--no-focus",
+            ],
+        )
+        self.assertEqual(commands[1], [herdres.herdr_bin(), "pane", "rename", "pane-devin", "GLM Devin"])
+        self.assertEqual(
+            commands[2],
+            [
+                herdres.herdr_bin(),
+                "pane",
+                "run",
+                "pane-devin",
+                "devin --model glm-5.2 --permission-mode dangerous",
+            ],
+        )
+
+    def test_ensure_devin_glm_space_seats_does_not_duplicate_pending_pane(self) -> None:
+        state = {
+            "version": 1,
+            "telegram": {},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "pane_keys": ["pane-1"],
+                    "devin_glm_seat_pane_id": "pane-devin",
+                    "devin_glm_seat_created_at": herdres.utc_now(),
+                }
+            },
+            "panes": {},
+        }
+        panes = [
+            {
+                "pane_id": "pane-1",
+                "pane_key": "pane-1",
+                "workspace_id": "workspace-1",
+                "agent": "codex",
+                "agent_status": "idle",
+            }
+        ]
+        all_panes = panes + [
+            {
+                "pane_id": "pane-devin",
+                "pane_key": "pane-devin",
+                "workspace_id": "workspace-1",
+                "agent": "",
+                "agent_status": "unknown",
+                "label": "GLM Devin",
+            }
+        ]
+
+        with patch.dict(
+            herdres.os.environ,
+            {
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT": "1",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN": "3",
+            },
+            clear=False,
+        ), patch.object(herdres, "pane_list", Mock(return_value=all_panes)), patch.object(herdres, "run_cmd") as run_cmd:
+            result = herdres.ensure_devin_glm_space_seats(state, panes)
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["started"], 0)
+        run_cmd.assert_not_called()
+
+    def test_ensure_devin_glm_space_seats_backs_off_after_recent_error(self) -> None:
+        state = {
+            "version": 1,
+            "telegram": {},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "pane_keys": ["pane-1"],
+                    "devin_glm_seat_error_at": herdres.utc_now(),
+                }
+            },
+            "panes": {},
+        }
+        panes = [
+            {
+                "pane_id": "pane-1",
+                "pane_key": "pane-1",
+                "workspace_id": "workspace-1",
+                "agent": "codex",
+                "agent_status": "idle",
+            }
+        ]
+
+        with patch.dict(
+            herdres.os.environ,
+            {
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT": "1",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN": "3",
+            },
+            clear=False,
+        ), patch.object(herdres, "pane_list", Mock(return_value=panes)), patch.object(herdres, "run_cmd") as run_cmd:
+            result = herdres.ensure_devin_glm_space_seats(state, panes)
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["started"], 0)
+        run_cmd.assert_not_called()
+
+    def test_command_reply_new_kimi_k27_launches_through_devin_with_model_label(self) -> None:
+        state = self._shared_state()
+        state["panes"]["pane-1"]["foreground_cwd"] = "/tmp/project"
+        commands: list[list[str]] = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stderr = ""
+            proc.stdout = (
+                herdres.json.dumps({"result": {"pane": {"pane_id": "pane-new"}}})
+                if args[1:3] == ["pane", "split"]
+                else ""
+            )
+            return proc
+
+        with callback_patches(state), patch.dict(
+            herdres.os.environ,
+            {
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE": "dangerous",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_KIMI_COMMAND": "",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_KIMI_EXTRA_ARGS": "",
+            },
+            clear=False,
+        ), patch.object(herdres, "run_cmd", run_cmd):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "4000",
+                    "reply_to_message_id": "",
+                    "user_id": "42",
+                    "text": "/new kimi-k2.7",
+                }
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertIn("Started Kimi Devin through Devin", result["reply"])
+        self.assertEqual(commands[1], [herdres.herdr_bin(), "pane", "rename", "pane-new", "Kimi Devin"])
+        self.assertEqual(
+            commands[2],
+            [
+                herdres.herdr_bin(),
+                "pane",
+                "run",
+                "pane-new",
+                "devin --model kimi-k2.7 --permission-mode dangerous",
+            ],
+        )
+
+    def test_command_reply_new_without_arg_sends_model_picker(self) -> None:
+        state = self._shared_state()
+        send_notice = Mock(return_value={"ok": True, "message_id": "555"})
+
+        with callback_patches(state, send_notice=send_notice):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "4000",
+                    "reply_to_message_id": "",
+                    "user_id": "42",
+                    "text": "/new",
+                }
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        _chat_id, title, body = send_notice.call_args.args[:3]
+        self.assertEqual(title, "Open a model pane")
+        self.assertIn("Labels ending in Devin run through the Devin CLI", body)
+        markup = send_notice.call_args.kwargs["reply_markup"]
+        button_texts = [button["text"] for row in markup["inline_keyboard"] for button in row]
+        self.assertIn("GLM Devin", button_texts)
+        self.assertIn("Kimi Devin", button_texts)
+        self.assertIn("GPT Devin", button_texts)
+        self.assertIn("DeepSeek Devin", button_texts)
+
+    def test_devin_model_labels_use_family_names(self) -> None:
+        expected = {
+            "claude-opus-4.8": "Claude Devin",
+            "gpt-5.5": "GPT Devin",
+            "kimi-k2.7": "Kimi Devin",
+            "glm-5.2": "GLM Devin",
+            "gemini-3.1-pro": "Gemini Devin",
+            "deepseek-v4-pro": "DeepSeek Devin",
+            "swe-1.6-fast": "SWE Devin",
+        }
+
+        for model, label in expected.items():
+            with self.subTest(model=model):
+                self.assertEqual(herdres.new_pane_launch_spec(model)["label"], label)
+
+    def test_new_pane_picker_callback_launches_glm_through_devin(self) -> None:
+        state = self._shared_state()
+        state["panes"]["pane-1"]["foreground_cwd"] = "/tmp/project"
+        space_token = herdres._callback_id("workspace:workspace-1", "space")[:16]
+        commands: list[list[str]] = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(args)
+            proc = Mock()
+            proc.returncode = 0
+            proc.stderr = ""
+            proc.stdout = (
+                herdres.json.dumps({"result": {"pane": {"pane_id": "pane-new"}}})
+                if args[1:3] == ["pane", "split"]
+                else ""
+            )
+            return proc
+
+        telegram_api = Mock(return_value={"ok": True, "result": True})
+        with callback_patches(state), patch.dict(
+            herdres.os.environ,
+            {
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE": "dangerous",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_COMMAND": "",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_EXTRA_ARGS": "",
+            },
+            clear=False,
+        ), patch.object(herdres, "run_cmd", run_cmd), patch.object(herdres, "telegram_api", telegram_api):
+            result = herdres.callback_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "555",
+                    "user_id": "42",
+                    "data": f"herdr:np:{space_token}:glm",
+                }
+            )
+
+        self.assertEqual(result["answer"], "Started GLM Devin through Devin in pane pane-new.")
+        self.assertEqual(commands[1], [herdres.herdr_bin(), "pane", "rename", "pane-new", "GLM Devin"])
+        self.assertEqual(
+            commands[2],
+            [
+                herdres.herdr_bin(),
+                "pane",
+                "run",
+                "pane-new",
+                "devin --model glm-5.2 --permission-mode dangerous",
+            ],
+        )
+        telegram_api.assert_called_once()
+        self.assertIn("Started GLM Devin through Devin", telegram_api.call_args.args[1]["text"])
+
+    def test_new_pane_picker_callback_launches_supported_devin_model(self) -> None:
+        state = self._shared_state()
+        state["panes"]["pane-1"]["foreground_cwd"] = "/tmp/project"
+        space_token = herdres._callback_id("workspace:workspace-1", "space")[:16]
+        commands: list[list[str]] = []
+
+        def run_cmd(args, **kwargs):
+            commands.append(list(args))
+            if args[:3] == [herdres.herdr_bin(), "pane", "split"]:
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"result": {"pane": {"pane_id": "pane-gpt"}}}), stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with callback_patches(state), patch.object(herdres, "run_cmd", run_cmd), patch.object(herdres, "telegram_api") as telegram_api:
+            telegram_api.return_value = {"ok": True}
+            result = herdres.callback_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "message_id": "555",
+                    "user_id": "42",
+                    "data": f"herdr:np:{space_token}:gpt-5.5",
+                }
+            )
+
+        self.assertEqual(result["answer"], "Started GPT Devin through Devin in pane pane-gpt.")
+        self.assertEqual(commands[1], [herdres.herdr_bin(), "pane", "rename", "pane-gpt", "GPT Devin"])
+        self.assertEqual(
+            commands[2],
+            [
+                herdres.herdr_bin(),
+                "pane",
+                "run",
+                "pane-gpt",
+                "devin --model gpt-5.5 --permission-mode dangerous",
+            ],
+        )
+
+    def test_pinned_status_uses_devin_model_label(self) -> None:
+        text = herdres.space_pinned_status_text(
+            [
+                {"agent": "devin", "agent_status": "idle", "label": "GLM Devin"},
+                {"agent": "codex", "agent_status": "working", "label": "Codex"},
+            ]
+        )
+
+        self.assertIn("GLM Devin 🟢", text)
+        labels = [part.strip().rsplit(" ", 1)[0] for part in text.split("|")]
+        self.assertNotIn("Devin", labels)
+
     def test_callback_reply_routes_by_callback_message_id(self) -> None:
         state = self._shared_state()
         send_to_pane = Mock(return_value=(True, ""))
@@ -1415,6 +1795,48 @@ class ManagedBotTests(unittest.TestCase):
         self.assertEqual(first["request_managed_bot"]["request_id"], 41001)
         self.assertEqual(first["request_managed_bot"]["suggested_name"], "Herdr Codex")
         self.assertEqual(first["request_managed_bot"]["suggested_username"], "herdr_codex_bot")
+
+    def test_glm_devin_pane_uses_glm_managed_bot_kind(self) -> None:
+        entry = {"agent": "devin", "pane_label_raw": "GLM Devin", "pane_thread_name": "GLM Devin"}
+
+        self.assertEqual(herdres.managed_bot_kind_for_entry(entry), "glm")
+        self.assertEqual(
+            herdres.managed_bot_kinds_for_panes([
+                {"agent": "devin", "label": "GLM Devin", "agent_status": "idle"}
+            ]),
+            ["glm"],
+        )
+
+    def test_kimi_devin_pane_uses_kimi_managed_bot_kind(self) -> None:
+        entry = {"agent": "devin", "pane_label_raw": "Kimi Devin", "pane_thread_name": "Kimi Devin"}
+
+        self.assertEqual(herdres.managed_bot_kind_for_entry(entry), "kimi")
+
+    def test_guremi_managed_bot_payload_infers_glm(self) -> None:
+        self.assertEqual(
+            herdres.managed_bot_kind_for_payload({"username": "Guremi_bot", "first_name": "Guremi"}),
+            "glm",
+        )
+
+    def test_env_managed_bot_token_assigns_guremi_to_glm(self) -> None:
+        telegram = {"managed_bots": {}}
+
+        with patch.dict(
+            herdres.os.environ,
+            {
+                "HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_TOKEN": "GLM_TOKEN",
+                "HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_USERNAME": "Guremi_bot",
+                "HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_NAME": "Guremi",
+            },
+            clear=False,
+        ):
+            changed = herdres.sync_env_managed_bot_tokens(telegram)
+
+        self.assertTrue(changed)
+        self.assertEqual(telegram["managed_bots"]["glm"]["token"], "GLM_TOKEN")
+        self.assertEqual(telegram["managed_bots"]["glm"]["username"], "Guremi_bot")
+        self.assertEqual(telegram["managed_bots"]["glm"]["name"], "Guremi")
+        self.assertEqual(telegram["managed_bots"]["glm"]["source"], "manual-env")
 
     def test_managed_bot_update_fetches_token_and_configures_profile(self) -> None:
         state = {"version": 1, "telegram": {"managed_bots": {}}}
@@ -5187,6 +5609,9 @@ What changed:
 
     def test_pane_label_preserves_two_word_topic_name(self) -> None:
         self.assertEqual(herdres.topic_name_from_pane_label("Topics Pane"), "Topics Pane")
+
+    def test_pane_label_preserves_glm_acronym(self) -> None:
+        self.assertEqual(herdres.topic_name_from_pane_label("GLM Devin"), "GLM Devin")
 
     def test_baselined_pane_label_reconciles_stale_topic_name(self) -> None:
         pane = {

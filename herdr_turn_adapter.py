@@ -25,6 +25,7 @@ CLAUDE_FALLBACK_READ_LINES = int(os.getenv("HERDRES_CLAUDE_FALLBACK_READ_LINES",
 # burst of completions (e.g. a reply immediately followed by an auto-pursued
 # turn) instead of collapsing to only the newest one.
 RECENT_TURNS = int(os.getenv("HERDRES_RECENT_TURNS", "12"))
+DEVIN_SESSION_START_SKEW_SECONDS = int(os.getenv("HERDRES_DEVIN_SESSION_START_SKEW", "30"))
 
 
 def real_herdr_bin() -> str:
@@ -180,6 +181,37 @@ def devin_bin() -> str:
     return str(Path.home() / ".local/bin/devin")
 
 
+def pane_devin_process_started_at(pane_id: str) -> int:
+    if not pane_id:
+        return 0
+    try:
+        data = run_real_herdr_json(["pane", "process-info", "--pane", pane_id])
+    except Exception:
+        return 0
+    info = data.get("result", {}).get("process_info")
+    if not isinstance(info, dict):
+        return 0
+    starts: list[int] = []
+    for proc in info.get("foreground_processes") or []:
+        if not isinstance(proc, dict):
+            continue
+        name = str(proc.get("name") or "").lower()
+        cmdline = str(proc.get("cmdline") or "").lower()
+        if "devin" not in name and "devin" not in cmdline:
+            continue
+        try:
+            pid = int(proc.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0:
+            continue
+        try:
+            starts.append(int(os.stat(f"/proc/{pid}").st_ctime))
+        except OSError:
+            continue
+    return min(starts) if starts else 0
+
+
 def devin_resolve_session_id(pane: dict[str, Any]) -> str:
     """Resolve the Devin session ID for a pane when agent_session is None.
 
@@ -188,6 +220,7 @@ def devin_resolve_session_id(pane: dict[str, Any]) -> str:
     sessions.db (most active sessions store data in the DB).
     """
     cwd = str(pane.get("cwd") or pane.get("foreground_cwd") or "")
+    pane_started_at = pane_devin_process_started_at(str(pane.get("pane_id") or ""))
     try:
         proc = subprocess.run(
             [devin_bin(), "list", "--format", "json"],
@@ -213,6 +246,12 @@ def devin_resolve_session_id(pane: dict[str, Any]) -> str:
                     for e in matching:
                         sid = str(e.get("id") or "")
                         if not sid:
+                            continue
+                        try:
+                            last_activity_at = int(e.get("last_activity_at") or 0)
+                        except (TypeError, ValueError):
+                            last_activity_at = 0
+                        if pane_started_at and last_activity_at < pane_started_at - DEVIN_SESSION_START_SKEW_SECONDS:
                             continue
                         if (transcripts_dir / f"{sid}.json").exists():
                             return sid

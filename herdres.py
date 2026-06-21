@@ -107,6 +107,87 @@ MANAGED_BOT_ROUTE_KIND_FIELDS = (
     "last_prompt_bot_kind",
 )
 MANAGED_BOT_REISSUE_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOT_REISSUE_RETRY_SECONDS", "300"))
+DEVIN_GLM_SEAT_DEFAULT_MODEL = "glm-5.2"
+DEVIN_GLM_SEAT_DEFAULT_PERMISSION_MODE = "dangerous"
+DEVIN_GLM_SEAT_DEFAULT_LABEL = "GLM Devin"
+DEVIN_GLM_SEAT_PENDING_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_PENDING_TTL", "1800"))
+DEVIN_GLM_SEAT_ERROR_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_ERROR_RETRY", "300"))
+DEVIN_SUPPORTED_MODELS: tuple[str, ...] = (
+    "adaptive",
+    "claude-haiku-4.5",
+    "claude-opus-4.5",
+    "claude-opus-4.6",
+    "claude-opus-4.7",
+    "claude-opus-4.8",
+    "claude-sonnet-4.5",
+    "claude-sonnet-4.6",
+    "deepseek-v4-pro",
+    "gemini-3-flash",
+    "gemini-3.1-pro",
+    "gemini-3.5-flash",
+    "glm-5.1",
+    "glm-5.2",
+    "gpt-5.2",
+    "gpt-5.3-codex",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.5",
+    "kimi-k2.6",
+    "kimi-k2.7",
+    "swe-1.5",
+    "swe-1.6",
+    "swe-1.6-fast",
+)
+def devin_model_env_prefix(model: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9]+", "_", str(model or "").strip()).strip("_").upper()
+    return f"DEVIN_{clean or 'MODEL'}"
+
+
+def devin_model_default_label(model: str) -> str:
+    clean = str(model or "").strip()
+    family_labels = {
+        "adaptive": "Adaptive",
+        "claude": "Claude",
+        "deepseek": "DeepSeek",
+        "gemini": "Gemini",
+        "glm": "GLM",
+        "gpt": "GPT",
+        "kimi": "Kimi",
+        "swe": "SWE",
+    }
+    family = re.split(r"[-_]+", clean, maxsplit=1)[0].lower()
+    return f"{family_labels.get(family, clean or 'Model')} Devin"
+
+
+def devin_model_alias(model: str, *, label: str | None = None, env: str | None = None) -> dict[str, str]:
+    clean = str(model or "").strip()
+    return {
+        "model": clean,
+        "label": label or devin_model_default_label(clean),
+        "env": env or devin_model_env_prefix(clean),
+    }
+
+
+DEVIN_MODEL_ALIASES: dict[str, dict[str, str]] = {
+    model: devin_model_alias(model)
+    for model in DEVIN_SUPPORTED_MODELS
+}
+DEVIN_MODEL_ALIASES.update({
+    "glm": devin_model_alias("glm-5.2", label="GLM Devin", env="DEVIN_GLM"),
+    "glm-5.2": devin_model_alias("glm-5.2", label="GLM Devin", env="DEVIN_GLM"),
+    "glm5.2": devin_model_alias("glm-5.2", label="GLM Devin", env="DEVIN_GLM"),
+    "glm-devin": devin_model_alias("glm-5.2", label="GLM Devin", env="DEVIN_GLM"),
+    "kimi": devin_model_alias("kimi-k2.7", env="DEVIN_KIMI"),
+    "kimi-k2.7": devin_model_alias("kimi-k2.7", env="DEVIN_KIMI"),
+    "kimi-k27": devin_model_alias("kimi-k2.7", env="DEVIN_KIMI"),
+    "kimi-devin": devin_model_alias("kimi-k2.7", env="DEVIN_KIMI"),
+    "opus": devin_model_alias("claude-opus-4.8"),
+    "claude-opus": devin_model_alias("claude-opus-4.8"),
+    "gpt": devin_model_alias("gpt-5.5"),
+    "gemini": devin_model_alias("gemini-3.1-pro"),
+    "deepseek": devin_model_alias("deepseek-v4-pro"),
+    "swe": devin_model_alias("swe-1.6"),
+})
 RICH_MESSAGES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1")
 RICH_BAD_REQUEST_LIMIT = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_BAD_REQUEST_LIMIT", "3"))
 LIVE_CARD_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "0")
@@ -302,6 +383,15 @@ MANAGED_BOT_SPECS: dict[str, dict[str, Any]] = {
         "description": "Herdr Devin pane bot for Herdres.",
         "short_description": "Devin panes in Herdr.",
         "aliases": ("devin", "cognition"),
+    },
+    "glm": {
+        "request_id": MANAGED_BOT_REQUEST_BASE_ID + 6,
+        "label": "GLM Devin",
+        "name": "Guremi",
+        "suggested_username": "Guremi_bot",
+        "description": "GLM Devin pane bot for Herdres, running through Devin.",
+        "short_description": "GLM Devin panes.",
+        "aliases": ("glm", "glm5", "glm5.2", "glm-5.2", "guremi"),
     },
 }
 NEW_PANE_AGENT_COMMANDS = {kind: kind for kind in MANAGED_BOT_SPECS}
@@ -575,6 +665,41 @@ def managed_bot_setup_enabled() -> bool:
     return MANAGED_BOTS_ENABLED
 
 
+def sync_env_managed_bot_tokens(telegram: dict[str, Any]) -> bool:
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+    if not isinstance(bots, dict):
+        bots = {}
+        telegram["managed_bots"] = bots
+    changed = False
+    for kind, spec in managed_bot_specs().items():
+        env_prefix = f"HERDR_TELEGRAM_TOPICS_MANAGED_BOT_{kind.upper()}"
+        token = os.getenv(f"{env_prefix}_TOKEN", "").strip()
+        if not token:
+            continue
+        username = os.getenv(f"{env_prefix}_USERNAME", "").strip().lstrip("@")
+        if not username:
+            username = str(spec.get("suggested_username") or "").strip().lstrip("@")
+        name = os.getenv(f"{env_prefix}_NAME", "").strip() or str(spec.get("name") or spec.get("label") or kind)
+        current = bots.get(kind) if isinstance(bots.get(kind), dict) else {}
+        if (
+            str(current.get("token") or "") == token
+            and str(current.get("username") or "") == username
+            and current.get("enabled") is True
+        ):
+            continue
+        bots[kind] = {
+            "kind": kind,
+            "username": username,
+            "name": name,
+            "token": token,
+            "enabled": True,
+            "source": "manual-env",
+            "updated_at": utc_now(),
+        }
+        changed = True
+    return changed
+
+
 def space_voice_mode(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> str:
     if not isinstance(pane_or_entry, dict):
         return "shared"
@@ -612,14 +737,29 @@ def managed_bot_kinds_for_panes(panes: list[dict[str, Any]]) -> list[str]:
     for pane in panes:
         if str(pane.get("agent_status") or "").lower() == "closed":
             continue
-        kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
+        kind = managed_bot_kind_for_entry(pane, pane)
         if kind:
             seen.add(kind)
     return [kind for kind in managed_bot_specs() if kind in seen]
 
 
+def devin_model_managed_bot_kind_from_label(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if "glm" in text or "guremi" in text:
+        return "glm"
+    if "kimi" in text:
+        return "kimi"
+    return ""
+
+
 def pane_agent_status_label(pane: dict[str, Any]) -> str:
     kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
+    if kind == "devin":
+        label = str(pane.get("label") or pane.get("name") or pane.get("title") or "").strip()
+        if label and label.lower() not in {"devin", "herdr devin"}:
+            return sanitize_text(label, 80)
     spec = managed_bot_specs().get(kind) if kind else None
     if spec:
         return str(spec.get("label") or kind.title())
@@ -804,6 +944,9 @@ def managed_bot_kind_for_payload(bot: dict[str, Any]) -> str:
         username = str(spec.get("suggested_username") or "").lower()
         if username and username in text:
             return kind
+        aliases = {str(alias).lower() for alias in spec.get("aliases") or ()}
+        if any(alias and alias in text for alias in aliases):
+            return kind
     return ""
 
 
@@ -812,9 +955,21 @@ def managed_bot_kind_for_entry(entry: dict[str, Any], pane: dict[str, Any] | Non
     if explicit in managed_bot_specs():
         return explicit
     if pane:
+        if managed_bot_kind_for_agent(str(pane.get("agent") or "")) == "devin":
+            model_kind = devin_model_managed_bot_kind_from_label(
+                " ".join(str(pane.get(key) or "") for key in ("label", "name", "title", "pane_thread_name"))
+            )
+            if model_kind:
+                return model_kind
         kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
         if kind:
             return kind
+    if managed_bot_kind_for_agent(str(entry.get("agent") or "")) == "devin":
+        model_kind = devin_model_managed_bot_kind_from_label(
+            " ".join(str(entry.get(key) or "") for key in ("pane_label_raw", "pane_thread_name", "topic_name", "label"))
+        )
+        if model_kind:
+            return model_kind
     return managed_bot_kind_for_agent(str(entry.get("agent") or ""))
 
 
@@ -1547,8 +1702,28 @@ def clean_topic_title(value: str, *, fallback: str = "Task") -> str:
     words = kept or words
     if not words:
         return fallback
-    title = " ".join(words[:2]).strip()
-    return title.title()[:32].strip() or fallback
+    title = format_topic_title_words(words[:2])
+    return title[:32].strip() or fallback
+
+
+TOPIC_TITLE_ACRONYMS = {
+    "api": "API",
+    "cli": "CLI",
+    "glm": "GLM",
+    "llm": "LLM",
+    "omp": "OMP",
+    "tg": "TG",
+    "ui": "UI",
+}
+
+
+def format_topic_title_words(words: list[str]) -> str:
+    formatted: list[str] = []
+    for word in words:
+        clean = str(word or "")
+        replacement = TOPIC_TITLE_ACRONYMS.get(clean.lower())
+        formatted.append(replacement if replacement else clean.title())
+    return " ".join(formatted).strip()
 
 
 def clean_label_topic_title(value: str, *, fallback: str = "Task") -> str:
@@ -1560,8 +1735,8 @@ def clean_label_topic_title(value: str, *, fallback: str = "Task") -> str:
     words = [w for w in text.strip().split() if w]
     if not words:
         return fallback
-    title = " ".join(words[:2]).strip()
-    return title.title()[:32].strip() or fallback
+    title = format_topic_title_words(words[:2])
+    return title[:32].strip() or fallback
 
 
 def title_from_text(text: str) -> str:
@@ -5429,6 +5604,27 @@ def agents_picker_reply_markup(space_token: str, live_entries: list[tuple[str, d
     return {"inline_keyboard": rows}
 
 
+def new_pane_picker_reply_markup(space_token: str) -> dict[str, Any]:
+    rows: list[list[dict[str, str]]] = []
+    current: list[dict[str, str]] = []
+    for model in DEVIN_SUPPORTED_MODELS:
+        spec = DEVIN_MODEL_ALIASES.get(model) or devin_model_alias(model)
+        current.append({
+            "text": str(spec.get("label") or model)[:64],
+            "callback_data": f"herdr:np:{space_token}:{model}",
+        })
+        if len(current) == 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append([
+        {"text": "Codex", "callback_data": f"herdr:np:{space_token}:codex"},
+        {"text": "Claude", "callback_data": f"herdr:np:{space_token}:claude"},
+    ])
+    return {"inline_keyboard": rows}
+
+
 def prompt_delivery_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
     if str(item.get("kind") or "").lower() not in {"choices", "decision"}:
         return None, None, True
@@ -8817,6 +9013,8 @@ def configure_telegram_state(state: dict[str, Any]) -> tuple[dict[str, Any], str
     )
     telegram.setdefault("implicit_send_enabled", False)
     telegram.setdefault("managed_bots", {})
+    if sync_env_managed_bot_tokens(telegram):
+        telegram["managed_bot_env_sync_at"] = utc_now()
     return telegram, chat_id
 
 
@@ -10050,6 +10248,13 @@ def sync_once() -> dict[str, Any]:
     for pane in panes:
         if sync_pane_once(state, chat_id, telegram, pane, counters, caps):
             changed = True
+    devin_glm_started = 0
+    devin_glm_result = ensure_devin_glm_space_seats(state, panes)
+    if devin_glm_result.get("changed"):
+        changed = True
+        devin_glm_started = int(devin_glm_result.get("started") or 0)
+        if devin_glm_started:
+            panes = observed_agent_panes()
     pinned_result = reconcile_pinned_status_views(state, chat_id, panes, counters, caps["max_sends"])
     changed, pinned_status_updated = add_pinned_reconcile_result(changed, pinned_status_updated, pinned_result)
     sends = counters["sends"]
@@ -10070,6 +10275,7 @@ def sync_once() -> dict[str, Any]:
         "marker_sent": counters["marker_sends"],
         "icon_updated": counters["icon_updates"],
         "pinned_status_updated": pinned_status_updated,
+        "devin_glm_started": devin_glm_started,
     }
 
 
@@ -10490,7 +10696,11 @@ def clear_active_pane(space: dict[str, Any], user_id: str) -> None:
 
 
 def new_pane_usage() -> str:
-    return "Usage: /new codex|claude|kimi|omp|devin"
+    examples = " | ".join(DEVIN_SUPPORTED_MODELS)
+    return (
+        "Usage: /new codex|claude|kimi|omp|devin|<devin-model-id>\n"
+        f"Devin model IDs: {examples}"
+    )
 
 
 def new_pane_agent_kind(arg: str) -> str:
@@ -10503,6 +10713,237 @@ def new_pane_agent_command(kind: str) -> str:
     env_name = f"HERDR_TELEGRAM_TOPICS_NEW_PANE_{kind.upper()}_COMMAND"
     configured = os.getenv(env_name, "").strip()
     return configured or NEW_PANE_AGENT_COMMANDS.get(kind, "")
+
+
+def devin_model_alias_key(arg: str) -> str:
+    first = str(arg or "").strip().split(None, 1)[0].lower() if str(arg or "").strip() else ""
+    return first.replace("_", "-")
+
+
+def devin_model_alias_spec(arg: str) -> dict[str, str] | None:
+    alias = devin_model_alias_key(arg)
+    spec = DEVIN_MODEL_ALIASES.get(alias)
+    return dict(spec) if spec else None
+
+
+def devin_model_command(model: str, env_prefix: str) -> str:
+    configured = os.getenv(f"HERDR_TELEGRAM_TOPICS_NEW_PANE_{env_prefix}_COMMAND", "").strip()
+    if configured:
+        return configured
+    configured = os.getenv(f"HERDR_TELEGRAM_TOPICS_{env_prefix}_COMMAND", "").strip()
+    if configured:
+        return configured
+    args = ["devin", "--model", model]
+    permission_mode = devin_glm_seat_permission_mode()
+    if permission_mode:
+        args.extend(["--permission-mode", permission_mode])
+    extra = os.getenv(f"HERDR_TELEGRAM_TOPICS_{env_prefix}_EXTRA_ARGS", "").strip()
+    if extra:
+        args.extend(shlex.split(extra))
+    return shlex.join(args)
+
+
+def new_pane_launch_spec(arg: str) -> dict[str, str] | None:
+    model_spec = devin_model_alias_spec(arg)
+    if model_spec:
+        model = model_spec["model"]
+        label = os.getenv(f"HERDR_TELEGRAM_TOPICS_{model_spec['env']}_LABEL", model_spec["label"]).strip() or model_spec["label"]
+        return {
+            "kind": "devin",
+            "label": label,
+            "command": devin_model_command(model, model_spec["env"]),
+            "rename_label": label,
+            "via": "Devin",
+        }
+    kind = new_pane_agent_kind(arg)
+    if not kind:
+        return None
+    label = str((managed_bot_specs().get(kind) or {}).get("label") or kind.title())
+    return {"kind": kind, "label": label, "command": new_pane_agent_command(kind), "rename_label": "", "via": ""}
+
+
+def devin_glm_seat_enabled() -> bool:
+    return parse_bool_env("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT", "0")
+
+
+def devin_glm_seat_model() -> str:
+    return os.getenv("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_MODEL", DEVIN_GLM_SEAT_DEFAULT_MODEL).strip() or DEVIN_GLM_SEAT_DEFAULT_MODEL
+
+
+def devin_glm_seat_permission_mode() -> str:
+    return (
+        os.getenv("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE", DEVIN_GLM_SEAT_DEFAULT_PERMISSION_MODE).strip()
+        or DEVIN_GLM_SEAT_DEFAULT_PERMISSION_MODE
+    )
+
+
+def devin_glm_seat_label() -> str:
+    return os.getenv("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_LABEL", DEVIN_GLM_SEAT_DEFAULT_LABEL).strip() or DEVIN_GLM_SEAT_DEFAULT_LABEL
+
+
+def devin_glm_seat_max_per_run() -> int:
+    try:
+        return max(0, int(os.getenv("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN", "1")))
+    except ValueError:
+        return 1
+
+
+def devin_glm_seat_command() -> str:
+    configured = os.getenv("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_COMMAND", "").strip()
+    if configured:
+        return configured
+    return devin_model_command(devin_glm_seat_model(), "DEVIN_GLM")
+
+
+def pane_closed_or_exited(pane: dict[str, Any]) -> bool:
+    status = str(pane.get("agent_status") or "").strip().lower()
+    return status in {"closed", "exited"} or bool(pane.get("closed") or pane.get("exited") or pane.get("process_exited"))
+
+
+def pane_is_devin_glm_seat(pane: dict[str, Any]) -> bool:
+    if pane_closed_or_exited(pane):
+        return False
+    agent_kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
+    labelish = " ".join(
+        str(pane.get(key) or "")
+        for key in ("label", "name", "title", "custom_status", "display_agent")
+    ).lower()
+    return agent_kind == "devin" and ("glm" in labelish or "5.2" in labelish)
+
+
+def pane_in_space(pane: dict[str, Any], space_key_value: str) -> bool:
+    try:
+        return str(space_key(pane)) == str(space_key_value)
+    except Exception:
+        return False
+
+
+def space_has_devin_glm_seat(space_entry: dict[str, Any], space_key_value: str, all_panes: list[dict[str, Any]]) -> bool:
+    for pane in all_panes:
+        if pane_in_space(pane, space_key_value) and pane_is_devin_glm_seat(pane):
+            return True
+    pending_pane_id = str(space_entry.get("devin_glm_seat_pane_id") or "")
+    if not pending_pane_id:
+        return False
+    for pane in all_panes:
+        if str(pane.get("pane_id") or "") == pending_pane_id and not pane_closed_or_exited(pane):
+            return True
+    if cache_fresh(str(space_entry.get("devin_glm_seat_created_at") or ""), DEVIN_GLM_SEAT_PENDING_TTL_SECONDS):
+        return True
+    return False
+
+
+def devin_glm_anchor_pane(space_panes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    candidates = [pane for pane in space_panes if not pane_closed_or_exited(pane) and not pane_is_devin_glm_seat(pane)]
+    if not candidates:
+        return None
+    status_rank = {"idle": 0, "done": 1, "blocked": 2, "unknown": 3, "working": 4}
+    return sorted(
+        candidates,
+        key=lambda pane: (
+            status_rank.get(str(pane.get("agent_status") or "").strip().lower(), 3),
+            str(pane.get("pane_id") or ""),
+        ),
+    )[0]
+
+
+def start_devin_glm_seat_for_space(
+    state: dict[str, Any],
+    space_key_value: str,
+    space_entry: dict[str, Any],
+    anchor: dict[str, Any],
+) -> dict[str, Any]:
+    anchor_pane_id = str(anchor.get("pane_id") or "").strip()
+    if not anchor_pane_id:
+        return {"ok": False, "error": "anchor pane has no pane_id"}
+    split_args = [herdr_bin(), "pane", "split", anchor_pane_id, "--direction", "right"]
+    cwd = str(anchor.get("foreground_cwd") or anchor.get("cwd") or "").strip()
+    if cwd:
+        split_args.extend(["--cwd", cwd])
+    split_args.append("--no-focus")
+    split_proc = run_cmd(split_args, timeout=10)
+    if split_proc.returncode != 0:
+        error = sanitize_text(split_proc.stderr or split_proc.stdout, 500)
+        space_entry["devin_glm_seat_error"] = error
+        space_entry["devin_glm_seat_error_at"] = utc_now()
+        return {"ok": False, "error": error}
+    try:
+        split_data = json.loads(split_proc.stdout)
+    except json.JSONDecodeError:
+        split_data = {}
+    new_pane_id = split_result_pane_id(split_data)
+    if not new_pane_id:
+        error = "Herdr did not return the new Devin GLM pane id."
+        space_entry["devin_glm_seat_error"] = error
+        space_entry["devin_glm_seat_error_at"] = utc_now()
+        return {"ok": False, "error": error}
+
+    label = devin_glm_seat_label()
+    rename_proc = run_cmd([herdr_bin(), "pane", "rename", new_pane_id, label], timeout=5)
+    if rename_proc.returncode != 0:
+        space_entry["devin_glm_seat_rename_error"] = sanitize_text(rename_proc.stderr or rename_proc.stdout, 500)
+        space_entry["devin_glm_seat_rename_error_at"] = utc_now()
+
+    command = devin_glm_seat_command()
+    run_proc = run_cmd([herdr_bin(), "pane", "run", new_pane_id, command], timeout=10)
+    if run_proc.returncode != 0:
+        error = sanitize_text(run_proc.stderr or run_proc.stdout, 500)
+        space_entry["devin_glm_seat_error"] = error
+        space_entry["devin_glm_seat_error_at"] = utc_now()
+        space_entry["devin_glm_seat_pane_id"] = new_pane_id
+        space_entry["devin_glm_seat_created_at"] = utc_now()
+        return {"ok": False, "pane_id": new_pane_id, "error": error}
+
+    space_entry["devin_glm_seat_pane_id"] = new_pane_id
+    space_entry["devin_glm_seat_created_at"] = utc_now()
+    space_entry["devin_glm_seat_command"] = command
+    space_entry["devin_glm_seat_model"] = devin_glm_seat_model()
+    space_entry["devin_glm_seat_permission_mode"] = devin_glm_seat_permission_mode()
+    space_entry.pop("devin_glm_seat_error", None)
+    space_entry.pop("devin_glm_seat_error_at", None)
+    return {"ok": True, "pane_id": new_pane_id, "space_key": space_key_value}
+
+
+def ensure_devin_glm_space_seats(state: dict[str, Any], panes: list[dict[str, Any]], max_starts: int | None = None) -> dict[str, Any]:
+    if not devin_glm_seat_enabled():
+        return {"changed": False, "started": 0, "skipped": True}
+    max_allowed = devin_glm_seat_max_per_run() if max_starts is None else max(0, int(max_starts))
+    if max_allowed <= 0:
+        return {"changed": False, "started": 0, "skipped": True, "reason": "start_cap"}
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    if not spaces:
+        return {"changed": False, "started": 0}
+    try:
+        all_panes = pane_list()
+    except Exception as exc:
+        state["last_devin_glm_seat_error"] = sanitize_text(str(exc), 500)
+        state["last_devin_glm_seat_error_at"] = utc_now()
+        return {"changed": True, "started": 0, "error": str(exc)}
+
+    grouped = open_panes_by_space(panes)
+    all_grouped = open_panes_by_space(all_panes)
+    started = 0
+    changed = False
+    for space_key_value in sorted(grouped):
+        if started >= max_allowed:
+            break
+        space_entry = spaces.get(str(space_key_value))
+        if not isinstance(space_entry, dict):
+            continue
+        if space_has_devin_glm_seat(space_entry, str(space_key_value), all_panes):
+            continue
+        if cache_fresh(str(space_entry.get("devin_glm_seat_error_at") or ""), DEVIN_GLM_SEAT_ERROR_RETRY_SECONDS):
+            continue
+        anchor = devin_glm_anchor_pane(all_grouped.get(str(space_key_value), []) or grouped.get(str(space_key_value), []))
+        if not anchor:
+            continue
+        result = start_devin_glm_seat_for_space(state, str(space_key_value), space_entry, anchor)
+        changed = True
+        if result.get("ok"):
+            started += 1
+    if changed:
+        state["last_devin_glm_seat_sync_at"] = utc_now()
+    return {"changed": changed, "started": started}
 
 
 def split_result_pane_id(data: Any) -> str:
@@ -10557,6 +10998,31 @@ def new_pane_anchor_entry(
     return entry
 
 
+def new_pane_picker_response(state: dict[str, Any], chat_id: str, topic_id: str) -> dict[str, Any]:
+    mapped = topic_space_entry(state, chat_id, topic_id)
+    if not mapped:
+        return {"handled": True, "reply": new_pane_usage()}
+    _space_key_value, space = mapped
+    space_token = _callback_id(str(space.get("space_key") or _space_key_value), "space")[:16]
+    result = send_notice(
+        chat_id,
+        "Open a model pane",
+        "Choose the model/agent pane to open in this space. Labels ending in Devin run through the Devin CLI.",
+        telegram=state.setdefault("telegram", {}),
+        thread_id=topic_id,
+        notify=True,
+        reply_markup=new_pane_picker_reply_markup(space_token),
+    )
+    if result.get("ok") and result.get("message_id"):
+        space["new_pane_picker_message_id"] = str(result["message_id"])
+        space["new_pane_picker_sent_at"] = utc_now()
+    else:
+        space["new_pane_picker_error"] = sanitize_text(str(result), 500)
+        space["new_pane_picker_error_at"] = utc_now()
+    save_state(state)
+    return {"handled": True, "reply": ""}
+
+
 def new_agent_pane_response(
     state: dict[str, Any],
     chat_id: str,
@@ -10564,12 +11030,15 @@ def new_agent_pane_response(
     payload: dict[str, Any],
     arg: str,
 ) -> dict[str, Any]:
-    kind = new_pane_agent_kind(arg)
-    if not kind:
+    if not str(arg or "").strip():
+        return new_pane_picker_response(state, chat_id, topic_id)
+    spec = new_pane_launch_spec(arg)
+    if not spec:
         return {"handled": True, "reply": new_pane_usage()}
-    command = new_pane_agent_command(kind)
+    kind = spec["kind"]
+    command = spec["command"]
     if not command:
-        return {"handled": True, "reply": f"No command configured for {kind}."}
+        return {"handled": True, "reply": f"No command configured for {spec['label']}."}
     anchor = new_pane_anchor_entry(
         state,
         chat_id,
@@ -10598,12 +11067,18 @@ def new_agent_pane_response(
     new_pane_id = split_result_pane_id(split_data)
     if not new_pane_id:
         return {"handled": True, "reply": "New pane failed: Herdr did not return the new pane id."}
+    rename_label = str(spec.get("rename_label") or "").strip()
+    if rename_label:
+        rename_proc = run_cmd([herdr_bin(), "pane", "rename", new_pane_id, rename_label], timeout=5)
+        if rename_proc.returncode != 0:
+            detail = sanitize_text(rename_proc.stderr or rename_proc.stdout, 300)
+            return {"handled": True, "reply": f"Started pane {new_pane_id}, but naming it failed: {detail}"}
     run_proc = run_cmd([herdr_bin(), "pane", "run", new_pane_id, command], timeout=10)
     if run_proc.returncode != 0:
         detail = sanitize_text(run_proc.stderr or run_proc.stdout, 500)
-        return {"handled": True, "reply": f"Started pane {new_pane_id}, but launching {kind} failed: {detail}"}
-    label = str((managed_bot_specs().get(kind) or {}).get("label") or kind.title())
-    return {"handled": True, "reply": f"Started {label} in pane {new_pane_id}."}
+        return {"handled": True, "reply": f"Started pane {new_pane_id}, but launching {spec['label']} failed: {detail}"}
+    via = f" through {spec['via']}" if spec.get("via") else ""
+    return {"handled": True, "reply": f"Started {spec['label']}{via} in pane {new_pane_id}."}
 
 
 def voice_mode_response(state: dict[str, Any], space: dict[str, Any], live: list[tuple[str, dict[str, Any]]], arg: str) -> dict[str, Any]:
@@ -11159,6 +11634,33 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
     return {"handled": True, "answer": ans}
 
 
+def handle_new_pane_picker_callback(state, telegram, chat_id, topic_id, message_id, space, parts):
+    if len(parts) != 4:
+        return {"handled": True, "answer": "Unknown Herdr action."}
+    target = str(parts[3] or "")
+    space_token = _callback_id(str(space.get("space_key") or ""), "space")[:16]
+    if str(parts[2] or "") != space_token:
+        return {"handled": True, "answer": "That picker expired. Use /new again.", "show_alert": True}
+    result = new_agent_pane_response(
+        state,
+        chat_id,
+        topic_id,
+        {"message_id": message_id, "reply_to_message_id": ""},
+        target,
+    )
+    reply = str(result.get("reply") or "").strip()
+    if reply:
+        try:
+            telegram_api("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": int(message_id),
+                "text": reply,
+            })
+        except Exception:
+            pass
+    return {"handled": True, "answer": reply or "Started."}
+
+
 def handle_multibot_offer_callback(state, telegram, chat_id, topic_id, message_id, space, parts):
     if len(parts) != 4:
         return {"handled": True, "answer": "Unknown Herdr action."}
@@ -11223,7 +11725,12 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
 
     if not data.startswith("herdr:"):
         return {"handled": False}
-    if data.startswith("herdr:ob:") or data.startswith("herdr:ag:") or data.startswith("herdr:mb:"):
+    if (
+        data.startswith("herdr:ob:")
+        or data.startswith("herdr:ag:")
+        or data.startswith("herdr:mb:")
+        or data.startswith("herdr:np:")
+    ):
         owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
         if not owners:
             owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
@@ -11238,6 +11745,8 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return handle_multibot_offer_callback(state, telegram, chat_id, topic_id, message_id, space, parts)
         if data.startswith("herdr:ob:"):
             return handle_onboarding_callback(state, telegram, chat_id, topic_id, message_id, space, parts)
+        if data.startswith("herdr:np:"):
+            return handle_new_pane_picker_callback(state, telegram, chat_id, topic_id, message_id, space, parts)
         return handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, user_id, space, parts)
     entry = topic_entry(state, chat_id, topic_id, message_id=message_id, prefer_message_id=True)
     if not entry:

@@ -84,7 +84,7 @@ In the mapped space topic, reply to a routed pane message or optional pane-root 
 - `/debug` - show technical mapping details
 - `/send <text>` - send instruction to this pane
 - `/keys <keys>` - send explicit keys to this pane
-- `/new codex|claude|kimi|omp|devin` - split a new pane to the right in this space and launch that agent CLI
+- `/new codex|claude|kimi|omp|devin|<devin-model-id>` - split a new pane to the right in this space and launch that agent/model. Devin model IDs such as `glm-5.2`, `kimi-k2.7`, `gpt-5.5`, and `claude-opus-4.8` are run through the local Devin CLI.
 
 Plain text replies under a routed pane message, ForceReply prompt, or optional pane-root message are forwarded directly to that pane without `/send`. Top-level owner messages in a shared space topic are also forwarded when that topic has exactly one live pane. Topics with multiple possible panes still fail closed with: `Reply inside a pane thread so I know which Herdr pane to control.` The General topic remains normal Hermes chat.
 
@@ -97,6 +97,36 @@ HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS=1200
 HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES=6
 HERDR_TELEGRAM_TOPICS_INPUT_FILE_MAX_CHARS=120000
 ```
+
+### Devin GLM Seats
+
+Herdres can optionally keep one Devin-backed GLM pane in every Herdr space. This is a local provisioner for this host: it does not modify Herdr, replace the Herdr binary, or require Devin API keys. When enabled, a sync run uses Herdr's normal public commands to split a pane in each live space, rename it to the model label, and run Devin:
+
+```bash
+devin --model glm-5.2 --permission-mode dangerous
+```
+
+Enable it only on machines where the Devin CLI is installed and logged in:
+
+```bash
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT=1
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_MODEL=glm-5.2
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE=dangerous
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_LABEL=GLM Devin
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN=1
+```
+
+`HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN` defaults to `1` so a first rollout does not create many panes at once. Set it higher for a deliberate one-shot backfill across all existing spaces. Herdres records the created pane id per space and treats a recently created unknown/shell pane as pending, so repeated syncs do not duplicate Devin seats while Devin is still starting. Failed start attempts back off for `HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_ERROR_RETRY` seconds, default `300`.
+
+Manual model choices are also available:
+
+```bash
+/new glm-5.2       # opens GLM Devin through Devin
+/new kimi-k2.7     # opens Kimi Devin through Devin
+/new gpt-5.5       # opens GPT Devin through Devin
+```
+
+Labels ending in `Devin` are hosted through the Devin CLI. Telegram topic names and pinned status rows use the model label, not the generic `Devin` label.
 
 Inbound pane-thread control is handled through the Hermes Telegram gateway, so Hermes must load the small bridge hook:
 
@@ -413,7 +443,7 @@ HERDR_TELEGRAM_TOPICS_DRY_RUN=1 ~/.local/bin/herdres sync
 
 ## Managed Pane Bots
 
-When `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1`, Herdres posts managed-bot setup links in General only for AI types that currently have open panes and do not already have a stored child-bot token. Supported pane bots are Codex, Claude, Kimi, OMP, and Devin. After Telegram sends the manager bot a `managed_bot` update, Herdres calls `getManagedBotToken`, stores the child token under `telegram.managed_bots`, and updates the child bot profile.
+When `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1`, Herdres posts managed-bot setup links in General only for AI types that currently have open panes and do not already have a stored child-bot token. Supported pane bots are Codex, Claude, Kimi, OMP, Devin, and GLM Devin. After Telegram sends the manager bot a `managed_bot` update, Herdres calls `getManagedBotToken`, stores the child token under `telegram.managed_bots`, and updates the child bot profile.
 
 Telegram still requires each child bot to have access to the forum group. If a child token is registered but Telegram rejects pane messages from it, Herdres posts add-to-group buttons in General and does not send that pane traffic as the manager bot.
 
@@ -438,6 +468,15 @@ HERDR_TELEGRAM_TOPICS_MANAGED_BOT_CLAUDE_PHOTO=~/.config/herdres/managed-bots/cl
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_KIMI_PHOTO=~/.config/herdres/managed-bots/kimi.jpg
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_OMP_PHOTO=~/.config/herdres/managed-bots/omp.jpg
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_DEVIN_PHOTO=~/.config/herdres/managed-bots/devin.jpg
+HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_PHOTO=~/.config/herdres/managed-bots/glm.jpg
+```
+
+If a child bot was created outside Telegram's managed-bot request flow, assign it manually by token. For example, to assign a bot named Guremi to GLM:
+
+```bash
+HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_TOKEN=123456:...
+HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_USERNAME=Guremi_bot
+HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_NAME=Guremi
 ```
 
 For local deployments that need this before Herdr exposes the endpoint upstream, Herdres includes `herdr_turn_adapter.py`. It is a wrapper, not a Herdr patch:
@@ -542,6 +581,7 @@ HERDR_TELEGRAM_TOPICS_MANAGED_BOT_CLAUDE_PHOTO=
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_KIMI_PHOTO=
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_OMP_PHOTO=
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_DEVIN_PHOTO=
+HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_PHOTO=
 HERDR_TELEGRAM_TOPICS_TURN_FEED=1
 HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS=0
 HERDR_TELEGRAM_TOPICS_VISIBLE_READONLY_PROMPTS=1
@@ -560,6 +600,14 @@ HERDR_TELEGRAM_TOPICS_NEW_PANE_CLAUDE_COMMAND=claude
 HERDR_TELEGRAM_TOPICS_NEW_PANE_KIMI_COMMAND=kimi
 HERDR_TELEGRAM_TOPICS_NEW_PANE_OMP_COMMAND=omp
 HERDR_TELEGRAM_TOPICS_NEW_PANE_DEVIN_COMMAND=devin
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT=0
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_MODEL=glm-5.2
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE=dangerous
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_LABEL=GLM Devin
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN=1
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_PENDING_TTL=1800
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_ERROR_RETRY=300
+HERDR_TELEGRAM_TOPICS_DEVIN_KIMI_LABEL=Kimi Devin
 HERDR_TELEGRAM_TOPICS_LIVE_CARD=0
 HERDR_TELEGRAM_TOPICS_STATUS_ICON=1
 HERDR_TELEGRAM_TOPICS_STATUS_ICON_CACHE_TTL=86400

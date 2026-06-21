@@ -69,6 +69,90 @@ class TurnAdapterTests(unittest.TestCase):
         # must NOT over-match a real prompt that merely starts with the tag text
         self.assertFalse(adapter.is_internal_codex_user_text("<codex_internal_contextualize this>keep"))
 
+    def test_devin_session_resolver_rejects_stale_cwd_match_for_new_pane(self) -> None:
+        proc = Mock()
+        proc.returncode = 0
+        proc.stdout = json.dumps(
+            [
+                {
+                    "id": "old-session",
+                    "working_directory": "/tmp/project",
+                    "last_activity_at": 1900,
+                }
+            ]
+        )
+        stat_result = Mock()
+        stat_result.st_ctime = 2000
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            adapter, "devin_bin", Mock(return_value="devin")
+        ), patch.object(adapter.subprocess, "run", Mock(return_value=proc)), patch.object(
+            adapter, "run_real_herdr_json",
+            Mock(
+                return_value={
+                    "result": {
+                        "process_info": {
+                            "foreground_processes": [
+                                {"name": "devin", "cmdline": "devin --model glm-5.2", "pid": 123}
+                            ]
+                        }
+                    }
+                }
+            ),
+        ), patch.object(adapter.os, "stat", Mock(return_value=stat_result)), patch.object(
+            adapter, "devin_transcripts_dir", Mock(return_value=Path(tmp))
+        ):
+            (Path(tmp) / "old-session.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                adapter.devin_resolve_session_id({"pane_id": "pane-1", "cwd": "/tmp/project"}),
+                "",
+            )
+
+    def test_devin_session_resolver_accepts_fresh_cwd_match(self) -> None:
+        proc = Mock()
+        proc.returncode = 0
+        proc.stdout = json.dumps(
+            [
+                {
+                    "id": "old-session",
+                    "working_directory": "/tmp/project",
+                    "last_activity_at": 1900,
+                },
+                {
+                    "id": "fresh-session",
+                    "working_directory": "/tmp/project",
+                    "last_activity_at": 2010,
+                },
+            ]
+        )
+        stat_result = Mock()
+        stat_result.st_ctime = 2000
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            adapter, "devin_bin", Mock(return_value="devin")
+        ), patch.object(adapter.subprocess, "run", Mock(return_value=proc)), patch.object(
+            adapter, "run_real_herdr_json",
+            Mock(
+                return_value={
+                    "result": {
+                        "process_info": {
+                            "foreground_processes": [
+                                {"name": "devin", "cmdline": "devin --model glm-5.2", "pid": 123}
+                            ]
+                        }
+                    }
+                }
+            ),
+        ), patch.object(adapter.os, "stat", Mock(return_value=stat_result)), patch.object(
+            adapter, "devin_transcripts_dir", Mock(return_value=Path(tmp))
+        ):
+            (Path(tmp) / "old-session.json").write_text("{}", encoding="utf-8")
+            (Path(tmp) / "fresh-session.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                adapter.devin_resolve_session_id({"pane_id": "pane-1", "cwd": "/tmp/project"}),
+                "fresh-session",
+            )
+
     def test_codex_open_turn_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
