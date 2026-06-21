@@ -3,7 +3,9 @@ set -eu
 
 install -Dm755 herdres.py "$HOME/.local/bin/herdres"
 install -Dm755 herdr_telegram_topics_install_bridge.py "$HOME/.local/bin/herdr_telegram_topics_install_bridge.py"
-install -Dm644 .env.example "$HOME/.config/herdres/herdres.env"
+# Never clobber an existing config: re-install becomes a safe update.
+[ -f "$HOME/.config/herdres/herdres.env" ] || \
+    install -Dm644 .env.example "$HOME/.config/herdres/herdres.env"
 install -Dm644 herdr_topic_bridge.py "$HOME/.local/share/herdres/herdr_topic_bridge.py"
 # Multi-token standalone inbound gateway (manager + per-agent child bots).
 # herdres_routing.py must sit next to it on the import path.
@@ -12,6 +14,9 @@ install -Dm644 herdres_routing.py "$HOME/.local/bin/herdres_routing.py"
 install -d "$HOME/.local/share/herdres/herdres-plugin"
 sed "s#\\[\"herdres\", #\\[\"$HOME/.local/bin/herdres\", #g" \
     herdres-plugin/herdr-plugin.toml > "$HOME/.local/share/herdres/herdres-plugin/herdr-plugin.toml"
+# Record this checkout's absolute path so `herdres update --edge` can git pull it.
+install -d "$HOME/.local/share/herdres"
+printf '%s\n' "$(cd "$(dirname "$0")" && pwd)" > "$HOME/.local/share/herdres/source"
 mkdir -p "$HOME/.config/systemd/user"
 cp systemd/user/herdres.service systemd/user/herdres.timer systemd/user/herdres-gateway.service "$HOME/.config/systemd/user/"
 
