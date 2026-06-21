@@ -2,5 +2,5 @@
   "name": "herdres",
   "version": "0.1.0",
   "description": "Operate the Herdr-to-Telegram bridge: per-agent topics, send/interrupt/queue, status, managed bots, cockpit, maintenance.",
-  "author": { "name": "jerryfane", "url": "https://github.com/jerryfane" }
+  "author": { "name": "luminexord", "url": "https://github.com/luminexord" }
 }

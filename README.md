@@ -33,7 +33,7 @@ Claude Code:
 /plugin install herdres@herdres
 ```
 
-Codex (or any skills-compatible agent that reads `.codex-plugin/`): add the same repo as a marketplace, then install the `herdres` plugin. Both manifests pin the bundled skill via `"source": "."` and `"skills": "./skills/"`, so the operator skill resolves from the plugin root.
+Codex (or any skills-compatible agent that reads `.codex-plugin/`): add the same repo as a marketplace, then install the `herdres` plugin. Both manifests pin the bundled skill via `"source": "./"` and `"skills": "./skills/"`, so the operator skill resolves from the plugin root.
 
 ## What It Does
 

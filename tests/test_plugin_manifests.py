@@ -89,7 +89,22 @@ def test_marketplace_manifest_shape() -> None:
         assert first.get(key), f"plugins[0] missing non-empty {key!r}"
     assert first["name"] == "herdres"
 
+    # The documented relative-path form must start with "./"; resolve it against
+    # the repo root and confirm it points at a real plugin root: the directory
+    # must bundle both `.claude-plugin/plugin.json` and `skills/herdres/SKILL.md`.
+    source = first["source"]
+    assert source.startswith("./"), f"plugins[0].source must be a ./ relative path: {source!r}"
+    plugin_root = (ROOT / source).resolve()
+    assert plugin_root.is_dir(), f"plugins[0].source does not resolve to a directory: {plugin_root}"
+    assert (plugin_root / ".claude-plugin" / "plugin.json").is_file(), (
+        f"plugin root {plugin_root} missing .claude-plugin/plugin.json"
+    )
+    assert (plugin_root / "skills" / "herdres" / "SKILL.md").is_file(), (
+        f"plugin root {plugin_root} missing skills/herdres/SKILL.md"
+    )
+
 
 def test_bundled_skill_resolves() -> None:
-    # The plugin source is "." and bundles skills/herdres/; the entrypoint must exist.
+    # The plugin source is "./" and bundles skills/herdres/; the entrypoint must exist.
+    assert (ROOT / "skills").is_dir(), "bundled ./skills/ directory must exist on disk"
     assert SKILL_MD.is_file(), "bundled skill skills/herdres/SKILL.md must exist"
