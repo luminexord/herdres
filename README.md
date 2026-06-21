@@ -10,6 +10,18 @@ It does not patch Hermes or Herdr core files and routine sync uses no LLM calls.
 
 **Operate it from an AI agent:** the [`skills/herdres/`](skills/herdres/SKILL.md) Agent Skill (agentskills.io `SKILL.md`) teaches a skills-compatible agent (Claude Code, Codex, …) to install, configure, and drive this bridge — a guided, self-verifying setup plus the full operator command surface. That skill is for *operating* herdres; [`AGENTS.md`](AGENTS.md) is for *contributing* to it.
 
+The repo-root [`SKILL.md`](SKILL.md) is a **self-contained, single-file** copy of that skill — tell any agent to install it directly (no folder needed):
+
+```text
+Install the herdres operator skill from this single file (do NOT install any skill named "herdr" — different project):
+  curl -fsSL https://raw.githubusercontent.com/luminexord/herdres/main/SKILL.md \
+    -o ~/.codex/skills/herdres/SKILL.md      # Codex
+  # or  -o ~/.claude/skills/herdres/SKILL.md  # Claude Code
+Verify: the file's frontmatter says `name: herdres`.
+```
+
+The packaged `skills/herdres/` (this file + `references/`) is the canonical, progressive-disclosure version; the root `SKILL.md` is the install-anywhere entrypoint.
+
 ## What It Does
 
 - Creates or maintains one Telegram forum topic per Herdr space.

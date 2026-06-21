@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = ROOT / "skills" / "herdres"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 REF_DIR = SKILL_DIR / "references"
+ROOT_SKILL_MD = ROOT / "SKILL.md"  # self-contained single-file entrypoint (install-anywhere)
 
 EXPECTED_REFERENCES = [
     "SETUP.md",
@@ -147,6 +148,18 @@ def test_no_invented_env_vars():
     assert mentioned, "expected the skill to mention env vars"
     invented = sorted(v for v in mentioned if v not in corpus)
     assert not invented, f"skill mentions env vars not found in any source file: {invented}"
+
+
+def test_root_single_file_entrypoint_is_self_contained():
+    """The repo-root SKILL.md installs as a lone file, so it must not depend on
+    sibling files via hard relative links."""
+    assert ROOT_SKILL_MD.is_file(), "repo-root SKILL.md (single-file entrypoint) is missing"
+    text = ROOT_SKILL_MD.read_text(encoding="utf-8")
+    fm, body = _frontmatter_and_body(text)
+    assert re.search(r"^name\s*:\s*herdres\s*$", fm, re.M), "root SKILL.md name must be 'herdres'"
+    assert re.search(r"^description\s*:", fm, re.M), "root SKILL.md missing description"
+    broken = re.findall(r"\]\((?:\./|references/|skills/)[^)]+\)", text)
+    assert not broken, f"root SKILL.md has hard relative links (breaks single-file install): {broken}"
 
 
 def test_native_pane_commands_are_real():
