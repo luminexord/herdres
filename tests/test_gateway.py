@@ -718,6 +718,85 @@ class GatewayManagedBotTests(unittest.TestCase):
         run_script.assert_called_once()
         self.assertEqual(run_script.call_args.args[0]["text"], first + second + terminal)
 
+    def test_poll_once_deletes_topic_icon_service_message(self) -> None:
+        state = self.single_pane_space_state()
+        icon_msg = {
+            "message_id": 7000,
+            "message_thread_id": 77,
+            "chat": {"id": -1001, "is_forum": True},
+            "forum_topic_edited": {"icon_custom_emoji_id": "5310000000000000001"},
+        }
+        managed_gateway.offset_path_for("manager").write_text("200\n", encoding="utf-8")
+        calls = []
+
+        def fake_api(method, params=None, timeout=30, *, token=None):
+            calls.append((method, params, token))
+            return {"ok": True, "result": [self.poll_update(200, icon_msg)] if method == "getUpdates" else True}
+
+        prepare = Mock(return_value=None)
+        with patch.object(managed_gateway, "clear_webhook"), patch.object(
+            managed_gateway, "api", fake_api
+        ), patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "prepare_message", prepare
+        ):
+            managed_gateway.poll_once("manager", "MANAGER_TOKEN", timeout_seconds=0)
+
+        deletes = [c for c in calls if c[0] == "deleteMessage"]
+        self.assertEqual(len(deletes), 1)
+        self.assertEqual(deletes[0][1]["message_id"], "7000")
+        self.assertEqual(deletes[0][2], "MANAGER_TOKEN")  # deleted with the manager's token
+        prepare.assert_not_called()  # service message never reaches the dispatch path
+        self.assertEqual(managed_gateway.offset_path_for("manager").read_text(encoding="utf-8").strip(), "201")
+
+    def test_consume_icon_service_message_matrix(self) -> None:
+        icon_msg = {"message_id": 1, "chat": {"id": -1001}, "forum_topic_edited": {"icon_custom_emoji_id": "5"}}
+        name_msg = {"message_id": 2, "chat": {"id": -1001}, "forum_topic_edited": {"name": "Renamed"}}
+        created_msg = {"message_id": 3, "chat": {"id": -1001}, "forum_topic_created": {"name": "New"}}
+
+        # name-only edit and topic-created are NOT consumed (fall through to normal handling)
+        self.assertFalse(managed_gateway.is_topic_icon_service_message(name_msg))
+        self.assertFalse(managed_gateway.is_topic_icon_service_message(created_msg))
+        self.assertTrue(managed_gateway.is_topic_icon_service_message(icon_msg))
+
+        # manager deletes
+        api = Mock(return_value={"ok": True, "result": True})
+        with patch.object(managed_gateway, "api", api):
+            self.assertTrue(managed_gateway.consume_topic_icon_service_message(icon_msg, bot_token="MANAGER_TOKEN", bot_key="manager"))
+        api.assert_called_once()
+        self.assertEqual(api.call_args.args[0], "deleteMessage")
+
+        # name-only edit: not consumed, no delete
+        api2 = Mock(return_value={"ok": True, "result": True})
+        with patch.object(managed_gateway, "api", api2):
+            self.assertFalse(managed_gateway.consume_topic_icon_service_message(name_msg, bot_token="MANAGER_TOKEN", bot_key="manager"))
+        api2.assert_not_called()
+
+        # child worker swallows but does NOT delete (only the manager deletes)
+        api3 = Mock(return_value={"ok": True, "result": True})
+        with patch.object(managed_gateway, "api", api3):
+            self.assertTrue(managed_gateway.consume_topic_icon_service_message(icon_msg, bot_token="CHILD", bot_key="managed-codex-abc"))
+        api3.assert_not_called()
+
+        # env-gated off: consumed (suppressed) but not deleted
+        api4 = Mock(return_value={"ok": True, "result": True})
+        with patch.object(managed_gateway, "DELETE_ICON_SERVICE_MESSAGES", False), patch.object(managed_gateway, "api", api4):
+            self.assertTrue(managed_gateway.consume_topic_icon_service_message(icon_msg, bot_token="MANAGER_TOKEN", bot_key="manager"))
+        api4.assert_not_called()
+
+        # delete failure is non-fatal (no exception escapes), still consumed
+        api5 = Mock(side_effect=RuntimeError("boom"))
+        with patch.object(managed_gateway, "api", api5):
+            self.assertTrue(managed_gateway.consume_topic_icon_service_message(icon_msg, bot_token="MANAGER_TOKEN", bot_key="manager"))
+
+    def test_handle_update_consumes_icon_service_message(self) -> None:
+        icon_msg = {"message_id": 9, "chat": {"id": -1001}, "forum_topic_edited": {"icon_custom_emoji_id": "5"}}
+        api = Mock(return_value={"ok": True, "result": True})
+        handle_message = Mock()
+        with patch.object(managed_gateway, "api", api), patch.object(managed_gateway, "handle_message", handle_message):
+            managed_gateway.handle_update({"update_id": 1, "message": icon_msg}, bot_token="MANAGER_TOKEN", bot_key="manager")
+        self.assertEqual(api.call_args.args[0], "deleteMessage")
+        handle_message.assert_not_called()
+
     def test_terminal_before_body_deterministic(self) -> None:
         class FakeFuture:
             def __init__(self) -> None:

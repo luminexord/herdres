@@ -101,6 +101,10 @@ REASSEMBLY_LOCK = threading.Lock()
 
 TOKEN = ""
 DEBUG = os.getenv("HERDRES_GATEWAY_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
+# Auto-delete the "<user> changed the topic icon to <emoji>" forum service messages
+# that the status-icon feature generates on every status change, so they don't clutter
+# the topic feed. Only the manager worker (which made the edit and is group admin) deletes.
+DELETE_ICON_SERVICE_MESSAGES = os.getenv("HERDRES_GATEWAY_DELETE_ICON_MESSAGES", "1").strip().lower() not in ("0", "false", "no")
 CLEARED_WEBHOOK_KEYS: set[str] = set()
 CLEARED_WEBHOOK_LOCK = threading.Lock()
 QUARANTINED_KEYS: set[str] = set()
@@ -1119,6 +1123,35 @@ def clear_webhook(key: str, bot_token: str) -> None:
         CLEARED_WEBHOOK_KEYS.add(key)
 
 
+def is_topic_icon_service_message(message: dict) -> bool:
+    # Telegram posts a forum_topic_edited service message on every topic-icon change;
+    # icon edits carry icon_custom_emoji_id (a name-only rename does not).
+    edited = message.get("forum_topic_edited") if isinstance(message, dict) else None
+    return isinstance(edited, dict) and "icon_custom_emoji_id" in edited
+
+
+def consume_topic_icon_service_message(message: dict, *, bot_token: str | None, bot_key: str | None) -> bool:
+    """If `message` is a topic-icon service message, consume it (caller must NOT
+    dispatch it further) and — on the manager worker only — delete it so it does not
+    clutter the feed. Returns True iff consumed. Deletion failures are non-fatal."""
+    if not is_topic_icon_service_message(message):
+        return False
+    if not DELETE_ICON_SERVICE_MESSAGES:
+        return True  # suppress dispatch but leave the message visible
+    if (bot_key or MANAGER_BOT_KIND) != MANAGER_BOT_KIND:
+        return True  # only the manager (made the edit + is admin) deletes; child swallows
+    chat_id = str((message.get("chat") or {}).get("id") or "")
+    msg_id = str(message.get("message_id") or "")
+    if chat_id and msg_id:
+        try:
+            resp = api("deleteMessage", {"chat_id": chat_id, "message_id": msg_id}, timeout=15, token=bot_token)
+            if isinstance(resp, dict) and resp.get("ok") is False:
+                log(f"icon service-message delete failed ({msg_id}): {resp.get('description')}")
+        except Exception as exc:
+            log(f"icon service-message delete error ({msg_id}): {exc}")
+    return True
+
+
 def handle_update(update: dict, *, bot_token: str | None = None, bot_key: str | None = None) -> None:
     if "managed_bot" in update:
         handle_managed_bot_update({"managed_bot": update["managed_bot"]})
@@ -1127,6 +1160,8 @@ def handle_update(update: dict, *, bot_token: str | None = None, bot_key: str | 
         message = update["message"]
         if isinstance(message, dict) and isinstance(message.get("managed_bot_created"), dict):
             handle_managed_bot_update({"message": message})
+            return
+        if isinstance(message, dict) and consume_topic_icon_service_message(message, bot_token=bot_token, bot_key=bot_key):
             return
         handle_message(message, bot_token=bot_token, bot_key=bot_key)
         return
@@ -1171,17 +1206,20 @@ def poll_once(key: str, bot_token: str, *, timeout_seconds: int) -> None:
         offset = update["update_id"] + 1
         try:
             message = update.get("message") if isinstance(update, dict) else None
-            is_plain_message = (
-                isinstance(message, dict)
-                and "managed_bot" not in update
-                and not isinstance(message.get("managed_bot_created"), dict)
-            )
-            if is_plain_message:
-                ready = prepare_message_guarded(message, bot_token=bot_token, bot_key=key)
-                if ready is not None:
-                    dispatch_ready(ready)
+            if isinstance(message, dict) and consume_topic_icon_service_message(message, bot_token=bot_token, bot_key=key):
+                pass  # topic-icon service message: deleted/suppressed, never dispatched
             else:
-                dispatch_update(update, bot_token=bot_token, bot_key=key)
+                is_plain_message = (
+                    isinstance(message, dict)
+                    and "managed_bot" not in update
+                    and not isinstance(message.get("managed_bot_created"), dict)
+                )
+                if is_plain_message:
+                    ready = prepare_message_guarded(message, bot_token=bot_token, bot_key=key)
+                    if ready is not None:
+                        dispatch_ready(ready)
+                else:
+                    dispatch_update(update, bot_token=bot_token, bot_key=key)
         except Exception as exc:
             log(f"dispatch submit error for {key}: {exc}")
         write_offset(offset, key)
