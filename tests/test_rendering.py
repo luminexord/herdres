@@ -978,6 +978,7 @@ class SharedTopicCommandTests(unittest.TestCase):
             }
         ]
         commands: list[list[str]] = []
+        _seat_base = tempfile.mkdtemp()
 
         def run_cmd(args, **kwargs):
             commands.append(args)
@@ -1000,6 +1001,7 @@ class SharedTopicCommandTests(unittest.TestCase):
                 "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE": "dangerous",
                 "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_COMMAND": "",
                 "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_EXTRA_ARGS": "",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_BASE": _seat_base,
             },
             clear=False,
         ), patch.object(herdres, "pane_list", Mock(return_value=panes)), patch.object(herdres, "run_cmd", run_cmd):
@@ -1008,6 +1010,11 @@ class SharedTopicCommandTests(unittest.TestCase):
         self.assertTrue(result["changed"])
         self.assertEqual(result["started"], 1)
         space = state["spaces"]["workspace:workspace-1"]
+        expected_seat_cwd = os.path.join(
+            _seat_base,
+            "workspace_workspace-1-" + herdres.hashlib.sha1(b"workspace:workspace-1").hexdigest()[:12],
+        )
+        self.assertEqual(space["devin_glm_seat_cwd"], expected_seat_cwd)
         self.assertEqual(space["devin_glm_seat_pane_id"], "pane-devin")
         self.assertEqual(space["devin_glm_seat_model"], "glm-5.2")
         self.assertEqual(space["devin_glm_seat_permission_mode"], "dangerous")
@@ -1021,7 +1028,7 @@ class SharedTopicCommandTests(unittest.TestCase):
                 "--direction",
                 "right",
                 "--cwd",
-                "/tmp/project",
+                expected_seat_cwd,
                 "--no-focus",
             ],
         )

@@ -11078,6 +11078,26 @@ def devin_glm_seat_command() -> str:
     return devin_model_command(devin_glm_seat_model(), "DEVIN_GLM")
 
 
+def devin_glm_seat_cwd(space_key_value: str) -> str:
+    """A stable, UNIQUE-per-space working directory for a Devin GLM seat.
+
+    The Devin turn adapter resolves a pane's session by working directory; seats
+    that share one cwd (e.g. every space's seat split from a /home/smith anchor)
+    collide onto a single Devin session and broadcast one pane's turn to every
+    space's topic. Giving each space's seat its own cwd makes that resolution
+    exact. Stable per space so a restarted/recreated seat reuses the same dir."""
+    key = str(space_key_value or "space")
+    # A readable prefix PLUS a hash of the full key. The hash guarantees the dir is
+    # unique per DISTINCT space key (a plain sanitizer collapses ":" and "_" to the
+    # same char, so "workspace:a:b" and "workspace:a_b" would otherwise collide onto
+    # one cwd and re-create the broadcast); it also makes the component traversal-safe
+    # (no bare ".."). Strip leading dots/separators from the prefix as defense-in-depth.
+    prefix = re.sub(r"[^A-Za-z0-9_-]", "_", key)[:40].strip("._-") or "space"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    base = os.getenv("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_BASE", str(state_path().parent / "devin-glm-seats"))
+    return str(Path(base) / f"{prefix}-{digest}")
+
+
 def pane_closed_or_exited(pane: dict[str, Any]) -> bool:
     status = str(pane.get("agent_status") or "").strip().lower()
     return status in {"closed", "exited"} or bool(pane.get("closed") or pane.get("exited") or pane.get("process_exited"))
@@ -11140,9 +11160,18 @@ def start_devin_glm_seat_for_space(
     if not anchor_pane_id:
         return {"ok": False, "error": "anchor pane has no pane_id"}
     split_args = [herdr_bin(), "pane", "split", anchor_pane_id, "--direction", "right"]
-    cwd = str(anchor.get("foreground_cwd") or anchor.get("cwd") or "").strip()
-    if cwd:
-        split_args.extend(["--cwd", cwd])
+    # Give the seat a UNIQUE-per-space cwd (not the anchor's shared /home/smith) so
+    # the Devin turn adapter resolves this pane's session unambiguously — same-cwd
+    # seats otherwise collide onto one session and broadcast across all topics.
+    seat_cwd = devin_glm_seat_cwd(space_key_value)
+    try:
+        os.makedirs(seat_cwd, exist_ok=True)
+    except OSError as exc:
+        space_entry["devin_glm_seat_error"] = sanitize_text(f"seat cwd mkdir failed: {exc}", 500)
+        space_entry["devin_glm_seat_error_at"] = utc_now()
+        return {"ok": False, "error": f"seat cwd mkdir failed: {exc}"}
+    split_args.extend(["--cwd", seat_cwd])
+    space_entry["devin_glm_seat_cwd"] = seat_cwd
     split_args.append("--no-focus")
     split_proc = run_cmd(split_args, timeout=10)
     if split_proc.returncode != 0:
