@@ -13,10 +13,14 @@ and never touch the real ~/.local, ~/.config, or the live services.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import subprocess
+import tarfile
 import unittest
+import urllib.error
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -42,6 +46,7 @@ def _args(**over):
     base = {
         "channel": "edge",
         "repo": "",
+        "version": "",
         "check": False,
         "rollback": False,
         "dry_run": False,
@@ -557,14 +562,10 @@ class EnvUntouchedTests(UpdateTestBase):
 
 
 class ChannelTests(UpdateTestBase):
-    def test_stable_channel_rejected(self):
-        with self.assertRaises(herdres.BridgeError) as ctx:
-            herdres.update_once(_args(channel="stable", repo=str(self.repo)))
-        self.assertIn("Phase 3", str(ctx.exception))
-
     def test_unknown_channel_rejected(self):
-        with self.assertRaises(herdres.BridgeError):
+        with self.assertRaises(herdres.BridgeError) as ctx:
             herdres.update_once(_args(channel="weird", repo=str(self.repo)))
+        self.assertIn("unknown channel", str(ctx.exception))
 
 
 class BackupPruneTests(UpdateTestBase):
@@ -610,6 +611,253 @@ class BackupPruneTests(UpdateTestBase):
         backup = herdres._backup_install_set()
         # Name like 20260101T000000.123456Z — a dot + 6 digits before the Z.
         self.assertRegex(backup.name, r"^\d{8}T\d{6}\.\d{6}Z$")
+
+
+def _build_release_tarball(prefix: str = "herdres-9.9.9", files=None) -> bytes:
+    """Build an in-memory .tar.gz of the install-set source under ``prefix/``.
+
+    Mirrors a real release tarball: every install-set source file lives under a
+    single top-level prefix dir, with herdres.py carrying the release version.
+    """
+    members = files if files is not None else SOURCE_FILES
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for rel, text in members.items():
+            data = text.encode("utf-8")
+            info = tarfile.TarInfo(name=f"{prefix}/{rel}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+class _FakeHTTP:
+    """Routes herdres' urllib.request.urlopen calls for the stable channel offline.
+
+    Serves the Releases API JSON for /releases/latest and /releases/tags/<tag>, and
+    the two release assets (tarball + .sha256). ``calls`` records every URL fetched
+    so tests can assert "nothing was downloaded" on --check / --dry-run. Knobs let a
+    test corrupt the sha256, omit a release, or pin a specific tag.
+    """
+
+    def __init__(self, *, tag="v9.9.9", tarball=None, sha_override=None, has_release=True):
+        self.tag = tag
+        self.tarball = tarball if tarball is not None else _build_release_tarball()
+        self.sha = sha_override if sha_override is not None else hashlib.sha256(self.tarball).hexdigest()
+        self.has_release = has_release
+        self.calls: list[str] = []
+
+    def _release_json(self) -> bytes:
+        # Assets are named off the literal tag (the RELEASE-ASSET contract):
+        # herdres-<tag>.tar.gz + herdres-<tag>.tar.gz.sha256.
+        tarball = f"herdres-{self.tag}.tar.gz"
+        assets = [
+            {"name": tarball, "browser_download_url": f"https://example.test/dl/{tarball}"},
+            {"name": tarball + ".sha256", "browser_download_url": f"https://example.test/dl/{tarball}.sha256"},
+        ]
+        return json.dumps({"tag_name": self.tag, "assets": assets}).encode("utf-8")
+
+    def __call__(self, req, *a, **kw):  # noqa: ANN001 - mimics urlopen(req)
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        self.calls.append(url)
+        if "/releases/" in url and "/download/" not in url and ".tar.gz" not in url:
+            if not self.has_release:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            body = self._release_json()
+        elif url.endswith(".sha256"):
+            body = (self.sha + "  herdres-stable.tar.gz\n").encode("utf-8")
+        elif url.endswith(".tar.gz"):
+            body = self.tarball
+        else:  # pragma: no cover - unexpected URL in a test
+            raise AssertionError(f"unexpected URL: {url}")
+        return _FakeResponse(body)
+
+
+class _FakeResponse:
+    """Minimal context-manager response with .read(), matching urlopen's contract."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class StableChannelTests(UpdateTestBase):
+    """The stable channel: API resolve -> download -> sha256 verify -> extract ->
+    the SAME env-safe backup/apply/restart/verify/rollback as edge.
+
+    urllib.request.urlopen is mocked with an in-memory tarball + sha256, so the
+    tests are fully offline and never hit GitHub.
+    """
+
+    def _patch_http(self, http: _FakeHTTP):
+        self.enterContext(patch.object(herdres.urllib.request, "urlopen", http))
+        return http
+
+    def test_stable_check_resolves_version_downloads_nothing(self):
+        self._seed_installed()
+        http = self._patch_http(_FakeHTTP(tag="v9.9.9"))
+        before = _snapshot(self.tmp)
+        result = herdres.update_once(_args(channel="stable", check=True))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "check")
+        self.assertEqual(result["channel"], "stable")
+        self.assertEqual(result["current_version"], herdres.HERDRES_VERSION)
+        self.assertEqual(result["available_version"], "9.9.9")
+        self.assertEqual(result["tag"], "v9.9.9")
+        self.assertTrue(result["update_available"])
+        # Nothing on disk changed and no asset was downloaded (only the API JSON).
+        self.assertEqual(_snapshot(self.tmp), before)
+        self.assertTrue(all(".tar.gz" not in u for u in http.calls), http.calls)
+        # No services were touched.
+        for call in self.router.calls:
+            self.assertNotIn(call[0], {"systemctl", "launchctl"})
+
+    def test_stable_check_uses_latest_endpoint_unpinned(self):
+        self._seed_installed()
+        http = self._patch_http(_FakeHTTP(tag="v9.9.9"))
+        herdres.update_once(_args(channel="stable", check=True))
+        self.assertTrue(any(u.endswith("/releases/latest") for u in http.calls), http.calls)
+
+    def test_stable_check_pins_tag_with_version(self):
+        self._seed_installed()
+        http = self._patch_http(_FakeHTTP(tag="v9.9.9"))
+        herdres.update_once(_args(channel="stable", check=True, version="v9.9.9"))
+        self.assertTrue(
+            any(u.endswith("/releases/tags/v9.9.9") for u in http.calls), http.calls
+        )
+
+    def test_stable_dry_run_downloads_nothing(self):
+        self._seed_installed()
+        http = self._patch_http(_FakeHTTP(tag="v9.9.9"))
+        before = _snapshot(self.tmp)
+        result = herdres.update_once(_args(channel="stable", dry_run=True))
+        self.assertEqual(result["action"], "dry-run")
+        self.assertEqual(result["channel"], "stable")
+        self.assertEqual(result["target_version"], "9.9.9")
+        self.assertEqual(result["tag"], "v9.9.9")
+        self.assertEqual(_snapshot(self.tmp), before)
+        self.assertTrue(all(".tar.gz" not in u for u in http.calls), http.calls)
+
+    def test_stable_apply_downloads_verifies_extracts_and_installs(self):
+        self._seed_installed()
+        self._patch_http(_FakeHTTP(tag="v9.9.9"))
+        env_path = self.tmp / "herdres.env"
+        env_path.write_text("TELEGRAM_BOT_TOKEN=secret\n", encoding="utf-8")
+        with patch.object(herdres, "DEFAULT_ENV", env_path):
+            result = herdres.update_once(_args(channel="stable"))
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["action"], "update")
+        self.assertEqual(result["channel"], "stable")
+        self.assertEqual(result["version"], "9.9.9")
+        self.assertEqual(result["head"], "v9.9.9")
+        # The release code landed on disk.
+        self.assertIn('HERDRES_VERSION = "9.9.9"', (self.bin / "herdres").read_text())
+        self.assertEqual((self.bin / "herdres-gateway").read_text(), "# gateway\n")
+        # Plugin manifest got the absolute path sed'd in (same transform as edge).
+        plugin = (self.share / "herdres-plugin" / "herdr-plugin.toml").read_text()
+        self.assertIn(f'["{self.bin / "herdres"}", "event"]', plugin)
+        # A backup exists and herdres.env is UNTOUCHED.
+        self.assertTrue(Path(result["backup"]).is_dir())
+        self.assertEqual(env_path.read_text(), "TELEGRAM_BOT_TOKEN=secret\n")
+        # Gateway was re-leased disable->enable, same as edge.
+        gw = [c for c in self.router.calls
+              if c[0] == "systemctl" and "herdres-gateway.service" in c and c[2] in {"disable", "enable"}]
+        self.assertEqual([c[2] for c in gw], ["disable", "enable"])
+
+    def test_stable_apply_flat_tarball_layout(self):
+        """A tarball with no top-level prefix dir (herdres.py at the root) works too."""
+        self._seed_installed()
+        self._patch_http(_FakeHTTP(tag="v9.9.9", tarball=_build_release_tarball(prefix=".")))
+        result = herdres.update_once(_args(channel="stable"))
+        self.assertEqual(result["version"], "9.9.9")
+        self.assertIn('HERDRES_VERSION = "9.9.9"', (self.bin / "herdres").read_text())
+
+    def test_stable_sha256_mismatch_refuses_and_does_not_install(self):
+        self._seed_installed()
+        before = _snapshot_install(self)
+        self._patch_http(_FakeHTTP(tag="v9.9.9", sha_override="0" * 64))
+        with self.assertRaises(herdres.BridgeError) as ctx:
+            herdres.update_once(_args(channel="stable"))
+        self.assertIn("sha256 mismatch", str(ctx.exception))
+        # Nothing was installed — the tarball never reached the apply step.
+        self.assertEqual(_snapshot_install(self), before)
+
+    def test_stable_malformed_sha256_refused(self):
+        self._seed_installed()
+        self._patch_http(_FakeHTTP(tag="v9.9.9", sha_override="not-a-hex-digest"))
+        with self.assertRaises(herdres.BridgeError) as ctx:
+            herdres.update_once(_args(channel="stable"))
+        self.assertIn("sha256", str(ctx.exception))
+
+    def test_stable_missing_release_raises(self):
+        self._seed_installed()
+        self._patch_http(_FakeHTTP(has_release=False))
+        with self.assertRaises(herdres.BridgeError) as ctx:
+            herdres.update_once(_args(channel="stable", check=True))
+        self.assertIn("404", str(ctx.exception))
+
+    def test_stable_verify_failure_rolls_back(self):
+        """A failing post-install verify rolls the stable apply back, same as edge."""
+        self._seed_installed()
+        self._patch_http(_FakeHTTP(tag="v9.9.9"))
+        self.router.version_returncode = 1  # `herdres version` probe fails -> rollback
+        with self.assertRaises(herdres.BridgeError) as ctx:
+            herdres.update_once(_args(channel="stable"))
+        self.assertIn("rolled back", str(ctx.exception))
+        self.assertEqual((self.bin / "herdres").read_text(), 'HERDRES_VERSION = "0.1.0"\n')
+
+    def test_stable_no_restart_skips_services(self):
+        self._seed_installed()
+        self._patch_http(_FakeHTTP(tag="v9.9.9"))
+        result = herdres.update_once(_args(channel="stable", no_restart=True))
+        self.assertTrue(result["ok"])
+        self.assertIn('HERDRES_VERSION = "9.9.9"', (self.bin / "herdres").read_text())
+        for call in self.router.calls:
+            self.assertNotIn(call[0], {"systemctl", "launchctl"})
+
+
+class StableFetchHelperTests(UpdateTestBase):
+    """Direct unit tests for the fetch building blocks (verify + safe-extract)."""
+
+    def test_verify_sha256_accepts_sha256sum_line(self):
+        blob = b"hello"
+        digest = hashlib.sha256(blob).hexdigest()
+        out = herdres._verify_sha256(blob, f"{digest}  some-file.tar.gz\n", "some-file.tar.gz")
+        self.assertEqual(out, digest)
+
+    def test_verify_sha256_accepts_bare_digest(self):
+        blob = b"world"
+        digest = hashlib.sha256(blob).hexdigest()
+        self.assertEqual(herdres._verify_sha256(blob, digest, "x"), digest)
+
+    def test_safe_extract_rejects_traversal(self):
+        evil = io.BytesIO()
+        with tarfile.open(fileobj=evil, mode="w:gz") as tar:
+            data = b"pwn"
+            info = tarfile.TarInfo(name="../escape.txt")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        evil.seek(0)
+        dest = self.tmp / "x"
+        dest.mkdir()
+        with tarfile.open(fileobj=evil, mode="r:gz") as tar:
+            with self.assertRaises(herdres.BridgeError):
+                herdres._safe_extract(tar, dest)
+        self.assertFalse((self.tmp / "escape.txt").exists())
+
+    def test_source_root_requires_herdres_py(self):
+        empty = self.tmp / "empty-extract"
+        empty.mkdir()
+        with self.assertRaises(herdres.BridgeError):
+            herdres._source_root(empty)
 
 
 def _snapshot(root: Path) -> dict[str, str]:
