@@ -40,6 +40,17 @@ Before starting a second poller, confirm what already consumes the token:
 systemctl --user status hermes-gateway.service herdres-gateway.service
 ```
 
+**Do not scavenge or auto-reuse credentials.** The `TELEGRAM_BOT_TOKEN`,
+`HERDR_TELEGRAM_TOPICS_CHAT_ID`, and `TELEGRAM_ALLOWED_USERS` are **user-supplied
+secrets**. When setting herdres up, get them **from the user** — never invent
+them, and never copy a token out of another app's config (e.g. an existing
+Hermes bot) on your own initiative. Reusing a token that Hermes already
+long-polls is the most common way to violate the one-consumer rule above. Prefer
+a **dedicated** bot for herdres; if the user does want to share a token, make it
+an explicit, informed choice and ensure only one consumer polls it. Running
+non-interactively with a required secret missing? **Stop and report what's
+needed — do not guess.**
+
 ---
 
 ## 2. Owner-only gate — enforce `TELEGRAM_ALLOWED_USERS`

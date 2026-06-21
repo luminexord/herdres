@@ -20,11 +20,11 @@ before doing anything, confirm `~/.config/herdres/herdres.env` exists and `herdr
 
 ## Quick install
 
-the headline path. do not skip preflight, and do not write Telegram state until verify passes.
+the headline path. do not skip preflight, do not write Telegram state until verify passes, and **never invent or scavenge credentials — the bot token, chat ID, and allowed-user IDs come from the user.**
 
 1. **preflight.** detect the OS: Linux uses **systemd** (`systemctl --user`), macOS uses **launchd** (no user systemd). check `python3 --version` is **>= 3.11**. confirm Herdr is running (`herdr --version`; `herdr` must be on `PATH` or set `HERDR_BIN`); **0.7.0+ is recommended** — older herdr still works in degraded mode (timer-only, no instant plugin trigger; see step 5). check whether `~/.config/herdres/herdres.env` already exists — if so, do not clobber it; just edit it and skip the installer's copy step.
 
-2. **guided Telegram setup** (the human does this once in the Telegram app — give them these exact steps, then validate what they paste back):
+2. **guided Telegram setup — pause here and ask the user.** the bot token, chat ID, and allowed-user IDs are **user-supplied secrets**: do not invent them, and do not copy them from another app's config (e.g. an existing **Hermes** bot token) unless the user explicitly approves — reusing a token another process already long-polls breaks the one-`getUpdates`-consumer rule (see **Safety rules**). prefer a **dedicated** bot for herdres. if you cannot ask the user (non-interactive), STOP and report what is needed rather than guessing. walk the user through these steps and validate what they paste back:
    - **a.** message **@BotFather**, run `/newbot`, copy the **bot token** → `TELEGRAM_BOT_TOKEN`. Validate: shape is `<digits>:<base64-ish>`, e.g. `123456:ABC-...`.
    - **b.** create a **group**, open Group Settings, and turn on **Topics** (this makes it a forum supergroup). herdres refuses any chat that is not a forum-enabled supergroup.
    - **c.** add the bot to the group, promote it to **Administrator**, and grant **Manage Topics**. Preflight fails closed without admin + `can_manage_topics`.
