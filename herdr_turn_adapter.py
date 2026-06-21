@@ -243,6 +243,7 @@ def devin_resolve_session_id(pane: dict[str, Any]) -> str:
                     matching.sort(key=lambda e: int(e.get("last_activity_at") or 0), reverse=True)
                     transcripts_dir = devin_transcripts_dir()
                     db_path = devin_sessions_db()
+                    valid: list[str] = []
                     for e in matching:
                         sid = str(e.get("id") or "")
                         if not sid:
@@ -253,10 +254,20 @@ def devin_resolve_session_id(pane: dict[str, Any]) -> str:
                             last_activity_at = 0
                         if pane_started_at and last_activity_at < pane_started_at - DEVIN_SESSION_START_SKEW_SECONDS:
                             continue
-                        if (transcripts_dir / f"{sid}.json").exists():
-                            return sid
-                        if devin_db_has_session(db_path, sid):
-                            return sid
+                        if (transcripts_dir / f"{sid}.json").exists() or devin_db_has_session(db_path, sid):
+                            if sid not in valid:
+                                valid.append(sid)
+                    # FAIL CLOSED on an ambiguous cwd. A single working directory shared
+                    # by more than one live Devin session — e.g. one GLM seat per space
+                    # all rooted at /home/smith — cannot be attributed to a specific
+                    # pane by cwd alone. Returning the newest (the old behavior) made
+                    # ONE pane's turn resolve for EVERY same-cwd pane, broadcasting it to
+                    # every space's topic. Resolve only when exactly one session matches;
+                    # otherwise return "" so the caller treats the pane as having no
+                    # agent session (no delivery) rather than delivering a wrong/shared
+                    # turn. A pane with a unique cwd still resolves normally.
+                    if len(valid) == 1:
+                        return valid[0]
     except Exception:
         pass
     return ""

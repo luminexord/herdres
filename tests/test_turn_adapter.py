@@ -153,6 +153,47 @@ class TurnAdapterTests(unittest.TestCase):
                 "fresh-session",
             )
 
+    def test_devin_session_resolver_fails_closed_on_ambiguous_cwd(self) -> None:
+        # The broadcast bug: multiple LIVE Devin sessions share one cwd (e.g. one GLM
+        # seat per space, all rooted at /home/smith). Resolving the newest attributed
+        # one pane's turn to every same-cwd pane -> broadcast to every topic. The
+        # resolver must fail closed (return "") when the cwd is ambiguous.
+        proc = Mock()
+        proc.returncode = 0
+        proc.stdout = json.dumps(
+            [
+                {"id": "session-a", "working_directory": "/tmp/project", "last_activity_at": 2010},
+                {"id": "session-b", "working_directory": "/tmp/project", "last_activity_at": 2020},
+            ]
+        )
+        stat_result = Mock()
+        stat_result.st_ctime = 2000  # both sessions are fresher than the pane -> both valid
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            adapter, "devin_bin", Mock(return_value="devin")
+        ), patch.object(adapter.subprocess, "run", Mock(return_value=proc)), patch.object(
+            adapter, "run_real_herdr_json",
+            Mock(
+                return_value={
+                    "result": {
+                        "process_info": {
+                            "foreground_processes": [
+                                {"name": "devin", "cmdline": "devin --model glm-5.2", "pid": 123}
+                            ]
+                        }
+                    }
+                }
+            ),
+        ), patch.object(adapter.os, "stat", Mock(return_value=stat_result)), patch.object(
+            adapter, "devin_transcripts_dir", Mock(return_value=Path(tmp))
+        ):
+            (Path(tmp) / "session-a.json").write_text("{}", encoding="utf-8")
+            (Path(tmp) / "session-b.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                adapter.devin_resolve_session_id({"pane_id": "pane-1", "cwd": "/tmp/project"}),
+                "",
+            )
+
     def test_codex_open_turn_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
