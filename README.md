@@ -10,6 +10,15 @@ It does not patch Hermes or Herdr core files and routine sync uses no LLM calls.
 
 **Operate it from an AI agent:** the [`skills/herdres/`](skills/herdres/SKILL.md) Agent Skill (agentskills.io `SKILL.md`) teaches a skills-compatible agent (Claude Code, Codex, …) to install, configure, and drive this bridge — a guided, self-verifying setup plus the full operator command surface. That skill is for *operating* herdres; [`AGENTS.md`](AGENTS.md) is for *contributing* to it.
 
+**Set it up by prompting an agent (simplest):** clone this repo, open it with a coding agent (Claude Code, Codex, …), and paste this — it reads [`skills/herdres/SKILL.md`](skills/herdres/SKILL.md) and walks you through setup:
+
+```text
+Read the herdres operator skill at skills/herdres/SKILL.md (and its references/ as needed),
+then set up herdres on this machine so I can control my Herdr agents from Telegram. Follow
+the skill's Quick install. When you need the Telegram bot token, the forum-group chat id,
+or my user id, ask me — never invent or reuse another app's token. Verify with a dry-run sync.
+```
+
 The repo-root [`SKILL.md`](SKILL.md) is a **self-contained, single-file** copy of that skill — tell any agent to install it directly (no folder needed):
 
 ```text
