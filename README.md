@@ -8,6 +8,20 @@ Herdres is a small stdlib-only Python bridge that maps each Herdr space to a Tel
 
 It does not patch Hermes or Herdr core files and routine sync uses no LLM calls.
 
+**Operate it from an AI agent:** the [`skills/herdres/`](skills/herdres/SKILL.md) Agent Skill (agentskills.io `SKILL.md`) teaches a skills-compatible agent (Claude Code, Codex, …) to install, configure, and drive this bridge — a guided, self-verifying setup plus the full operator command surface. That skill is for *operating* herdres; [`AGENTS.md`](AGENTS.md) is for *contributing* to it.
+
+The repo-root [`SKILL.md`](SKILL.md) is a **self-contained, single-file** copy of that skill — tell any agent to install it directly (no folder needed):
+
+```text
+Install the herdres operator skill from this single file (do NOT install any skill named "herdr" — different project):
+  mkdir -p ~/.codex/skills/herdres        # or ~/.claude/skills/herdres for Claude Code
+  curl -fsSL https://raw.githubusercontent.com/luminexord/herdres/main/SKILL.md \
+    -o ~/.codex/skills/herdres/SKILL.md
+Verify: the file's frontmatter says `name: herdres`.
+```
+
+The packaged `skills/herdres/` (this file + `references/`) is the canonical, progressive-disclosure version; the root `SKILL.md` is the install-anywhere entrypoint.
+
 ## What It Does
 
 - Creates or maintains one Telegram forum topic per Herdr space.
@@ -653,7 +667,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gaijinjoe.herdres-ga
 
 This provides:
 
-- `com.gaijinjoe.herdres` — launchd agent running `herdres sync` every 60s, the
+- `com.gaijinjoe.herdres` — launchd agent running `herdres sync` every 5s, the
   equivalent of the systemd reconcile timer (closed-pane detection, stale-mapping
   repair, missed-event coverage).
 - `com.gaijinjoe.herdres-gateway` — launchd agent running `herdres_gateway.py`, a

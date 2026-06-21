@@ -8,6 +8,8 @@ Herdres is a **stdlib-only Python 3.11+ bridge** that maps each [Herdr](https://
 
 It does **not** patch Hermes or Herdr core. Routine sync uses no LLM calls. The cleanest mode (`HERDR_TELEGRAM_TOPICS_TURN_FEED=1`) consumes a structured `herdr pane turn <id> --last --format json` contract instead of parsing terminal text.
 
+> **Operating vs contributing:** this file guides agents *working on* herdres. To *operate* a deployment (install it, drive panes from Telegram), use the [`skills/herdres/`](skills/herdres/SKILL.md) Agent Skill instead — it is the portable operator counterpart to this contributor guide.
+
 ## Repository layout
 
 | Path | Role |
