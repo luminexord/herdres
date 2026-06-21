@@ -1,0 +1,13 @@
+{
+  "name": "guided-install",
+  "skills": ["herdres"],
+  "query": "I'm on a fresh Linux box and want to control my Herdr agents from Telegram. Walk me through setting up herdres end to end.",
+  "expected_behavior": [
+    "Runs preflight first: detects the OS (Linux uses systemd), checks python3 is >= 3.11, and confirms herdr is running (0.7.0+ recommended) before changing anything.",
+    "Walks the user through the guided Telegram setup: @BotFather /newbot for the bot token, creating a group and enabling Topics so it is a forum supergroup, and adding/promoting the bot to Administrator with Manage Topics.",
+    "Collects and validates the negative chat id: confirms HERDR_TELEGRAM_TOPICS_CHAT_ID is negative and starts with -100, and that TELEGRAM_ALLOWED_USERS is a positive numeric user id.",
+    "Runs the Linux installer ./install-user.sh, writes the three required env vars into ~/.config/herdres/herdres.env without clobbering an existing file, and warns that ~/.local/bin may need to be on PATH.",
+    "Enables the service: systemctl --user daemon-reload then systemctl --user enable --now herdres.timer, and links/enables the herdr plugin.",
+    "Verifies non-destructively with a dry-run sync (HERDR_TELEGRAM_TOPICS_DRY_RUN=1 herdres sync) before the first real herdres sync."
+  ]
+}
