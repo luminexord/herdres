@@ -3,8 +3,8 @@ name: release
 # Cut a release when a v* tag is pushed. The pipeline is a hard gate -> a sanity
 # check that the tag matches the code's HERDRES_VERSION -> build the install-set
 # assets -> publish a GitHub release with both assets and auto-generated notes.
-# The asset names (herdres-<tag>.tar.gz + .sha256) are the Phase-3 release contract
-# the `herdres update --channel stable` fetcher relies on.
+# The asset names (herdres-<tag>.tar.gz + herdres-<tag>.tar.gz.sha256) are the
+# Phase-3 release contract the `herdres update --channel stable` fetcher relies on.
 on:
   push:
     tags:
@@ -24,7 +24,8 @@ jobs:
           python-version: "3.11"
 
       - name: Install pytest
-        run: pip install pytest
+        # Pin so a future pytest behavior change can't silently flip the gate.
+        run: pip install 'pytest==8.3.4'
 
       # Hard gate: the release tests must pass before anything is built or shipped.
       - name: Run release + update tests (required gate)
@@ -64,6 +65,6 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           gh release create "$tag" \
             "dist/herdres-$tag.tar.gz" \
-            "dist/herdres-$tag.sha256" \
+            "dist/herdres-$tag.tar.gz.sha256" \
             --title "$tag" \
             --generate-notes

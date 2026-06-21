@@ -7,9 +7,9 @@
 #                            under a single "herdres-<tag>/" prefix so an extraction
 #                            yields a directory that `_apply_install_set(repo)` can
 #                            treat as a source checkout.
-#   herdres-<tag>.sha256   - "<hexdigest>  herdres-<tag>.tar.gz" (two-space, the
-#                            `sha256sum -c` format) so the fetcher can verify the
-#                            download before applying it.
+#   herdres-<tag>.tar.gz.sha256 - "<hexdigest>  herdres-<tag>.tar.gz" (two-space,
+#                            the `sha256sum -c` format) so the fetcher can verify
+#                            the download before applying it.
 #
 # Usage:
 #   scripts/build_release.sh <tag> [out_dir]
@@ -36,7 +36,7 @@ mkdir -p "$out_dir"
 
 name="herdres-$tag"
 tarball="$out_dir/$name.tar.gz"
-checksum="$out_dir/$name.sha256"
+checksum="$out_dir/$name.tar.gz.sha256"
 
 # The install set the update engine applies (mirrors herdres.py:_update_files_plan),
 # plus the installer scripts + .env.example so the extracted tree is a complete,
@@ -88,8 +88,10 @@ tar \
     -czf "$tarball" \
     -C "$stage" "$name"
 
-# Emit the checksum in `sha256sum -c` format next to the tarball.
-( cd "$out_dir" && sha256sum "$name.tar.gz" > "$name.sha256" )
+# Emit the checksum in `sha256sum -c` format next to the tarball. The asset name is
+# "<tarball>.sha256" (herdres-<tag>.tar.gz.sha256) — the Phase-3 contract the stable
+# fetcher's _release_sha_name() resolves.
+( cd "$out_dir" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
 
 printf '%s\n' "$tarball"
 printf '%s\n' "$checksum"

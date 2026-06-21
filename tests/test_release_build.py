@@ -4,7 +4,7 @@ These run the *real* build script against a fake herdres checkout on a tmp
 filesystem and pin the cross-task release-asset contract that the
 ``herdres update --channel stable`` fetcher depends on:
 
-- the assets are named ``herdres-<tag>.tar.gz`` and ``herdres-<tag>.sha256``;
+- the assets are named ``herdres-<tag>.tar.gz`` and ``herdres-<tag>.tar.gz.sha256``;
 - the tarball's members are the install set, rooted under a single
   ``herdres-<tag>/`` prefix, so an extraction is a directory the update engine's
   ``_apply_install_set(repo)`` can consume;
@@ -81,7 +81,7 @@ def test_build_emits_named_assets(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
 
     tarball = out / f"herdres-{tag}.tar.gz"
-    checksum = out / f"herdres-{tag}.sha256"
+    checksum = out / f"herdres-{tag}.tar.gz.sha256"
     assert tarball.exists(), "tarball asset missing"
     assert checksum.exists(), "sha256 asset missing"
 
@@ -139,7 +139,7 @@ def test_sha256_file_matches_tarball(tmp_path: Path) -> None:
     assert _run_build(repo, tag, out).returncode == 0
 
     tarball = out / f"herdres-{tag}.tar.gz"
-    checksum = out / f"herdres-{tag}.sha256"
+    checksum = out / f"herdres-{tag}.tar.gz.sha256"
 
     line = checksum.read_text(encoding="utf-8").strip()
     digest, _, fname = line.partition("  ")
@@ -156,7 +156,7 @@ def test_sha256_verifies_with_sha256sum(tmp_path: Path) -> None:
     assert _run_build(repo, tag, out).returncode == 0
 
     proc = subprocess.run(
-        ["sha256sum", "-c", f"herdres-{tag}.sha256"],
+        ["sha256sum", "-c", f"herdres-{tag}.tar.gz.sha256"],
         cwd=out,
         capture_output=True,
         text=True,
@@ -186,3 +186,34 @@ def test_requires_tag_argument(tmp_path: Path) -> None:
     )
     assert proc.returncode != 0
     assert "usage" in proc.stderr.lower()
+
+
+def test_packaged_set_covers_live_update_plan(tmp_path: Path) -> None:
+    """Guard against drift: every source the engine applies must ship in the tarball.
+
+    Both INSTALL_SET (this test) and build_release.sh's ``files`` list mirror
+    herdres.py:_update_files_plan() by hand. Import the *live* plan and prove the
+    packaged set is a superset of it (+ that the bytes actually land), so adding a
+    file to the plan without updating the build script fails here instead of silently
+    shipping a stable release that ``_apply_install_set`` can't fully apply.
+    """
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT))
+    import herdres  # noqa: E402 - repo root injected above
+
+    plan_srcs = {str(entry["src"]) for entry in herdres._update_files_plan()}
+    # The build script (and this test's INSTALL_SET) must carry every engine source.
+    assert plan_srcs <= set(INSTALL_SET), (
+        "build_release.sh / INSTALL_SET out of sync with _update_files_plan(); "
+        f"missing: {sorted(plan_srcs - set(INSTALL_SET))}"
+    )
+
+    repo = _make_checkout(tmp_path)
+    out = tmp_path / "dist"
+    tag = "v9.9.9"
+    assert _run_build(repo, tag, out).returncode == 0
+    with tarfile.open(out / f"herdres-{tag}.tar.gz", "r:gz") as tar:
+        names = set(tar.getnames())
+    for src in plan_srcs:
+        assert f"herdres-{tag}/{src}" in names, f"engine source {src} missing from release tarball"
