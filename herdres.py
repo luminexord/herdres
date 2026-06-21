@@ -7999,58 +7999,205 @@ _RICH_TOP_BLOCK_RE = re.compile(
 )
 
 
+_DETAILS_WRAPPER_RE = re.compile(
+    r"^\s*(<(ol|ul|table|blockquote|pre)\b[^>]*>)(.*)(</\2>)\s*\Z",
+    re.DOTALL | re.IGNORECASE,
+)
+_SUMMARY_RE = re.compile(r"^\s*<summary\b[^>]*>.*?</summary>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def _split_top_level_units(inner: str, delim_re: str, container_re: str | None) -> list[str]:
+    """Split `inner` into units, each ending at a TOP-LEVEL delimiter match.
+
+    When `container_re` is given (e.g. "ol|ul" for the `</li>` delimiter, or
+    "table" for `</tr>`), a delimiter nested inside another such container is NOT
+    treated as a boundary — so a nested sub-list/table inside an item keeps the
+    whole parent item in one unit and every emitted chunk stays tag-balanced.
+    When `container_re` is None (e.g. `<br>`/newline) every delimiter is a
+    boundary. Delimiters stay attached to the unit they close."""
+    if container_re is None:
+        units, cur = [], ""
+        for part in re.split("(" + delim_re + ")", inner, flags=re.IGNORECASE):
+            if not part:
+                continue
+            cur += part
+            if re.fullmatch(delim_re, part, flags=re.IGNORECASE):
+                units.append(cur)
+                cur = ""
+        if cur:
+            units.append(cur)
+        return [u for u in units if u]
+    token_re = re.compile(
+        r"<(/?)(" + container_re + r")\b[^>]*>|(" + delim_re + r")", re.IGNORECASE
+    )
+    units, depth, start = [], 0, 0
+    for tok in token_re.finditer(inner):
+        if tok.group(3) is not None:  # boundary delimiter (e.g. </li>, </tr>)
+            if depth == 0:
+                units.append(inner[start:tok.end()])
+                start = tok.end()
+        elif tok.group(1):  # nested container close
+            depth = max(0, depth - 1)
+        else:  # nested container open
+            depth += 1
+    if start < len(inner):
+        units.append(inner[start:])
+    return [u for u in units if u]
+
+
+# An "atom" for inline-aware breaking: a COMPLETE non-nested inline element
+# (kept whole so we never split mid-<b>/<code>/<a>/<td>), a lone/void tag, a run
+# of non-space non-`<` text, or a whitespace run.
+_INLINE_ATOM_RE = re.compile(
+    r"<([a-zA-Z0-9]+)\b[^>]*>.*?</\1\s*>|<[^>]+>|[^<\s]+|\s+", re.DOTALL | re.IGNORECASE
+)
+
+
+def _break_inline(html: str, budget: int) -> list[str]:
+    """Break inline/flow HTML into fragments each <= budget WITHOUT ever splitting
+    inside a tag or an inline element. A complete element (e.g. <td>…</td>,
+    <code>…</code>) is atomic; an oversize element is recursed into and re-wrapped;
+    an oversize bare text token is char-sliced as a last resort (never loops).
+
+    Contract: every fragment is <= budget AND tag-balanced, EXCEPT a single
+    indivisible atom whose own tag overhead exceeds the budget (only reachable via
+    an absurdly long <a href="…"> URL — herdres emits no other attribute-bearing
+    inline tag). Such an atom is emitted whole and VALID rather than char-sliced
+    through its tag (which would corrupt it); its size is bounded by the one atom
+    and stays well under the hard MAX_RICH_HTML_CHARS ceiling, so Telegram still
+    accepts it. Balance always wins over the soft size target."""
+    if len(html) <= budget:
+        return [html]
+    pieces, cur = [], ""
+    for atom in (m.group(0) for m in _INLINE_ATOM_RE.finditer(html)):
+        if len(atom) > budget:
+            # An atom that alone exceeds the budget: flush whatever is buffered
+            # first, then subdivide the atom itself (recurse into an element so its
+            # tags stay balanced; char-slice an indivisible bare token).
+            if cur:
+                pieces.append(cur)
+                cur = ""
+            em = re.match(r"(<([a-zA-Z0-9]+)\b[^>]*>)(.*)(</\2\s*>)\Z", atom, re.DOTALL | re.IGNORECASE)
+            if em:
+                open_t, _name, inner, close_t = em.groups()
+                sub_budget = max(40, budget - len(open_t) - len(close_t))
+                pieces.extend(open_t + frag + close_t for frag in _break_inline(inner, sub_budget))
+            else:
+                pieces.extend(atom[k:k + budget] for k in range(0, len(atom), budget))
+            continue
+        if cur and len(cur) + len(atom) > budget:
+            pieces.append(cur)
+            cur = atom
+        else:
+            cur += atom
+    if cur:
+        pieces.append(cur)
+    return [p for p in pieces if p] or [html]
+
+
+def _hard_break_unit(unit: str, budget: int) -> list[str]:
+    """Break a single over-budget unit so no emitted piece exceeds `budget`, while
+    keeping every piece tag-balanced.
+
+    A unit containing a nested BLOCK wrapper (<ol>/<ul>/<table>/<blockquote>/<pre>)
+    is kept whole — breaking it would sever the nested structure (the GAP-1 bug);
+    balance wins over size for that rare case. A `<li>`/`<tr>` is broken via the
+    inline-aware breaker on its inner content (inline tags and table cells stay
+    intact, oversize text is char-sliced) and each fragment re-wrapped in the same
+    item tag. Anything else is inline-broken directly."""
+    if len(unit) <= budget:
+        return [unit]
+    if re.search(r"<(ol|ul|table|blockquote|pre|details)\b", unit, re.IGNORECASE):
+        return [unit]
+    item = re.match(r"(<(li|tr)\b[^>]*>)(.*)(</\2>)\Z", unit, re.DOTALL | re.IGNORECASE)
+    if item:
+        open_t, _name, text, close_t = item.groups()
+        inner_budget = max(80, budget - len(open_t) - len(close_t))
+        return [open_t + frag + close_t for frag in _break_inline(text, inner_budget)]
+    return _break_inline(unit, budget)
+
+
 def _hard_split_rich_block(block: str, limit: int) -> list[str]:
-    # A single top-level block bigger than the limit (e.g. a long table or <pre>).
-    # Split its inner content at row/list/line boundaries and re-wrap each piece in
-    # the same tag so we never emit a half-open tag.
+    # A single top-level block bigger than the limit (e.g. a long <details> turn
+    # block whose inner <ol>/<table>/<blockquote> overflows). Split the inner
+    # content at TOP-LEVEL row/list/line boundaries (nested sub-lists/tables stay
+    # intact) and re-wrap each piece in BOTH the outer tag AND the nested wrapper
+    # so every chunk is tag-balanced; the <summary> rides the first chunk only.
     m = re.match(r"(<([a-zA-Z0-9]+)\b[^>]*>)(.*)(</\2>)\Z", block, re.DOTALL)
     if not m:
-        # No clean wrapper (inline text / <br>): break on whitespace near the limit.
-        pieces, cur = [], ""
-        for token in re.split(r"(\s+)", block):
-            if cur and len(cur) + len(token) > limit:
-                pieces.append(cur)
-                cur = token
+        # No clean outer wrapper (inline text / <br>): inline-aware break so inline
+        # tags stay intact and an indivisible whitespace-free token is char-sliced
+        # (every piece <= limit).
+        return _break_inline(block, limit)
+    open_tag, name, inner, close_tag = m.groups()
+    # Peel a leading <summary>…</summary> off the inner HTML (only meaningful for
+    # <details>, harmless to check for other tags since they won't have one).
+    summary_html = ""
+    body = inner
+    if name.lower() == "details":
+        sm = _SUMMARY_RE.match(inner)
+        if sm:
+            summary_html = sm.group(0).strip()
+            body = inner[sm.end():]
+
+    def _delims_for(html: str) -> tuple[str, str | None]:
+        if "</tr>" in html:
+            return r"</tr>", r"table"
+        if "</li>" in html:
+            return r"</li>", r"ol|ul"
+        return r"<br\s*/?>|\n", None
+
+    wm = _DETAILS_WRAPPER_RE.match(body)
+    if not wm:
+        # No recognizable single nested wrapper: split body directly (no nested
+        # wrapper to sever), but still depth-aware + hard-break over-budget units.
+        budget = max(200, limit - len(open_tag) - len(close_tag) - len(summary_html))
+        delim_re, container_re = _delims_for(body)
+        units = []
+        for u in _split_top_level_units(body, delim_re, container_re):
+            units.extend(_hard_break_unit(u, budget))
+        pieces, cur, first = [], "", True
+        for u in units:
+            if cur and len(cur) + len(u) > budget:
+                pieces.append(open_tag + (summary_html if first else "") + cur + close_tag)
+                cur, first = u, False
             else:
-                cur += token
+                cur += u
         if cur:
-            pieces.append(cur)
-        return pieces or [block[:limit]]
-    open_tag, _name, inner, close_tag = m.groups()
-    budget = max(200, limit - len(open_tag) - len(close_tag))
-    # Break only at structurally-complete boundaries so a chunk is never tag
-    # unbalanced: whole rows for tables, whole items for lists, else lines/<br>.
-    # Restricting the boundary by block type means a stray "\n" inside an open
-    # <tr>/<li> can't split that row/item.
-    if "</tr>" in inner:
-        delim = r"(</tr>)"
-    elif "</li>" in inner:
-        delim = r"(</li>)"
-    else:
-        delim = r"(<br\s*/?>|\n)"
-    boundary = re.compile(delim[1:-1], re.IGNORECASE)
-    pieces, cur = [], ""
-    unit = ""
-    for part in re.split(delim, inner):
-        if not part:
-            continue
-        unit += part
-        if boundary.fullmatch(part):
-            if cur and len(cur) + len(unit) > budget:
-                pieces.append(open_tag + cur + close_tag)
-                cur = unit
-            else:
-                cur += unit
-            unit = ""
-    if unit:
-        if cur and len(cur) + len(unit) > budget:
-            pieces.append(open_tag + cur + close_tag)
-            cur = unit
+            pieces.append(open_tag + (summary_html if first else "") + cur + close_tag)
+        return pieces or [block]
+    w_open, w_name, w_inner, w_close = wm.groups()
+    # Pick the structural delimiter by wrapper type so a chunk is never cut
+    # mid-row / mid-item, and the nesting container so nested sub-lists/tables
+    # are never treated as top-level boundaries.
+    if w_name.lower() == "table":
+        delim_re, container_re = r"</tr>", r"table"
+    elif w_name.lower() in ("ol", "ul"):
+        delim_re, container_re = r"</li>", r"ol|ul"
+    else:  # blockquote / pre — no nestable item boundary
+        delim_re, container_re = r"<br\s*/?>|\n", None
+    # Budget must account for outer tag + summary + wrapper open/close per chunk.
+    per_chunk_overhead = len(open_tag) + len(close_tag) + len(w_open) + len(w_close)
+    budget = max(200, limit - per_chunk_overhead - len(summary_html))
+    # Top-level units (nested sub-lists/tables stay whole), then hard-break any
+    # single unit that alone exceeds the budget so no chunk silently overflows.
+    units = []
+    for u in _split_top_level_units(w_inner, delim_re, container_re):
+        units.extend(_hard_break_unit(u, budget))
+    pieces, cur, first = [], "", True
+    for u in units:
+        if cur and len(cur) + len(u) > budget:
+            pieces.append(
+                open_tag + (summary_html if first else "") + w_open + cur + w_close + close_tag
+            )
+            cur, first = u, False
         else:
-            cur += unit
+            cur += u
     if cur:
-        pieces.append(open_tag + cur + close_tag)
-    return pieces
+        pieces.append(
+            open_tag + (summary_html if first else "") + w_open + cur + w_close + close_tag
+        )
+    return pieces or [block]
 
 
 def split_rich_html(html_text: str, limit: int) -> list[str]:
@@ -8222,11 +8369,18 @@ def send_rich_message(
 
     sanitized = sanitize_text(html_text, MAX_RICH_HTML_CHARS)
     chunks = split_rich_html(sanitized, RICH_SAFE_CHARS)
+    # Drop chunks whose plain-text projection is empty (a hard-split bug used to
+    # emit e.g. <details></ol></details> with no visible content). Recompute the
+    # first/last indices over the survivors so notify/reply_markup still attach
+    # to the real first/last chunk rather than a blank one.
+    chunks = [c for c in chunks if html_to_plain(c).strip()]
+    if not chunks:
+        return {"ok": False, "format": "rich", "kind": "empty"}
     # Common case: one chunk, identical behaviour to before.
     if len(chunks) <= 1:
         return _send_rich_chunk(
             chat_id,
-            sanitized,
+            chunks[0],
             telegram=telegram,
             fallback=fallback,
             thread_id=thread_id,
