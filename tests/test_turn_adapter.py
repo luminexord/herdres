@@ -1317,5 +1317,78 @@ class TailReadTests(unittest.TestCase):
         self.assertEqual(turn["assistant_final_text"], "answer big0")
 
 
+class ModelExtractionTests(unittest.TestCase):
+    """The adapter surfaces the model (for the pinned-status suffix). claude carries
+    message.model on every assistant event; codex emits turn_context.model ~per turn,
+    so it survives the tail read. Absent -> the field is omitted (sync won't clobber)."""
+
+    def test_codex_turn_extracts_model_from_turn_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, [
+                {"type": "session_meta", "payload": {"cwd": "/root"}},
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1", "started_at": 1}},
+                {"type": "turn_context", "payload": {"model": "gpt-5.5", "effort": "high"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "Go."}]}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1",
+                    "completed_at": 2, "last_agent_message": "Done."}},
+            ])
+            turn = adapter.extract_codex_turn(path, "p", "s")
+        self.assertEqual(turn["model"], "gpt-5.5")
+
+    def test_claude_turn_extracts_model_from_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Hi."}},
+                {"type": "assistant", "uuid": "a1", "timestamp": "ts",
+                 "message": {"role": "assistant", "model": "claude-opus-4-8",
+                             "stop_reason": "end_turn", "content": [{"type": "text", "text": "Hello."}]}},
+            ])
+            turn = adapter.extract_claude_turn(path, "p", "s")
+        self.assertEqual(turn["model"], "claude-opus-4-8")
+
+    def test_claude_ignores_synthetic_model(self) -> None:
+        # A trailing synthetic message (interrupt/error) must not overwrite the real model.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Hi."}},
+                {"type": "assistant", "uuid": "a1", "timestamp": "ts",
+                 "message": {"role": "assistant", "model": "claude-opus-4-8",
+                             "stop_reason": "end_turn", "content": [{"type": "text", "text": "Hello."}]}},
+                {"type": "assistant", "uuid": "s1",
+                 "message": {"role": "assistant", "model": "<synthetic>",
+                             "stop_reason": "tool_use", "content": [{"type": "text", "text": "x"}]}},
+            ])
+            turn = adapter.extract_claude_turn(path, "p", "s")
+        self.assertEqual(turn["model"], "claude-opus-4-8")
+
+    def test_model_omitted_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, _codex_turns(2))  # no turn_context anywhere
+            turn = adapter.extract_codex_turn(path, "p", "s")
+        self.assertNotIn("model", turn)
+
+    def test_codex_model_survives_tail_read(self) -> None:
+        # turn_context recurs per turn, so even a tiny tail window still surfaces a model.
+        rows: list[dict] = []
+        for i in range(adapter.RECENT_TURNS + 5):
+            rows.append({"type": "event_msg", "payload": {"type": "task_started", "turn_id": f"t{i}", "started_at": i}})
+            rows.append({"type": "turn_context", "payload": {"model": "gpt-5.4"}})
+            rows.append({"type": "response_item", "payload": {"type": "message", "role": "user",
+                         "content": [{"type": "input_text", "text": f"prompt {i}"}]}})
+            rows.append({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": f"t{i}",
+                         "completed_at": i, "last_agent_message": f"answer {i}"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, rows)
+            with patch.object(adapter, "TURN_TAIL_BYTES", 200):  # force the tail path
+                turn = adapter.extract_codex_turn(path, "p", "s")
+        self.assertEqual(turn["model"], "gpt-5.4")
+
+
 if __name__ == "__main__":
     unittest.main()
