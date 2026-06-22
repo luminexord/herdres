@@ -1257,13 +1257,52 @@ class TailReadTests(unittest.TestCase):
             path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
             write_jsonl(path, rows)
             size = path.stat().st_size
-            lines = adapter._jsonl_tail_lines(path, adapter._codex_is_turn_start, 256, adapter.RECENT_TURNS)
+            lines = adapter._jsonl_tail_lines(
+                path, adapter._codex_is_turn_start, adapter._codex_is_turn_end, 256, adapter.RECENT_TURNS)
         self.assertTrue(lines)
         joined = "\n".join(lines)
         self.assertNotIn("old0", joined)          # the huge old turn was not read
         self.assertIn('"new0"', joined)            # the recent turns were
         self.assertTrue(adapter._codex_is_turn_start(lines[0]))  # starts at a clean boundary
         self.assertLess(sum(len(l) for l in lines), size // 2)   # read far less than the whole file
+
+    def test_codex_window_grows_past_trailing_aborted_turns(self) -> None:
+        # Window sizing must count COMPLETED turns, not turn-starts: a tail full of aborted
+        # turns (task_started but no task_complete) must still grow to the recent completions.
+        rows = _codex_turns(adapter.RECENT_TURNS + 3, prefix="done")
+        for i in range(20):
+            rows.append({"type": "event_msg", "payload": {"type": "task_started", "turn_id": f"ab{i}", "started_at": i}})
+            rows.append({"type": "response_item", "payload": {"type": "message", "role": "user",
+                         "content": [{"type": "input_text", "text": f"aborted {i}"}]}})
+            rows.append({"type": "event_msg", "payload": {"type": "turn_aborted"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, rows)
+            with patch.object(adapter, "TURN_TAIL_BYTES", 10**9):
+                full = adapter.extract_codex_turn(path, "p", "s")
+            with patch.object(adapter, "TURN_TAIL_BYTES", 200):
+                tail = adapter.extract_codex_turn(path, "p", "s")
+        self.assertEqual(tail["assistant_final_text"], full["assistant_final_text"])
+        self.assertEqual([t["turn_id"] for t in tail["recent_turns"]],
+                         [t["turn_id"] for t in full["recent_turns"]])
+        self.assertEqual(len(full["recent_turns"]), adapter.RECENT_TURNS)
+
+    def test_claude_window_grows_past_trailing_internal_users(self) -> None:
+        rows = _claude_turns(adapter.RECENT_TURNS + 3)
+        for i in range(20):  # trailing internal-user markers (no end_turn completion)
+            rows.append({"type": "user", "uuid": f"int{i}",
+                         "message": {"role": "user", "content": "<task-notification>x</task-notification>"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            write_jsonl(path, rows)
+            with patch.object(adapter, "TURN_TAIL_BYTES", 10**9):
+                full = adapter.extract_claude_turn(path, "p", "s")
+            with patch.object(adapter, "TURN_TAIL_BYTES", 200):
+                tail = adapter.extract_claude_turn(path, "p", "s")
+        self.assertEqual(tail["assistant_final_text"], full["assistant_final_text"])
+        self.assertEqual([t["turn_id"] for t in tail["recent_turns"]],
+                         [t["turn_id"] for t in full["recent_turns"]])
+        self.assertEqual(len(full["recent_turns"]), adapter.RECENT_TURNS)
 
     def test_single_turn_over_ceiling_falls_back_to_full_read(self) -> None:
         # A single turn larger than the ceiling -> no boundary in the window -> full read.
