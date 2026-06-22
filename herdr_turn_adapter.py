@@ -181,6 +181,7 @@ def content_text(content: Any) -> str:
 _TOOL_PATH_KEYS = ("file_path", "path", "notebook_path")
 _TOOL_ARG_KEYS = (
     "command",
+    "cmd",  # codex exec_command / shell
     "file_path",
     "path",
     "notebook_path",
@@ -190,16 +191,23 @@ _TOOL_ARG_KEYS = (
     "description",
     "prompt",
     "subagent_type",
+    "input",  # custom_tool_call / generic
 )
 
 
 def summarize_tool_use(name: Any, tool_input: Any) -> str:
-    """One concise worklog line for a tool_use block: the tool name plus a short arg."""
+    """One concise worklog line for a tool call: the tool name plus a short arg.
+
+    Handles claude tool_use input dicts and codex/devin arg dicts. A list value
+    (e.g. a codex shell ``command: ["bash","-lc","..."]``) is joined to a string.
+    """
     label = sanitize_text(str(name or "tool").strip(), 40) or "tool"
     if not isinstance(tool_input, dict):
         return label
     for key in _TOOL_ARG_KEYS:
         val = tool_input.get(key)
+        if isinstance(val, list):
+            val = " ".join(str(c) for c in val if isinstance(c, (str, int, float)))
         if isinstance(val, str) and val.strip():
             brief = val.strip().splitlines()[0]
             if key in _TOOL_PATH_KEYS:
@@ -207,6 +215,57 @@ def summarize_tool_use(name: Any, tool_input: Any) -> str:
             brief = sanitize_text(brief, WORKLOG_LINE_MAX_CHARS)
             return f"{label} {brief}".strip()
     return label
+
+
+def _tool_call_worklog_line(name: Any, arguments: Any) -> str:
+    """Worklog line for a codex/devin tool call. ``arguments`` may be a JSON string,
+    a dict, or a raw string (e.g. an apply_patch body); fall back to a first-line brief."""
+    if isinstance(arguments, str):
+        s = arguments.strip()
+        if s[:1] in "{[":
+            try:
+                arguments = json.loads(s)
+            except Exception:
+                pass
+    if isinstance(arguments, dict):
+        return summarize_tool_use(name, arguments)
+    label = sanitize_text(str(name or "tool").strip(), 40) or "tool"
+    if isinstance(arguments, str) and arguments.strip():
+        return f"{label} {sanitize_text(arguments.strip().splitlines()[0], WORKLOG_LINE_MAX_CHARS)}".strip()
+    return label
+
+
+def codex_worklog_line(payload: dict[str, Any]) -> str:
+    """One worklog line for a codex intermediate response_item (tool call)."""
+    pt = payload.get("type")
+    if pt == "function_call":
+        return _tool_call_worklog_line(payload.get("name"), payload.get("arguments"))
+    if pt == "custom_tool_call":
+        return _tool_call_worklog_line(payload.get("name"), payload.get("input"))
+    return ""
+
+
+def devin_tool_call_line(call: Any) -> str:
+    """Worklog line for one Devin tool_call entry (OpenAI-style ``function`` or flat)."""
+    if not isinstance(call, dict):
+        return ""
+    fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+    name = fn.get("name") or call.get("name") or call.get("tool") or call.get("type") or "tool"
+    args = fn.get("arguments")
+    if args is None:
+        args = call.get("arguments") or call.get("args") or call.get("input") or call.get("parameters")
+    return _tool_call_worklog_line(name, args)
+
+
+def _accumulate_worklog(parts: list[str], raw_lines: list[str]) -> None:
+    """Clean (strip control chars + redact secrets), append, and bound the accumulator
+    to WORKLOG_MAX_LINES (keeping the most recent lines)."""
+    for ln in raw_lines:
+        cleaned = _clean_worklog_line(ln)
+        if cleaned:
+            parts.append(sanitize_text(cleaned, WORKLOG_LINE_MAX_CHARS))
+    if len(parts) > WORKLOG_MAX_LINES:
+        del parts[: len(parts) - WORKLOG_MAX_LINES]
 
 
 def claude_worklog_lines(content: Any) -> list[str]:
@@ -443,6 +502,28 @@ def extract_devin_turn_from_db(db_path: Path, pane_id: str, session_id: str) -> 
     current_user_text = ""
     last_agent_text = ""
     open_turn = False
+    worklog_parts: list[str] = []  # devin tool calls + interim narration for the open turn
+
+    def _devin_turn(final_text: str, completed_at: Any) -> dict[str, Any]:
+        turn = {
+            "available": True,
+            "pane_id": pane_id,
+            "agent": "devin",
+            "agent_session_id": session_id,
+            "turn_id": str(current_turn_id),
+            "turn_index": None,
+            "complete": True,
+            "complete_reason": "done",
+            "started_at": current_started_at,
+            "completed_at": completed_at,
+            "user_text": current_user_text,
+            "assistant_final_text": final_text,
+        }
+        if WORKLOG_ENABLED and worklog_parts:
+            worklog = _join_worklog(worklog_parts)
+            if worklog:
+                turn["worklog_text"] = worklog
+        return turn
 
     for node_id, chat_message_json, created_at in rows:
         try:
@@ -456,46 +537,25 @@ def extract_devin_turn_from_db(db_path: Path, pane_id: str, session_id: str) -> 
 
         if role == "user" and content.strip() and not is_internal_devin_user_text(content):
             if open_turn and current_user_text and last_agent_text:
-                completed.append({
-                    "available": True,
-                    "pane_id": pane_id,
-                    "agent": "devin",
-                    "agent_session_id": session_id,
-                    "turn_id": str(current_turn_id),
-                    "turn_index": None,
-                    "complete": True,
-                    "complete_reason": "done",
-                    "started_at": current_started_at,
-                    "completed_at": timestamp,
-                    "user_text": current_user_text,
-                    "assistant_final_text": last_agent_text,
-                })
+                completed.append(_devin_turn(last_agent_text, timestamp))
             current_turn_id = str(node_id)
             current_started_at = timestamp
             current_user_text = sanitize_text(content)
             last_agent_text = ""
             open_turn = True
+            worklog_parts = []
             continue
 
         if role == "assistant" and open_turn:
             if content.strip():
                 last_agent_text = sanitize_text(content)
-            if content.strip() and not tool_calls:
+            if tool_calls:
+                if WORKLOG_ENABLED:
+                    raw = ([content] if content.strip() else []) + [devin_tool_call_line(c) for c in tool_calls]
+                    _accumulate_worklog(worklog_parts, [r for r in raw if r])
+            elif content.strip():
                 if current_user_text and last_agent_text:
-                    completed.append({
-                        "available": True,
-                        "pane_id": pane_id,
-                        "agent": "devin",
-                        "agent_session_id": session_id,
-                        "turn_id": str(current_turn_id),
-                        "turn_index": None,
-                        "complete": True,
-                        "complete_reason": "done",
-                        "started_at": current_started_at,
-                        "completed_at": timestamp,
-                        "user_text": current_user_text,
-                        "assistant_final_text": last_agent_text,
-                    })
+                    completed.append(_devin_turn(last_agent_text, timestamp))
                     open_turn = False
             continue
 
@@ -852,6 +912,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
     last_assistant_text = ""
     completed: list[dict[str, Any]] = []
     open_turn = False
+    worklog_parts: list[str] = []  # codex tool calls for the open turn
 
     with path.open(encoding="utf-8", errors="replace") as handle:
         for raw in handle:
@@ -866,6 +927,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 current_user_text = ""
                 last_assistant_text = ""
                 open_turn = True
+                worklog_parts = []
                 continue
             if event.get("type") == "response_item" and payload.get("type") == "message":
                 role = str(payload.get("role") or "")
@@ -875,12 +937,25 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 elif role == "assistant" and text:
                     last_assistant_text = sanitize_text(text)
                 continue
+            # Tool calls between task_started and task_complete are the worklog. (codex
+            # reasoning summaries are encrypted/empty, and the final reply is itself an
+            # agent_message, so only the tool steps are surfaced here.)
+            if (
+                WORKLOG_ENABLED
+                and open_turn
+                and event.get("type") == "response_item"
+                and payload.get("type") in ("function_call", "custom_tool_call")
+            ):
+                line = codex_worklog_line(payload)
+                if line:
+                    _accumulate_worklog(worklog_parts, [line])
+                continue
             if event.get("type") == "event_msg" and payload.get("type") == "task_complete":
                 final_text = sanitize_text(str(payload.get("last_agent_message") or "").strip())
                 if not final_text:
                     final_text = last_assistant_text
                 if final_text and current_user_text:
-                    completed.append({
+                    turn = {
                         "available": True,
                         "pane_id": pane_id,
                         "agent": "codex",
@@ -893,7 +968,12 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                         "completed_at": payload.get("completed_at"),
                         "user_text": current_user_text,
                         "assistant_final_text": final_text,
-                    })
+                    }
+                    if WORKLOG_ENABLED and worklog_parts:
+                        worklog = _join_worklog(worklog_parts)
+                        if worklog:
+                            turn["worklog_text"] = worklog
+                    completed.append(turn)
                 open_turn = False
                 continue
             if event.get("type") == "event_msg" and payload.get("type") == "turn_aborted":
@@ -1115,6 +1195,28 @@ def extract_devin_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
     current_user_text = ""
     last_agent_text = ""
     open_turn = False
+    worklog_parts: list[str] = []  # devin tool calls + interim narration for the open turn
+
+    def _devin_turn(final_text: str, completed_at: Any) -> dict[str, Any]:
+        turn = {
+            "available": True,
+            "pane_id": pane_id,
+            "agent": "devin",
+            "agent_session_id": session_id,
+            "turn_id": str(current_turn_id),
+            "turn_index": None,
+            "complete": True,
+            "complete_reason": "done",
+            "started_at": current_started_at,
+            "completed_at": completed_at,
+            "user_text": current_user_text,
+            "assistant_final_text": final_text,
+        }
+        if WORKLOG_ENABLED and worklog_parts:
+            worklog = _join_worklog(worklog_parts)
+            if worklog:
+                turn["worklog_text"] = worklog
+        return turn
 
     for step in steps:
         source = str(step.get("source") or "")
@@ -1126,47 +1228,28 @@ def extract_devin_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
         if source == "user" and msg.strip() and not is_internal_devin_user_text(msg):
             # New user prompt: close out any open turn
             if open_turn and current_user_text and last_agent_text:
-                completed.append({
-                    "available": True,
-                    "pane_id": pane_id,
-                    "agent": "devin",
-                    "agent_session_id": session_id,
-                    "turn_id": str(current_turn_id),
-                    "turn_index": None,
-                    "complete": True,
-                    "complete_reason": "done",
-                    "started_at": current_started_at,
-                    "completed_at": timestamp,
-                    "user_text": current_user_text,
-                    "assistant_final_text": last_agent_text,
-                })
+                completed.append(_devin_turn(last_agent_text, timestamp))
             current_turn_id = str(step_id)
             current_started_at = timestamp
             current_user_text = sanitize_text(msg)
             last_agent_text = ""
             open_turn = True
+            worklog_parts = []
             continue
 
         if source == "agent" and open_turn:
             if msg.strip():
                 last_agent_text = sanitize_text(msg)
-            # If the agent step has text but no tool calls, it's likely a final response
-            if msg.strip() and not tool_calls:
+            if tool_calls:
+                # Tool-using step: the message (if any) is interim narration; record it
+                # plus each tool call as the worklog. Not a completion.
+                if WORKLOG_ENABLED:
+                    raw = ([msg] if msg.strip() else []) + [devin_tool_call_line(c) for c in tool_calls]
+                    _accumulate_worklog(worklog_parts, [r for r in raw if r])
+            elif msg.strip():
+                # text with no tool calls -> final response
                 if current_user_text and last_agent_text:
-                    completed.append({
-                        "available": True,
-                        "pane_id": pane_id,
-                        "agent": "devin",
-                        "agent_session_id": session_id,
-                        "turn_id": str(current_turn_id),
-                        "turn_index": None,
-                        "complete": True,
-                        "complete_reason": "done",
-                        "started_at": current_started_at,
-                        "completed_at": timestamp,
-                        "user_text": current_user_text,
-                        "assistant_final_text": last_agent_text,
-                    })
+                    completed.append(_devin_turn(last_agent_text, timestamp))
                     open_turn = False
             continue
 
