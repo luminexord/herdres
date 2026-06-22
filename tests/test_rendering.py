@@ -2725,6 +2725,95 @@ class StreamingIntegrationTests(unittest.TestCase):
         for call in edit_feed_item.call_args_list:
             self.assertEqual(call.args[1], "3001", "worklog must only edit the turn's own message")
 
+    def test_collapse_response_flag_folds_only_the_response(self) -> None:
+        base = {"available": True, "complete": True, "turn_id": "t1",
+                "user_text": "q", "assistant_final_text": "## Heading\nthe answer body"}
+        item = herdres.make_turn_feed_item(base)
+        expanded = herdres.render_turn_item_html(item)
+        collapsed = herdres.render_turn_item_html(dict(item, collapse_response=True))
+        # latest turn: Response details is open
+        self.assertIn("<details open><summary><b>Response</b>", expanded)
+        # previous turn: Response details is folded (no ` open`), with a preview
+        self.assertNotIn("<details open><summary><b>Response</b>", collapsed)
+        self.assertIn("<details><summary><b>Response</b>", collapsed)
+        # the response body is preserved either way (collapse is a fold, not a drop)
+        self.assertIn("the answer body", collapsed)
+
+    def test_new_turn_folds_previous_turn_response_when_enabled(self) -> None:
+        state, pane, _key, entry = self._state()
+        counters, caps = self._caps()
+        space_key = str(entry.get("space_key") or "")
+        state.setdefault("spaces", {}).setdefault(space_key, {})["collapse_previous_responses"] = True
+        prior_item = herdres.make_turn_feed_item(
+            {"available": True, "complete": True, "turn_id": "turn-1",
+             "user_text": "q1", "assistant_final_text": "Answer one."})
+        entry.update({
+            "last_clean_item": prior_item,
+            "last_clean_text": herdres.item_plain_text(prior_item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(prior_item, include_render_version=False),
+            "last_clean_hash": herdres.clean_feed_hash(prior_item),
+            "last_clean_render_hash": herdres.clean_feed_hash(prior_item),
+            "last_clean_message_id": "3001",
+            "last_turn_id": "turn-1",
+        })
+        turn2 = {"available": True, "complete": True, "turn_id": "turn-2",
+                 "user_text": "q2", "assistant_final_text": "Answer two."}
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3002"})
+        edit_feed_item = Mock(return_value={"ok": True})
+        with patch.multiple(
+            herdres,
+            pane_turn=Mock(return_value=turn2),
+            send_feed_item=send_feed_item,
+            edit_feed_item=edit_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True, LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False, STATUS_ICON_ENABLED=False,
+        ):
+            herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        # the new turn was sent as its own fresh message...
+        send_feed_item.assert_called()
+        # ...and the PREVIOUS turn's message (3001) was folded in place
+        folds = [c for c in edit_feed_item.call_args_list if c.args[1] == "3001"]
+        self.assertTrue(folds, "previous turn's message should be folded")
+        folded_item = folds[-1].args[2]
+        self.assertTrue(folded_item.get("collapse_response"))
+        self.assertEqual(str(folded_item.get("turn_id")), "turn-1")
+
+    def test_new_turn_does_not_fold_previous_when_disabled(self) -> None:
+        state, pane, _key, entry = self._state()
+        counters, caps = self._caps()
+        # toggle left at default (off)
+        prior_item = herdres.make_turn_feed_item(
+            {"available": True, "complete": True, "turn_id": "turn-1",
+             "user_text": "q1", "assistant_final_text": "Answer one."})
+        entry.update({
+            "last_clean_item": prior_item,
+            "last_clean_text": herdres.item_plain_text(prior_item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(prior_item, include_render_version=False),
+            "last_clean_hash": herdres.clean_feed_hash(prior_item),
+            "last_clean_render_hash": herdres.clean_feed_hash(prior_item),
+            "last_clean_message_id": "3001",
+            "last_turn_id": "turn-1",
+        })
+        turn2 = {"available": True, "complete": True, "turn_id": "turn-2",
+                 "user_text": "q2", "assistant_final_text": "Answer two."}
+        edit_feed_item = Mock(return_value={"ok": True})
+        with patch.multiple(
+            herdres,
+            pane_turn=Mock(return_value=turn2),
+            send_feed_item=Mock(return_value={"ok": True, "message_id": "3002"}),
+            edit_feed_item=edit_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True, LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False, STATUS_ICON_ENABLED=False,
+        ):
+            herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+        self.assertFalse([c for c in edit_feed_item.call_args_list if c.args[1] == "3001"],
+                         "with the toggle off, the previous turn must not be folded")
+
     def test_sync_streams_open_turn_after_completed_turn_already_delivered(self) -> None:
         state, pane, _key, entry = self._state()
         completed_turn = {

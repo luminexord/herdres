@@ -222,6 +222,9 @@ USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHA
 # chars. Default to a threshold so long agent-to-agent echoes collapse while short
 # human one-liners stay expanded.
 PROMPT_COLLAPSE_CHARS_DEFAULT = int(os.getenv("HERDR_TELEGRAM_TOPICS_PROMPT_COLLAPSE_CHARS", "200"))
+# When on, a new turn folds the PREVIOUS turn's Response in place (latest stays open).
+# Per-space override via space["collapse_previous_responses"]; off by default (opt-in).
+RESPONSE_COLLAPSE_PREVIOUS_DEFAULT = parse_bool_env("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "")
 PROMPT_PREVIEW_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PROMPT_PREVIEW_CHARS", "60"))
 INTERACTION_READONLY_WARNING_TITLE = "⚠️ Manual action required"
 INTERACTION_READONLY_WARNING_BODY = (
@@ -745,6 +748,67 @@ def space_prompt_collapse_chars(state: dict[str, Any], pane_or_entry: dict[str, 
         except (TypeError, ValueError):
             return default
     return default
+
+
+def space_collapse_previous_responses(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> bool:
+    """Per-space: when a new turn arrives, fold the PREVIOUS turn's Response in place
+    (the latest turn always stays expanded). Defaults to
+    RESPONSE_COLLAPSE_PREVIOUS_DEFAULT; per-space override via
+    space["collapse_previous_responses"]."""
+    default = RESPONSE_COLLAPSE_PREVIOUS_DEFAULT
+    if not isinstance(pane_or_entry, dict):
+        return default
+    key = str(pane_or_entry.get("space_key") or "") or space_key(pane_or_entry)
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    space = spaces.get(key)
+    if isinstance(space, dict) and space.get("collapse_previous_responses") is not None:
+        return bool(space.get("collapse_previous_responses"))
+    return default
+
+
+def fold_previous_turn_response(
+    state: dict[str, Any],
+    entry: dict[str, Any],
+    telegram: dict[str, Any],
+    chat_id: str,
+    new_item: dict[str, Any],
+    new_message_id: str,
+    *,
+    api_token: str | None = None,
+) -> None:
+    """When a NEW turn supersedes a DIFFERENT prior turn, re-edit the prior turn's own
+    message in place to fold its Response (the latest turn always stays expanded).
+
+    Best-effort + cosmetic: any failure (message too old to edit, deleted, etc.) is
+    swallowed so it never breaks the new turn's delivery. Gated per-space; called with
+    entry's last_clean_* STILL pointing at the prior turn (before record overwrites it).
+    """
+    if str(new_item.get("kind") or "").lower() != "turn":
+        return
+    if not space_collapse_previous_responses(state, entry):
+        return
+    prior_item = entry.get("last_clean_item")
+    prior_mid = str(entry.get("last_clean_message_id") or "")
+    if not isinstance(prior_item, dict) or str(prior_item.get("kind") or "").lower() != "turn":
+        return
+    if not prior_mid or prior_mid == str(new_message_id or ""):
+        return  # the prior turn shares the message we just delivered into (an edit, not a new msg)
+    if str(prior_item.get("turn_id") or "") == str(new_item.get("turn_id") or ""):
+        return  # same turn re-rendered, not a new turn
+    if not str(prior_item.get("assistant_final_text") or "").strip():
+        return  # no response to fold
+    folded = dict(prior_item)
+    folded["collapse_response"] = True
+    try:
+        edit_feed_item(
+            chat_id,
+            prior_mid,
+            folded,
+            telegram=telegram,
+            api_token=api_token or managed_bot_token_for_entry(telegram, entry),
+        )
+    except Exception:
+        pass
 
 
 def refresh_entry_managed_voice(state: dict[str, Any], entry: dict[str, Any], pane: dict[str, Any] | None = None) -> None:
@@ -4696,14 +4760,19 @@ def _turn_fallback_body_html(assistant_final: str, reserved_chars: int) -> str:
     return _rich_paragraph(sanitize_text(assistant_final, 900))
 
 
-def render_assistant_response_quote_html(assistant_final: str) -> str:
+def render_assistant_response_quote_html(
+    assistant_final: str, *, open_by_default: bool = True, preview: str = ""
+) -> str:
     clean = str(assistant_final or "").strip()
     if not clean:
         return ""
     body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
-    # Collapsible (open) like before, but NOT blockquoted — the blue quote bar
-    # flattened the rich response. Prompt + worklog keep their blockquote.
-    return _rich_details_quote_html(RESPONSE_LABEL, body_html, quote=False)
+    # NOT blockquoted — the blue quote bar flattened the rich response (prompt +
+    # worklog keep their blockquote). open_by_default=False folds a PREVIOUS turn's
+    # response with a one-line preview; the latest turn renders open.
+    return _rich_details_quote_html(
+        RESPONSE_LABEL, body_html, quote=False, open_by_default=open_by_default, preview=preview
+    )
 
 
 def render_worklog_quote_html(
@@ -4725,13 +4794,18 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     worklog_label = str(item.get("worklog_label") or WORKLOG_LABEL).strip() or WORKLOG_LABEL
     assistant_final = str(item.get("assistant_final_text") or "").strip()
     collapse_chars = _item_prompt_collapse_chars(item)
+    # A PREVIOUS turn re-rendered with collapse_response folds its response (latest stays open).
+    response_open = not bool(item.get("collapse_response"))
+    response_preview = "" if response_open else _prompt_preview(assistant_final)
     parts: list[str] = []
     if user_text:
         parts.append(render_user_prompt_quote_html(user_text, collapse_chars))
     worklog_html = render_worklog_quote_html(worklog_text, response_available=bool(assistant_final), label=worklog_label)
     if worklog_html:
         parts.append(worklog_html)
-    response_html = render_assistant_response_quote_html(assistant_final)
+    response_html = render_assistant_response_quote_html(
+        assistant_final, open_by_default=response_open, preview=response_preview
+    )
     if response_html:
         parts.append(response_html)
     rendered = _join_blocks(parts).strip()
@@ -4746,7 +4820,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
         response_html = ""
         if assistant_final:
             body_html = _turn_fallback_body_html(assistant_final, len(quote_html) + len(worklog_html) + 120)
-            response_html = _rich_details_quote_html(RESPONSE_LABEL, body_html)
+            response_html = _rich_details_quote_html(RESPONSE_LABEL, body_html, open_by_default=response_open, preview=response_preview)
         rendered = _join_blocks([quote_html, worklog_html, response_html]).strip()
         if len(rendered) > MAX_RICH_HTML_CHARS:
             worklog_html = ""
@@ -4759,7 +4833,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
             response_html = ""
             if assistant_final:
                 body_html = _rich_paragraph(sanitize_text(assistant_final, 900))
-                response_html = _rich_details_quote_html(RESPONSE_LABEL, body_html)
+                response_html = _rich_details_quote_html(RESPONSE_LABEL, body_html, open_by_default=response_open, preview=response_preview)
             return _join_blocks([quote_html, worklog_html, response_html]).strip()
     return rendered
 
@@ -10186,6 +10260,17 @@ def _sync_pane_clean_feed(
                 counters["sends"] = counters.get("sends", 0) + 1
                 counters["feed_sends"] = counters.get("feed_sends", 0) + 1
                 feed_delivered_this_pane = True
+                # Fold the PREVIOUS turn's response in place (latest stays open) — must run
+                # while last_clean_* still points at the prior turn, before record overwrites it.
+                fold_previous_turn_response(
+                    state,
+                    entry,
+                    telegram,
+                    chat_id,
+                    item,
+                    str(result.get("message_id") or (message_id if did_edit else "")),
+                    api_token=pane_api_token,
+                )
                 record_delivered_feed_item(
                     entry,
                     item,
