@@ -2725,6 +2725,23 @@ class StreamingIntegrationTests(unittest.TestCase):
         for call in edit_feed_item.call_args_list:
             self.assertEqual(call.args[1], "3001", "worklog must only edit the turn's own message")
 
+    def test_worklog_label_elapsed_tick_does_not_change_hash(self) -> None:
+        """worklog_label embeds a wall-clock elapsed time ("Worklog (1h 11m)"), so it must
+        stay OUT of the render hash. Otherwise a long-idle pane whose turn still carries a
+        worklog re-render-delivers (edits) its message every minute forever as the clock
+        ticks — the live re-delivery loop this guards against (found via p19)."""
+        base = {"available": True, "complete": True, "turn_id": "t1",
+                "user_text": "q", "assistant_final_text": "done", "worklog_text": "Bash echo hi"}
+        item = herdres.make_turn_feed_item(base)
+        assert item is not None
+        a = dict(item, worklog_label="Worklog (1h 9m)")
+        b = dict(item, worklog_label="Worklog (1h 11m)")
+        self.assertEqual(herdres.clean_feed_hash(a), herdres.clean_feed_hash(b))
+        self.assertEqual(
+            herdres.clean_feed_hash(a, include_render_version=False),
+            herdres.clean_feed_hash(b, include_render_version=False),
+        )
+
     def test_collapse_response_flag_folds_only_the_response(self) -> None:
         base = {"available": True, "complete": True, "turn_id": "t1",
                 "user_text": "q", "assistant_final_text": "## Heading\nthe answer body"}

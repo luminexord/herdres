@@ -5345,9 +5345,14 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
     # turn whose live anchor has moved on, posts a DUPLICATE message. So the worklog
     # only ever rides along on a delivery triggered by real content (user_text /
     # assistant_final_text); it never independently triggers one.
+    #
+    # worklog_label is excluded for the SAME reason, and one worse: it embeds a
+    # wall-clock elapsed time ("Worklog (1h 11m)") via worklog_label_for_turn, so
+    # hashing it makes the render hash tick every minute. A long-idle pane whose
+    # turn still carries a worklog would then re-render-deliver (edit) every cycle
+    # forever — a live re-delivery loop. The label is pure render data; keep it out.
     if include_render_version:
         payload["render_version"] = RICH_RENDER_VERSION
-        payload["worklog_label"] = item.get("worklog_label")
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
