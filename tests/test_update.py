@@ -34,6 +34,7 @@ SOURCE_FILES = {
     "herdres.py": f'#!/usr/bin/env python3\nHERDRES_VERSION = "9.9.9"\n',
     "herdres_gateway.py": "# gateway\n",
     "herdres_routing.py": "# routing\n",
+    "herdr_turn_adapter.py": "# turn adapter\n",
     "herdr_topic_bridge.py": "# bridge\n",
     "herdres-plugin/herdr-plugin.toml": 'command = ["herdres", "event"]\n',
     "systemd/user/herdres.service": "[Service]\n",

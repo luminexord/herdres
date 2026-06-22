@@ -12699,6 +12699,9 @@ def _update_files_plan() -> list[dict[str, Any]]:
         {"src": "herdres.py", "dest": _installed_bin(), "mode": 0o755},
         {"src": "herdres_gateway.py", "dest": INSTALL_BIN_DIR / "herdres-gateway", "mode": 0o755},
         {"src": "herdres_routing.py", "dest": INSTALL_BIN_DIR / "herdres_routing.py", "mode": 0o644},
+        # The `pane turn` shim (HERDR_BIN points at it); shipping it via update keeps
+        # the turn/worklog adapter in lockstep with herdres.py instead of installer-only.
+        {"src": "herdr_turn_adapter.py", "dest": INSTALL_BIN_DIR / "herdr_turn_adapter.py", "mode": 0o755},
         {"src": "herdr_topic_bridge.py", "dest": INSTALL_SHARE_DIR / "herdr_topic_bridge.py", "mode": 0o644},
         {
             "src": "herdres-plugin/herdr-plugin.toml",
