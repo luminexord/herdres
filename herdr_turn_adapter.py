@@ -7,6 +7,7 @@ the integration upgrade-safe: Herdr itself is never patched.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import hashlib
 import os
@@ -15,7 +16,7 @@ import subprocess
 import sys
 import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DEFAULT_REAL_HERDR = "herdr"
@@ -26,6 +27,12 @@ CLAUDE_FALLBACK_READ_LINES = int(os.getenv("HERDRES_CLAUDE_FALLBACK_READ_LINES",
 # burst of completions (e.g. a reply immediately followed by an auto-pursued
 # turn) instead of collapsing to only the newest one.
 RECENT_TURNS = int(os.getenv("HERDRES_RECENT_TURNS", "12"))
+# Tail-read window for turn extraction so a huge rollout (1+ GB) isn't fully parsed every
+# sync. Files <= TURN_TAIL_BYTES are read whole (byte-identical to a full read); larger
+# files read only the recent tail starting at a turn boundary. TURN_TAIL_MAX_BYTES caps
+# the grow-the-window loop. Both env-overridable.
+TURN_TAIL_BYTES = int(os.getenv("HERDRES_TURN_TAIL_BYTES", str(512 * 1024)))
+TURN_TAIL_MAX_BYTES = int(os.getenv("HERDRES_TURN_TAIL_MAX_BYTES", str(8 * 1024 * 1024)))
 DEVIN_SESSION_START_SKEW_SECONDS = int(os.getenv("HERDRES_DEVIN_SESSION_START_SKEW", "30"))
 # Per-turn worklog: summarize the intermediate tool_use + interim assistant text so a
 # COMPLETED turn carries a worklog the bridge renders under the Response. Previously the
@@ -175,6 +182,126 @@ def content_text(content: Any) -> str:
                 parts.append(text)
         return "\n".join(part for part in parts if part)
     return ""
+
+
+def _jsonl_tail_lines(
+    path: Path,
+    is_turn_start: Callable[[str], bool],
+    is_turn_end: Callable[[str], bool],
+    cap: int,
+    min_turns: int,
+) -> list[str]:
+    """Lines of a large JSONL file from the first turn-start boundary within a bounded tail.
+
+    Reads the last ``cap`` bytes from EOF, drops the partial first record, and starts at the
+    first line where ``is_turn_start`` holds. Sufficiency is measured by COMPLETED turns
+    (``is_turn_end`` markers — task_complete / end_turn), NOT turn-starts: a tail dominated by
+    aborted / open / internal-prompt markers would otherwise stop growing before it holds the
+    recent COMPLETED turns and surface fewer than a full read. If fewer than ``min_turns + 1``
+    completions are present and the window can still grow, doubles it up to TURN_TAIL_MAX_BYTES.
+    Returns ``[]`` (no usable start boundary, e.g. one turn larger than the ceiling) so the
+    caller falls back to a full read.
+    """
+    size = path.stat().st_size
+    window = cap
+    while True:
+        start = max(0, size - window)
+        with path.open("rb") as fh:
+            fh.seek(start)
+            chunk = fh.read()
+        lines = chunk.decode("utf-8", errors="replace").split("\n")
+        if start > 0:
+            lines = lines[1:]  # drop the partial record we seeked into the middle of
+        first_idx: int | None = None
+        completed = 0
+        for i, ln in enumerate(lines):
+            if not ln:
+                continue
+            if first_idx is None and is_turn_start(ln):
+                first_idx = i
+            if is_turn_end(ln):
+                completed += 1
+        at_ceiling = start == 0 or window >= TURN_TAIL_MAX_BYTES
+        if first_idx is not None and (completed >= min_turns + 1 or at_ceiling):
+            return lines[first_idx:]
+        if at_ceiling:
+            return []  # no start boundary even at the ceiling -> caller does a full read
+        window = min(window * 2, size, TURN_TAIL_MAX_BYTES)
+
+
+@contextlib.contextmanager
+def open_jsonl_tail(
+    path: Path,
+    is_turn_start: Callable[[str], bool],
+    is_turn_end: Callable[[str], bool],
+    *,
+    cap: int | None = None,
+    min_turns: int = RECENT_TURNS,
+):
+    """Yield an iterable of JSONL lines for the recent tail of ``path``.
+
+    A file <= the cap is read whole (a real file handle — byte-identical to the prior
+    ``with path.open(...) as handle``). A larger file is read from a bounded tail starting
+    at a clean turn-start boundary, so a multi-GB transcript is never fully parsed every
+    sync. Both turn parsers reset all per-turn state at a boundary, so the exposed recent
+    turns are identical to a full read. A drop-in for ``with path.open(...) as handle:``.
+    """
+    cap = TURN_TAIL_BYTES if cap is None else cap
+    try:
+        size = path.stat().st_size
+    except OSError:
+        yield iter(())
+        return
+    if size <= cap:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            yield handle
+        return
+    lines = _jsonl_tail_lines(path, is_turn_start, is_turn_end, cap, min_turns)
+    if not lines:
+        # One turn larger than the ceiling: full read so correctness is never compromised.
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            yield handle
+        return
+    yield iter(lines)
+
+
+def _codex_is_turn_start(raw: str) -> bool:
+    try:
+        event = json.loads(raw)
+    except Exception:
+        return False
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    return event.get("type") == "event_msg" and payload.get("type") == "task_started"
+
+
+def _claude_is_turn_start(raw: str) -> bool:
+    try:
+        event = json.loads(raw)
+    except Exception:
+        return False
+    return str(event.get("type") or "") == "user"
+
+
+def _codex_is_turn_end(raw: str) -> bool:
+    """A COMPLETED codex turn (task_complete) — used to size the tail window."""
+    try:
+        event = json.loads(raw)
+    except Exception:
+        return False
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    return event.get("type") == "event_msg" and payload.get("type") == "task_complete"
+
+
+def _claude_is_turn_end(raw: str) -> bool:
+    """A COMPLETED claude turn (assistant end_turn) — used to size the tail window."""
+    try:
+        event = json.loads(raw)
+    except Exception:
+        return False
+    if str(event.get("type") or "") != "assistant":
+        return False
+    msg = event.get("message") if isinstance(event.get("message"), dict) else {}
+    return msg.get("stop_reason") == "end_turn"
 
 
 # File-path-ish tool args are shown as a basename; everything else as a first-line brief.
@@ -918,7 +1045,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
     open_turn = False
     worklog_parts: list[str] = []  # codex tool calls for the open turn
 
-    with path.open(encoding="utf-8", errors="replace") as handle:
+    with open_jsonl_tail(path, _codex_is_turn_start, _codex_is_turn_end) as handle:
         for raw in handle:
             try:
                 event = json.loads(raw)
@@ -1027,7 +1154,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
     latest_stream_updated_at: Any = ""
     worklog_parts: list[str] = []  # intermediate tool_use + text for the open turn
 
-    with path.open(encoding="utf-8", errors="replace") as handle:
+    with open_jsonl_tail(path, _claude_is_turn_start, _claude_is_turn_end) as handle:
         for raw in handle:
             try:
                 event = json.loads(raw)
