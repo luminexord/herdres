@@ -104,8 +104,29 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["assistant_final_text"], "Fixed.")
         wl = turn.get("worklog_text") or ""
         self.assertIn("shell go test ./...", wl)  # OpenAI-style function.arguments parsed
-        self.assertIn("Let me run the tests.", wl)  # interim narration on the tool step
         self.assertNotIn("Fixed.", wl)  # final reply not in worklog
+        self.assertNotIn("Let me run the tests.", wl)  # step message excluded (it can become the final reply)
+
+    def test_devin_worklog_no_dup_when_turn_closed_by_next_prompt(self) -> None:
+        # A tool step's message becomes last_agent_text; if the turn is closed by the
+        # NEXT prompt (not a text-only final step), that message is the final reply and
+        # must NOT also appear in the worklog.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "devin.json"
+            path.write_text(json.dumps({"steps": [
+                {"source": "user", "step_id": "s1", "timestamp": 1, "message": "Do step one."},
+                {"source": "agent", "step_id": "s2", "timestamp": 2, "message": "Here is the summary of step one.",
+                 "tool_calls": [{"type": "function", "function": {"name": "shell",
+                                 "arguments": "{\"command\":\"ls\"}"}}]},
+                {"source": "user", "step_id": "s3", "timestamp": 3, "message": "Now step two."},
+            ]}), encoding="utf-8")
+            turn = adapter.extract_devin_turn(path, "pane-1", "session-1")
+
+        t1 = turn["recent_turns"][0]  # the turn closed by the next prompt
+        self.assertEqual(t1["assistant_final_text"], "Here is the summary of step one.")
+        wl = t1.get("worklog_text") or ""
+        self.assertIn("shell ls", wl)
+        self.assertNotIn("Here is the summary of step one.", wl)  # final reply not duplicated
 
     def test_codex_suppresses_new_internal_user_prefixes(self) -> None:
         self.assertTrue(adapter.is_internal_codex_user_text("<codex_internal_context foo>ignore"))

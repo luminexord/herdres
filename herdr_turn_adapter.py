@@ -230,6 +230,9 @@ def _tool_call_worklog_line(name: Any, arguments: Any) -> str:
     if isinstance(arguments, dict):
         return summarize_tool_use(name, arguments)
     label = sanitize_text(str(name or "tool").strip(), 40) or "tool"
+    if isinstance(arguments, list):
+        joined = " ".join(str(c) for c in arguments if isinstance(c, (str, int, float))).strip()
+        return f"{label} {sanitize_text(joined.splitlines()[0], WORKLOG_LINE_MAX_CHARS)}".strip() if joined else label
     if isinstance(arguments, str) and arguments.strip():
         return f"{label} {sanitize_text(arguments.strip().splitlines()[0], WORKLOG_LINE_MAX_CHARS)}".strip()
     return label
@@ -550,9 +553,10 @@ def extract_devin_turn_from_db(db_path: Path, pane_id: str, session_id: str) -> 
             if content.strip():
                 last_agent_text = sanitize_text(content)
             if tool_calls:
+                # Tool steps only (see extract_devin_turn): the message can become the
+                # final reply when closed by the next prompt, so don't dup it here.
                 if WORKLOG_ENABLED:
-                    raw = ([content] if content.strip() else []) + [devin_tool_call_line(c) for c in tool_calls]
-                    _accumulate_worklog(worklog_parts, [r for r in raw if r])
+                    _accumulate_worklog(worklog_parts, [l for l in (devin_tool_call_line(c) for c in tool_calls) if l])
             elif content.strip():
                 if current_user_text and last_agent_text:
                     completed.append(_devin_turn(last_agent_text, timestamp))
@@ -1241,11 +1245,12 @@ def extract_devin_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
             if msg.strip():
                 last_agent_text = sanitize_text(msg)
             if tool_calls:
-                # Tool-using step: the message (if any) is interim narration; record it
-                # plus each tool call as the worklog. Not a completion.
+                # Tool-using step: record each tool call. The step's message is NOT added —
+                # it also becomes last_agent_text and, when the turn is closed by the next
+                # prompt, the final reply, which would duplicate the response into the
+                # worklog. (Mirrors codex: tool steps only.)
                 if WORKLOG_ENABLED:
-                    raw = ([msg] if msg.strip() else []) + [devin_tool_call_line(c) for c in tool_calls]
-                    _accumulate_worklog(worklog_parts, [r for r in raw if r])
+                    _accumulate_worklog(worklog_parts, [l for l in (devin_tool_call_line(c) for c in tool_calls) if l])
             elif msg.strip():
                 # text with no tool calls -> final response
                 if current_user_text and last_agent_text:
