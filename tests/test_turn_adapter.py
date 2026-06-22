@@ -60,6 +60,74 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["user_text"], "<literal> What happened?")
         self.assertEqual(turn["assistant_final_text"], "Final answer only.")
 
+    def test_codex_worklog_captures_tool_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1", "started_at": 10}},
+                    {"type": "response_item", "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "Build it."}]}},
+                    {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+                        "arguments": "{\"cmd\":\"go test ./...\\n(more)\"}"}},
+                    {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch",
+                        "input": "*** Begin Patch\n*** Update File: engine.go"}},
+                    {"type": "response_item", "payload": {"type": "reasoning", "summary": [],
+                        "content": None, "encrypted_content": "gAAAencryptedopaque"}},
+                    {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1",
+                        "completed_at": 20, "last_agent_message": "Built and tests pass."}},
+                ],
+            )
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["assistant_final_text"], "Built and tests pass.")
+        wl = turn.get("worklog_text") or ""
+        self.assertIn("exec_command go test ./...", wl)  # arguments JSON parsed (cmd key)
+        self.assertNotIn("(more)", wl)  # first line of the command only
+        self.assertIn("apply_patch *** Begin Patch", wl)  # custom_tool_call input brief
+        self.assertNotIn("Built and tests pass.", wl)  # final reply not duplicated into worklog
+        self.assertNotIn("gAAAencryptedopaque", wl)  # encrypted reasoning never surfaced
+
+    def test_devin_worklog_captures_tool_calls_and_interim_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "devin.json"
+            path.write_text(json.dumps({"steps": [
+                {"source": "user", "step_id": "s1", "timestamp": 1, "message": "Fix the bug."},
+                {"source": "agent", "step_id": "s2", "timestamp": 2, "message": "Let me run the tests.",
+                 "tool_calls": [{"type": "function", "function": {"name": "shell",
+                                 "arguments": "{\"command\":\"go test ./...\"}"}}]},
+                {"source": "agent", "step_id": "s3", "timestamp": 3, "message": "Fixed.", "tool_calls": []},
+            ]}), encoding="utf-8")
+            turn = adapter.extract_devin_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["assistant_final_text"], "Fixed.")
+        wl = turn.get("worklog_text") or ""
+        self.assertIn("shell go test ./...", wl)  # OpenAI-style function.arguments parsed
+        self.assertNotIn("Fixed.", wl)  # final reply not in worklog
+        self.assertNotIn("Let me run the tests.", wl)  # step message excluded (it can become the final reply)
+
+    def test_devin_worklog_no_dup_when_turn_closed_by_next_prompt(self) -> None:
+        # A tool step's message becomes last_agent_text; if the turn is closed by the
+        # NEXT prompt (not a text-only final step), that message is the final reply and
+        # must NOT also appear in the worklog.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "devin.json"
+            path.write_text(json.dumps({"steps": [
+                {"source": "user", "step_id": "s1", "timestamp": 1, "message": "Do step one."},
+                {"source": "agent", "step_id": "s2", "timestamp": 2, "message": "Here is the summary of step one.",
+                 "tool_calls": [{"type": "function", "function": {"name": "shell",
+                                 "arguments": "{\"command\":\"ls\"}"}}]},
+                {"source": "user", "step_id": "s3", "timestamp": 3, "message": "Now step two."},
+            ]}), encoding="utf-8")
+            turn = adapter.extract_devin_turn(path, "pane-1", "session-1")
+
+        t1 = turn["recent_turns"][0]  # the turn closed by the next prompt
+        self.assertEqual(t1["assistant_final_text"], "Here is the summary of step one.")
+        wl = t1.get("worklog_text") or ""
+        self.assertIn("shell ls", wl)
+        self.assertNotIn("Here is the summary of step one.", wl)  # final reply not duplicated
+
     def test_codex_suppresses_new_internal_user_prefixes(self) -> None:
         self.assertTrue(adapter.is_internal_codex_user_text("<codex_internal_context foo>ignore"))
         self.assertTrue(adapter.is_internal_codex_user_text("  <codex_internal_context>ignore"))
