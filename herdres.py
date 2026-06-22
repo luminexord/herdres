@@ -1496,8 +1496,26 @@ def herdr_bin() -> str:
     return os.getenv("HERDR_BIN", DEFAULT_HERDR_BIN)
 
 
+def _herdr_proc(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    """Run a herdr CLI command, converting a timeout / OS error into a BridgeError.
+
+    subprocess.run(timeout=) raises subprocess.TimeoutExpired (NOT a BridgeError) when a
+    slow pane's command exceeds the budget. Left uncaught it propagated past
+    pane_turn's `except BridgeError` and aborted the whole sync — which then re-delivered
+    already-sent turns because state was never saved (a stuck "same message" loop). By
+    raising BridgeError here, one slow/unreachable pane degrades to "unavailable" and the
+    sync still completes and persists.
+    """
+    try:
+        return run_cmd([herdr_bin(), *args], timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise BridgeError(f"herdr {' '.join(args[:2])} timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise BridgeError(f"herdr {' '.join(args[:2])} failed ({exc})") from exc
+
+
 def herdr_json(args: list[str], *, timeout: int = 10) -> Any:
-    proc = run_cmd([herdr_bin(), *args], timeout=timeout)
+    proc = _herdr_proc(args, timeout)
     if proc.returncode != 0:
         raise BridgeError(sanitize_text((proc.stderr or proc.stdout or "").strip(), 500))
     try:
@@ -1507,7 +1525,7 @@ def herdr_json(args: list[str], *, timeout: int = 10) -> Any:
 
 
 def herdr_text(args: list[str], *, timeout: int = 10) -> str:
-    proc = run_cmd([herdr_bin(), *args], timeout=timeout)
+    proc = _herdr_proc(args, timeout)
     if proc.returncode != 0:
         raise BridgeError(sanitize_text((proc.stderr or proc.stdout or "").strip(), 500))
     return proc.stdout
