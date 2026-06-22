@@ -174,10 +174,14 @@ class PinnedStatusModelTests(unittest.TestCase):
         cases = {
             "claude-opus-4-8": "Claude Opus 4.8",
             "claude-sonnet-4-6": "Claude Sonnet 4.6",
+            "claude-fable-5": "Claude Fable 5",          # review: fable family must not fall through
             "claude-opus-4-8[1m]": "Claude Opus 4.8",
             "gpt-5.5": "GPT-5.5",
             "gpt-5-codex": "GPT-5 Codex",
+            "gpt-4o": "GPT-4o",                          # review: trailing 'o' must survive
+            "gpt-4o-mini": "GPT-4o Mini",
             "glm-5.2": "GLM 5.2",
+            "gemini-2.5-pro": "Gemini 2.5 Pro",          # review: multi-segment must not dot-mangle
             "": "",
         }
         for raw, exp in cases.items():

@@ -6337,19 +6337,19 @@ def pretty_model_label(raw: str) -> str:
     if not clean:
         return ""
     low = clean.lower()
-    m = re.match(r"^claude-(opus|sonnet|haiku)-(\d+)(?:[-.](\d+))?", low)
+    m = re.match(r"^claude-(opus|sonnet|haiku|fable)-(\d+)(?:[-.](\d+))?", low)
     if m:
         ver = m.group(2) + ("." + m.group(3) if m.group(3) else "")
         return f"Claude {m.group(1).capitalize()} {ver}"
-    m = re.match(r"^gpt-(\d+(?:\.\d+)?)(?:-(codex|mini|turbo|pro|nano))?", low)
+    m = re.match(r"^gpt-([\d.]+o?)(?:-(codex|mini|turbo|pro|nano))?", low)  # 5.5, 5-codex, 4o, 4o-mini
     if m:
         suffix = (" " + m.group(2).capitalize()) if m.group(2) else ""
         return f"GPT-{m.group(1)}{suffix}"
-    m = re.match(r"^(glm|kimi|gemini|deepseek|grok|qwen)[-.]?(\S+)?$", low)
+    m = re.match(r"^(glm|kimi|gemini|deepseek|grok|qwen)[-.]?(.*)$", low)
     if m:
         fam = {"glm": "GLM", "kimi": "Kimi", "gemini": "Gemini", "deepseek": "DeepSeek",
                "grok": "Grok", "qwen": "Qwen"}[m.group(1)]
-        rest = (m.group(2) or "").replace("-", ".").strip(".")
+        rest = " ".join(p.capitalize() if p.isalpha() else p for p in re.split(r"[-_]+", m.group(2)) if p)
         return f"{fam} {rest}".strip()
     return clean.replace("_", " ").strip()
 
