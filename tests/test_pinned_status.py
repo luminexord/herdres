@@ -166,5 +166,52 @@ class PinnedStatusTests(unittest.TestCase):
         self.assertEqual(herdres.pinned_status_dot(pane("Mystery", "unknown")), "⬜")
 
 
+class PinnedStatusModelTests(unittest.TestCase):
+    """The pin appends a compact model suffix from the model cached on the pane state
+    entry, degrading to the bare family label when none is known."""
+
+    def test_pretty_model_label(self):
+        cases = {
+            "claude-opus-4-8": "Claude Opus 4.8",
+            "claude-sonnet-4-6": "Claude Sonnet 4.6",
+            "claude-opus-4-8[1m]": "Claude Opus 4.8",
+            "gpt-5.5": "GPT-5.5",
+            "gpt-5-codex": "GPT-5 Codex",
+            "glm-5.2": "GLM 5.2",
+            "": "",
+        }
+        for raw, exp in cases.items():
+            self.assertEqual(herdres.pretty_model_label(raw), exp, raw)
+
+    def test_pin_shows_cached_model(self):
+        claude = pane("Claude", "working", agent="claude")
+        codex = pane("Codex", "idle", agent="codex")
+        state = {"panes": {
+            herdres.pane_key(claude): {"model": "claude-opus-4-8"},
+            herdres.pane_key(codex): {"model": "gpt-5.5"},
+        }}
+        self.assertEqual(
+            herdres.render_pinned_status(state, [claude, codex]),
+            "Claude · Opus 4.8 🟡 | Codex · GPT-5.5 🟢",
+        )
+
+    def test_pin_degrades_to_bare_label_without_model(self):
+        claude = pane("Claude", "working", agent="claude")
+        codex = pane("Codex", "idle", agent="codex")
+        self.assertEqual(
+            herdres.render_pinned_status({"panes": {}}, [claude, codex]),
+            "Claude 🟡 | Codex 🟢",
+        )
+
+    def test_suffix_strips_redundant_family_only(self):
+        # The per-agent label "Claude" already names the family, so drop it; a topic-name
+        # label (global dashboard) keeps the family for context.
+        claude = pane("Claude", "idle", agent="claude")
+        state = {"panes": {herdres.pane_key(claude): {"model": "claude-opus-4-8"}}}
+        self.assertEqual(herdres.pinned_model_suffix(state, claude, "Claude"), " · Opus 4.8")
+        self.assertEqual(herdres.pinned_model_suffix(state, claude, "Gitmoot"), " · Claude Opus 4.8")
+        self.assertEqual(herdres.pinned_model_suffix({"panes": {}}, claude, "Claude"), "")
+
+
 if __name__ == "__main__":
     unittest.main()

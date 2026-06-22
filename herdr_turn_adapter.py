@@ -1041,6 +1041,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
     current_started_at: Any = None
     current_user_text = ""
     last_assistant_text = ""
+    current_model = ""  # latest model seen (turn_context recurs ~per turn, so it is in the tail)
     completed: list[dict[str, Any]] = []
     open_turn = False
     worklog_parts: list[str] = []  # codex tool calls for the open turn
@@ -1052,6 +1053,11 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
             except Exception:
                 continue
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if event.get("type") in ("turn_context", "session_meta"):
+                model = str(payload.get("model") or "").strip()
+                if model:
+                    current_model = model
+                continue
             if event.get("type") == "event_msg" and payload.get("type") == "task_started":
                 current_turn_id = str(payload.get("turn_id") or "")
                 current_started_at = payload.get("started_at")
@@ -1120,6 +1126,8 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 latest["open_user_text"] = current_user_text
             add_stream_fields(latest, last_assistant_text, "codex")
         latest["recent_turns"] = recent
+        if current_model:
+            latest["model"] = current_model
         return latest
     if open_turn:
         turn = {
@@ -1132,6 +1140,8 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
             "user_text": current_user_text,
             "assistant_final_text": "",
         }
+        if current_model:
+            turn["model"] = current_model
         return add_stream_fields(turn, last_assistant_text, "codex")
     return {
         "available": True,
@@ -1152,6 +1162,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
     pending_api_error: dict[str, Any] | None = None  # set if an API error is the latest unresolved event
     latest_stream_text = ""
     latest_stream_updated_at: Any = ""
+    current_model = ""  # latest model seen (every assistant message carries message.model)
     worklog_parts: list[str] = []  # intermediate tool_use + text for the open turn
 
     with open_jsonl_tail(path, _claude_is_turn_start, _claude_is_turn_end) as handle:
@@ -1191,6 +1202,9 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         worklog_parts = []
                 continue
             if event_type == "assistant":
+                model = str(msg.get("model") or "").strip()
+                if model and model.lower() != "<synthetic>":
+                    current_model = model
                 if event.get("isApiErrorMessage") is True:
                     # Claude logs the API error (retries exhausted) as an
                     # assistant message; the turn stops here. Record it as the
@@ -1261,6 +1275,8 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
         latest["recent_turns"] = recent
         if pending_api_error:
             latest["api_error"] = pending_api_error
+        if current_model:
+            latest["model"] = current_model
         return latest
     if incomplete_user:
         result = {
@@ -1275,6 +1291,8 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
         }
         if pending_api_error:
             result["api_error"] = pending_api_error
+        if current_model:
+            result["model"] = current_model
         add_stream_fields(result, latest_stream_text, "claude", latest_stream_updated_at)
         return result
     result = {

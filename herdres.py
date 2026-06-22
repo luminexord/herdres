@@ -3456,6 +3456,12 @@ def extract_turn_feed_item(
         entry["pending_api_error"] = api_error
     else:
         entry.pop("pending_api_error", None)
+    # Cache the model for the pinned-status suffix. Pin-only metadata — kept out of
+    # every last_clean_* / dedup field so it can never re-deliver a turn. Cache-and-keep
+    # (don't clear on empty) so an idle pane keeps showing its last-known model.
+    model = sanitize_text(str(turn.get("model") or "").strip(), 60) if isinstance(turn, dict) else ""
+    if model:
+        entry["model"] = model
     item = attach_stream_worklog(select_turn_feed_item(turn, entry), entry, turn)
     # Prefer the actual completed turn over any visible-screen scrape. This
     # covers the auto-continue case AND the done->working status-lag race: even
@@ -6323,6 +6329,47 @@ def pinned_status_pane_label(state: dict[str, Any], pane: dict[str, Any]) -> str
     return sanitize_text(label or "pane", 80)
 
 
+def pretty_model_label(raw: str) -> str:
+    """A compact, human label for a raw model id, e.g. ``claude-opus-4-8`` -> ``Claude
+    Opus 4.8``, ``gpt-5.5`` -> ``GPT-5.5``, ``gpt-5-codex`` -> ``GPT-5 Codex``. Unknown
+    ids are tidied but otherwise preserved. Returns "" for empty input."""
+    clean = re.sub(r"\[[^\]]*\]", "", str(raw or "")).strip()  # drop context-window tags like [1m]
+    if not clean:
+        return ""
+    low = clean.lower()
+    m = re.match(r"^claude-(opus|sonnet|haiku)-(\d+)(?:[-.](\d+))?", low)
+    if m:
+        ver = m.group(2) + ("." + m.group(3) if m.group(3) else "")
+        return f"Claude {m.group(1).capitalize()} {ver}"
+    m = re.match(r"^gpt-(\d+(?:\.\d+)?)(?:-(codex|mini|turbo|pro|nano))?", low)
+    if m:
+        suffix = (" " + m.group(2).capitalize()) if m.group(2) else ""
+        return f"GPT-{m.group(1)}{suffix}"
+    m = re.match(r"^(glm|kimi|gemini|deepseek|grok|qwen)[-.]?(\S+)?$", low)
+    if m:
+        fam = {"glm": "GLM", "kimi": "Kimi", "gemini": "Gemini", "deepseek": "DeepSeek",
+               "grok": "Grok", "qwen": "Qwen"}[m.group(1)]
+        rest = (m.group(2) or "").replace("-", ".").strip(".")
+        return f"{fam} {rest}".strip()
+    return clean.replace("_", " ").strip()
+
+
+def pinned_model_suffix(state: dict[str, Any], pane: dict[str, Any], label: str) -> str:
+    """`" · <pretty model>"` for the pin, from the model cached on the pane state entry,
+    or "" when unknown (graceful degrade to the bare label). A leading family word already
+    present in `label` is dropped so "Claude" + "Claude Opus 4.8" reads "Claude · Opus 4.8"."""
+    entries = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    entry = entries.get(pane_key(pane)) if isinstance(entries, dict) else None
+    pretty = pretty_model_label(str(entry.get("model") or "")) if isinstance(entry, dict) else ""
+    if not pretty:
+        return ""
+    words = pretty.split()
+    first_label_word = label.strip().split()[0].lower() if label.strip() else ""
+    if words and first_label_word and words[0].lower() == first_label_word:
+        pretty = " ".join(words[1:]).strip() or pretty
+    return f" · {pretty}"
+
+
 def render_pinned_status(
     state: dict[str, Any],
     panes: list[dict[str, Any]],
@@ -6345,7 +6392,8 @@ def render_pinned_status(
         if not pinned_status_pane_open(pane):
             continue
         label = label_fn(pane)
-        rows.append((status_severity(status_icon_key(pane)), label, f"{label} {pinned_status_dot(pane)}"))
+        display = f"{label}{pinned_model_suffix(state, pane, label)}"
+        rows.append((status_severity(status_icon_key(pane)), label, f"{display} {pinned_status_dot(pane)}"))
     if not rows:
         return "No active panes."
     rows.sort(key=lambda r: (-r[0], r[1]))
