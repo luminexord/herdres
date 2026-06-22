@@ -379,6 +379,149 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["user_text"], "Diagnose it.")
         self.assertEqual(turn["assistant_final_text"], "Final diagnosis.")
 
+    def _claude_turn_with_tools(self):
+        return [
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": "Fix the bug."},
+            },
+            {
+                "type": "assistant",
+                "uuid": "step-1",
+                "message": {
+                    "role": "assistant",
+                    "stop_reason": "tool_use",
+                    "content": [
+                        {"type": "text", "text": "Let me run the tests."},
+                        {"type": "tool_use", "name": "Bash", "input": {"command": "go test ./...\n(more)"}},
+                    ],
+                },
+            },
+            {  # tool_result comes back as an internal user event — must not break the turn
+                "type": "user",
+                "uuid": "tool-result-1",
+                "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+            },
+            {
+                "type": "assistant",
+                "uuid": "step-2",
+                "message": {
+                    "role": "assistant",
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": "/root/gitmoot/engine.go"}}],
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "assistant-final",
+                "timestamp": "2026-06-15T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "Fixed and tests pass."}],
+                },
+            },
+        ]
+
+    def test_claude_worklog_captures_tool_use_and_interim_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, self._claude_turn_with_tools())
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn["assistant_final_text"], "Fixed and tests pass.")
+        worklog = turn.get("worklog_text") or ""
+        # tool calls (with a short, single-line arg) + interim narration are preserved
+        self.assertIn("Let me run the tests.", worklog)
+        self.assertIn("Bash go test ./...", worklog)
+        self.assertNotIn("(more)", worklog)  # multi-line tool args trimmed to first line
+        self.assertIn("Edit engine.go", worklog)  # file paths shown as basename
+        # the final response text is NOT duplicated into the worklog
+        self.assertNotIn("Fixed and tests pass.", worklog)
+
+    def test_claude_worklog_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, self._claude_turn_with_tools())
+            with patch.object(adapter, "WORKLOG_ENABLED", False):
+                turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["assistant_final_text"], "Fixed and tests pass.")
+        self.assertNotIn("worklog_text", turn)
+
+    def test_claude_worklog_spans_coalesced_consecutive_end_turns(self) -> None:
+        # Two end_turns under ONE prompt (no intervening user event) coalesce into a
+        # single turn; the worklog must include the tool step that ran BETWEEN them.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Do it."}},
+                    {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "first-cmd"}}]}},
+                    {"type": "assistant", "uuid": "e1", "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Done one."}]}},
+                    {"type": "assistant", "uuid": "s2", "message": {"role": "assistant", "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "second-cmd"}}]}},
+                    {"type": "assistant", "uuid": "e2", "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Done one revised."}]}},
+                ],
+            )
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["assistant_final_text"], "Done one revised.")
+        self.assertEqual(len(turn["recent_turns"]), 1)  # coalesced into one turn
+        worklog = turn.get("worklog_text") or ""
+        self.assertIn("Bash first-cmd", worklog)
+        self.assertIn("Bash second-cmd", worklog)  # the step between the two end_turns
+
+    def test_claude_worklog_redacts_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Deploy."}},
+                    {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                        "content": [
+                            {"type": "tool_use", "name": "Bash", "input": {"command": "export TOKEN=ghp_supersecretvalue && go build"}},
+                            {"type": "tool_use", "name": "WebFetch", "input": {"url": "https://user:pw@example.com/x"}},
+                        ]}},
+                    {"type": "assistant", "uuid": "e1", "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Deployed."}]}},
+                ],
+            )
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        worklog = turn.get("worklog_text") or ""
+        self.assertNotIn("ghp_supersecretvalue", worklog)  # secret value masked
+        self.assertIn("***", worklog)
+        self.assertNotIn("user:pw@", worklog)  # url credentials masked
+        self.assertIn("go build", worklog)  # non-secret part of the command preserved
+
+    def test_claude_worklog_strips_control_chars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Go."}},
+                    {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                        "content": [{"type": "text", "text": "step‮RTL​zw done"}]}},
+                    {"type": "assistant", "uuid": "e1", "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "ok"}]}},
+                ],
+            )
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        worklog = turn.get("worklog_text") or ""
+        self.assertNotIn("‮", worklog)  # bidi override stripped
+        self.assertNotIn("​", worklog)  # zero-width space stripped
+        self.assertIn("step", worklog)
+
     def test_claude_suppresses_internal_task_notification_user_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "session-1.jsonl"

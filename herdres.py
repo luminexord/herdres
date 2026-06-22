@@ -2858,8 +2858,10 @@ def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
     text_parts: list[str] = []
     if user_text:
         text_parts.extend([USER_PROMPT_LABEL, user_text, ""])
-    if worklog_text:
-        text_parts.extend([WORKLOG_LABEL, worklog_text, ""])
+    # worklog_text is intentionally NOT folded into item["text"]: that field is hashed by
+    # clean_feed_hash for dedup, and a worklog attached to an already-delivered turn would
+    # change the hash and re-deliver (duplicate) the turn. The worklog still renders via
+    # the dedicated worklog_text field (render_turn_item_html), just not through item["text"].
     text_parts.append(assistant_final)
     return {
         "kind": "turn",
@@ -3473,13 +3475,13 @@ def clear_stream_state(entry: dict[str, Any]) -> None:
 def item_plain_text(item: dict[str, Any]) -> str:
     if str(item.get("kind") or "").lower() == "turn":
         user_text = str(item.get("user_text") or "").strip()
-        worklog_text = str(item.get("worklog_text") or "").strip()
         assistant_final = str(item.get("assistant_final_text") or "").strip()
         parts: list[str] = []
         if user_text:
             parts.extend([USER_PROMPT_LABEL, user_text, ""])
-        if worklog_text:
-            parts.extend([WORKLOG_LABEL, worklog_text, ""])
+        # worklog_text is intentionally excluded (see clean_feed_hash): the dedup
+        # fallback compares this plain text, so including the worklog would let a
+        # worklog-only change defeat dedup and re-deliver an already-sent turn.
         if assistant_final:
             parts.append(assistant_final)
         return sanitize_text("\n".join(parts).strip(), FINAL_REPLY_MAX_CHARS)
@@ -5234,11 +5236,17 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
         "interaction_id": item.get("interaction_id"),
         "interaction_revision": item.get("interaction_revision"),
         "user_text": item.get("user_text"),
-        "worklog_text": item.get("worklog_text"),
         "assistant_final_text": item.get("assistant_final_text"),
         "questions": item.get("questions") or [],
         "answers": item.get("answers") or {},
     }
+    # worklog_text is deliberately NOT in the dedup payload: it is supplementary
+    # render data (the intermediate steps), and the adapter can attach it to an
+    # ALREADY-DELIVERED turn (a completed turn re-parsed with the worklog). Hashing
+    # it would flip same_delivered_content and re-deliver the turn — which, for a
+    # turn whose live anchor has moved on, posts a DUPLICATE message. So the worklog
+    # only ever rides along on a delivery triggered by real content (user_text /
+    # assistant_final_text); it never independently triggers one.
     if include_render_version:
         payload["render_version"] = RICH_RENDER_VERSION
         payload["worklog_label"] = item.get("worklog_label")
@@ -12699,6 +12707,9 @@ def _update_files_plan() -> list[dict[str, Any]]:
         {"src": "herdres.py", "dest": _installed_bin(), "mode": 0o755},
         {"src": "herdres_gateway.py", "dest": INSTALL_BIN_DIR / "herdres-gateway", "mode": 0o755},
         {"src": "herdres_routing.py", "dest": INSTALL_BIN_DIR / "herdres_routing.py", "mode": 0o644},
+        # The `pane turn` shim (HERDR_BIN points at it); shipping it via update keeps
+        # the turn/worklog adapter in lockstep with herdres.py instead of installer-only.
+        {"src": "herdr_turn_adapter.py", "dest": INSTALL_BIN_DIR / "herdr_turn_adapter.py", "mode": 0o755},
         {"src": "herdr_topic_bridge.py", "dest": INSTALL_SHARE_DIR / "herdr_topic_bridge.py", "mode": 0o644},
         {
             "src": "herdres-plugin/herdr-plugin.toml",

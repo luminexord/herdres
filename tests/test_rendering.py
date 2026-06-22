@@ -2662,6 +2662,69 @@ class StreamingIntegrationTests(unittest.TestCase):
         send_feed_item.assert_not_called()
         self.assertEqual(entry["last_clean_hash"], herdres.clean_feed_hash(item))
 
+    def test_worklog_on_delivered_turn_does_not_repost(self) -> None:
+        """A worklog attached to an ALREADY-DELIVERED turn must be a no-op.
+
+        worklog_text is excluded from clean_feed_hash, item_plain_text, and item["text"],
+        so re-parsing a completed turn with a worklog neither re-sends nor edits it.
+        Without this, the worklog flips the dedup hash and re-delivers the turn as a
+        DUPLICATE (the issue #3 live-test regression).
+        """
+        state, pane, _key, entry = self._state()
+        counters, caps = self._caps()
+        delivered = {
+            "available": True,
+            "complete": True,
+            "turn_id": "turn-1",
+            "user_text": "Run tests",
+            "assistant_final_text": "Tests passed.",
+        }
+        item = herdres.make_turn_feed_item(delivered)
+        assert item is not None
+        entry.update({
+            "last_clean_item": item,
+            "last_clean_text": herdres.item_plain_text(item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(item, include_render_version=False),
+            "last_clean_hash": herdres.clean_feed_hash(item),
+            "last_clean_render_hash": herdres.clean_feed_hash(item),
+            "last_clean_message_id": "3001",
+            "last_turn_id": "turn-1",
+        })
+        with_worklog = dict(delivered, worklog_text="Bash go test ./...\nEdit engine.go")
+        worklog_item = herdres.make_turn_feed_item(with_worklog)
+
+        # The worklog must not change any dedup input...
+        self.assertEqual(herdres.clean_feed_hash(item), herdres.clean_feed_hash(worklog_item))
+        self.assertEqual(
+            herdres.clean_feed_hash(item, include_render_version=False),
+            herdres.clean_feed_hash(worklog_item, include_render_version=False),
+        )
+        self.assertEqual(herdres.item_plain_text(item), herdres.item_plain_text(worklog_item))
+        # ...but is still carried on the item for rendering.
+        self.assertIn("Bash go test", worklog_item["worklog_text"])
+
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3002"})
+        edit_feed_item = Mock(return_value={"ok": True})
+        with patch.multiple(
+            herdres,
+            pane_turn=Mock(return_value=with_worklog),
+            send_feed_item=send_feed_item,
+            edit_feed_item=edit_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        # The invariant: NO new message (no duplicate). The worklog may only ride along
+        # as an in-place edit of the turn's OWN existing message (3001), never a fresh send.
+        send_feed_item.assert_not_called()
+        for call in edit_feed_item.call_args_list:
+            self.assertEqual(call.args[1], "3001", "worklog must only edit the turn's own message")
+
     def test_sync_streams_open_turn_after_completed_turn_already_delivered(self) -> None:
         state, pane, _key, entry = self._state()
         completed_turn = {

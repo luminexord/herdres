@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,67 @@ CLAUDE_FALLBACK_READ_LINES = int(os.getenv("HERDRES_CLAUDE_FALLBACK_READ_LINES",
 # turn) instead of collapsing to only the newest one.
 RECENT_TURNS = int(os.getenv("HERDRES_RECENT_TURNS", "12"))
 DEVIN_SESSION_START_SKEW_SECONDS = int(os.getenv("HERDRES_DEVIN_SESSION_START_SKEW", "30"))
+# Per-turn worklog: summarize the intermediate tool_use + interim assistant text so a
+# COMPLETED turn carries a worklog the bridge renders under the Response. Previously the
+# worklog was live-only (open turns) and cleared on completion; this persists it. Toggle
+# off with HERDRES_TURN_ADAPTER_WORKLOG=0.
+WORKLOG_ENABLED = os.getenv("HERDRES_TURN_ADAPTER_WORKLOG", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+WORKLOG_MAX_CHARS = int(os.getenv("HERDRES_TURN_ADAPTER_WORKLOG_MAX_CHARS", "4000"))
+WORKLOG_LINE_MAX_CHARS = int(os.getenv("HERDRES_TURN_ADAPTER_WORKLOG_LINE_MAX_CHARS", "160"))
+# Cap the accumulator itself (not just the emitted join) so a very long turn can't grow
+# worklog_parts without bound; we keep the most recent lines (closest to the answer).
+WORKLOG_MAX_LINES = int(os.getenv("HERDRES_TURN_ADAPTER_WORKLOG_MAX_LINES", "400"))
+
+# Redact obvious secrets before a tool arg / interim line reaches Telegram: KEY=value or
+# "Header: value" for auth-ish keys, and URL embedded credentials. Best-effort, not a
+# guarantee — worklog content is a summary, so over-redaction is preferred to a leak.
+_SECRET_KV_RE = re.compile(
+    r"(?i)\b(authorization|bearer|api[_-]?key|access[_-]?key|client[_-]?secret|secret|token|password|passwd|passphrase)\b"
+    r"([\"']?\s*[:=]\s*[\"']?)(\S+)"
+)
+_URL_CRED_RE = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
+
+
+def _redact_secrets(text: str) -> str:
+    redacted = _SECRET_KV_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}***", text)
+    return _URL_CRED_RE.sub("://***@", redacted)
+
+
+def _strip_control(text: str) -> str:
+    # Drop control + format chars (incl. NUL, bidi overrides like U+202E, zero-width) that
+    # could spoof or corrupt the rendered worklog; keep tabs.
+    return "".join(ch for ch in text if ch == "\t" or unicodedata.category(ch) not in ("Cc", "Cf"))
+
+
+def _clean_worklog_line(text: str) -> str:
+    return _redact_secrets(_strip_control(text)).strip()
+
+
+def _join_worklog(parts: list[str]) -> str:
+    """Join worklog lines keeping the MOST RECENT that fit WORKLOG_MAX_CHARS.
+
+    Truncation keeps the tail (the steps closest to the final answer), not the oldest
+    boilerplate — and the [...] marker shows when earlier steps were dropped.
+    """
+    kept: list[str] = []
+    total = 0
+    dropped = False
+    for line in reversed(parts):
+        add = len(line) + 1
+        if kept and total + add > WORKLOG_MAX_CHARS:
+            dropped = True
+            break
+        kept.append(line)
+        total += add
+    kept.reverse()
+    if dropped:
+        kept.insert(0, "[...]")
+    return "\n".join(kept).strip()
 
 
 def real_herdr_bin() -> str:
@@ -113,6 +175,64 @@ def content_text(content: Any) -> str:
                 parts.append(text)
         return "\n".join(part for part in parts if part)
     return ""
+
+
+# File-path-ish tool args are shown as a basename; everything else as a first-line brief.
+_TOOL_PATH_KEYS = ("file_path", "path", "notebook_path")
+_TOOL_ARG_KEYS = (
+    "command",
+    "file_path",
+    "path",
+    "notebook_path",
+    "pattern",
+    "query",
+    "url",
+    "description",
+    "prompt",
+    "subagent_type",
+)
+
+
+def summarize_tool_use(name: Any, tool_input: Any) -> str:
+    """One concise worklog line for a tool_use block: the tool name plus a short arg."""
+    label = sanitize_text(str(name or "tool").strip(), 40) or "tool"
+    if not isinstance(tool_input, dict):
+        return label
+    for key in _TOOL_ARG_KEYS:
+        val = tool_input.get(key)
+        if isinstance(val, str) and val.strip():
+            brief = val.strip().splitlines()[0]
+            if key in _TOOL_PATH_KEYS:
+                brief = brief.rstrip("/").rsplit("/", 1)[-1]
+            brief = sanitize_text(brief, WORKLOG_LINE_MAX_CHARS)
+            return f"{label} {brief}".strip()
+    return label
+
+
+def claude_worklog_lines(content: Any) -> list[str]:
+    """Worklog lines for one assistant message: tool_use summaries + interim text.
+
+    Unlike ``content_text`` (which keeps only text blocks), this also surfaces the
+    tool calls — the intermediate steps that make up the worklog under the Response.
+    """
+    raw: list[str] = []
+    if not isinstance(content, list):
+        raw = content_text(content).splitlines()
+    else:
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype == "tool_use":
+                raw.append(summarize_tool_use(item.get("name"), item.get("input")))
+            elif itype == "text":
+                raw.extend(str(item.get("text") or "").splitlines())
+    lines: list[str] = []
+    for ln in raw:
+        cleaned = _clean_worklog_line(ln)  # strip control chars + redact secrets
+        if cleaned:
+            lines.append(sanitize_text(cleaned, WORKLOG_LINE_MAX_CHARS))
+    return lines
 
 
 def is_internal_codex_user_text(text: str) -> bool:
@@ -821,6 +941,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
     pending_api_error: dict[str, Any] | None = None  # set if an API error is the latest unresolved event
     latest_stream_text = ""
     latest_stream_updated_at: Any = ""
+    worklog_parts: list[str] = []  # intermediate tool_use + text for the open turn
 
     with path.open(encoding="utf-8", errors="replace") as handle:
         for raw in handle:
@@ -843,6 +964,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     pending_api_error = None
                     latest_stream_text = ""
                     latest_stream_updated_at = ""
+                    worklog_parts = []
                 else:
                     # Internal (<task-notification> etc.) or empty user event. It
                     # still marks a turn boundary, but must NOT destroy a real
@@ -855,6 +977,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         incomplete_user = True
                         latest_stream_text = ""
                         latest_stream_updated_at = ""
+                        worklog_parts = []
                 continue
             if event_type == "assistant":
                 if event.get("isApiErrorMessage") is True:
@@ -869,7 +992,8 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         "at": event.get("timestamp"),
                     }
                     continue
-                text = content_text(msg.get("content")).strip()
+                content = msg.get("content")
+                text = content_text(content).strip()
                 if text and msg.get("stop_reason") == "end_turn" and pending_user_uuid:
                     turn = {
                         "available": True,
@@ -885,6 +1009,10 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         "assistant_final_text": sanitize_text(text),
                         "_prompt_uuid": pending_user_uuid,
                     }
+                    if WORKLOG_ENABLED and worklog_parts:
+                        worklog = _join_worklog(worklog_parts)
+                        if worklog:
+                            turn["worklog_text"] = worklog
                     # Coalesce consecutive end_turns under the same prompt (the
                     # last non-empty assistant message wins) rather than emitting
                     # a duplicate turn for the same prompt.
@@ -897,9 +1025,18 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     pending_api_error = None  # a real completion supersedes any prior API error
                     latest_stream_text = ""
                     latest_stream_updated_at = ""
-                elif text and incomplete_user and pending_user_text:
-                    latest_stream_text = sanitize_text(text)
-                    latest_stream_updated_at = event.get("timestamp") or ""
+                elif pending_user_text:
+                    # Intermediate step (tool_use and/or interim text) inside an open
+                    # prompt. Gated on pending_user_text (NOT incomplete_user) so steps
+                    # between coalesced consecutive end_turns of the same prompt are
+                    # captured too; tool_use-only messages have no text but still count.
+                    if WORKLOG_ENABLED:
+                        worklog_parts.extend(claude_worklog_lines(content))
+                        if len(worklog_parts) > WORKLOG_MAX_LINES:
+                            del worklog_parts[: len(worklog_parts) - WORKLOG_MAX_LINES]
+                    if text and incomplete_user:
+                        latest_stream_text = sanitize_text(text)
+                        latest_stream_updated_at = event.get("timestamp") or ""
 
     if completed:
         recent = [{k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]]
