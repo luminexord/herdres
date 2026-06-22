@@ -743,6 +743,103 @@ class TurnAdapterTests(unittest.TestCase):
                 turn = adapter.pane_turn("p")["result"]["turn"]
             self.assertEqual(turn["session_match_source"], "exclusive_cwd_mtime")
 
+    def test_claude_stale_herdr_value_loses_to_pid_map(self) -> None:
+        # THE X-topic regression: Herdr reports a NON-EMPTY but DEAD session id
+        # (a /resume after a 529 left it stale); the live pid map points at the
+        # active session. The pid map must win, and the stale id is surfaced.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "-tmp-proj"
+            project.mkdir()
+            sessions = root / "sessions"
+            sessions.mkdir()
+            self._claude_session_file(project, "sidStale", "old", "Dead: what would you like to work on?")
+            self._claude_session_file(project, "sidActive", "do the work", "Done: the real final reply.")
+            self._pid_map_file(sessions, 101, "sidActive", "/tmp/proj", "111")
+            pane = {"pane_id": "p", "agent": "claude", "cwd": "/tmp/proj", "foreground_cwd": "/tmp/proj",
+                    "agent_session": {"agent": "claude", "kind": "id", "source": "herdr:claude", "value": "sidStale"}}
+            with patch.dict(adapter.os.environ, {"CLAUDE_PROJECTS_DIR": str(root), "CLAUDE_SESSIONS_DIR": str(sessions)}), \
+                 patch.object(adapter, "pane_from_list", Mock(return_value=pane)), \
+                 patch.object(adapter, "claude_pid_for_pane", Mock(return_value=101)), \
+                 patch.object(adapter, "proc_starttime", Mock(return_value="111")):
+                turn = adapter.pane_turn("p")["result"]["turn"]
+            self.assertEqual(turn["session_match_source"], "pid_session_map")
+            self.assertEqual(turn["agent_session_id"], "sidActive")
+            self.assertEqual(turn["assistant_final_text"], "Done: the real final reply.")
+            self.assertEqual(turn["herdr_session_id"], "sidStale")
+
+    def test_claude_herdr_value_used_when_pid_map_missing(self) -> None:
+        # PID hop broken (no foreground claude found) but Herdr's id is present
+        # and its file exists -> use it (ranks below pid map, above heuristics).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "-tmp-proj"
+            project.mkdir()
+            sessions = root / "sessions"
+            sessions.mkdir()
+            self._claude_session_file(project, "sidH", "prompt", "herdr fallback answer")
+            pane = {"pane_id": "p", "agent": "claude", "cwd": "/tmp/proj", "foreground_cwd": "/tmp/proj",
+                    "agent_session": {"value": "sidH"}}
+            with patch.dict(adapter.os.environ, {"CLAUDE_PROJECTS_DIR": str(root), "CLAUDE_SESSIONS_DIR": str(sessions)}), \
+                 patch.object(adapter, "pane_from_list", Mock(return_value=pane)), \
+                 patch.object(adapter, "claude_pid_for_pane", Mock(return_value=None)):
+                turn = adapter.pane_turn("p")["result"]["turn"]
+            self.assertEqual(turn["session_match_source"], "herdr_agent_session")
+            self.assertEqual(turn["agent_session_id"], "sidH")
+            self.assertEqual(turn["assistant_final_text"], "herdr fallback answer")
+
+    def test_claude_pid_map_self_guard_rejects_mismatched_pid_field(self) -> None:
+        # A map file whose own "pid" field disagrees with the queried PID is
+        # corrupt/misnamed and must be rejected (falls through to heuristics).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "-tmp-proj"
+            project.mkdir()
+            sessions = root / "sessions"
+            sessions.mkdir()
+            self._claude_session_file(project, "sidA", "prompt A", "answer A")
+            self._pid_map_file(sessions, 999, "sidA", "/tmp/proj", "111")  # file says pid 999
+            (sessions / "101.json").write_text((sessions / "999.json").read_text(), encoding="utf-8")  # misnamed copy
+            pane = {"pane_id": "p", "agent": "claude", "cwd": "/tmp/proj",
+                    "foreground_cwd": "/tmp/proj", "agent_session": None}
+            with patch.dict(adapter.os.environ, {"CLAUDE_PROJECTS_DIR": str(root), "CLAUDE_SESSIONS_DIR": str(sessions)}), \
+                 patch.object(adapter, "pane_from_list", Mock(return_value=pane)), \
+                 patch.object(adapter, "claude_pid_for_pane", Mock(return_value=101)), \
+                 patch.object(adapter, "proc_starttime", Mock(return_value="111")), \
+                 patch.object(adapter, "claude_sibling_count", Mock(return_value=1)), \
+                 patch.object(adapter, "pane_recent_text", Mock(return_value="noise")):
+                turn = adapter.pane_turn("p")["result"]["turn"]
+            self.assertEqual(turn["session_match_source"], "exclusive_cwd_mtime")
+
+    def test_claude_pid_for_pane_ancestor_walk_finds_claude_parent(self) -> None:
+        # Foreground leaf is a Bash tool child; walk up to its claude parent.
+        info = {"result": {"process_info": {
+            "foreground_processes": [{"name": "bash", "pid": 200}],
+            "foreground_process_group_id": 100}}}
+        with patch.object(adapter, "run_real_herdr_json", Mock(return_value=info)), \
+             patch.object(adapter, "proc_ppid", Mock(side_effect=lambda p: {200: 100, 100: 1}.get(p))), \
+             patch.object(adapter, "proc_is_claude", Mock(side_effect=lambda p: p == 100)):
+            self.assertEqual(adapter.claude_pid_for_pane("pane"), 100)
+
+    def test_claude_pid_for_pane_skips_malformed_entry_without_aborting(self) -> None:
+        # A foreground entry missing its pid must not abort resolution; the later
+        # valid claude entry (and otherwise the pgid fallback) must still win.
+        info = {"result": {"process_info": {
+            "foreground_processes": [{"name": "bash"}, {"name": "claude", "pid": 101}],
+            "foreground_process_group_id": 99}}}
+        with patch.object(adapter, "run_real_herdr_json", Mock(return_value=info)):
+            self.assertEqual(adapter.claude_pid_for_pane("pane"), 101)
+
+    def test_claude_pid_for_pane_falls_back_to_pgid(self) -> None:
+        # No claude-named foreground proc and no claude ancestor -> pgid leader.
+        info = {"result": {"process_info": {
+            "foreground_processes": [{"name": "bash", "pid": 200}],
+            "foreground_process_group_id": 100}}}
+        with patch.object(adapter, "run_real_herdr_json", Mock(return_value=info)), \
+             patch.object(adapter, "proc_ppid", Mock(return_value=1)), \
+             patch.object(adapter, "proc_is_claude", Mock(return_value=False)):
+            self.assertEqual(adapter.claude_pid_for_pane("pane"), 100)
+
     def test_extract_claude_turn_preserves_real_prompt_through_trailing_internal_user(self) -> None:
         # Live X Issues case: a real prompt is answered, then the agent
         # auto-continues on an internal <task-notification>. The real prompt must

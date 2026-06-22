@@ -518,25 +518,79 @@ def proc_starttime(pid: int) -> str | None:
         return None
 
 
+def proc_ppid(pid: int) -> int | None:
+    """Parent PID (field 4 of /proc/<pid>/stat), or None.
+
+    Same comm-aware parse as proc_starttime: state is index 0 after ") ",
+    ppid is index 1. Used to walk up from a tool child to its claude parent.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
+            data = handle.read()
+        rest = data[data.rfind(")") + 2:]
+        return int(rest.split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def proc_is_claude(pid: int) -> bool:
+    """True if /proc/<pid>/comm or its argv0 names the claude binary.
+
+    comm is truncated to 15 chars (fine for "claude") and reads "node" for a
+    wrapper install, so we also check the argv0 basename as a fallback.
+    """
+    try:
+        with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as handle:
+            if handle.read().strip() == "claude":
+                return True
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            argv0 = handle.read().split(b"\x00", 1)[0].decode("utf-8", "replace")
+    except OSError:
+        return False
+    return bool(argv0) and os.path.basename(argv0) == "claude"
+
+
 def claude_pid_for_pane(pane_id: str) -> int | None:
     """The live claude PID for a pane via `herdr pane process-info`.
 
-    Deterministic: Herdr reports the pane's foreground process. claude is its
-    own process-group leader, so foreground_process_group_id is a safe fallback
-    when a child (bash/node) is momentarily the named foreground process.
+    Deterministic, in priority order: (1) a foreground process that IS claude;
+    (2) the claude ancestor of a foreground tool child (claude stays the pane's
+    process while a Bash/node child is the momentary foreground leaf); (3) the
+    foreground process-group leader as a last resort. Whatever PID is returned
+    is still validated against Claude's own pid->session map (procStart + cwd +
+    pid) by the caller, so a wrong guess fails closed rather than mis-attributes.
     """
     try:
         data = run_real_herdr_json(["pane", "process-info", "--pane", pane_id])
         info = data.get("result", {}).get("process_info", {})
         procs = info.get("foreground_processes")
+        leaf_pids: list[int] = []
         if isinstance(procs, list):
             for proc in procs:
                 if not isinstance(proc, dict):
                     continue
+                try:
+                    pid = int(proc["pid"])
+                except (KeyError, TypeError, ValueError):
+                    continue  # one malformed entry must not abort resolution.
                 argv = proc.get("argv")
                 argv0 = str(argv[0]) if isinstance(argv, list) and argv else ""
                 if str(proc.get("name") or "") == "claude" or argv0 == "claude":
-                    return int(proc["pid"])
+                    return pid
+                leaf_pids.append(pid)
+        # Walk up from each foreground leaf to a claude parent (bounded).
+        for leaf in leaf_pids:
+            pid = leaf
+            for _ in range(8):
+                ppid = proc_ppid(pid)
+                if ppid is None or ppid <= 1:
+                    break
+                if proc_is_claude(ppid):
+                    return ppid
+                pid = ppid
         pgid = info.get("foreground_process_group_id")
         if pgid is not None:
             return int(pgid)
@@ -565,6 +619,11 @@ def claude_session_record_for_pid(pid: int, expected_cwd: str = "") -> dict[str,
         return None
     session_id = str(record.get("sessionId") or "")
     if not session_id:
+        return None
+    try:
+        if int(record.get("pid")) != pid:
+            return None  # map file is for a different PID (corrupt/misnamed).
+    except (TypeError, ValueError):
         return None
     started = proc_starttime(pid)
     if started is not None and str(record.get("procStart")) != str(started):
@@ -601,11 +660,27 @@ def infer_claude_turn_from_visible_pane(pane: dict[str, Any], pane_id: str) -> d
     # Reads exactly one session file (no project-dir glob, no sibling pane-list
     # call, no visible-text scrape), which also removes the timeout class for
     # large project dirs. Falls through to the heuristics only on a broken hop.
+    sess = pane.get("agent_session")
+    herdr_sid = str(sess.get("value") or "") if isinstance(sess, dict) else ""
     pid_path, pid_sid = resolve_claude_session_via_pid(pane, pane_id)
     if pid_path is not None:
         turn = extract_claude_turn(pid_path, pane_id, pid_sid)
         turn["session_match_source"] = "pid_session_map"
+        if herdr_sid and herdr_sid != pid_sid:
+            # Herdr's cached agent_session.value went stale (e.g. /resume after a
+            # 529); the live pid map wins. Surfaced for observability only.
+            turn["herdr_session_id"] = herdr_sid
         return result_turn(turn)
+
+    # SECONDARY: Herdr's cached agent_session.value. A definite id, but cached at
+    # pane-bind and stale across a resume/restart, so it ranks below the live pid
+    # map. Used only when the pid hop is broken AND the file still exists.
+    if herdr_sid:
+        path = claude_session_path(herdr_sid)
+        if path is not None and path.exists():
+            turn = extract_claude_turn(path, pane_id, herdr_sid)
+            turn["session_match_source"] = "herdr_agent_session"
+            return result_turn(turn)
 
     candidates: list[tuple[float, Path, dict[str, Any]]] = []
     for path in claude_candidate_paths_for_pane(pane):
@@ -1012,11 +1087,15 @@ def pane_turn(pane_id: str) -> dict[str, Any]:
     if pane.get("_adapter_error"):
         return unavailable(str(pane.get("_adapter_error")))
     agent = str(pane.get("agent") or "").lower()
+    # Claude resolves through the deterministic pid map FIRST, regardless of
+    # whether Herdr supplied agent_session.value: that value is cached at
+    # pane-bind and goes stale across a /resume or restart (e.g. after an API
+    # 529), so trusting it here would read a dead session and stop delivery.
+    if agent == "claude":
+        return infer_claude_turn_from_visible_pane(pane, pane_id)
     session = pane.get("agent_session") if isinstance(pane.get("agent_session"), dict) else {}
     session_id = str(session.get("value") or "")
     if not session_id:
-        if agent == "claude":
-            return infer_claude_turn_from_visible_pane(pane, pane_id)
         if agent == "devin":
             session_id = devin_resolve_session_id(pane)
             if not session_id:
@@ -1029,12 +1108,6 @@ def pane_turn(pane_id: str) -> dict[str, Any]:
         if not path:
             return unavailable("session_file_not_found", pane_id=pane_id, agent=agent, agent_session_id=session_id)
         return result_turn(extract_codex_turn(path, pane_id, session_id))
-
-    if agent == "claude":
-        path = claude_session_path(session_id)
-        if not path:
-            return unavailable("session_file_not_found", pane_id=pane_id, agent=agent, agent_session_id=session_id)
-        return result_turn(extract_claude_turn(path, pane_id, session_id))
 
     if agent == "devin":
         path = devin_session_path(session_id)
