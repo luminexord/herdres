@@ -8851,6 +8851,130 @@ def edit_feed_item(
     )
 
 
+def upsert_rich_chunks(
+    chat_id: str,
+    existing_ids: list[str],
+    chunks: list[str],
+    *,
+    telegram: dict[str, Any] | None = None,
+    fallback_texts: list[str] | None = None,
+    thread_id: str | int | None = None,
+    notify: bool = False,
+    reply_markup: dict[str, Any] | None = None,
+    reply_to_message_id: str | int | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Deliver pre-split `chunks` as an ordered SET of messages, reusing `existing_ids`
+    in place so a turn occupies one message (or one tracked continuation set), never an
+    orphaned duplicate: EDIT overlapping chunks, SEND new tail chunks, DELETE removed
+    tail chunks when content shrank. reply_markup attaches to the LAST chunk only;
+    reply_to to a freshly-sent FIRST chunk only.
+
+    Returns {ok, message_ids: [...ordered...], message_id: ids[0]}. Anchor (index 0)
+    not_found -> {ok: False, anchor_lost: True} so the caller re-sends the whole set
+    fresh. A non-anchor not_found truncates the existing list there and re-sends the
+    remaining chunks as a fresh tail. On a transient mid-way failure the ids that landed
+    are returned (partial) so the caller can persist them and never re-orphan."""
+    chunks = [c for c in (chunks or []) if html_to_plain(c).strip()]
+    if not chunks:
+        return {"ok": False, "format": "rich", "kind": "empty"}
+    existing = [str(m) for m in (existing_ids or []) if str(m or "").strip()]
+    last = len(chunks) - 1
+    empty_markup = {"inline_keyboard": []}
+    result_ids: list[str] = []
+    i = 0
+    while i < len(chunks):
+        chunk = chunks[i]
+        fallback = fallback_texts[i] if fallback_texts and i < len(fallback_texts) else ""
+        if i < len(existing):
+            # Edit the existing chunk in place. Clear markup on a non-last chunk (it may
+            # have been last before); set the real markup only on the last chunk.
+            res = edit_rich_message(
+                chat_id,
+                existing[i],
+                chunk,
+                telegram=telegram,
+                fallback_text=fallback,
+                reply_markup=reply_markup if i == last else empty_markup,
+                api_token=api_token,
+                rich_payload=True,
+            )
+            if res.get("not_found"):
+                if i == 0:
+                    return {"ok": False, "format": "rich", "anchor_lost": True, "not_found": True}
+                existing = existing[:i]  # non-anchor gone: re-send this + the rest fresh
+                continue
+            if not res.get("ok"):
+                out = {"ok": False, "format": "rich", "kind": res.get("kind"),
+                       "error": res.get("error"), "message_ids": result_ids + existing[i:], "partial": True}
+                for flag in ("topic_missing", "transient"):
+                    if res.get(flag):
+                        out[flag] = True
+                return out
+            result_ids.append(existing[i])
+        else:
+            res = send_rich_message(
+                chat_id,
+                chunk,
+                telegram=telegram,
+                fallback_text=fallback,
+                thread_id=thread_id,
+                notify=notify if not result_ids else False,
+                reply_markup=reply_markup if i == last else None,
+                reply_to_message_id=reply_to_message_id if not result_ids else None,
+                api_token=api_token,
+            )
+            if not res.get("ok"):
+                out = {"ok": False, "format": "rich", "kind": res.get("kind"),
+                       "error": res.get("error"), "message_ids": result_ids, "partial": True}
+                for flag in ("topic_missing", "transient"):
+                    if res.get(flag):
+                        out[flag] = True
+                return out
+            mid = str(res.get("message_id") or "")
+            if mid:
+                result_ids.append(mid)
+        i += 1
+    for stale in existing[len(chunks):]:  # content shrank: drop the orphaned tail
+        try:
+            delete_message(chat_id, stale, api_token=api_token)
+        except Exception:
+            pass
+    return {"ok": True, "format": "rich", "message_ids": result_ids,
+            "message_id": result_ids[0] if result_ids else ""}
+
+
+def upsert_feed_item_chunks(
+    chat_id: str,
+    existing_ids: list[str],
+    item: dict[str, Any],
+    *,
+    telegram: dict[str, Any] | None,
+    reply_markup: dict[str, Any] | None = None,
+    reply_to_message_id: str | int | None = None,
+    notify: bool = False,
+    thread_id: str | int | None = None,
+    live: bool = False,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """upsert_rich_chunks for a rendered feed item (splits like send_feed_item does)."""
+    html_text = sanitize_text(render_feed_item_html(item, live=live), MAX_RICH_HTML_CHARS)
+    chunks = split_rich_html(html_text, RICH_SAFE_CHARS)
+    fallback_texts = [item_plain_text(item)] if len([c for c in chunks if html_to_plain(c).strip()]) <= 1 else None
+    return upsert_rich_chunks(
+        chat_id,
+        existing_ids,
+        chunks,
+        telegram=telegram,
+        fallback_texts=fallback_texts,
+        thread_id=thread_id,
+        notify=notify,
+        reply_markup=reply_markup,
+        reply_to_message_id=reply_to_message_id,
+        api_token=api_token,
+    )
+
+
 def send_notice(
     chat_id: str,
     title: str,
