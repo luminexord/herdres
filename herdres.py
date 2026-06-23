@@ -9904,6 +9904,16 @@ def turn_visible_anchor_message_id(entry: dict[str, Any], turn_id: str) -> str:
     prompt_turn_id = str(entry.get("last_prompt_turn_id") or "")
     if prompt_message_id and prompt_turn_id == clean_turn_id and pane_message_is_latest(entry, prompt_message_id):
         return prompt_message_id
+    # Same-pane prompt fallback. An auto-continued turn finalizes under a turn_id that
+    # differs from the open-prompt turn_id (select_turn_feed_item's catch-up case: a human
+    # prompt immediately followed by an auto-pursued turn), so the strict match above misses
+    # and the turn would post a DUPLICATE message instead of editing the prompt. When the
+    # prompt message is still the pane's latest (no stream anchor, nothing posted after it),
+    # reuse it so the completed turn edits the prompt in place — one message per input. The
+    # pane_message_is_latest gate makes this fire only in the normal prompt->response
+    # sequence and skips it once a stream anchor or any later message exists.
+    if prompt_message_id and not stream_message_id and pane_message_is_latest(entry, prompt_message_id):
+        return prompt_message_id
     return ""
 
 
