@@ -8951,16 +8951,34 @@ def upsert_feed_item_chunks(
     live: bool = False,
     api_token: str | None = None,
 ) -> dict[str, Any]:
-    """upsert_rich_chunks for a rendered feed item (splits like send_feed_item does)."""
+    """Deliver a rendered feed item as one message (or a tracked continuation set),
+    reusing existing_ids in place. The common SINGLE-chunk case delegates to the item-level
+    edit_feed_item/send_feed_item primitives (identical behavior + fallback to the prior
+    single-message path); only oversize multi-chunk content uses the chunk-level upserter."""
+    existing = [str(m) for m in (existing_ids or []) if str(m or "").strip()]
     html_text = sanitize_text(render_feed_item_html(item, live=live), MAX_RICH_HTML_CHARS)
-    chunks = split_rich_html(html_text, RICH_SAFE_CHARS)
-    fallback_texts = [item_plain_text(item)] if len([c for c in chunks if html_to_plain(c).strip()]) <= 1 else None
+    chunks = [c for c in split_rich_html(html_text, RICH_SAFE_CHARS) if html_to_plain(c).strip()]
+    if len(chunks) <= 1 and len(existing) <= 1:
+        if existing:
+            res = edit_feed_item(chat_id, existing[0], item, telegram=telegram,
+                                 reply_markup=reply_markup, live=live, api_token=api_token)
+            if res.get("ok"):
+                return {**res, "message_ids": [existing[0]], "sent_ids": [], "message_id": existing[0]}
+            if res.get("not_found"):
+                return {**res, "anchor_lost": True}
+            return res
+        res = send_feed_item(chat_id, item, telegram=telegram, thread_id=thread_id, notify=notify,
+                             reply_markup=reply_markup, reply_to_message_id=reply_to_message_id,
+                             live=live, api_token=api_token)
+        if res.get("ok"):
+            mid = str(res.get("message_id") or "")
+            return {**res, "message_ids": [mid] if mid else [], "sent_ids": [mid] if mid else [], "message_id": mid}
+        return res
     return upsert_rich_chunks(
         chat_id,
-        existing_ids,
+        existing,
         chunks,
         telegram=telegram,
-        fallback_texts=fallback_texts,
         thread_id=thread_id,
         notify=notify,
         reply_markup=reply_markup,
@@ -10387,9 +10405,10 @@ def _sync_pane_clean_feed(
             return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
         if stream_result.get("ok"):
             stream_active_this_pane = True
-            new_ids = stream_result.get("sent_ids") or []
-            if new_ids:
-                counters["sends"] = counters.get("sends", 0) + len(new_ids)
+            if stream_result.get("sent_ids") is not None:  # real result: count only new sends
+                counters["sends"] = counters.get("sends", 0) + len(stream_result.get("sent_ids") or [])
+            elif stream_result.get("sent_message"):  # back-compat for results without sent_ids
+                counters["sends"] = counters.get("sends", 0) + 1
             route_ids = stream_result.get("message_ids") or (
                 [stream_result["message_id"]] if stream_result.get("message_id") else []
             )

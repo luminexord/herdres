@@ -1777,8 +1777,9 @@ class TelegramDraftTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["format"], "message-edit")
+        self.assertEqual(result["format"], "message")
         self.assertFalse(result.get("skipped", False))
+        self.assertFalse(result.get("sent_message", False))  # edit, not a fresh send
         send_rich.assert_not_called()
         edit_rich.assert_called_once()
         self.assertEqual(entry["last_stream_update_count"], 9)
@@ -10822,6 +10823,97 @@ class TopicLatestAnchorTests(unittest.TestCase):
         ):
             herdres.command_reply(payload)
         self.assertNotIn("last_topic_message_id", state["spaces"]["workspace:workspace-1"])
+
+
+class StreamEditInPlaceTests(unittest.TestCase):
+    """One message per turn, edited in place (stream -> finalize), with continuation
+    messages tracked as a set for oversize turns. Guards the user-input-duplication fix."""
+
+    def test_message_id_accessors_back_compat(self) -> None:
+        # Live state may only have the scalar (pre-list): accessors synthesize [scalar].
+        self.assertEqual(herdres.stream_message_ids({"last_stream_message_id": "5"}), ["5"])
+        self.assertEqual(herdres.clean_message_ids({"last_clean_message_id": "9"}), ["9"])
+        self.assertEqual(herdres.stream_message_ids({}), [])
+        e: dict = {}
+        herdres.set_stream_message_ids(e, ["7", "8"])
+        self.assertEqual(e["last_stream_message_ids"], ["7", "8"])
+        self.assertEqual(e["last_stream_message_id"], "7")  # scalar = anchor
+        herdres.set_stream_message_ids(e, [])
+        self.assertNotIn("last_stream_message_ids", e)
+        self.assertNotIn("last_stream_message_id", e)
+
+    def test_turn_visible_anchor_message_ids(self) -> None:
+        # stream set latest (anchor == pane latest) -> returns the stream list
+        e = {"last_stream_message_ids": ["50", "51"], "last_stream_turn_id": "t1", "last_pane_message_id": "50"}
+        self.assertEqual(herdres.turn_visible_anchor_message_ids(e, "t1"), ["50", "51"])
+        # stream anchor buried, prompt anchor is latest -> [prompt]
+        e2 = {"last_stream_message_id": "50", "last_stream_turn_id": "t1",
+              "last_prompt_message_id": "40", "last_prompt_turn_id": "t1", "last_pane_message_id": "40"}
+        self.assertEqual(herdres.turn_visible_anchor_message_ids(e2, "t1"), ["40"])
+        # nothing for this turn -> []
+        self.assertEqual(herdres.turn_visible_anchor_message_ids({"last_stream_turn_id": "other"}, "t1"), [])
+
+    def test_upsert_grows_and_shrinks_chunk_set(self) -> None:
+        sent = iter(["100", "200"])
+        edits, deletes = [], []
+        def edit(chat, mid, html, **kw): edits.append(str(mid)); return {"ok": True, "kind": "edited", "message_id": str(mid)}
+        def send(chat, html, **kw): return {"ok": True, "message_id": next(sent)}
+        def dele(chat, mid, **kw): deletes.append(str(mid)); return True
+        with patch.multiple(herdres, edit_rich_message=edit, send_rich_message=send, delete_message=dele):
+            grow = herdres.upsert_rich_chunks("c", ["a"], ["<p>one body</p>", "<p>two body</p>"])
+            self.assertEqual(grow["message_ids"], ["a", "100"])
+            self.assertEqual(grow["sent_ids"], ["100"])  # only the new tail counts as a send
+            shrink = herdres.upsert_rich_chunks("c", ["a", "b"], ["<p>only body</p>"])
+        self.assertEqual(shrink["message_ids"], ["a"])
+        self.assertEqual(deletes, ["b"])  # surplus tail chunk deleted
+
+    def test_upsert_anchor_lost(self) -> None:
+        def edit_nf(chat, mid, html, **kw): return {"ok": False, "not_found": True, "kind": "not_found"}
+        with patch.object(herdres, "edit_rich_message", edit_nf):
+            r = herdres.upsert_rich_chunks("c", ["gone"], ["<p>body</p>"])
+        self.assertTrue(r.get("anchor_lost"))
+        self.assertFalse(r.get("ok"))
+
+    def test_send_stream_message_tracks_real_message_ids(self) -> None:
+        # The real-message path records last_stream_message_ids (the draft path never did,
+        # which is what orphaned the duplicate at finalize).
+        telegram = {"rich_messages": {"supported": "yes"}}
+        entry = {"pane_key": "p", "space_key": "s", "topic_id": "77", "pane_root_message_id": "1001"}
+        with patch.multiple(herdres,
+                            send_rich_message=Mock(return_value={"ok": True, "message_id": "5001"}),
+                            STREAM_MIN_INTERVAL_SECONDS=0, STREAM_MIN_CHARS=0):
+            res = herdres.send_stream_message("-1001", telegram, entry, turn_id="t1", text="streaming worklog body")
+        self.assertTrue(res["ok"])
+        self.assertEqual(entry["last_stream_message_ids"], ["5001"])
+        self.assertEqual(entry["last_stream_message_id"], "5001")
+        self.assertTrue(res.get("sent_message"))
+
+    def test_send_stream_update_prefers_real_message_over_draft(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}, "streaming_drafts": {"supported": "yes"}}
+        entry = {"pane_key": "p", "space_key": "s", "topic_id": "77"}
+        msg = Mock(return_value={"ok": True, "format": "message", "message_ids": ["6001"], "sent_ids": ["6001"], "message_id": "6001"})
+        draft = Mock(return_value={"ok": True, "format": "rich-draft"})
+        with patch.multiple(herdres, send_stream_message=msg, send_stream_draft=draft):
+            herdres.send_stream_update("-1001", telegram, entry, turn_id="t1", text="x")
+        msg.assert_called_once()
+        draft.assert_not_called()
+        # draft is used only when the real message path hits a capability/bad_request issue
+        msg2 = Mock(return_value={"ok": False, "kind": "capability"})
+        draft2 = Mock(return_value={"ok": True, "format": "rich-draft"})
+        with patch.multiple(herdres, send_stream_message=msg2, send_stream_draft=draft2):
+            herdres.send_stream_update("-1001", telegram, entry, turn_id="t1", text="x")
+        draft2.assert_called_once()
+
+    def test_stream_message_throttled_at_update_cap(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes"}}
+        entry = {"pane_key": "p", "space_key": "s", "topic_id": "77",
+                 "last_stream_turn_id": "t1", "last_stream_update_count": herdres.MAX_STREAM_UPDATES,
+                 "last_stream_sent_at": herdres.utc_now(), "last_stream_message_id": "5001"}
+        with patch.multiple(herdres, STREAM_MIN_CHARS=0,
+                            send_rich_message=Mock(side_effect=AssertionError("should not send")),
+                            edit_rich_message=Mock(side_effect=AssertionError("should not edit"))):
+            res = herdres.send_stream_message("-1001", telegram, entry, turn_id="t1", text="another worklog line body")
+        self.assertTrue(res.get("skipped"))
 
 
 if __name__ == "__main__":
