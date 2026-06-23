@@ -224,7 +224,10 @@ USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHA
 PROMPT_COLLAPSE_CHARS_DEFAULT = int(os.getenv("HERDR_TELEGRAM_TOPICS_PROMPT_COLLAPSE_CHARS", "200"))
 # When on, a new turn folds the PREVIOUS turn's Response in place (latest stays open).
 # Per-space override via space["collapse_previous_responses"]; off by default (opt-in).
-RESPONSE_COLLAPSE_PREVIOUS_DEFAULT = parse_bool_env("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "")
+# Read at runtime via response_collapse_previous_default(), NOT an import-time constant:
+# the Herdr plugin runs `herdres event` (and bare CLI runs) with no systemd
+# EnvironmentFile, so a frozen constant would be False there and silently skip the
+# fold on every plugin-delivered turn (see per_agent_topics_enabled above).
 PROMPT_PREVIEW_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PROMPT_PREVIEW_CHARS", "60"))
 INTERACTION_READONLY_WARNING_TITLE = "⚠️ Manual action required"
 INTERACTION_READONLY_WARNING_BODY = (
@@ -750,12 +753,26 @@ def space_prompt_collapse_chars(state: dict[str, Any], pane_or_entry: dict[str, 
     return default
 
 
+def response_collapse_previous_default() -> bool:
+    """Default for folding a previous turn's Response when a new turn arrives.
+
+    Read at call time, not as an import-time constant — the Herdr plugin runs
+    `herdres event` (and bare CLI invocations run) with no systemd EnvironmentFile, so
+    a module-level constant would freeze to False before load_dotenv() runs and silently
+    disable collapse on every plugin-delivered turn. The fold only fires on the NEXT
+    delivery and the timer sync won't retroactively fold a turn the plugin already
+    delivered, so a missed plugin-path fold leaves the prior response expanded forever.
+    Entry points call load_dotenv() first, so this honors herdres.env on every path.
+    Mirrors per_agent_topics_enabled()."""
+    return parse_bool_env("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "")
+
+
 def space_collapse_previous_responses(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> bool:
     """Per-space: when a new turn arrives, fold the PREVIOUS turn's Response in place
     (the latest turn always stays expanded). Defaults to
-    RESPONSE_COLLAPSE_PREVIOUS_DEFAULT; per-space override via
+    response_collapse_previous_default(); per-space override via
     space["collapse_previous_responses"]."""
-    default = RESPONSE_COLLAPSE_PREVIOUS_DEFAULT
+    default = response_collapse_previous_default()
     if not isinstance(pane_or_entry, dict):
         return default
     key = str(pane_or_entry.get("space_key") or "") or space_key(pane_or_entry)
