@@ -88,9 +88,6 @@ STREAMING_DRAFTS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STREAMING", "1"
 STREAM_MIN_INTERVAL_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_STREAM_MIN_INTERVAL", "2"))
 STREAM_MIN_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STREAM_MIN_CHARS", "80"))
 MAX_STREAM_DRAFTS = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_DRAFTS", "8"))
-# Per-turn cap on real-message stream edits (editMessageText is rate-limited, unlike the
-# bridge draft). Bounds edits/turn now that streaming edits a real tracked message.
-MAX_STREAM_UPDATES = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_STREAM_UPDATES", "20"))
 MANAGED_BOTS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "0")
 MANAGER_BOT_KIND = "manager"
 MANAGER_BOT_COMMANDS = [
@@ -824,8 +821,7 @@ def fold_previous_turn_response(
     if not space_collapse_previous_responses(state, entry):
         return
     prior_item = entry.get("last_clean_item")
-    prior_ids = clean_message_ids(entry)
-    prior_mid = prior_ids[0] if prior_ids else ""
+    prior_mid = str(entry.get("last_clean_message_id") or "")
     if not isinstance(prior_item, dict) or str(prior_item.get("kind") or "").lower() != "turn":
         return
     if not prior_mid or prior_mid == str(new_message_id or ""):
@@ -837,12 +833,9 @@ def fold_previous_turn_response(
     folded = dict(prior_item)
     folded["collapse_response"] = True
     try:
-        # Folding shrinks the response, so this edits the prior turn's chunk(s) in place
-        # and deletes any now-surplus continuation chunks (never sends a new message: an
-        # anchor that's gone returns anchor_lost and is swallowed below).
-        upsert_feed_item_chunks(
+        edit_feed_item(
             chat_id,
-            prior_ids,
+            prior_mid,
             folded,
             telegram=telegram,
             api_token=api_token or managed_bot_token_for_entry(telegram, entry),
@@ -3356,7 +3349,7 @@ def suppress_duplicate_native_session_stream(entry: dict[str, Any], owner_key: s
     entry["last_stream_update_count"] = update_count + 1
     entry["last_stream_suppressed_reason"] = f"duplicate_native_session:{owner_key}"
     entry["last_stream_suppressed_at"] = utc_now()
-    for key in ("pending_stream_turn_id", "pending_stream_text", "pending_stream_revision", "last_stream_message_id", "last_stream_message_ids", "last_stream_draft_id"):
+    for key in ("pending_stream_turn_id", "pending_stream_text", "pending_stream_revision", "last_stream_message_id", "last_stream_draft_id"):
         entry.pop(key, None)
     return True
 
@@ -3578,7 +3571,6 @@ def clear_delivered_stream_state(entry: dict[str, Any]) -> None:
         "last_stream_turn_id",
         "last_stream_draft_id",
         "last_stream_message_id",
-        "last_stream_message_ids",
         "last_stream_text",
         "last_stream_sent_at",
         "last_stream_error",
@@ -5454,7 +5446,6 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_semantic_hash",
         "last_clean_render_hash",
         "last_clean_message_id",
-        "last_clean_message_ids",
         "last_clean_kind",
         "last_clean_text",
         "last_clean_item",
@@ -5912,7 +5903,6 @@ def record_delivered_feed_item(
     item_render_hash: str | None = None,
     item_semantic_hash: str | None = None,
     fallback_message_id: str | int | None = None,
-    fallback_message_ids: list[str] | None = None,
 ) -> None:
     if pending_active_prompt:
         bind_active_prompt_message(
@@ -5934,12 +5924,10 @@ def record_delivered_feed_item(
     entry["last_clean_hash"] = item_render_hash
     entry["last_clean_semantic_hash"] = item_semantic_hash
     entry["last_clean_render_hash"] = item_render_hash
-    delivered_ids = result.get("message_ids") if isinstance(result.get("message_ids"), list) else None
-    if not delivered_ids:
-        single = str(result.get("message_id") or fallback_message_id or "").strip()
-        delivered_ids = [single] if single else list(fallback_message_ids or [])
-    if delivered_ids:
-        set_clean_message_ids(entry, delivered_ids)
+    if result.get("message_id"):
+        entry["last_clean_message_id"] = str(result["message_id"])
+    elif fallback_message_id:
+        entry["last_clean_message_id"] = str(fallback_message_id)
     entry["last_clean_kind"] = str(item.get("kind") or "")
     entry["last_clean_text"] = item_plain_text(item)
     entry["last_clean_item"] = item
@@ -6002,7 +5990,7 @@ def refresh_stale_visible_prompt(
         entry["last_clean_semantic_hash"] = clean_feed_hash(current_item, include_render_version=False)
         entry["last_clean_render_hash"] = clean_feed_hash(current_item)
         if result.get("message_id"):
-            set_clean_message_ids(entry, [str(result["message_id"])])
+            entry["last_clean_message_id"] = str(result["message_id"])
         entry["last_clean_kind"] = str(current_item.get("kind") or "choices")
         entry["last_clean_text"] = item_plain_text(current_item)
         entry["last_clean_item"] = current_item
@@ -7764,11 +7752,8 @@ def stream_draft_id(chat_id: str, space_key_value: str, pane_key_value: str, tur
 def reusable_stream_state_for_turn(entry: dict[str, Any], turn_id: str) -> bool:
     if str(entry.get("last_stream_turn_id") or "") != str(turn_id):
         return False
-    ids = stream_message_ids(entry)
-    # Reusable when nothing was posted after the set's NEWEST chunk (ids[-1]); the anchor
-    # ids[0] is not the latest message for a multi-chunk set, so checking it would wrongly
-    # disable reuse and re-send a fresh (orphaning) set every update.
-    return not ids or pane_message_is_latest(entry, ids[-1])
+    message_id = str(entry.get("last_stream_message_id") or "")
+    return not message_id or pane_message_is_latest(entry, message_id)
 
 
 def stream_throttle_reason(entry: dict[str, Any], turn_id: str, *, max_updates: int | None = None) -> str:
@@ -8019,58 +8004,77 @@ def send_stream_message(
         and not message_bot_reissue_due(entry, "last_stream_bot_kind", desired_bot_kind)
     ):
         return {"ok": True, "skipped": True, "reason": "unchanged_hash", "hash": text_hash, "format": "message"}
-    throttle_reason = stream_throttle_reason(entry, str(turn_id), max_updates=MAX_STREAM_UPDATES)
+    throttle_reason = stream_throttle_reason(entry, str(turn_id))
     if throttle_reason:
         return {"ok": True, "skipped": True, "reason": throttle_reason, "hash": text_hash, "format": "message"}
 
     html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
-    chunks = split_rich_html(sanitize_text(html_text, MAX_RICH_HTML_CHARS), RICH_SAFE_CHARS)
-    api_token = managed_bot_token_for_entry(telegram, entry)
-    # Reuse the streamed chunk set if it's still ours for this turn, else the turn's
-    # anchor (the prompt message) — so streaming edits ONE message from the prompt onward.
-    existing_ids: list[str] = []
-    if stream_message_ids(entry) and reusable_stream_state_for_turn(entry, str(turn_id)):
-        existing_ids = stream_message_ids(entry)
-    if not existing_ids:
-        existing_ids = turn_visible_anchor_message_ids(entry, str(turn_id))
-    anchor_id = existing_ids[0] if existing_ids else ""
+    fallback_text = html_to_plain(html_text)
+    message_id = ""
+    stream_message_id = str(entry.get("last_stream_message_id") or "")
+    if stream_message_id and reusable_stream_state_for_turn(entry, str(turn_id)):
+        message_id = stream_message_id
+    if not message_id:
+        message_id = turn_visible_anchor_message_id(entry, str(turn_id))
     if (
-        anchor_id
+        message_id
         and not entry.get("last_stream_bot_kind")
-        and anchor_id == str(entry.get("last_prompt_message_id") or "")
+        and message_id == str(entry.get("last_prompt_message_id") or "")
         and entry.get("last_prompt_bot_kind")
     ):
         entry["last_stream_bot_kind"] = str(entry.get("last_prompt_bot_kind") or "")
-    if existing_ids and message_bot_reissue_due(entry, "last_stream_bot_kind", desired_bot_kind):
-        existing_ids = []  # re-issue under the new bot identity: send fresh
+    if message_id and message_bot_reissue_due(entry, "last_stream_bot_kind", desired_bot_kind):
+        message_id = ""
+    if message_id:
+        result = edit_rich_message(
+            chat_id,
+            message_id,
+            html_text,
+            telegram=telegram,
+            fallback_text=fallback_text,
+            api_token=managed_bot_token_for_entry(telegram, entry),
+            rich_payload=True,
+        )
+        if result.get("not_found"):
+            entry.pop("last_stream_message_id", None)
+            entry.pop("last_stream_bot_kind", None)
+            message_id = ""
+        elif result.get("ok"):
+            entry["last_stream_message_id"] = message_id
+            record_stream_sent(entry, str(turn_id), text_hash, transport="message", text=clean_text)
+            record_message_bot_kind(entry, "last_stream_bot_kind", sent_message_bot_kind(telegram, entry, None, result), desired_bot_kind)
+            result.update({"format": "message-edit", "hash": text_hash, "message_id": message_id})
+            return result
+        else:
+            if result.get("kind") == "bot_access":
+                note_managed_bot_access_required(entry, "last_stream_bot_kind", desired_bot_kind)
+            entry["last_stream_error"] = sanitize_text(str(result), 500)
+            result.update({"format": "message-edit", "hash": text_hash, "message_id": message_id})
+            return result
 
-    result = upsert_rich_chunks(
+    result = send_rich_message(
         chat_id,
-        existing_ids,
-        chunks,
+        html_text,
         telegram=telegram,
+        fallback_text=fallback_text,
         thread_id=entry.get("topic_id"),
         notify=False,
-        reply_to_message_id=pane_root_reply_target(entry) if not existing_ids else None,
-        api_token=api_token,
+        reply_to_message_id=pane_root_reply_target(entry),
+        api_token=managed_bot_token_for_entry(telegram, entry),
     )
-    if result.get("anchor_lost"):  # tracked anchor was deleted -> re-send the whole set fresh
-        result = upsert_rich_chunks(
-            chat_id, [], chunks, telegram=telegram, thread_id=entry.get("topic_id"),
-            notify=False, reply_to_message_id=pane_root_reply_target(entry), api_token=api_token,
-        )
     result["hash"] = text_hash
     if result.get("ok"):
-        set_stream_message_ids(entry, result.get("message_ids"))
+        mid = str(result.get("message_id") or "")
+        if mid:
+            entry["last_stream_message_id"] = mid
         record_message_bot_kind(entry, "last_stream_bot_kind", sent_message_bot_kind(telegram, entry, None, result), desired_bot_kind)
         record_stream_sent(entry, str(turn_id), text_hash, transport="message", text=clean_text)
         result["format"] = "message"
-        result["sent_message"] = bool(result.get("sent_ids"))  # True only when a NEW message was sent
+        result["sent_message"] = True
+    elif result.get("kind") == "bot_access":
+        note_managed_bot_access_required(entry, "last_stream_bot_kind", desired_bot_kind)
+        entry["last_stream_error"] = sanitize_text(str(result), 500)
     else:
-        if result.get("message_ids"):  # partial: persist what landed so we never re-orphan
-            set_stream_message_ids(entry, result.get("message_ids"))
-        if result.get("kind") == "bot_access":
-            note_managed_bot_access_required(entry, "last_stream_bot_kind", desired_bot_kind)
         entry["last_stream_error"] = sanitize_text(str(result), 500)
     return result
 
@@ -8086,15 +8090,13 @@ def send_stream_update(
 ) -> dict[str, Any]:
     if not stream_config_enabled():
         return {"ok": False, "skipped": True, "reason": "streaming_disabled"}
-    # Stream into a REAL tracked message so the finalize edits it in place (one message
-    # per turn). The bridge draft returns no message_id, so it orphaned a duplicate at
-    # finalize — keep it only as a fallback when rich real-message editing is unavailable.
-    result = send_stream_message(chat_id, telegram, entry, turn_id=turn_id, text=text, user_text=user_text)
-    if result.get("ok") or result.get("skipped"):
-        return result
-    if streaming_enabled(telegram) and result.get("kind") in {"capability", "bad_request"}:
-        return send_stream_draft(chat_id, telegram, entry, turn_id=turn_id, text=text, user_text=user_text)
-    return result
+    if streaming_enabled(telegram):
+        draft_result = send_stream_draft(chat_id, telegram, entry, turn_id=turn_id, text=text, user_text=user_text)
+        if draft_result.get("ok") or draft_result.get("skipped") or draft_result.get("transient"):
+            return draft_result
+        if result_topic_missing(draft_result) or draft_result.get("kind") not in {"capability", "bad_request", "bot_access"}:
+            return draft_result
+    return send_stream_message(chat_id, telegram, entry, turn_id=turn_id, text=text, user_text=user_text)
 
 
 def send_message(
@@ -8841,166 +8843,6 @@ def edit_feed_item(
         reply_markup=reply_markup,
         api_token=api_token,
         rich_payload=True,
-    )
-
-
-def upsert_rich_chunks(
-    chat_id: str,
-    existing_ids: list[str],
-    chunks: list[str],
-    *,
-    telegram: dict[str, Any] | None = None,
-    fallback_texts: list[str] | None = None,
-    thread_id: str | int | None = None,
-    notify: bool = False,
-    reply_markup: dict[str, Any] | None = None,
-    reply_to_message_id: str | int | None = None,
-    api_token: str | None = None,
-) -> dict[str, Any]:
-    """Deliver pre-split `chunks` as an ordered SET of messages, reusing `existing_ids`
-    in place so a turn occupies one message (or one tracked continuation set), never an
-    orphaned duplicate: EDIT overlapping chunks, SEND new tail chunks, DELETE removed
-    tail chunks when content shrank. reply_markup attaches to the LAST chunk only;
-    reply_to to a freshly-sent FIRST chunk only.
-
-    Returns {ok, message_ids: [...ordered...], message_id: ids[0]}. Anchor (index 0)
-    not_found -> {ok: False, anchor_lost: True} so the caller re-sends the whole set
-    fresh. A non-anchor not_found truncates the existing list there and re-sends the
-    remaining chunks as a fresh tail. On a transient mid-way failure the ids that landed
-    are returned (partial) so the caller can persist them and never re-orphan."""
-    chunks = [c for c in (chunks or []) if html_to_plain(c).strip()]
-    if not chunks:
-        return {"ok": False, "format": "rich", "kind": "empty"}
-    existing = [str(m) for m in (existing_ids or []) if str(m or "").strip()]
-    last = len(chunks) - 1
-    empty_markup = {"inline_keyboard": []}
-    result_ids: list[str] = []
-    sent_ids: list[str] = []  # only the NEWLY-sent ids (edits don't count against send caps)
-    i = 0
-    while i < len(chunks):
-        chunk = chunks[i]
-        fallback = fallback_texts[i] if fallback_texts and i < len(fallback_texts) else ""
-        if i < len(existing):
-            # Edit the existing chunk in place. Clear markup on a non-last chunk (it may
-            # have been last before); set the real markup only on the last chunk.
-            res = edit_rich_message(
-                chat_id,
-                existing[i],
-                chunk,
-                telegram=telegram,
-                fallback_text=fallback,
-                reply_markup=reply_markup if i == last else empty_markup,
-                api_token=api_token,
-                rich_payload=True,
-            )
-            if res.get("not_found"):
-                if i == 0:
-                    # Anchor gone: delete any surviving tail so it isn't orphaned, then
-                    # signal the caller to re-send the whole set fresh.
-                    for stale in existing[1:]:
-                        try:
-                            delete_message(chat_id, stale, api_token=api_token)
-                        except Exception:
-                            pass
-                    return {"ok": False, "format": "rich", "anchor_lost": True, "not_found": True}
-                # Non-anchor gone: delete the surviving tail (it would be orphaned) and
-                # re-send this chunk + the rest fresh.
-                for stale in existing[i + 1:]:
-                    try:
-                        delete_message(chat_id, stale, api_token=api_token)
-                    except Exception:
-                        pass
-                existing = existing[:i]
-                continue
-            if not res.get("ok"):
-                out = {"ok": False, "format": "rich", "kind": res.get("kind"),
-                       "error": res.get("error"), "message_ids": result_ids + existing[i:],
-                       "sent_ids": sent_ids, "partial": True}
-                for flag in ("topic_missing", "transient"):
-                    if res.get(flag):
-                        out[flag] = True
-                return out
-            result_ids.append(existing[i])
-        else:
-            res = send_rich_message(
-                chat_id,
-                chunk,
-                telegram=telegram,
-                fallback_text=fallback,
-                thread_id=thread_id,
-                notify=notify if not result_ids else False,
-                reply_markup=reply_markup if i == last else None,
-                reply_to_message_id=reply_to_message_id if not result_ids else None,
-                api_token=api_token,
-            )
-            if not res.get("ok"):
-                out = {"ok": False, "format": "rich", "kind": res.get("kind"),
-                       "error": res.get("error"), "message_ids": result_ids,
-                       "sent_ids": sent_ids, "partial": True}
-                for flag in ("topic_missing", "transient"):
-                    if res.get(flag):
-                        out[flag] = True
-                return out
-            mid = str(res.get("message_id") or "")
-            if mid:
-                result_ids.append(mid)
-                sent_ids.append(mid)
-        i += 1
-    for stale in existing[len(chunks):]:  # content shrank: drop the orphaned tail
-        try:
-            delete_message(chat_id, stale, api_token=api_token)
-        except Exception:
-            pass
-    return {"ok": True, "format": "rich", "message_ids": result_ids, "sent_ids": sent_ids,
-            "message_id": result_ids[0] if result_ids else ""}
-
-
-def upsert_feed_item_chunks(
-    chat_id: str,
-    existing_ids: list[str],
-    item: dict[str, Any],
-    *,
-    telegram: dict[str, Any] | None,
-    reply_markup: dict[str, Any] | None = None,
-    reply_to_message_id: str | int | None = None,
-    notify: bool = False,
-    thread_id: str | int | None = None,
-    live: bool = False,
-    api_token: str | None = None,
-) -> dict[str, Any]:
-    """Deliver a rendered feed item as one message (or a tracked continuation set),
-    reusing existing_ids in place. The common SINGLE-chunk case delegates to the item-level
-    edit_feed_item/send_feed_item primitives (identical behavior + fallback to the prior
-    single-message path); only oversize multi-chunk content uses the chunk-level upserter."""
-    existing = [str(m) for m in (existing_ids or []) if str(m or "").strip()]
-    html_text = sanitize_text(render_feed_item_html(item, live=live), MAX_RICH_HTML_CHARS)
-    chunks = [c for c in split_rich_html(html_text, RICH_SAFE_CHARS) if html_to_plain(c).strip()]
-    if len(chunks) <= 1 and len(existing) <= 1:
-        if existing:
-            res = edit_feed_item(chat_id, existing[0], item, telegram=telegram,
-                                 reply_markup=reply_markup, live=live, api_token=api_token)
-            if res.get("ok"):
-                return {**res, "message_ids": [existing[0]], "sent_ids": [], "message_id": existing[0]}
-            if res.get("not_found"):
-                return {**res, "anchor_lost": True}
-            return res
-        res = send_feed_item(chat_id, item, telegram=telegram, thread_id=thread_id, notify=notify,
-                             reply_markup=reply_markup, reply_to_message_id=reply_to_message_id,
-                             live=live, api_token=api_token)
-        if res.get("ok"):
-            mid = str(res.get("message_id") or "")
-            return {**res, "message_ids": [mid] if mid else [], "sent_ids": [mid] if mid else [], "message_id": mid}
-        return res
-    return upsert_rich_chunks(
-        chat_id,
-        existing,
-        chunks,
-        telegram=telegram,
-        thread_id=thread_id,
-        notify=notify,
-        reply_markup=reply_markup,
-        reply_to_message_id=reply_to_message_id,
-        api_token=api_token,
     )
 
 
@@ -10050,67 +9892,19 @@ def note_topic_high_water_mark(space: dict[str, Any] | None, message_id: str | i
     return True
 
 
-def _message_id_list(entry: dict[str, Any], list_key: str, scalar_key: str) -> list[str]:
-    """The ordered chunk message ids for a turn's message. Back-compat: live state may
-    only have the scalar (pre-list), so synthesize ``[scalar]`` when the list is absent."""
-    ids = entry.get(list_key)
-    if isinstance(ids, list) and ids:
-        return [str(m) for m in ids if str(m or "").strip()]
-    scalar = str(entry.get(scalar_key) or "").strip()
-    return [scalar] if scalar else []
-
-
-def _set_message_id_list(entry: dict[str, Any], list_key: str, scalar_key: str, ids: list[str] | None) -> None:
-    """Write the ordered chunk list and keep the scalar = ids[0] (the anchor that routing,
-    fold, dedup and the latest-checks key off). Empty ids clears both."""
-    clean = [str(m) for m in (ids or []) if str(m or "").strip()]
-    if clean:
-        entry[list_key] = clean
-        entry[scalar_key] = clean[0]
-    else:
-        entry.pop(list_key, None)
-        entry.pop(scalar_key, None)
-
-
-def stream_message_ids(entry: dict[str, Any]) -> list[str]:
-    return _message_id_list(entry, "last_stream_message_ids", "last_stream_message_id")
-
-
-def clean_message_ids(entry: dict[str, Any]) -> list[str]:
-    return _message_id_list(entry, "last_clean_message_ids", "last_clean_message_id")
-
-
-def set_stream_message_ids(entry: dict[str, Any], ids: list[str] | None) -> None:
-    _set_message_id_list(entry, "last_stream_message_ids", "last_stream_message_id", ids)
-
-
-def set_clean_message_ids(entry: dict[str, Any], ids: list[str] | None) -> None:
-    _set_message_id_list(entry, "last_clean_message_ids", "last_clean_message_id", ids)
-
-
-def turn_visible_anchor_message_ids(entry: dict[str, Any], turn_id: str) -> list[str]:
-    """List-aware anchor: the ordered chunk message ids that currently hold this turn —
-    the stream set if its anchor (ids[0]) is still the pane's latest message, else the
-    prompt message (single chunk), else []. The anchor governs the latest-checks."""
+def turn_visible_anchor_message_id(entry: dict[str, Any], turn_id: str) -> str:
     clean_turn_id = str(turn_id or "")
     if not clean_turn_id:
-        return []
-    stream_ids = stream_message_ids(entry)
+        return ""
+    stream_message_id = str(entry.get("last_stream_message_id") or "")
     stream_turn_id = str(entry.get("last_stream_turn_id") or "")
-    # Latest-ness is judged on the NEWEST chunk (ids[-1]); for a multi-chunk set the anchor
-    # ids[0] is never the pane's latest message.
-    if stream_ids and stream_turn_id == clean_turn_id and pane_message_is_latest(entry, stream_ids[-1]):
-        return stream_ids
+    if stream_message_id and stream_turn_id == clean_turn_id and pane_message_is_latest(entry, stream_message_id):
+        return stream_message_id
     prompt_message_id = str(entry.get("last_prompt_message_id") or "")
     prompt_turn_id = str(entry.get("last_prompt_turn_id") or "")
     if prompt_message_id and prompt_turn_id == clean_turn_id and pane_message_is_latest(entry, prompt_message_id):
-        return [prompt_message_id]
-    return []
-
-
-def turn_visible_anchor_message_id(entry: dict[str, Any], turn_id: str) -> str:
-    ids = turn_visible_anchor_message_ids(entry, turn_id)
-    return ids[0] if ids else ""
+        return prompt_message_id
+    return ""
 
 
 def route_message_to_pane(
@@ -10424,20 +10218,15 @@ def _sync_pane_clean_feed(
             return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
         if stream_result.get("ok"):
             stream_active_this_pane = True
-            if stream_result.get("sent_ids") is not None:  # real result: count only new sends
-                counters["sends"] = counters.get("sends", 0) + len(stream_result.get("sent_ids") or [])
-            elif stream_result.get("sent_message"):  # back-compat for results without sent_ids
+            if stream_result.get("sent_message"):
                 counters["sends"] = counters.get("sends", 0) + 1
-            route_ids = stream_result.get("message_ids") or (
-                [stream_result["message_id"]] if stream_result.get("message_id") else []
-            )
-            for mid in route_ids:  # record every chunk id (idempotent for reused/edited ids)
-                record_pane_message_route(
-                    state,
-                    str(entry.get("space_key") or ""),
-                    str(entry.get("pane_key") or ""),
-                    str(mid),
-                )
+                if stream_result.get("message_id"):
+                    record_pane_message_route(
+                        state,
+                        str(entry.get("space_key") or ""),
+                        str(entry.get("pane_key") or ""),
+                        str(stream_result["message_id"]),
+                    )
             changed = True
         elif not stream_result.get("skipped"):
             entry["last_stream_error"] = sanitize_text(str(stream_result), 500)
@@ -10478,51 +10267,76 @@ def _sync_pane_clean_feed(
             entry["last_clean_attempt_hash"] = item_render_hash
             entry["last_clean_attempt_at"] = utc_now()
             changed = True
-            lifecycle_message_ids: list[str] = []
+            did_edit = False
+            lifecycle_message_id = ""
             if str(item.get("kind") or "").lower() == "turn":
-                lifecycle_message_ids = turn_visible_anchor_message_ids(entry, str(item.get("turn_id") or ""))
-                if lifecycle_message_ids:
+                lifecycle_message_id = turn_visible_anchor_message_id(entry, str(item.get("turn_id") or ""))
+                if lifecycle_message_id:
                     space_entry = (state.get("spaces") or {}).get(str(entry.get("space_key") or ""))
-                    # Buried iff something was posted after the set's NEWEST chunk (ids[-1]).
-                    if not topic_message_is_latest(space_entry, lifecycle_message_ids[-1]):
+                    if not topic_message_is_latest(space_entry, lifecycle_message_id):
                         # A sibling pane (or the owner) posted to this shared topic after the
                         # turn's anchor was placed. Editing it in place would leave the final
-                        # completion buried mid-feed where the owner never sees it. Drop the
-                        # whole set so the turn is re-sent fresh at the bottom of the topic.
-                        lifecycle_message_ids = []
-            anchor_id = lifecycle_message_ids[0] if lifecycle_message_ids else ""
-            if anchor_id and not entry.get("last_clean_bot_kind"):
-                if anchor_id == str(entry.get("last_stream_message_id") or "") and entry.get("last_stream_bot_kind"):
+                        # completion buried mid-feed where the owner never sees it (the actual
+                        # bug: a long codex turn finalized into a 17-min-old message that the
+                        # newly-added Devin pane's messages had since buried). Drop the anchor
+                        # so the turn is sent as a fresh message at the bottom of the topic.
+                        lifecycle_message_id = ""
+            if lifecycle_message_id and not entry.get("last_clean_bot_kind"):
+                if lifecycle_message_id == str(entry.get("last_stream_message_id") or "") and entry.get("last_stream_bot_kind"):
                     entry["last_clean_bot_kind"] = str(entry.get("last_stream_bot_kind") or "")
-                elif anchor_id == str(entry.get("last_prompt_message_id") or "") and entry.get("last_prompt_bot_kind"):
+                elif lifecycle_message_id == str(entry.get("last_prompt_message_id") or "") and entry.get("last_prompt_bot_kind"):
                     entry["last_clean_bot_kind"] = str(entry.get("last_prompt_bot_kind") or "")
-
-            def _deliver_chunks(existing: list[str]) -> dict[str, Any]:
-                # One message (or one tracked continuation set) edited in place; never
-                # orphans a duplicate. Fresh sends reply to the pane root + carry notify.
-                return upsert_feed_item_chunks(
+            if (
+                lifecycle_message_id
+                and not message_bot_reissue_due(entry, "last_clean_bot_kind", desired_bot_kind)
+            ):
+                result = edit_feed_item(
                     chat_id,
-                    existing,
+                    lifecycle_message_id,
                     item,
                     telegram=telegram,
                     reply_markup=reply_markup,
-                    reply_to_message_id=pane_root_reply_target(entry) if not existing else None,
-                    notify=bool(item.get("notify")),
-                    thread_id=entry["topic_id"],
                     api_token=pane_api_token,
                 )
-
-            if lifecycle_message_ids and not message_bot_reissue_due(entry, "last_clean_bot_kind", desired_bot_kind):
-                result = _deliver_chunks(lifecycle_message_ids)
-                if not result.get("ok") and (result.get("anchor_lost") or result.get("not_found")):
-                    result = _deliver_chunks([])  # anchor gone -> re-send the whole set fresh
-                elif not result.get("ok"):
+                if result.get("ok"):
+                    did_edit = True
+                    message_id = lifecycle_message_id
+                elif result.get("not_found"):
+                    result = send_feed_item(
+                        chat_id,
+                        item,
+                        telegram=telegram,
+                        thread_id=entry["topic_id"],
+                        notify=bool(item.get("notify")),
+                        reply_markup=reply_markup,
+                        reply_to_message_id=pane_root_reply_target(entry),
+                        api_token=pane_api_token,
+                    )
+                else:
                     result = {**result, "edit_failed": True}
-            elif same_semantic and (render_changed or old_clean_has_noise) and clean_message_ids(entry):
-                result = _deliver_chunks(clean_message_ids(entry))
-                if not result.get("ok") and (result.get("anchor_lost") or result.get("not_found")):
+            elif same_semantic and (render_changed or old_clean_has_noise) and message_id:
+                result = edit_feed_item(
+                    chat_id,
+                    message_id,
+                    item,
+                    telegram=telegram,
+                    reply_markup=reply_markup,
+                    api_token=pane_api_token,
+                )
+                if result.get("ok"):
+                    did_edit = True
+                elif result.get("not_found"):
                     if content_changed:
-                        result = _deliver_chunks([])
+                        result = send_feed_item(
+                            chat_id,
+                            item,
+                            telegram=telegram,
+                            thread_id=entry["topic_id"],
+                            notify=bool(item.get("notify")),
+                            reply_markup=reply_markup,
+                            reply_to_message_id=pane_root_reply_target(entry),
+                            api_token=pane_api_token,
+                        )
                     else:
                         entry["last_clean_render_hash"] = item_render_hash
                         entry["last_clean_hash"] = item_render_hash
@@ -10533,14 +10347,21 @@ def _sync_pane_clean_feed(
                         entry.pop("last_clean_send_error", None)
                         changed = True
                         result = {"ok": False, "kind": "not_found", "skipped_stale_repost": True}
-                elif not result.get("ok"):
+                else:
                     result = {**result, "edit_failed": True}
             else:
-                result = _deliver_chunks([])
+                result = send_feed_item(
+                    chat_id,
+                    item,
+                    telegram=telegram,
+                    thread_id=entry["topic_id"],
+                    notify=bool(item.get("notify")),
+                    reply_markup=reply_markup,
+                    reply_to_message_id=pane_root_reply_target(entry),
+                    api_token=pane_api_token,
+                )
             if result.get("ok"):
-                delivered_ids = result.get("message_ids") or []
-                # Edits don't count against the send cap; only newly-sent chunks do.
-                counters["sends"] = counters.get("sends", 0) + len(result.get("sent_ids") or [])
+                counters["sends"] = counters.get("sends", 0) + 1
                 counters["feed_sends"] = counters.get("feed_sends", 0) + 1
                 feed_delivered_this_pane = True
                 # Fold the PREVIOUS turn's response in place (latest stays open) — must run
@@ -10551,7 +10372,7 @@ def _sync_pane_clean_feed(
                     telegram,
                     chat_id,
                     item,
-                    delivered_ids[0] if delivered_ids else "",
+                    str(result.get("message_id") or (message_id if did_edit else "")),
                     api_token=pane_api_token,
                 )
                 record_delivered_feed_item(
@@ -10562,6 +10383,7 @@ def _sync_pane_clean_feed(
                     clear_active_prompt=clear_active_prompt,
                     item_render_hash=item_render_hash,
                     item_semantic_hash=item_semantic_hash,
+                    fallback_message_id=message_id if did_edit else None,
                 )
                 record_message_bot_kind(
                     entry,
@@ -10569,14 +10391,14 @@ def _sync_pane_clean_feed(
                     sent_message_bot_kind(telegram, entry, None, result),
                     desired_bot_kind,
                 )
-                for route_id in delivered_ids:  # record every chunk id
-                    if route_id:
-                        record_pane_message_route(
-                            state,
-                            str(entry.get("space_key") or ""),
-                            str(entry.get("pane_key") or ""),
-                            str(route_id),
-                        )
+                route_id = str(result.get("message_id") or (message_id if did_edit else ""))
+                if route_id:
+                    record_pane_message_route(
+                        state,
+                        str(entry.get("space_key") or ""),
+                        str(entry.get("pane_key") or ""),
+                        route_id,
+                    )
                 if str(item.get("kind") or "").lower() == "turn":
                     clear_stream_state(entry)
                 changed = True
