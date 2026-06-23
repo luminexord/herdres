@@ -196,7 +196,11 @@ RICH_MESSAGES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1
 RICH_BAD_REQUEST_LIMIT = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_BAD_REQUEST_LIMIT", "3"))
 LIVE_CARD_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "0")
 STATUS_MARKER_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "0")
-PANE_ROOT_MESSAGES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES", "0")
+# Pane-root messages are read at runtime via pane_root_messages_enabled(), NOT as an
+# import-time constant: the Herdr plugin runs `herdres event` with no systemd
+# EnvironmentFile, so a frozen constant would be False there and plugin-delivered turns
+# would skip pane-root creation + reply-threading that sync-delivered turns get (the same
+# class of bug as per_agent_topics_enabled / response_collapse_previous_default).
 PINNED_STATUS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_PINNED_STATUS", "1")
 # Per-agent topic grouping is read at runtime via per_agent_topics_enabled(),
 # NOT as an import-time constant: the Herdr plugin and bare CLI invocations have
@@ -555,6 +559,18 @@ def per_agent_topics_enabled() -> bool:
     grouping back to per-space, collapsing all agents onto one topic.
     """
     return os.getenv("HERDR_TELEGRAM_TOPICS_PER_AGENT", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def pane_root_messages_enabled() -> bool:
+    """Whether to post a per-pane root message that feed turns thread under.
+
+    Read at call time, not as an import-time constant — the Herdr plugin runs
+    `herdres event` with no systemd EnvironmentFile, so a frozen constant would be False
+    before load_dotenv() runs and plugin-delivered turns would skip pane-root creation and
+    reply-threading, leaving them unthreaded while sync-delivered turns thread under the
+    root (split message organization). Entry points call load_dotenv() first, so this
+    honors herdres.env on every path. Mirrors per_agent_topics_enabled()."""
+    return parse_bool_env("HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES", "0")
 
 
 def state_path() -> Path:
@@ -7533,7 +7549,7 @@ def clear_pane_root_message(state: dict[str, Any], entry: dict[str, Any], reason
 
 
 def pane_root_reply_target(entry: dict[str, Any]) -> str | int | None:
-    if not PANE_ROOT_MESSAGES_ENABLED:
+    if not pane_root_messages_enabled():
         return None
     target = entry.get("pane_root_message_id")
     if isinstance(target, (str, int)):
@@ -9752,7 +9768,7 @@ def ensure_pane_root_message(
     desired_bot_kind = desired_message_bot_kind(telegram, entry, pane)
     if not topic_id:
         return False, {"ok": True, "skipped": True}
-    if not PANE_ROOT_MESSAGES_ENABLED:
+    if not pane_root_messages_enabled():
         return False, {"ok": True, "skipped": True, "reason": "pane_root_messages_disabled"}
     if managed_bot_access_retry_waiting(entry, "pane_root_bot_kind", desired_bot_kind):
         return False, {"ok": True, "skipped": True, "reason": "managed_bot_access_pending"}

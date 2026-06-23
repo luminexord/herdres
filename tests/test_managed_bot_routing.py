@@ -60,7 +60,7 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
 
         with patch.object(herdres, "send_pane_root_message", send_root), patch.object(
             herdres, "save_state", Mock()
-        ), patch.object(herdres, "PANE_ROOT_MESSAGES_ENABLED", True):
+        ), patch.object(herdres, "pane_root_messages_enabled", lambda: True):
             changed, result = herdres.ensure_pane_root_message(
                 state,
                 "-1001",
@@ -103,7 +103,7 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
         send_root = Mock(return_value={"ok": True, "message_id": "2001"})
 
         with patch.object(herdres, "send_pane_root_message", send_root), patch.object(
-            herdres, "PANE_ROOT_MESSAGES_ENABLED", True
+            herdres, "pane_root_messages_enabled", lambda: True
         ):
             changed, result = herdres.ensure_pane_root_message(
                 state,

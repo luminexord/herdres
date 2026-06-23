@@ -339,7 +339,7 @@ class SpaceTopicSyncTests(unittest.TestCase):
             STATUS_ICON_ENABLED=False,
             LIVE_CARD_ENABLED=False,
             STATUS_MARKER_ENABLED=False,
-            PANE_ROOT_MESSAGES_ENABLED=True,
+            pane_root_messages_enabled=lambda: True,
             TURN_FEED_ENABLED=False,
         ):
             changed_a = herdres.sync_pane_once(state, "-1001", telegram, pane_a, counters, caps, turn_only=True)
@@ -385,7 +385,7 @@ class SpaceTopicSyncTests(unittest.TestCase):
             STATUS_ICON_ENABLED=False,
             LIVE_CARD_ENABLED=False,
             STATUS_MARKER_ENABLED=False,
-            PANE_ROOT_MESSAGES_ENABLED=True,
+            pane_root_messages_enabled=lambda: True,
             TURN_FEED_ENABLED=False,
         ):
             herdres.sync_pane_once(state, "-1001", telegram, pane_a, counters, caps, turn_only=True)
@@ -436,7 +436,7 @@ class SpaceTopicSyncTests(unittest.TestCase):
             STATUS_ICON_ENABLED=False,
             LIVE_CARD_ENABLED=False,
             STATUS_MARKER_ENABLED=False,
-            PANE_ROOT_MESSAGES_ENABLED=True,
+            pane_root_messages_enabled=lambda: True,
             TURN_FEED_ENABLED=False,
             per_agent_topics_enabled=lambda: True,
         ):
@@ -488,7 +488,7 @@ class SpaceTopicSyncTests(unittest.TestCase):
             STATUS_ICON_ENABLED=False,
             LIVE_CARD_ENABLED=False,
             STATUS_MARKER_ENABLED=False,
-            PANE_ROOT_MESSAGES_ENABLED=True,
+            pane_root_messages_enabled=lambda: True,
             TURN_FEED_ENABLED=False,
         ):
             changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps, turn_only=True)
@@ -750,10 +750,20 @@ class PaneThreadRoutingTests(unittest.TestCase):
     def test_pane_root_reply_target_requires_opt_in(self) -> None:
         entry = {"pane_root_message_id": "1001"}
 
-        with patch.object(herdres, "PANE_ROOT_MESSAGES_ENABLED", False):
+        with patch.object(herdres, "pane_root_messages_enabled", lambda: False):
             self.assertIsNone(herdres.pane_root_reply_target(entry))
-        with patch.object(herdres, "PANE_ROOT_MESSAGES_ENABLED", True):
+        with patch.object(herdres, "pane_root_messages_enabled", lambda: True):
             self.assertEqual(herdres.pane_root_reply_target(entry), "1001")
+
+    def test_pane_root_messages_default_is_read_at_runtime(self) -> None:
+        """Must be read at CALL time, not frozen at import. The Herdr plugin runs
+        `herdres event` with no systemd EnvironmentFile, so the flag is set by
+        load_dotenv() AFTER import; a frozen constant would be False and plugin-delivered
+        turns would skip pane-root creation + reply-threading (split message thread)."""
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES": "1"}, clear=False):
+            self.assertTrue(herdres.pane_root_messages_enabled())
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES": "0"}, clear=False):
+            self.assertFalse(herdres.pane_root_messages_enabled())
 
     def test_message_route_index_records_final_prompt_and_notice_messages(self) -> None:
         state, _pane, key, entry = self._pane_state()
