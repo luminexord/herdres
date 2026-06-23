@@ -2798,6 +2798,19 @@ class StreamingIntegrationTests(unittest.TestCase):
         self.assertTrue(folded_item.get("collapse_response"))
         self.assertEqual(str(folded_item.get("turn_id")), "turn-1")
 
+    def test_collapse_default_is_read_at_runtime(self) -> None:
+        """The collapse default must be read at CALL time, not frozen at import. The Herdr
+        plugin runs `herdres event` with no systemd EnvironmentFile, so the flag is set by
+        load_dotenv() AFTER import; a frozen constant would be False and silently skip the
+        fold on every plugin-delivered turn (the bug behind 'previous responses not
+        collapsing'). Mirrors the per_agent_topics_enabled runtime-read fix."""
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS": "1"}, clear=False):
+            self.assertTrue(herdres.response_collapse_previous_default())
+            self.assertTrue(herdres.space_collapse_previous_responses({"spaces": {}}, {"space_key": "s"}))
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS": ""}, clear=False):
+            self.assertFalse(herdres.response_collapse_previous_default())
+            self.assertFalse(herdres.space_collapse_previous_responses({"spaces": {}}, {"space_key": "s"}))
+
     def test_new_turn_does_not_fold_previous_when_disabled(self) -> None:
         state, pane, _key, entry = self._state()
         counters, caps = self._caps()
