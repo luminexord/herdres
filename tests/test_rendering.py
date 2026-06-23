@@ -10932,5 +10932,79 @@ class StreamAnchorFallbackTests(unittest.TestCase):
         self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, {"available": False}), "")
 
 
+class PruneOrphanedCollidingSpacesTests(unittest.TestCase):
+    """A herdr pane renumber (p16 -> p1H) leaves the old space bound to the topic with a
+    dangling pane_key; sorting first, it shadows the live space and inbound commands get
+    'No live Herdr panes in this topic.' Prune the fully-orphaned space ONLY when a live
+    sibling owns the same topic."""
+
+    def test_prunes_orphan_when_live_sibling_owns_topic(self) -> None:
+        state = {
+            "panes": {"w:p1H:c9": {"last_known_status": "working", "topic_id": "198"}},
+            "spaces": {
+                "agent:w:p16": {"topic_id": "198", "pane_keys": ["w:p16:1f"]},   # dangling
+                "agent:w:p1H": {"topic_id": "198", "pane_keys": ["w:p1H:c9"]},   # live
+            },
+        }
+        self.assertTrue(herdres.prune_orphaned_colliding_spaces(state))
+        self.assertEqual(list(state["spaces"]), ["agent:w:p1H"])
+
+    def test_keeps_sole_orphan_when_no_live_sibling(self) -> None:
+        # The only space for the topic is orphaned -> keep it (don't strand the topic).
+        state = {
+            "panes": {},
+            "spaces": {"agent:w:p16": {"topic_id": "198", "pane_keys": ["w:p16:1f"]}},
+        }
+        self.assertFalse(herdres.prune_orphaned_colliding_spaces(state))
+        self.assertIn("agent:w:p16", state["spaces"])
+
+    def test_keeps_space_with_live_pane(self) -> None:
+        state = {
+            "panes": {"w:p1H:c9": {"last_known_status": "working"}},
+            "spaces": {"agent:w:p1H": {"topic_id": "198", "pane_keys": ["w:p1H:c9"]}},
+        }
+        self.assertFalse(herdres.prune_orphaned_colliding_spaces(state))
+        self.assertIn("agent:w:p1H", state["spaces"])
+
+    def test_ignores_orphan_on_different_topic(self) -> None:
+        # Orphan on topic 200; the live space owns 198 -> no collision, don't prune.
+        state = {
+            "panes": {"w:p1H:c9": {"last_known_status": "working"}},
+            "spaces": {
+                "agent:w:p16": {"topic_id": "200", "pane_keys": ["w:p16:1f"]},
+                "agent:w:p1H": {"topic_id": "198", "pane_keys": ["w:p1H:c9"]},
+            },
+        }
+        self.assertFalse(herdres.prune_orphaned_colliding_spaces(state))
+        self.assertIn("agent:w:p16", state["spaces"])
+
+    def test_does_not_prune_space_without_pane_keys(self) -> None:
+        # A freshly-created space (no pane_keys yet) colliding with a live one is left alone.
+        state = {
+            "panes": {"w:p1H:c9": {"last_known_status": "working"}},
+            "spaces": {
+                "agent:w:new": {"topic_id": "198", "pane_keys": []},
+                "agent:w:p1H": {"topic_id": "198", "pane_keys": ["w:p1H:c9"]},
+            },
+        }
+        self.assertFalse(herdres.prune_orphaned_colliding_spaces(state))
+        self.assertIn("agent:w:new", state["spaces"])
+
+    def test_normalize_state_applies_the_prune(self) -> None:
+        # End-to-end through normalize_state (the load path).
+        state = {
+            "version": 1,
+            "telegram": {},
+            "panes": {"w:p1H:c9": {"last_known_status": "working"}},
+            "spaces": {
+                "agent:w:p16": {"topic_id": "198", "pane_keys": ["w:p16:1f"]},
+                "agent:w:p1H": {"topic_id": "198", "pane_keys": ["w:p1H:c9"]},
+            },
+        }
+        herdres.normalize_state(state)
+        self.assertNotIn("agent:w:p16", state["spaces"])
+        self.assertIn("agent:w:p1H", state["spaces"])
+
+
 if __name__ == "__main__":
     unittest.main()

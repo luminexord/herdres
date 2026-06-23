@@ -615,6 +615,7 @@ def normalize_state(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("panes", {})
     migrate_legacy_pane_topics(data)
     migrate_space_voice_mode(data)
+    prune_orphaned_colliding_spaces(data)
     clear_disabled_visible_choice_state(data)
     return data
 
@@ -2082,6 +2083,54 @@ def migrate_space_voice_mode(state: dict[str, Any]) -> bool:
                 changed = True
                 break
     return changed
+
+
+def prune_orphaned_colliding_spaces(state: dict[str, Any]) -> bool:
+    """Drop a space whose pane_keys are ALL dangling (no entry in state["panes"]) when
+    another space owns the SAME topic with at least one live pane.
+
+    A herdr pane can be renumbered mid-session (e.g. p16 -> p1H): a fresh space/pane is
+    created for the new id, but the old space stays bound to the topic with a now-dangling
+    pane_key. Because topic_space_entry returns the FIRST space matching a topic, the dead
+    space shadows the live one and inbound commands/replies resolve to it — yielding
+    "No live Herdr panes in this topic." (live_entries_for_space skips the dangling pane).
+
+    The condition is deliberately conservative: prune only a fully-orphaned space (every
+    pane_key missing from state["panes"]) AND only when a sibling space on the exact same
+    topic still has a live pane. This never deletes the sole space for a topic, nor a space
+    that is merely momentarily idle — it requires a healthy live owner of that topic to
+    already exist. Returns True if any space was pruned (caller persists state)."""
+    spaces = state.get("spaces")
+    panes = state.get("panes")
+    if not isinstance(spaces, dict) or not isinstance(panes, dict):
+        return False
+
+    def live_pane_count(space: dict[str, Any]) -> int:
+        if not isinstance(space, dict):
+            return 0
+        return sum(1 for k in (space.get("pane_keys") or []) if str(k) in panes)
+
+    healthy_topics: set[str] = set()
+    for space in spaces.values():
+        if live_pane_count(space) > 0:
+            topic = str(space.get("topic_id") or "").strip()
+            if topic:
+                healthy_topics.add(topic)
+
+    orphans: list[str] = []
+    for key, space in spaces.items():
+        if not isinstance(space, dict):
+            continue
+        if not (space.get("pane_keys") or []):
+            continue  # never had/declared a pane -> leave alone
+        if live_pane_count(space) > 0:
+            continue  # still has a live pane -> keep
+        topic = str(space.get("topic_id") or "").strip()
+        if topic and topic in healthy_topics:
+            orphans.append(key)
+    for key in orphans:
+        spaces.pop(key, None)
+    return bool(orphans)
 
 
 def status_object(pane: dict[str, Any]) -> dict[str, Any]:
