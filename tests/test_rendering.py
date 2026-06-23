@@ -10863,5 +10863,74 @@ class PromptAnchorFallbackTests(unittest.TestCase):
         self.assertEqual(herdres.turn_visible_anchor_message_id(entry, "18a4d8e5"), "")
 
 
+class StreamAnchorFallbackTests(unittest.TestCase):
+    """A turn that streamed a live worklog message must finalize by EDITING that message,
+    not by posting a fresh one. The duplicate (live 3100 -> 3105 case) happens when the
+    completed turn finalizes under a turn_id that differs from the open_turn_id it streamed
+    under: turn_visible_anchor_message_id strict-misses and, because a stream message
+    exists, the #33 prompt fallback is gated off, so the completion orphans the stream
+    message. turn_stream_anchor_fallback reuses it — guarded so an older catch-up turn (which
+    streamed nothing) never hijacks the newer stream message."""
+
+    def _streaming_entry(self) -> dict:
+        # Stream message 3100 was just edited for the open turn; it's the pane's latest.
+        return {
+            "last_stream_message_id": "3100",
+            "last_stream_turn_id": "1ee3de2e-open",
+            "last_pane_message_id": "3100",
+            "last_clean_message_id": "3072",
+        }
+
+    def test_reuses_stream_message_when_completed_turn_id_differs(self) -> None:
+        # The completed turn finalizes under turn.turn_id (== the latest completed turn),
+        # which differs from the open_turn_id the message streamed under.
+        entry = self._streaming_entry()
+        item = {"kind": "turn", "turn_id": "e74fdf39-done"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "3100")
+
+    def test_reuses_stream_message_when_item_is_open_turn(self) -> None:
+        entry = self._streaming_entry()
+        item = {"kind": "turn", "turn_id": "1ee3de2e-open"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "3100")
+
+    def test_skips_older_catch_up_turn(self) -> None:
+        # Catch-up is delivering an OLDER completed turn while a newer turn streamed; its
+        # id is neither the current completed nor the open turn -> must stay its own message.
+        entry = self._streaming_entry()
+        item = {"kind": "turn", "turn_id": "aaaa-older-interrupted"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "")
+
+    def test_skips_when_stream_message_buried(self) -> None:
+        # A later message buried the stream message -> editing it would strand the
+        # completion mid-feed; send a fresh message instead.
+        entry = self._streaming_entry()
+        entry["last_pane_message_id"] = "3104"
+        item = {"kind": "turn", "turn_id": "e74fdf39-done"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "")
+
+    def test_skips_when_already_finalized_as_clean(self) -> None:
+        entry = self._streaming_entry()
+        entry["last_clean_message_id"] = "3100"  # already the finalized clean message
+        item = {"kind": "turn", "turn_id": "e74fdf39-done"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "")
+
+    def test_skips_when_no_stream_message(self) -> None:
+        entry = {"last_pane_message_id": "3100"}
+        item = {"kind": "turn", "turn_id": "e74fdf39-done"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "")
+
+    def test_skips_when_turn_unavailable(self) -> None:
+        # No authoritative current-turn ids -> cannot prove the item is the current turn.
+        entry = self._streaming_entry()
+        item = {"kind": "turn", "turn_id": "e74fdf39-done"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, {"available": False}), "")
+
+
 if __name__ == "__main__":
     unittest.main()

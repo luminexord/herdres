@@ -9917,6 +9917,48 @@ def turn_visible_anchor_message_id(entry: dict[str, Any], turn_id: str) -> str:
     return ""
 
 
+def turn_stream_anchor_fallback(
+    entry: dict[str, Any], item: dict[str, Any], turn: dict[str, Any] | None
+) -> str:
+    """Reuse the live stream message at finalize when the strict anchor missed.
+
+    A turn streams its worklog into a real message keyed by the adapter's open_turn_id,
+    but the completed turn can finalize under a DIFFERENT turn_id — adapter id
+    reassignment (the open turn's id != the completed turn's id) or select_turn_feed_item's
+    catch-up picking recent[idx+1]. turn_visible_anchor_message_id then strict-misses, and
+    because a stream message exists the #33 prompt fallback is gated off, so the completion
+    posts a fresh message and ORPHANS the live stream message — the user sees one
+    "User + Worklog" message followed by a separate "User + Worklog + Response" message
+    (the duplicate). Editing the stream message in place instead yields one message that
+    grows User -> Worklog -> Response with the streamed worklog preserved.
+
+    Guards (all required):
+      - a stream message exists and has not already been finalized as the clean message;
+      - it is still the pane's latest (nothing posted after it, so editing neither buries
+        the completion nor races a sibling pane's message);
+      - the item is the pane's CURRENT turn (its completed or open id) — never an older
+        catch-up turn, which streamed nothing and must stay its own message; reusing the
+        (newer) stream message for an older turn would overwrite the wrong turn.
+    """
+    stream_message_id = str(entry.get("last_stream_message_id") or "")
+    if not stream_message_id:
+        return ""
+    if str(entry.get("last_clean_message_id") or "") == stream_message_id:
+        return ""
+    if not pane_message_is_latest(entry, stream_message_id):
+        return ""
+    item_turn_id = str(item.get("turn_id") or "")
+    if not item_turn_id:
+        return ""
+    current_turn_ids = set()
+    if isinstance(turn, dict):
+        current_turn_ids = {str(turn.get("turn_id") or ""), str(turn.get("open_turn_id") or "")}
+    current_turn_ids.discard("")
+    if item_turn_id not in current_turn_ids:
+        return ""
+    return stream_message_id
+
+
 def route_message_to_pane(
     state: dict[str, Any],
     chat_id: str,
@@ -10281,6 +10323,10 @@ def _sync_pane_clean_feed(
             lifecycle_message_id = ""
             if str(item.get("kind") or "").lower() == "turn":
                 lifecycle_message_id = turn_visible_anchor_message_id(entry, str(item.get("turn_id") or ""))
+                if not lifecycle_message_id and entry.get("last_stream_message_id"):
+                    lifecycle_message_id = turn_stream_anchor_fallback(
+                        entry, item, cached_pane_turn(str(pane.get("pane_id") or ""))
+                    )
                 if lifecycle_message_id:
                     space_entry = (state.get("spaces") or {}).get(str(entry.get("space_key") or ""))
                     if not topic_message_is_latest(space_entry, lifecycle_message_id):
