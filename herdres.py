@@ -7764,8 +7764,11 @@ def stream_draft_id(chat_id: str, space_key_value: str, pane_key_value: str, tur
 def reusable_stream_state_for_turn(entry: dict[str, Any], turn_id: str) -> bool:
     if str(entry.get("last_stream_turn_id") or "") != str(turn_id):
         return False
-    message_id = str(entry.get("last_stream_message_id") or "")
-    return not message_id or pane_message_is_latest(entry, message_id)
+    ids = stream_message_ids(entry)
+    # Reusable when nothing was posted after the set's NEWEST chunk (ids[-1]); the anchor
+    # ids[0] is not the latest message for a multi-chunk set, so checking it would wrongly
+    # disable reuse and re-send a fresh (orphaning) set every update.
+    return not ids or pane_message_is_latest(entry, ids[-1])
 
 
 def stream_throttle_reason(entry: dict[str, Any], turn_id: str, *, max_updates: int | None = None) -> str:
@@ -8892,8 +8895,22 @@ def upsert_rich_chunks(
             )
             if res.get("not_found"):
                 if i == 0:
+                    # Anchor gone: delete any surviving tail so it isn't orphaned, then
+                    # signal the caller to re-send the whole set fresh.
+                    for stale in existing[1:]:
+                        try:
+                            delete_message(chat_id, stale, api_token=api_token)
+                        except Exception:
+                            pass
                     return {"ok": False, "format": "rich", "anchor_lost": True, "not_found": True}
-                existing = existing[:i]  # non-anchor gone: re-send this + the rest fresh
+                # Non-anchor gone: delete the surviving tail (it would be orphaned) and
+                # re-send this chunk + the rest fresh.
+                for stale in existing[i + 1:]:
+                    try:
+                        delete_message(chat_id, stale, api_token=api_token)
+                    except Exception:
+                        pass
+                existing = existing[:i]
                 continue
             if not res.get("ok"):
                 out = {"ok": False, "format": "rich", "kind": res.get("kind"),
@@ -10080,7 +10097,9 @@ def turn_visible_anchor_message_ids(entry: dict[str, Any], turn_id: str) -> list
         return []
     stream_ids = stream_message_ids(entry)
     stream_turn_id = str(entry.get("last_stream_turn_id") or "")
-    if stream_ids and stream_turn_id == clean_turn_id and pane_message_is_latest(entry, stream_ids[0]):
+    # Latest-ness is judged on the NEWEST chunk (ids[-1]); for a multi-chunk set the anchor
+    # ids[0] is never the pane's latest message.
+    if stream_ids and stream_turn_id == clean_turn_id and pane_message_is_latest(entry, stream_ids[-1]):
         return stream_ids
     prompt_message_id = str(entry.get("last_prompt_message_id") or "")
     prompt_turn_id = str(entry.get("last_prompt_turn_id") or "")
@@ -10464,7 +10483,8 @@ def _sync_pane_clean_feed(
                 lifecycle_message_ids = turn_visible_anchor_message_ids(entry, str(item.get("turn_id") or ""))
                 if lifecycle_message_ids:
                     space_entry = (state.get("spaces") or {}).get(str(entry.get("space_key") or ""))
-                    if not topic_message_is_latest(space_entry, lifecycle_message_ids[0]):
+                    # Buried iff something was posted after the set's NEWEST chunk (ids[-1]).
+                    if not topic_message_is_latest(space_entry, lifecycle_message_ids[-1]):
                         # A sibling pane (or the owner) posted to this shared topic after the
                         # turn's anchor was placed. Editing it in place would leave the final
                         # completion buried mid-feed where the owner never sees it. Drop the

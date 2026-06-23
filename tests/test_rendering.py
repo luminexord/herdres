@@ -10843,8 +10843,8 @@ class StreamEditInPlaceTests(unittest.TestCase):
         self.assertNotIn("last_stream_message_id", e)
 
     def test_turn_visible_anchor_message_ids(self) -> None:
-        # stream set latest (anchor == pane latest) -> returns the stream list
-        e = {"last_stream_message_ids": ["50", "51"], "last_stream_turn_id": "t1", "last_pane_message_id": "50"}
+        # stream set latest (its NEWEST chunk == pane latest) -> returns the stream list
+        e = {"last_stream_message_ids": ["50", "51"], "last_stream_turn_id": "t1", "last_pane_message_id": "51"}
         self.assertEqual(herdres.turn_visible_anchor_message_ids(e, "t1"), ["50", "51"])
         # stream anchor buried, prompt anchor is latest -> [prompt]
         e2 = {"last_stream_message_id": "50", "last_stream_turn_id": "t1",
@@ -10914,6 +10914,26 @@ class StreamEditInPlaceTests(unittest.TestCase):
                             edit_rich_message=Mock(side_effect=AssertionError("should not edit"))):
             res = herdres.send_stream_message("-1001", telegram, entry, turn_id="t1", text="another worklog line body")
         self.assertTrue(res.get("skipped"))
+
+    def test_multichunk_set_reusable_by_last_chunk_not_anchor(self) -> None:
+        # A multi-chunk set is reused while its NEWEST chunk (ids[-1]) is the pane's latest
+        # message — judging by the anchor ids[0] would wrongly re-send + orphan every update.
+        e = {"last_stream_message_ids": ["100", "200"], "last_stream_turn_id": "t1", "last_pane_message_id": "200"}
+        self.assertTrue(herdres.reusable_stream_state_for_turn(e, "t1"))
+        self.assertEqual(herdres.turn_visible_anchor_message_ids(e, "t1"), ["100", "200"])
+        # something posted after the set -> not reusable, no anchor
+        e2 = dict(e, last_pane_message_id="999")
+        self.assertFalse(herdres.reusable_stream_state_for_turn(e2, "t1"))
+        self.assertEqual(herdres.turn_visible_anchor_message_ids(e2, "t1"), [])
+
+    def test_upsert_anchor_lost_deletes_surviving_tail(self) -> None:
+        deletes = []
+        def edit_nf(chat, mid, html, **kw): return {"ok": False, "not_found": True, "kind": "not_found"}
+        def dele(chat, mid, **kw): deletes.append(str(mid)); return True
+        with patch.multiple(herdres, edit_rich_message=edit_nf, delete_message=dele):
+            r = herdres.upsert_rich_chunks("c", ["a", "b"], ["<p>body one</p>", "<p>body two</p>"])
+        self.assertTrue(r.get("anchor_lost"))
+        self.assertEqual(deletes, ["b"])  # surviving tail cleaned up, not orphaned
 
 
 if __name__ == "__main__":
