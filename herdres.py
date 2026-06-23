@@ -3349,7 +3349,7 @@ def suppress_duplicate_native_session_stream(entry: dict[str, Any], owner_key: s
     entry["last_stream_update_count"] = update_count + 1
     entry["last_stream_suppressed_reason"] = f"duplicate_native_session:{owner_key}"
     entry["last_stream_suppressed_at"] = utc_now()
-    for key in ("pending_stream_turn_id", "pending_stream_text", "pending_stream_revision", "last_stream_message_id", "last_stream_draft_id"):
+    for key in ("pending_stream_turn_id", "pending_stream_text", "pending_stream_revision", "last_stream_message_id", "last_stream_message_ids", "last_stream_draft_id"):
         entry.pop(key, None)
     return True
 
@@ -3571,6 +3571,7 @@ def clear_delivered_stream_state(entry: dict[str, Any]) -> None:
         "last_stream_turn_id",
         "last_stream_draft_id",
         "last_stream_message_id",
+        "last_stream_message_ids",
         "last_stream_text",
         "last_stream_sent_at",
         "last_stream_error",
@@ -5446,6 +5447,7 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_semantic_hash",
         "last_clean_render_hash",
         "last_clean_message_id",
+        "last_clean_message_ids",
         "last_clean_kind",
         "last_clean_text",
         "last_clean_item",
@@ -5903,6 +5905,7 @@ def record_delivered_feed_item(
     item_render_hash: str | None = None,
     item_semantic_hash: str | None = None,
     fallback_message_id: str | int | None = None,
+    fallback_message_ids: list[str] | None = None,
 ) -> None:
     if pending_active_prompt:
         bind_active_prompt_message(
@@ -5924,10 +5927,12 @@ def record_delivered_feed_item(
     entry["last_clean_hash"] = item_render_hash
     entry["last_clean_semantic_hash"] = item_semantic_hash
     entry["last_clean_render_hash"] = item_render_hash
-    if result.get("message_id"):
-        entry["last_clean_message_id"] = str(result["message_id"])
-    elif fallback_message_id:
-        entry["last_clean_message_id"] = str(fallback_message_id)
+    delivered_ids = result.get("message_ids") if isinstance(result.get("message_ids"), list) else None
+    if not delivered_ids:
+        single = str(result.get("message_id") or fallback_message_id or "").strip()
+        delivered_ids = [single] if single else list(fallback_message_ids or [])
+    if delivered_ids:
+        set_clean_message_ids(entry, delivered_ids)
     entry["last_clean_kind"] = str(item.get("kind") or "")
     entry["last_clean_text"] = item_plain_text(item)
     entry["last_clean_item"] = item
@@ -5990,7 +5995,7 @@ def refresh_stale_visible_prompt(
         entry["last_clean_semantic_hash"] = clean_feed_hash(current_item, include_render_version=False)
         entry["last_clean_render_hash"] = clean_feed_hash(current_item)
         if result.get("message_id"):
-            entry["last_clean_message_id"] = str(result["message_id"])
+            set_clean_message_ids(entry, [str(result["message_id"])])
         entry["last_clean_kind"] = str(current_item.get("kind") or "choices")
         entry["last_clean_text"] = item_plain_text(current_item)
         entry["last_clean_item"] = current_item
@@ -9892,19 +9897,65 @@ def note_topic_high_water_mark(space: dict[str, Any] | None, message_id: str | i
     return True
 
 
-def turn_visible_anchor_message_id(entry: dict[str, Any], turn_id: str) -> str:
+def _message_id_list(entry: dict[str, Any], list_key: str, scalar_key: str) -> list[str]:
+    """The ordered chunk message ids for a turn's message. Back-compat: live state may
+    only have the scalar (pre-list), so synthesize ``[scalar]`` when the list is absent."""
+    ids = entry.get(list_key)
+    if isinstance(ids, list) and ids:
+        return [str(m) for m in ids if str(m or "").strip()]
+    scalar = str(entry.get(scalar_key) or "").strip()
+    return [scalar] if scalar else []
+
+
+def _set_message_id_list(entry: dict[str, Any], list_key: str, scalar_key: str, ids: list[str] | None) -> None:
+    """Write the ordered chunk list and keep the scalar = ids[0] (the anchor that routing,
+    fold, dedup and the latest-checks key off). Empty ids clears both."""
+    clean = [str(m) for m in (ids or []) if str(m or "").strip()]
+    if clean:
+        entry[list_key] = clean
+        entry[scalar_key] = clean[0]
+    else:
+        entry.pop(list_key, None)
+        entry.pop(scalar_key, None)
+
+
+def stream_message_ids(entry: dict[str, Any]) -> list[str]:
+    return _message_id_list(entry, "last_stream_message_ids", "last_stream_message_id")
+
+
+def clean_message_ids(entry: dict[str, Any]) -> list[str]:
+    return _message_id_list(entry, "last_clean_message_ids", "last_clean_message_id")
+
+
+def set_stream_message_ids(entry: dict[str, Any], ids: list[str] | None) -> None:
+    _set_message_id_list(entry, "last_stream_message_ids", "last_stream_message_id", ids)
+
+
+def set_clean_message_ids(entry: dict[str, Any], ids: list[str] | None) -> None:
+    _set_message_id_list(entry, "last_clean_message_ids", "last_clean_message_id", ids)
+
+
+def turn_visible_anchor_message_ids(entry: dict[str, Any], turn_id: str) -> list[str]:
+    """List-aware anchor: the ordered chunk message ids that currently hold this turn —
+    the stream set if its anchor (ids[0]) is still the pane's latest message, else the
+    prompt message (single chunk), else []. The anchor governs the latest-checks."""
     clean_turn_id = str(turn_id or "")
     if not clean_turn_id:
-        return ""
-    stream_message_id = str(entry.get("last_stream_message_id") or "")
+        return []
+    stream_ids = stream_message_ids(entry)
     stream_turn_id = str(entry.get("last_stream_turn_id") or "")
-    if stream_message_id and stream_turn_id == clean_turn_id and pane_message_is_latest(entry, stream_message_id):
-        return stream_message_id
+    if stream_ids and stream_turn_id == clean_turn_id and pane_message_is_latest(entry, stream_ids[0]):
+        return stream_ids
     prompt_message_id = str(entry.get("last_prompt_message_id") or "")
     prompt_turn_id = str(entry.get("last_prompt_turn_id") or "")
     if prompt_message_id and prompt_turn_id == clean_turn_id and pane_message_is_latest(entry, prompt_message_id):
-        return prompt_message_id
-    return ""
+        return [prompt_message_id]
+    return []
+
+
+def turn_visible_anchor_message_id(entry: dict[str, Any], turn_id: str) -> str:
+    ids = turn_visible_anchor_message_ids(entry, turn_id)
+    return ids[0] if ids else ""
 
 
 def route_message_to_pane(
