@@ -10824,5 +10824,44 @@ class TopicLatestAnchorTests(unittest.TestCase):
         self.assertNotIn("last_topic_message_id", state["spaces"]["workspace:workspace-1"])
 
 
+class PromptAnchorFallbackTests(unittest.TestCase):
+    """A completed turn must reuse the prompt message even when its turn_id differs from
+    the open-prompt turn_id (the auto-continue case), so one input -> one message, not a
+    duplicate. Reproduces the live 2818/2820 case (prompt 2818 turn '14275889' + finalized
+    turn '18a4d8e5' posted as a separate 2820)."""
+
+    def test_finalize_reuses_prompt_when_turn_id_differs(self) -> None:
+        # Prompt 2818 was just delivered for the open turn; it's the pane's latest message.
+        entry = {
+            "last_prompt_message_id": "2818",
+            "last_prompt_turn_id": "14275889",
+            "last_pane_message_id": "2818",
+        }
+        # The completed turn finalizes under a DIFFERENT turn_id (auto-continue):
+        self.assertEqual(herdres.turn_visible_anchor_message_id(entry, "18a4d8e5"), "2818")
+        # ...and the strict same-turn_id case still works.
+        self.assertEqual(herdres.turn_visible_anchor_message_id(entry, "14275889"), "2818")
+
+    def test_fallback_skipped_when_prompt_not_latest(self) -> None:
+        # Something newer was posted after the prompt -> don't hijack it; send fresh.
+        entry = {
+            "last_prompt_message_id": "2818",
+            "last_prompt_turn_id": "14275889",
+            "last_pane_message_id": "2820",  # a later message buried the prompt
+        }
+        self.assertEqual(herdres.turn_visible_anchor_message_id(entry, "18a4d8e5"), "")
+
+    def test_fallback_skipped_when_stream_anchor_exists(self) -> None:
+        # A live stream anchor is the proper anchor; the loose prompt fallback must not fire.
+        entry = {
+            "last_prompt_message_id": "2818",
+            "last_prompt_turn_id": "14275889",
+            "last_stream_message_id": "2819",
+            "last_stream_turn_id": "other",
+            "last_pane_message_id": "2818",
+        }
+        self.assertEqual(herdres.turn_visible_anchor_message_id(entry, "18a4d8e5"), "")
+
+
 if __name__ == "__main__":
     unittest.main()
