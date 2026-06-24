@@ -615,6 +615,7 @@ def normalize_state(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("panes", {})
     migrate_legacy_pane_topics(data)
     migrate_space_voice_mode(data)
+    prune_orphaned_colliding_spaces(data)
     clear_disabled_visible_choice_state(data)
     return data
 
@@ -2082,6 +2083,54 @@ def migrate_space_voice_mode(state: dict[str, Any]) -> bool:
                 changed = True
                 break
     return changed
+
+
+def prune_orphaned_colliding_spaces(state: dict[str, Any]) -> bool:
+    """Drop a space whose pane_keys are ALL dangling (no entry in state["panes"]) when
+    another space owns the SAME topic with at least one live pane.
+
+    A herdr pane can be renumbered mid-session (e.g. p16 -> p1H): a fresh space/pane is
+    created for the new id, but the old space stays bound to the topic with a now-dangling
+    pane_key. Because topic_space_entry returns the FIRST space matching a topic, the dead
+    space shadows the live one and inbound commands/replies resolve to it — yielding
+    "No live Herdr panes in this topic." (live_entries_for_space skips the dangling pane).
+
+    The condition is deliberately conservative: prune only a fully-orphaned space (every
+    pane_key missing from state["panes"]) AND only when a sibling space on the exact same
+    topic still has a live pane. This never deletes the sole space for a topic, nor a space
+    that is merely momentarily idle — it requires a healthy live owner of that topic to
+    already exist. Returns True if any space was pruned (caller persists state)."""
+    spaces = state.get("spaces")
+    panes = state.get("panes")
+    if not isinstance(spaces, dict) or not isinstance(panes, dict):
+        return False
+
+    def live_pane_count(space: dict[str, Any]) -> int:
+        if not isinstance(space, dict):
+            return 0
+        return sum(1 for k in (space.get("pane_keys") or []) if str(k) in panes)
+
+    healthy_topics: set[str] = set()
+    for space in spaces.values():
+        if live_pane_count(space) > 0:
+            topic = str(space.get("topic_id") or "").strip()
+            if topic:
+                healthy_topics.add(topic)
+
+    orphans: list[str] = []
+    for key, space in spaces.items():
+        if not isinstance(space, dict):
+            continue
+        if not (space.get("pane_keys") or []):
+            continue  # never had/declared a pane -> leave alone
+        if live_pane_count(space) > 0:
+            continue  # still has a live pane -> keep
+        topic = str(space.get("topic_id") or "").strip()
+        if topic and topic in healthy_topics:
+            orphans.append(key)
+    for key in orphans:
+        spaces.pop(key, None)
+    return bool(orphans)
 
 
 def status_object(pane: dict[str, Any]) -> dict[str, Any]:
@@ -9917,6 +9966,48 @@ def turn_visible_anchor_message_id(entry: dict[str, Any], turn_id: str) -> str:
     return ""
 
 
+def turn_stream_anchor_fallback(
+    entry: dict[str, Any], item: dict[str, Any], turn: dict[str, Any] | None
+) -> str:
+    """Reuse the live stream message at finalize when the strict anchor missed.
+
+    A turn streams its worklog into a real message keyed by the adapter's open_turn_id,
+    but the completed turn can finalize under a DIFFERENT turn_id — adapter id
+    reassignment (the open turn's id != the completed turn's id) or select_turn_feed_item's
+    catch-up picking recent[idx+1]. turn_visible_anchor_message_id then strict-misses, and
+    because a stream message exists the #33 prompt fallback is gated off, so the completion
+    posts a fresh message and ORPHANS the live stream message — the user sees one
+    "User + Worklog" message followed by a separate "User + Worklog + Response" message
+    (the duplicate). Editing the stream message in place instead yields one message that
+    grows User -> Worklog -> Response with the streamed worklog preserved.
+
+    Guards (all required):
+      - a stream message exists and has not already been finalized as the clean message;
+      - it is still the pane's latest (nothing posted after it, so editing neither buries
+        the completion nor races a sibling pane's message);
+      - the item is the pane's CURRENT turn (its completed or open id) — never an older
+        catch-up turn, which streamed nothing and must stay its own message; reusing the
+        (newer) stream message for an older turn would overwrite the wrong turn.
+    """
+    stream_message_id = str(entry.get("last_stream_message_id") or "")
+    if not stream_message_id:
+        return ""
+    if str(entry.get("last_clean_message_id") or "") == stream_message_id:
+        return ""
+    if not pane_message_is_latest(entry, stream_message_id):
+        return ""
+    item_turn_id = str(item.get("turn_id") or "")
+    if not item_turn_id:
+        return ""
+    current_turn_ids = set()
+    if isinstance(turn, dict):
+        current_turn_ids = {str(turn.get("turn_id") or ""), str(turn.get("open_turn_id") or "")}
+    current_turn_ids.discard("")
+    if item_turn_id not in current_turn_ids:
+        return ""
+    return stream_message_id
+
+
 def route_message_to_pane(
     state: dict[str, Any],
     chat_id: str,
@@ -10281,6 +10372,10 @@ def _sync_pane_clean_feed(
             lifecycle_message_id = ""
             if str(item.get("kind") or "").lower() == "turn":
                 lifecycle_message_id = turn_visible_anchor_message_id(entry, str(item.get("turn_id") or ""))
+                if not lifecycle_message_id and entry.get("last_stream_message_id"):
+                    lifecycle_message_id = turn_stream_anchor_fallback(
+                        entry, item, cached_pane_turn(str(pane.get("pane_id") or ""))
+                    )
                 if lifecycle_message_id:
                     space_entry = (state.get("spaces") or {}).get(str(entry.get("space_key") or ""))
                     if not topic_message_is_latest(space_entry, lifecycle_message_id):
