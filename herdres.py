@@ -13151,6 +13151,82 @@ def _setup_confirm_hermes_reuse(interactive: bool) -> bool:
     return input().strip().lower() == "reuse"
 
 
+# Issue #36: the herdres Claude hook (herdres-decision-hook) reports a pending
+# AskUserQuestion/ExitPlanMode so the bridge renders tappable buttons. Registered in
+# ~/.claude/settings.json for these events; matcher-scoped so it only runs for those tools
+# (SessionEnd cleans up an abandoned record). The hook script itself also filters by tool name.
+CLAUDE_DECISION_HOOK_EVENTS = (
+    ("PreToolUse", "AskUserQuestion|ExitPlanMode"),
+    ("PostToolUse", "AskUserQuestion|ExitPlanMode"),
+    ("SessionEnd", "*"),
+)
+
+
+def claude_settings_path() -> Path:
+    return Path.home() / ".claude" / "settings.json"
+
+
+def decision_hook_command() -> str:
+    return f"python3 '{Path.home() / '.local' / 'bin' / 'herdres-decision-hook'}'"
+
+
+def install_claude_decision_hook(settings_path: Path | None = None, command: str | None = None) -> bool:
+    """Idempotently register the herdres decision hook (issue #36) in ~/.claude/settings.json.
+    Coexists with other hooks (orca/herdr): only adds our exact command if absent, never touches
+    others — mirrors herdr's ensure_command_hook. Returns True if settings.json changed; no-op
+    (False) when ~/.claude is absent (Claude Code not installed here)."""
+    settings_path = Path(settings_path) if settings_path else claude_settings_path()
+    command = command or decision_hook_command()
+    if not settings_path.parent.exists():
+        return False
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        data["hooks"] = hooks
+    changed = False
+    for event, matcher in CLAUDE_DECISION_HOOK_EVENTS:
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            entries = []
+            hooks[event] = entries
+        already = any(
+            isinstance(h, dict) and str(h.get("command")) == command
+            for entry in entries
+            if isinstance(entry, dict)
+            for h in (entry.get("hooks") if isinstance(entry.get("hooks"), list) else [])
+        )
+        if already:
+            continue
+        entries.append({"matcher": matcher, "hooks": [{"type": "command", "command": command, "timeout": 10}]})
+        changed = True
+    if changed:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = settings_path.parent / (settings_path.name + ".herdres.tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, settings_path)
+    return changed
+
+
+def hooks_once(args: Any) -> dict[str, Any]:
+    if str(getattr(args, "action", "install") or "install") != "install":
+        return {"ok": False, "error": f"unknown hooks action: {getattr(args, 'action', '')}"}
+    hook_path = Path.home() / ".local" / "bin" / "herdres-decision-hook"
+    changed = install_claude_decision_hook()
+    return {
+        "ok": True,
+        "settings_changed": changed,
+        "hook_script_present": hook_path.exists(),
+        "settings_path": str(claude_settings_path()),
+        "hook_path": str(hook_path),
+    }
+
+
 def setup_once(args: Any) -> dict[str, Any]:
     """Interactive credential wizard. Validates, preflights, then writes 0o600."""
     load_dotenv()
@@ -13350,6 +13426,10 @@ def _update_files_plan() -> list[dict[str, Any]]:
         # The `pane turn` shim (HERDR_BIN points at it); shipping it via update keeps
         # the turn/worklog adapter in lockstep with herdres.py instead of installer-only.
         {"src": "herdr_turn_adapter.py", "dest": INSTALL_BIN_DIR / "herdr_turn_adapter.py", "mode": 0o755},
+        # Claude Code hook (issue #36): records a pending AskUserQuestion/ExitPlanMode so the
+        # bridge can render tappable buttons. Registered in ~/.claude/settings.json by
+        # install_claude_decision_hook() (called post-apply below + by `herdres hooks install`).
+        {"src": "herdres_decision_hook.py", "dest": INSTALL_BIN_DIR / "herdres-decision-hook", "mode": 0o755},
         {"src": "herdr_topic_bridge.py", "dest": INSTALL_SHARE_DIR / "herdr_topic_bridge.py", "mode": 0o644},
         {
             "src": "herdres-plugin/herdr-plugin.toml",
@@ -13986,6 +14066,12 @@ def _apply_from_source(
     backup = _backup_install_set()
     try:
         written = _apply_install_set(repo)
+        # Re-register the Claude decision hook (issue #36) after files land — idempotent,
+        # best-effort (never fail an update over a cosmetic hook); coexists with orca/herdr.
+        try:
+            install_claude_decision_hook()
+        except Exception:
+            pass
         # _restart_services raises if a previously-active gateway can't be brought
         # back; that propagates here and rolls back. (--no-restart skips it; the
         # operator restarts manually later.)
@@ -14265,6 +14351,8 @@ def main() -> int:
     setup.add_argument("--allowed-users", default="")
     setup.add_argument("--reuse-hermes-token", action="store_true")
     sub.add_parser("version")
+    hooks = sub.add_parser("hooks")
+    hooks.add_argument("action", nargs="?", default="install", choices=["install"])
     update = sub.add_parser("update")
     update.add_argument("--channel", default="edge")
     update.add_argument("--edge", action="store_const", const="edge", dest="channel")
@@ -14301,6 +14389,8 @@ def main() -> int:
             result = setup_once(args)
         elif args.cmd == "version":
             result = version_once(args)
+        elif args.cmd == "hooks":
+            result = hooks_once(args)
         elif args.cmd == "update":
             result = update_once(args)
         else:

@@ -1,5 +1,7 @@
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -1391,35 +1393,46 @@ class ModelExtractionTests(unittest.TestCase):
 
 
 class ClaudeDecisionTests(unittest.TestCase):
-    """Issue #36: the adapter surfaces pending AskUserQuestion / ExitPlanMode tool_use blocks
-    as structured pending_decision / pending_interaction turns so herdres renders buttons."""
+    """Issue #36: the adapter surfaces a PENDING AskUserQuestion/ExitPlanMode — recorded by the
+    herdres Claude hook to a per-session file (the transcript never contains it while pending) — as
+    a structured pending_decision/pending_interaction turn so herdres renders buttons."""
 
-    def _extract(self, events):
+    SESSION = "session-1"
+    OPEN_PROMPT = [{"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Help me decide."}}]
+
+    def _run(self, pending=None, events=None, session=None):
+        """Write a transcript (default: just an open user prompt) + an optional hook-style pending
+        file under a temp HERDRES_PENDING_DIR, then extract."""
+        session = session or self.SESSION
+        events = self.OPEN_PROMPT if events is None else events
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "session-1.jsonl"
+            pdir = Path(tmp) / "pending"
+            if pending is not None:
+                pdir.mkdir(parents=True, exist_ok=True)
+                safe = "".join(c for c in session if c.isalnum() or c in "-_.")[:120] or "session"
+                (pdir / f"{safe}.json").write_text(json.dumps(pending), encoding="utf-8")
+            path = Path(tmp) / f"{session}.jsonl"
             write_jsonl(path, events)
-            return adapter.extract_claude_turn(path, "pane-1", "session-1")
+            with patch.dict(os.environ, {"HERDRES_PENDING_DIR": str(pdir)}, clear=False):
+                return adapter.extract_claude_turn(path, "pane-1", session)
 
-    def _ask(self, questions):
-        return [
-            {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Help me decide."}},
-            {"type": "assistant", "uuid": "step-1", "message": {"role": "assistant", "stop_reason": "tool_use",
-                "content": [
-                    {"type": "text", "text": "I need a decision."},
-                    {"type": "tool_use", "id": "toolu_q1", "name": "AskUserQuestion", "input": {"questions": questions}},
-                ]}},
-        ]
+    def _pending(self, name, tool_input, tool_use_id="hookdec-abc", ts=None):
+        return {"tool_use_id": tool_use_id, "name": name, "input": tool_input,
+                "session_id": self.SESSION, "ts": time.time() if ts is None else ts}
+
+    def _auq(self, questions, **kw):
+        return self._pending("AskUserQuestion", {"questions": questions}, **kw)
 
     def test_ask_user_question_pending_emits_decision(self) -> None:
-        turn = self._extract(self._ask([
+        turn = self._run(self._auq([
             {"question": "Which DB?", "header": "Storage", "multiSelect": False,
              "options": [{"label": "Postgres", "description": "x"}, {"label": "SQLite"}]},
-        ]))
+        ], tool_use_id="hookdec-q1"))
         self.assertTrue(turn.get("awaiting_input"))
         self.assertIs(turn.get("complete"), False)
         dec = turn.get("pending_decision")
         self.assertIsInstance(dec, dict)
-        self.assertEqual(dec["decision_id"], "toolu_q1")
+        self.assertEqual(dec["decision_id"], "hookdec-q1")
         labels = [o["label"] for o in dec["options"]]
         self.assertEqual(labels[:2], ["Postgres", "SQLite"])
         self.assertEqual(dec["options"][0]["send_text"], "Postgres")  # send_text == label (verified round-trip)
@@ -1427,34 +1440,19 @@ class ClaudeDecisionTests(unittest.TestCase):
         self.assertIn("Storage", dec["prompt"])
         self.assertNotIn("pending_interaction", turn)
 
-    def test_ask_user_question_answered_emits_no_decision(self) -> None:
-        events = self._ask([
-            {"question": "Which DB?", "header": "Storage", "multiSelect": False,
-             "options": [{"label": "Postgres"}, {"label": "SQLite"}]},
-        ])
-        events += [
-            {"type": "user", "uuid": "ans-1", "message": {"role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "toolu_q1", "content": "=Postgres"}]}},
-            {"type": "assistant", "uuid": "final-1", "timestamp": "2026-06-15T10:00:00Z",
-             "message": {"role": "assistant", "stop_reason": "end_turn",
-                         "content": [{"type": "text", "text": "Using Postgres."}]}},
-        ]
-        turn = self._extract(events)
-        self.assertTrue(turn.get("complete"))
+    def test_no_pending_file_no_decision(self) -> None:
+        # The hook cleared the file on answer (PostToolUse) -> no decision; the open turn is normal.
+        turn = self._run(pending=None)
         self.assertNotIn("pending_decision", turn)
-        self.assertEqual(turn.get("assistant_final_text"), "Using Postgres.")
+        self.assertNotIn("pending_interaction", turn)
 
     def test_exit_plan_mode_pending_emits_two_option_decision(self) -> None:
         with patch.object(adapter, "PLAN_APPROVE_SEND_TEXT", "1"):
-            turn = self._extract([
-                {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Plan it."}},
-                {"type": "assistant", "uuid": "step-1", "message": {"role": "assistant", "stop_reason": "tool_use",
-                    "content": [{"type": "tool_use", "id": "toolu_plan", "name": "ExitPlanMode",
-                                 "input": {"plan": "# Plan\n1. do thing\n2. do other thing"}}]}},
-            ])
+            turn = self._run(self._pending("ExitPlanMode", {"plan": "# Plan\n1. do thing\n2. more"},
+                                           tool_use_id="hookdec-plan"))
         dec = turn.get("pending_decision")
         self.assertIsInstance(dec, dict)
-        self.assertEqual(dec["decision_id"], "toolu_plan")
+        self.assertEqual(dec["decision_id"], "hookdec-plan")
         self.assertEqual([o["id"] for o in dec["options"]], ["approve", "revise"])
         self.assertEqual(dec["options"][0]["send_text"], "1")
         self.assertEqual(dec["options"][1]["send_text"], "")  # revise -> ForceReply
@@ -1462,7 +1460,7 @@ class ClaudeDecisionTests(unittest.TestCase):
         self.assertTrue(turn.get("awaiting_input"))
 
     def test_multi_question_is_readonly_interaction(self) -> None:
-        turn = self._extract(self._ask([
+        turn = self._run(self._auq([
             {"question": "Q1?", "header": "A", "multiSelect": False, "options": [{"label": "a1"}, {"label": "a2"}]},
             {"question": "Q2?", "header": "B", "multiSelect": False, "options": [{"label": "b1"}, {"label": "b2"}]},
         ]))
@@ -1473,7 +1471,7 @@ class ClaudeDecisionTests(unittest.TestCase):
         self.assertEqual(len(inter["questions"]), 2)
 
     def test_multi_select_single_question_is_readonly(self) -> None:
-        turn = self._extract(self._ask([
+        turn = self._run(self._auq([
             {"question": "Pick several", "header": "Multi", "multiSelect": True,
              "options": [{"label": "x"}, {"label": "y"}]},
         ]))
@@ -1482,14 +1480,14 @@ class ClaudeDecisionTests(unittest.TestCase):
 
     def test_decisions_disabled_by_flag(self) -> None:
         with patch.object(adapter, "DECISIONS_ENABLED", False):
-            turn = self._extract(self._ask([
+            turn = self._run(self._auq([
                 {"question": "Which DB?", "header": "S", "multiSelect": False, "options": [{"label": "Postgres"}]},
             ]))
         self.assertNotIn("pending_decision", turn)
         self.assertNotIn("pending_interaction", turn)
 
     def test_option_without_label_is_skipped_not_none(self) -> None:
-        turn = self._extract(self._ask([
+        turn = self._run(self._auq([
             {"question": "Pick", "header": "H", "multiSelect": False,
              "options": [{"text": "Real A"}, {"label": "B"}, {"label": None}]},
         ]))
@@ -1498,9 +1496,35 @@ class ClaudeDecisionTests(unittest.TestCase):
         self.assertIn("Real A", labels)   # falls back to text
         self.assertIn("B", labels)
 
+    def test_stale_pending_file_is_ignored(self) -> None:
+        # An abandoned file (missed PostToolUse / crash) is bounded by the TTL.
+        turn = self._run(self._auq([
+            {"question": "Which DB?", "header": "S", "multiSelect": False, "options": [{"label": "Postgres"}]},
+        ], ts=0))  # epoch -> far older than HERDRES_PENDING_TTL_SECONDS
+        self.assertNotIn("pending_decision", turn)
+
+    def test_foreign_tool_pending_file_is_ignored(self) -> None:
+        # A stray file naming a non-decision tool must never produce buttons.
+        turn = self._run(self._pending("Bash", {"command": "ls"}))
+        self.assertNotIn("pending_decision", turn)
+        self.assertNotIn("pending_interaction", turn)
+
+    def test_decision_with_prior_completed_turns_keeps_recent(self) -> None:
+        events = [
+            {"type": "user", "uuid": "u0", "message": {"role": "user", "content": "First task."}},
+            {"type": "assistant", "uuid": "a0", "timestamp": "2026-06-15T09:00:00Z",
+             "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "Done first."}]}},
+            {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Next?"}},
+        ]
+        turn = self._run(self._auq([
+            {"question": "Next?", "header": "Step", "multiSelect": False, "options": [{"label": "Go"}, {"label": "Stop"}]},
+        ]), events=events)
+        self.assertIsInstance(turn.get("pending_decision"), dict)
+        self.assertIn("recent_turns", turn)  # history preserved for catch-up
+
     def test_ask_user_question_decision_consumable_by_herdres(self) -> None:
         import herdres
-        turn = self._extract(self._ask([
+        turn = self._run(self._auq([
             {"question": "Which DB?", "header": "Storage", "multiSelect": False,
              "options": [{"label": "Postgres"}, {"label": "SQLite"}]},
         ]))
@@ -1514,12 +1538,7 @@ class ClaudeDecisionTests(unittest.TestCase):
     def test_exit_plan_mode_decision_consumable_by_herdres(self) -> None:
         import herdres
         with patch.object(adapter, "PLAN_APPROVE_SEND_TEXT", "1"):
-            turn = self._extract([
-                {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Plan it."}},
-                {"type": "assistant", "uuid": "step-1", "message": {"role": "assistant", "stop_reason": "tool_use",
-                    "content": [{"type": "tool_use", "id": "toolu_plan", "name": "ExitPlanMode",
-                                 "input": {"plan": "# Plan\nstep one"}}]}},
-            ])
+            turn = self._run(self._pending("ExitPlanMode", {"plan": "# Plan\nstep one"}))
         norm = herdres.normalize_pending_decision(turn)
         self.assertIsInstance(norm, dict)
         self.assertEqual([o["label"] for o in norm["options"]],
@@ -1527,18 +1546,6 @@ class ClaudeDecisionTests(unittest.TestCase):
         # approve carries the send_text knob; revise (empty) flags needs_detail -> ForceReply
         self.assertEqual(norm["options"][0]["send_text"], "1")
         self.assertEqual(norm["options"][1].get("needs_detail"), "1")
-
-    def test_decision_with_prior_completed_turns_keeps_recent(self) -> None:
-        events = [
-            {"type": "user", "uuid": "u0", "message": {"role": "user", "content": "First task."}},
-            {"type": "assistant", "uuid": "a0", "timestamp": "2026-06-15T09:00:00Z",
-             "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "Done first."}]}},
-        ] + self._ask([
-            {"question": "Next?", "header": "Step", "multiSelect": False, "options": [{"label": "Go"}, {"label": "Stop"}]},
-        ])
-        turn = self._extract(events)
-        self.assertIsInstance(turn.get("pending_decision"), dict)
-        self.assertIn("recent_turns", turn)  # history preserved for catch-up
 
 
 if __name__ == "__main__":

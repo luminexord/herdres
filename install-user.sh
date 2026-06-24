@@ -11,6 +11,11 @@ install -Dm644 herdr_topic_bridge.py "$HOME/.local/share/herdres/herdr_topic_bri
 # herdres_routing.py must sit next to it on the import path.
 install -Dm755 herdres_gateway.py "$HOME/.local/bin/herdres-gateway"
 install -Dm644 herdres_routing.py "$HOME/.local/bin/herdres_routing.py"
+# Claude Code hook (issue #36): mirrors a pending AskUserQuestion/ExitPlanMode to Telegram as
+# tappable buttons. Install the script, then register it in ~/.claude/settings.json (idempotent,
+# coexists with other hooks; no-op if Claude Code isn't installed).
+install -Dm755 herdres_decision_hook.py "$HOME/.local/bin/herdres-decision-hook"
+"$HOME/.local/bin/herdres" hooks install >/dev/null 2>&1 || true
 install -d "$HOME/.local/share/herdres/herdres-plugin"
 sed "s#\\[\"herdres\", #\\[\"$HOME/.local/bin/herdres\", #g" \
     herdres-plugin/herdr-plugin.toml > "$HOME/.local/share/herdres/herdres-plugin/herdr-plugin.toml"
