@@ -1390,5 +1390,156 @@ class ModelExtractionTests(unittest.TestCase):
         self.assertEqual(turn["model"], "gpt-5.4")
 
 
+class ClaudeDecisionTests(unittest.TestCase):
+    """Issue #36: the adapter surfaces pending AskUserQuestion / ExitPlanMode tool_use blocks
+    as structured pending_decision / pending_interaction turns so herdres renders buttons."""
+
+    def _extract(self, events):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, events)
+            return adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+    def _ask(self, questions):
+        return [
+            {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Help me decide."}},
+            {"type": "assistant", "uuid": "step-1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                "content": [
+                    {"type": "text", "text": "I need a decision."},
+                    {"type": "tool_use", "id": "toolu_q1", "name": "AskUserQuestion", "input": {"questions": questions}},
+                ]}},
+        ]
+
+    def test_ask_user_question_pending_emits_decision(self) -> None:
+        turn = self._extract(self._ask([
+            {"question": "Which DB?", "header": "Storage", "multiSelect": False,
+             "options": [{"label": "Postgres", "description": "x"}, {"label": "SQLite"}]},
+        ]))
+        self.assertTrue(turn.get("awaiting_input"))
+        self.assertIs(turn.get("complete"), False)
+        dec = turn.get("pending_decision")
+        self.assertIsInstance(dec, dict)
+        self.assertEqual(dec["decision_id"], "toolu_q1")
+        labels = [o["label"] for o in dec["options"]]
+        self.assertEqual(labels[:2], ["Postgres", "SQLite"])
+        self.assertEqual(dec["options"][0]["send_text"], "Postgres")  # send_text == label (verified round-trip)
+        self.assertEqual(dec["options"][-1]["send_text"], "")  # trailing custom -> ForceReply
+        self.assertIn("Storage", dec["prompt"])
+        self.assertNotIn("pending_interaction", turn)
+
+    def test_ask_user_question_answered_emits_no_decision(self) -> None:
+        events = self._ask([
+            {"question": "Which DB?", "header": "Storage", "multiSelect": False,
+             "options": [{"label": "Postgres"}, {"label": "SQLite"}]},
+        ])
+        events += [
+            {"type": "user", "uuid": "ans-1", "message": {"role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_q1", "content": "=Postgres"}]}},
+            {"type": "assistant", "uuid": "final-1", "timestamp": "2026-06-15T10:00:00Z",
+             "message": {"role": "assistant", "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "Using Postgres."}]}},
+        ]
+        turn = self._extract(events)
+        self.assertTrue(turn.get("complete"))
+        self.assertNotIn("pending_decision", turn)
+        self.assertEqual(turn.get("assistant_final_text"), "Using Postgres.")
+
+    def test_exit_plan_mode_pending_emits_two_option_decision(self) -> None:
+        with patch.object(adapter, "PLAN_APPROVE_SEND_TEXT", "1"):
+            turn = self._extract([
+                {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Plan it."}},
+                {"type": "assistant", "uuid": "step-1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "toolu_plan", "name": "ExitPlanMode",
+                                 "input": {"plan": "# Plan\n1. do thing\n2. do other thing"}}]}},
+            ])
+        dec = turn.get("pending_decision")
+        self.assertIsInstance(dec, dict)
+        self.assertEqual(dec["decision_id"], "toolu_plan")
+        self.assertEqual([o["id"] for o in dec["options"]], ["approve", "revise"])
+        self.assertEqual(dec["options"][0]["send_text"], "1")
+        self.assertEqual(dec["options"][1]["send_text"], "")  # revise -> ForceReply
+        self.assertIn("do thing", turn.get("assistant_final_text", ""))  # plan in the card body
+        self.assertTrue(turn.get("awaiting_input"))
+
+    def test_multi_question_is_readonly_interaction(self) -> None:
+        turn = self._extract(self._ask([
+            {"question": "Q1?", "header": "A", "multiSelect": False, "options": [{"label": "a1"}, {"label": "a2"}]},
+            {"question": "Q2?", "header": "B", "multiSelect": False, "options": [{"label": "b1"}, {"label": "b2"}]},
+        ]))
+        self.assertNotIn("pending_decision", turn)
+        inter = turn.get("pending_interaction")
+        self.assertIsInstance(inter, dict)
+        self.assertEqual(inter["kind"], "multi_question_form")
+        self.assertEqual(len(inter["questions"]), 2)
+
+    def test_multi_select_single_question_is_readonly(self) -> None:
+        turn = self._extract(self._ask([
+            {"question": "Pick several", "header": "Multi", "multiSelect": True,
+             "options": [{"label": "x"}, {"label": "y"}]},
+        ]))
+        self.assertNotIn("pending_decision", turn)
+        self.assertIsInstance(turn.get("pending_interaction"), dict)
+
+    def test_decisions_disabled_by_flag(self) -> None:
+        with patch.object(adapter, "DECISIONS_ENABLED", False):
+            turn = self._extract(self._ask([
+                {"question": "Which DB?", "header": "S", "multiSelect": False, "options": [{"label": "Postgres"}]},
+            ]))
+        self.assertNotIn("pending_decision", turn)
+        self.assertNotIn("pending_interaction", turn)
+
+    def test_option_without_label_is_skipped_not_none(self) -> None:
+        turn = self._extract(self._ask([
+            {"question": "Pick", "header": "H", "multiSelect": False,
+             "options": [{"text": "Real A"}, {"label": "B"}, {"label": None}]},
+        ]))
+        labels = [o["label"] for o in turn["pending_decision"]["options"]]
+        self.assertNotIn("None", labels)  # no literal "None" button from a missing label
+        self.assertIn("Real A", labels)   # falls back to text
+        self.assertIn("B", labels)
+
+    def test_ask_user_question_decision_consumable_by_herdres(self) -> None:
+        import herdres
+        turn = self._extract(self._ask([
+            {"question": "Which DB?", "header": "Storage", "multiSelect": False,
+             "options": [{"label": "Postgres"}, {"label": "SQLite"}]},
+        ]))
+        norm = herdres.normalize_pending_decision(turn)
+        self.assertIsInstance(norm, dict)  # adapter output passes herdres' validation
+        self.assertEqual([o["send_text"] for o in norm["options"]][:2], ["Postgres", "SQLite"])
+        item = herdres.make_decision_feed_item(turn, norm)
+        self.assertEqual(item["kind"], "decision")
+        self.assertFalse(herdres.prompt_interaction_disabled(item))  # structured source -> buttons enabled
+
+    def test_exit_plan_mode_decision_consumable_by_herdres(self) -> None:
+        import herdres
+        with patch.object(adapter, "PLAN_APPROVE_SEND_TEXT", "1"):
+            turn = self._extract([
+                {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Plan it."}},
+                {"type": "assistant", "uuid": "step-1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "toolu_plan", "name": "ExitPlanMode",
+                                 "input": {"plan": "# Plan\nstep one"}}]}},
+            ])
+        norm = herdres.normalize_pending_decision(turn)
+        self.assertIsInstance(norm, dict)
+        self.assertEqual([o["label"] for o in norm["options"]],
+                         ["✅ Approve & proceed", "✍️ Keep planning / revise"])
+        # approve carries the send_text knob; revise (empty) flags needs_detail -> ForceReply
+        self.assertEqual(norm["options"][0]["send_text"], "1")
+        self.assertEqual(norm["options"][1].get("needs_detail"), "1")
+
+    def test_decision_with_prior_completed_turns_keeps_recent(self) -> None:
+        events = [
+            {"type": "user", "uuid": "u0", "message": {"role": "user", "content": "First task."}},
+            {"type": "assistant", "uuid": "a0", "timestamp": "2026-06-15T09:00:00Z",
+             "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "Done first."}]}},
+        ] + self._ask([
+            {"question": "Next?", "header": "Step", "multiSelect": False, "options": [{"label": "Go"}, {"label": "Stop"}]},
+        ])
+        turn = self._extract(events)
+        self.assertIsInstance(turn.get("pending_decision"), dict)
+        self.assertIn("recent_turns", turn)  # history preserved for catch-up
+
+
 if __name__ == "__main__":
     unittest.main()

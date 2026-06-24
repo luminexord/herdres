@@ -50,6 +50,23 @@ WORKLOG_LINE_MAX_CHARS = int(os.getenv("HERDRES_TURN_ADAPTER_WORKLOG_LINE_MAX_CH
 # worklog_parts without bound; we keep the most recent lines (closest to the answer).
 WORKLOG_MAX_LINES = int(os.getenv("HERDRES_TURN_ADAPTER_WORKLOG_MAX_LINES", "400"))
 
+# Issue #36: surface Claude Code AskUserQuestion / ExitPlanMode prompts as structured
+# pending_decision/pending_interaction turns, so herdres renders tappable buttons instead of
+# a read-only visible-screen prompt. Toggle off with HERDRES_TURN_ADAPTER_DECISIONS=0.
+DECISIONS_ENABLED = os.getenv("HERDRES_TURN_ADAPTER_DECISIONS", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+DECISION_TOOL_NAMES = {"askuserquestion", "exitplanmode"}
+# ExitPlanMode is a TUI approve/reject dialog (not a freeform-text prompt), so the text sent
+# to the pane when the owner taps "Approve & proceed" is a tunable knob validated by the e2e.
+# "Keep planning / revise" uses an empty send_text -> herdres opens a ForceReply so the owner
+# types revision feedback that is sent to the pane.
+PLAN_APPROVE_SEND_TEXT = os.getenv("HERDRES_PLAN_APPROVE_SEND_TEXT", "1")
+PLAN_REVISE_SEND_TEXT = os.getenv("HERDRES_PLAN_REVISE_SEND_TEXT", "")
+
 # Redact obvious secrets before a tool arg / interim line reaches Telegram: KEY=value or
 # "Header: value" for auth-ish keys, and URL embedded credentials. Best-effort, not a
 # guarantee — worklog content is a summary, so over-redaction is preferred to a leak.
@@ -422,6 +439,137 @@ def claude_worklog_lines(content: Any) -> list[str]:
         if cleaned:
             lines.append(sanitize_text(cleaned, WORKLOG_LINE_MAX_CHARS))
     return lines
+
+
+def _claude_decision_tool_use(content: Any) -> dict[str, Any] | None:
+    """The last AskUserQuestion / ExitPlanMode tool_use block in an assistant message
+    (issue #36), plus any accompanying preamble text. None if absent."""
+    if not isinstance(content, list):
+        return None
+    found: dict[str, Any] | None = None
+    preamble_parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type")
+        if itype == "text":
+            preamble_parts.append(str(item.get("text") or ""))
+        elif itype == "tool_use" and str(item.get("name") or "").strip().lower() in DECISION_TOOL_NAMES:
+            found = {
+                "tool_use_id": str(item.get("id") or ""),
+                "name": str(item.get("name") or "").strip(),
+                "input": item.get("input") if isinstance(item.get("input"), dict) else {},
+            }
+    if found is not None:
+        found["preamble"] = "\n".join(p for p in preamble_parts if p.strip()).strip()
+    return found
+
+
+def _claude_tool_result_ids(content: Any) -> set[str]:
+    """tool_use_ids resolved by tool_result blocks in a user message (issue #36)."""
+    ids: set[str] = set()
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "tool_result":
+                tid = str(item.get("tool_use_id") or "")
+                if tid:
+                    ids.add(tid)
+    return ids
+
+
+def claude_decision_turn_fields(tool: dict[str, Any]) -> dict[str, Any] | None:
+    """Map a pending AskUserQuestion / ExitPlanMode tool_use to the turn fields herdres needs
+    to render tappable buttons (pending_decision) or a read-only form (pending_interaction).
+    Returns the dict to merge onto the open turn, or None to fall back to normal handling."""
+    name = str(tool.get("name") or "").strip().lower()
+    tool_id = str(tool.get("tool_use_id") or "")
+    if not tool_id:
+        return None
+    tool_input = tool.get("input") if isinstance(tool.get("input"), dict) else {}
+
+    if name == "exitplanmode":
+        fields: dict[str, Any] = {
+            "pending_decision": {
+                "decision_id": tool_id,
+                "prompt": "Approve this plan?",
+                "mode": "buttons",
+                "options": [
+                    {"id": "approve", "label": "✅ Approve & proceed", "send_text": PLAN_APPROVE_SEND_TEXT},
+                    {"id": "revise", "label": "✍️ Keep planning / revise", "send_text": PLAN_REVISE_SEND_TEXT},
+                ],
+            }
+        }
+        plan = sanitize_text(str(tool_input.get("plan") or "")).strip()
+        if plan:
+            fields["assistant_final_text"] = plan
+        return fields
+
+    if name == "askuserquestion":
+        questions = tool_input.get("questions")
+        if not isinstance(questions, list) or not questions:
+            return None
+        first = questions[0] if isinstance(questions[0], dict) else {}
+        single = len(questions) == 1 and not bool(first.get("multiSelect"))
+        if single:
+            options: list[dict[str, str]] = []
+            raw_opts = first.get("options") if isinstance(first.get("options"), list) else []
+            for opt in raw_opts[:11]:
+                label = sanitize_text(str((opt.get("label") or opt.get("text") or opt.get("title") or "") if isinstance(opt, dict) else (opt or "")), 180).strip()
+                if label:
+                    options.append({"id": str(len(options) + 1), "label": label, "send_text": label})
+            if not options:
+                return None
+            options.append({"id": "custom", "label": "✍️ Write a different answer", "send_text": ""})
+            header = sanitize_text(str(first.get("header") or ""), 80).strip()
+            question = sanitize_text(str(first.get("question") or "Choose an option."), 1200).strip() or "Choose an option."
+            prompt = f"{header}: {question}" if header and header.lower() not in question.lower() else question
+            fields = {
+                "pending_decision": {
+                    "decision_id": tool_id,
+                    "prompt": prompt,
+                    "mode": "buttons",
+                    "options": options,
+                }
+            }
+            preamble = sanitize_text(str(tool.get("preamble") or "")).strip()
+            if preamble:
+                fields["assistant_final_text"] = preamble
+            return fields
+
+        # Multi-question or multi-select -> read-only structured form (owner answers in the pane).
+        norm_questions: list[dict[str, Any]] = []
+        for qi, q in enumerate(questions[:12], start=1):
+            if not isinstance(q, dict):
+                continue
+            opts: list[dict[str, str]] = []
+            raw_opts = q.get("options") if isinstance(q.get("options"), list) else []
+            for opt in raw_opts[:12]:
+                label = sanitize_text(str((opt.get("label") or opt.get("text") or opt.get("title") or "") if isinstance(opt, dict) else (opt or "")), 180).strip()
+                if label:
+                    opts.append({"option_id": str(len(opts) + 1), "label": label, "value": label})
+            if not opts:
+                continue
+            norm_questions.append(
+                {
+                    "question_id": f"q{qi}",
+                    "title": sanitize_text(str(q.get("question") or f"Question {qi}"), 500).strip() or f"Question {qi}",
+                    "type": "multi_choice" if bool(q.get("multiSelect")) else "single_choice",
+                    "options": opts,
+                }
+            )
+        if not norm_questions:
+            return None
+        return {
+            "pending_interaction": {
+                "interaction_id": tool_id,
+                "revision": "1",
+                "kind": "multi_question_form" if len(norm_questions) > 1 else "single_question",
+                "prompt": "Input needed.",
+                "questions": norm_questions,
+                "answers": {},
+            }
+        }
+    return None
 
 
 def is_internal_codex_user_text(text: str) -> bool:
@@ -1164,6 +1312,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
     latest_stream_updated_at: Any = ""
     current_model = ""  # latest model seen (every assistant message carries message.model)
     worklog_parts: list[str] = []  # intermediate tool_use + text for the open turn
+    pending_decision_tool: dict[str, Any] | None = None  # open AskUserQuestion/ExitPlanMode (issue #36)
 
     with open_jsonl_tail(path, _claude_is_turn_start, _claude_is_turn_end) as handle:
         for raw in handle:
@@ -1174,6 +1323,8 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             event_type = str(event.get("type") or "")
             msg = event.get("message") if isinstance(event.get("message"), dict) else {}
             if event_type == "user":
+                if pending_decision_tool and pending_decision_tool["tool_use_id"] in _claude_tool_result_ids(msg.get("content")):
+                    pending_decision_tool = None  # the question/plan prompt was answered
                 text = content_text(msg.get("content")).strip()
                 uuid = str(event.get("uuid") or "")
                 if text and not is_internal_claude_user_text(text):
@@ -1187,6 +1338,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     latest_stream_text = ""
                     latest_stream_updated_at = ""
                     worklog_parts = []
+                    pending_decision_tool = None  # a new prompt supersedes any open question
                 else:
                     # Internal (<task-notification> etc.) or empty user event. It
                     # still marks a turn boundary, but must NOT destroy a real
@@ -1200,6 +1352,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         latest_stream_text = ""
                         latest_stream_updated_at = ""
                         worklog_parts = []
+                        pending_decision_tool = None  # turn boundary resets any open question
                 continue
             if event_type == "assistant":
                 model = str(msg.get("model") or "").strip()
@@ -1219,6 +1372,10 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     continue
                 content = msg.get("content")
                 text = content_text(content).strip()
+                if DECISIONS_ENABLED:
+                    detected_decision = _claude_decision_tool_use(content)
+                    if detected_decision is not None:
+                        pending_decision_tool = detected_decision  # AskUserQuestion/ExitPlanMode awaiting answer
                 if text and msg.get("stop_reason") == "end_turn" and pending_user_uuid:
                     turn = {
                         "available": True,
@@ -1248,6 +1405,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     consumed_user_uuid = pending_user_uuid
                     incomplete_user = False
                     pending_api_error = None  # a real completion supersedes any prior API error
+                    pending_decision_tool = None  # a completed turn has no open question
                     latest_stream_text = ""
                     latest_stream_updated_at = ""
                 elif pending_user_text:
@@ -1263,6 +1421,30 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         latest_stream_text = sanitize_text(text)
                         latest_stream_updated_at = event.get("timestamp") or ""
 
+    if DECISIONS_ENABLED and pending_decision_tool is not None and incomplete_user:
+        # An AskUserQuestion/ExitPlanMode prompt is open: deliver it as a structured decision
+        # turn so herdres renders tappable buttons (issue #36), preserving recent_turns for history.
+        decision_fields = claude_decision_turn_fields(pending_decision_tool)
+        if decision_fields:
+            result: dict[str, Any] = {
+                "available": True,
+                "pane_id": pane_id,
+                "agent": "claude",
+                "agent_session_id": session_id,
+                "turn_id": pending_user_uuid or pending_decision_tool["tool_use_id"],
+                "complete": False,
+                "awaiting_input": True,
+                "user_text": pending_user_text,
+                "assistant_final_text": "",
+                **decision_fields,
+            }
+            if completed:
+                result["recent_turns"] = [
+                    {k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]
+                ]
+            if current_model:
+                result["model"] = current_model
+            return result
     if completed:
         recent = [{k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]]
         latest = dict(recent[-1])

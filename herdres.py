@@ -12295,7 +12295,10 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             force_reply_message_id = str(awaiting.get("force_reply_message_id") or "")
             reply_to_message_id = str(payload.get("reply_to_message_id") or "")
             if force_reply_message_id and reply_to_message_id != force_reply_message_id:
-                return {"handled": True, "reply": "Reply directly to the detail prompt, or tap the button again."}
+                return {
+                    "handled": True,
+                    "reply": "Reply to the detail prompt above (use Telegram's Reply), or tap the option button again to re-open it.",
+                }
             choice = str(awaiting.get("choice") or "").strip()
             select_choice = str(awaiting.get("select_choice") or "").strip()
             visible_choice = str(awaiting.get("visible_choice") or "").strip()
@@ -12345,7 +12348,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return forward_text_to_pane_response(pane_id, arg)
         if resolved_active_entry or implicit or target_bot_kind or is_single_live_space_pane(state, chat_id, topic_id):
             return forward_text_to_pane_response(pane_id, arg)
-        return {"handled": True, "reply": "This is a mapped Herdr pane topic. Use /send <text> to forward to this pane, or /help."}
+        return {
+            "handled": True,
+            "reply": (
+                "Not sure which agent this is for. Reply to a message in that agent's thread, "
+                "send /agents to pick one (replies then route there), or use /send <text>."
+            ),
+        }
 
     if command in {"help", "start"}:
         implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
