@@ -139,6 +139,8 @@ Herdres renders `pending_decision` as a rich decision card with inline buttons i
 
 Structured `pending_decision` data is the supported automatic button path. The only other path that produces buttons is an explicit `HERDRES_CHOICES_START` block emitted by the pane (see Clean Report Markers below). Buttons inferred from visible TUI choice screens are **off by default** — see SAFETY.md.
 
+The bundled Claude adapter (`herdr_turn_adapter.py`) emits `pending_decision` automatically for a pending **`AskUserQuestion`** (single, single-select → one option per choice + a "Write a different answer" custom option) and **`ExitPlanMode`** (→ "Approve & proceed" / "Keep planning / revise"), so these render as tappable buttons rather than a read-only visible-screen prompt. Multi-question or multi-select `AskUserQuestion` maps to a read-only `pending_interaction` (answer in the pane). Toggle with `HERDRES_TURN_ADAPTER_DECISIONS=0`. `ExitPlanMode` is a TUI approve/reject dialog, not a freeform-text prompt, so the approve answer is tunable via `HERDRES_PLAN_APPROVE_SEND_TEXT` (default `1`); "Keep planning / revise" uses an empty `send_text` → ForceReply for typed feedback.
+
 ## Pending Interactions (Read-Only Forms)
 
 For multi-question prompts (for example Claude wizards with a later "Review your answers" / submit step), the intended future contract is a normalized structured interaction, not visible-screen key driving:

@@ -151,7 +151,7 @@ Plain text (no leading `/`) typed in a pane topic is handled by context:
 
 - If the agent just asked a **detail question** and you are replying to that prompt, your text is sent as the detail answer.
 - If **implicit send** is enabled (`implicit_send_enabled` in state), if you addressed a managed pane bot, if you **reply** to a pane message, if you have a live **active pane** from `/agents`, or if the topic maps to exactly one live pane, your text is **forwarded to the pane** (same idle-vs-working behavior as `/send`).
-- Otherwise herdres replies: *"This is a mapped Herdr pane topic. Use /send <text> to forward to this pane, or /help."* (so a stray message isn't silently injected).
+- Otherwise herdres replies: *"Not sure which agent this is for. Reply to a message in that agent's thread, send /agents to pick one (replies then route there), or use /send <text>."* (so a stray message isn't silently injected).
 
 Plain text follows the same queue/interrupt rules as `/send` — to a busy agent it queues.
 

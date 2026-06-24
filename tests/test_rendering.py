@@ -7663,7 +7663,10 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
                 }
             )
 
-        self.assertEqual(result["reply"], "Reply directly to the detail prompt, or tap the button again.")
+        self.assertEqual(
+            result["reply"],
+            "Reply to the detail prompt above (use Telegram's Reply), or tap the option button again to re-open it.",
+        )
         send_to_pane.assert_not_called()
 
     def test_force_reply_detail_sends_choice_and_clears_prompt(self) -> None:
