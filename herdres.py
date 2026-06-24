@@ -12273,6 +12273,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "reply": "Sent attachment to this pane."}
 
     if command == "plain":
+        implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
         awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
         if awaiting and str(awaiting.get("user_id") or "") == user_id:
             awaiting_source = awaiting_detail_source(awaiting)
@@ -12294,7 +12295,27 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 return {"handled": True, "reply": "That detail request expired. Use /choices to resend the choices."}
             force_reply_message_id = str(awaiting.get("force_reply_message_id") or "")
             reply_to_message_id = str(payload.get("reply_to_message_id") or "")
-            if force_reply_message_id and reply_to_message_id != force_reply_message_id:
+            # #37: drop the "use Telegram's Reply" requirement for a BARE typed answer (no reply_to)
+            # when the message unambiguously targets this one pane — the same conditions under which a
+            # bare non-prompt message is forwarded to the pane below (active pick / implicit send /
+            # @mention / single live pane). A message that explicitly REPLIES to a different message is
+            # left strict: the reply-to signals intent toward a specific (possibly superseded) prompt,
+            # and in a colliding/multi-pane topic that reply could otherwise answer the wrong prompt.
+            bare_unambiguous = (
+                not reply_to_message_id
+                and bool(str(topic_id).strip())
+                and (
+                    resolved_active_entry
+                    or implicit
+                    or bool(target_bot_kind)
+                    or is_single_live_space_pane(state, chat_id, topic_id)
+                )
+            )
+            if (
+                force_reply_message_id
+                and reply_to_message_id != force_reply_message_id
+                and not bare_unambiguous
+            ):
                 return {
                     "handled": True,
                     "reply": "Reply to the detail prompt above (use Telegram's Reply), or tap the option button again to re-open it.",
@@ -12326,7 +12347,6 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             entry.pop("active_prompt", None)
             save_state(state)
             return {"handled": True, "reply": "Sent details."}
-        implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
         if str(payload.get("reply_to_message_id") or "").strip():
             disabled_awaiting = (
                 entry.get("last_disabled_awaiting_detail")
