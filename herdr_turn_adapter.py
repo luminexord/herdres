@@ -1332,6 +1332,49 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             if event_type == "user":
                 text = content_text(msg.get("content")).strip()
                 uuid = str(event.get("uuid") or "")
+                if text.startswith("[Request interrupted by user"):
+                    # Issue #3: an interrupt ends the open turn WITHOUT an end_turn, so the worklog
+                    # tail would otherwise be discarded by the reset below and never reach Telegram.
+                    # Finalize what we accumulated as a completed (interrupted) turn so it lands, then
+                    # treat the marker as a boundary only — never a visible "[Request interrupted…]"
+                    # prompt. Gated on real open-turn content so a bare interrupt is a no-op.
+                    if (
+                        pending_user_uuid
+                        and pending_user_uuid != consumed_user_uuid
+                        and (worklog_parts or latest_stream_text)
+                    ):
+                        final_text = sanitize_text(latest_stream_text).strip() or "(interrupted)"
+                        turn = {
+                            "available": True,
+                            "pane_id": pane_id,
+                            "agent": "claude",
+                            "agent_session_id": session_id,
+                            "turn_id": pending_user_uuid,
+                            "complete": True,
+                            "complete_reason": "interrupted",
+                            "started_at": None,
+                            "completed_at": event.get("timestamp"),
+                            "user_text": pending_user_text,
+                            "assistant_final_text": final_text,
+                            "_prompt_uuid": pending_user_uuid,
+                        }
+                        if WORKLOG_ENABLED and worklog_parts:
+                            worklog = _join_worklog(worklog_parts)
+                            if worklog:
+                                turn["worklog_text"] = worklog
+                        if completed and completed[-1].get("_prompt_uuid") == pending_user_uuid:
+                            completed[-1] = turn
+                        else:
+                            completed.append(turn)
+                        consumed_user_uuid = pending_user_uuid
+                    pending_user_text = ""
+                    pending_user_uuid = ""
+                    incomplete_user = False
+                    pending_api_error = None
+                    latest_stream_text = ""
+                    latest_stream_updated_at = ""
+                    worklog_parts = []
+                    continue
                 if text and not is_internal_claude_user_text(text):
                     # A real human prompt: it opens a new turn boundary. It also
                     # supersedes any prior API error (the owner has responded /

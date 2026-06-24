@@ -215,6 +215,11 @@ ALLOW_UNBOUNDED_REPORTS = parse_bool_env("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORT
 RICH_RENDER_VERSION = 20
 USER_PROMPT_LABEL = "User:"
 WORKLOG_LABEL = "Worklog"
+# Issue #3: while a turn is still open/streaming, the worklog header reads "Working…" instead of
+# "Worklog" so the topic shows the agent is alive. Lives in the worklog LABEL only (excluded from
+# clean_feed_hash) so it can never trigger a re-deliver/edit loop; reverts to WORKLOG_LABEL on
+# completion. Gated by working_badge_enabled() (HERDR_TELEGRAM_TOPICS_WORKING_BADGE, default on).
+WORKING_LABEL = "Working…"
 RESPONSE_LABEL = "Response"
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
@@ -3152,11 +3157,14 @@ def request_started_at_for_turn(entry: dict[str, Any], turn_id: str) -> str:
     return ""
 
 
-def worklog_label_for_turn(entry: dict[str, Any], turn_id: str) -> str:
+def worklog_label_for_turn(entry: dict[str, Any], turn_id: str, working: bool = False) -> str:
+    # `working` is set only by the open/streaming render path (issue #3); completed-turn items keep
+    # the default so finishing a turn auto-reverts the badge to "Worklog".
+    base = WORKING_LABEL if (working and working_badge_enabled()) else WORKLOG_LABEL
     elapsed = request_elapsed_label(request_started_at_for_turn(entry, turn_id))
     if not elapsed:
-        return WORKLOG_LABEL
-    return f"{WORKLOG_LABEL} ({elapsed})"
+        return base
+    return f"{base} ({elapsed})"
 
 
 def stream_user_text_for_turn(entry: dict[str, Any], turn_id: str) -> str:
@@ -6557,6 +6565,12 @@ def pinned_status_enabled() -> bool:
     return os.getenv("HERDR_TELEGRAM_TOPICS_PINNED_STATUS", "0").strip() == "1"
 
 
+def working_badge_enabled() -> bool:
+    # Read at runtime, not as a module constant: the Herdr plugin runs `herdres event` and
+    # load_dotenv() executes inside the handler (the import-time flag gotcha).
+    return os.getenv("HERDR_TELEGRAM_TOPICS_WORKING_BADGE", "1").strip() != "0"
+
+
 def pinned_status_dot(pane: dict[str, Any]) -> str:
     # Derive PURELY from the canonical classifier so the dot, the topic icon, and the
     # sort all agree. status_icon_key already maps an idle pane pursuing a goal to
@@ -8326,7 +8340,7 @@ def send_stream_draft(
         str(entry.get("pane_key") or ""),
         str(turn_id),
     )
-    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
+    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id), working=True), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
     result = send_rich_message_draft(
         chat_id,
         html_text,
@@ -8376,7 +8390,7 @@ def send_stream_message(
     if throttle_reason:
         return {"ok": True, "skipped": True, "reason": throttle_reason, "hash": text_hash, "format": "message"}
 
-    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
+    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id), working=True), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
     fallback_text = html_to_plain(html_text)
     message_id = ""
     stream_message_id = str(entry.get("last_stream_message_id") or "")

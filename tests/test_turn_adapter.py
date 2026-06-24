@@ -548,6 +548,43 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertIn("Bash first-cmd", worklog)
         self.assertIn("Bash second-cmd", worklog)  # the step between the two end_turns
 
+    def test_claude_interrupt_finalizes_open_turn_worklog(self) -> None:
+        # Issue #3: an interrupt ends the turn WITHOUT an end_turn. The accumulated worklog/stream
+        # tail must be finalized (so it still lands on Telegram), and the "[Request interrupted…]"
+        # marker must NOT become a visible prompt.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Profile the CPU."}},
+                {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                    "content": [{"type": "text", "text": "Running the profiler now."},
+                                {"type": "tool_use", "name": "Bash", "input": {"command": "py-spy record"}}]}},
+                {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "[Request interrupted by user]"}},
+            ])
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn.get("complete_reason"), "interrupted")
+        self.assertEqual(turn["user_text"], "Profile the CPU.")
+        self.assertIn("Running the profiler now.", turn["assistant_final_text"])   # partial response preserved
+        self.assertIn("Bash py-spy record", turn.get("worklog_text") or "")        # worklog tail preserved
+        self.assertNotIn("Request interrupted", turn["user_text"])                 # marker is not a prompt
+        self.assertNotIn("Request interrupted", turn.get("assistant_final_text") or "")
+
+    def test_claude_interrupt_with_no_open_work_emits_no_turn(self) -> None:
+        # A bare interrupt with no accumulated worklog/stream must not synthesize a spurious turn.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Start."}},
+                {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "[Request interrupted by user]"}},
+            ])
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertIsNot(turn.get("complete"), True)            # nothing finalized
+        self.assertEqual(turn.get("reason"), "no_completed_turn")
+        self.assertNotIn("Request interrupted", str(turn.get("user_text") or ""))
+
     def test_claude_worklog_redacts_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "session-1.jsonl"

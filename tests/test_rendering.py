@@ -1572,7 +1572,7 @@ class TelegramDraftTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         rich_message = json.loads(calls[0][1]["rich_message"])
-        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", rich_message["html"])
+        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", rich_message["html"])
         self.assertNotIn("<b>Response</b>", rich_message["html"])
 
     def test_request_elapsed_label_formats_minutes_and_hours(self) -> None:
@@ -1623,7 +1623,7 @@ class TelegramDraftTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         rich_message = json.loads(calls[0][1]["rich_message"])
-        self.assertIn("<details open><summary><b>Worklog (2m)</b></summary><blockquote>", rich_message["html"])
+        self.assertIn("<details open><summary><b>Working… (2m)</b></summary><blockquote>", rich_message["html"])
 
     def test_stream_draft_throttle_enforces_min_interval_between_updates(self) -> None:
         telegram = {"rich_messages": {"supported": "yes"}}
@@ -1736,12 +1736,12 @@ class TelegramDraftTests(unittest.TestCase):
         self.assertTrue(first["sent_message"])
         self.assertEqual(entry["last_stream_message_id"], "5001")
         send_rich.assert_called_once()
-        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", send_rich.call_args.args[1])
+        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", send_rich.call_args.args[1])
         self.assertNotIn("<b>Response</b>", send_rich.call_args.args[1])
         self.assertEqual(send_rich.call_args.kwargs["thread_id"], "77")
         self.assertIsNone(send_rich.call_args.kwargs["reply_to_message_id"])
         edit_rich.assert_called_once()
-        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", edit_rich.call_args.args[2])
+        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", edit_rich.call_args.args[2])
         self.assertTrue(second["ok"])
         self.assertFalse(second.get("sent_message", False))
 
@@ -1981,7 +1981,7 @@ class ManagedBotTests(unittest.TestCase):
         rich_message = json.loads(calls[0][1]["rich_message"])
         self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", rich_message["html"])
         self.assertIn("Run the profile.", rich_message["html"])
-        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", rich_message["html"])
+        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", rich_message["html"])
         self.assertNotIn("<b>Response</b>", rich_message["html"])
 
     def test_stream_update_reissues_same_worklog_when_user_block_is_added(self) -> None:
@@ -2151,7 +2151,7 @@ class StreamingIntegrationTests(unittest.TestCase):
             working_html = json.loads(edit_calls[0][1]["rich_message"])["html"]
             self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", working_html)
             self.assertIn(user_text, working_html)
-            self.assertIn("<details open><summary><b>Worklog (1m)</b></summary><blockquote>", working_html)
+            self.assertIn("<details open><summary><b>Working… (1m)</b></summary><blockquote>", working_html)
             self.assertIn(worklog_text, working_html)
             self.assertNotIn("<b>Response</b>", working_html)
 
@@ -2751,6 +2751,28 @@ class StreamingIntegrationTests(unittest.TestCase):
             herdres.clean_feed_hash(a, include_render_version=False),
             herdres.clean_feed_hash(b, include_render_version=False),
         )
+
+    def test_working_badge_label_is_hash_invariant(self) -> None:
+        """Issue #3: the 'Working…' badge lives only in worklog_label (excluded from the render
+        hash), so swapping 'Worklog' for 'Working…' must NOT change clean_feed_hash/item_plain_text
+        — otherwise the badge would re-deliver/edit-loop the turn (the exact live regression #3 avoids)."""
+        base = {"available": True, "complete": True, "turn_id": "t1",
+                "user_text": "q", "assistant_final_text": "done", "worklog_text": "Bash echo hi"}
+        item = herdres.make_turn_feed_item(base)
+        assert item is not None
+        worklog = dict(item, worklog_label="Worklog (1m)")
+        working = dict(item, worklog_label="Working… (1m)")
+        self.assertEqual(herdres.clean_feed_hash(worklog), herdres.clean_feed_hash(working))
+        self.assertEqual(herdres.item_plain_text(worklog), herdres.item_plain_text(working))
+
+    def test_worklog_label_working_badge_toggle(self) -> None:
+        """worklog_label_for_turn(working=True) shows 'Working…' when the badge flag is on (default)
+        and reverts to 'Worklog' when working=False or HERDR_TELEGRAM_TOPICS_WORKING_BADGE=0."""
+        entry: dict = {}  # no request_started_at -> bare label, no elapsed suffix
+        self.assertEqual(herdres.worklog_label_for_turn(entry, "t1", working=True), "Working…")
+        self.assertEqual(herdres.worklog_label_for_turn(entry, "t1", working=False), "Worklog")
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_WORKING_BADGE": "0"}):
+            self.assertEqual(herdres.worklog_label_for_turn(entry, "t1", working=True), "Worklog")
 
     def test_collapse_response_flag_folds_only_the_response(self) -> None:
         base = {"available": True, "complete": True, "turn_id": "t1",
