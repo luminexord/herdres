@@ -1332,6 +1332,53 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             if event_type == "user":
                 text = content_text(msg.get("content")).strip()
                 uuid = str(event.get("uuid") or "")
+                if re.match(r"^\[Request interrupted by user[^\]]*\]$", text):
+                    # Issue #3: an interrupt ends the open turn WITHOUT an end_turn. The marker is a
+                    # control message, never a human prompt — the exact bracketed whole-message form
+                    # avoids swallowing a prompt that merely starts with the phrase — so it only acts
+                    # as a boundary here, never a visible "[Request interrupted…]" prompt.
+                    if DECISIONS_ENABLED and read_pending_decision(session_id):
+                        # A #36 decision is pending (tappable buttons). Leave the open turn intact so
+                        # the post-loop decision path surfaces it with the REAL prompt; don't finalize
+                        # and don't arm the marker as a prompt.
+                        continue
+                    if (
+                        pending_user_uuid
+                        and pending_user_uuid != consumed_user_uuid
+                        and (worklog_parts or latest_stream_text)
+                    ):
+                        # Finalize the accumulated worklog/stream tail as a completed (interrupted)
+                        # turn so it still lands on Telegram instead of being discarded by the reset.
+                        final_text = sanitize_text(latest_stream_text).strip() or "(interrupted)"
+                        turn = {
+                            "available": True,
+                            "pane_id": pane_id,
+                            "agent": "claude",
+                            "agent_session_id": session_id,
+                            "turn_id": pending_user_uuid,
+                            "complete": True,
+                            "complete_reason": "interrupted",
+                            "started_at": None,
+                            "completed_at": event.get("timestamp"),
+                            "user_text": pending_user_text,
+                            "assistant_final_text": final_text,
+                            "_prompt_uuid": pending_user_uuid,
+                        }
+                        if WORKLOG_ENABLED and worklog_parts:
+                            worklog = _join_worklog(worklog_parts)
+                            if worklog:
+                                turn["worklog_text"] = worklog
+                        completed.append(turn)
+                        consumed_user_uuid = pending_user_uuid
+                    # Boundary reset: drop the marker and any content-less open turn.
+                    pending_user_text = ""
+                    pending_user_uuid = ""
+                    incomplete_user = False
+                    pending_api_error = None
+                    latest_stream_text = ""
+                    latest_stream_updated_at = ""
+                    worklog_parts = []
+                    continue
                 if text and not is_internal_claude_user_text(text):
                     # A real human prompt: it opens a new turn boundary. It also
                     # supersedes any prior API error (the owner has responded /
