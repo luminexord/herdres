@@ -416,6 +416,16 @@ class ClaudeDecisionHookInstallTests(unittest.TestCase):
             self.assertIn("herdr-state.sh", self._commands_for(data, "SessionStart"))  # untouched event kept
             self.assertEqual(data.get("model"), "opus")                            # unrelated top-level keys kept
 
+    def test_command_tracks_install_bin_dir(self) -> None:
+        # The registered command must point at the manifest's install dest, so it can't escape
+        # a patched INSTALL_BIN_DIR into the real ~/.local/bin (the bug that polluted settings.json).
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(herdres, "INSTALL_BIN_DIR", Path(tmp) / "bin"):
+                self.assertEqual(
+                    herdres.decision_hook_command(),
+                    f"python3 '{Path(tmp) / 'bin' / 'herdres-decision-hook'}'",
+                )
+
     def test_malformed_settings_is_recovered(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = self._settings_in(tmp)

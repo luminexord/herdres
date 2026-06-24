@@ -13170,7 +13170,10 @@ def claude_settings_path() -> Path:
 
 
 def decision_hook_command() -> str:
-    return f"python3 '{Path.home() / '.local' / 'bin' / 'herdres-decision-hook'}'"
+    # Point at the SAME dest the update manifest installs the script to (INSTALL_BIN_DIR /
+    # "herdres-decision-hook"), so the registered command always matches where the script
+    # actually lands — and so tests that patch INSTALL_BIN_DIR can't escape into the real bin.
+    return f"python3 '{INSTALL_BIN_DIR / 'herdres-decision-hook'}'"
 
 
 def install_claude_decision_hook(settings_path: Path | None = None, command: str | None = None) -> bool:
