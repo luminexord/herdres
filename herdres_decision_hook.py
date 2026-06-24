@@ -48,11 +48,21 @@ def main() -> None:
         if name.lower() not in DECISION_TOOLS:
             return
         tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
-        # PreToolUse carries no tool_use_id, so synthesize a STABLE id from the prompt content:
-        # re-fires for the same prompt produce the same decision_id (no duplicate buttons).
-        digest = hashlib.sha256((session_id + json.dumps(tool_input, sort_keys=True)).encode("utf-8")).hexdigest()[:16]
+        # Prefer Claude Code's own tool_use_id when the payload carries one (unique per call).
+        # Otherwise synthesize a STABLE id from tool name + prompt content: the same pending file
+        # is read every sync, so the id must not change between reads (no duplicate buttons). The
+        # tool name is in the digest so an ExitPlanMode and an AskUserQuestion with identical input
+        # never collide to the same decision_id.
+        real_id = str(payload.get("tool_use_id") or "").strip()
+        if real_id:
+            decision_id = real_id
+        else:
+            digest = hashlib.sha256(
+                (session_id + "\x00" + name + "\x00" + json.dumps(tool_input, sort_keys=True)).encode("utf-8")
+            ).hexdigest()[:16]
+            decision_id = f"hookdec-{digest}"
         record = {
-            "tool_use_id": f"hookdec-{digest}",
+            "tool_use_id": decision_id,
             "name": name,
             "input": tool_input,
             "session_id": session_id,
@@ -62,7 +72,9 @@ def main() -> None:
         tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
         tmp.write_text(json.dumps(record), encoding="utf-8")
         os.replace(tmp, path)
-    elif event in ("PostToolUse", "SessionEnd", "Stop"):
+    elif event in ("PostToolUse", "UserPromptSubmit", "SessionEnd", "Stop"):
+        # Answered (PostToolUse), superseded by a brand-new prompt (UserPromptSubmit), or the
+        # session/turn ended — the pending prompt is no longer awaiting an answer.
         try:
             path.unlink()
         except OSError:

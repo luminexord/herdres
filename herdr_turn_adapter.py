@@ -452,15 +452,21 @@ def pending_decision_dir() -> Path:
     return Path(base) if base else (Path.home() / ".local" / "share" / "herdres" / "pending")
 
 
+def _safe_session_id(session_id: str) -> str:
+    """Per-session pending filename stem. MUST stay byte-identical to herdres_decision_hook.py's
+    `_safe` — the hook writes the file and this consumer reads it; any drift silently breaks the
+    button path. tests/test_decision_hook.py pins the two together with a contract test."""
+    cleaned = "".join(c for c in str(session_id) if c.isalnum() or c in "-_.")
+    return cleaned[:120] or "session"
+
+
 def read_pending_decision(session_id: str) -> dict[str, Any] | None:
     """The pending AskUserQuestion/ExitPlanMode for this session, as recorded by the herdres
-    Claude hook (issue #36). None if absent, malformed, or stale (TTL). The filename derivation
-    MUST match herdres_decision_hook.py's `_safe`."""
+    Claude hook (issue #36). None if absent, malformed, or stale (TTL)."""
     sid = str(session_id or "").strip()
     if not sid:
         return None
-    safe = "".join(c for c in sid if c.isalnum() or c in "-_.")[:120] or "session"
-    path = pending_decision_dir() / f"{safe}.json"
+    path = pending_decision_dir() / f"{_safe_session_id(sid)}.json"
     try:
         if not path.exists():
             return None
@@ -533,9 +539,9 @@ def claude_decision_turn_fields(tool: dict[str, Any]) -> dict[str, Any] | None:
                     "options": options,
                 }
             }
-            preamble = sanitize_text(str(tool.get("preamble") or "")).strip()
-            if preamble:
-                fields["assistant_final_text"] = preamble
+            # The hook's PreToolUse payload carries only the structured tool_input, not the
+            # assistant's surrounding prose, so there is no preamble to attach here; the question
+            # text itself is the card body.
             return fields
 
         # Multi-question or multi-select -> read-only structured form (owner answers in the pane).

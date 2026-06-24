@@ -160,7 +160,7 @@ hooks** (orca/herdr) — it only adds Herdres' own entries and never touches oth
 by hand — e.g. on a host where Claude Code was installed after Herdres, or during a canary deploy:
 
 ```bash
-herdres hooks install        # adds PreToolUse/PostToolUse (AskUserQuestion|ExitPlanMode) + SessionEnd
+herdres hooks install        # adds PreToolUse/PostToolUse (AskUserQuestion|ExitPlanMode) + UserPromptSubmit/SessionEnd
 ```
 
 It is a no-op if `~/.claude/` does not exist (Claude Code not installed). Relevant knobs:

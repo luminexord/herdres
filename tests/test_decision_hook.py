@@ -78,6 +78,26 @@ class DecisionHookTests(unittest.TestCase):
             second = json.loads(self._file(tmp, "sess-S").read_text())["tool_use_id"]
             self.assertEqual(first, second)
 
+    def test_prefers_real_tool_use_id_when_present(self) -> None:
+        # Claude Code may supply a real tool_use_id on PreToolUse; use it verbatim (unique per call).
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+                       "session_id": "sess-R", "tool_use_id": "toolu_real_123",
+                       "tool_input": {"questions": [{"question": "Q?"}]}}, tmp)
+            self.assertEqual(json.loads(self._file(tmp, "sess-R").read_text())["tool_use_id"], "toolu_real_123")
+
+    def test_tool_name_separates_identical_input_digests(self) -> None:
+        # Without a real id, the digest folds in the tool name: identical input under two tools
+        # must NOT collide to the same decision_id.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run({"hook_event_name": "PreToolUse", "tool_name": "ExitPlanMode",
+                       "session_id": "sess-X", "tool_input": {}}, tmp)
+            plan_id = json.loads(self._file(tmp, "sess-X").read_text())["tool_use_id"]
+            self._run({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+                       "session_id": "sess-X", "tool_input": {}}, tmp)
+            auq_id = json.loads(self._file(tmp, "sess-X").read_text())["tool_use_id"]
+            self.assertNotEqual(plan_id, auq_id)
+
     def test_posttooluse_clears_pending_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             pre = {"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
@@ -87,6 +107,17 @@ class DecisionHookTests(unittest.TestCase):
             self._run({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion",
                        "session_id": "sess-C"}, tmp)
             self.assertFalse(self._file(tmp, "sess-C").exists())
+
+    def test_userpromptsubmit_clears_pending_file(self) -> None:
+        # A brand-new prompt supersedes an abandoned/cancelled decision (the guard the transcript
+        # scan used to provide) — otherwise a stale plan could re-surface over the new prompt.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run({"hook_event_name": "PreToolUse", "tool_name": "ExitPlanMode",
+                       "session_id": "sess-U", "tool_input": {"plan": "p"}}, tmp)
+            self.assertTrue(self._file(tmp, "sess-U").exists())
+            self._run({"hook_event_name": "UserPromptSubmit", "session_id": "sess-U",
+                       "prompt": "do something else instead"}, tmp)
+            self.assertFalse(self._file(tmp, "sess-U").exists())
 
     def test_sessionend_and_stop_clear_pending_file(self) -> None:
         for event in ("SessionEnd", "Stop"):
@@ -136,6 +167,28 @@ class DecisionHookTests(unittest.TestCase):
             written = list(Path(tmp).glob("*.json"))
             self.assertEqual(len(written), 1)
             self.assertEqual(written[0].parent, Path(tmp))  # stayed inside the pending dir
+
+
+class SafeSessionIdContractTests(unittest.TestCase):
+    """The hook (producer) and the adapter (consumer) are separate install artifacts that cannot
+    share a runtime import, but they MUST derive the same pending filename from a session_id. Pin
+    them together so drift in either copy fails here instead of silently killing the button path."""
+
+    def test_hook_and_adapter_derive_identical_filename(self) -> None:
+        import herdr_turn_adapter as adapter
+        import herdres_decision_hook as hook
+        cases = [
+            "abc123",
+            "01234567-89ab-cdef-0123-456789abcdef",  # a normal Claude session uuid
+            "../../etc/passwd",                        # path separators stripped
+            "a b/c\\d:e",                              # spaces + separators
+            "x" * 300,                                 # longer than the 120 cap
+            "名前-test_1.2",                            # unicode + allowed punctuation
+            "",                                        # empty -> "session" fallback
+            "/////",                                   # all stripped -> "session" fallback
+        ]
+        for sid in cases:
+            self.assertEqual(hook._safe(sid), adapter._safe_session_id(sid), repr(sid))
 
 
 if __name__ == "__main__":

@@ -13153,11 +13153,14 @@ def _setup_confirm_hermes_reuse(interactive: bool) -> bool:
 
 # Issue #36: the herdres Claude hook (herdres-decision-hook) reports a pending
 # AskUserQuestion/ExitPlanMode so the bridge renders tappable buttons. Registered in
-# ~/.claude/settings.json for these events; matcher-scoped so it only runs for those tools
-# (SessionEnd cleans up an abandoned record). The hook script itself also filters by tool name.
+# ~/.claude/settings.json for these events. PreToolUse/PostToolUse are matcher-scoped so they
+# only run for those tools (record / clear-on-answer). UserPromptSubmit (a brand-new prompt
+# supersedes any abandoned decision) and SessionEnd (turn/session ended) clear a stale record so
+# a cancelled prompt can't re-surface stale buttons. The hook script also filters by tool name.
 CLAUDE_DECISION_HOOK_EVENTS = (
     ("PreToolUse", "AskUserQuestion|ExitPlanMode"),
     ("PostToolUse", "AskUserQuestion|ExitPlanMode"),
+    ("UserPromptSubmit", "*"),
     ("SessionEnd", "*"),
 )
 
@@ -13207,7 +13210,7 @@ def install_claude_decision_hook(settings_path: Path | None = None, command: str
         changed = True
     if changed:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = settings_path.parent / (settings_path.name + ".herdres.tmp")
+        tmp = settings_path.parent / (settings_path.name + f".herdres.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, settings_path)
     return changed
