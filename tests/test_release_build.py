@@ -34,6 +34,7 @@ INSTALL_SET = [
     "herdres.py",
     "herdres_gateway.py",
     "herdres_routing.py",
+    "herdres_decision_hook.py",
     "herdr_turn_adapter.py",
     "herdr_topic_bridge.py",
     "herdres-plugin/herdr-plugin.toml",

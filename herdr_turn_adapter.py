@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Callable
@@ -66,6 +67,11 @@ DECISION_TOOL_NAMES = {"askuserquestion", "exitplanmode"}
 # types revision feedback that is sent to the pane.
 PLAN_APPROVE_SEND_TEXT = os.getenv("HERDRES_PLAN_APPROVE_SEND_TEXT", "1")
 PLAN_REVISE_SEND_TEXT = os.getenv("HERDRES_PLAN_REVISE_SEND_TEXT", "")
+# A pending AskUserQuestion/ExitPlanMode is recorded by the herdres Claude hook
+# (herdres_decision_hook.py, PreToolUse) to a per-session file here — the transcript never
+# contains it while pending. Cleared by the hook on PostToolUse/SessionEnd; TTL bounds an
+# abandoned file (missed clear / crash).
+PENDING_DECISION_TTL_SECONDS = int(os.getenv("HERDRES_PENDING_TTL_SECONDS", "3600"))
 
 # Redact obvious secrets before a tool arg / interim line reaches Telegram: KEY=value or
 # "Header: value" for auth-ish keys, and URL embedded credentials. Best-effort, not a
@@ -441,40 +447,42 @@ def claude_worklog_lines(content: Any) -> list[str]:
     return lines
 
 
-def _claude_decision_tool_use(content: Any) -> dict[str, Any] | None:
-    """The last AskUserQuestion / ExitPlanMode tool_use block in an assistant message
-    (issue #36), plus any accompanying preamble text. None if absent."""
-    if not isinstance(content, list):
+def pending_decision_dir() -> Path:
+    base = os.environ.get("HERDRES_PENDING_DIR")
+    return Path(base) if base else (Path.home() / ".local" / "share" / "herdres" / "pending")
+
+
+def _safe_session_id(session_id: str) -> str:
+    """Per-session pending filename stem. MUST stay byte-identical to herdres_decision_hook.py's
+    `_safe` — the hook writes the file and this consumer reads it; any drift silently breaks the
+    button path. tests/test_decision_hook.py pins the two together with a contract test."""
+    cleaned = "".join(c for c in str(session_id) if c.isalnum() or c in "-_.")
+    return cleaned[:120] or "session"
+
+
+def read_pending_decision(session_id: str) -> dict[str, Any] | None:
+    """The pending AskUserQuestion/ExitPlanMode for this session, as recorded by the herdres
+    Claude hook (issue #36). None if absent, malformed, or stale (TTL)."""
+    sid = str(session_id or "").strip()
+    if not sid:
         return None
-    found: dict[str, Any] | None = None
-    preamble_parts: list[str] = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        itype = item.get("type")
-        if itype == "text":
-            preamble_parts.append(str(item.get("text") or ""))
-        elif itype == "tool_use" and str(item.get("name") or "").strip().lower() in DECISION_TOOL_NAMES:
-            found = {
-                "tool_use_id": str(item.get("id") or ""),
-                "name": str(item.get("name") or "").strip(),
-                "input": item.get("input") if isinstance(item.get("input"), dict) else {},
-            }
-    if found is not None:
-        found["preamble"] = "\n".join(p for p in preamble_parts if p.strip()).strip()
-    return found
-
-
-def _claude_tool_result_ids(content: Any) -> set[str]:
-    """tool_use_ids resolved by tool_result blocks in a user message (issue #36)."""
-    ids: set[str] = set()
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "tool_result":
-                tid = str(item.get("tool_use_id") or "")
-                if tid:
-                    ids.add(tid)
-    return ids
+    path = pending_decision_dir() / f"{_safe_session_id(sid)}.json"
+    try:
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("input"), dict):
+        return None
+    if str(data.get("name") or "").strip().lower() not in DECISION_TOOL_NAMES:
+        return None  # only the two decision tools — ignore a stray/foreign file
+    try:
+        if PENDING_DECISION_TTL_SECONDS > 0 and (time.time() - float(data.get("ts") or 0)) > PENDING_DECISION_TTL_SECONDS:
+            return None  # abandoned (missed clear / crash) — bounded by TTL
+    except (TypeError, ValueError):
+        pass
+    return data
 
 
 def claude_decision_turn_fields(tool: dict[str, Any]) -> dict[str, Any] | None:
@@ -531,9 +539,9 @@ def claude_decision_turn_fields(tool: dict[str, Any]) -> dict[str, Any] | None:
                     "options": options,
                 }
             }
-            preamble = sanitize_text(str(tool.get("preamble") or "")).strip()
-            if preamble:
-                fields["assistant_final_text"] = preamble
+            # The hook's PreToolUse payload carries only the structured tool_input, not the
+            # assistant's surrounding prose, so there is no preamble to attach here; the question
+            # text itself is the card body.
             return fields
 
         # Multi-question or multi-select -> read-only structured form (owner answers in the pane).
@@ -1312,7 +1320,6 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
     latest_stream_updated_at: Any = ""
     current_model = ""  # latest model seen (every assistant message carries message.model)
     worklog_parts: list[str] = []  # intermediate tool_use + text for the open turn
-    pending_decision_tool: dict[str, Any] | None = None  # open AskUserQuestion/ExitPlanMode (issue #36)
 
     with open_jsonl_tail(path, _claude_is_turn_start, _claude_is_turn_end) as handle:
         for raw in handle:
@@ -1323,8 +1330,6 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             event_type = str(event.get("type") or "")
             msg = event.get("message") if isinstance(event.get("message"), dict) else {}
             if event_type == "user":
-                if pending_decision_tool and pending_decision_tool["tool_use_id"] in _claude_tool_result_ids(msg.get("content")):
-                    pending_decision_tool = None  # the question/plan prompt was answered
                 text = content_text(msg.get("content")).strip()
                 uuid = str(event.get("uuid") or "")
                 if text and not is_internal_claude_user_text(text):
@@ -1338,7 +1343,6 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     latest_stream_text = ""
                     latest_stream_updated_at = ""
                     worklog_parts = []
-                    pending_decision_tool = None  # a new prompt supersedes any open question
                 else:
                     # Internal (<task-notification> etc.) or empty user event. It
                     # still marks a turn boundary, but must NOT destroy a real
@@ -1352,7 +1356,6 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         latest_stream_text = ""
                         latest_stream_updated_at = ""
                         worklog_parts = []
-                        pending_decision_tool = None  # turn boundary resets any open question
                 continue
             if event_type == "assistant":
                 model = str(msg.get("model") or "").strip()
@@ -1372,10 +1375,6 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     continue
                 content = msg.get("content")
                 text = content_text(content).strip()
-                if DECISIONS_ENABLED:
-                    detected_decision = _claude_decision_tool_use(content)
-                    if detected_decision is not None:
-                        pending_decision_tool = detected_decision  # AskUserQuestion/ExitPlanMode awaiting answer
                 if text and msg.get("stop_reason") == "end_turn" and pending_user_uuid:
                     turn = {
                         "available": True,
@@ -1405,7 +1404,6 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     consumed_user_uuid = pending_user_uuid
                     incomplete_user = False
                     pending_api_error = None  # a real completion supersedes any prior API error
-                    pending_decision_tool = None  # a completed turn has no open question
                     latest_stream_text = ""
                     latest_stream_updated_at = ""
                 elif pending_user_text:
@@ -1421,30 +1419,34 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         latest_stream_text = sanitize_text(text)
                         latest_stream_updated_at = event.get("timestamp") or ""
 
-    if DECISIONS_ENABLED and pending_decision_tool is not None and incomplete_user:
-        # An AskUserQuestion/ExitPlanMode prompt is open: deliver it as a structured decision
-        # turn so herdres renders tappable buttons (issue #36), preserving recent_turns for history.
-        decision_fields = claude_decision_turn_fields(pending_decision_tool)
-        if decision_fields:
-            result: dict[str, Any] = {
-                "available": True,
-                "pane_id": pane_id,
-                "agent": "claude",
-                "agent_session_id": session_id,
-                "turn_id": pending_user_uuid or pending_decision_tool["tool_use_id"],
-                "complete": False,
-                "awaiting_input": True,
-                "user_text": pending_user_text,
-                "assistant_final_text": "",
-                **decision_fields,
-            }
-            if completed:
-                result["recent_turns"] = [
-                    {k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]
-                ]
-            if current_model:
-                result["model"] = current_model
-            return result
+    if DECISIONS_ENABLED and incomplete_user:
+        # A pending AskUserQuestion/ExitPlanMode prompt is recorded by the herdres Claude hook
+        # (PreToolUse) keyed by session_id — the transcript never contains it while pending.
+        # Deliver it as a structured decision turn so herdres renders tappable buttons (issue #36),
+        # preserving recent_turns for history.
+        pending_decision_tool = read_pending_decision(session_id)
+        if pending_decision_tool is not None:
+            decision_fields = claude_decision_turn_fields(pending_decision_tool)
+            if decision_fields:
+                result: dict[str, Any] = {
+                    "available": True,
+                    "pane_id": pane_id,
+                    "agent": "claude",
+                    "agent_session_id": session_id,
+                    "turn_id": pending_user_uuid or str(pending_decision_tool.get("tool_use_id") or ""),
+                    "complete": False,
+                    "awaiting_input": True,
+                    "user_text": pending_user_text,
+                    "assistant_final_text": "",
+                    **decision_fields,
+                }
+                if completed:
+                    result["recent_turns"] = [
+                        {k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]
+                    ]
+                if current_model:
+                    result["model"] = current_model
+                return result
     if completed:
         recent = [{k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]]
         latest = dict(recent[-1])
