@@ -11006,5 +11006,135 @@ class PruneOrphanedCollidingSpacesTests(unittest.TestCase):
         self.assertIn("agent:w:p1H", state["spaces"])
 
 
+class SelfHealingFoldTests(unittest.TestCase):
+    """Self-healing fold: every previously-delivered turn (not the latest) collapses, and a
+    fold missed on delivery heals on the next sync via the per-pane unfolded_turns buffer."""
+
+    def _item(self, tid: str, resp: str = "Answer.") -> dict:
+        return {"kind": "turn", "turn_id": tid, "user_text": "q", "worklog_text": "wl",
+                "assistant_final_text": resp}
+
+    def _state(self, enabled: bool = True) -> dict:
+        return {"spaces": {"s": {"collapse_previous_responses": enabled}}}
+
+    def _entry(self, **kw) -> dict:
+        e = {"space_key": "s"}
+        e.update(kw)
+        return e
+
+    # --- append_unfolded_turn ---
+    def test_append_dedups_by_message_id_and_bounds(self) -> None:
+        entry = self._entry()
+        for i in range(herdres.UNFOLDED_TURNS_CAP + 3):
+            herdres.append_unfolded_turn(entry, f"m{i}", self._item(f"t{i}"))
+        buf = entry["unfolded_turns"]
+        self.assertEqual(len(buf), herdres.UNFOLDED_TURNS_CAP)  # bounded
+        self.assertEqual(buf[-1]["message_id"], f"m{herdres.UNFOLDED_TURNS_CAP + 2}")  # newest kept
+        # re-append an existing message_id -> refreshed in place, not duplicated
+        herdres.append_unfolded_turn(entry, buf[-1]["message_id"], self._item("tX"))
+        ids = [e["message_id"] for e in entry["unfolded_turns"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_append_skips_turn_without_response(self) -> None:
+        entry = self._entry()
+        herdres.append_unfolded_turn(entry, "m1", self._item("t1", resp=""))
+        self.assertNotIn("unfolded_turns", entry)
+
+    def test_trimmed_item_keeps_render_fields(self) -> None:
+        entry = self._entry()
+        herdres.append_unfolded_turn(entry, "m1", {**self._item("t1"), "summary": "x", "lines": ["y"],
+                                                   "prompt_collapse_chars": 50, "worklog_label": "Worklog (2m)"})
+        stored = entry["unfolded_turns"][0]["item"]
+        self.assertEqual(stored["assistant_final_text"], "Answer.")
+        self.assertEqual(stored["worklog_label"], "Worklog (2m)")
+        self.assertEqual(stored["prompt_collapse_chars"], 50)
+        self.assertNotIn("summary", stored)  # dropped to keep state small
+
+    def test_trimmed_item_does_not_truncate_long_response_body(self) -> None:
+        # A response longer than MAX_REPLY_CHARS (3200) but within FINAL_REPLY_MAX_CHARS must be
+        # preserved, so the folded body matches what was delivered (no content loss on expand).
+        # Use varied text (sanitize_text collapses repeated chars, so "x"*N won't do).
+        long_body = " ".join(f"detail-line-{i}" for i in range(700))  # ~9k varied chars
+        self.assertGreater(len(long_body), herdres.MAX_REPLY_CHARS)
+        entry = self._entry()
+        herdres.append_unfolded_turn(entry, "m1", self._item("t1", resp=long_body))
+        stored = entry["unfolded_turns"][0]["item"]
+        # Bug would truncate to MAX_REPLY_CHARS (3200); fix keeps it at FINAL_REPLY_MAX_CHARS.
+        self.assertGreater(len(stored["assistant_final_text"]), herdres.MAX_REPLY_CHARS)
+
+    # --- fold_superseded_turns ---
+    def test_folds_non_latest_and_keeps_latest(self) -> None:
+        entry = self._entry(last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+            {"message_id": "m2", "turn_id": "t2", "item": self._item("t2")},
+        ])
+        edits = []
+        ef = Mock(side_effect=lambda *a, **k: edits.append((a[1], a[2].get("collapse_response"))) or {"ok": True})
+        with patch.multiple(herdres, edit_feed_item=ef, managed_bot_token_for_entry=Mock(return_value="tok")):
+            mutated = herdres.fold_superseded_turns(self._state(), entry, {}, "-1001")
+        self.assertTrue(mutated)
+        self.assertEqual(edits, [("m1", True)])  # only the non-latest folded
+        self.assertEqual([e["message_id"] for e in entry.get("unfolded_turns", [])], ["m2"])  # m1 dropped
+
+    def test_self_heals_stuck_turn_without_a_new_turn(self) -> None:
+        # A prior fold was missed: m1 sits unfolded while m2 is already the latest. A plain
+        # sweep (no new delivery) folds it.
+        entry = self._entry(last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        ef = Mock(return_value={"ok": True})
+        with patch.multiple(herdres, edit_feed_item=ef, managed_bot_token_for_entry=Mock(return_value="tok")):
+            herdres.fold_superseded_turns(self._state(), entry, {}, "-1001")
+        self.assertEqual(ef.call_args.args[1], "m1")
+        self.assertTrue(ef.call_args.args[2].get("collapse_response"))
+
+    def test_skips_latest_by_message_id_on_edit_in_place_reuse(self) -> None:
+        # Edit-in-place reuse: a buffered entry shares the latest's message_id -> never fold it.
+        entry = self._entry(last_clean_message_id="m1", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        ef = Mock(return_value={"ok": True})
+        with patch.multiple(herdres, edit_feed_item=ef, managed_bot_token_for_entry=Mock(return_value="tok")):
+            herdres.fold_superseded_turns(self._state(), entry, {}, "-1001")
+        ef.assert_not_called()
+
+    def test_drops_entry_on_not_found(self) -> None:
+        entry = self._entry(last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        with patch.multiple(herdres, edit_feed_item=Mock(return_value={"ok": False, "not_found": True}),
+                            managed_bot_token_for_entry=Mock(return_value="tok")):
+            herdres.fold_superseded_turns(self._state(), entry, {}, "-1001")
+        self.assertNotIn("unfolded_turns", entry)  # dead message dropped
+
+    def test_retries_then_drops_on_persistent_error(self) -> None:
+        entry = self._entry(last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        with patch.multiple(herdres, edit_feed_item=Mock(return_value={"ok": False}),
+                            managed_bot_token_for_entry=Mock(return_value="tok")):
+            for _ in range(herdres.FOLD_ATTEMPT_CAP):
+                herdres.fold_superseded_turns(self._state(), entry, {}, "-1001")
+        self.assertFalse(entry.get("unfolded_turns"))  # gave up after the attempt cap
+
+    def test_no_fold_when_setting_disabled(self) -> None:
+        entry = self._entry(last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        ef = Mock(return_value={"ok": True})
+        with patch.multiple(herdres, edit_feed_item=ef, managed_bot_token_for_entry=Mock(return_value="tok")):
+            mutated = herdres.fold_superseded_turns(self._state(enabled=False), entry, {}, "-1001")
+        self.assertFalse(mutated)
+        ef.assert_not_called()
+
+    # --- record_delivered_feed_item seeding ---
+    def test_record_seeds_prior_then_appends_new_turn(self) -> None:
+        entry = self._entry(last_clean_item=self._item("t1"), last_clean_message_id="m1", last_turn_id="t1")
+        herdres.record_delivered_feed_item(
+            entry, self._item("t2"), {"ok": True, "message_id": "m2"},
+            pending_active_prompt=None, clear_active_prompt=False)
+        self.assertEqual([e["message_id"] for e in entry["unfolded_turns"]], ["m1", "m2"])
+
+
 if __name__ == "__main__":
     unittest.main()

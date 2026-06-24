@@ -800,49 +800,126 @@ def space_collapse_previous_responses(state: dict[str, Any], pane_or_entry: dict
     return default
 
 
-def fold_previous_turn_response(
+# Per-pane bounded buffer of recently-delivered turns awaiting a fold. Small: in steady
+# state it holds just the latest (which stays open); extras appear only when a fold was
+# missed and is being caught up.
+UNFOLDED_TURNS_CAP = 5
+FOLD_ATTEMPT_CAP = 3
+
+
+def _trim_turn_item_for_fold(item: dict[str, Any]) -> dict[str, Any]:
+    """A render-essential, length-bounded copy of a turn item, for storing in
+    entry["unfolded_turns"] so an OLD turn can be re-rendered collapsed later.
+    render_turn_item_html only reads these fields; title/summary/lines/text are dropped."""
+    trimmed: dict[str, Any] = {"kind": "turn", "turn_id": str(item.get("turn_id") or "")}
+    user_text = str(item.get("user_text") or "")
+    if user_text:
+        trimmed["user_text"] = sanitize_text(user_text, USER_PROMPT_MAX_CHARS)
+    worklog_text = str(item.get("worklog_text") or item.get("assistant_stream_text") or "")
+    if worklog_text:
+        # Bound at the SAME cap make_turn_feed_item used for the delivered turn
+        # (FINAL_REPLY_MAX_CHARS), so the re-rendered folded body is identical to what was
+        # delivered — never a shorter truncation that loses content when expanded.
+        trimmed["worklog_text"] = sanitize_text(worklog_text, FINAL_REPLY_MAX_CHARS)
+    final_text = str(item.get("assistant_final_text") or "")
+    if final_text:
+        trimmed["assistant_final_text"] = sanitize_text(final_text, FINAL_REPLY_MAX_CHARS)
+    label = str(item.get("worklog_label") or "").strip()
+    if label:
+        trimmed["worklog_label"] = label
+    collapse_chars = _item_prompt_collapse_chars(item)
+    if collapse_chars:
+        trimmed["prompt_collapse_chars"] = collapse_chars
+    return trimmed
+
+
+def append_unfolded_turn(entry: dict[str, Any], message_id: str | int, item: dict[str, Any]) -> None:
+    """Record a delivered TURN (its message_id + trimmed item) so a later sweep can fold its
+    Response once a newer turn exists. Dedups by message_id (last-write-wins, so a same-turn
+    re-render refreshes in place) and prunes oldest beyond UNFOLDED_TURNS_CAP. Turns without a
+    response are skipped (nothing to fold)."""
+    mid = str(message_id or "").strip()
+    if not mid or str(item.get("kind") or "").lower() != "turn":
+        return
+    if not str(item.get("assistant_final_text") or "").strip():
+        return
+    buf = entry.get("unfolded_turns")
+    buf = [e for e in buf if isinstance(e, dict) and str(e.get("message_id") or "") != mid] if isinstance(buf, list) else []
+    buf.append({"message_id": mid, "turn_id": str(item.get("turn_id") or ""), "item": _trim_turn_item_for_fold(item)})
+    if len(buf) > UNFOLDED_TURNS_CAP:
+        buf = buf[-UNFOLDED_TURNS_CAP:]
+    entry["unfolded_turns"] = buf
+
+
+def fold_superseded_turns(
     state: dict[str, Any],
     entry: dict[str, Any],
     telegram: dict[str, Any],
     chat_id: str,
-    new_item: dict[str, Any],
-    new_message_id: str,
     *,
     api_token: str | None = None,
-) -> None:
-    """When a NEW turn supersedes a DIFFERENT prior turn, re-edit the prior turn's own
-    message in place to fold its Response (the latest turn always stays expanded).
+) -> bool:
+    """Fold the Response of every previously-delivered turn EXCEPT the current latest.
 
-    Best-effort + cosmetic: any failure (message too old to edit, deleted, etc.) is
-    swallowed so it never breaks the new turn's delivery. Gated per-space; called with
-    entry's last_clean_* STILL pointing at the prior turn (before record overwrites it).
-    """
-    if str(new_item.get("kind") or "").lower() != "turn":
-        return
+    Self-healing replacement for the old one-shot fold. A per-pane bounded buffer
+    (entry["unfolded_turns"], populated by append_unfolded_turn in record_delivered_feed_item)
+    records each recent turn's message_id + trimmed item. This sweep runs once per pane every
+    sync (timer AND plugin paths) and re-edits each non-latest turn's own message with
+    collapse_response, so a fold missed on the plugin path — or when an intermediate turn never
+    finalized as its own message — is corrected on the next sync without needing a new turn.
+    Best-effort + cosmetic; the current latest (last_clean_message_id / last_turn_id) stays
+    expanded.
+
+    Known limitation: a turn delivered BEFORE this shipped has no stored item and cannot be
+    folded (only post-deploy turns and the one seeded from last_clean_item are captured).
+
+    Returns True if the buffer mutated (caller persists state)."""
     if not space_collapse_previous_responses(state, entry):
-        return
-    prior_item = entry.get("last_clean_item")
-    prior_mid = str(entry.get("last_clean_message_id") or "")
-    if not isinstance(prior_item, dict) or str(prior_item.get("kind") or "").lower() != "turn":
-        return
-    if not prior_mid or prior_mid == str(new_message_id or ""):
-        return  # the prior turn shares the message we just delivered into (an edit, not a new msg)
-    if str(prior_item.get("turn_id") or "") == str(new_item.get("turn_id") or ""):
-        return  # same turn re-rendered, not a new turn
-    if not str(prior_item.get("assistant_final_text") or "").strip():
-        return  # no response to fold
-    folded = dict(prior_item)
-    folded["collapse_response"] = True
-    try:
-        edit_feed_item(
-            chat_id,
-            prior_mid,
-            folded,
-            telegram=telegram,
-            api_token=api_token or managed_bot_token_for_entry(telegram, entry),
-        )
-    except Exception:
-        pass
+        return False
+    buf = entry.get("unfolded_turns")
+    if not isinstance(buf, list) or not buf:
+        return False
+    latest_mid = str(entry.get("last_clean_message_id") or "").strip()
+    latest_turn = str(entry.get("last_turn_id") or "").strip()
+    token = api_token or managed_bot_token_for_entry(telegram, entry)
+    kept: list[dict[str, Any]] = []
+    mutated = False
+    for rec in buf:
+        if not isinstance(rec, dict):
+            mutated = True
+            continue
+        mid = str(rec.get("message_id") or "").strip()
+        tid = str(rec.get("turn_id") or "").strip()
+        item = rec.get("item") if isinstance(rec.get("item"), dict) else None
+        # The current latest turn stays expanded (skip by message id OR turn id — either can
+        # collide via edit-in-place reuse or id reassignment).
+        if not mid or mid == latest_mid or (tid and tid == latest_turn) or not isinstance(item, dict):
+            kept.append(rec)
+            continue
+        if not str(item.get("assistant_final_text") or "").strip():
+            mutated = True  # nothing to fold -> drop
+            continue
+        try:
+            result = edit_feed_item(
+                chat_id, mid, {**item, "collapse_response": True}, telegram=telegram, api_token=token
+            )
+        except Exception:
+            result = {"ok": False}
+        if result.get("ok") or result.get("not_found") or result.get("topic_missing"):
+            mutated = True  # folded (not_modified counts as ok), or message/topic gone -> drop
+            continue
+        attempts = int(rec.get("attempts") or 0) + 1
+        mutated = True
+        if attempts >= FOLD_ATTEMPT_CAP:
+            continue  # give up on a persistently-failing edit
+        rec["attempts"] = attempts
+        kept.append(rec)
+    if mutated:
+        if kept:
+            entry["unfolded_turns"] = kept
+        else:
+            entry.pop("unfolded_turns", None)
+    return mutated
 
 
 def refresh_entry_managed_voice(state: dict[str, Any], entry: dict[str, Any], pane: dict[str, Any] | None = None) -> None:
@@ -5502,6 +5579,7 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_send_error",
         "last_clean_attempt_hash",
         "last_clean_attempt_at",
+        "unfolded_turns",
         "last_turn_id",
         "last_turn_available",
         "last_turn_reason",
@@ -5953,6 +6031,10 @@ def record_delivered_feed_item(
     item_semantic_hash: str | None = None,
     fallback_message_id: str | int | None = None,
 ) -> None:
+    # Capture the prior delivered turn BEFORE the last_clean_* overwrites below, so the
+    # unfolded-turns buffer can seed from it on the first post-deploy delivery.
+    prior_clean_item = entry.get("last_clean_item")
+    prior_clean_mid = str(entry.get("last_clean_message_id") or "")
     if pending_active_prompt:
         bind_active_prompt_message(
             entry,
@@ -5984,6 +6066,20 @@ def record_delivered_feed_item(
     if item.get("turn_id"):
         entry["last_turn_id"] = str(item.get("turn_id") or "")
     entry.pop("last_clean_send_error", None)
+    # Record this turn for the self-healing fold sweep. Seed from the prior turn first (only
+    # when the buffer is empty — the transition right after deploy) so the existing previous
+    # turn still folds; then append the turn we just delivered (stays open as the latest).
+    if str(item.get("kind") or "").lower() == "turn":
+        new_mid = str(result.get("message_id") or fallback_message_id or "")
+        if (
+            not entry.get("unfolded_turns")
+            and isinstance(prior_clean_item, dict)
+            and str(prior_clean_item.get("kind") or "").lower() == "turn"
+            and prior_clean_mid
+            and prior_clean_mid != new_mid
+        ):
+            append_unfolded_turn(entry, prior_clean_mid, prior_clean_item)
+        append_unfolded_turn(entry, new_mid, item)
 
 
 def active_prompt_message_rejection(prompt: dict[str, Any], callback_message_id: str) -> str:
@@ -10469,17 +10565,6 @@ def _sync_pane_clean_feed(
                 counters["sends"] = counters.get("sends", 0) + 1
                 counters["feed_sends"] = counters.get("feed_sends", 0) + 1
                 feed_delivered_this_pane = True
-                # Fold the PREVIOUS turn's response in place (latest stays open) — must run
-                # while last_clean_* still points at the prior turn, before record overwrites it.
-                fold_previous_turn_response(
-                    state,
-                    entry,
-                    telegram,
-                    chat_id,
-                    item,
-                    str(result.get("message_id") or (message_id if did_edit else "")),
-                    api_token=pane_api_token,
-                )
                 record_delivered_feed_item(
                     entry,
                     item,
@@ -10530,6 +10615,11 @@ def _sync_pane_clean_feed(
                 changed = True
     elif old_clean_has_noise:
         clear_clean_feed_state(entry)
+        changed = True
+    # Self-healing fold: collapse every previously-delivered turn except the current latest.
+    # Runs every sync (timer + plugin paths), so a fold missed on delivery heals on the next
+    # tick without needing a new turn.
+    if fold_superseded_turns(state, entry, telegram, chat_id, api_token=pane_api_token):
         changed = True
     entry["last_status_hash"] = stable_obj_hash
     return {"early_return": None, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
