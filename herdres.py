@@ -3688,6 +3688,7 @@ def extract_turn_feed_item(
                 item = None
                 stream_turn_id = str(turn.get("open_turn_id") or turn.get("turn_id") or "")
     if not item and stream_turn_id:
+        entry["prompt_working"] = False  # issue #3: the worklog "Working… (Nm)" badge takes over once streaming
         entry["pending_stream_turn_id"] = stream_turn_id
         entry["pending_stream_text"] = stream_text
         entry["pending_stream_revision"] = str(turn.get("stream_revision") or stream_text_hash(stream_text))
@@ -3696,6 +3697,18 @@ def extract_turn_feed_item(
     entry.pop("pending_stream_turn_id", None)
     entry.pop("pending_stream_text", None)
     entry.pop("pending_stream_revision", None)
+    # Issue #3: show a "Working…" indicator on the open prompt message while the turn is reasoning
+    # with no streamed output yet (the gap where a 32s "✢ Hatching…" showed nothing on Telegram).
+    # Set only when a prompt is staged for delivery, the pane is ACTIVELY working (not parked on a
+    # blocked/idle prompt), and the turn is still open (a fresh turn has complete=False; a back-to-
+    # back turn opens via has_open_turn). The later stream / finalize edit replaces the prompt
+    # message and clears the badge; an interrupt also finalizes the turn so the badge can't linger.
+    entry["prompt_working"] = bool(
+        working_badge_enabled()
+        and entry.get("pending_prompt_turn_id")
+        and status in ACTIVE_AGENT_STATUSES
+        and (turn.get("complete") is False or turn.get("has_open_turn") is True)
+    )
     # Visible-screen prompt fallback: never scrape an actively-working pane — its
     # screen is its own in-progress output (spinner, tool noise, the echo of an
     # already-delivered reply), which produced the "Input needed" spam and
@@ -5193,11 +5206,24 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
     return rendered
 
 
+def render_working_header_html(label: str) -> str:
+    # Issue #3: a static "Working…" indicator on the open prompt message during the reasoning
+    # window (no streamed output yet). A plain bold line — NOT a body-less <details>, which
+    # Telegram's server-side sendRichMessage parser may drop — so it always renders. The label is
+    # bare (no ticking elapsed) so it never churns the prompt message's hash.
+    text = _html_text(label, 80).strip()
+    return f"<b>{text}</b>" if text else ""
+
+
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
     if kind == "prompt":
         prompt = str(item.get("user_text") or item.get("summary") or "").strip()
-        return render_user_prompt_quote_html(prompt, _item_prompt_collapse_chars(item))
+        html_out = render_user_prompt_quote_html(prompt, _item_prompt_collapse_chars(item))
+        working_label = str(item.get("working_label") or "").strip()  # issue #3 thinking indicator
+        if html_out and working_label:
+            return f"{html_out}\n{render_working_header_html(working_label)}"
+        return html_out
     if kind == "turn":
         return render_turn_item_html(item)
     if kind == "decision":
@@ -10423,6 +10449,8 @@ def send_pending_prompt_message(
         }
 
     item = make_prompt_feed_item(turn_id, prompt_text)
+    if entry.get("prompt_working"):
+        item["working_label"] = WORKING_LABEL  # issue #3: "Working…" while the open turn reasons with no output yet
     result = send_feed_item(
         chat_id,
         item,

@@ -2137,6 +2137,8 @@ class StreamingIntegrationTests(unittest.TestCase):
             prompt_html = json.loads(send_calls[0][1]["rich_message"])["html"]
             self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", prompt_html)
             self.assertIn(user_text, prompt_html)
+            self.assertIn("<b>Working…</b>", prompt_html)  # issue #3: reasoning indicator on the bare prompt
+            self.assertNotIn("Working… (", prompt_html)    # bare label, no ticking elapsed (no churn)
             self.assertNotIn("<b>Worklog</b>", prompt_html)
             self.assertNotIn("<b>Response</b>", prompt_html)
 
@@ -2180,6 +2182,50 @@ class StreamingIntegrationTests(unittest.TestCase):
         self.assertNotIn("<blockquote>", final_html[response_start:response_body_start])
         self.assertLess(final_html.index("<b>User:</b>"), final_html.index("<b>Worklog (1m)</b>"))
         self.assertLess(final_html.index("<b>Worklog (1m)</b>"), final_html.index("<b>Response</b>"))
+
+    def _open_no_content_turn(self) -> dict:
+        return {"available": True, "complete": False, "turn_id": "turn-1",
+                "user_text": "Run it.", "assistant_final_text": "", "assistant_stream_text": ""}
+
+    def _first_sync_prompt_html(self, state, pane, *, env=None):
+        api_calls = []
+
+        def telegram_api(method, payload, *, token=None):
+            api_calls.append((method, dict(payload)))
+            return {"ok": True, "result": {"message_id": "9001"} if method == "sendRichMessage" else True}
+
+        state["telegram"]["rich_messages"] = {"supported": "yes"}
+        ctx = patch.dict(os.environ, env or {})
+        with ctx, patch.multiple(
+            herdres,
+            pane_turn=Mock(return_value=self._open_no_content_turn()),
+            telegram_api=telegram_api,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True, CLEAN_FEED_ENABLED=True, LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False, STATUS_ICON_ENABLED=False,
+        ):
+            counters, caps = self._caps()
+            herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+        return [json.loads(p["rich_message"])["html"] for m, p in api_calls if m == "sendRichMessage"]
+
+    def test_working_badge_flag_off_omits_reasoning_indicator(self) -> None:
+        # With HERDR_TELEGRAM_TOPICS_WORKING_BADGE=0 the open-turn prompt has NO "Working…" (the gate
+        # is checked at staging time, not just the render layer).
+        state, pane, _key, _entry = self._state()
+        sends = self._first_sync_prompt_html(state, pane, env={"HERDR_TELEGRAM_TOPICS_WORKING_BADGE": "0"})
+        self.assertTrue(sends)
+        self.assertIn("Run it.", "\n".join(sends))
+        self.assertNotIn("Working", "\n".join(sends))
+
+    def test_blocked_pane_open_turn_omits_reasoning_indicator(self) -> None:
+        # A pane parked on a blocked/awaiting-input prompt is NOT actively working — no "Working…".
+        state, pane, _key, entry = self._state()
+        pane["agent_status"] = "blocked"
+        entry["last_known_status"] = "blocked"
+        sends = self._first_sync_prompt_html(state, pane)
+        for html in sends:
+            self.assertNotIn("Working", html)
 
     def test_stream_message_edits_latest_prompt_anchor_when_stream_message_is_stale(self) -> None:
         _state, _pane, _key, entry = self._state()
@@ -2764,6 +2810,27 @@ class StreamingIntegrationTests(unittest.TestCase):
         working = dict(item, worklog_label="Working… (1m)")
         self.assertEqual(herdres.clean_feed_hash(worklog), herdres.clean_feed_hash(working))
         self.assertEqual(herdres.item_plain_text(worklog), herdres.item_plain_text(working))
+
+    def test_prompt_item_renders_working_indicator(self) -> None:
+        """Issue #3: a prompt item carrying working_label renders a bare 'Working…' indicator after
+        the User block (the reasoning window); without it the base prompt render is unchanged."""
+        item = herdres.make_prompt_feed_item("turn-1", "Profile the CPU.")
+        base = herdres.render_feed_item_html(item)
+        self.assertNotIn("Working", base)
+        item["working_label"] = herdres.WORKING_LABEL
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
+        self.assertIn("Profile the CPU.", html)
+        self.assertIn("<b>Working…</b>", html)
+        self.assertNotIn("Working… (", html)  # bare label, no ticking elapsed
+
+    def test_prompt_working_label_is_hash_invariant(self) -> None:
+        """The prompt 'Working…' indicator lives in working_label only — excluded from clean_feed_hash
+        and item_plain_text — so it can never churn/re-edit the prompt message."""
+        item = herdres.make_prompt_feed_item("turn-1", "q")
+        with_label = dict(item, working_label=herdres.WORKING_LABEL)
+        self.assertEqual(herdres.clean_feed_hash(item), herdres.clean_feed_hash(with_label))
+        self.assertEqual(herdres.item_plain_text(item), herdres.item_plain_text(with_label))
 
     def test_worklog_label_working_badge_toggle(self) -> None:
         """worklog_label_for_turn(working=True) shows 'Working…' when the badge flag is on (default)

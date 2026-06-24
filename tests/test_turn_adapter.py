@@ -571,8 +571,10 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertNotIn("Request interrupted", turn["user_text"])                 # marker is not a prompt
         self.assertNotIn("Request interrupted", turn.get("assistant_final_text") or "")
 
-    def test_claude_interrupt_with_no_open_work_emits_no_turn(self) -> None:
-        # A bare interrupt with no accumulated worklog/stream must not synthesize a spurious turn.
+    def test_claude_interrupt_with_prompt_only_finalizes_interrupted(self) -> None:
+        # An interrupt during the pure-reasoning window (a prompt open, no output yet) finalizes the
+        # turn as "(interrupted)" so it EDITS the prompt message — clearing the issue-#3 "Working…"
+        # reasoning indicator instead of leaving it stuck forever.
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "session-1.jsonl"
             write_jsonl(path, [
@@ -581,8 +583,10 @@ class TurnAdapterTests(unittest.TestCase):
             ])
             turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
 
-        self.assertIsNot(turn.get("complete"), True)            # nothing finalized
-        self.assertEqual(turn.get("reason"), "no_completed_turn")
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn.get("complete_reason"), "interrupted")
+        self.assertEqual(turn["user_text"], "Start.")
+        self.assertEqual(turn["assistant_final_text"], "(interrupted)")
         self.assertNotIn("Request interrupted", str(turn.get("user_text") or ""))
 
     def test_claude_interrupt_tools_only_uses_placeholder_response(self) -> None:

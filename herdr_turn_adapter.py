@@ -1345,10 +1345,12 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     if (
                         pending_user_uuid
                         and pending_user_uuid != consumed_user_uuid
-                        and (worklog_parts or latest_stream_text)
                     ):
-                        # Finalize the accumulated worklog/stream tail as a completed (interrupted)
-                        # turn so it still lands on Telegram instead of being discarded by the reset.
+                        # Finalize the open turn as a completed (interrupted) turn so its worklog/stream
+                        # tail lands on Telegram instead of being discarded. We finalize even with NO
+                        # accumulated content (a pure-reasoning interrupt): the resulting turn EDITS the
+                        # prompt message, which clears the "Working…" reasoning indicator (issue #3) —
+                        # without it, a bare prompt message would keep "Working…" forever after an Esc.
                         final_text = sanitize_text(latest_stream_text).strip() or "(interrupted)"
                         turn = {
                             "available": True,
