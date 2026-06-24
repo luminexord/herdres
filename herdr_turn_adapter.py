@@ -1332,17 +1332,23 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             if event_type == "user":
                 text = content_text(msg.get("content")).strip()
                 uuid = str(event.get("uuid") or "")
-                if text.startswith("[Request interrupted by user"):
-                    # Issue #3: an interrupt ends the open turn WITHOUT an end_turn, so the worklog
-                    # tail would otherwise be discarded by the reset below and never reach Telegram.
-                    # Finalize what we accumulated as a completed (interrupted) turn so it lands, then
-                    # treat the marker as a boundary only — never a visible "[Request interrupted…]"
-                    # prompt. Gated on real open-turn content so a bare interrupt is a no-op.
+                if re.match(r"^\[Request interrupted by user[^\]]*\]$", text):
+                    # Issue #3: an interrupt ends the open turn WITHOUT an end_turn. The marker is a
+                    # control message, never a human prompt — the exact bracketed whole-message form
+                    # avoids swallowing a prompt that merely starts with the phrase — so it only acts
+                    # as a boundary here, never a visible "[Request interrupted…]" prompt.
+                    if DECISIONS_ENABLED and read_pending_decision(session_id):
+                        # A #36 decision is pending (tappable buttons). Leave the open turn intact so
+                        # the post-loop decision path surfaces it with the REAL prompt; don't finalize
+                        # and don't arm the marker as a prompt.
+                        continue
                     if (
                         pending_user_uuid
                         and pending_user_uuid != consumed_user_uuid
                         and (worklog_parts or latest_stream_text)
                     ):
+                        # Finalize the accumulated worklog/stream tail as a completed (interrupted)
+                        # turn so it still lands on Telegram instead of being discarded by the reset.
                         final_text = sanitize_text(latest_stream_text).strip() or "(interrupted)"
                         turn = {
                             "available": True,
@@ -1362,11 +1368,9 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                             worklog = _join_worklog(worklog_parts)
                             if worklog:
                                 turn["worklog_text"] = worklog
-                        if completed and completed[-1].get("_prompt_uuid") == pending_user_uuid:
-                            completed[-1] = turn
-                        else:
-                            completed.append(turn)
+                        completed.append(turn)
                         consumed_user_uuid = pending_user_uuid
+                    # Boundary reset: drop the marker and any content-less open turn.
                     pending_user_text = ""
                     pending_user_uuid = ""
                     incomplete_user = False

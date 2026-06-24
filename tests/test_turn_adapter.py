@@ -585,6 +585,49 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn.get("reason"), "no_completed_turn")
         self.assertNotIn("Request interrupted", str(turn.get("user_text") or ""))
 
+    def test_claude_interrupt_tools_only_uses_placeholder_response(self) -> None:
+        # Interrupted after a tool_use step that streamed NO prose: the worklog is preserved and the
+        # Response falls back to the "(interrupted)" placeholder (assistant_final must be non-empty
+        # or make_turn_feed_item would drop the turn).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Profile it."}},
+                {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "py-spy record"}}]}},
+                {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "[Request interrupted by user]"}},
+            ])
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn.get("complete_reason"), "interrupted")
+        self.assertEqual(turn["assistant_final_text"], "(interrupted)")  # placeholder when no prose streamed
+        self.assertIn("Bash py-spy record", turn.get("worklog_text") or "")
+
+    def test_claude_interrupt_preserves_pending_decision(self) -> None:
+        # Issue #36 must survive issue #3: when a decision is pending (hook file present), an interrupt
+        # must NOT finalize the turn as 'interrupted' — the tappable buttons are still surfaced.
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = Path(tmp) / "pending"
+            pdir.mkdir()
+            (pdir / "session-1.json").write_text(json.dumps({
+                "tool_use_id": "hookdec-x", "name": "ExitPlanMode",
+                "input": {"plan": "# Plan\nstep one"}, "session_id": "session-1", "ts": time.time(),
+            }))
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Plan it."}},
+                {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                    "content": [{"type": "text", "text": "Drafting a plan."}]}},
+                {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "[Request interrupted by user]"}},
+            ])
+            with patch.dict(os.environ, {"HERDRES_PENDING_DIR": str(pdir)}, clear=False):
+                turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+        self.assertIsInstance(turn.get("pending_decision"), dict)        # buttons still surfaced
+        self.assertTrue(turn.get("awaiting_input"))
+        self.assertNotEqual(turn.get("complete_reason"), "interrupted")  # not finalized as interrupted
+        self.assertEqual(turn.get("user_text"), "Plan it.")              # REAL prompt, not the marker
+        self.assertNotIn("Request interrupted", str(turn.get("user_text") or ""))
+
     def test_claude_worklog_redacts_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "session-1.jsonl"
