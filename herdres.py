@@ -3699,10 +3699,15 @@ def extract_turn_feed_item(
     entry.pop("pending_stream_revision", None)
     # Issue #3: show a "Working…" indicator on the open prompt message while the turn is reasoning
     # with no streamed output yet (the gap where a 32s "✢ Hatching…" showed nothing on Telegram).
-    # Set only when a prompt is staged for delivery and the turn is still open; the later stream /
-    # finalize edit replaces the prompt message and clears it automatically.
+    # Set only when a prompt is staged for delivery, the pane is ACTIVELY working (not parked on a
+    # blocked/idle prompt), and the turn is still open (a fresh turn has complete=False; a back-to-
+    # back turn opens via has_open_turn). The later stream / finalize edit replaces the prompt
+    # message and clears the badge; an interrupt also finalizes the turn so the badge can't linger.
     entry["prompt_working"] = bool(
-        working_badge_enabled() and entry.get("pending_prompt_turn_id") and turn.get("complete") is False
+        working_badge_enabled()
+        and entry.get("pending_prompt_turn_id")
+        and status in ACTIVE_AGENT_STATUSES
+        and (turn.get("complete") is False or turn.get("has_open_turn") is True)
     )
     # Visible-screen prompt fallback: never scrape an actively-working pane — its
     # screen is its own in-progress output (spinner, tool noise, the echo of an

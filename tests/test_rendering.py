@@ -2183,6 +2183,50 @@ class StreamingIntegrationTests(unittest.TestCase):
         self.assertLess(final_html.index("<b>User:</b>"), final_html.index("<b>Worklog (1m)</b>"))
         self.assertLess(final_html.index("<b>Worklog (1m)</b>"), final_html.index("<b>Response</b>"))
 
+    def _open_no_content_turn(self) -> dict:
+        return {"available": True, "complete": False, "turn_id": "turn-1",
+                "user_text": "Run it.", "assistant_final_text": "", "assistant_stream_text": ""}
+
+    def _first_sync_prompt_html(self, state, pane, *, env=None):
+        api_calls = []
+
+        def telegram_api(method, payload, *, token=None):
+            api_calls.append((method, dict(payload)))
+            return {"ok": True, "result": {"message_id": "9001"} if method == "sendRichMessage" else True}
+
+        state["telegram"]["rich_messages"] = {"supported": "yes"}
+        ctx = patch.dict(os.environ, env or {})
+        with ctx, patch.multiple(
+            herdres,
+            pane_turn=Mock(return_value=self._open_no_content_turn()),
+            telegram_api=telegram_api,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True, CLEAN_FEED_ENABLED=True, LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False, STATUS_ICON_ENABLED=False,
+        ):
+            counters, caps = self._caps()
+            herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+        return [json.loads(p["rich_message"])["html"] for m, p in api_calls if m == "sendRichMessage"]
+
+    def test_working_badge_flag_off_omits_reasoning_indicator(self) -> None:
+        # With HERDR_TELEGRAM_TOPICS_WORKING_BADGE=0 the open-turn prompt has NO "Working…" (the gate
+        # is checked at staging time, not just the render layer).
+        state, pane, _key, _entry = self._state()
+        sends = self._first_sync_prompt_html(state, pane, env={"HERDR_TELEGRAM_TOPICS_WORKING_BADGE": "0"})
+        self.assertTrue(sends)
+        self.assertIn("Run it.", "\n".join(sends))
+        self.assertNotIn("Working", "\n".join(sends))
+
+    def test_blocked_pane_open_turn_omits_reasoning_indicator(self) -> None:
+        # A pane parked on a blocked/awaiting-input prompt is NOT actively working — no "Working…".
+        state, pane, _key, entry = self._state()
+        pane["agent_status"] = "blocked"
+        entry["last_known_status"] = "blocked"
+        sends = self._first_sync_prompt_html(state, pane)
+        for html in sends:
+            self.assertNotIn("Working", html)
+
     def test_stream_message_edits_latest_prompt_anchor_when_stream_message_is_stale(self) -> None:
         _state, _pane, _key, entry = self._state()
         telegram = {
