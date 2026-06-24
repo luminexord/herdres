@@ -221,6 +221,15 @@ FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "16000"))
 FINAL_REPLY_MAX_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES", "140"))
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
+# Plan/oversized turns (issue #26): deliver a short summary turn + the full markdown as a
+# .md document attachment instead of truncating/flattening it inline.
+PLAN_ATTACH_MIN_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PLAN_ATTACH_MIN_CHARS", "8000"))
+PLAN_SUMMARY_LINES = 12
+PLAN_SUMMARY_CHARS = 1200
+PLAN_DOC_ATTEMPT_CAP = 3
+# Generous cap for the .md attachment body — large enough not to truncate a plan, but it
+# still runs through sanitize_text so the same secret-redaction as every other outbound path applies.
+PLAN_DOC_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PLAN_DOC_MAX_CHARS", "200000"))
 # Default per-space prompt-collapse threshold (see space_prompt_collapse_chars):
 # 0 = never collapse, 1 = always collapse, N>1 = collapse when the prompt exceeds N
 # chars. Default to a threshold so long agent-to-agent echoes collapse while short
@@ -4737,6 +4746,13 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                     parts.append(rendered_fence)
                 previous_blank = False
                 continue
+            if language.lower() == "mermaid":
+                # A mermaid diagram dumped as raw monospace is noise on Telegram (issue #26).
+                # Show a one-line placeholder instead; the real diagram ships in the attached
+                # plan.md (and renders in any markdown/mermaid viewer).
+                parts.append("<blockquote>📊 mermaid diagram — see the attached plan</blockquote>")
+                previous_blank = False
+                continue
             class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
             parts.append(f"<pre><code{class_attr}>{_html_text(chr(10).join(code_lines), 3000)}</code></pre>")
             previous_blank = False
@@ -4930,6 +4946,62 @@ def render_final_reply_html(value: str) -> str:
     if not clean:
         return ""
     return _render_final_reply_blocks(clean.splitlines())
+
+
+def _final_text_has_structure(text: str) -> bool:
+    """Markdown structure that degrades inline on Telegram (headings, tables, fences)."""
+    return bool(re.search(r"(?m)^\s{0,3}#{1,6}\s", text)) or "\n|" in text or "```" in text or "~~~" in text
+
+
+def turn_needs_plan_attachment(item: dict[str, Any]) -> bool:
+    """A turn renders poorly inline (issue #26) when it would exceed the rich cap (→ flat
+    plain-text fallback), contains a mermaid diagram (dumped as raw source), or is a large
+    structured doc (a plan). Such turns get a short summary + a full .md attachment."""
+    if str(item.get("kind") or "").lower() != "turn":
+        return False
+    final_text = str(item.get("assistant_final_text") or "")
+    if not final_text.strip():
+        return False
+    if "```mermaid" in final_text:
+        return True
+    if len(final_text) > MAX_RICH_HTML_CHARS:
+        return True  # would exceed the rich cap -> inline falls back to flat plain text
+    if len(final_text) >= PLAN_ATTACH_MIN_CHARS and _final_text_has_structure(final_text):
+        return True
+    return False
+
+
+def _plan_summary_text(final_text: str) -> str:
+    """First few non-blank, non-fenced lines of the plan — a scannable inline summary
+    (mermaid/code fences are skipped so they're never dumped raw)."""
+    out: list[str] = []
+    in_fence = False
+    for line in str(final_text or "").splitlines():
+        if FENCE_START_RE.match(line) or line.strip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        out.append(line)
+        if len([ln for ln in out if ln.strip()]) >= PLAN_SUMMARY_LINES:
+            break
+    summary = compact_block(out, max_lines=PLAN_SUMMARY_LINES, max_chars=PLAN_SUMMARY_CHARS)
+    return (summary + "\n\n📎 Full plan attached below.").strip()
+
+
+def plan_summary_item(item: dict[str, Any]) -> dict[str, Any]:
+    """A shallow copy of a turn item whose Response is replaced by a short summary, so it
+    renders as a normal (small) rich turn while the full plan ships as a .md attachment."""
+    return {**item, "assistant_final_text": _plan_summary_text(str(item.get("assistant_final_text") or ""))}
+
+
+def plan_attachment_swap(item: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """If a turn renders poorly inline (issue #26), return (summary_item, full_plan_text);
+    otherwise (item, ""). Used by both the sync delivery path and the manual /report path so
+    they behave identically."""
+    if str(item.get("kind") or "").lower() == "turn" and turn_needs_plan_attachment(item):
+        return plan_summary_item(item), str(item.get("assistant_final_text") or "")
+    return item, ""
 
 
 def _turn_fallback_body_html(assistant_final: str, reserved_chars: int) -> str:
@@ -5580,6 +5652,8 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_attempt_hash",
         "last_clean_attempt_at",
         "unfolded_turns",
+        "last_plan_doc_turn_id",
+        "pending_plan_doc",
         "last_turn_id",
         "last_turn_available",
         "last_turn_reason",
@@ -7536,7 +7610,9 @@ def telegram_api_multipart(
 ) -> dict[str, Any]:
     if dry_run_enabled():
         payload = dict(fields)
-        payload["files"] = {key: str(path) for key, path in files.items()}
+        payload["files"] = {
+            key: str(spec[0] if isinstance(spec, tuple) else spec) for key, spec in files.items()
+        }
         return dry_run_result(method, payload)
     api_token = token or telegram_token()
     boundary = "------------------------" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
@@ -7550,7 +7626,13 @@ def telegram_api_multipart(
                 b"\r\n",
             ]
         )
-    for key, path in files.items():
+    for key, spec in files.items():
+        # spec is a Path (defaults to image/jpeg for the profile-photo caller) or a
+        # (path, mime) tuple so callers like sendDocument can set text/markdown.
+        if isinstance(spec, tuple):
+            path, mime = spec[0], (spec[1] or "application/octet-stream")
+        else:
+            path, mime = spec, "image/jpeg"
         file_path = Path(path)
         chunks.extend(
             [
@@ -7558,7 +7640,7 @@ def telegram_api_multipart(
                 (
                     f'Content-Disposition: form-data; name="{key}"; '
                     f'filename="{file_path.name}"\r\n'
-                    "Content-Type: image/jpeg\r\n\r\n"
+                    f"Content-Type: {mime}\r\n\r\n"
                 ).encode("utf-8"),
                 file_path.read_bytes(),
                 b"\r\n",
@@ -7597,6 +7679,147 @@ def telegram_message_id(response: dict[str, Any]) -> str | None:
     if isinstance(result, dict) and result.get("message_id") is not None:
         return str(result.get("message_id"))
     return None
+
+
+def send_document(
+    chat_id: str,
+    file_path: Path | str,
+    *,
+    caption_text: str = "",
+    telegram: dict[str, Any] | None = None,
+    thread_id: str | int | None = None,
+    reply_to_message_id: str | int | None = None,
+    notify: bool = False,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Upload a file to a Telegram topic via the standard sendDocument Bot API method
+    (multipart, hits api.telegram.org directly — not the custom rich-message bridge)."""
+    fields = _message_common_payload(chat_id, thread_id=thread_id, notify=notify, reply_markup=None)
+    fields.update(_reply_parameters_payload(reply_to_message_id))
+    fields["document"] = "attach://file"
+    caption = sanitize_text(str(caption_text or ""), 1024).strip()
+    if caption:
+        fields["caption"] = caption  # plain text (no parse_mode) — the summary lives in the turn message
+    return telegram_api_multipart(
+        "sendDocument", fields, {"file": (Path(file_path), "text/markdown")}, token=api_token
+    )
+
+
+def outbound_doc_dir() -> Path:
+    base = state_path().parent / "outbound"
+    if base.is_symlink():
+        raise BridgeError("outbound directory path is unsafe (symlink)")
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.chmod(0o700)
+    except OSError:
+        pass
+    return base
+
+
+def write_outbound_plan_doc(turn_id: str, text: str) -> Path:
+    root = outbound_doc_dir()
+    nonce = os.urandom(4).hex()
+    name = f"plan-{safe_file_component(str(turn_id), 'turn')[:24]}-{nonce}.md"
+    path = root / name
+    # Redact secrets like every other outbound text path (the item text is already sanitized
+    # upstream, but do it here too so the guarantee holds for any caller).
+    path.write_text(sanitize_text(str(text or ""), PLAN_DOC_MAX_CHARS), encoding="utf-8")
+    prune_attachment_dir(root, keep=20)  # bound the outbound dir like attachments
+    return path
+
+
+def _plan_doc_caption(plan_text: str) -> str:
+    for line in str(plan_text or "").splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if stripped:
+            return ("📎 " + stripped)[:200]
+    return "📎 Full plan"
+
+
+def deliver_plan_document(
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    plan_text: str,
+    reply_to_message_id: str | int | None,
+) -> bool:
+    """Stage the full plan markdown as a .md file and QUEUE it (issue #26). The send is driven
+    by flush_pending_plan_doc (called once per sync, and explicitly by /report), so each sync
+    spends at most one attempt and a transient failure self-heals. Sent at most once per
+    turn_id. Returns True if state changed."""
+    clean_turn = str(turn_id or "")
+    if not str(plan_text or "").strip() or not clean_turn:
+        return False
+    if str(entry.get("last_plan_doc_turn_id") or "") == clean_turn:
+        return False  # already delivered for this turn
+    existing = entry.get("pending_plan_doc")
+    if isinstance(existing, dict) and str(existing.get("turn_id") or "") == clean_turn:
+        return False  # already queued for this turn (don't rewrite / orphan the staged file)
+    try:
+        path = write_outbound_plan_doc(clean_turn, plan_text)
+    except Exception:
+        return False
+    if isinstance(existing, dict) and str(existing.get("path") or ""):
+        _unlink_quietly(Path(str(existing.get("path"))))  # drop a stale queue for a different turn
+    entry["pending_plan_doc"] = {
+        "turn_id": clean_turn,
+        "path": str(path),
+        "reply_to": str(reply_to_message_id or ""),
+        "caption": _plan_doc_caption(plan_text),
+    }
+    return True
+
+
+def flush_pending_plan_doc(
+    state: dict[str, Any], entry: dict[str, Any], telegram: dict[str, Any], chat_id: str, *, api_token: str | None = None
+) -> bool:
+    """Send a queued plan document (set by deliver_plan_document). Runs every sync so a
+    missed/failed send self-heals. Drops the queue entry on success, on a vanished file, or
+    after PLAN_DOC_ATTEMPT_CAP failures; on a rate-limit it leaves the queue for the next sync
+    without spending an attempt. Returns True if state changed."""
+    pending = entry.get("pending_plan_doc")
+    if not isinstance(pending, dict):
+        return False
+    turn_id = str(pending.get("turn_id") or "")
+    path = Path(str(pending.get("path") or ""))
+    if not turn_id or not str(pending.get("path") or "") or not path.exists():
+        entry.pop("pending_plan_doc", None)
+        return True
+    try:
+        result = send_document(
+            chat_id,
+            path,
+            caption_text=str(pending.get("caption") or ""),
+            telegram=telegram,
+            thread_id=str(entry.get("topic_id") or ""),
+            reply_to_message_id=str(pending.get("reply_to") or "") or None,
+            notify=False,
+            api_token=api_token,
+        )
+    except RateLimited:
+        return False  # respect the backoff; retry next sync without burning an attempt
+    except Exception:
+        result = {"ok": False}
+    if result.get("ok"):
+        entry["last_plan_doc_turn_id"] = turn_id
+        doc_message_id = telegram_message_id(result)
+        if doc_message_id:
+            # The doc is a real new message below the summary — advance the pane/topic
+            # high-water marks (PR #35) so a later in-place edit isn't left buried above it.
+            record_pane_message_route(
+                state, str(entry.get("space_key") or ""), str(entry.get("pane_key") or ""), doc_message_id
+            )
+        _unlink_quietly(path)
+        entry.pop("pending_plan_doc", None)
+        return True
+    attempts = int(pending.get("attempts") or 0) + 1
+    if attempts >= PLAN_DOC_ATTEMPT_CAP:
+        _unlink_quietly(path)
+        entry.pop("pending_plan_doc", None)
+        return True
+    pending["attempts"] = attempts
+    return True
 
 
 def _telegram_error_is_bot_access(exc: Exception) -> bool:
@@ -10435,6 +10658,9 @@ def _sync_pane_clean_feed(
         item = None
         changed = True
     if item:
+        # Issue #26: a plan/oversized turn renders badly inline. Deliver a short summary as the
+        # turn message and ship the FULL markdown as a .md attachment (below, after the send).
+        item, plan_doc_text = plan_attachment_swap(item)
         item_render_hash = clean_feed_hash(item)
         item_semantic_hash = clean_feed_hash(item, include_render_version=False)
         previous_render_hash = str(entry.get("last_clean_render_hash") or entry.get("last_clean_hash") or "")
@@ -10591,6 +10817,13 @@ def _sync_pane_clean_feed(
                     )
                 if str(item.get("kind") or "").lower() == "turn":
                     clear_stream_state(entry)
+                    if plan_doc_text:
+                        deliver_plan_document(
+                            entry,
+                            turn_id=str(item.get("turn_id") or ""),
+                            plan_text=plan_doc_text,
+                            reply_to_message_id=str(result.get("message_id") or (message_id if did_edit else "")),
+                        )
                 changed = True
             elif result_topic_missing(result):
                 clear_entry_topic_mapping(state, entry, str(result.get("error") or result))
@@ -10620,6 +10853,9 @@ def _sync_pane_clean_feed(
     # Runs every sync (timer + plugin paths), so a fold missed on delivery heals on the next
     # tick without needing a new turn.
     if fold_superseded_turns(state, entry, telegram, chat_id, api_token=pane_api_token):
+        changed = True
+    # Send/retry a queued plan-document (issue #26); runs every sync so it self-heals.
+    if flush_pending_plan_doc(state, entry, telegram, chat_id, api_token=pane_api_token):
         changed = True
     entry["last_status_hash"] = stable_obj_hash
     return {"early_return": None, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
@@ -12139,6 +12375,9 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         if TURN_FEED_ENABLED:
             item = latest_turn_item(entry, pane)
             if item:
+                # Issue #26: a plan/oversized turn shows a summary here too; the full plan ships
+                # as a .md attachment (deduped per turn, so it isn't re-sent if already delivered).
+                item, plan_doc_text = plan_attachment_swap(item)
                 report_render_hash = clean_feed_hash(item)
                 report_semantic_hash = clean_feed_hash(item, include_render_version=False)
                 reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
@@ -12175,6 +12414,14 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                             str(entry.get("pane_key") or ""),
                             str(result["message_id"]),
                         )
+                    if plan_doc_text:
+                        deliver_plan_document(
+                            entry,
+                            turn_id=str(item.get("turn_id") or ""),
+                            plan_text=plan_doc_text,
+                            reply_to_message_id=str(result.get("message_id") or ""),
+                        )
+                        flush_pending_plan_doc(state, entry, telegram, chat_id, api_token=pane_api_token)
                     save_state(state)
                     return {"handled": True, "reply": ""}
                 entry["last_clean_send_error"] = sanitize_text(str(result), 500)

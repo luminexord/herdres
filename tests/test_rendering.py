@@ -11136,5 +11136,137 @@ class SelfHealingFoldTests(unittest.TestCase):
         self.assertEqual([e["message_id"] for e in entry["unfolded_turns"]], ["m1", "m2"])
 
 
+class PlanAttachmentTests(unittest.TestCase):
+    """Issue #26: a plan/oversized turn delivers a short summary turn + the full markdown as a
+    .md document attachment, instead of truncating/flattening it inline."""
+
+    def _turn(self, final_text: str) -> dict:
+        return {"kind": "turn", "turn_id": "t1", "user_text": "make a plan",
+                "worklog_text": "thinking", "assistant_final_text": final_text}
+
+    # --- detection ---
+    def test_detects_mermaid(self) -> None:
+        self.assertTrue(herdres.turn_needs_plan_attachment(
+            self._turn("# Plan\n```mermaid\nflowchart TD\nA-->B\n```\n")))
+
+    def test_detects_large_structured(self) -> None:
+        big = "# Plan\n\n" + "\n".join(f"## Section {i}\n- a\n- b" for i in range(400))
+        self.assertGreater(len(big), herdres.PLAN_ATTACH_MIN_CHARS)
+        self.assertTrue(herdres.turn_needs_plan_attachment(self._turn(big)))
+
+    def test_detects_render_over_cap(self) -> None:
+        # Unique paragraphs (no repeated-run collapse) so the rendered HTML exceeds the rich cap.
+        prose = "\n\n".join(f"Paragraph {i} discusses a distinct idea about subject {i} in detail here."
+                            for i in range(400))
+        self.assertTrue(herdres.turn_needs_plan_attachment(self._turn(prose)))
+
+    def test_small_turn_not_attached(self) -> None:
+        self.assertFalse(herdres.turn_needs_plan_attachment(self._turn("# Plan\nshort and sweet.")))
+
+    def test_non_turn_not_attached(self) -> None:
+        self.assertFalse(herdres.turn_needs_plan_attachment(
+            {"kind": "status", "assistant_final_text": "x" * 20000}))
+
+    # --- summary ---
+    def test_summary_item_shortens_and_keeps_user_worklog(self) -> None:
+        big = "# Title\n" + "\n".join(f"line {i}" for i in range(200))
+        item = self._turn(big)
+        summ = herdres.plan_summary_item(item)
+        self.assertEqual(summ["user_text"], item["user_text"])
+        self.assertEqual(summ["worklog_text"], item["worklog_text"])
+        self.assertLess(len(summ["assistant_final_text"]), len(big))
+        self.assertIn("Full plan attached", summ["assistant_final_text"])
+
+    def test_summary_skips_fenced_blocks(self) -> None:
+        text = "# Title\n```mermaid\nflowchart TD\nA-->B\n```\nReal intro line."
+        summ = herdres._plan_summary_text(text)
+        self.assertNotIn("flowchart", summ)
+        self.assertIn("Title", summ)
+
+    # --- mermaid placeholder in the renderer ---
+    def test_mermaid_fence_renders_placeholder_not_raw(self) -> None:
+        html = herdres.render_final_reply_html("before\n```mermaid\nflowchart TD\nA-->B\n```\nafter")
+        self.assertNotIn("language-mermaid", html)
+        self.assertNotIn("flowchart TD", html)
+        self.assertIn("mermaid diagram", html)
+
+    # --- send_document ---
+    def test_send_document_builds_sendDocument_multipart(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "plan.md"
+            p.write_text("# Plan", encoding="utf-8")
+            tam = Mock(return_value={"ok": True, "result": {"message_id": 999}})
+            with patch.object(herdres, "telegram_api_multipart", tam):
+                res = herdres.send_document("-1001", p, caption_text="📎 Plan",
+                                            thread_id="77", reply_to_message_id="500", api_token="tok")
+            self.assertTrue(res["ok"])
+            method, fields, files = tam.call_args.args
+            self.assertEqual(method, "sendDocument")
+            self.assertEqual(fields["document"], "attach://file")
+            self.assertEqual(fields["chat_id"], "-1001")
+            self.assertEqual(fields["message_thread_id"], "77")
+            self.assertIn("reply_parameters", fields)
+            self.assertEqual(fields["caption"], "📎 Plan")
+            self.assertEqual(files["file"][0], p)
+            self.assertEqual(files["file"][1], "text/markdown")
+            self.assertEqual(tam.call_args.kwargs["token"], "tok")
+
+    # --- deliver (queue) / flush (send) dedup + retry ---
+    def test_deliver_queues_and_flush_sends_once_per_turn(self) -> None:
+        entry = {"topic_id": "77", "space_key": "s", "pane_key": "p"}
+        state = {"spaces": {}, "panes": {}}
+        sent = []
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(herdres, "state_path", Mock(return_value=Path(d) / "state.json")), \
+                 patch.object(herdres, "record_pane_message_route", Mock()), \
+                 patch.object(herdres, "send_document",
+                              Mock(side_effect=lambda *a, **k: sent.append(k.get("reply_to_message_id"))
+                                   or {"ok": True, "result": {"message_id": "9"}})):
+                self.assertTrue(herdres.deliver_plan_document(entry, turn_id="t1",
+                                plan_text="# Plan\nbody", reply_to_message_id="500"))
+                self.assertIn("pending_plan_doc", entry)
+                self.assertEqual(len(sent), 0)  # deliver only queues
+                self.assertTrue(herdres.flush_pending_plan_doc(state, entry, {}, "-1001", api_token="tok"))
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(entry.get("last_plan_doc_turn_id"), "t1")
+                self.assertNotIn("pending_plan_doc", entry)  # sent + cleared
+                # re-deliver the same turn -> no new queue
+                self.assertFalse(herdres.deliver_plan_document(entry, turn_id="t1",
+                                 plan_text="# Plan\nbody", reply_to_message_id="500"))
+                herdres.flush_pending_plan_doc(state, entry, {}, "-1001", api_token="tok")
+        self.assertEqual(len(sent), 1)
+
+    def test_flush_retries_then_drops_on_persistent_failure(self) -> None:
+        entry = {"topic_id": "77", "space_key": "s", "pane_key": "p"}
+        state = {"spaces": {}, "panes": {}}
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(herdres, "state_path", Mock(return_value=Path(d) / "state.json")), \
+                 patch.object(herdres, "send_document", Mock(return_value={"ok": False})):
+                herdres.deliver_plan_document(entry, turn_id="t2", plan_text="# Plan", reply_to_message_id="1")
+                self.assertIn("pending_plan_doc", entry)
+                for _ in range(herdres.PLAN_DOC_ATTEMPT_CAP):
+                    herdres.flush_pending_plan_doc(state, entry, {}, "-1001", api_token="tok")
+        self.assertNotIn("pending_plan_doc", entry)  # gave up after the cap
+        self.assertNotEqual(entry.get("last_plan_doc_turn_id"), "t2")
+
+    def test_flush_rate_limited_keeps_queue_without_burning_attempt(self) -> None:
+        entry = {"topic_id": "77", "space_key": "s", "pane_key": "p"}
+        state = {"spaces": {}, "panes": {}}
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(herdres, "state_path", Mock(return_value=Path(d) / "state.json")), \
+                 patch.object(herdres, "send_document", Mock(side_effect=herdres.RateLimited(30))):
+                herdres.deliver_plan_document(entry, turn_id="t3", plan_text="# Plan", reply_to_message_id="1")
+                changed = herdres.flush_pending_plan_doc(state, entry, {}, "-1001", api_token="tok")
+        self.assertFalse(changed)  # rate-limit: no state change
+        self.assertIn("pending_plan_doc", entry)  # kept for next sync
+        self.assertEqual(int(entry["pending_plan_doc"].get("attempts") or 0), 0)  # attempt not burned
+
+    def test_clear_clean_feed_state_clears_plan_doc(self) -> None:
+        entry = {"last_plan_doc_turn_id": "t1", "pending_plan_doc": {"turn_id": "t1"}}
+        herdres.clear_clean_feed_state(entry)
+        self.assertNotIn("last_plan_doc_turn_id", entry)
+        self.assertNotIn("pending_plan_doc", entry)
+
+
 if __name__ == "__main__":
     unittest.main()
