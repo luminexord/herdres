@@ -2137,6 +2137,8 @@ class StreamingIntegrationTests(unittest.TestCase):
             prompt_html = json.loads(send_calls[0][1]["rich_message"])["html"]
             self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", prompt_html)
             self.assertIn(user_text, prompt_html)
+            self.assertIn("<b>Working…</b>", prompt_html)  # issue #3: reasoning indicator on the bare prompt
+            self.assertNotIn("Working… (", prompt_html)    # bare label, no ticking elapsed (no churn)
             self.assertNotIn("<b>Worklog</b>", prompt_html)
             self.assertNotIn("<b>Response</b>", prompt_html)
 
@@ -2764,6 +2766,27 @@ class StreamingIntegrationTests(unittest.TestCase):
         working = dict(item, worklog_label="Working… (1m)")
         self.assertEqual(herdres.clean_feed_hash(worklog), herdres.clean_feed_hash(working))
         self.assertEqual(herdres.item_plain_text(worklog), herdres.item_plain_text(working))
+
+    def test_prompt_item_renders_working_indicator(self) -> None:
+        """Issue #3: a prompt item carrying working_label renders a bare 'Working…' indicator after
+        the User block (the reasoning window); without it the base prompt render is unchanged."""
+        item = herdres.make_prompt_feed_item("turn-1", "Profile the CPU.")
+        base = herdres.render_feed_item_html(item)
+        self.assertNotIn("Working", base)
+        item["working_label"] = herdres.WORKING_LABEL
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
+        self.assertIn("Profile the CPU.", html)
+        self.assertIn("<b>Working…</b>", html)
+        self.assertNotIn("Working… (", html)  # bare label, no ticking elapsed
+
+    def test_prompt_working_label_is_hash_invariant(self) -> None:
+        """The prompt 'Working…' indicator lives in working_label only — excluded from clean_feed_hash
+        and item_plain_text — so it can never churn/re-edit the prompt message."""
+        item = herdres.make_prompt_feed_item("turn-1", "q")
+        with_label = dict(item, working_label=herdres.WORKING_LABEL)
+        self.assertEqual(herdres.clean_feed_hash(item), herdres.clean_feed_hash(with_label))
+        self.assertEqual(herdres.item_plain_text(item), herdres.item_plain_text(with_label))
 
     def test_worklog_label_working_badge_toggle(self) -> None:
         """worklog_label_for_turn(working=True) shows 'Working…' when the badge flag is on (default)
