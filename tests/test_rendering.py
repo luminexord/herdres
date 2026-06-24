@@ -7697,6 +7697,204 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
         self.assertNotIn("active_prompt", state["panes"]["pane-1"])
 
+    # --- Issue #37: relax the reply gate for a BARE answer in an unambiguous topic ---
+    # A plain typed message (no Telegram "Reply" gesture) is accepted as the answer to the one open
+    # prompt when the topic unambiguously targets a single pane; an explicit reply to a DIFFERENT
+    # message stays strict (it could target a superseded prompt / wrong pane).
+
+    @staticmethod
+    def _single_live_space(state: dict) -> None:
+        """Map topic 77 to a space with exactly one live pane (mirrors prod per-agent topology),
+        so is_single_live_space_pane(...) is True."""
+        state["spaces"] = {
+            "agent:pane-1": {"space_key": "agent:pane-1", "topic_id": "77", "pane_keys": ["pane-1"]}
+        }
+
+    def test_force_reply_detail_accepts_bare_message_in_single_pane_topic(self) -> None:
+        # #37 happy path: no Telegram Reply gesture, no /send — a plain answer resolves the one prompt.
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "extra detail"}
+            )  # NOTE: no reply_to_message_id
+        self.assertEqual(result["reply"], "Sent details.")
+        send_to_pane.assert_called_once_with("pane-1", "1\nextra detail")
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+        self.assertNotIn("active_prompt", state["panes"]["pane-1"])
+
+    def test_force_reply_detail_wrong_reply_still_strict_in_single_pane_topic(self) -> None:
+        # Relaxation is BARE-only: an explicit reply to a DIFFERENT/older message stays strict even in
+        # a single-pane topic, so a reply to a superseded prompt cannot mis-attach to the current one.
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42",
+                 "text": "extra detail", "reply_to_message_id": "123"}  # explicit reply, != force_reply 999
+            )
+        self.assertEqual(
+            result["reply"],
+            "Reply to the detail prompt above (use Telegram's Reply), or tap the option button again to re-open it.",
+        )
+        send_to_pane.assert_not_called()
+        self.assertIn("awaiting_detail", state["panes"]["pane-1"])  # preserved
+
+    def test_force_reply_detail_still_strict_in_multi_pane_topic(self) -> None:
+        # Two live panes share the topic: a mis-targeted reply stays ambiguous, so the gate holds.
+        state = callback_state()
+        state["spaces"] = {
+            "workspace:w1": {
+                "space_key": "workspace:w1", "topic_id": "77",
+                "pane_keys": ["pane-1", "pane-2"], "message_routes": {"123": "pane-1"},
+            }
+        }
+        state["panes"]["pane-2"] = {"pane_id": "pane-2", "topic_id": "77", "last_known_status": "working"}
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42",
+                 "text": "extra detail", "reply_to_message_id": "123"}  # routes to pane-1 but != 999
+            )
+        self.assertEqual(
+            result["reply"],
+            "Reply to the detail prompt above (use Telegram's Reply), or tap the option button again to re-open it.",
+        )
+        send_to_pane.assert_not_called()
+        self.assertIn("awaiting_detail", state["panes"]["pane-1"])  # preserved for a correct reply/re-tap
+
+    def test_force_reply_detail_expired_clears_before_relaxed_gate_in_single_pane_topic(self) -> None:
+        # The expiry guard runs BEFORE the relaxed gate: a stale prompt is cleared, never sent.
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": "2020-01-01T00:00:00Z",
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "extra detail"}
+            )
+        self.assertEqual(result["reply"], "That detail request expired. Use /choices to resend the choices.")
+        send_to_pane.assert_not_called()
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+
+    def test_force_reply_detail_other_owner_bare_message_does_not_answer_prompt(self) -> None:
+        # Cross-user isolation: a different owner's plain text forwards as a fresh instruction and
+        # must NOT consume someone else's open prompt (the choice is not prepended; slot preserved).
+        state = callback_state()
+        self._single_live_space(state)
+        state["telegram"]["owner_user_ids"] = ["42", "99"]
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "99", "text": "unrelated message"}
+            )
+        send_to_pane.assert_called_once_with("pane-1", "unrelated message")  # forwarded raw, not "1\n..."
+        self.assertIn("awaiting_detail", state["panes"]["pane-1"])  # owner 42's prompt untouched
+
+    def test_force_reply_detail_accepts_bare_message_when_agent_picked_in_multi_pane_topic(self) -> None:
+        # Multi-pane topic, but the owner picked this agent via /agents (resolved_active_entry): a bare
+        # answer is unambiguous and accepted, matching how a bare non-prompt message forwards there.
+        state = callback_state()
+        state["spaces"] = {
+            "workspace:w1": {
+                "space_key": "workspace:w1", "topic_id": "77",
+                "pane_keys": ["pane-1", "pane-2"],
+                "active_pane": {"42": {"pane_key": "pane-1", "set_at": herdres.utc_now()}},
+            }
+        }
+        state["panes"]["pane-2"] = {"pane_id": "pane-2", "topic_id": "77", "last_known_status": "working"}
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "extra detail"}
+            )  # bare — resolves via the active pane, not a reply
+        self.assertEqual(result["reply"], "Sent details.")
+        send_to_pane.assert_called_once_with("pane-1", "1\nextra detail")
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+
+    def test_force_reply_detail_bare_send_failure_preserves_slot_in_single_pane_topic(self) -> None:
+        # A transient send failure on the relaxed bare path must NOT consume the prompt (retryable).
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(False, "boom"))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "extra detail"}
+            )
+        self.assertEqual(result["reply"], "Send failed: boom")
+        self.assertIn("awaiting_detail", state["panes"]["pane-1"])  # preserved for retry
+        self.assertIn("active_prompt", state["panes"]["pane-1"])
+
+    def test_force_reply_detail_bare_select_choice_in_single_pane_topic(self) -> None:
+        # The relaxed bare path also reaches the select_choice dispatch (keys + detail), not just plain.
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "", "select_choice": "2",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_choice = Mock(return_value=(True, ""))
+        with callback_patches(state), patch.object(herdres, "send_choice_detail_to_pane", send_choice):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "with detail"}
+            )  # bare
+        self.assertEqual(result["reply"], "Sent details.")
+        send_choice.assert_called_once_with("pane-1", "2", "with detail")
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+
+    def test_force_reply_visible_choice_bare_message_fails_closed_when_prompt_changed(self) -> None:
+        # Visible-prompt re-validation runs AFTER the relaxed gate: a bare answer to a visible choice
+        # whose on-screen options changed is still rejected (fail-closed) and never key-driven.
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "",
+            "visible_choice": "4", "visible_options": [{"number": "4", "label": "Type something."}],
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_visible = Mock(return_value=(True, ""))
+        with callback_patches(state), patch.multiple(
+            herdres,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=True,
+            send_visible_choice_detail_to_pane=send_visible,
+            visible_prompt_matches_awaiting=Mock(return_value=False),
+        ):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "answer"}
+            )  # bare, no reply_to
+        self.assertIn("choices changed", result["reply"])
+        send_visible.assert_not_called()
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+
     def test_prompt_feed_renders_user_label_in_open_details_quote(self) -> None:
         item = herdres.make_prompt_feed_item("turn-1", "Why did the bot freeze?\nCheck logs.")
 
