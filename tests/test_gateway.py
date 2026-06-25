@@ -2097,7 +2097,7 @@ class TypingActionTests(unittest.TestCase):
             "d": {"last_known_status": "working", "topic_id": ""},     # no topic
             "e": {"last_known_status": "working", "topic_id": "1"},    # General topic — never targeted
         })
-        topics = sorted(t for _c, t in managed_gateway.typing_panes(st))
+        topics = sorted(t for _c, t, _tok in managed_gateway.typing_panes(st))
         self.assertEqual(topics, ["77", "79"])
 
     def test_busy_and_hyphenated_statuses_are_active(self):
@@ -2105,7 +2105,7 @@ class TypingActionTests(unittest.TestCase):
             "a": {"last_known_status": "busy", "topic_id": "77"},
             "b": {"last_known_status": "in-progress", "topic_id": "78"},  # hyphen normalized
         })
-        self.assertEqual(sorted(t for _c, t in managed_gateway.typing_panes(st)), ["77", "78"])
+        self.assertEqual(sorted(t for _c, t, _tok in managed_gateway.typing_panes(st)), ["77", "78"])
 
     def test_skips_stale_status(self):
         # A frozen "working" status (e.g. the sync timer paused) must not animate forever.
@@ -2113,7 +2113,7 @@ class TypingActionTests(unittest.TestCase):
             "fresh": {"last_known_status": "working", "topic_id": "77"},  # no last_seen_at -> treated fresh
             "stale": {"last_known_status": "working", "topic_id": "78", "last_seen_at": "2020-01-01T00:00:00Z"},
         })
-        self.assertEqual(sorted(t for _c, t in managed_gateway.typing_panes(st)), ["77"])
+        self.assertEqual(sorted(t for _c, t, _tok in managed_gateway.typing_panes(st)), ["77"])
 
     def test_general_topic_with_empty_id_in_state_still_excluded(self):
         # If general_thread_id is present-but-empty, fall back to the env default so the real General
@@ -2141,11 +2141,30 @@ class TypingActionTests(unittest.TestCase):
         with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_TYPING_ACTION": "1"}):
             self.assertTrue(managed_gateway.typing_action_enabled())
 
-    def test_tick_sends_typing_per_topic_with_manager_token_and_clean_payload(self):
-        st = self._state({
-            "a": {"last_known_status": "working", "topic_id": "77"},
-            "b": {"last_known_status": "working", "topic_id": "79"},
-        })
+    def test_token_resolution_prefers_voice_bot_then_any_managed(self):
+        # The typing token MUST be an in-group bot (the manager/poll token is often not a chat
+        # member -> 400 "chat not found"). Prefer the pane's own voice bot; else any managed bot.
+        st = self._state(
+            {"voiced": {"last_known_status": "working", "topic_id": "77",
+                        "managed_voice_active": True, "pane_root_bot_kind": "codex"},
+             "manager_voiced": {"last_known_status": "working", "topic_id": "78"}},  # not managed-voice
+            managed_bots={"claude": {"enabled": True, "token": "CLAUDE_TOK"},
+                          "codex": {"enabled": True, "token": "CODEX_TOK"}},
+        )
+        by_topic = {t: tok for _c, t, tok in managed_gateway.typing_panes(st)}
+        self.assertEqual(by_topic["77"], "CODEX_TOK")   # the pane's own voice bot
+        self.assertEqual(by_topic["78"], "CLAUDE_TOK")  # any in-group managed bot (sorted: claude first)
+
+    def test_token_falls_back_to_manager_when_no_managed_bots(self):
+        st = self._state({"a": {"last_known_status": "working", "topic_id": "77"}})  # no managed_bots
+        self.assertEqual(managed_gateway.typing_panes(st), [("-1001", "77", None)])
+
+    def test_tick_sends_typing_per_topic_with_clean_payload(self):
+        st = self._state(
+            {"a": {"last_known_status": "working", "topic_id": "77"},
+             "b": {"last_known_status": "working", "topic_id": "79"}},
+            managed_bots={"claude": {"enabled": True, "token": "CLAUDE_TOK"}},
+        )
         calls = []
 
         def fake_api(method, params=None, timeout=30, *, token=None):
@@ -2157,7 +2176,7 @@ class TypingActionTests(unittest.TestCase):
         self.assertEqual((sent, backoff), (2, 0.0))
         self.assertTrue(all(m == "sendChatAction" and p["action"] == "typing" for m, p, _t in calls))
         self.assertEqual(sorted(p["message_thread_id"] for _m, p, _t in calls), ["77", "79"])
-        self.assertTrue(all(tok is None for _m, _p, tok in calls))  # always the manager token
+        self.assertTrue(all(tok == "CLAUDE_TOK" for _m, _p, tok in calls))  # an in-group bot, not manager
         # sendChatAction rejects extra fields — never send notify/markup
         self.assertTrue(all("disable_notification" not in p and "reply_markup" not in p for _m, p, _t in calls))
 
