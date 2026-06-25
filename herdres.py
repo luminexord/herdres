@@ -13295,6 +13295,63 @@ def hooks_once(args: Any) -> dict[str, Any]:
     }
 
 
+def claude_commands_dir() -> Path:
+    return Path.home() / ".claude" / "commands"
+
+
+def _commands_source_dir(source_dir: Path | None) -> Path | None:
+    if source_dir is not None:
+        return Path(source_dir)
+    try:
+        marker = SOURCE_MARKER.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):  # missing, or binary garbage (UnicodeDecodeError is a ValueError)
+        return None
+    return Path(marker) if marker else None  # empty/whitespace marker -> no-op, not Path('.')==cwd
+
+
+def install_runtime_commands(source_dir: Path | None = None) -> dict[str, int]:
+    """Issue #27: copy the repo `commands/herdres*.md` files into Claude Code's command dir
+    (~/.claude/commands/) so the /herdres* slash commands work outside a marketplace install —
+    Claude Code auto-discovers commands/*.md there. Idempotent (overwrites only our own herdres-*
+    files). Skips when ~/.claude is absent (Claude Code isn't installed here). Returns counts.
+
+    Codex is intentionally NOT handled yet: its native custom-command mechanism is skills
+    (SKILL.md frontmatter + $ARGUMENTS) / ~/.codex/prompts/*.md, not loose .toml files under
+    ~/.codex/commands/ — tracked as a follow-up so we don't ship a path that reports success but
+    produces no working command."""
+    counts = {"claude": 0}
+    src = _commands_source_dir(source_dir)
+    cmds = (src / "commands") if src else None
+    if not cmds or not cmds.is_dir():
+        return counts
+    dest = claude_commands_dir()
+    if not dest.parent.exists():  # ~/.claude absent -> Claude Code isn't installed here
+        return counts
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in sorted(cmds.glob("herdres*.md")):
+            (dest / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+            counts["claude"] += 1
+    except OSError:
+        pass
+    return counts
+
+
+def commands_once(args: Any) -> dict[str, Any]:
+    action = str(getattr(args, "action", "install") or "install")
+    if action != "install":
+        return {"ok": False, "error": f"unknown commands action: {action}"}
+    # An explicit --source (passed by the installers) is cwd-independent; without it we fall back
+    # to the recorded SOURCE_MARKER (the manual `herdres commands install` from inside a checkout).
+    source = (getattr(args, "source", "") or "").strip()
+    counts = install_runtime_commands(Path(source) if source else None)
+    return {
+        "ok": True,
+        "installed": counts,
+        "claude_dir": str(claude_commands_dir()),
+    }
+
+
 def setup_once(args: Any) -> dict[str, Any]:
     """Interactive credential wizard. Validates, preflights, then writes 0o600."""
     load_dotenv()
@@ -14148,6 +14205,13 @@ def _apply_from_source(
         else:
             service_actions = _restart_services()
         verify = _verify_install(available, gateway_was_active)
+        # Refresh the /herdres* slash commands ONLY after verify passes (issue #27). Doing it before
+        # verify would leave command files that invoke `herdres status`/`commands` against a reverted
+        # (pre-#27) binary if the update then rolls back. Idempotent, best-effort.
+        try:
+            install_runtime_commands(repo)
+        except Exception:
+            pass
     except Exception as exc:
         # Roll back when: a file replace errors, the new binary fails to run / version
         # mismatches, or the gateway fails to come back. (A soft dry-run sync failure
@@ -14399,6 +14463,109 @@ def version_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler
     return {"ok": True, "version": HERDRES_VERSION}
 
 
+def _unit_is_active(unit: str) -> bool:
+    """True if a systemd --user unit is RUNNING right now (is-active) — distinct from
+    _systemd_unit_active (is-ENABLED = operator intent). Tolerates a missing systemctl (sandbox/CI)."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", unit], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "active"
+
+
+def status_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
+    """Read-only install/config/service health + panes/topics roster for the /herdres* commands
+    (issue #27). NEVER writes state, NEVER touches the network, and exposes secrets only as
+    booleans/counts (the JSON reaches a Telegram chat)."""
+    macos = _platform_is_macos()
+
+    def _safe(fn, *a):
+        # Tolerate a missing systemctl/launchctl (sandbox/CI/no-systemd box) so the read-only
+        # health command degrades instead of hard-failing — same intent as _unit_is_active.
+        try:
+            return bool(fn(*a))
+        except OSError:
+            return False
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "version": HERDRES_VERSION,
+        "installed": {
+            "binary": str(Path(sys.argv[0]).resolve()) if sys.argv and sys.argv[0] else "",
+            "env_present": DEFAULT_ENV.exists(),
+            "state_present": state_path().exists(),  # distinct from load_state() defaulting on a fresh box
+        },
+        "services": {
+            "platform": "macos" if macos else "linux",
+            "timer_active": _safe(_launchd_label_loaded, "com.gaijinjoe.herdres") if macos else _unit_is_active("herdres.timer"),
+            "gateway_active": _safe(_gateway_is_active),
+        },
+        "config": {},
+        "health": {},
+        "panes": [],
+        "spaces": [],
+        "counts": {"panes": 0, "spaces": 0, "open_panes": 0},
+    }
+    src = Path.home() / ".local/share/herdres/source"
+    if src.exists():
+        try:
+            result["installed"]["source"] = src.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    # State is best-effort AND strictly read-only here: parse the file directly rather than via
+    # load_state(), which would RENAME a corrupt state.json aside (a write) — `status` must never
+    # mutate the filesystem. A corrupt/absent file still yields install + service health (degraded).
+    state: dict[str, Any] = {}
+    if state_path().exists():
+        try:
+            state = normalize_state(json.loads(state_path().read_text(encoding="utf-8")))
+        except Exception as exc:
+            result["state_error"] = sanitize_text(str(exc), 200)
+            state = {}
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    result["config"] = {
+        "chat_id_set": bool(str(telegram.get("chat_id") or "").strip()),
+        "allowed_users_count": len(telegram.get("owner_user_ids") or []),
+        "enabled": bool(state.get("enabled", True)) if state else None,
+        "plugin_event_enabled": bool(state.get("plugin_event_enabled", True)) if state else None,
+        "topics_per_agent": per_agent_topics_enabled(),
+    }
+    result["health"] = {
+        "last_preflight_ok_at": telegram.get("last_preflight_ok_at") or "",
+        "last_preflight_error_at": telegram.get("last_event_preflight_error_at") or "",
+        "updated_at": state.get("updated_at") or "",
+    }
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    open_panes = 0
+    for entry in panes.values():
+        if not isinstance(entry, dict):
+            continue
+        status = str(entry.get("last_known_status") or "unknown").lower()
+        if status != "closed":
+            open_panes += 1
+        result["panes"].append({
+            "pane_id": str(entry.get("pane_id") or ""),
+            "agent": str(entry.get("agent") or ""),
+            "status": status,
+            "topic_id": str(entry.get("topic_id") or ""),
+            "space_key": str(entry.get("space_key") or ""),
+        })
+    for sp in spaces.values():
+        if not isinstance(sp, dict):
+            continue
+        result["spaces"].append({
+            "space_key": str(sp.get("space_key") or ""),
+            "topic_id": str(sp.get("topic_id") or ""),
+            "topic_name": str(sp.get("topic_name") or ""),
+            "pane_count": len(sp.get("pane_keys") or []),
+        })
+    result["counts"] = {"panes": len(panes), "spaces": len(spaces), "open_panes": open_panes}
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -14419,8 +14586,13 @@ def main() -> int:
     setup.add_argument("--allowed-users", default="")
     setup.add_argument("--reuse-hermes-token", action="store_true")
     sub.add_parser("version")
+    sub.add_parser("status")
     hooks = sub.add_parser("hooks")
     hooks.add_argument("action", nargs="?", default="install", choices=["install"])
+    commands = sub.add_parser("commands")
+    commands.add_argument("action", nargs="?", default="install", choices=["install"])
+    commands.add_argument("--source", default="",
+                          help="checkout dir to copy commands from (default: the recorded source marker)")
     update = sub.add_parser("update")
     update.add_argument("--channel", default="edge")
     update.add_argument("--edge", action="store_const", const="edge", dest="channel")
@@ -14457,8 +14629,12 @@ def main() -> int:
             result = setup_once(args)
         elif args.cmd == "version":
             result = version_once(args)
+        elif args.cmd == "status":
+            result = status_once(args)  # MUST precede the probe fallback, or `status` sends a Telegram probe
         elif args.cmd == "hooks":
             result = hooks_once(args)
+        elif args.cmd == "commands":
+            result = commands_once(args)
         elif args.cmd == "update":
             result = update_once(args)
         else:
