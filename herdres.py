@@ -31,6 +31,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+try:
+    # Optional local speech engine (issue #4 — voice notes ↔ panes). If the module/its deps are
+    # absent, speech features are simply off and the text path is unaffected (fail-open).
+    import herdres_speech
+except Exception:  # pragma: no cover - speech is strictly additive
+    herdres_speech = None  # type: ignore
+
 
 HERDRES_VERSION = "0.3.0"
 
@@ -196,7 +203,11 @@ RICH_MESSAGES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1
 RICH_BAD_REQUEST_LIMIT = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_BAD_REQUEST_LIMIT", "3"))
 LIVE_CARD_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "0")
 STATUS_MARKER_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "0")
-PANE_ROOT_MESSAGES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES", "0")
+# Pane-root messages are read at runtime via pane_root_messages_enabled(), NOT as an
+# import-time constant: the Herdr plugin runs `herdres event` with no systemd
+# EnvironmentFile, so a frozen constant would be False there and plugin-delivered turns
+# would skip pane-root creation + reply-threading that sync-delivered turns get (the same
+# class of bug as per_agent_topics_enabled / response_collapse_previous_default).
 PINNED_STATUS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_PINNED_STATUS", "1")
 # Per-agent topic grouping is read at runtime via per_agent_topics_enabled(),
 # NOT as an import-time constant: the Herdr plugin and bare CLI invocations have
@@ -211,17 +222,37 @@ ALLOW_UNBOUNDED_REPORTS = parse_bool_env("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORT
 RICH_RENDER_VERSION = 20
 USER_PROMPT_LABEL = "User:"
 WORKLOG_LABEL = "Worklog"
+# Issue #3: while a turn is still open/streaming, the worklog header reads "Working…" instead of
+# "Worklog" so the topic shows the agent is alive. Lives in the worklog LABEL only (excluded from
+# clean_feed_hash) so it can never trigger a re-deliver/edit loop; reverts to WORKLOG_LABEL on
+# completion. Gated by working_badge_enabled() (HERDR_TELEGRAM_TOPICS_WORKING_BADGE, default on).
+WORKING_LABEL = "Working…"
 RESPONSE_LABEL = "Response"
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "16000"))
 FINAL_REPLY_MAX_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES", "140"))
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
+# Plan/oversized turns (issue #26): deliver a short summary turn + the full markdown as a
+# .md document attachment instead of truncating/flattening it inline.
+PLAN_ATTACH_MIN_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PLAN_ATTACH_MIN_CHARS", "8000"))
+PLAN_SUMMARY_LINES = 12
+PLAN_SUMMARY_CHARS = 1200
+PLAN_DOC_ATTEMPT_CAP = 3
+# Generous cap for the .md attachment body — large enough not to truncate a plan, but it
+# still runs through sanitize_text so the same secret-redaction as every other outbound path applies.
+PLAN_DOC_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PLAN_DOC_MAX_CHARS", "200000"))
 # Default per-space prompt-collapse threshold (see space_prompt_collapse_chars):
 # 0 = never collapse, 1 = always collapse, N>1 = collapse when the prompt exceeds N
 # chars. Default to a threshold so long agent-to-agent echoes collapse while short
 # human one-liners stay expanded.
 PROMPT_COLLAPSE_CHARS_DEFAULT = int(os.getenv("HERDR_TELEGRAM_TOPICS_PROMPT_COLLAPSE_CHARS", "200"))
+# When on, a new turn folds the PREVIOUS turn's Response in place (latest stays open).
+# Per-space override via space["collapse_previous_responses"]; off by default (opt-in).
+# Read at runtime via response_collapse_previous_default(), NOT an import-time constant:
+# the Herdr plugin runs `herdres event` (and bare CLI runs) with no systemd
+# EnvironmentFile, so a frozen constant would be False there and silently skip the
+# fold on every plugin-delivered turn (see per_agent_topics_enabled above).
 PROMPT_PREVIEW_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PROMPT_PREVIEW_CHARS", "60"))
 INTERACTION_READONLY_WARNING_TITLE = "⚠️ Manual action required"
 INTERACTION_READONLY_WARNING_BODY = (
@@ -551,6 +582,18 @@ def per_agent_topics_enabled() -> bool:
     return os.getenv("HERDR_TELEGRAM_TOPICS_PER_AGENT", "0").lower() in {"1", "true", "yes", "on"}
 
 
+def pane_root_messages_enabled() -> bool:
+    """Whether to post a per-pane root message that feed turns thread under.
+
+    Read at call time, not as an import-time constant — the Herdr plugin runs
+    `herdres event` with no systemd EnvironmentFile, so a frozen constant would be False
+    before load_dotenv() runs and plugin-delivered turns would skip pane-root creation and
+    reply-threading, leaving them unthreaded while sync-delivered turns thread under the
+    root (split message organization). Entry points call load_dotenv() first, so this
+    honors herdres.env on every path. Mirrors per_agent_topics_enabled()."""
+    return parse_bool_env("HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES", "0")
+
+
 def state_path() -> Path:
     return Path(os.getenv("HERDR_TELEGRAM_TOPICS_STATE", str(DEFAULT_STATE))).expanduser()
 
@@ -594,6 +637,7 @@ def normalize_state(data: dict[str, Any]) -> dict[str, Any]:
     migrate_legacy_pane_topics(data)
     migrate_space_origins(data)
     migrate_space_voice_mode(data)
+    prune_orphaned_colliding_spaces(data)
     clear_disabled_visible_choice_state(data)
     return data
 
@@ -754,6 +798,158 @@ def space_prompt_collapse_chars(state: dict[str, Any], pane_or_entry: dict[str, 
     return default
 
 
+def response_collapse_previous_default() -> bool:
+    """Default for folding a previous turn's Response when a new turn arrives.
+
+    Read at call time, not as an import-time constant — the Herdr plugin runs
+    `herdres event` (and bare CLI invocations run) with no systemd EnvironmentFile, so
+    a module-level constant would freeze to False before load_dotenv() runs and silently
+    disable collapse on every plugin-delivered turn. The fold only fires on the NEXT
+    delivery and the timer sync won't retroactively fold a turn the plugin already
+    delivered, so a missed plugin-path fold leaves the prior response expanded forever.
+    Entry points call load_dotenv() first, so this honors herdres.env on every path.
+    Mirrors per_agent_topics_enabled()."""
+    return parse_bool_env("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "")
+
+
+def space_collapse_previous_responses(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> bool:
+    """Per-space: when a new turn arrives, fold the PREVIOUS turn's Response in place
+    (the latest turn always stays expanded). Defaults to
+    response_collapse_previous_default(); per-space override via
+    space["collapse_previous_responses"]."""
+    default = response_collapse_previous_default()
+    if not isinstance(pane_or_entry, dict):
+        return default
+    key = str(pane_or_entry.get("space_key") or "") or space_key(pane_or_entry)
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    space = spaces.get(key)
+    if isinstance(space, dict) and space.get("collapse_previous_responses") is not None:
+        return bool(space.get("collapse_previous_responses"))
+    return default
+
+
+# Per-pane bounded buffer of recently-delivered turns awaiting a fold. Small: in steady
+# state it holds just the latest (which stays open); extras appear only when a fold was
+# missed and is being caught up.
+UNFOLDED_TURNS_CAP = 5
+FOLD_ATTEMPT_CAP = 3
+
+
+def _trim_turn_item_for_fold(item: dict[str, Any]) -> dict[str, Any]:
+    """A render-essential, length-bounded copy of a turn item, for storing in
+    entry["unfolded_turns"] so an OLD turn can be re-rendered collapsed later.
+    render_turn_item_html only reads these fields; title/summary/lines/text are dropped."""
+    trimmed: dict[str, Any] = {"kind": "turn", "turn_id": str(item.get("turn_id") or "")}
+    user_text = str(item.get("user_text") or "")
+    if user_text:
+        trimmed["user_text"] = sanitize_text(user_text, USER_PROMPT_MAX_CHARS)
+    worklog_text = str(item.get("worklog_text") or item.get("assistant_stream_text") or "")
+    if worklog_text:
+        # Bound at the SAME cap make_turn_feed_item used for the delivered turn
+        # (FINAL_REPLY_MAX_CHARS), so the re-rendered folded body is identical to what was
+        # delivered — never a shorter truncation that loses content when expanded.
+        trimmed["worklog_text"] = sanitize_text(worklog_text, FINAL_REPLY_MAX_CHARS)
+    final_text = str(item.get("assistant_final_text") or "")
+    if final_text:
+        trimmed["assistant_final_text"] = sanitize_text(final_text, FINAL_REPLY_MAX_CHARS)
+    label = str(item.get("worklog_label") or "").strip()
+    if label:
+        trimmed["worklog_label"] = label
+    collapse_chars = _item_prompt_collapse_chars(item)
+    if collapse_chars:
+        trimmed["prompt_collapse_chars"] = collapse_chars
+    return trimmed
+
+
+def append_unfolded_turn(entry: dict[str, Any], message_id: str | int, item: dict[str, Any]) -> None:
+    """Record a delivered TURN (its message_id + trimmed item) so a later sweep can fold its
+    Response once a newer turn exists. Dedups by message_id (last-write-wins, so a same-turn
+    re-render refreshes in place) and prunes oldest beyond UNFOLDED_TURNS_CAP. Turns without a
+    response are skipped (nothing to fold)."""
+    mid = str(message_id or "").strip()
+    if not mid or str(item.get("kind") or "").lower() != "turn":
+        return
+    if not str(item.get("assistant_final_text") or "").strip():
+        return
+    buf = entry.get("unfolded_turns")
+    buf = [e for e in buf if isinstance(e, dict) and str(e.get("message_id") or "") != mid] if isinstance(buf, list) else []
+    buf.append({"message_id": mid, "turn_id": str(item.get("turn_id") or ""), "item": _trim_turn_item_for_fold(item)})
+    if len(buf) > UNFOLDED_TURNS_CAP:
+        buf = buf[-UNFOLDED_TURNS_CAP:]
+    entry["unfolded_turns"] = buf
+
+
+def fold_superseded_turns(
+    state: dict[str, Any],
+    entry: dict[str, Any],
+    telegram: dict[str, Any],
+    chat_id: str,
+    *,
+    api_token: str | None = None,
+) -> bool:
+    """Fold the Response of every previously-delivered turn EXCEPT the current latest.
+
+    Self-healing replacement for the old one-shot fold. A per-pane bounded buffer
+    (entry["unfolded_turns"], populated by append_unfolded_turn in record_delivered_feed_item)
+    records each recent turn's message_id + trimmed item. This sweep runs once per pane every
+    sync (timer AND plugin paths) and re-edits each non-latest turn's own message with
+    collapse_response, so a fold missed on the plugin path — or when an intermediate turn never
+    finalized as its own message — is corrected on the next sync without needing a new turn.
+    Best-effort + cosmetic; the current latest (last_clean_message_id / last_turn_id) stays
+    expanded.
+
+    Known limitation: a turn delivered BEFORE this shipped has no stored item and cannot be
+    folded (only post-deploy turns and the one seeded from last_clean_item are captured).
+
+    Returns True if the buffer mutated (caller persists state)."""
+    if not space_collapse_previous_responses(state, entry):
+        return False
+    buf = entry.get("unfolded_turns")
+    if not isinstance(buf, list) or not buf:
+        return False
+    latest_mid = str(entry.get("last_clean_message_id") or "").strip()
+    latest_turn = str(entry.get("last_turn_id") or "").strip()
+    token = api_token or managed_bot_token_for_entry(telegram, entry)
+    kept: list[dict[str, Any]] = []
+    mutated = False
+    for rec in buf:
+        if not isinstance(rec, dict):
+            mutated = True
+            continue
+        mid = str(rec.get("message_id") or "").strip()
+        tid = str(rec.get("turn_id") or "").strip()
+        item = rec.get("item") if isinstance(rec.get("item"), dict) else None
+        # The current latest turn stays expanded (skip by message id OR turn id — either can
+        # collide via edit-in-place reuse or id reassignment).
+        if not mid or mid == latest_mid or (tid and tid == latest_turn) or not isinstance(item, dict):
+            kept.append(rec)
+            continue
+        if not str(item.get("assistant_final_text") or "").strip():
+            mutated = True  # nothing to fold -> drop
+            continue
+        try:
+            result = edit_feed_item(
+                chat_id, mid, {**item, "collapse_response": True}, telegram=telegram, api_token=token
+            )
+        except Exception:
+            result = {"ok": False}
+        if result.get("ok") or result.get("not_found") or result.get("topic_missing"):
+            mutated = True  # folded (not_modified counts as ok), or message/topic gone -> drop
+            continue
+        attempts = int(rec.get("attempts") or 0) + 1
+        mutated = True
+        if attempts >= FOLD_ATTEMPT_CAP:
+            continue  # give up on a persistently-failing edit
+        rec["attempts"] = attempts
+        kept.append(rec)
+    if mutated:
+        if kept:
+            entry["unfolded_turns"] = kept
+        else:
+            entry.pop("unfolded_turns", None)
+    return mutated
+
+
 def refresh_entry_managed_voice(state: dict[str, Any], entry: dict[str, Any], pane: dict[str, Any] | None = None) -> None:
     if isinstance(entry, dict):
         entry["managed_voice_active"] = managed_voice_enabled_for_space(
@@ -789,6 +985,29 @@ def devin_model_managed_bot_kind_from_label(value: str | None) -> str:
     if "kimi" in text:
         return "kimi"
     return ""
+
+
+def council_seat_managed_bot_kind(text: str | None) -> str:
+    """Resolve a managed-bot kind from a council pane label like
+    'council-codex · d1 · main' or the human 'Council Codex' form.
+    Pure, stdlib-only (re), no I/O, no state. Returns '' when no
+    council-<seat> token is present or the seat has no managed bot."""
+    lowered = str(text or "").lower()
+    if not lowered:
+        return ""
+    match = re.search(r"council[-\s]+([a-z0-9]+(?:-[a-z0-9]+)?)", lowered)
+    if not match:
+        return ""
+    seat = match.group(1).split("-", 1)[0]
+    return {
+        "codex": "codex",
+        "claude": "claude",
+        "kimi": "kimi",
+        "glm": "glm",
+        "implement": "omp",
+        "omp": "omp",
+        "lead": "claude",
+    }.get(seat, "")
 
 
 def pane_agent_status_label(pane: dict[str, Any]) -> str:
@@ -987,7 +1206,23 @@ def managed_bot_kind_for_entry(entry: dict[str, Any], pane: dict[str, Any] | Non
         )
         if model_kind:
             return model_kind
-    return managed_bot_kind_for_agent(str(entry.get("agent") or ""))
+    entry_kind = managed_bot_kind_for_agent(str(entry.get("agent") or ""))
+    if entry_kind:
+        return entry_kind
+    label_candidates: list[str] = []
+    if pane:
+        label_candidates.extend(
+            str(pane.get(key) or "") for key in ("pane_thread_name", "pane_label_raw", "label", "name", "title")
+        )
+    label_candidates.extend(
+        str(entry.get(key) or "")
+        for key in ("pane_thread_name", "pane_label_raw", "pane_label_topic_name", "topic_name", "label")
+    )
+    for candidate in label_candidates:
+        council_kind = council_seat_managed_bot_kind(candidate)
+        if council_kind:
+            return council_kind
+    return ""
 
 
 def managed_bot_token_for_entry(
@@ -1448,8 +1683,26 @@ def herdr_bin() -> str:
     return os.getenv("HERDR_BIN", DEFAULT_HERDR_BIN)
 
 
+def _herdr_proc(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    """Run a herdr CLI command, converting a timeout / OS error into a BridgeError.
+
+    subprocess.run(timeout=) raises subprocess.TimeoutExpired (NOT a BridgeError) when a
+    slow pane's command exceeds the budget. Left uncaught it propagated past
+    pane_turn's `except BridgeError` and aborted the whole sync — which then re-delivered
+    already-sent turns because state was never saved (a stuck "same message" loop). By
+    raising BridgeError here, one slow/unreachable pane degrades to "unavailable" and the
+    sync still completes and persists.
+    """
+    try:
+        return run_cmd([herdr_bin(), *args], timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise BridgeError(f"herdr {' '.join(args[:2])} timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise BridgeError(f"herdr {' '.join(args[:2])} failed ({exc})") from exc
+
+
 def herdr_json(args: list[str], *, timeout: int = 10) -> Any:
-    proc = run_cmd([herdr_bin(), *args], timeout=timeout)
+    proc = _herdr_proc(args, timeout)
     if proc.returncode != 0:
         raise BridgeError(sanitize_text((proc.stderr or proc.stdout or "").strip(), 500))
     try:
@@ -1459,7 +1712,7 @@ def herdr_json(args: list[str], *, timeout: int = 10) -> Any:
 
 
 def herdr_text(args: list[str], *, timeout: int = 10) -> str:
-    proc = run_cmd([herdr_bin(), *args], timeout=timeout)
+    proc = _herdr_proc(args, timeout)
     if proc.returncode != 0:
         raise BridgeError(sanitize_text((proc.stderr or proc.stdout or "").strip(), 500))
     return proc.stdout
@@ -2129,6 +2382,54 @@ def migrate_space_voice_mode(state: dict[str, Any]) -> bool:
                 changed = True
                 break
     return changed
+
+
+def prune_orphaned_colliding_spaces(state: dict[str, Any]) -> bool:
+    """Drop a space whose pane_keys are ALL dangling (no entry in state["panes"]) when
+    another space owns the SAME topic with at least one live pane.
+
+    A herdr pane can be renumbered mid-session (e.g. p16 -> p1H): a fresh space/pane is
+    created for the new id, but the old space stays bound to the topic with a now-dangling
+    pane_key. Because topic_space_entry returns the FIRST space matching a topic, the dead
+    space shadows the live one and inbound commands/replies resolve to it — yielding
+    "No live Herdr panes in this topic." (live_entries_for_space skips the dangling pane).
+
+    The condition is deliberately conservative: prune only a fully-orphaned space (every
+    pane_key missing from state["panes"]) AND only when a sibling space on the exact same
+    topic still has a live pane. This never deletes the sole space for a topic, nor a space
+    that is merely momentarily idle — it requires a healthy live owner of that topic to
+    already exist. Returns True if any space was pruned (caller persists state)."""
+    spaces = state.get("spaces")
+    panes = state.get("panes")
+    if not isinstance(spaces, dict) or not isinstance(panes, dict):
+        return False
+
+    def live_pane_count(space: dict[str, Any]) -> int:
+        if not isinstance(space, dict):
+            return 0
+        return sum(1 for k in (space.get("pane_keys") or []) if str(k) in panes)
+
+    healthy_topics: set[str] = set()
+    for space in spaces.values():
+        if live_pane_count(space) > 0:
+            topic = str(space.get("topic_id") or "").strip()
+            if topic:
+                healthy_topics.add(topic)
+
+    orphans: list[str] = []
+    for key, space in spaces.items():
+        if not isinstance(space, dict):
+            continue
+        if not (space.get("pane_keys") or []):
+            continue  # never had/declared a pane -> leave alone
+        if live_pane_count(space) > 0:
+            continue  # still has a live pane -> keep
+        topic = str(space.get("topic_id") or "").strip()
+        if topic and topic in healthy_topics:
+            orphans.append(key)
+    for key in orphans:
+        spaces.pop(key, None)
+    return bool(orphans)
 
 
 def status_object(pane: dict[str, Any]) -> dict[str, Any]:
@@ -3020,8 +3321,10 @@ def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
     text_parts: list[str] = []
     if user_text:
         text_parts.extend([USER_PROMPT_LABEL, user_text, ""])
-    if worklog_text:
-        text_parts.extend([WORKLOG_LABEL, worklog_text, ""])
+    # worklog_text is intentionally NOT folded into item["text"]: that field is hashed by
+    # clean_feed_hash for dedup, and a worklog attached to an already-delivered turn would
+    # change the hash and re-deliver (duplicate) the turn. The worklog still renders via
+    # the dedicated worklog_text field (render_turn_item_html), just not through item["text"].
     text_parts.append(assistant_final)
     return {
         "kind": "turn",
@@ -3062,11 +3365,14 @@ def request_started_at_for_turn(entry: dict[str, Any], turn_id: str) -> str:
     return ""
 
 
-def worklog_label_for_turn(entry: dict[str, Any], turn_id: str) -> str:
+def worklog_label_for_turn(entry: dict[str, Any], turn_id: str, working: bool = False) -> str:
+    # `working` is set only by the open/streaming render path (issue #3); completed-turn items keep
+    # the default so finishing a turn auto-reverts the badge to "Worklog".
+    base = WORKING_LABEL if (working and working_badge_enabled()) else WORKLOG_LABEL
     elapsed = request_elapsed_label(request_started_at_for_turn(entry, turn_id))
     if not elapsed:
-        return WORKLOG_LABEL
-    return f"{WORKLOG_LABEL} ({elapsed})"
+        return base
+    return f"{base} ({elapsed})"
 
 
 def stream_user_text_for_turn(entry: dict[str, Any], turn_id: str) -> str:
@@ -3534,6 +3840,12 @@ def extract_turn_feed_item(
         entry["pending_api_error"] = api_error
     else:
         entry.pop("pending_api_error", None)
+    # Cache the model for the pinned-status suffix. Pin-only metadata — kept out of
+    # every last_clean_* / dedup field so it can never re-deliver a turn. Cache-and-keep
+    # (don't clear on empty) so an idle pane keeps showing its last-known model.
+    model = sanitize_text(str(turn.get("model") or "").strip(), 60) if isinstance(turn, dict) else ""
+    if model:
+        entry["model"] = model
     item = attach_stream_worklog(select_turn_feed_item(turn, entry), entry, turn)
     # Prefer the actual completed turn over any visible-screen scrape. This
     # covers the auto-continue case AND the done->working status-lag race: even
@@ -3584,6 +3896,7 @@ def extract_turn_feed_item(
                 item = None
                 stream_turn_id = str(turn.get("open_turn_id") or turn.get("turn_id") or "")
     if not item and stream_turn_id:
+        entry["prompt_working"] = False  # issue #3: the worklog "Working… (Nm)" badge takes over once streaming
         entry["pending_stream_turn_id"] = stream_turn_id
         entry["pending_stream_text"] = stream_text
         entry["pending_stream_revision"] = str(turn.get("stream_revision") or stream_text_hash(stream_text))
@@ -3592,6 +3905,18 @@ def extract_turn_feed_item(
     entry.pop("pending_stream_turn_id", None)
     entry.pop("pending_stream_text", None)
     entry.pop("pending_stream_revision", None)
+    # Issue #3: show a "Working…" indicator on the open prompt message while the turn is reasoning
+    # with no streamed output yet (the gap where a 32s "✢ Hatching…" showed nothing on Telegram).
+    # Set only when a prompt is staged for delivery, the pane is ACTIVELY working (not parked on a
+    # blocked/idle prompt), and the turn is still open (a fresh turn has complete=False; a back-to-
+    # back turn opens via has_open_turn). The later stream / finalize edit replaces the prompt
+    # message and clears the badge; an interrupt also finalizes the turn so the badge can't linger.
+    entry["prompt_working"] = bool(
+        working_badge_enabled()
+        and entry.get("pending_prompt_turn_id")
+        and status in ACTIVE_AGENT_STATUSES
+        and (turn.get("complete") is False or turn.get("has_open_turn") is True)
+    )
     # Visible-screen prompt fallback: never scrape an actively-working pane — its
     # screen is its own in-progress output (spinner, tool noise, the echo of an
     # already-delivered reply), which produced the "Input needed" spam and
@@ -3635,13 +3960,13 @@ def clear_stream_state(entry: dict[str, Any]) -> None:
 def item_plain_text(item: dict[str, Any]) -> str:
     if str(item.get("kind") or "").lower() == "turn":
         user_text = str(item.get("user_text") or "").strip()
-        worklog_text = str(item.get("worklog_text") or "").strip()
         assistant_final = str(item.get("assistant_final_text") or "").strip()
         parts: list[str] = []
         if user_text:
             parts.extend([USER_PROMPT_LABEL, user_text, ""])
-        if worklog_text:
-            parts.extend([WORKLOG_LABEL, worklog_text, ""])
+        # worklog_text is intentionally excluded (see clean_feed_hash): the dedup
+        # fallback compares this plain text, so including the worklog would let a
+        # worklog-only change defeat dedup and re-deliver an already-sent turn.
         if assistant_final:
             parts.append(assistant_final)
         return sanitize_text("\n".join(parts).strip(), FINAL_REPLY_MAX_CHARS)
@@ -4650,6 +4975,13 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                     parts.append(rendered_fence)
                 previous_blank = False
                 continue
+            if language.lower() == "mermaid":
+                # A mermaid diagram dumped as raw monospace is noise on Telegram (issue #26).
+                # Show a one-line placeholder instead; the real diagram ships in the attached
+                # plan.md (and renders in any markdown/mermaid viewer).
+                parts.append("<blockquote>📊 mermaid diagram — see the attached plan</blockquote>")
+                previous_blank = False
+                continue
             class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
             parts.append(f"<pre><code{class_attr}>{_html_text(chr(10).join(code_lines), 3000)}</code></pre>")
             previous_blank = False
@@ -4845,6 +5177,62 @@ def render_final_reply_html(value: str) -> str:
     return _render_final_reply_blocks(clean.splitlines())
 
 
+def _final_text_has_structure(text: str) -> bool:
+    """Markdown structure that degrades inline on Telegram (headings, tables, fences)."""
+    return bool(re.search(r"(?m)^\s{0,3}#{1,6}\s", text)) or "\n|" in text or "```" in text or "~~~" in text
+
+
+def turn_needs_plan_attachment(item: dict[str, Any]) -> bool:
+    """A turn renders poorly inline (issue #26) when it would exceed the rich cap (→ flat
+    plain-text fallback), contains a mermaid diagram (dumped as raw source), or is a large
+    structured doc (a plan). Such turns get a short summary + a full .md attachment."""
+    if str(item.get("kind") or "").lower() != "turn":
+        return False
+    final_text = str(item.get("assistant_final_text") or "")
+    if not final_text.strip():
+        return False
+    if "```mermaid" in final_text:
+        return True
+    if len(final_text) > MAX_RICH_HTML_CHARS:
+        return True  # would exceed the rich cap -> inline falls back to flat plain text
+    if len(final_text) >= PLAN_ATTACH_MIN_CHARS and _final_text_has_structure(final_text):
+        return True
+    return False
+
+
+def _plan_summary_text(final_text: str) -> str:
+    """First few non-blank, non-fenced lines of the plan — a scannable inline summary
+    (mermaid/code fences are skipped so they're never dumped raw)."""
+    out: list[str] = []
+    in_fence = False
+    for line in str(final_text or "").splitlines():
+        if FENCE_START_RE.match(line) or line.strip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        out.append(line)
+        if len([ln for ln in out if ln.strip()]) >= PLAN_SUMMARY_LINES:
+            break
+    summary = compact_block(out, max_lines=PLAN_SUMMARY_LINES, max_chars=PLAN_SUMMARY_CHARS)
+    return (summary + "\n\n📎 Full plan attached below.").strip()
+
+
+def plan_summary_item(item: dict[str, Any]) -> dict[str, Any]:
+    """A shallow copy of a turn item whose Response is replaced by a short summary, so it
+    renders as a normal (small) rich turn while the full plan ships as a .md attachment."""
+    return {**item, "assistant_final_text": _plan_summary_text(str(item.get("assistant_final_text") or ""))}
+
+
+def plan_attachment_swap(item: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """If a turn renders poorly inline (issue #26), return (summary_item, full_plan_text);
+    otherwise (item, ""). Used by both the sync delivery path and the manual /report path so
+    they behave identically."""
+    if str(item.get("kind") or "").lower() == "turn" and turn_needs_plan_attachment(item):
+        return plan_summary_item(item), str(item.get("assistant_final_text") or "")
+    return item, ""
+
+
 def _turn_fallback_body_html(assistant_final: str, reserved_chars: int) -> str:
     budget = max(1200, min(FINAL_REPLY_MAX_CHARS, MAX_RICH_HTML_CHARS - reserved_chars - 500))
     while budget >= 900:
@@ -4856,14 +5244,19 @@ def _turn_fallback_body_html(assistant_final: str, reserved_chars: int) -> str:
     return _rich_paragraph(sanitize_text(assistant_final, 900))
 
 
-def render_assistant_response_quote_html(assistant_final: str) -> str:
+def render_assistant_response_quote_html(
+    assistant_final: str, *, open_by_default: bool = True, preview: str = ""
+) -> str:
     clean = str(assistant_final or "").strip()
     if not clean:
         return ""
     body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
-    # Collapsible (open) like before, but NOT blockquoted — the blue quote bar
-    # flattened the rich response. Prompt + worklog keep their blockquote.
-    return _rich_details_quote_html(RESPONSE_LABEL, body_html, quote=False)
+    # NOT blockquoted — the blue quote bar flattened the rich response (prompt +
+    # worklog keep their blockquote). open_by_default=False folds a PREVIOUS turn's
+    # response with a one-line preview; the latest turn renders open.
+    return _rich_details_quote_html(
+        RESPONSE_LABEL, body_html, quote=False, open_by_default=open_by_default, preview=preview
+    )
 
 
 def render_worklog_quote_html(
@@ -4885,13 +5278,18 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     worklog_label = str(item.get("worklog_label") or WORKLOG_LABEL).strip() or WORKLOG_LABEL
     assistant_final = str(item.get("assistant_final_text") or "").strip()
     collapse_chars = _item_prompt_collapse_chars(item)
+    # A PREVIOUS turn re-rendered with collapse_response folds its response (latest stays open).
+    response_open = not bool(item.get("collapse_response"))
+    response_preview = "" if response_open else _prompt_preview(assistant_final)
     parts: list[str] = []
     if user_text:
         parts.append(render_user_prompt_quote_html(user_text, collapse_chars))
     worklog_html = render_worklog_quote_html(worklog_text, response_available=bool(assistant_final), label=worklog_label)
     if worklog_html:
         parts.append(worklog_html)
-    response_html = render_assistant_response_quote_html(assistant_final)
+    response_html = render_assistant_response_quote_html(
+        assistant_final, open_by_default=response_open, preview=response_preview
+    )
     if response_html:
         parts.append(response_html)
     rendered = _join_blocks(parts).strip()
@@ -4906,7 +5304,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
         response_html = ""
         if assistant_final:
             body_html = _turn_fallback_body_html(assistant_final, len(quote_html) + len(worklog_html) + 120)
-            response_html = _rich_details_quote_html(RESPONSE_LABEL, body_html)
+            response_html = _rich_details_quote_html(RESPONSE_LABEL, body_html, open_by_default=response_open, preview=response_preview)
         rendered = _join_blocks([quote_html, worklog_html, response_html]).strip()
         if len(rendered) > MAX_RICH_HTML_CHARS:
             worklog_html = ""
@@ -4919,7 +5317,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
             response_html = ""
             if assistant_final:
                 body_html = _rich_paragraph(sanitize_text(assistant_final, 900))
-                response_html = _rich_details_quote_html(RESPONSE_LABEL, body_html)
+                response_html = _rich_details_quote_html(RESPONSE_LABEL, body_html, open_by_default=response_open, preview=response_preview)
             return _join_blocks([quote_html, worklog_html, response_html]).strip()
     return rendered
 
@@ -5016,11 +5414,24 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
     return rendered
 
 
+def render_working_header_html(label: str) -> str:
+    # Issue #3: a static "Working…" indicator on the open prompt message during the reasoning
+    # window (no streamed output yet). A plain bold line — NOT a body-less <details>, which
+    # Telegram's server-side sendRichMessage parser may drop — so it always renders. The label is
+    # bare (no ticking elapsed) so it never churns the prompt message's hash.
+    text = _html_text(label, 80).strip()
+    return f"<b>{text}</b>" if text else ""
+
+
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
     if kind == "prompt":
         prompt = str(item.get("user_text") or item.get("summary") or "").strip()
-        return render_user_prompt_quote_html(prompt, _item_prompt_collapse_chars(item))
+        html_out = render_user_prompt_quote_html(prompt, _item_prompt_collapse_chars(item))
+        working_label = str(item.get("working_label") or "").strip()  # issue #3 thinking indicator
+        if html_out and working_label:
+            return f"{html_out}\n{render_working_header_html(working_label)}"
+        return html_out
     if kind == "turn":
         return render_turn_item_html(item)
     if kind == "decision":
@@ -5396,14 +5807,25 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
         "interaction_id": item.get("interaction_id"),
         "interaction_revision": item.get("interaction_revision"),
         "user_text": item.get("user_text"),
-        "worklog_text": item.get("worklog_text"),
         "assistant_final_text": item.get("assistant_final_text"),
         "questions": item.get("questions") or [],
         "answers": item.get("answers") or {},
     }
+    # worklog_text is deliberately NOT in the dedup payload: it is supplementary
+    # render data (the intermediate steps), and the adapter can attach it to an
+    # ALREADY-DELIVERED turn (a completed turn re-parsed with the worklog). Hashing
+    # it would flip same_delivered_content and re-deliver the turn — which, for a
+    # turn whose live anchor has moved on, posts a DUPLICATE message. So the worklog
+    # only ever rides along on a delivery triggered by real content (user_text /
+    # assistant_final_text); it never independently triggers one.
+    #
+    # worklog_label is excluded for the SAME reason, and one worse: it embeds a
+    # wall-clock elapsed time ("Worklog (1h 11m)") via worklog_label_for_turn, so
+    # hashing it makes the render hash tick every minute. A long-idle pane whose
+    # turn still carries a worklog would then re-render-deliver (edit) every cycle
+    # forever — a live re-delivery loop. The label is pure render data; keep it out.
     if include_render_version:
         payload["render_version"] = RICH_RENDER_VERSION
-        payload["worklog_label"] = item.get("worklog_label")
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -5471,6 +5893,11 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_send_error",
         "last_clean_attempt_hash",
         "last_clean_attempt_at",
+        "unfolded_turns",
+        "last_plan_doc_turn_id",
+        "pending_plan_doc",
+        "last_speech_reply_turn_id",
+        "pending_speech_reply",
         "last_turn_id",
         "last_turn_available",
         "last_turn_reason",
@@ -5721,6 +6148,9 @@ def reconcile_topic_grouping(state: dict[str, Any]) -> bool:
 
 
 def choice_needs_detail(option: dict[str, str]) -> bool:
+    if _boolish(option.get("direct")):
+        return False  # /skills options always run directly, even if the command name (label) or its
+        #               index would otherwise trip the decision-prompt detail heuristics below.
     if _boolish(option.get("needs_detail")):
         return True
     label = str(option.get("label") or "").lower()
@@ -5776,6 +6206,18 @@ def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[
         rows.append([{"text": button_text[:64], "callback_data": safe_callback_data(action, prompt_id, callback_id)}])
     if not has_custom_button:
         rows.append([{"text": "Tell me differently", "callback_data": safe_callback_data("d", prompt_id, "custom")}])
+    return {"inline_keyboard": rows}
+
+
+def skills_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[str, Any]:
+    """Inline keyboard for the /skills picker (issue #27). Every option is a direct ("c") run — never
+    the force-reply detail path choices_reply_markup infers from label keywords — and there is no
+    "Tell me differently" custom row. The button text is the command/skill label as-is."""
+    rows: list[list[dict[str, str]]] = []
+    for idx, opt in enumerate(options[:12], start=1):
+        callback_id = str(opt.get("callback_id") or opt.get("number") or f"s{idx}")
+        label = re.sub(r"\s+", " ", str(opt.get("label") or "")).strip() or f"s{idx}"
+        rows.append([{"text": label[:64], "callback_data": safe_callback_data("c", prompt_id, callback_id)}])
     return {"inline_keyboard": rows}
 
 
@@ -5922,6 +6364,10 @@ def record_delivered_feed_item(
     item_semantic_hash: str | None = None,
     fallback_message_id: str | int | None = None,
 ) -> None:
+    # Capture the prior delivered turn BEFORE the last_clean_* overwrites below, so the
+    # unfolded-turns buffer can seed from it on the first post-deploy delivery.
+    prior_clean_item = entry.get("last_clean_item")
+    prior_clean_mid = str(entry.get("last_clean_message_id") or "")
     if pending_active_prompt:
         bind_active_prompt_message(
             entry,
@@ -5953,6 +6399,20 @@ def record_delivered_feed_item(
     if item.get("turn_id"):
         entry["last_turn_id"] = str(item.get("turn_id") or "")
     entry.pop("last_clean_send_error", None)
+    # Record this turn for the self-healing fold sweep. Seed from the prior turn first (only
+    # when the buffer is empty — the transition right after deploy) so the existing previous
+    # turn still folds; then append the turn we just delivered (stays open as the latest).
+    if str(item.get("kind") or "").lower() == "turn":
+        new_mid = str(result.get("message_id") or fallback_message_id or "")
+        if (
+            not entry.get("unfolded_turns")
+            and isinstance(prior_clean_item, dict)
+            and str(prior_clean_item.get("kind") or "").lower() == "turn"
+            and prior_clean_mid
+            and prior_clean_mid != new_mid
+        ):
+            append_unfolded_turn(entry, prior_clean_mid, prior_clean_item)
+        append_unfolded_turn(entry, new_mid, item)
 
 
 def active_prompt_message_rejection(prompt: dict[str, Any], callback_message_id: str) -> str:
@@ -6356,6 +6816,12 @@ def pinned_status_enabled() -> bool:
     return os.getenv("HERDR_TELEGRAM_TOPICS_PINNED_STATUS", "0").strip() == "1"
 
 
+def working_badge_enabled() -> bool:
+    # Read at runtime, not as a module constant: the Herdr plugin runs `herdres event` and
+    # load_dotenv() executes inside the handler (the import-time flag gotcha).
+    return os.getenv("HERDR_TELEGRAM_TOPICS_WORKING_BADGE", "1").strip() != "0"
+
+
 def pinned_status_dot(pane: dict[str, Any]) -> str:
     # Derive PURELY from the canonical classifier so the dot, the topic icon, and the
     # sort all agree. status_icon_key already maps an idle pane pursuing a goal to
@@ -6385,6 +6851,47 @@ def pinned_status_pane_label(state: dict[str, Any], pane: dict[str, Any]) -> str
     return sanitize_text(label or "pane", 80)
 
 
+def pretty_model_label(raw: str) -> str:
+    """A compact, human label for a raw model id, e.g. ``claude-opus-4-8`` -> ``Claude
+    Opus 4.8``, ``gpt-5.5`` -> ``GPT-5.5``, ``gpt-5-codex`` -> ``GPT-5 Codex``. Unknown
+    ids are tidied but otherwise preserved. Returns "" for empty input."""
+    clean = re.sub(r"\[[^\]]*\]", "", str(raw or "")).strip()  # drop context-window tags like [1m]
+    if not clean:
+        return ""
+    low = clean.lower()
+    m = re.match(r"^claude-(opus|sonnet|haiku|fable)-(\d+)(?:[-.](\d+))?", low)
+    if m:
+        ver = m.group(2) + ("." + m.group(3) if m.group(3) else "")
+        return f"Claude {m.group(1).capitalize()} {ver}"
+    m = re.match(r"^gpt-([\d.]+o?)(?:-(codex|mini|turbo|pro|nano))?", low)  # 5.5, 5-codex, 4o, 4o-mini
+    if m:
+        suffix = (" " + m.group(2).capitalize()) if m.group(2) else ""
+        return f"GPT-{m.group(1)}{suffix}"
+    m = re.match(r"^(glm|kimi|gemini|deepseek|grok|qwen)[-.]?(.*)$", low)
+    if m:
+        fam = {"glm": "GLM", "kimi": "Kimi", "gemini": "Gemini", "deepseek": "DeepSeek",
+               "grok": "Grok", "qwen": "Qwen"}[m.group(1)]
+        rest = " ".join(p.capitalize() if p.isalpha() else p for p in re.split(r"[-_]+", m.group(2)) if p)
+        return f"{fam} {rest}".strip()
+    return clean.replace("_", " ").strip()
+
+
+def pinned_model_suffix(state: dict[str, Any], pane: dict[str, Any], label: str) -> str:
+    """`" · <pretty model>"` for the pin, from the model cached on the pane state entry,
+    or "" when unknown (graceful degrade to the bare label). A leading family word already
+    present in `label` is dropped so "Claude" + "Claude Opus 4.8" reads "Claude · Opus 4.8"."""
+    entries = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    entry = entries.get(pane_key(pane)) if isinstance(entries, dict) else None
+    pretty = pretty_model_label(str(entry.get("model") or "")) if isinstance(entry, dict) else ""
+    if not pretty:
+        return ""
+    words = pretty.split()
+    first_label_word = label.strip().split()[0].lower() if label.strip() else ""
+    if words and first_label_word and words[0].lower() == first_label_word:
+        pretty = " ".join(words[1:]).strip() or pretty
+    return f" · {pretty}"
+
+
 def render_pinned_status(
     state: dict[str, Any],
     panes: list[dict[str, Any]],
@@ -6407,7 +6914,8 @@ def render_pinned_status(
         if not pinned_status_pane_open(pane):
             continue
         label = label_fn(pane)
-        rows.append((status_severity(status_icon_key(pane)), label, f"{label} {pinned_status_dot(pane)}"))
+        display = f"{label}{pinned_model_suffix(state, pane, label)}"
+        rows.append((status_severity(status_icon_key(pane)), label, f"{display} {pinned_status_dot(pane)}"))
     if not rows:
         return "No active panes."
     rows.sort(key=lambda r: (-r[0], r[1]))
@@ -7367,7 +7875,9 @@ def telegram_api_multipart(
 ) -> dict[str, Any]:
     if dry_run_enabled():
         payload = dict(fields)
-        payload["files"] = {key: str(path) for key, path in files.items()}
+        payload["files"] = {
+            key: str(spec[0] if isinstance(spec, tuple) else spec) for key, spec in files.items()
+        }
         return dry_run_result(method, payload)
     api_token = token or telegram_token()
     boundary = "------------------------" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
@@ -7381,7 +7891,13 @@ def telegram_api_multipart(
                 b"\r\n",
             ]
         )
-    for key, path in files.items():
+    for key, spec in files.items():
+        # spec is a Path (defaults to image/jpeg for the profile-photo caller) or a
+        # (path, mime) tuple so callers like sendDocument can set text/markdown.
+        if isinstance(spec, tuple):
+            path, mime = spec[0], (spec[1] or "application/octet-stream")
+        else:
+            path, mime = spec, "image/jpeg"
         file_path = Path(path)
         chunks.extend(
             [
@@ -7389,7 +7905,7 @@ def telegram_api_multipart(
                 (
                     f'Content-Disposition: form-data; name="{key}"; '
                     f'filename="{file_path.name}"\r\n'
-                    "Content-Type: image/jpeg\r\n\r\n"
+                    f"Content-Type: {mime}\r\n\r\n"
                 ).encode("utf-8"),
                 file_path.read_bytes(),
                 b"\r\n",
@@ -7428,6 +7944,344 @@ def telegram_message_id(response: dict[str, Any]) -> str | None:
     if isinstance(result, dict) and result.get("message_id") is not None:
         return str(result.get("message_id"))
     return None
+
+
+def send_voice(
+    chat_id: str,
+    file_path: Path | str,
+    *,
+    telegram: dict[str, Any] | None = None,
+    thread_id: str | int | None = None,
+    reply_to_message_id: str | int | None = None,
+    notify: bool = False,
+    api_token: str | None = None,
+    duration: int = 0,
+) -> dict[str, Any]:
+    """Send an OGG/Opus voice message to a topic via the Bot API sendVoice (multipart). Mirrors
+    send_document; used by the spoken-reply path (issue #4 v2)."""
+    fields = _message_common_payload(chat_id, thread_id=thread_id, notify=notify, reply_markup=None)
+    fields.update(_reply_parameters_payload(reply_to_message_id))
+    fields["voice"] = "attach://file"
+    if duration:
+        fields["duration"] = str(int(duration))
+    return telegram_api_multipart(
+        "sendVoice", fields, {"file": (Path(file_path), "audio/ogg")}, token=api_token
+    )
+
+
+def send_document(
+    chat_id: str,
+    file_path: Path | str,
+    *,
+    caption_text: str = "",
+    telegram: dict[str, Any] | None = None,
+    thread_id: str | int | None = None,
+    reply_to_message_id: str | int | None = None,
+    notify: bool = False,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Upload a file to a Telegram topic via the standard sendDocument Bot API method
+    (multipart, hits api.telegram.org directly — not the custom rich-message bridge)."""
+    fields = _message_common_payload(chat_id, thread_id=thread_id, notify=notify, reply_markup=None)
+    fields.update(_reply_parameters_payload(reply_to_message_id))
+    fields["document"] = "attach://file"
+    caption = sanitize_text(str(caption_text or ""), 1024).strip()
+    if caption:
+        fields["caption"] = caption  # plain text (no parse_mode) — the summary lives in the turn message
+    return telegram_api_multipart(
+        "sendDocument", fields, {"file": (Path(file_path), "text/markdown")}, token=api_token
+    )
+
+
+def outbound_doc_dir() -> Path:
+    base = state_path().parent / "outbound"
+    if base.is_symlink():
+        raise BridgeError("outbound directory path is unsafe (symlink)")
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.chmod(0o700)
+    except OSError:
+        pass
+    return base
+
+
+def write_outbound_plan_doc(turn_id: str, text: str) -> Path:
+    root = outbound_doc_dir()
+    nonce = os.urandom(4).hex()
+    name = f"plan-{safe_file_component(str(turn_id), 'turn')[:24]}-{nonce}.md"
+    path = root / name
+    # Redact secrets like every other outbound text path (the item text is already sanitized
+    # upstream, but do it here too so the guarantee holds for any caller).
+    path.write_text(sanitize_text(str(text or ""), PLAN_DOC_MAX_CHARS), encoding="utf-8")
+    prune_attachment_dir(root, keep=20)  # bound the outbound dir like attachments
+    return path
+
+
+def _plan_doc_caption(plan_text: str) -> str:
+    for line in str(plan_text or "").splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if stripped:
+            return ("📎 " + stripped)[:200]
+    return "📎 Full plan"
+
+
+def deliver_plan_document(
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    plan_text: str,
+    reply_to_message_id: str | int | None,
+) -> bool:
+    """Stage the full plan markdown as a .md file and QUEUE it (issue #26). The send is driven
+    by flush_pending_plan_doc (called once per sync, and explicitly by /report), so each sync
+    spends at most one attempt and a transient failure self-heals. Sent at most once per
+    turn_id. Returns True if state changed."""
+    clean_turn = str(turn_id or "")
+    if not str(plan_text or "").strip() or not clean_turn:
+        return False
+    if str(entry.get("last_plan_doc_turn_id") or "") == clean_turn:
+        return False  # already delivered for this turn
+    existing = entry.get("pending_plan_doc")
+    if isinstance(existing, dict) and str(existing.get("turn_id") or "") == clean_turn:
+        return False  # already queued for this turn (don't rewrite / orphan the staged file)
+    try:
+        path = write_outbound_plan_doc(clean_turn, plan_text)
+    except Exception:
+        return False
+    if isinstance(existing, dict) and str(existing.get("path") or ""):
+        _unlink_quietly(Path(str(existing.get("path"))))  # drop a stale queue for a different turn
+    entry["pending_plan_doc"] = {
+        "turn_id": clean_turn,
+        "path": str(path),
+        "reply_to": str(reply_to_message_id or ""),
+        "caption": _plan_doc_caption(plan_text),
+    }
+    return True
+
+
+def flush_pending_plan_doc(
+    state: dict[str, Any], entry: dict[str, Any], telegram: dict[str, Any], chat_id: str, *, api_token: str | None = None
+) -> bool:
+    """Send a queued plan document (set by deliver_plan_document). Runs every sync so a
+    missed/failed send self-heals. Drops the queue entry on success, on a vanished file, or
+    after PLAN_DOC_ATTEMPT_CAP failures; on a rate-limit it leaves the queue for the next sync
+    without spending an attempt. Returns True if state changed."""
+    pending = entry.get("pending_plan_doc")
+    if not isinstance(pending, dict):
+        return False
+    turn_id = str(pending.get("turn_id") or "")
+    path = Path(str(pending.get("path") or ""))
+    if not turn_id or not str(pending.get("path") or "") or not path.exists():
+        entry.pop("pending_plan_doc", None)
+        return True
+    try:
+        result = send_document(
+            chat_id,
+            path,
+            caption_text=str(pending.get("caption") or ""),
+            telegram=telegram,
+            thread_id=str(entry.get("topic_id") or ""),
+            reply_to_message_id=str(pending.get("reply_to") or "") or None,
+            notify=False,
+            api_token=api_token,
+        )
+    except RateLimited:
+        return False  # respect the backoff; retry next sync without burning an attempt
+    except Exception:
+        result = {"ok": False}
+    if result.get("ok"):
+        entry["last_plan_doc_turn_id"] = turn_id
+        doc_message_id = telegram_message_id(result)
+        if doc_message_id:
+            # The doc is a real new message below the summary — advance the pane/topic
+            # high-water marks (PR #35) so a later in-place edit isn't left buried above it.
+            record_pane_message_route(
+                state, str(entry.get("space_key") or ""), str(entry.get("pane_key") or ""), doc_message_id
+            )
+        _unlink_quietly(path)
+        entry.pop("pending_plan_doc", None)
+        return True
+    attempts = int(pending.get("attempts") or 0) + 1
+    if attempts >= PLAN_DOC_ATTEMPT_CAP:
+        _unlink_quietly(path)
+        entry.pop("pending_plan_doc", None)
+        return True
+    pending["attempts"] = attempts
+    return True
+
+
+SPEECH_REPLY_ATTEMPT_CAP = 3
+
+
+def _prune_speech_dir(base: Path, *, keep: int = 64, part_stale_seconds: int = 600) -> None:
+    """Bound the SHARED outbound-speech dir: keep the newest `keep` finished .ogg files and sweep
+    only STALE .part files (older than part_stale_seconds). Unlike prune_attachment_dir we must NOT
+    delete fresh .part files — the sidecar synthesizes other panes' replies into <dest>.part
+    concurrently, and deleting an in-flight one would corrupt/lose that synthesis."""
+    try:
+        entries = [p for p in base.iterdir() if p.is_file() and not p.is_symlink()]
+    except OSError:
+        return
+    now = time.time()
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for part in (p for p in entries if p.name.endswith(".part")):
+        if now - _mtime(part) > part_stale_seconds:  # only orphans from a crashed synth
+            _unlink_quietly(part)
+    finals = [p for p in entries if p.name.endswith(".ogg")]
+    for stale in sorted(finals, key=_mtime, reverse=True)[keep:]:
+        _unlink_quietly(stale)
+
+
+def outbound_speech_dir(*, prune: bool = False) -> Path:
+    base = state_path().parent / "outbound-speech"
+    if base.is_symlink():
+        raise BridgeError("outbound speech directory path is unsafe (symlink)")
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.chmod(0o700)
+    except OSError:
+        pass
+    if prune:
+        _prune_speech_dir(base)
+    return base
+
+
+def _speech_flush_wait_seconds() -> float:
+    # Default 0: do NOT block the sync lock waiting for the async synth — defer to the next sync.
+    # An operator can set a small value to trade a brief lock-hold for same-sync voice delivery.
+    try:
+        return max(0.0, float(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_FLUSH_WAIT", "0") or "0"))
+    except ValueError:
+        return 0.0
+
+
+def enqueue_speech_reply(turn_id: str, text: str) -> Path | None:
+    """Ask the warm sidecar to synthesize a trimmed, speakable version of the reply to an OGG file
+    and return that (future) path — synthesis happens ASYNCHRONOUSLY in the sidecar, OFF the sync
+    lock, so this call is just a fast enqueue. Returns None when speech is off / no sidecar / nothing
+    to say (the spoken reply is simply skipped; the delivered text turn is untouched). Issue #4 v2."""
+    if herdres_speech is None:
+        return None
+    try:
+        spoken = herdres_speech.trim_for_speech(str(text or ""))
+    except Exception:
+        spoken = ""
+    if not spoken:
+        return None
+    try:
+        base = outbound_speech_dir(prune=True)  # bound the dir; the sidecar writes the file itself
+        # Stable, turn-keyed name (no random suffix): a re-enqueue for the same turn reuses the same
+        # path so the sidecar's in-flight/exists dedup is meaningful and idempotent. The sha suffix
+        # keeps distinct turn_ids from colliding after safe_file_component's lossy sanitization.
+        tag = hashlib.sha1(str(turn_id).encode("utf-8")).hexdigest()[:8]
+        dest = base / f"reply-{safe_file_component(str(turn_id), 'turn')[:32]}-{tag}.ogg"
+        ok = bool(herdres_speech.speech_request("tts", {"text": spoken, "dest": str(dest)}).get("ok"))
+    except Exception:
+        return None
+    return dest if ok else None
+
+
+def queue_speech_reply(entry: dict[str, Any], *, turn_id: str, item: dict[str, Any],
+                       reply_to_message_id: str | int | None) -> bool:
+    """Enqueue a spoken version of the agent's final reply (issue #4 v2). At most once per turn_id;
+    the sidecar synthesizes async and flush_pending_speech_reply sends the finished OGG. The enqueue
+    is a fast socket call — NO synthesis runs here under the sync lock. Returns True if state changed."""
+    clean_turn = str(turn_id or "")
+    text = str(item.get("assistant_final_text") or "").strip()
+    if not clean_turn or not text:
+        return False
+    if str(entry.get("last_speech_reply_turn_id") or "") == clean_turn:
+        return False  # already spoken (or given up) for this turn
+    existing = entry.get("pending_speech_reply")
+    if isinstance(existing, dict) and str(existing.get("turn_id") or "") == clean_turn:
+        return False  # already queued for this turn
+    dest = enqueue_speech_reply(clean_turn, text)
+    if dest is None:
+        return False  # speech off / no sidecar — skip the spoken reply (text turn already delivered)
+    if isinstance(existing, dict) and str(existing.get("path") or ""):
+        _unlink_quietly(Path(str(existing.get("path"))))  # drop a stale queue for a different turn
+    entry["pending_speech_reply"] = {
+        "turn_id": clean_turn,
+        "path": str(dest),
+        "reply_to": str(reply_to_message_id or ""),
+        "ticks": 0,
+    }
+    return True
+
+
+def _abandon_speech_reply(entry: dict[str, Any], turn_id: str, path: Path) -> None:
+    # Give up on this turn's spoken reply: clean the (possibly partial) file AND mark the turn done so
+    # a later render change doesn't re-synthesize it (the text turn already went out).
+    _unlink_quietly(path)
+    _unlink_quietly(Path(str(path) + ".part"))
+    entry["last_speech_reply_turn_id"] = turn_id
+    entry.pop("pending_speech_reply", None)
+
+
+def flush_pending_speech_reply(
+    state: dict[str, Any], entry: dict[str, Any], telegram: dict[str, Any], chat_id: str, *, api_token: str | None = None
+) -> bool:
+    """Send a queued spoken reply once the sidecar has produced its OGG. Runs every sync so it
+    self-heals: if the async file isn't ready yet it defers to the next sync (no lock-held wait by
+    default; HERDR_TELEGRAM_TOPICS_SPEECH_FLUSH_WAIT can add a small same-sync poll), giving up after
+    the attempt cap. Drops on success / cap; leaves on rate-limit. Returns True if state changed."""
+    pending = entry.get("pending_speech_reply")
+    if not isinstance(pending, dict):
+        return False
+    turn_id = str(pending.get("turn_id") or "")
+    raw_path = str(pending.get("path") or "")
+    if not turn_id or not raw_path:
+        entry.pop("pending_speech_reply", None)
+        return True
+    path = Path(raw_path)
+    if not path.exists():
+        # The sidecar is still synthesizing — wait a short, bounded time (so a warm synth lands now),
+        # then defer to the next sync. This bounded poll is the only lock-held time; no synthesis runs
+        # under the lock.
+        deadline = time.monotonic() + _speech_flush_wait_seconds()
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.2)
+    if not path.exists():
+        ticks = int(pending.get("ticks") or 0) + 1
+        if ticks >= SPEECH_REPLY_ATTEMPT_CAP:
+            _abandon_speech_reply(entry, turn_id, path)  # synth never landed — give up
+        else:
+            pending["ticks"] = ticks
+        return True
+    try:
+        result = send_voice(
+            chat_id, path, telegram=telegram, thread_id=str(entry.get("topic_id") or ""),
+            reply_to_message_id=str(pending.get("reply_to") or "") or None, notify=False, api_token=api_token,
+        )
+    except RateLimited:
+        return False  # respect the backoff; retry next sync without burning an attempt
+    except Exception:
+        result = {"ok": False}
+    if result.get("ok"):
+        # The voice note is a real new message below the turn — record it as the pane/topic high-water
+        # mark (like the plan-doc path, PR #35) so a later in-place turn edit re-anchors fresh instead
+        # of being left buried above it.
+        voice_message_id = telegram_message_id(result)
+        if voice_message_id:
+            record_pane_message_route(
+                state, str(entry.get("space_key") or ""), str(entry.get("pane_key") or ""), voice_message_id
+            )
+        _unlink_quietly(path)
+        entry["last_speech_reply_turn_id"] = turn_id
+        entry.pop("pending_speech_reply", None)
+        return True
+    ticks = int(pending.get("ticks") or 0) + 1
+    if ticks >= SPEECH_REPLY_ATTEMPT_CAP:
+        _abandon_speech_reply(entry, turn_id, path)
+        return True
+    pending["ticks"] = ticks
+    return True
 
 
 def _telegram_error_is_bot_access(exc: Exception) -> bool:
@@ -7525,7 +8379,7 @@ def clear_pane_root_message(state: dict[str, Any], entry: dict[str, Any], reason
 
 
 def pane_root_reply_target(entry: dict[str, Any]) -> str | int | None:
-    if not PANE_ROOT_MESSAGES_ENABLED:
+    if not pane_root_messages_enabled():
         return None
     target = entry.get("pane_root_message_id")
     if isinstance(target, (str, int)):
@@ -7934,7 +8788,7 @@ def send_stream_draft(
         str(entry.get("pane_key") or ""),
         str(turn_id),
     )
-    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
+    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id), working=True), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
     result = send_rich_message_draft(
         chat_id,
         html_text,
@@ -7984,7 +8838,7 @@ def send_stream_message(
     if throttle_reason:
         return {"ok": True, "skipped": True, "reason": throttle_reason, "hash": text_hash, "format": "message"}
 
-    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id)), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
+    html_text = render_stream_turn_html(user_text, clean_text, worklog_label=worklog_label_for_turn(entry, str(turn_id), working=True), collapse_chars=int(entry.get("prompt_collapse_chars") or 0))
     fallback_text = html_to_plain(html_text)
     message_id = ""
     stream_message_id = str(entry.get("last_stream_message_id") or "")
@@ -9744,7 +10598,7 @@ def ensure_pane_root_message(
     desired_bot_kind = desired_message_bot_kind(telegram, entry, pane)
     if not topic_id:
         return False, {"ok": True, "skipped": True}
-    if not PANE_ROOT_MESSAGES_ENABLED:
+    if not pane_root_messages_enabled():
         return False, {"ok": True, "skipped": True, "reason": "pane_root_messages_disabled"}
     if managed_bot_access_retry_waiting(entry, "pane_root_bot_kind", desired_bot_kind):
         return False, {"ok": True, "skipped": True, "reason": "managed_bot_access_pending"}
@@ -9880,7 +10734,59 @@ def turn_visible_anchor_message_id(entry: dict[str, Any], turn_id: str) -> str:
     prompt_turn_id = str(entry.get("last_prompt_turn_id") or "")
     if prompt_message_id and prompt_turn_id == clean_turn_id and pane_message_is_latest(entry, prompt_message_id):
         return prompt_message_id
+    # Same-pane prompt fallback. An auto-continued turn finalizes under a turn_id that
+    # differs from the open-prompt turn_id (select_turn_feed_item's catch-up case: a human
+    # prompt immediately followed by an auto-pursued turn), so the strict match above misses
+    # and the turn would post a DUPLICATE message instead of editing the prompt. When the
+    # prompt message is still the pane's latest (no stream anchor, nothing posted after it),
+    # reuse it so the completed turn edits the prompt in place — one message per input. The
+    # pane_message_is_latest gate makes this fire only in the normal prompt->response
+    # sequence and skips it once a stream anchor or any later message exists.
+    if prompt_message_id and not stream_message_id and pane_message_is_latest(entry, prompt_message_id):
+        return prompt_message_id
     return ""
+
+
+def turn_stream_anchor_fallback(
+    entry: dict[str, Any], item: dict[str, Any], turn: dict[str, Any] | None
+) -> str:
+    """Reuse the live stream message at finalize when the strict anchor missed.
+
+    A turn streams its worklog into a real message keyed by the adapter's open_turn_id,
+    but the completed turn can finalize under a DIFFERENT turn_id — adapter id
+    reassignment (the open turn's id != the completed turn's id) or select_turn_feed_item's
+    catch-up picking recent[idx+1]. turn_visible_anchor_message_id then strict-misses, and
+    because a stream message exists the #33 prompt fallback is gated off, so the completion
+    posts a fresh message and ORPHANS the live stream message — the user sees one
+    "User + Worklog" message followed by a separate "User + Worklog + Response" message
+    (the duplicate). Editing the stream message in place instead yields one message that
+    grows User -> Worklog -> Response with the streamed worklog preserved.
+
+    Guards (all required):
+      - a stream message exists and has not already been finalized as the clean message;
+      - it is still the pane's latest (nothing posted after it, so editing neither buries
+        the completion nor races a sibling pane's message);
+      - the item is the pane's CURRENT turn (its completed or open id) — never an older
+        catch-up turn, which streamed nothing and must stay its own message; reusing the
+        (newer) stream message for an older turn would overwrite the wrong turn.
+    """
+    stream_message_id = str(entry.get("last_stream_message_id") or "")
+    if not stream_message_id:
+        return ""
+    if str(entry.get("last_clean_message_id") or "") == stream_message_id:
+        return ""
+    if not pane_message_is_latest(entry, stream_message_id):
+        return ""
+    item_turn_id = str(item.get("turn_id") or "")
+    if not item_turn_id:
+        return ""
+    current_turn_ids = set()
+    if isinstance(turn, dict):
+        current_turn_ids = {str(turn.get("turn_id") or ""), str(turn.get("open_turn_id") or "")}
+    current_turn_ids.discard("")
+    if item_turn_id not in current_turn_ids:
+        return ""
+    return stream_message_id
 
 
 def route_message_to_pane(
@@ -9965,6 +10871,8 @@ def send_pending_prompt_message(
         }
 
     item = make_prompt_feed_item(turn_id, prompt_text)
+    if entry.get("prompt_working"):
+        item["working_label"] = WORKING_LABEL  # issue #3: "Working…" while the open turn reasons with no output yet
     result = send_feed_item(
         chat_id,
         item,
@@ -10214,6 +11122,9 @@ def _sync_pane_clean_feed(
         item = None
         changed = True
     if item:
+        # Issue #26: a plan/oversized turn renders badly inline. Deliver a short summary as the
+        # turn message and ship the FULL markdown as a .md attachment (below, after the send).
+        item, plan_doc_text = plan_attachment_swap(item)
         item_render_hash = clean_feed_hash(item)
         item_semantic_hash = clean_feed_hash(item, include_render_version=False)
         previous_render_hash = str(entry.get("last_clean_render_hash") or entry.get("last_clean_hash") or "")
@@ -10247,6 +11158,10 @@ def _sync_pane_clean_feed(
             lifecycle_message_id = ""
             if str(item.get("kind") or "").lower() == "turn":
                 lifecycle_message_id = turn_visible_anchor_message_id(entry, str(item.get("turn_id") or ""))
+                if not lifecycle_message_id and entry.get("last_stream_message_id"):
+                    lifecycle_message_id = turn_stream_anchor_fallback(
+                        entry, item, cached_pane_turn(str(pane.get("pane_id") or ""))
+                    )
                 if lifecycle_message_id:
                     space_entry = (state.get("spaces") or {}).get(str(entry.get("space_key") or ""))
                     if not topic_message_is_latest(space_entry, lifecycle_message_id):
@@ -10366,6 +11281,30 @@ def _sync_pane_clean_feed(
                     )
                 if str(item.get("kind") or "").lower() == "turn":
                     clear_stream_state(entry)
+                    if plan_doc_text:
+                        deliver_plan_document(
+                            entry,
+                            turn_id=str(item.get("turn_id") or ""),
+                            plan_text=plan_doc_text,
+                            reply_to_message_id=str(result.get("message_id") or (message_id if did_edit else "")),
+                        )
+                    # Issue #4 v2: queue a spoken version of the reply (flushed below, like plan_doc).
+                    # Speak this turn when the owner's prompt contained the trigger phrase ("reply by
+                    # voice"), or when SPEECH_REPLIES force-speaks every reply. Keyword path needs no
+                    # global flag — per-message opt-in, default text.
+                    try:
+                        if herdres_speech is not None and (
+                            herdres_speech.speech_reply_triggered(item.get("user_text"))
+                            or herdres_speech.speech_replies_enabled()
+                        ):
+                            queue_speech_reply(
+                                entry,
+                                turn_id=str(item.get("turn_id") or ""),
+                                item=item,
+                                reply_to_message_id=str(result.get("message_id") or (message_id if did_edit else "")),
+                            )
+                    except Exception:  # speech is strictly additive — never break turn delivery
+                        pass
                 changed = True
             elif result_topic_missing(result):
                 clear_entry_topic_mapping(state, entry, str(result.get("error") or result))
@@ -10391,6 +11330,21 @@ def _sync_pane_clean_feed(
     elif old_clean_has_noise:
         clear_clean_feed_state(entry)
         changed = True
+    # Self-healing fold: collapse every previously-delivered turn except the current latest.
+    # Runs every sync (timer + plugin paths), so a fold missed on delivery heals on the next
+    # tick without needing a new turn.
+    if fold_superseded_turns(state, entry, telegram, chat_id, api_token=pane_api_token):
+        changed = True
+    # Send/retry a queued plan-document (issue #26); runs every sync so it self-heals.
+    if flush_pending_plan_doc(state, entry, telegram, chat_id, api_token=pane_api_token):
+        changed = True
+    # Send/retry a queued spoken reply (issue #4 v2); runs every sync so it self-heals. Guarded so a
+    # speech failure can never break the sync loop (speech is strictly additive).
+    try:
+        if flush_pending_speech_reply(state, entry, telegram, chat_id, api_token=pane_api_token):
+            changed = True
+    except Exception:
+        entry.pop("pending_speech_reply", None)
     entry["last_status_hash"] = stable_obj_hash
     return {"early_return": None, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
 
@@ -11799,6 +12753,153 @@ def voice_mode_response(state: dict[str, Any], space: dict[str, Any], live: list
     return {"handled": True, "reply": f"Voice mode for this space is now {label}."}
 
 
+# --- Issue #27: enumerate a pane agent's skills/slash-commands for the /skills picker ----------
+# Panes run on the same host as herdres, so this reads the local filesystem for the pane's agent
+# kind + working dir. Claude commands/skills (user, project <cwd>/.claude, enabled plugins) invoke
+# as "/<name>". Codex prompts invoke as "/<name>"; Codex skills are model-invoked, surfaced
+# best-effort with a natural-language send_text. stdlib-only and defensive (never raises — it feeds
+# an interactive command). Returns normalized option dicts; the /skills branch maps them to buttons.
+_SKILL_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.S)
+_SKILL_NAME_RE = re.compile(r"^name\s*:\s*(.+?)\s*$", re.M)
+_SKILL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
+def _skill_slug_ok(name: str) -> bool:
+    return bool(name) and _SKILL_SLUG_RE.fullmatch(name) is not None
+
+
+def _skill_frontmatter_name(skill_md: Path) -> str:
+    """The raw `name:` from a SKILL.md frontmatter, or "" if absent/unreadable. The caller decides
+    whether it's a usable slug and falls back to the directory name otherwise. Only the file HEAD is
+    read (frontmatter is at the very top) so a huge SKILL.md can't drive the lazy frontmatter regex
+    into quadratic backtracking inside the interactive command handler."""
+    try:
+        with skill_md.open(encoding="utf-8") as fh:
+            text = fh.read(8192)
+    except (OSError, ValueError):
+        return ""
+    m = _SKILL_FRONTMATTER_RE.match(text)
+    if m:
+        nm = _SKILL_NAME_RE.search(m.group(1))
+        if nm:
+            return nm.group(1).strip().strip('"').strip("'").strip()
+    return ""
+
+
+def _skill_option(name: str, *, scope: str, kind: str, send_text: str | None = None,
+                  best_effort: bool = False) -> dict[str, Any]:
+    name = name.strip()
+    return {
+        "id": name,
+        "label": (f"{name} (skill)" if best_effort else f"/{name}"),
+        "send_text": (send_text if send_text is not None else f"/{name}"),
+        "scope": scope,        # user | project | plugin:<name>
+        "kind": kind,          # command | skill
+        "best_effort": best_effort,
+    }
+
+
+def _skill_commands_in(dir_path: Path, scope: str) -> list[dict[str, Any]]:
+    # Top-level *.md only. Namespaced subdirectory commands (commands/<ns>/<cmd>.md -> /<ns>:<cmd>)
+    # are deferred (issue #27) — the invocation syntax for nested *user* commands is version-specific
+    # and forwarding a wrong "/ns:cmd" would be worse than omitting it.
+    out: list[dict[str, Any]] = []
+    try:
+        files = sorted(dir_path.glob("*.md"))
+    except OSError:
+        return out
+    for f in files:
+        if _skill_slug_ok(f.stem):
+            out.append(_skill_option(f.stem, scope=scope, kind="command"))
+    return out
+
+
+def _skill_dirs_in(dir_path: Path, scope: str, *, codex: bool = False) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    try:
+        subs = sorted(p for p in dir_path.iterdir() if p.is_dir())
+    except OSError:
+        return out
+    for sub in subs:
+        md = sub / "SKILL.md"
+        if not md.is_file():
+            continue
+        # Prefer the frontmatter name, but fall back to the directory name when it is absent OR
+        # present-but-not-a-usable-slug (e.g. `name: has space`) rather than dropping the skill.
+        fm_name = _skill_frontmatter_name(md)
+        name = fm_name if _skill_slug_ok(fm_name) else sub.name
+        if not _skill_slug_ok(name):
+            continue
+        if codex:  # Codex skills are model-invoked (no slash parser) -> best-effort natural language
+            out.append(_skill_option(name, scope=scope, kind="skill",
+                                     send_text=f"Use the {name} skill.", best_effort=True))
+        else:      # Claude skills surface as /<name>
+            out.append(_skill_option(name, scope=scope, kind="skill"))
+    return out
+
+
+def _enabled_plugin_skills(home: Path) -> list[dict[str, Any]]:
+    """Commands + skills of every plugin enabled in ~/.claude/settings.json, resolved through
+    installed_plugins.json. A plugin we can't resolve is silently skipped."""
+    out: list[dict[str, Any]] = []
+    try:
+        settings = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    enabled = {k for k, v in (settings.get("enabledPlugins") or {}).items() if v}
+    if not enabled:
+        return out
+    try:
+        installed = json.loads(
+            (home / ".claude" / "plugins" / "installed_plugins.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    plugins = installed.get("plugins") if isinstance(installed.get("plugins"), dict) else {}
+    for key in sorted(enabled):
+        entries = plugins.get(key) or []
+        if not isinstance(entries, list) or not entries:
+            continue
+        install_path = Path(str((entries[-1] or {}).get("installPath") or ""))  # latest install
+        if not str(install_path).strip():
+            continue
+        scope = f"plugin:{key.split('@', 1)[0]}"
+        out.extend(_skill_commands_in(install_path / "commands", scope))
+        out.extend(_skill_dirs_in(install_path / "skills", scope))
+    return out
+
+
+def enumerate_pane_skills(agent_kind: str, cwd: str | None = None, *,
+                          home: Path | None = None) -> list[dict[str, Any]]:
+    """Slash-commands/skills available to a pane's agent, as option dicts
+    ``{id, label, send_text, scope, kind, best_effort}`` deduped by send_text (stable order:
+    user, then project, then plugins). Empty for an unknown/unsupported agent kind."""
+    home = Path(home) if home is not None else Path.home()
+    kind = (agent_kind or "").strip().lower()
+    out: list[dict[str, Any]] = []
+    if kind == "claude":
+        out += _skill_commands_in(home / ".claude" / "commands", "user")
+        out += _skill_dirs_in(home / ".claude" / "skills", "user")
+        if cwd and str(cwd).strip():
+            proj = Path(str(cwd))
+            out += _skill_commands_in(proj / ".claude" / "commands", "project")
+            out += _skill_dirs_in(proj / ".claude" / "skills", "project")
+        out += _enabled_plugin_skills(home)
+    elif kind == "codex":
+        out += _skill_commands_in(home / ".codex" / "prompts", "user")        # /<name>, reliable
+        out += _skill_dirs_in(home / ".codex" / "skills", "user", codex=True)  # best-effort
+        # Codex project-level + plugin enumeration is deferred (see issue #27).
+
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for opt in out:
+        st = opt["send_text"]
+        if st in seen:
+            continue
+        seen.add(st)
+        deduped.append(opt)
+    return deduped
+
+
 def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     load_dotenv()
     state = load_state()
@@ -11947,7 +13048,51 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
         return {"handled": True, "reply": "Sent attachment to this pane."}
 
+    # Issue #4: an owner's voice note → transcribe locally (parakeet) → deliver as the pane's input.
+    # Fail-open: if speech is unavailable/disabled we tell the owner; we never break the text path.
+    if isinstance(attachment, dict) and attachment.get("kind") == "voice" and attachment.get("file_id"):
+        caption = str(payload.get("caption") or "").strip()
+        try:
+            speech_on = herdres_speech is not None and herdres_speech.speech_input_enabled()
+        except Exception:  # a flag read must never abort the turn (fail-open)
+            speech_on = False
+        if not speech_on:
+            # Speech off/unavailable: still deliver a caption if the owner attached one, rather than
+            # silently dropping it (parity with the document/photo arm); otherwise explain how to enable.
+            if caption:
+                sent_ok, sent_detail = send_to_pane(pane_id, caption)
+                if not sent_ok:
+                    return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
+                return {"handled": True, "reply": "Voice transcription is off; sent your caption to this pane."}
+            return {"handled": True, "reply": (
+                "Voice transcription is off. Enable it with `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1` "
+                "and `herdres speech install`, or send text.")}
+        ok, detail, dest = deliver_attachment(pane_id, attachment)
+        if not ok or dest is None:
+            return {"handled": True, "reply": f"Could not fetch that voice note: {detail}"}
+        try:
+            transcript = str(herdres_speech.speech_request("stt", {"path": str(dest)}).get("text") or "").strip()
+        except Exception:
+            transcript = ""
+        if not transcript:
+            return {"handled": True, "reply": (
+                "Got your voice note, but speech-to-text is unavailable on this host. "
+                "Send text, or run `herdres speech install`.")}
+        # The echo is cosmetic — neither the flag read nor the send may abort delivery to the pane.
+        try:
+            if herdres_speech.speech_echo_transcript_enabled():
+                send_message(chat_id, f"🎙️ Heard: {sanitize_text(transcript, 1000)}",
+                             thread_id=topic_id, api_token=pane_api_token)
+        except Exception:
+            pass
+        outbound = f"{transcript}\n\n{caption}" if caption else transcript
+        sent_ok, sent_detail = send_to_pane(pane_id, outbound)
+        if not sent_ok:
+            return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
+        return {"handled": True, "reply": "Sent your voice message to this pane."}
+
     if command == "plain":
+        implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
         awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
         if awaiting and str(awaiting.get("user_id") or "") == user_id:
             awaiting_source = awaiting_detail_source(awaiting)
@@ -11969,8 +13114,31 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 return {"handled": True, "reply": "That detail request expired. Use /choices to resend the choices."}
             force_reply_message_id = str(awaiting.get("force_reply_message_id") or "")
             reply_to_message_id = str(payload.get("reply_to_message_id") or "")
-            if force_reply_message_id and reply_to_message_id != force_reply_message_id:
-                return {"handled": True, "reply": "Reply directly to the detail prompt, or tap the button again."}
+            # #37: drop the "use Telegram's Reply" requirement for a BARE typed answer (no reply_to)
+            # when the message unambiguously targets this one pane — the same conditions under which a
+            # bare non-prompt message is forwarded to the pane below (active pick / implicit send /
+            # @mention / single live pane). A message that explicitly REPLIES to a different message is
+            # left strict: the reply-to signals intent toward a specific (possibly superseded) prompt,
+            # and in a colliding/multi-pane topic that reply could otherwise answer the wrong prompt.
+            bare_unambiguous = (
+                not reply_to_message_id
+                and bool(str(topic_id).strip())
+                and (
+                    resolved_active_entry
+                    or implicit
+                    or bool(target_bot_kind)
+                    or is_single_live_space_pane(state, chat_id, topic_id)
+                )
+            )
+            if (
+                force_reply_message_id
+                and reply_to_message_id != force_reply_message_id
+                and not bare_unambiguous
+            ):
+                return {
+                    "handled": True,
+                    "reply": "Reply to the detail prompt above (use Telegram's Reply), or tap the option button again to re-open it.",
+                }
             choice = str(awaiting.get("choice") or "").strip()
             select_choice = str(awaiting.get("select_choice") or "").strip()
             visible_choice = str(awaiting.get("visible_choice") or "").strip()
@@ -11998,7 +13166,6 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             entry.pop("active_prompt", None)
             save_state(state)
             return {"handled": True, "reply": "Sent details."}
-        implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
         if str(payload.get("reply_to_message_id") or "").strip():
             disabled_awaiting = (
                 entry.get("last_disabled_awaiting_detail")
@@ -12020,7 +13187,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return forward_text_to_pane_response(pane_id, arg)
         if resolved_active_entry or implicit or target_bot_kind or is_single_live_space_pane(state, chat_id, topic_id):
             return forward_text_to_pane_response(pane_id, arg)
-        return {"handled": True, "reply": "This is a mapped Herdr pane topic. Use /send <text> to forward to this pane, or /help."}
+        return {
+            "handled": True,
+            "reply": (
+                "Not sure which agent this is for. Reply to a message in that agent's thread, "
+                "send /agents to pick one (replies then route there), or use /send <text>."
+            ),
+        }
 
     if command in {"help", "start"}:
         implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
@@ -12035,6 +13208,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 "Pane topic commands:\n"
                 "/report or /status - latest clean report/question\n"
                 "/choices - resend active choices or decision buttons\n"
+                "/skills - list this pane agent's skills/commands as tappable buttons\n"
                 "/raw [lines] - sanitized raw visible output\n"
                 "/debug - technical mapping details\n"
                 "/send <text> - send instruction to this pane\n"
@@ -12050,6 +13224,9 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         if TURN_FEED_ENABLED:
             item = latest_turn_item(entry, pane)
             if item:
+                # Issue #26: a plan/oversized turn shows a summary here too; the full plan ships
+                # as a .md attachment (deduped per turn, so it isn't re-sent if already delivered).
+                item, plan_doc_text = plan_attachment_swap(item)
                 report_render_hash = clean_feed_hash(item)
                 report_semantic_hash = clean_feed_hash(item, include_render_version=False)
                 reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
@@ -12086,6 +13263,14 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                             str(entry.get("pane_key") or ""),
                             str(result["message_id"]),
                         )
+                    if plan_doc_text:
+                        deliver_plan_document(
+                            entry,
+                            turn_id=str(item.get("turn_id") or ""),
+                            plan_text=plan_doc_text,
+                            reply_to_message_id=str(result.get("message_id") or ""),
+                        )
+                        flush_pending_plan_doc(state, entry, telegram, chat_id, api_token=pane_api_token)
                     save_state(state)
                     return {"handled": True, "reply": ""}
                 entry["last_clean_send_error"] = sanitize_text(str(result), 500)
@@ -12135,7 +13320,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return {"handled": True, "reply": "No active choices for this pane."}
         if not prompt_id or not options or not prompt_text:
             return {"handled": True, "reply": "No active choices for this pane."}
-        revalidation, fresh_prompt_item = revalidate_pending_decision_prompt(pane_id, prompt)
+        # A /skills picker has no agent decision turn to revalidate against; skip straight to
+        # re-rendering it (the prompt_item path below selects skills_reply_markup for it).
+        if prompt_source(prompt) == "skills":
+            revalidation, fresh_prompt_item = "ok", None
+        else:
+            revalidation, fresh_prompt_item = revalidate_pending_decision_prompt(pane_id, prompt)
         if revalidation == "stale":
             entry.pop("active_prompt", None)
             entry.pop("awaiting_detail", None)
@@ -12181,13 +13371,16 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             }
             prompt_item["options"] = options
             prompt_item["prompt_id"] = prompt_id
+        # A /skills picker re-surfaced via /choices keeps its dedicated all-direct markup (no
+        # "N." prefixes, no "Tell me differently" row); real decision prompts use choices_reply_markup.
+        choices_markup = (skills_reply_markup if prompt_source(prompt) == "skills" else choices_reply_markup)
         result = send_feed_item(
             chat_id,
             prompt_item,
             telegram=telegram,
             thread_id=topic_id,
             notify=True,
-            reply_markup=choices_reply_markup(prompt_id, options),
+            reply_markup=choices_markup(prompt_id, options),
             reply_to_message_id=pane_root_reply_target(entry),
             api_token=pane_api_token,
         )
@@ -12202,6 +13395,86 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             bind_active_prompt_message(entry, prompt, result.get("message_id"))
         save_state(state)
         return {"handled": True, "reply": ""}
+    if command in {"skills", "commands"}:
+        # Issue #27: list the pane agent's slash-commands/skills as tappable buttons; a tap reuses
+        # the active_prompt -> callback("c") -> send_to_pane path verbatim (send_text is "/name", or
+        # a best-effort natural-language invocation for Codex skills).
+        agent_kind = managed_bot_kind_for_agent(entry.get("agent"))
+        if agent_kind not in {"claude", "codex"}:
+            return {"handled": True, "reply": "The skills picker supports Claude Code and Codex panes only."}
+        # Don't clobber a live agent decision prompt sharing the single active_prompt slot.
+        existing = entry.get("active_prompt") if isinstance(entry.get("active_prompt"), dict) else {}
+        if (existing and existing.get("options") and existing.get("source") != "skills"
+                and not prompt_interaction_disabled(existing)):
+            return {"handled": True, "reply": "Answer or dismiss the active question first, then run /skills again."}
+        cwd = str(entry.get("foreground_cwd") or entry.get("cwd") or "").strip()
+        try:
+            found = enumerate_pane_skills(agent_kind, cwd or None)
+        except Exception:  # defensive: a skills picker must never break the command handler
+            found = []
+        if not found:
+            return {"handled": True, "reply": "No skills or slash-commands found for this pane."}
+        cap = 12  # choices_reply_markup truncates at 12; cap + note (pagination is a follow-up)
+        shown, truncated = found[:cap], len(found) > cap
+        options: list[dict[str, str]] = []
+        for idx, sk in enumerate(shown, start=1):
+            # A per-button token (s1..s12), not the skill name: unique (no 32-char-prefix collision),
+            # never a decision keyword, and never matches a skill's own id/label in the tap lookup.
+            token = f"s{idx}"
+            options.append({
+                "number": token,
+                "callback_id": token,
+                "id": token,
+                "label": sanitize_text(str(sk.get("label") or sk.get("id") or token), 120),
+                "send_text": sanitize_text(str(sk.get("send_text") or ""), 500),
+                "direct": "1",  # always run directly (see choice_needs_detail / skills_reply_markup)
+            })
+        prompt_text = "Tap a skill or command to run it on this pane."
+        summary_lines = [prompt_text]
+        if any(sk.get("best_effort") for sk in shown):
+            summary_lines.append("Items marked “(skill)” are best-effort on Codex (no slash invocation).")
+        if truncated:
+            summary_lines.append(f"Showing the first {cap} of {len(found)}.")
+        prompt_id = prompt_id_for(prompt_text, options)
+        prompt_item = {
+            "kind": "choices",
+            "title": "Skills",
+            "summary": "\n".join(summary_lines),
+            "detail": "",
+            "text": prompt_text,
+            "notify": True,
+            "source": "skills",  # keep prompt_interaction_disabled() False so it survives normalize_state
+            "options": options,
+            "prompt_id": prompt_id,
+        }
+        result = send_feed_item(
+            chat_id,
+            prompt_item,
+            telegram=telegram,
+            thread_id=topic_id,
+            notify=True,
+            reply_markup=skills_reply_markup(prompt_id, options),
+            reply_to_message_id=pane_root_reply_target(entry),
+            api_token=pane_api_token,
+        )
+        if result.get("ok"):
+            if result.get("message_id"):
+                record_pane_message_route(
+                    state,
+                    str(entry.get("space_key") or ""),
+                    str(entry.get("pane_key") or ""),
+                    str(result["message_id"]),
+                )
+            bind_active_prompt_message(
+                entry,
+                {"id": prompt_id, "text": prompt_text, "options": options,
+                 "item": prompt_item, "source": "skills"},
+                result.get("message_id"),
+            )
+            save_state(state)
+            return {"handled": True, "reply": ""}
+        save_state(state)
+        return {"handled": True, "reply": "Could not post the skills list."}
     if command in {"raw", "read"}:
         try:
             lines = int(arg.strip() or READ_LINES_COMMAND_DEFAULT)
@@ -12669,16 +13942,20 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     entry.pop("active_prompt", None)
     entry.pop("awaiting_detail", None)
     save_state(state)
+    # For the /skills picker the choice number is an internal token (s1..s12); show the command
+    # label instead. Decision prompts keep the familiar "N) label" / "Selected N." form.
+    direct_skill = _boolish(option.get("direct"))
+    option_label = str(option.get("label") or choice_number)
     send_notice(
         chat_id,
         "Selected",
-        f"{choice_number}) {option.get('label')}",
+        option_label if direct_skill else f"{choice_number}) {option_label}",
         telegram=telegram,
         thread_id=topic_id,
         notify=False,
         api_token=pane_api_token,
     )
-    return {"handled": True, "answer": f"Selected {choice_number}."}
+    return {"handled": True, "answer": f"Sent {option_label}." if direct_skill else f"Selected {choice_number}."}
 
 
 def probe_rich(thread_id: str | None = None) -> dict[str, Any]:
@@ -12804,6 +14081,116 @@ def _setup_confirm_hermes_reuse(interactive: bool) -> bool:
         return False
     print("Type 'reuse' to share the Hermes token anyway: ", end="", file=sys.stderr, flush=True)
     return input().strip().lower() == "reuse"
+
+
+# Issue #36: the herdres Claude hook (herdres-decision-hook) reports a pending
+# AskUserQuestion/ExitPlanMode so the bridge renders tappable buttons. Registered in
+# ~/.claude/settings.json for these events. PreToolUse/PostToolUse are matcher-scoped so they
+# only run for those tools (record / clear-on-answer). UserPromptSubmit (a brand-new prompt
+# supersedes any abandoned decision) and SessionEnd (turn/session ended) clear a stale record so
+# a cancelled prompt can't re-surface stale buttons. The hook script also filters by tool name.
+CLAUDE_DECISION_HOOK_EVENTS = (
+    ("PreToolUse", "AskUserQuestion|ExitPlanMode"),
+    ("PostToolUse", "AskUserQuestion|ExitPlanMode"),
+    ("UserPromptSubmit", "*"),
+    ("SessionEnd", "*"),
+)
+
+
+def claude_settings_path() -> Path:
+    return Path.home() / ".claude" / "settings.json"
+
+
+def decision_hook_command() -> str:
+    # Point at the SAME dest the update manifest installs the script to (INSTALL_BIN_DIR /
+    # "herdres-decision-hook"), so the registered command always matches where the script
+    # actually lands — and so tests that patch INSTALL_BIN_DIR can't escape into the real bin.
+    return f"python3 '{INSTALL_BIN_DIR / 'herdres-decision-hook'}'"
+
+
+def install_claude_decision_hook(settings_path: Path | None = None, command: str | None = None) -> bool:
+    """Idempotently register the herdres decision hook (issue #36) in ~/.claude/settings.json.
+    Coexists with other hooks (orca/herdr): only adds our exact command if absent, never touches
+    others — mirrors herdr's ensure_command_hook. Returns True if settings.json changed; no-op
+    (False) when ~/.claude is absent (Claude Code not installed here)."""
+    settings_path = Path(settings_path) if settings_path else claude_settings_path()
+    command = command or decision_hook_command()
+    if not settings_path.parent.exists():
+        return False
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        data["hooks"] = hooks
+    changed = False
+    for event, matcher in CLAUDE_DECISION_HOOK_EVENTS:
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            entries = []
+            hooks[event] = entries
+        already = any(
+            isinstance(h, dict) and str(h.get("command")) == command
+            for entry in entries
+            if isinstance(entry, dict)
+            for h in (entry.get("hooks") if isinstance(entry.get("hooks"), list) else [])
+        )
+        if already:
+            continue
+        entries.append({"matcher": matcher, "hooks": [{"type": "command", "command": command, "timeout": 10}]})
+        changed = True
+    if changed:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = settings_path.parent / (settings_path.name + f".herdres.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, settings_path)
+    return changed
+
+
+def hooks_once(args: Any) -> dict[str, Any]:
+    if str(getattr(args, "action", "install") or "install") != "install":
+        return {"ok": False, "error": f"unknown hooks action: {getattr(args, 'action', '')}"}
+    hook_path = Path.home() / ".local" / "bin" / "herdres-decision-hook"
+    changed = install_claude_decision_hook()
+    return {
+        "ok": True,
+        "settings_changed": changed,
+        "hook_script_present": hook_path.exists(),
+        "settings_path": str(claude_settings_path()),
+        "hook_path": str(hook_path),
+    }
+
+
+def speech_once(args: Any) -> dict[str, Any]:
+    """`herdres speech check|install` (issue #4): preflight or fetch the local speech models/deps."""
+    action = str(getattr(args, "action", "check") or "check")
+    if herdres_speech is None:
+        return {"ok": False, "error": "herdres_speech is not importable on this host"}
+    if action == "check":
+        return {"ok": True, "action": "check", **herdres_speech.check()}
+    if action == "install":
+        # Progress goes to stderr so stdout stays a single JSON object (the subcommand contract).
+        force = bool(getattr(args, "force", False))
+        log = lambda m: print(m, file=sys.stderr)  # noqa: E731
+        stt_ok, stt_detail = herdres_speech.install_stt_model(force=force, log=log)
+        # The TTS model is the larger Kokoro voice download; install it too unless --stt-only.
+        if getattr(args, "stt_only", False):
+            tts_ok, tts_detail = True, "skipped (--stt-only)"
+        else:
+            tts_ok, tts_detail = herdres_speech.install_tts_model(force=force, log=log)
+        chk = herdres_speech.check()
+        hints = []
+        if not chk.get("sherpa_onnx"):
+            hints.append("pip install --user sherpa-onnx numpy")
+        if not chk.get("ffmpeg"):
+            hints.append("install ffmpeg (apt-get install ffmpeg / brew install ffmpeg)")
+        return {"ok": stt_ok and tts_ok, "action": "install", "stt_model": stt_detail,
+                "tts_model": tts_detail, "check": chk, "next_steps": hints}
+    return {"ok": False, "error": f"unknown speech action: {action}"}
 
 
 def setup_once(args: Any) -> dict[str, Any]:
@@ -13002,6 +14389,17 @@ def _update_files_plan() -> list[dict[str, Any]]:
         {"src": "herdres.py", "dest": _installed_bin(), "mode": 0o755},
         {"src": "herdres_gateway.py", "dest": INSTALL_BIN_DIR / "herdres-gateway", "mode": 0o755},
         {"src": "herdres_routing.py", "dest": INSTALL_BIN_DIR / "herdres_routing.py", "mode": 0o644},
+        # Local speech engine + warm sidecar (issue #4). herdres imports herdres_speech best-effort;
+        # the sidecar is opt-in (its unit is shipped but not enabled). Heavy deps/models are not here.
+        {"src": "herdres_speech.py", "dest": INSTALL_BIN_DIR / "herdres_speech.py", "mode": 0o644},
+        {"src": "herdres-speech", "dest": INSTALL_BIN_DIR / "herdres-speech", "mode": 0o755},
+        # The `pane turn` shim (HERDR_BIN points at it); shipping it via update keeps
+        # the turn/worklog adapter in lockstep with herdres.py instead of installer-only.
+        {"src": "herdr_turn_adapter.py", "dest": INSTALL_BIN_DIR / "herdr_turn_adapter.py", "mode": 0o755},
+        # Claude Code hook (issue #36): records a pending AskUserQuestion/ExitPlanMode so the
+        # bridge can render tappable buttons. Registered in ~/.claude/settings.json by
+        # install_claude_decision_hook() (called post-apply below + by `herdres hooks install`).
+        {"src": "herdres_decision_hook.py", "dest": INSTALL_BIN_DIR / "herdres-decision-hook", "mode": 0o755},
         {"src": "herdr_topic_bridge.py", "dest": INSTALL_SHARE_DIR / "herdr_topic_bridge.py", "mode": 0o644},
         {
             "src": "herdres-plugin/herdr-plugin.toml",
@@ -13015,6 +14413,11 @@ def _update_files_plan() -> list[dict[str, Any]]:
         {
             "src": "systemd/user/herdres-gateway.service",
             "dest": INSTALL_SYSTEMD_DIR / "herdres-gateway.service",
+            "mode": 0o644,
+        },
+        {
+            "src": "systemd/user/herdres-speech.service",
+            "dest": INSTALL_SYSTEMD_DIR / "herdres-speech.service",
             "mode": 0o644,
         },
     ]
@@ -13638,6 +15041,12 @@ def _apply_from_source(
     backup = _backup_install_set()
     try:
         written = _apply_install_set(repo)
+        # Re-register the Claude decision hook (issue #36) after files land — idempotent,
+        # best-effort (never fail an update over a cosmetic hook); coexists with orca/herdr.
+        try:
+            install_claude_decision_hook()
+        except Exception:
+            pass
         # _restart_services raises if a previously-active gateway can't be brought
         # back; that propagates here and rolls back. (--no-restart skips it; the
         # operator restarts manually later.)
@@ -13917,6 +15326,13 @@ def main() -> int:
     setup.add_argument("--allowed-users", default="")
     setup.add_argument("--reuse-hermes-token", action="store_true")
     sub.add_parser("version")
+    hooks = sub.add_parser("hooks")
+    hooks.add_argument("action", nargs="?", default="install", choices=["install"])
+    speech = sub.add_parser("speech")
+    speech.add_argument("action", nargs="?", default="check", choices=["check", "install"])
+    speech.add_argument("--force", action="store_true")
+    speech.add_argument("--stt-only", dest="stt_only", action="store_true",
+                        help="install only the STT model, skipping the larger Kokoro TTS voice")
     update = sub.add_parser("update")
     update.add_argument("--channel", default="edge")
     update.add_argument("--edge", action="store_const", const="edge", dest="channel")
@@ -13953,6 +15369,10 @@ def main() -> int:
             result = setup_once(args)
         elif args.cmd == "version":
             result = version_once(args)
+        elif args.cmd == "hooks":
+            result = hooks_once(args)
+        elif args.cmd == "speech":
+            result = speech_once(args)
         elif args.cmd == "update":
             result = update_once(args)
         else:

@@ -1,5 +1,7 @@
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -59,6 +61,74 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["turn_id"], "turn-1")
         self.assertEqual(turn["user_text"], "<literal> What happened?")
         self.assertEqual(turn["assistant_final_text"], "Final answer only.")
+
+    def test_codex_worklog_captures_tool_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1", "started_at": 10}},
+                    {"type": "response_item", "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "Build it."}]}},
+                    {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+                        "arguments": "{\"cmd\":\"go test ./...\\n(more)\"}"}},
+                    {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch",
+                        "input": "*** Begin Patch\n*** Update File: engine.go"}},
+                    {"type": "response_item", "payload": {"type": "reasoning", "summary": [],
+                        "content": None, "encrypted_content": "gAAAencryptedopaque"}},
+                    {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1",
+                        "completed_at": 20, "last_agent_message": "Built and tests pass."}},
+                ],
+            )
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["assistant_final_text"], "Built and tests pass.")
+        wl = turn.get("worklog_text") or ""
+        self.assertIn("exec_command go test ./...", wl)  # arguments JSON parsed (cmd key)
+        self.assertNotIn("(more)", wl)  # first line of the command only
+        self.assertIn("apply_patch *** Begin Patch", wl)  # custom_tool_call input brief
+        self.assertNotIn("Built and tests pass.", wl)  # final reply not duplicated into worklog
+        self.assertNotIn("gAAAencryptedopaque", wl)  # encrypted reasoning never surfaced
+
+    def test_devin_worklog_captures_tool_calls_and_interim_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "devin.json"
+            path.write_text(json.dumps({"steps": [
+                {"source": "user", "step_id": "s1", "timestamp": 1, "message": "Fix the bug."},
+                {"source": "agent", "step_id": "s2", "timestamp": 2, "message": "Let me run the tests.",
+                 "tool_calls": [{"type": "function", "function": {"name": "shell",
+                                 "arguments": "{\"command\":\"go test ./...\"}"}}]},
+                {"source": "agent", "step_id": "s3", "timestamp": 3, "message": "Fixed.", "tool_calls": []},
+            ]}), encoding="utf-8")
+            turn = adapter.extract_devin_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["assistant_final_text"], "Fixed.")
+        wl = turn.get("worklog_text") or ""
+        self.assertIn("shell go test ./...", wl)  # OpenAI-style function.arguments parsed
+        self.assertNotIn("Fixed.", wl)  # final reply not in worklog
+        self.assertNotIn("Let me run the tests.", wl)  # step message excluded (it can become the final reply)
+
+    def test_devin_worklog_no_dup_when_turn_closed_by_next_prompt(self) -> None:
+        # A tool step's message becomes last_agent_text; if the turn is closed by the
+        # NEXT prompt (not a text-only final step), that message is the final reply and
+        # must NOT also appear in the worklog.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "devin.json"
+            path.write_text(json.dumps({"steps": [
+                {"source": "user", "step_id": "s1", "timestamp": 1, "message": "Do step one."},
+                {"source": "agent", "step_id": "s2", "timestamp": 2, "message": "Here is the summary of step one.",
+                 "tool_calls": [{"type": "function", "function": {"name": "shell",
+                                 "arguments": "{\"command\":\"ls\"}"}}]},
+                {"source": "user", "step_id": "s3", "timestamp": 3, "message": "Now step two."},
+            ]}), encoding="utf-8")
+            turn = adapter.extract_devin_turn(path, "pane-1", "session-1")
+
+        t1 = turn["recent_turns"][0]  # the turn closed by the next prompt
+        self.assertEqual(t1["assistant_final_text"], "Here is the summary of step one.")
+        wl = t1.get("worklog_text") or ""
+        self.assertIn("shell ls", wl)
+        self.assertNotIn("Here is the summary of step one.", wl)  # final reply not duplicated
 
     def test_codex_suppresses_new_internal_user_prefixes(self) -> None:
         self.assertTrue(adapter.is_internal_codex_user_text("<codex_internal_context foo>ignore"))
@@ -378,6 +448,233 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["turn_id"], "assistant-1")
         self.assertEqual(turn["user_text"], "Diagnose it.")
         self.assertEqual(turn["assistant_final_text"], "Final diagnosis.")
+
+    def _claude_turn_with_tools(self):
+        return [
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": "Fix the bug."},
+            },
+            {
+                "type": "assistant",
+                "uuid": "step-1",
+                "message": {
+                    "role": "assistant",
+                    "stop_reason": "tool_use",
+                    "content": [
+                        {"type": "text", "text": "Let me run the tests."},
+                        {"type": "tool_use", "name": "Bash", "input": {"command": "go test ./...\n(more)"}},
+                    ],
+                },
+            },
+            {  # tool_result comes back as an internal user event — must not break the turn
+                "type": "user",
+                "uuid": "tool-result-1",
+                "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+            },
+            {
+                "type": "assistant",
+                "uuid": "step-2",
+                "message": {
+                    "role": "assistant",
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": "/root/gitmoot/engine.go"}}],
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "assistant-final",
+                "timestamp": "2026-06-15T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "Fixed and tests pass."}],
+                },
+            },
+        ]
+
+    def test_claude_worklog_captures_tool_use_and_interim_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, self._claude_turn_with_tools())
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn["assistant_final_text"], "Fixed and tests pass.")
+        worklog = turn.get("worklog_text") or ""
+        # tool calls (with a short, single-line arg) + interim narration are preserved
+        self.assertIn("Let me run the tests.", worklog)
+        self.assertIn("Bash go test ./...", worklog)
+        self.assertNotIn("(more)", worklog)  # multi-line tool args trimmed to first line
+        self.assertIn("Edit engine.go", worklog)  # file paths shown as basename
+        # the final response text is NOT duplicated into the worklog
+        self.assertNotIn("Fixed and tests pass.", worklog)
+
+    def test_claude_worklog_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, self._claude_turn_with_tools())
+            with patch.object(adapter, "WORKLOG_ENABLED", False):
+                turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["assistant_final_text"], "Fixed and tests pass.")
+        self.assertNotIn("worklog_text", turn)
+
+    def test_claude_worklog_spans_coalesced_consecutive_end_turns(self) -> None:
+        # Two end_turns under ONE prompt (no intervening user event) coalesce into a
+        # single turn; the worklog must include the tool step that ran BETWEEN them.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Do it."}},
+                    {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "first-cmd"}}]}},
+                    {"type": "assistant", "uuid": "e1", "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Done one."}]}},
+                    {"type": "assistant", "uuid": "s2", "message": {"role": "assistant", "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "second-cmd"}}]}},
+                    {"type": "assistant", "uuid": "e2", "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Done one revised."}]}},
+                ],
+            )
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["assistant_final_text"], "Done one revised.")
+        self.assertEqual(len(turn["recent_turns"]), 1)  # coalesced into one turn
+        worklog = turn.get("worklog_text") or ""
+        self.assertIn("Bash first-cmd", worklog)
+        self.assertIn("Bash second-cmd", worklog)  # the step between the two end_turns
+
+    def test_claude_interrupt_finalizes_open_turn_worklog(self) -> None:
+        # Issue #3: an interrupt ends the turn WITHOUT an end_turn. The accumulated worklog/stream
+        # tail must be finalized (so it still lands on Telegram), and the "[Request interrupted…]"
+        # marker must NOT become a visible prompt.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Profile the CPU."}},
+                {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                    "content": [{"type": "text", "text": "Running the profiler now."},
+                                {"type": "tool_use", "name": "Bash", "input": {"command": "py-spy record"}}]}},
+                {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "[Request interrupted by user]"}},
+            ])
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn.get("complete_reason"), "interrupted")
+        self.assertEqual(turn["user_text"], "Profile the CPU.")
+        self.assertIn("Running the profiler now.", turn["assistant_final_text"])   # partial response preserved
+        self.assertIn("Bash py-spy record", turn.get("worklog_text") or "")        # worklog tail preserved
+        self.assertNotIn("Request interrupted", turn["user_text"])                 # marker is not a prompt
+        self.assertNotIn("Request interrupted", turn.get("assistant_final_text") or "")
+
+    def test_claude_interrupt_with_prompt_only_finalizes_interrupted(self) -> None:
+        # An interrupt during the pure-reasoning window (a prompt open, no output yet) finalizes the
+        # turn as "(interrupted)" so it EDITS the prompt message — clearing the issue-#3 "Working…"
+        # reasoning indicator instead of leaving it stuck forever.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Start."}},
+                {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "[Request interrupted by user]"}},
+            ])
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn.get("complete_reason"), "interrupted")
+        self.assertEqual(turn["user_text"], "Start.")
+        self.assertEqual(turn["assistant_final_text"], "(interrupted)")
+        self.assertNotIn("Request interrupted", str(turn.get("user_text") or ""))
+
+    def test_claude_interrupt_tools_only_uses_placeholder_response(self) -> None:
+        # Interrupted after a tool_use step that streamed NO prose: the worklog is preserved and the
+        # Response falls back to the "(interrupted)" placeholder (assistant_final must be non-empty
+        # or make_turn_feed_item would drop the turn).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Profile it."}},
+                {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "py-spy record"}}]}},
+                {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "[Request interrupted by user]"}},
+            ])
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn.get("complete_reason"), "interrupted")
+        self.assertEqual(turn["assistant_final_text"], "(interrupted)")  # placeholder when no prose streamed
+        self.assertIn("Bash py-spy record", turn.get("worklog_text") or "")
+
+    def test_claude_interrupt_preserves_pending_decision(self) -> None:
+        # Issue #36 must survive issue #3: when a decision is pending (hook file present), an interrupt
+        # must NOT finalize the turn as 'interrupted' — the tappable buttons are still surfaced.
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = Path(tmp) / "pending"
+            pdir.mkdir()
+            (pdir / "session-1.json").write_text(json.dumps({
+                "tool_use_id": "hookdec-x", "name": "ExitPlanMode",
+                "input": {"plan": "# Plan\nstep one"}, "session_id": "session-1", "ts": time.time(),
+            }))
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Plan it."}},
+                {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                    "content": [{"type": "text", "text": "Drafting a plan."}]}},
+                {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "[Request interrupted by user]"}},
+            ])
+            with patch.dict(os.environ, {"HERDRES_PENDING_DIR": str(pdir)}, clear=False):
+                turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+        self.assertIsInstance(turn.get("pending_decision"), dict)        # buttons still surfaced
+        self.assertTrue(turn.get("awaiting_input"))
+        self.assertNotEqual(turn.get("complete_reason"), "interrupted")  # not finalized as interrupted
+        self.assertEqual(turn.get("user_text"), "Plan it.")              # REAL prompt, not the marker
+        self.assertNotIn("Request interrupted", str(turn.get("user_text") or ""))
+
+    def test_claude_worklog_redacts_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Deploy."}},
+                    {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                        "content": [
+                            {"type": "tool_use", "name": "Bash", "input": {"command": "export TOKEN=ghp_supersecretvalue && go build"}},
+                            {"type": "tool_use", "name": "WebFetch", "input": {"url": "https://user:pw@example.com/x"}},
+                        ]}},
+                    {"type": "assistant", "uuid": "e1", "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Deployed."}]}},
+                ],
+            )
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        worklog = turn.get("worklog_text") or ""
+        self.assertNotIn("ghp_supersecretvalue", worklog)  # secret value masked
+        self.assertIn("***", worklog)
+        self.assertNotIn("user:pw@", worklog)  # url credentials masked
+        self.assertIn("go build", worklog)  # non-secret part of the command preserved
+
+    def test_claude_worklog_strips_control_chars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Go."}},
+                    {"type": "assistant", "uuid": "s1", "message": {"role": "assistant", "stop_reason": "tool_use",
+                        "content": [{"type": "text", "text": "step‮RTL​zw done"}]}},
+                    {"type": "assistant", "uuid": "e1", "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "ok"}]}},
+                ],
+            )
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        worklog = turn.get("worklog_text") or ""
+        self.assertNotIn("‮", worklog)  # bidi override stripped
+        self.assertNotIn("​", worklog)  # zero-width space stripped
+        self.assertIn("step", worklog)
 
     def test_claude_suppresses_internal_task_notification_user_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -973,6 +1270,366 @@ class TurnAdapterTests(unittest.TestCase):
 
         exec_real.assert_called_once_with()
         self.assertEqual(result, 127)
+
+
+def _codex_turns(n: int, prefix: str = "t", user_pad: str = "") -> list[dict]:
+    rows: list[dict] = []
+    for i in range(n):
+        rows.append({"type": "event_msg", "payload": {"type": "task_started", "turn_id": f"{prefix}{i}", "started_at": i}})
+        rows.append({"type": "response_item", "payload": {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": f"prompt {prefix}{i} {user_pad}"}]}})
+        rows.append({"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+                     "arguments": "{\"cmd\":\"echo hi\"}"}})
+        rows.append({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": f"{prefix}{i}",
+                     "completed_at": i, "last_agent_message": f"answer {prefix}{i}"}})
+    return rows
+
+
+def _claude_turns(n: int, prefix: str = "u") -> list[dict]:
+    rows: list[dict] = []
+    for i in range(n):
+        rows.append({"type": "user", "uuid": f"{prefix}{i}", "message": {"role": "user", "content": f"prompt {i}"}})
+        rows.append({"type": "assistant", "uuid": f"a{prefix}{i}", "timestamp": f"ts{i}",
+                     "message": {"role": "assistant", "stop_reason": "tool_use", "content": [{"type": "text", "text": "step"}]}})
+        rows.append({"type": "assistant", "uuid": f"f{prefix}{i}", "timestamp": f"te{i}",
+                     "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": f"answer {i}"}]}})
+    return rows
+
+
+class TailReadTests(unittest.TestCase):
+    """Tail-reading a huge transcript must yield the SAME recent turns as a full read,
+    while reading only a bounded tail (a 1+ GB rollout must not be fully parsed each sync)."""
+
+    def test_codex_tail_read_matches_full_read(self) -> None:
+        rows = _codex_turns(adapter.RECENT_TURNS + 5)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, rows)
+            with patch.object(adapter, "TURN_TAIL_BYTES", 10**9):  # whole-file path
+                full = adapter.extract_codex_turn(path, "p", "s")
+            with patch.object(adapter, "TURN_TAIL_BYTES", 200):    # tail path
+                tail = adapter.extract_codex_turn(path, "p", "s")
+        self.assertEqual(tail["turn_id"], full["turn_id"])
+        self.assertEqual(tail["user_text"], full["user_text"])
+        self.assertEqual(tail["assistant_final_text"], full["assistant_final_text"])
+        self.assertEqual([t["turn_id"] for t in tail["recent_turns"]],
+                         [t["turn_id"] for t in full["recent_turns"]])
+        self.assertEqual(len(full["recent_turns"]), adapter.RECENT_TURNS)
+
+    def test_claude_tail_read_matches_full_read_with_internal_user(self) -> None:
+        rows = _claude_turns(adapter.RECENT_TURNS + 5)
+        # an internal user event mid-stream (turn boundary that must not change output)
+        rows.insert(6, {"type": "user", "uuid": "internal-1",
+                        "message": {"role": "user", "content": "<task-notification>ignore</task-notification>"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            write_jsonl(path, rows)
+            with patch.object(adapter, "TURN_TAIL_BYTES", 10**9):
+                full = adapter.extract_claude_turn(path, "p", "s")
+            with patch.object(adapter, "TURN_TAIL_BYTES", 200):
+                tail = adapter.extract_claude_turn(path, "p", "s")
+        self.assertEqual(tail["turn_id"], full["turn_id"])
+        self.assertEqual(tail["assistant_final_text"], full["assistant_final_text"])
+        self.assertEqual([t["turn_id"] for t in tail["recent_turns"]],
+                         [t["turn_id"] for t in full["recent_turns"]])
+        self.assertEqual(len(full["recent_turns"]), adapter.RECENT_TURNS)
+
+    def test_tail_read_is_bounded_excludes_old_turns(self) -> None:
+        # One huge old turn (far bigger than the window) followed by RECENT_TURNS+1 small
+        # turns. The tail reader must start at a recent boundary and NOT include the old turn.
+        rows = _codex_turns(1, prefix="old", user_pad="X" * 200_000)
+        rows += _codex_turns(adapter.RECENT_TURNS + 1, prefix="new")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, rows)
+            size = path.stat().st_size
+            lines = adapter._jsonl_tail_lines(
+                path, adapter._codex_is_turn_start, adapter._codex_is_turn_end, 256, adapter.RECENT_TURNS)
+        self.assertTrue(lines)
+        joined = "\n".join(lines)
+        self.assertNotIn("old0", joined)          # the huge old turn was not read
+        self.assertIn('"new0"', joined)            # the recent turns were
+        self.assertTrue(adapter._codex_is_turn_start(lines[0]))  # starts at a clean boundary
+        self.assertLess(sum(len(l) for l in lines), size // 2)   # read far less than the whole file
+
+    def test_codex_window_grows_past_trailing_aborted_turns(self) -> None:
+        # Window sizing must count COMPLETED turns, not turn-starts: a tail full of aborted
+        # turns (task_started but no task_complete) must still grow to the recent completions.
+        rows = _codex_turns(adapter.RECENT_TURNS + 3, prefix="done")
+        for i in range(20):
+            rows.append({"type": "event_msg", "payload": {"type": "task_started", "turn_id": f"ab{i}", "started_at": i}})
+            rows.append({"type": "response_item", "payload": {"type": "message", "role": "user",
+                         "content": [{"type": "input_text", "text": f"aborted {i}"}]}})
+            rows.append({"type": "event_msg", "payload": {"type": "turn_aborted"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, rows)
+            with patch.object(adapter, "TURN_TAIL_BYTES", 10**9):
+                full = adapter.extract_codex_turn(path, "p", "s")
+            with patch.object(adapter, "TURN_TAIL_BYTES", 200):
+                tail = adapter.extract_codex_turn(path, "p", "s")
+        self.assertEqual(tail["assistant_final_text"], full["assistant_final_text"])
+        self.assertEqual([t["turn_id"] for t in tail["recent_turns"]],
+                         [t["turn_id"] for t in full["recent_turns"]])
+        self.assertEqual(len(full["recent_turns"]), adapter.RECENT_TURNS)
+
+    def test_claude_window_grows_past_trailing_internal_users(self) -> None:
+        rows = _claude_turns(adapter.RECENT_TURNS + 3)
+        for i in range(20):  # trailing internal-user markers (no end_turn completion)
+            rows.append({"type": "user", "uuid": f"int{i}",
+                         "message": {"role": "user", "content": "<task-notification>x</task-notification>"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            write_jsonl(path, rows)
+            with patch.object(adapter, "TURN_TAIL_BYTES", 10**9):
+                full = adapter.extract_claude_turn(path, "p", "s")
+            with patch.object(adapter, "TURN_TAIL_BYTES", 200):
+                tail = adapter.extract_claude_turn(path, "p", "s")
+        self.assertEqual(tail["assistant_final_text"], full["assistant_final_text"])
+        self.assertEqual([t["turn_id"] for t in tail["recent_turns"]],
+                         [t["turn_id"] for t in full["recent_turns"]])
+        self.assertEqual(len(full["recent_turns"]), adapter.RECENT_TURNS)
+
+    def test_single_turn_over_ceiling_falls_back_to_full_read(self) -> None:
+        # A single turn larger than the ceiling -> no boundary in the window -> full read.
+        rows = _codex_turns(1, prefix="big", user_pad="Y" * 5000)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, rows)
+            with patch.object(adapter, "TURN_TAIL_BYTES", 256), patch.object(adapter, "TURN_TAIL_MAX_BYTES", 512):
+                turn = adapter.extract_codex_turn(path, "p", "s")
+        self.assertTrue(turn["available"])
+        self.assertEqual(turn["turn_id"], "big0")
+        self.assertEqual(turn["assistant_final_text"], "answer big0")
+
+
+class ModelExtractionTests(unittest.TestCase):
+    """The adapter surfaces the model (for the pinned-status suffix). claude carries
+    message.model on every assistant event; codex emits turn_context.model ~per turn,
+    so it survives the tail read. Absent -> the field is omitted (sync won't clobber)."""
+
+    def test_codex_turn_extracts_model_from_turn_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, [
+                {"type": "session_meta", "payload": {"cwd": "/root"}},
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1", "started_at": 1}},
+                {"type": "turn_context", "payload": {"model": "gpt-5.5", "effort": "high"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "Go."}]}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1",
+                    "completed_at": 2, "last_agent_message": "Done."}},
+            ])
+            turn = adapter.extract_codex_turn(path, "p", "s")
+        self.assertEqual(turn["model"], "gpt-5.5")
+
+    def test_claude_turn_extracts_model_from_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Hi."}},
+                {"type": "assistant", "uuid": "a1", "timestamp": "ts",
+                 "message": {"role": "assistant", "model": "claude-opus-4-8",
+                             "stop_reason": "end_turn", "content": [{"type": "text", "text": "Hello."}]}},
+            ])
+            turn = adapter.extract_claude_turn(path, "p", "s")
+        self.assertEqual(turn["model"], "claude-opus-4-8")
+
+    def test_claude_ignores_synthetic_model(self) -> None:
+        # A trailing synthetic message (interrupt/error) must not overwrite the real model.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Hi."}},
+                {"type": "assistant", "uuid": "a1", "timestamp": "ts",
+                 "message": {"role": "assistant", "model": "claude-opus-4-8",
+                             "stop_reason": "end_turn", "content": [{"type": "text", "text": "Hello."}]}},
+                {"type": "assistant", "uuid": "s1",
+                 "message": {"role": "assistant", "model": "<synthetic>",
+                             "stop_reason": "tool_use", "content": [{"type": "text", "text": "x"}]}},
+            ])
+            turn = adapter.extract_claude_turn(path, "p", "s")
+        self.assertEqual(turn["model"], "claude-opus-4-8")
+
+    def test_model_omitted_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, _codex_turns(2))  # no turn_context anywhere
+            turn = adapter.extract_codex_turn(path, "p", "s")
+        self.assertNotIn("model", turn)
+
+    def test_codex_model_survives_tail_read(self) -> None:
+        # turn_context recurs per turn, so even a tiny tail window still surfaces a model.
+        rows: list[dict] = []
+        for i in range(adapter.RECENT_TURNS + 5):
+            rows.append({"type": "event_msg", "payload": {"type": "task_started", "turn_id": f"t{i}", "started_at": i}})
+            rows.append({"type": "turn_context", "payload": {"model": "gpt-5.4"}})
+            rows.append({"type": "response_item", "payload": {"type": "message", "role": "user",
+                         "content": [{"type": "input_text", "text": f"prompt {i}"}]}})
+            rows.append({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": f"t{i}",
+                         "completed_at": i, "last_agent_message": f"answer {i}"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-s.jsonl"
+            write_jsonl(path, rows)
+            with patch.object(adapter, "TURN_TAIL_BYTES", 200):  # force the tail path
+                turn = adapter.extract_codex_turn(path, "p", "s")
+        self.assertEqual(turn["model"], "gpt-5.4")
+
+
+class ClaudeDecisionTests(unittest.TestCase):
+    """Issue #36: the adapter surfaces a PENDING AskUserQuestion/ExitPlanMode — recorded by the
+    herdres Claude hook to a per-session file (the transcript never contains it while pending) — as
+    a structured pending_decision/pending_interaction turn so herdres renders buttons."""
+
+    SESSION = "session-1"
+    OPEN_PROMPT = [{"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Help me decide."}}]
+
+    def _run(self, pending=None, events=None, session=None):
+        """Write a transcript (default: just an open user prompt) + an optional hook-style pending
+        file under a temp HERDRES_PENDING_DIR, then extract."""
+        session = session or self.SESSION
+        events = self.OPEN_PROMPT if events is None else events
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = Path(tmp) / "pending"
+            if pending is not None:
+                pdir.mkdir(parents=True, exist_ok=True)
+                safe = "".join(c for c in session if c.isalnum() or c in "-_.")[:120] or "session"
+                (pdir / f"{safe}.json").write_text(json.dumps(pending), encoding="utf-8")
+            path = Path(tmp) / f"{session}.jsonl"
+            write_jsonl(path, events)
+            with patch.dict(os.environ, {"HERDRES_PENDING_DIR": str(pdir)}, clear=False):
+                return adapter.extract_claude_turn(path, "pane-1", session)
+
+    def _pending(self, name, tool_input, tool_use_id="hookdec-abc", ts=None):
+        return {"tool_use_id": tool_use_id, "name": name, "input": tool_input,
+                "session_id": self.SESSION, "ts": time.time() if ts is None else ts}
+
+    def _auq(self, questions, **kw):
+        return self._pending("AskUserQuestion", {"questions": questions}, **kw)
+
+    def test_ask_user_question_pending_emits_decision(self) -> None:
+        turn = self._run(self._auq([
+            {"question": "Which DB?", "header": "Storage", "multiSelect": False,
+             "options": [{"label": "Postgres", "description": "x"}, {"label": "SQLite"}]},
+        ], tool_use_id="hookdec-q1"))
+        self.assertTrue(turn.get("awaiting_input"))
+        self.assertIs(turn.get("complete"), False)
+        dec = turn.get("pending_decision")
+        self.assertIsInstance(dec, dict)
+        self.assertEqual(dec["decision_id"], "hookdec-q1")
+        labels = [o["label"] for o in dec["options"]]
+        self.assertEqual(labels[:2], ["Postgres", "SQLite"])
+        self.assertEqual(dec["options"][0]["send_text"], "Postgres")  # send_text == label (verified round-trip)
+        self.assertEqual(dec["options"][-1]["send_text"], "")  # trailing custom -> ForceReply
+        self.assertIn("Storage", dec["prompt"])
+        self.assertNotIn("pending_interaction", turn)
+
+    def test_no_pending_file_no_decision(self) -> None:
+        # The hook cleared the file on answer (PostToolUse) -> no decision; the open turn is normal.
+        turn = self._run(pending=None)
+        self.assertNotIn("pending_decision", turn)
+        self.assertNotIn("pending_interaction", turn)
+
+    def test_exit_plan_mode_pending_emits_two_option_decision(self) -> None:
+        with patch.object(adapter, "PLAN_APPROVE_SEND_TEXT", "1"):
+            turn = self._run(self._pending("ExitPlanMode", {"plan": "# Plan\n1. do thing\n2. more"},
+                                           tool_use_id="hookdec-plan"))
+        dec = turn.get("pending_decision")
+        self.assertIsInstance(dec, dict)
+        self.assertEqual(dec["decision_id"], "hookdec-plan")
+        self.assertEqual([o["id"] for o in dec["options"]], ["approve", "revise"])
+        self.assertEqual(dec["options"][0]["send_text"], "1")
+        self.assertEqual(dec["options"][1]["send_text"], "")  # revise -> ForceReply
+        self.assertIn("do thing", turn.get("assistant_final_text", ""))  # plan in the card body
+        self.assertTrue(turn.get("awaiting_input"))
+
+    def test_multi_question_is_readonly_interaction(self) -> None:
+        turn = self._run(self._auq([
+            {"question": "Q1?", "header": "A", "multiSelect": False, "options": [{"label": "a1"}, {"label": "a2"}]},
+            {"question": "Q2?", "header": "B", "multiSelect": False, "options": [{"label": "b1"}, {"label": "b2"}]},
+        ]))
+        self.assertNotIn("pending_decision", turn)
+        inter = turn.get("pending_interaction")
+        self.assertIsInstance(inter, dict)
+        self.assertEqual(inter["kind"], "multi_question_form")
+        self.assertEqual(len(inter["questions"]), 2)
+
+    def test_multi_select_single_question_is_readonly(self) -> None:
+        turn = self._run(self._auq([
+            {"question": "Pick several", "header": "Multi", "multiSelect": True,
+             "options": [{"label": "x"}, {"label": "y"}]},
+        ]))
+        self.assertNotIn("pending_decision", turn)
+        self.assertIsInstance(turn.get("pending_interaction"), dict)
+
+    def test_decisions_disabled_by_flag(self) -> None:
+        with patch.object(adapter, "DECISIONS_ENABLED", False):
+            turn = self._run(self._auq([
+                {"question": "Which DB?", "header": "S", "multiSelect": False, "options": [{"label": "Postgres"}]},
+            ]))
+        self.assertNotIn("pending_decision", turn)
+        self.assertNotIn("pending_interaction", turn)
+
+    def test_option_without_label_is_skipped_not_none(self) -> None:
+        turn = self._run(self._auq([
+            {"question": "Pick", "header": "H", "multiSelect": False,
+             "options": [{"text": "Real A"}, {"label": "B"}, {"label": None}]},
+        ]))
+        labels = [o["label"] for o in turn["pending_decision"]["options"]]
+        self.assertNotIn("None", labels)  # no literal "None" button from a missing label
+        self.assertIn("Real A", labels)   # falls back to text
+        self.assertIn("B", labels)
+
+    def test_stale_pending_file_is_ignored(self) -> None:
+        # An abandoned file (missed PostToolUse / crash) is bounded by the TTL.
+        turn = self._run(self._auq([
+            {"question": "Which DB?", "header": "S", "multiSelect": False, "options": [{"label": "Postgres"}]},
+        ], ts=0))  # epoch -> far older than HERDRES_PENDING_TTL_SECONDS
+        self.assertNotIn("pending_decision", turn)
+
+    def test_foreign_tool_pending_file_is_ignored(self) -> None:
+        # A stray file naming a non-decision tool must never produce buttons.
+        turn = self._run(self._pending("Bash", {"command": "ls"}))
+        self.assertNotIn("pending_decision", turn)
+        self.assertNotIn("pending_interaction", turn)
+
+    def test_decision_with_prior_completed_turns_keeps_recent(self) -> None:
+        events = [
+            {"type": "user", "uuid": "u0", "message": {"role": "user", "content": "First task."}},
+            {"type": "assistant", "uuid": "a0", "timestamp": "2026-06-15T09:00:00Z",
+             "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "Done first."}]}},
+            {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": "Next?"}},
+        ]
+        turn = self._run(self._auq([
+            {"question": "Next?", "header": "Step", "multiSelect": False, "options": [{"label": "Go"}, {"label": "Stop"}]},
+        ]), events=events)
+        self.assertIsInstance(turn.get("pending_decision"), dict)
+        self.assertIn("recent_turns", turn)  # history preserved for catch-up
+
+    def test_ask_user_question_decision_consumable_by_herdres(self) -> None:
+        import herdres
+        turn = self._run(self._auq([
+            {"question": "Which DB?", "header": "Storage", "multiSelect": False,
+             "options": [{"label": "Postgres"}, {"label": "SQLite"}]},
+        ]))
+        norm = herdres.normalize_pending_decision(turn)
+        self.assertIsInstance(norm, dict)  # adapter output passes herdres' validation
+        self.assertEqual([o["send_text"] for o in norm["options"]][:2], ["Postgres", "SQLite"])
+        item = herdres.make_decision_feed_item(turn, norm)
+        self.assertEqual(item["kind"], "decision")
+        self.assertFalse(herdres.prompt_interaction_disabled(item))  # structured source -> buttons enabled
+
+    def test_exit_plan_mode_decision_consumable_by_herdres(self) -> None:
+        import herdres
+        with patch.object(adapter, "PLAN_APPROVE_SEND_TEXT", "1"):
+            turn = self._run(self._pending("ExitPlanMode", {"plan": "# Plan\nstep one"}))
+        norm = herdres.normalize_pending_decision(turn)
+        self.assertIsInstance(norm, dict)
+        self.assertEqual([o["label"] for o in norm["options"]],
+                         ["✅ Approve & proceed", "✍️ Keep planning / revise"])
+        # approve carries the send_text knob; revise (empty) flags needs_detail -> ForceReply
+        self.assertEqual(norm["options"][0]["send_text"], "1")
+        self.assertEqual(norm["options"][1].get("needs_detail"), "1")
 
 
 if __name__ == "__main__":

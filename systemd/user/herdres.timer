@@ -3,7 +3,10 @@ Description=Run Herdres Herdr Telegram topic sync
 
 [Timer]
 OnBootSec=30s
-OnUnitActiveSec=60s
+# 30s (issue #3): fresher mid-turn worklogs. Edits are deduped by render hash, the flock
+# serializes timer-vs-event syncs, and the working badge / flush-on-boundary already cover the
+# interactive cases — so this is a modest freshness bump, not the primary real-time mechanism.
+OnUnitActiveSec=30s
 AccuracySec=10s
 Persistent=true
 
