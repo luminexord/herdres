@@ -405,6 +405,23 @@ MANAGED_BOT_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 NEW_PANE_AGENT_COMMANDS = {kind: kind for kind in MANAGED_BOT_SPECS}
+COUNCIL_SEAT_LABELS = {
+    "codex": "Codex",
+    "claude": "Claude",
+    "kimi": "Kimi",
+    "omp": "OMP",
+    "devin": "Devin",
+    "glm": "GLM",
+}
+GITMOOT_WORKFLOW_EVENTS = {
+    "advance_started",
+    "advance_completed",
+    "advance_failed",
+    "delegation_worktree_removed",
+    "delegation_worktree_created",
+    "delegation_started",
+    "delegation_completed",
+}
 CODE_FILE_EXTENSIONS = ("py", "json", "toml", "service", "timer", "sh", "md", "txt", "yaml", "yml")
 PATH_OR_SYMBOL_FILE_EXTENSIONS = (
     "py", "js", "ts", "tsx", "jsx", "json", "md", "txt", "yaml", "yml", "toml", "sh", "service", "timer"
@@ -785,6 +802,9 @@ def devin_model_managed_bot_kind_from_label(value: str | None) -> str:
 
 
 def pane_agent_status_label(pane: dict[str, Any]) -> str:
+    council_label = council_display_label_for_council_entry_like(pane, pane)
+    if council_label:
+        return sanitize_text(council_label, 80)
     kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
     if kind == "devin":
         label = str(pane.get("label") or pane.get("name") or pane.get("title") or "").strip()
@@ -933,6 +953,73 @@ def managed_bot_kind_for_agent(value: str | None) -> str:
             return kind
     return ""
 
+def _normalized_managed_bot_kind(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if text in managed_bot_specs():
+        return text
+    return managed_bot_kind_for_agent(text)
+
+
+def _council_seat_slug_from_text(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"\bcouncil[-_\s:/·]+([A-Za-z0-9_.-]+)", text, flags=re.IGNORECASE)
+    if match:
+        return _normalized_managed_bot_kind(match.group(1).replace(".", "-"))
+    return ""
+
+
+def council_seat_slug_from_entry_like(entry: dict[str, Any] | None, pane: dict[str, Any] | None = None) -> str:
+    items = [item for item in (entry, pane) if isinstance(item, dict)]
+    for item in items:
+        for key in ("council_seat", "seat"):
+            slug = _normalized_managed_bot_kind(str(item.get(key) or ""))
+            if slug:
+                return slug
+    for item in items:
+        for key in ("label", "name", "title", "pane_thread_name", "pane_label_raw", "pane_label_topic_name", "topic_name"):
+            slug = _council_seat_slug_from_text(str(item.get(key) or ""))
+            if slug:
+                return slug
+    if any(str(item.get("origin") or "").strip().lower() == "council" for item in items):
+        for item in items:
+            for key in ("managed_bot_kind", "agent", "label", "name", "title", "pane_thread_name", "pane_label_raw", "topic_name"):
+                slug = _normalized_managed_bot_kind(str(item.get(key) or ""))
+                if slug:
+                    return slug
+    return ""
+
+
+def council_seat_display_label(slug: str) -> str:
+    clean = str(slug or "").strip().lower()
+    if not clean:
+        return ""
+    return f"Council {COUNCIL_SEAT_LABELS.get(clean, clean.title())}"
+
+
+def council_display_label_for_entry_like(entry: dict[str, Any] | None, pane: dict[str, Any] | None = None) -> str:
+    return council_seat_display_label(council_seat_slug_from_entry_like(entry, pane))
+
+def council_entry_like_has_explicit_marker(entry: dict[str, Any] | None, pane: dict[str, Any] | None = None) -> bool:
+    items = [item for item in (entry, pane) if isinstance(item, dict)]
+    for item in items:
+        if str(item.get("origin") or "").strip().lower() == "council":
+            return True
+        for key in ("council_seat", "seat"):
+            if _normalized_managed_bot_kind(str(item.get(key) or "")):
+                return True
+        for key in ("label", "name", "title", "pane_thread_name", "pane_label_raw", "pane_label_topic_name", "topic_name"):
+            if _council_seat_slug_from_text(str(item.get(key) or "")):
+                return True
+    return False
+
+
+def council_display_label_for_council_entry_like(entry: dict[str, Any] | None, pane: dict[str, Any] | None = None) -> str:
+    if not council_entry_like_has_explicit_marker(entry, pane):
+        return ""
+    return council_display_label_for_entry_like(entry, pane)
+
 
 def managed_bot_kind_for_payload(bot: dict[str, Any]) -> str:
     text = " ".join(
@@ -955,6 +1042,9 @@ def managed_bot_kind_for_payload(bot: dict[str, Any]) -> str:
 
 
 def managed_bot_kind_for_entry(entry: dict[str, Any], pane: dict[str, Any] | None = None) -> str:
+    council_kind = council_seat_slug_from_entry_like(entry, pane)
+    if council_kind:
+        return council_kind
     explicit = str(entry.get("managed_bot_kind") or "").strip().lower()
     if explicit in managed_bot_specs():
         return explicit
@@ -1449,6 +1539,220 @@ def herdr_text(args: list[str], *, timeout: int = 10) -> str:
     return proc.stdout
 
 
+def gitmoot_job_show(job_ref, *, timeout=8) -> dict | None:
+    try:
+        proc = run_cmd(["gitmoot", "job", "show", str(job_ref), "--json"], timeout=int(timeout))
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if proc.returncode != 0 or not str(proc.stdout or "").strip():
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _gitmoot_text_is_workflow_event(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict) and _gitmoot_node_is_workflow_event(parsed):
+        return True
+    key = re.sub(r"[^a-z0-9_]+", "_", text.lower()).strip("_")
+    if key in GITMOOT_WORKFLOW_EVENTS:
+        return True
+    return len(text) <= 240 and any(token in key for token in GITMOOT_WORKFLOW_EVENTS)
+
+
+def _gitmoot_node_is_workflow_event(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for key in ("event", "type", "kind", "name", "action"):
+        raw = str(value.get(key) or "").strip().lower()
+        if not raw:
+            continue
+        normalized = re.sub(r"[^a-z0-9_]+", "_", raw).strip("_")
+        if normalized in GITMOOT_WORKFLOW_EVENTS or normalized.startswith(("advance_", "delegation_worktree_")):
+            return True
+    return False
+
+
+def _gitmoot_first_field_text(value: Any, field: str) -> str:
+    if isinstance(value, dict):
+        if _gitmoot_node_is_workflow_event(value):
+            return ""
+        current = value.get(field)
+        if isinstance(current, str) and current.strip() and not _gitmoot_text_is_workflow_event(current):
+            return sanitize_text(current, FINAL_REPLY_MAX_CHARS).strip()
+        for child in value.values():
+            text = _gitmoot_first_field_text(child, field)
+            if text:
+                return text
+    elif isinstance(value, list):
+        for child in value:
+            text = _gitmoot_first_field_text(child, field)
+            if text:
+                return text
+    return ""
+
+
+def _gitmoot_values_for_key(value: Any, field: str) -> Iterator[Any]:
+    if isinstance(value, dict):
+        if _gitmoot_node_is_workflow_event(value):
+            return
+        if field in value:
+            yield value[field]
+        for child in value.values():
+            yield from _gitmoot_values_for_key(child, field)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _gitmoot_values_for_key(child, field)
+
+
+def _gitmoot_raw_output_text(value: Any) -> str:
+    if isinstance(value, str):
+        return "" if _gitmoot_text_is_workflow_event(value) else sanitize_text(value, FINAL_REPLY_MAX_CHARS).strip()
+    if isinstance(value, list):
+        chunks = [_gitmoot_raw_output_text(item) for item in value]
+        return sanitize_text("\n\n".join(chunk for chunk in chunks if chunk), FINAL_REPLY_MAX_CHARS).strip()
+    if isinstance(value, dict):
+        if _gitmoot_node_is_workflow_event(value):
+            return ""
+        for key in ("text", "content", "body", "output", "message", "summary"):
+            current = value.get(key)
+            if isinstance(current, str) and current.strip() and not _gitmoot_text_is_workflow_event(current):
+                return sanitize_text(current, FINAL_REPLY_MAX_CHARS).strip()
+        return _gitmoot_raw_output_text(list(value.values()))
+    return ""
+
+
+def gitmoot_job_model_content(job_json) -> str:
+    if not isinstance(job_json, dict):
+        return ""
+    for field in ("artifact_body", "artifactBody"):
+        text = _gitmoot_first_field_text(job_json, field)
+        if text:
+            return text
+    text = _gitmoot_first_field_text(job_json, "summary")
+    if text:
+        return text
+    chunks = [_gitmoot_raw_output_text(value) for value in _gitmoot_values_for_key(job_json, "raw_outputs")]
+    return sanitize_text("\n\n".join(chunk for chunk in chunks if chunk), FINAL_REPLY_MAX_CHARS).strip()
+
+GITMOOT_JOB_STABLE_MARKER_KEYS = (
+    "artifact_hash",
+    "artifactHash",
+    "artifact_sha",
+    "artifactSha",
+    "content_hash",
+    "contentHash",
+    "output_hash",
+    "outputHash",
+    "raw_outputs_hash",
+    "rawOutputsHash",
+    "summary_hash",
+    "summaryHash",
+    "result_hash",
+    "resultHash",
+    "job_hash",
+    "jobHash",
+    "revision",
+    "rev",
+    "version",
+    "job_revision",
+    "jobRevision",
+    "hash",
+    "sha",
+    "sha256",
+)
+
+
+def _gitmoot_marker_scalar(value: Any) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (str, int, float)):
+        text = sanitize_text(str(value), 180).strip()
+        text = re.sub(r"\s+", " ", text).strip()
+        if text and not _gitmoot_text_is_workflow_event(text):
+            return text
+    return ""
+
+
+def gitmoot_job_stable_marker_component(job_json: Any) -> str:
+    if isinstance(job_json, dict):
+        if _gitmoot_node_is_workflow_event(job_json):
+            return ""
+        for key in GITMOOT_JOB_STABLE_MARKER_KEYS:
+            text = _gitmoot_marker_scalar(job_json.get(key))
+            if text:
+                return text
+        for child in job_json.values():
+            text = gitmoot_job_stable_marker_component(child)
+            if text:
+                return text
+    elif isinstance(job_json, list):
+        for child in job_json:
+            text = gitmoot_job_stable_marker_component(child)
+            if text:
+                return text
+    return ""
+
+
+def gitmoot_job_content_marker(job_json: Any, content: str) -> str:
+    clean_content = sanitize_text(str(content or ""), FINAL_REPLY_MAX_CHARS).strip()
+    content_hash = hashlib.sha256(clean_content.encode("utf-8")).hexdigest()
+    stable_component = gitmoot_job_stable_marker_component(job_json)
+    if stable_component:
+        return f"{stable_component}:{content_hash}"
+    return content_hash
+
+
+def gitmoot_job_feed_item(job_ref: str, job_json: Any) -> dict[str, Any] | None:
+    job_ref = sanitize_text(str(job_ref or ""), 260).strip()
+    if not job_ref:
+        return None
+    content = sanitize_text(gitmoot_job_model_content(job_json), FINAL_REPLY_MAX_CHARS).strip()
+    if not content or _gitmoot_text_is_workflow_event(content):
+        return None
+    marker = gitmoot_job_content_marker(job_json, content)
+    return {
+        "kind": "turn",
+        "title": "",
+        "summary": compact_block(content.splitlines()[:4], max_lines=4, max_chars=700),
+        "detail": "",
+        "lines": content.splitlines()[:FINAL_REPLY_MAX_LINES],
+        "text": content,
+        "turn_id": f"gitmoot-job:{job_ref}",
+        "assistant_final_text": content,
+        "source": "gitmoot_job",
+        "gitmoot_job_ref": job_ref,
+        "gitmoot_job_marker": marker,
+        "notify": False,
+    }
+
+
+def gitmoot_job_fallback_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        delegation_ref = gitmoot_delegation_ref_from_pane(pane)
+        if not delegation_ref:
+            return None
+        root, delegation = delegation_ref
+        job_ref = f"{root}/delegation/{delegation}"
+        item = gitmoot_job_feed_item(job_ref, gitmoot_job_show(job_ref))
+    except Exception:
+        return None
+    if not item:
+        return None
+    marker = str(item.get("gitmoot_job_marker") or "")
+    if marker and str(entry.get("last_gitmoot_job_marker") or "") == marker:
+        return None
+    return item
+
 def workspace_label_map(deadline: float | None = None) -> dict[str, str]:
     if deadline is not None and _remaining(deadline) <= SEND_TO_PANE_MIN_CALL_SECONDS:
         return {}
@@ -1584,6 +1888,38 @@ def pane_agent_session_id(pane: dict[str, Any]) -> str:
         return str(sess.get("value") or "")
     return ""
 
+def gitmoot_delegation_ref_from_pane(pane) -> tuple[str, str] | None:
+    if not isinstance(pane, dict) or not council_seat_slug_from_entry_like(pane):
+        return None
+    cwd = str(pane.get("foreground_cwd") or "").strip()
+    if not cwd or not os.path.isabs(cwd):
+        return None
+    try:
+        parts = Path(cwd).parts
+    except (OSError, RuntimeError, ValueError):
+        return None
+    matches: list[tuple[str, str]] = []
+    for idx, part in enumerate(parts):
+        if part != ".gitmoot":
+            continue
+        if idx + 5 >= len(parts):
+            continue
+        if parts[idx + 1] != "worktrees" or parts[idx + 3] != "delegations":
+            continue
+        worktree = parts[idx + 2]
+        if "--" not in worktree or worktree.startswith("--") or worktree.endswith("--"):
+            continue
+        root_job_id = parts[idx + 4]
+        delegation_id = parts[idx + 5]
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$", root_job_id):
+            continue
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$", delegation_id):
+            continue
+        matches.append((root_job_id, delegation_id))
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
 
 def pane_key(pane: dict[str, Any]) -> str:
     parts = [
@@ -1634,8 +1970,17 @@ def clean_space_topic_title(value: str, *, fallback: str = "Herdr Space") -> str
 
 
 def agent_topic_name_for_pane(pane: dict[str, Any]) -> str:
-    # Per-agent topic title. A manual pane label is the user's explicit intent,
-    # so it wins; otherwise name the topic "<agent> · <folder>".
+    # Council panes use their resolved seat label before Herdr pane labels so
+    # runner names like "Gm Local" do not leak into Telegram topic titles.
+    # Otherwise a manual pane label is the user's explicit intent, so it wins;
+    # without one, name the topic "<agent> · <folder>".
+    council_label = council_display_label_for_council_entry_like(pane, pane)
+    if council_label:
+        cwd_value = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
+        folder = sanitize_text(Path(cwd_value).name if cwd_value else "", 40).strip()
+        if folder:
+            return f"{council_label} · {folder}"[:60]
+        return council_label
     manual = pane_manual_label(pane)
     if manual:
         labelled = topic_name_from_pane_label(manual)
@@ -1773,6 +2118,9 @@ def topic_name_from_pane_label(label: str) -> str:
 
 
 def topic_name_for_pane(pane: dict[str, Any]) -> str:
+    council_label = council_display_label_for_council_entry_like(pane, pane)
+    if council_label:
+        return council_label
     label = pane_manual_label(pane)
     if label:
         return topic_name_from_pane_label(label)
@@ -1793,6 +2141,9 @@ def topic_name_for_pane(pane: dict[str, Any]) -> str:
 
 
 def pane_thread_name(pane: dict[str, Any]) -> str:
+    council_label = council_display_label_for_council_entry_like(pane, pane)
+    if council_label:
+        return council_label
     label = pane_manual_label(pane)
     if label:
         return label
@@ -1819,18 +2170,34 @@ def pane_entry_iter(state: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any]
 
 
 def ensure_space_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str, dict[str, Any], bool]:
+    pane_origin = str(pane.get("origin") or "").strip().lower()
+    pane_voice_mode = str(pane.get("voice_mode") or "").strip().lower()
     key = space_key(pane)
     spaces = state.setdefault("spaces", {})
     entry = spaces.get(key)
     changed = False
     if not isinstance(entry, dict):
         preserved = state.get("_preserved_voice_mode") if isinstance(state.get("_preserved_voice_mode"), dict) else {}
-        vm = preserved.pop(key, None) or "shared"
+        vm = preserved.pop(key, None) or (
+            "per_agent" if pane_origin == "council" and pane_voice_mode == "per_agent" else "shared"
+        )
         entry = {"space_key": key, "created_at": utc_now(), "pane_keys": [], "voice_mode": vm}
+        if pane_origin == "council":
+            entry["origin"] = "council"
         spaces[key] = entry
         changed = True
     if entry.get("space_key") != key:
         entry["space_key"] = key
+        changed = True
+    if pane_origin == "council" and entry.get("origin") != "council":
+        entry["origin"] = "council"
+        changed = True
+    if (
+        pane_origin == "council"
+        and pane_voice_mode in {"shared", "per_agent"}
+        and not entry.get("voice_mode")
+    ):
+        entry["voice_mode"] = pane_voice_mode
         changed = True
     space_id = str(pane.get("space_id") or pane.get("workspace_id") or pane.get("workspace") or "")
     if space_id and entry.get("space_id") != space_id:
@@ -1876,6 +2243,9 @@ def migrate_legacy_pane_topics(state: dict[str, Any]) -> bool:
             "label": entry.get("pane_label_raw") or entry.get("topic_name") or "",
             "agent": entry.get("agent") or "",
             "foreground_cwd": entry.get("foreground_cwd") or entry.get("cwd") or "",
+            "origin": entry.get("origin") or "",
+            "council_seat": entry.get("council_seat") or entry.get("seat") or "",
+            "managed_bot_kind": entry.get("managed_bot_kind") or "",
         }
         key_for_space = space_key(pane_like)
         space_entry = spaces.get(key_for_space)
@@ -3251,6 +3621,8 @@ def should_baseline_new_pane_turn(entry: dict[str, Any], item: dict[str, Any] | 
     if not new_entry or not item:
         return False
     if str(item.get("kind") or "").lower() != "turn":
+        return False
+    if str(item.get("source") or "") == "gitmoot_job":
         return False
     if not str(item.get("turn_id") or "").strip():
         return False
@@ -5239,6 +5611,10 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
         "questions": item.get("questions") or [],
         "answers": item.get("answers") or {},
     }
+    if str(item.get("source") or "") == "gitmoot_job":
+        payload["source"] = "gitmoot_job"
+        payload["gitmoot_job_ref"] = item.get("gitmoot_job_ref")
+        payload["gitmoot_job_marker"] = item.get("gitmoot_job_marker")
     if include_render_version:
         payload["render_version"] = RICH_RENDER_VERSION
         payload["worklog_label"] = item.get("worklog_label")
@@ -5249,6 +5625,9 @@ def same_delivered_content(entry: dict[str, Any], item: dict[str, Any], item_sem
     previous_semantic_hash = str(entry.get("last_clean_semantic_hash") or "")
     if previous_semantic_hash and previous_semantic_hash == item_semantic_hash:
         return True
+    if str(item.get("source") or "") == "gitmoot_job":
+        marker = str(item.get("gitmoot_job_marker") or "")
+        return bool(marker and str(entry.get("last_gitmoot_job_marker") or "") == marker)
     turn_id = str(item.get("turn_id") or "")
     previous_turn_id = str(entry.get("last_turn_id") or (entry.get("last_clean_item") or {}).get("turn_id") or "")
     if turn_id and previous_turn_id and turn_id == previous_turn_id:
@@ -5309,6 +5688,8 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_send_error",
         "last_clean_attempt_hash",
         "last_clean_attempt_at",
+        "last_gitmoot_job_marker",
+        "last_gitmoot_job_ref",
         "last_turn_id",
         "last_turn_available",
         "last_turn_reason",
@@ -5790,6 +6171,13 @@ def record_delivered_feed_item(
     entry["last_clean_sent_at"] = utc_now()
     if item.get("turn_id"):
         entry["last_turn_id"] = str(item.get("turn_id") or "")
+    if str(item.get("source") or "") == "gitmoot_job":
+        marker = str(item.get("gitmoot_job_marker") or "")
+        ref = str(item.get("gitmoot_job_ref") or "")
+        if marker:
+            entry["last_gitmoot_job_marker"] = marker
+        if ref:
+            entry["last_gitmoot_job_ref"] = ref
     entry.pop("last_clean_send_error", None)
 
 
@@ -5864,13 +6252,15 @@ def format_status(
     include_commands: bool = False,
 ) -> str:
     obj = status_object(pane)
+    council_label = council_display_label_for_council_entry_like(pane, pane)
+    display_agent = council_label or obj["agent"]
     lines = [
         f"Herdr pane {obj['pane_id']}",
         f"Status: {obj['status'] or 'unknown'}",
     ]
-    if obj["agent"]:
-        lines.append(f"Agent: {obj['agent']}")
-    if obj["label"]:
+    if display_agent:
+        lines.append(f"Agent: {display_agent}")
+    if obj["label"] and not council_label:
         lines.append(f"Label: {obj['label']}")
     if obj["cwd"]:
         lines.append(f"Path: {obj['cwd']}")
@@ -6214,6 +6604,9 @@ def pinned_status_pane_open(pane: dict[str, Any]) -> bool:
 def pinned_status_pane_label(state: dict[str, Any], pane: dict[str, Any]) -> str:
     entries = state.get("panes") if isinstance(state.get("panes"), dict) else {}
     entry = entries.get(pane_key(pane)) if isinstance(entries, dict) else None
+    council_label = council_display_label_for_council_entry_like(entry if isinstance(entry, dict) else None, pane)
+    if council_label:
+        return sanitize_text(council_label, 80)
     raw = ""
     if isinstance(entry, dict):
         raw = str(entry.get("topic_name") or "")
@@ -9468,9 +9861,10 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
 
 
 def pane_root_message_text(pane: dict[str, Any], entry: dict[str, Any]) -> str:
-    title = str(entry.get("pane_thread_name") or pane_thread_name(pane))
+    council_label = council_display_label_for_council_entry_like(entry, pane)
+    title = str(council_label or entry.get("pane_thread_name") or pane_thread_name(pane))
     pane_id = str(pane.get("pane_id") or entry.get("pane_id") or "")
-    agent = str(pane.get("agent") or "")
+    agent = str(council_label or pane.get("agent") or "")
     cwd = compact_path(pane.get("cwd") or pane.get("foreground_cwd") or "")
     lines = [
         f"Pane thread: {title}",
@@ -9488,7 +9882,11 @@ def pane_root_message_text(pane: dict[str, Any], entry: dict[str, Any]) -> str:
 
 
 def pane_root_message_html(pane: dict[str, Any], entry: dict[str, Any]) -> str:
-    title = html.escape(str(entry.get("pane_thread_name") or pane_thread_name(pane)))
+    title = html.escape(str(
+        council_display_label_for_council_entry_like(entry, pane)
+        or entry.get("pane_thread_name")
+        or pane_thread_name(pane)
+    ))
     body = html.escape(pane_root_message_text(pane, entry)).replace("\n", "<br>")
     return f"<b>{title}</b><br>{body}"
 
@@ -9534,10 +9932,16 @@ def ensure_space_topic(
     space_entry.pop("topic_missing_at", None)
     space_entry.pop("topic_missing_id", None)
     space_entry.pop("topic_missing_reason", None)
+    council_per_agent_onboarding = (
+        str(space_entry.get("origin") or "").strip().lower() == "council"
+        and str(space_entry.get("voice_mode") or "").strip().lower() == "per_agent"
+    )
     # The "which agents work here?" onboarding card only makes sense in per-space
     # grouping, where one topic holds several agents. In per-agent mode each topic
-    # IS a single agent, so the question is moot — skip the card entirely.
-    if not per_agent_topics_enabled():
+    # IS a single agent, so the question is moot — skip the card entirely. Council
+    # spaces can opt into that same per-agent voice mode without enabling global
+    # per-agent topic grouping, so suppress their onboarding card with the same rule.
+    if not per_agent_topics_enabled() and not council_per_agent_onboarding:
         live = live_entries_for_space(state, space_entry)
         detected_kinds = []
         seen_kinds: set[str] = set()
@@ -9946,6 +10350,13 @@ def _sync_pane_clean_feed(
             # sync_pane_once) onto the feed item so the renderer collapses the echoed
             # prompt accordingly.
             item["prompt_collapse_chars"] = int(entry.get("prompt_collapse_chars") or 0)
+        if not item and (
+            entry.get("last_turn_available") is False
+            or not str(entry.get("agent_session_id") or pane_agent_session_id(pane) or "").strip()
+        ):
+            item = gitmoot_job_fallback_feed_item(pane, entry)
+            if isinstance(item, dict):
+                item["prompt_collapse_chars"] = int(entry.get("prompt_collapse_chars") or 0)
         after_turn_state = (
             entry.get("last_turn_available"),
             entry.get("last_turn_reason"),
