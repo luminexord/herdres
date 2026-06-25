@@ -5734,6 +5734,8 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "unfolded_turns",
         "last_plan_doc_turn_id",
         "pending_plan_doc",
+        "last_speech_reply_turn_id",
+        "pending_speech_reply",
         "last_turn_id",
         "last_turn_available",
         "last_turn_reason",
@@ -7782,6 +7784,29 @@ def telegram_message_id(response: dict[str, Any]) -> str | None:
     return None
 
 
+def send_voice(
+    chat_id: str,
+    file_path: Path | str,
+    *,
+    telegram: dict[str, Any] | None = None,
+    thread_id: str | int | None = None,
+    reply_to_message_id: str | int | None = None,
+    notify: bool = False,
+    api_token: str | None = None,
+    duration: int = 0,
+) -> dict[str, Any]:
+    """Send an OGG/Opus voice message to a topic via the Bot API sendVoice (multipart). Mirrors
+    send_document; used by the spoken-reply path (issue #4 v2)."""
+    fields = _message_common_payload(chat_id, thread_id=thread_id, notify=notify, reply_markup=None)
+    fields.update(_reply_parameters_payload(reply_to_message_id))
+    fields["voice"] = "attach://file"
+    if duration:
+        fields["duration"] = str(int(duration))
+    return telegram_api_multipart(
+        "sendVoice", fields, {"file": (Path(file_path), "audio/ogg")}, token=api_token
+    )
+
+
 def send_document(
     chat_id: str,
     file_path: Path | str,
@@ -7920,6 +7945,180 @@ def flush_pending_plan_doc(
         entry.pop("pending_plan_doc", None)
         return True
     pending["attempts"] = attempts
+    return True
+
+
+SPEECH_REPLY_ATTEMPT_CAP = 3
+
+
+def _prune_speech_dir(base: Path, *, keep: int = 64, part_stale_seconds: int = 600) -> None:
+    """Bound the SHARED outbound-speech dir: keep the newest `keep` finished .ogg files and sweep
+    only STALE .part files (older than part_stale_seconds). Unlike prune_attachment_dir we must NOT
+    delete fresh .part files — the sidecar synthesizes other panes' replies into <dest>.part
+    concurrently, and deleting an in-flight one would corrupt/lose that synthesis."""
+    try:
+        entries = [p for p in base.iterdir() if p.is_file() and not p.is_symlink()]
+    except OSError:
+        return
+    now = time.time()
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for part in (p for p in entries if p.name.endswith(".part")):
+        if now - _mtime(part) > part_stale_seconds:  # only orphans from a crashed synth
+            _unlink_quietly(part)
+    finals = [p for p in entries if p.name.endswith(".ogg")]
+    for stale in sorted(finals, key=_mtime, reverse=True)[keep:]:
+        _unlink_quietly(stale)
+
+
+def outbound_speech_dir(*, prune: bool = False) -> Path:
+    base = state_path().parent / "outbound-speech"
+    if base.is_symlink():
+        raise BridgeError("outbound speech directory path is unsafe (symlink)")
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.chmod(0o700)
+    except OSError:
+        pass
+    if prune:
+        _prune_speech_dir(base)
+    return base
+
+
+def _speech_flush_wait_seconds() -> float:
+    # Default 0: do NOT block the sync lock waiting for the async synth — defer to the next sync.
+    # An operator can set a small value to trade a brief lock-hold for same-sync voice delivery.
+    try:
+        return max(0.0, float(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_FLUSH_WAIT", "0") or "0"))
+    except ValueError:
+        return 0.0
+
+
+def enqueue_speech_reply(turn_id: str, text: str) -> Path | None:
+    """Ask the warm sidecar to synthesize a trimmed, speakable version of the reply to an OGG file
+    and return that (future) path — synthesis happens ASYNCHRONOUSLY in the sidecar, OFF the sync
+    lock, so this call is just a fast enqueue. Returns None when speech is off / no sidecar / nothing
+    to say (the spoken reply is simply skipped; the delivered text turn is untouched). Issue #4 v2."""
+    if herdres_speech is None:
+        return None
+    try:
+        spoken = herdres_speech.trim_for_speech(str(text or ""))
+    except Exception:
+        spoken = ""
+    if not spoken:
+        return None
+    try:
+        base = outbound_speech_dir(prune=True)  # bound the dir; the sidecar writes the file itself
+        # Stable, turn-keyed name (no random suffix): a re-enqueue for the same turn reuses the same
+        # path so the sidecar's in-flight/exists dedup is meaningful and idempotent. The sha suffix
+        # keeps distinct turn_ids from colliding after safe_file_component's lossy sanitization.
+        tag = hashlib.sha1(str(turn_id).encode("utf-8")).hexdigest()[:8]
+        dest = base / f"reply-{safe_file_component(str(turn_id), 'turn')[:32]}-{tag}.ogg"
+        ok = bool(herdres_speech.speech_request("tts", {"text": spoken, "dest": str(dest)}).get("ok"))
+    except Exception:
+        return None
+    return dest if ok else None
+
+
+def queue_speech_reply(entry: dict[str, Any], *, turn_id: str, item: dict[str, Any],
+                       reply_to_message_id: str | int | None) -> bool:
+    """Enqueue a spoken version of the agent's final reply (issue #4 v2). At most once per turn_id;
+    the sidecar synthesizes async and flush_pending_speech_reply sends the finished OGG. The enqueue
+    is a fast socket call — NO synthesis runs here under the sync lock. Returns True if state changed."""
+    clean_turn = str(turn_id or "")
+    text = str(item.get("assistant_final_text") or "").strip()
+    if not clean_turn or not text:
+        return False
+    if str(entry.get("last_speech_reply_turn_id") or "") == clean_turn:
+        return False  # already spoken (or given up) for this turn
+    existing = entry.get("pending_speech_reply")
+    if isinstance(existing, dict) and str(existing.get("turn_id") or "") == clean_turn:
+        return False  # already queued for this turn
+    dest = enqueue_speech_reply(clean_turn, text)
+    if dest is None:
+        return False  # speech off / no sidecar — skip the spoken reply (text turn already delivered)
+    if isinstance(existing, dict) and str(existing.get("path") or ""):
+        _unlink_quietly(Path(str(existing.get("path"))))  # drop a stale queue for a different turn
+    entry["pending_speech_reply"] = {
+        "turn_id": clean_turn,
+        "path": str(dest),
+        "reply_to": str(reply_to_message_id or ""),
+        "ticks": 0,
+    }
+    return True
+
+
+def _abandon_speech_reply(entry: dict[str, Any], turn_id: str, path: Path) -> None:
+    # Give up on this turn's spoken reply: clean the (possibly partial) file AND mark the turn done so
+    # a later render change doesn't re-synthesize it (the text turn already went out).
+    _unlink_quietly(path)
+    _unlink_quietly(Path(str(path) + ".part"))
+    entry["last_speech_reply_turn_id"] = turn_id
+    entry.pop("pending_speech_reply", None)
+
+
+def flush_pending_speech_reply(
+    state: dict[str, Any], entry: dict[str, Any], telegram: dict[str, Any], chat_id: str, *, api_token: str | None = None
+) -> bool:
+    """Send a queued spoken reply once the sidecar has produced its OGG. Runs every sync so it
+    self-heals: if the async file isn't ready yet it defers to the next sync (no lock-held wait by
+    default; HERDR_TELEGRAM_TOPICS_SPEECH_FLUSH_WAIT can add a small same-sync poll), giving up after
+    the attempt cap. Drops on success / cap; leaves on rate-limit. Returns True if state changed."""
+    pending = entry.get("pending_speech_reply")
+    if not isinstance(pending, dict):
+        return False
+    turn_id = str(pending.get("turn_id") or "")
+    raw_path = str(pending.get("path") or "")
+    if not turn_id or not raw_path:
+        entry.pop("pending_speech_reply", None)
+        return True
+    path = Path(raw_path)
+    if not path.exists():
+        # The sidecar is still synthesizing — wait a short, bounded time (so a warm synth lands now),
+        # then defer to the next sync. This bounded poll is the only lock-held time; no synthesis runs
+        # under the lock.
+        deadline = time.monotonic() + _speech_flush_wait_seconds()
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.2)
+    if not path.exists():
+        ticks = int(pending.get("ticks") or 0) + 1
+        if ticks >= SPEECH_REPLY_ATTEMPT_CAP:
+            _abandon_speech_reply(entry, turn_id, path)  # synth never landed — give up
+        else:
+            pending["ticks"] = ticks
+        return True
+    try:
+        result = send_voice(
+            chat_id, path, telegram=telegram, thread_id=str(entry.get("topic_id") or ""),
+            reply_to_message_id=str(pending.get("reply_to") or "") or None, notify=False, api_token=api_token,
+        )
+    except RateLimited:
+        return False  # respect the backoff; retry next sync without burning an attempt
+    except Exception:
+        result = {"ok": False}
+    if result.get("ok"):
+        # The voice note is a real new message below the turn — record it as the pane/topic high-water
+        # mark (like the plan-doc path, PR #35) so a later in-place turn edit re-anchors fresh instead
+        # of being left buried above it.
+        voice_message_id = telegram_message_id(result)
+        if voice_message_id:
+            record_pane_message_route(
+                state, str(entry.get("space_key") or ""), str(entry.get("pane_key") or ""), voice_message_id
+            )
+        _unlink_quietly(path)
+        entry["last_speech_reply_turn_id"] = turn_id
+        entry.pop("pending_speech_reply", None)
+        return True
+    ticks = int(pending.get("ticks") or 0) + 1
+    if ticks >= SPEECH_REPLY_ATTEMPT_CAP:
+        _abandon_speech_reply(entry, turn_id, path)
+        return True
+    pending["ticks"] = ticks
     return True
 
 
@@ -10927,6 +11126,17 @@ def _sync_pane_clean_feed(
                             plan_text=plan_doc_text,
                             reply_to_message_id=str(result.get("message_id") or (message_id if did_edit else "")),
                         )
+                    # Issue #4 v2: queue a spoken version of the reply (flushed below, like plan_doc).
+                    try:
+                        if herdres_speech is not None and herdres_speech.speech_replies_enabled():
+                            queue_speech_reply(
+                                entry,
+                                turn_id=str(item.get("turn_id") or ""),
+                                item=item,
+                                reply_to_message_id=str(result.get("message_id") or (message_id if did_edit else "")),
+                            )
+                    except Exception:  # speech is strictly additive — never break turn delivery
+                        pass
                 changed = True
             elif result_topic_missing(result):
                 clear_entry_topic_mapping(state, entry, str(result.get("error") or result))
@@ -10960,6 +11170,13 @@ def _sync_pane_clean_feed(
     # Send/retry a queued plan-document (issue #26); runs every sync so it self-heals.
     if flush_pending_plan_doc(state, entry, telegram, chat_id, api_token=pane_api_token):
         changed = True
+    # Send/retry a queued spoken reply (issue #4 v2); runs every sync so it self-heals. Guarded so a
+    # speech failure can never break the sync loop (speech is strictly additive).
+    try:
+        if flush_pending_speech_reply(state, entry, telegram, chat_id, api_token=pane_api_token):
+            changed = True
+    except Exception:
+        entry.pop("pending_speech_reply", None)
     entry["last_status_hash"] = stable_obj_hash
     return {"early_return": None, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
 
@@ -13647,14 +13864,23 @@ def speech_once(args: Any) -> dict[str, Any]:
     if action == "check":
         return {"ok": True, "action": "check", **herdres_speech.check()}
     if action == "install":
-        ok, detail = herdres_speech.install_stt_model(force=bool(getattr(args, "force", False)))
+        # Progress goes to stderr so stdout stays a single JSON object (the subcommand contract).
+        force = bool(getattr(args, "force", False))
+        log = lambda m: print(m, file=sys.stderr)  # noqa: E731
+        stt_ok, stt_detail = herdres_speech.install_stt_model(force=force, log=log)
+        # The TTS model is the larger Kokoro voice download; install it too unless --stt-only.
+        if getattr(args, "stt_only", False):
+            tts_ok, tts_detail = True, "skipped (--stt-only)"
+        else:
+            tts_ok, tts_detail = herdres_speech.install_tts_model(force=force, log=log)
         chk = herdres_speech.check()
         hints = []
         if not chk.get("sherpa_onnx"):
             hints.append("pip install --user sherpa-onnx numpy")
         if not chk.get("ffmpeg"):
             hints.append("install ffmpeg (apt-get install ffmpeg / brew install ffmpeg)")
-        return {"ok": ok, "action": "install", "model": detail, "check": chk, "next_steps": hints}
+        return {"ok": stt_ok and tts_ok, "action": "install", "stt_model": stt_detail,
+                "tts_model": tts_detail, "check": chk, "next_steps": hints}
     return {"ok": False, "error": f"unknown speech action: {action}"}
 
 
@@ -13854,6 +14080,10 @@ def _update_files_plan() -> list[dict[str, Any]]:
         {"src": "herdres.py", "dest": _installed_bin(), "mode": 0o755},
         {"src": "herdres_gateway.py", "dest": INSTALL_BIN_DIR / "herdres-gateway", "mode": 0o755},
         {"src": "herdres_routing.py", "dest": INSTALL_BIN_DIR / "herdres_routing.py", "mode": 0o644},
+        # Local speech engine + warm sidecar (issue #4). herdres imports herdres_speech best-effort;
+        # the sidecar is opt-in (its unit is shipped but not enabled). Heavy deps/models are not here.
+        {"src": "herdres_speech.py", "dest": INSTALL_BIN_DIR / "herdres_speech.py", "mode": 0o644},
+        {"src": "herdres-speech", "dest": INSTALL_BIN_DIR / "herdres-speech", "mode": 0o755},
         # The `pane turn` shim (HERDR_BIN points at it); shipping it via update keeps
         # the turn/worklog adapter in lockstep with herdres.py instead of installer-only.
         {"src": "herdr_turn_adapter.py", "dest": INSTALL_BIN_DIR / "herdr_turn_adapter.py", "mode": 0o755},
@@ -13874,6 +14104,11 @@ def _update_files_plan() -> list[dict[str, Any]]:
         {
             "src": "systemd/user/herdres-gateway.service",
             "dest": INSTALL_SYSTEMD_DIR / "herdres-gateway.service",
+            "mode": 0o644,
+        },
+        {
+            "src": "systemd/user/herdres-speech.service",
+            "dest": INSTALL_SYSTEMD_DIR / "herdres-speech.service",
             "mode": 0o644,
         },
     ]
@@ -14787,6 +15022,8 @@ def main() -> int:
     speech = sub.add_parser("speech")
     speech.add_argument("action", nargs="?", default="check", choices=["check", "install"])
     speech.add_argument("--force", action="store_true")
+    speech.add_argument("--stt-only", dest="stt_only", action="store_true",
+                        help="install only the STT model, skipping the larger Kokoro TTS voice")
     update = sub.add_parser("update")
     update.add_argument("--channel", default="edge")
     update.add_argument("--edge", action="store_const", const="edge", dest="channel")

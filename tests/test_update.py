@@ -34,6 +34,8 @@ SOURCE_FILES = {
     "herdres.py": f'#!/usr/bin/env python3\nHERDRES_VERSION = "9.9.9"\n',
     "herdres_gateway.py": "# gateway\n",
     "herdres_routing.py": "# routing\n",
+    "herdres_speech.py": "# speech\n",
+    "herdres-speech": "# speech sidecar\n",
     "herdres_decision_hook.py": "# decision hook\n",
     "herdr_turn_adapter.py": "# turn adapter\n",
     "herdr_topic_bridge.py": "# bridge\n",
@@ -41,6 +43,7 @@ SOURCE_FILES = {
     "systemd/user/herdres.service": "[Service]\n",
     "systemd/user/herdres.timer": "[Timer]\n",
     "systemd/user/herdres-gateway.service": "[Service]\n",
+    "systemd/user/herdres-speech.service": "[Service]\n",
 }
 
 

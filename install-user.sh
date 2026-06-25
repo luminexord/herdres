@@ -14,6 +14,8 @@ install -Dm644 herdres_routing.py "$HOME/.local/bin/herdres_routing.py"
 # Optional local speech engine (issue #4): herdres imports it best-effort, so it must sit next to the
 # CLI on the import path. Heavy deps (sherpa-onnx + models) are opt-in via `herdres speech install`.
 install -Dm644 herdres_speech.py "$HOME/.local/bin/herdres_speech.py"
+# Warm speech sidecar (issue #4 v2) — installed but NOT enabled by default (opt-in; needs the models).
+install -Dm755 herdres-speech "$HOME/.local/bin/herdres-speech"
 # Claude Code hook (issue #36): mirrors a pending AskUserQuestion/ExitPlanMode to Telegram as
 # tappable buttons. Install the script, then register it in ~/.claude/settings.json (idempotent,
 # coexists with other hooks; no-op if Claude Code isn't installed).
@@ -28,7 +30,7 @@ sed "s#\\[\"herdres\", #\\[\"$HOME/.local/bin/herdres\", #g" \
 install -d "$HOME/.local/share/herdres"
 printf '%s\n' "$PWD" > "$HOME/.local/share/herdres/source"
 mkdir -p "$HOME/.config/systemd/user"
-cp systemd/user/herdres.service systemd/user/herdres.timer systemd/user/herdres-gateway.service "$HOME/.config/systemd/user/"
+cp systemd/user/herdres.service systemd/user/herdres.timer systemd/user/herdres-gateway.service systemd/user/herdres-speech.service "$HOME/.config/systemd/user/"
 
 printf '%s\n' "Installed herdres."
 printf '%s\n' "Edit $HOME/.config/herdres/herdres.env, then run:"
