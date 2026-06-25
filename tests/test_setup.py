@@ -13,9 +13,12 @@ tests are offline and deterministic.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -352,6 +355,85 @@ class SetupWizardTests(unittest.TestCase):
                 herdres.setup_once(_args())
         self.assertIn("reuse the Hermes bot token", str(ctx.exception))
         self.assertFalse(self.env_path.exists())
+
+
+class ClaudeDecisionHookInstallTests(unittest.TestCase):
+    """Issue #36: install_claude_decision_hook() registers the herdres hook in ~/.claude/settings.json
+    idempotently and coexists with unrelated hooks (orca/herdr), mirroring herdr's ensure_command_hook."""
+
+    CMD = "python3 '/tmp/herdres-decision-hook'"
+
+    def _settings_in(self, tmp):
+        return Path(tmp) / ".claude" / "settings.json"
+
+    def _commands_for(self, data, event):
+        out = []
+        for entry in data.get("hooks", {}).get(event, []):
+            for h in entry.get("hooks", []):
+                out.append(h.get("command"))
+        return out
+
+    def test_noop_when_claude_dir_absent(self) -> None:
+        # No ~/.claude -> Claude Code isn't installed here; must not create it.
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings_in(tmp)  # parent .claude does not exist
+            self.assertFalse(herdres.install_claude_decision_hook(settings, self.CMD))
+            self.assertFalse(settings.parent.exists())
+
+    def test_installs_all_events_on_empty_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings_in(tmp)
+            settings.parent.mkdir(parents=True)
+            self.assertTrue(herdres.install_claude_decision_hook(settings, self.CMD))
+            data = json.loads(settings.read_text())
+            for event, _matcher in herdres.CLAUDE_DECISION_HOOK_EVENTS:
+                self.assertIn(self.CMD, self._commands_for(data, event), event)
+
+    def test_idempotent_second_run_makes_no_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings_in(tmp)
+            settings.parent.mkdir(parents=True)
+            self.assertTrue(herdres.install_claude_decision_hook(settings, self.CMD))
+            self.assertFalse(herdres.install_claude_decision_hook(settings, self.CMD))  # no change
+            data = json.loads(settings.read_text())
+            for event, _matcher in herdres.CLAUDE_DECISION_HOOK_EVENTS:
+                self.assertEqual(self._commands_for(data, event).count(self.CMD), 1, event)
+
+    def test_preserves_unrelated_hooks(self) -> None:
+        # An orca/herdr-style PreToolUse hook with matcher "*" must survive untouched.
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings_in(tmp)
+            settings.parent.mkdir(parents=True)
+            other = {"hooks": {
+                "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "orca-hook.sh"}]}],
+                "SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "herdr-state.sh"}]}],
+            }, "model": "opus"}
+            settings.write_text(json.dumps(other))
+            self.assertTrue(herdres.install_claude_decision_hook(settings, self.CMD))
+            data = json.loads(settings.read_text())
+            self.assertIn("orca-hook.sh", self._commands_for(data, "PreToolUse"))   # unrelated PreToolUse kept
+            self.assertIn(self.CMD, self._commands_for(data, "PreToolUse"))         # ours added alongside
+            self.assertIn("herdr-state.sh", self._commands_for(data, "SessionStart"))  # untouched event kept
+            self.assertEqual(data.get("model"), "opus")                            # unrelated top-level keys kept
+
+    def test_command_tracks_install_bin_dir(self) -> None:
+        # The registered command must point at the manifest's install dest, so it can't escape
+        # a patched INSTALL_BIN_DIR into the real ~/.local/bin (the bug that polluted settings.json).
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(herdres, "INSTALL_BIN_DIR", Path(tmp) / "bin"):
+                self.assertEqual(
+                    herdres.decision_hook_command(),
+                    f"python3 '{Path(tmp) / 'bin' / 'herdres-decision-hook'}'",
+                )
+
+    def test_malformed_settings_is_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings_in(tmp)
+            settings.parent.mkdir(parents=True)
+            settings.write_text("}{ not json")
+            self.assertTrue(herdres.install_claude_decision_hook(settings, self.CMD))
+            data = json.loads(settings.read_text())  # rewritten as valid JSON with our hook
+            self.assertIn(self.CMD, self._commands_for(data, "PreToolUse"))
 
 
 class _TempDir:

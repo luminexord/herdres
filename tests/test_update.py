@@ -34,6 +34,8 @@ SOURCE_FILES = {
     "herdres.py": f'#!/usr/bin/env python3\nHERDRES_VERSION = "9.9.9"\n',
     "herdres_gateway.py": "# gateway\n",
     "herdres_routing.py": "# routing\n",
+    "herdres_decision_hook.py": "# decision hook\n",
+    "herdr_turn_adapter.py": "# turn adapter\n",
     "herdr_topic_bridge.py": "# bridge\n",
     "herdres-plugin/herdr-plugin.toml": 'command = ["herdres", "event"]\n',
     "systemd/user/herdres.service": "[Service]\n",
@@ -150,6 +152,12 @@ class UpdateTestBase(unittest.TestCase):
         self.enterContext(patch.object(herdres, "INSTALL_SYSTEMD_DIR", self.systemd))
         self.enterContext(patch.object(herdres, "BACKUP_DIR", self.backups))
         self.enterContext(patch.object(herdres, "SOURCE_MARKER", self.marker))
+        # CRITICAL: _apply_from_source re-registers the Claude decision hook (issue #36) by
+        # writing ~/.claude/settings.json. Sandbox that path too, or the update tests would
+        # pollute the developer's real settings.json with a hook pointing at the sandbox bin.
+        self.claude_settings = tmp / "claude" / "settings.json"
+        self.claude_settings.parent.mkdir(parents=True, exist_ok=True)
+        self.enterContext(patch.object(herdres, "claude_settings_path", lambda: self.claude_settings))
         # Force Linux/systemd path regardless of the host.
         self.enterContext(patch.object(herdres, "_platform_is_macos", lambda: False))
 
@@ -324,6 +332,15 @@ class EdgeApplyTests(UpdateTestBase):
 
         # Installed binary has the 0755 mode.
         self.assertEqual((self.bin / "herdres").stat().st_mode & 0o777, 0o755)
+
+        # Issue #36: the update re-registered the Claude decision hook into the (sandboxed)
+        # settings.json, and the command points at the script that was just installed into the
+        # sandbox bin -- never the developer's real ~/.local/bin or ~/.claude.
+        self.assertTrue((self.bin / "herdres-decision-hook").exists())  # script landed first
+        settings = json.loads(self.claude_settings.read_text())
+        cmds = [h.get("command") for entries in settings.get("hooks", {}).values()
+                for entry in entries for h in entry.get("hooks", [])]
+        self.assertTrue(any(str(self.bin / "herdres-decision-hook") in str(c) for c in cmds), cmds)
 
     def test_gateway_restart_is_disable_then_enable(self):
         self._seed_installed()

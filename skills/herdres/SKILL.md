@@ -74,6 +74,7 @@ these are the highest-frequency commands, typed **inside a pane's forum topic**.
 - `/status`, `/report` — resend the latest clean report or pending question for this pane.
 - `/raw [lines]` — sanitized raw visible pane output (default 80, max 160) when the clean report is not enough.
 - `/choices` — resend the active decision prompt and its inline buttons.
+- `/skills` (alias `/commands`) — list this pane agent's skills/slash-commands as tappable buttons; tap to run one on the pane.
 - `/new <codex|claude|kimi|omp|devin>` — split a new pane in this space and launch that agent.
 - `/agents` — in a per-space topic, pick which agent your messages address (sets a ~10-min active pane); replies `Only one agent here` in per-agent mode.
 - `/voice shared|per_agent` — switch this space's Telegram voice (single shared bot vs per-agent bots); per-space and reversible.

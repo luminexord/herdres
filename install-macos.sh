@@ -44,6 +44,10 @@ install_pinned herdres_gateway.py    herdres-gateway
 # herdres_gateway.py imports routing helpers from herdres_routing.py, so it
 # must sit next to the installed gateway binary on the import path.
 install -m 644 "$HERE/herdres_routing.py" "$BIN/herdres_routing.py"
+# Claude Code hook (issue #36): mirrors a pending AskUserQuestion/ExitPlanMode to Telegram as
+# tappable buttons; register it in ~/.claude/settings.json (idempotent, no-op without Claude Code).
+install_pinned herdres_decision_hook.py herdres-decision-hook
+"$BIN/herdres" hooks install >/dev/null 2>&1 || true
 
 if [ -d "$HERE/assets/managed-bots" ]; then
     for photo in codex claude kimi omp devin; do

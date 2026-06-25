@@ -1,10 +1,40 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
 import herdres
+
+
+class HerdrCommandTimeoutTests(unittest.TestCase):
+    """A slow/unreachable pane's herdr command must degrade to a BridgeError (one pane
+    unavailable), never an uncaught subprocess.TimeoutExpired that aborts the whole sync
+    — which previously left already-delivered turns unsaved and re-delivered every cycle."""
+
+    @staticmethod
+    def _timeout_runner():
+        def boom(args, **kw):
+            raise subprocess.TimeoutExpired(cmd=args, timeout=kw.get("timeout", 8))
+        return boom
+
+    def test_herdr_json_converts_timeout_to_bridgeerror(self) -> None:
+        with patch.object(herdres, "run_cmd", self._timeout_runner()):
+            with self.assertRaises(herdres.BridgeError):
+                herdres.herdr_json(["pane", "turn", "p1", "--last", "--format", "json"], timeout=8)
+
+    def test_herdr_text_converts_timeout_to_bridgeerror(self) -> None:
+        with patch.object(herdres, "run_cmd", self._timeout_runner()):
+            with self.assertRaises(herdres.BridgeError):
+                herdres.herdr_text(["pane", "read", "p1"], timeout=8)
+
+    def test_pane_turn_degrades_to_unavailable_on_timeout(self) -> None:
+        if hasattr(herdres, "_turn_cache"):
+            herdres._turn_cache.clear()
+        with patch.object(herdres, "run_cmd", self._timeout_runner()):
+            turn = herdres.pane_turn("w:pTimeout")
+        self.assertFalse(turn.get("available"))
 
 
 class FakeClock:

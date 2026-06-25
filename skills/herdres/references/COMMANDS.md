@@ -63,6 +63,7 @@ An agent runs **one turn at a time**. So a command issued while the agent is `wo
 | `/status`, `/report` | Resend the latest clean report / question for this pane | Same |
 | `/raw [lines]` | Sanitized raw visible pane output (default 80 lines, max 160) | Same |
 | `/choices` | Resend the active decision prompt / inline buttons | Same |
+| `/skills` (alias `/commands`) | List this pane agent's skills/slash-commands as tappable buttons; a tap runs one on the pane | Same (the chosen command queues if the agent is busy) |
 | `/new <kind>` | Split a new pane in this space and launch an agent | Same (operates on the space, not the busy turn) |
 | `/agents` | Inline picker to choose which agent this topic addresses (per-space mode only) | Same |
 | `/voice shared\|per_agent` | Switch this space's Telegram voice (per-space, reversible) | Same |
@@ -102,6 +103,8 @@ Empty `/keys` replies with `Usage: /keys <key> [key ...]`; a parse error reports
 ```
 
 **`/choices`** — Resend the pane's **active decision prompt** (question text plus its inline-button options). If the prompt is gone or no longer safe to answer from Telegram, you get `No active choices for this pane.` Tap a button, or reply to the prompt to send a free-text detail (see SAFETY.md for the fail-closed rules around prompts).
+
+**`/skills`** (alias **`/commands`**) — List the slash-commands and skills the **underlying agent** can run, as tappable inline buttons, discovered from that pane's runtime on the herdres host: for **Claude Code** the user-level `~/.claude/commands` + `~/.claude/skills`, the pane's project `<cwd>/.claude/…`, and enabled plugins; for **Codex** the `~/.codex/prompts` (and skills). Tapping a button forwards the invocation to the pane — `/<name>` for Claude (and Codex prompts), or a best-effort `Use the <name> skill.` for Codex skills (marked “(skill)”; Codex has no slash-command parser). Reuses the same inline-button machinery as `/choices`, so a tap on a busy agent **queues** the command. Refuses while an agent decision prompt is already active in the topic (answer or dismiss it first). Shows the first 12; only the pane agent's *own* runtime is read (panes are local to herdres).
 
 **`/debug`** — Show technical mapping details for troubleshooting: which pane id and topic this thread is bound to, and route metadata. Use this to confirm a topic is wired to the pane you expect.
 
@@ -151,7 +154,7 @@ Plain text (no leading `/`) typed in a pane topic is handled by context:
 
 - If the agent just asked a **detail question** and you are replying to that prompt, your text is sent as the detail answer.
 - If **implicit send** is enabled (`implicit_send_enabled` in state), if you addressed a managed pane bot, if you **reply** to a pane message, if you have a live **active pane** from `/agents`, or if the topic maps to exactly one live pane, your text is **forwarded to the pane** (same idle-vs-working behavior as `/send`).
-- Otherwise herdres replies: *"This is a mapped Herdr pane topic. Use /send <text> to forward to this pane, or /help."* (so a stray message isn't silently injected).
+- Otherwise herdres replies: *"Not sure which agent this is for. Reply to a message in that agent's thread, send /agents to pick one (replies then route there), or use /send <text>."* (so a stray message isn't silently injected).
 
 Plain text follows the same queue/interrupt rules as `/send` — to a busy agent it queues.
 
@@ -185,6 +188,7 @@ This means: you can paste a long brief or a multi-paragraph goal into a pane top
 | See what's on the pane's screen | `/raw` |
 | Re-surface the last report/question | `/status` |
 | Re-show decision buttons | `/choices` |
+| See & run the agent's own skills/commands | `/skills` |
 | Spin up another agent here | `/new <codex\|claude\|kimi\|omp\|devin>` |
 | Pick which agent a shared topic addresses | `/agents` (per-space mode) |
 | Switch this space's bot voice | `/voice shared\|per_agent` |

@@ -37,6 +37,7 @@ def _load_script(filename: str, module_name: str) -> None:
 # Load all script modules at collection time.
 _load_script("herdres.py", "herdres")
 _load_script("herdr_turn_adapter.py", "herdr_turn_adapter")
+_load_script("herdres_decision_hook.py", "herdres_decision_hook")
 _load_script("herdr_topic_bridge.py", "herdr_topic_bridge")
 _load_script("herdres_gateway.py", "herdres_gateway_managed")
 _load_script("herdres-gateway.py", "herdres_gateway_upstream")
