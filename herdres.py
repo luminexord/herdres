@@ -8541,6 +8541,7 @@ def classify_telegram_error(exc: Exception, *, managed_bot_context: bool = False
         or "forum topic not found" in text
         or "topic not found" in text
         or "topic_deleted" in text
+        or "topic_id_invalid" in text
     ):
         return "topic_not_found"
     if (
