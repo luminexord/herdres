@@ -181,6 +181,145 @@ class VoiceCommandReplyTests(unittest.TestCase):
         self.assertIn("speech-to-text is unavailable", result["reply"])
         send_to_pane.assert_not_called()
 
+    # --- the off-lock pretranscribed path (issue #4 perf) -------------------------------------
+    def test_pretranscribed_skips_download_and_stt(self) -> None:
+        # When pretranscribe_voice_payload already produced the transcript OFF the lock, the voice
+        # arm must NOT download or transcribe again (that's the whole point — no lock-held I/O).
+        speech = Mock()
+        speech.speech_echo_transcript_enabled.return_value = True
+        payload = _voice_payload()
+        payload["_speech_pretranscribed"] = True
+        payload["_speech_transcript"] = "already heard off the lock"
+        result, send_to_pane, deliver, send_message = self._run(speech=speech, payload=payload)
+        deliver.assert_not_called()
+        speech.speech_request.assert_not_called()
+        speech.speech_input_enabled.assert_not_called()
+        send_to_pane.assert_called_once()
+        self.assertEqual(send_to_pane.call_args.args[1], "already heard off the lock")
+        self.assertTrue(any("Heard" in str(a) for a in send_message.call_args.args))
+        self.assertIn("Sent your voice message", result["reply"])
+
+    def test_pretranscribed_empty_is_graceful(self) -> None:
+        speech = Mock()
+        payload = _voice_payload()
+        payload["_speech_pretranscribed"] = True
+        payload["_speech_transcript"] = ""  # download ran off-lock but STT yielded nothing
+        result, send_to_pane, deliver, _ = self._run(speech=speech, payload=payload)
+        self.assertIn("speech-to-text is unavailable", result["reply"])
+        deliver.assert_not_called()
+        send_to_pane.assert_not_called()
+
+    def test_pretranscribed_caption_appended(self) -> None:
+        speech = Mock()
+        speech.speech_echo_transcript_enabled.return_value = False
+        payload = _voice_payload(caption="be terse")
+        payload["_speech_pretranscribed"] = True
+        payload["_speech_transcript"] = "the body"
+        _, send_to_pane, _, _ = self._run(speech=speech, payload=payload)
+        self.assertIn("the body", send_to_pane.call_args.args[1])
+        self.assertIn("be terse", send_to_pane.call_args.args[1])
+
+
+class VoicePretranscribeTests(unittest.TestCase):
+    """pretranscribe_voice_payload runs the download + STT BEFORE the lock; strictly fail-open."""
+
+    def test_eligible_voice_sets_transcript(self) -> None:
+        speech = Mock()
+        speech.speech_input_enabled.return_value = True
+        speech.speech_request.return_value = {"text": "hello from off the lock"}
+        with patch.multiple(
+            herdres, herdres_speech=speech,
+            telegram_get_file=Mock(return_value={"file_path": "f/p", "file_size": 5000}),
+            download_telegram_file=Mock(return_value=5000),
+        ):
+            out = herdres.pretranscribe_voice_payload(_voice_payload())
+        self.assertTrue(out.get("_speech_pretranscribed"))
+        self.assertEqual(out["_speech_transcript"], "hello from off the lock")
+        self.assertEqual(speech.speech_request.call_args.args[0], "stt")
+
+    def test_disabled_returns_unchanged(self) -> None:
+        speech = Mock()
+        speech.speech_input_enabled.return_value = False
+        with patch.object(herdres, "herdres_speech", speech):
+            out = herdres.pretranscribe_voice_payload(_voice_payload())
+        self.assertNotIn("_speech_pretranscribed", out)
+
+    def test_module_absent_returns_unchanged(self) -> None:
+        with patch.object(herdres, "herdres_speech", None):
+            out = herdres.pretranscribe_voice_payload(_voice_payload())
+        self.assertNotIn("_speech_pretranscribed", out)
+
+    def test_non_voice_returns_unchanged(self) -> None:
+        out = herdres.pretranscribe_voice_payload({"chat_id": "-1001", "text": "hi"})
+        self.assertNotIn("_speech_pretranscribed", out)
+
+    def test_oversized_returns_unchanged(self) -> None:
+        speech = Mock()
+        speech.speech_input_enabled.return_value = True
+        payload = _voice_payload()
+        payload["attachment"]["file_size"] = herdres.ATTACHMENT_MAX_BYTES + 1
+        with patch.object(herdres, "herdres_speech", speech):
+            out = herdres.pretranscribe_voice_payload(payload)
+        self.assertNotIn("_speech_pretranscribed", out)
+
+    def test_download_error_is_failopen(self) -> None:
+        # A download/network failure must fall back to the in-lock path, not crash the command.
+        speech = Mock()
+        speech.speech_input_enabled.return_value = True
+        with patch.multiple(
+            herdres, herdres_speech=speech,
+            telegram_get_file=Mock(side_effect=herdres.BridgeError("nope")),
+        ):
+            out = herdres.pretranscribe_voice_payload(_voice_payload())
+        self.assertNotIn("_speech_pretranscribed", out)
+
+
+class SpeechFlushOnceTests(unittest.TestCase):
+    """speech_flush_once sends every ready spoken reply now (poked by the sidecar)."""
+
+    def _state_with_pending(self, n: int) -> dict:
+        st = _state()
+        st["panes"] = {
+            f"p{i}": {"pane_key": f"p{i}", "pane_id": f"p{i}", "space_key": "sp", "topic_id": "77",
+                      "pending_speech_reply": {"turn_id": f"T{i}", "path": "/x.ogg", "ticks": 0}}
+            for i in range(n)
+        }
+        return st
+
+    def _patch(self, state, flush, save=None):
+        return patch.multiple(
+            herdres, load_dotenv=Mock(), load_state=Mock(return_value=state), save_state=save or Mock(),
+            configure_telegram_state=Mock(return_value=(state["telegram"], "-1001")),
+            managed_bot_token_for_entry=Mock(return_value=None),
+            flush_pending_speech_reply=flush,
+        )
+
+    def test_flushes_each_pending_pane(self) -> None:
+        state = self._state_with_pending(2)
+        flush = Mock(return_value=True)
+        with self._patch(state, flush):
+            out = herdres.speech_flush_once()
+        self.assertEqual(flush.call_count, 2)
+        self.assertEqual(out["flushed"], 2)
+        self.assertTrue(out["ok"])
+
+    def test_no_pending_is_noop(self) -> None:
+        state = _state()  # the one pane has no pending_speech_reply
+        flush, save = Mock(return_value=True), Mock()
+        with self._patch(state, flush, save=save):
+            out = herdres.speech_flush_once()
+        flush.assert_not_called()
+        save.assert_not_called()
+        self.assertEqual(out["flushed"], 0)
+
+    def test_one_bad_entry_does_not_wedge_the_rest(self) -> None:
+        state = self._state_with_pending(2)
+        flush = Mock(side_effect=[RuntimeError("boom"), True])
+        with self._patch(state, flush):
+            herdres.speech_flush_once()
+        self.assertEqual(flush.call_count, 2)  # the second pane is still attempted
+        self.assertNotIn("pending_speech_reply", state["panes"]["p0"])  # the bad one is dropped
+
 
 # --- engine module ----------------------------------------------------------------------------
 
