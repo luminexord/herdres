@@ -592,6 +592,7 @@ def normalize_state(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("spaces", {})
     data.setdefault("panes", {})
     migrate_legacy_pane_topics(data)
+    migrate_space_origins(data)
     migrate_space_voice_mode(data)
     clear_disabled_visible_choice_state(data)
     return data
@@ -620,23 +621,29 @@ def load_state() -> dict[str, Any]:
     return normalize_state(data)
 
 
-def save_state(state: dict[str, Any]) -> None:
+def save_state(state, *, mirror_bak=False) -> None:
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
     payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
-    if path.exists():
+    if path.exists() and not mirror_bak:
         backup = path.with_suffix(path.suffix + ".bak")
         try:
             backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
         except OSError:
             pass
-    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(payload)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp_name, path)
+
+    def write_atomic(target: Path, content: str) -> None:
+        fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, target)
+
+    write_atomic(path, payload)
+    if mirror_bak:
+        write_atomic(path.with_suffix(path.suffix + ".bak"), payload)
 
 
 def sanitize_text(text: str, max_chars: int = MAX_REPLY_CHARS) -> str:
@@ -959,6 +966,9 @@ def managed_bot_kind_for_entry(entry: dict[str, Any], pane: dict[str, Any] | Non
     if explicit in managed_bot_specs():
         return explicit
     if pane:
+        council_kind = managed_bot_kind_for_council_seat(council_seat_slug_from_entry_like(pane, pane))
+        if council_kind:
+            return council_kind
         if managed_bot_kind_for_agent(str(pane.get("agent") or "")) == "devin":
             model_kind = devin_model_managed_bot_kind_from_label(
                 " ".join(str(pane.get(key) or "") for key in ("label", "name", "title", "pane_thread_name"))
@@ -968,6 +978,9 @@ def managed_bot_kind_for_entry(entry: dict[str, Any], pane: dict[str, Any] | Non
         kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
         if kind:
             return kind
+    council_kind = managed_bot_kind_for_council_seat(council_seat_slug_from_entry_like(entry))
+    if council_kind:
+        return council_kind
     if managed_bot_kind_for_agent(str(entry.get("agent") or "")) == "devin":
         model_kind = devin_model_managed_bot_kind_from_label(
             " ".join(str(entry.get(key) or "") for key in ("pane_label_raw", "pane_thread_name", "topic_name", "label"))
@@ -982,7 +995,10 @@ def managed_bot_token_for_entry(
     entry: dict[str, Any],
     pane: dict[str, Any] | None = None,
 ) -> str | None:
-    enabled = entry.get("managed_voice_active") if isinstance(entry, dict) and "managed_voice_active" in entry else managed_bot_setup_enabled()
+    if isinstance(entry, dict) and "managed_voice_active" in entry:
+        enabled = bool(entry.get("managed_voice_active"))
+    else:
+        enabled = bool(managed_bot_setup_enabled() and not (isinstance(entry, dict) and entry.get("space_key")))
     if not enabled or not isinstance(telegram, dict):
         return None
     kind = managed_bot_kind_for_entry(entry, pane)
@@ -1454,7 +1470,7 @@ def workspace_label_map(deadline: float | None = None) -> dict[str, str]:
         return {}
     try:
         data = herdr_json(["workspace", "list"], timeout=(8 if deadline is None else _bounded_timeout(deadline)))
-    except BridgeError:
+    except Exception:
         return {}
     if not isinstance(data, dict):
         return {}
@@ -1467,7 +1483,7 @@ def workspace_label_map(deadline: float | None = None) -> dict[str, str]:
             continue
         workspace_id = str(workspace.get("workspace_id") or "")
         label = clean_space_topic_title(str(workspace.get("label") or ""), fallback="")
-        if workspace_id and label:
+        if workspace_id:
             labels[workspace_id] = label
     return labels
 
@@ -1626,6 +1642,87 @@ def space_key(pane: dict[str, Any]) -> str:
         return f"cwd:{cwd_name}"
     return "default"
 
+COUNCIL_LABEL_RE = re.compile(r"^\s*council-([A-Za-z0-9_.-]+)", re.IGNORECASE)
+COUNCIL_WORKSPACE_MARKERS = ("gitmoot", "local-as", "local_as")
+
+
+def clean_council_seat_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+def council_seat_slug_from_text(value: str | None) -> str:
+    match = COUNCIL_LABEL_RE.match(str(value or "").strip())
+    return clean_council_seat_slug(match.group(1)) if match else ""
+
+
+def council_seat_slug_from_entry_like(entry: dict[str, Any], pane: dict[str, Any] | None = None) -> str:
+    for obj in (pane, entry):
+        if not isinstance(obj, dict):
+            continue
+        for key in ("pane_thread_name", "label", "name", "title", "pane_label_raw", "topic_name"):
+            slug = council_seat_slug_from_text(str(obj.get(key) or ""))
+            if slug:
+                return slug
+    return ""
+
+
+def managed_bot_kind_for_council_seat(seat_slug: str) -> str:
+    slug = clean_council_seat_slug(seat_slug)
+    if slug in managed_bot_specs():
+        return slug
+    return managed_bot_kind_for_agent(slug)
+
+
+def council_seat_slug_for_pane(pane: dict[str, Any]) -> str:
+    if not isinstance(pane, dict):
+        return ""
+    slug = council_seat_slug_from_entry_like(pane, pane)
+    if slug:
+        return slug
+    kind = managed_bot_kind_for_entry(pane, pane)
+    return kind if kind in managed_bot_specs() else ""
+
+
+def council_seat_slug_for_entry(entry: dict[str, Any]) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    slug = council_seat_slug_from_entry_like(entry)
+    if slug:
+        return slug
+    kind = managed_bot_kind_for_entry(entry)
+    return kind if kind in managed_bot_specs() else ""
+
+
+def workspace_id_from_pane_or_key(pane: dict[str, Any], space_key_value: str) -> str:
+    if isinstance(pane, dict):
+        for key in ("workspace_id", "workspace", "space_id"):
+            value = str(pane.get(key) or "").strip()
+            if value:
+                return value
+    for prefix in ("workspace:", "space:"):
+        if str(space_key_value).startswith(prefix):
+            return str(space_key_value)[len(prefix):].strip()
+    return ""
+
+
+def is_council_pane(pane) -> bool:
+    if not isinstance(pane, dict):
+        return False
+    if council_seat_slug_from_entry_like(pane, pane):
+        return True
+    workspace_text = " ".join(
+        str(pane.get(key) or "") for key in ("space_name", "workspace_label", "workspace_name")
+    ).lower()
+    return any(marker in workspace_text for marker in COUNCIL_WORKSPACE_MARKERS)
+
+
+def council_space_topic_name(pane, space_key) -> str:
+    workspace_id = workspace_id_from_pane_or_key(pane if isinstance(pane, dict) else {}, str(space_key or ""))
+    root = workspace_id.lstrip("wW")[:8] if workspace_id else ""
+    if not root:
+        root = hashlib.sha1(str(space_key or "").encode("utf-8")).hexdigest()[:8]
+    return clean_space_topic_title(f"Council · {root}", fallback="Council")
+
 
 def clean_space_topic_title(value: str, *, fallback: str = "Herdr Space") -> str:
     text = sanitize_text(value, 80)
@@ -1654,6 +1751,9 @@ def agent_topic_name_for_pane(pane: dict[str, Any]) -> str:
 
 
 def space_name_for_pane(pane: dict[str, Any]) -> str:
+    key = space_key(pane)
+    if is_council_pane(pane):
+        return council_space_topic_name(pane, key)
     if per_agent_topics_enabled():
         return agent_topic_name_for_pane(pane)
     explicit_name = clean_space_topic_title(
@@ -1823,11 +1923,15 @@ def ensure_space_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str
     spaces = state.setdefault("spaces", {})
     entry = spaces.get(key)
     changed = False
+    council = is_council_pane(pane)
     if not isinstance(entry, dict):
         preserved = state.get("_preserved_voice_mode") if isinstance(state.get("_preserved_voice_mode"), dict) else {}
-        vm = preserved.pop(key, None) or "shared"
+        vm = preserved.pop(key, None) or ("per_agent" if council else "shared")
         entry = {"space_key": key, "created_at": utc_now(), "pane_keys": [], "voice_mode": vm}
         spaces[key] = entry
+        changed = True
+    if not entry.get("origin"):
+        entry["origin"] = "council" if council else "personal"
         changed = True
     if entry.get("space_key") != key:
         entry["space_key"] = key
@@ -1843,14 +1947,14 @@ def ensure_space_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str
     if workspace_label and entry.get("workspace_name") != workspace_label:
         entry["workspace_name"] = workspace_label
         changed = True
-    topic_name = space_name_for_pane(pane)
+    topic_name = council_space_topic_name(pane, key) if council else space_name_for_pane(pane)
     current_topic_name = str(entry.get("topic_name") or "")
     if not current_topic_name:
         entry["topic_name"] = topic_name
         changed = True
-    elif workspace_label and current_topic_name != topic_name:
+    elif (workspace_label or council) and current_topic_name != topic_name:
         entry["topic_name"] = topic_name
-        entry["topic_title_source"] = "workspace-label"
+        entry["topic_title_source"] = "council" if council else "workspace-label"
         if entry.get("topic_id"):
             entry["topic_rename_pending_at"] = utc_now()
             entry["topic_rename_from"] = current_topic_name
@@ -1858,8 +1962,51 @@ def ensure_space_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str
             entry.pop("last_topic_verified_at", None)
         changed = True
     pane_keys = entry.setdefault("pane_keys", [])
+    if not isinstance(pane_keys, list):
+        pane_keys = []
+        entry["pane_keys"] = pane_keys
+        changed = True
     key_for_pane = pane_key(pane)
-    if key_for_pane not in pane_keys:
+    normalized_pane_keys = [str(value) for value in pane_keys]
+    if normalized_pane_keys != pane_keys:
+        entry["pane_keys"] = normalized_pane_keys
+        pane_keys = normalized_pane_keys
+        changed = True
+    seat_slug = council_seat_slug_for_pane(pane) if council else ""
+    seat_slugs = entry.setdefault("pane_seat_slugs", {}) if seat_slug else {}
+    if seat_slug and not isinstance(seat_slugs, dict):
+        seat_slugs = {}
+        entry["pane_seat_slugs"] = seat_slugs
+        changed = True
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    if seat_slug:
+        next_pane_keys: list[str] = []
+        insert_at: int | None = None
+        for existing_key in pane_keys:
+            existing_entry = panes.get(str(existing_key))
+            existing_slug = str(seat_slugs.get(str(existing_key)) or "") if isinstance(seat_slugs, dict) else ""
+            if not existing_slug:
+                existing_slug = council_seat_slug_for_entry(existing_entry)
+            if str(existing_key) == key_for_pane or existing_slug == seat_slug:
+                if insert_at is None:
+                    insert_at = len(next_pane_keys)
+                if str(existing_key) != key_for_pane:
+                    changed = True
+                if isinstance(seat_slugs, dict):
+                    seat_slugs.pop(str(existing_key), None)
+                continue
+            next_pane_keys.append(str(existing_key))
+        if insert_at is None:
+            insert_at = len(next_pane_keys)
+        next_pane_keys.insert(insert_at, key_for_pane)
+        if next_pane_keys != pane_keys:
+            entry["pane_keys"] = next_pane_keys
+            pane_keys = next_pane_keys
+            changed = True
+        if isinstance(seat_slugs, dict) and seat_slugs.get(key_for_pane) != seat_slug:
+            seat_slugs[key_for_pane] = seat_slug
+            changed = True
+    elif key_for_pane not in pane_keys:
         pane_keys.append(key_for_pane)
         changed = True
     return key, entry, changed
@@ -1945,6 +2092,17 @@ def migrate_legacy_pane_topics(state: dict[str, Any]) -> bool:
     return changed
 
 
+def migrate_space_origins(state: dict[str, Any]) -> bool:
+    changed = False
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    for space in spaces.values():
+        if not isinstance(space, dict) or space.get("origin"):
+            continue
+        space["origin"] = "council" if space_is_council(state, space) else "personal"
+        changed = True
+    return changed
+
+
 def migrate_space_voice_mode(state: dict[str, Any]) -> bool:
     changed = False
     telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
@@ -1953,6 +2111,10 @@ def migrate_space_voice_mode(state: dict[str, Any]) -> bool:
     spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
     for space in spaces.values():
         if not isinstance(space, dict) or space.get("voice_mode"):
+            continue
+        if space_is_council(state, space):
+            space["voice_mode"] = "per_agent"
+            changed = True
             continue
         for pane_key_value in space.get("pane_keys") or []:
             entry = panes.get(str(pane_key_value))
@@ -10506,6 +10668,135 @@ def sync_pane_once(
             changed = True
     return changed
 
+def space_workspace_id(state: dict[str, Any], space_key_value: str, space: dict[str, Any]) -> str:
+    value = str(space.get("space_id") or "").strip()
+    if value:
+        return value
+    for prefix in ("workspace:", "space:"):
+        if str(space_key_value).startswith(prefix):
+            return str(space_key_value)[len(prefix):].strip()
+    if not str(space_key_value).startswith("agent:"):
+        return ""
+    agent_pane_id = str(space_key_value)[len("agent:"):].strip()
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    candidate_keys = [str(value) for value in space.get("pane_keys") or []]
+    candidate_keys.extend(str(key) for key in panes)
+    seen: set[str] = set()
+    for candidate_key in candidate_keys:
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        entry = panes.get(candidate_key)
+        if not isinstance(entry, dict):
+            continue
+        entry_pane_id = str(entry.get("pane_id") or "")
+        if agent_pane_id and entry_pane_id and entry_pane_id != agent_pane_id:
+            continue
+        if agent_pane_id and not entry_pane_id and not str(candidate_key).startswith(agent_pane_id):
+            continue
+        workspace_id = str(entry.get("workspace_id") or entry.get("workspace") or entry.get("space_id") or "").strip()
+        if workspace_id:
+            return workspace_id
+    return ""
+
+
+def space_is_council(state: dict[str, Any], space: dict[str, Any]) -> bool:
+    if not isinstance(space, dict):
+        return False
+    if str(space.get("origin") or "").strip().lower() == "personal":
+        return False
+    workspace_text = " ".join(str(space.get(key) or "") for key in ("workspace_name", "topic_name")).lower()
+    if workspace_text.startswith("council ") or any(marker in workspace_text for marker in COUNCIL_WORKSPACE_MARKERS):
+        return True
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    space_key_value = str(space.get("space_key") or "")
+    for pane_key_value in space.get("pane_keys") or []:
+        entry = panes.get(str(pane_key_value))
+        if isinstance(entry, dict) and is_council_pane(entry):
+            return True
+    if space_key_value:
+        for entry in panes.values():
+            if isinstance(entry, dict) and str(entry.get("space_key") or "") == space_key_value and is_council_pane(entry):
+                return True
+    return False
+
+
+def prune_orphan_spaces(state, chat_id, telegram, live_workspace_ids, live_panes, *, delete_cap=None) -> int:
+    """Prune herdres spaces whose backing herdr workspace is gone AND that have no
+    live pane. Returns the count pruned. Deletes the Telegram forum topic via the
+    existing delete_topic() before removing space+panes from state. Caller invokes
+    save_state(state, mirror_bak=True) iff this returns > 0."""
+    _ = telegram
+    live_workspace_set = {str(value) for value in (live_workspace_ids or []) if str(value)}
+    if not live_workspace_set:
+        return 0
+    try:
+        cap = DUPLICATE_TOPIC_DELETE_LIMIT if delete_cap is None else max(0, int(delete_cap))
+    except (TypeError, ValueError):
+        cap = DUPLICATE_TOPIC_DELETE_LIMIT
+    if cap <= 0:
+        return 0
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    live_pane_key_set = {pane_key(pane) for pane in (live_panes or []) if isinstance(pane, dict)}
+    live_space_key_set = {space_key(pane) for pane in (live_panes or []) if isinstance(pane, dict)}
+    pruned = 0
+    for space_key_value, space in list(spaces.items()):
+        if pruned >= cap:
+            break
+        if not isinstance(space, dict):
+            continue
+        if not space.get("origin"):
+            space["origin"] = "council" if space_is_council(state, space) else "personal"
+        if str(space.get("origin") or "").strip().lower() == "personal":
+            continue
+        topic_id = space.get("topic_id")
+        if not topic_id:
+            continue
+        workspace_id = space_workspace_id(state, str(space_key_value), space)
+        if not workspace_id or workspace_id in live_workspace_set:
+            continue
+        pane_keys = [str(value) for value in space.get("pane_keys") or []]
+        if live_entries_for_space(state, space):
+            continue
+        if any(key in live_pane_key_set for key in pane_keys) or str(space_key_value) in live_space_key_set:
+            continue
+        status = ""
+        try:
+            if delete_topic(chat_id, topic_id):
+                status = "deleted"
+            else:
+                continue
+        except Exception as exc:
+            kind = classify_telegram_error(exc)
+            if kind != "topic_not_found":
+                continue
+            status = kind
+        removed_pane_keys = set(pane_keys)
+        for pane_key_value, entry in list(panes.items()):
+            if isinstance(entry, dict) and str(entry.get("space_key") or "") == str(space_key_value):
+                removed_pane_keys.add(str(pane_key_value))
+        for pane_key_value in removed_pane_keys:
+            panes.pop(str(pane_key_value), None)
+        spaces.pop(space_key_value, None)
+        audit = {
+            "space_key": str(space_key_value),
+            "workspace_id": workspace_id,
+            "topic_id": topic_id,
+            "topic_name": str(space.get("topic_name") or ""),
+            "reason": "workspace_not_found",
+            "status": status,
+            "pruned_at": utc_now(),
+        }
+        deleted = state.setdefault("deleted_orphan_topics", [])
+        if isinstance(deleted, list):
+            deleted.append(audit)
+            state["deleted_orphan_topics"] = deleted[-200:]
+        else:
+            state["deleted_orphan_topics"] = [audit]
+        pruned += 1
+    return pruned
+
 
 def sync_once() -> dict[str, Any]:
     load_dotenv()
@@ -10538,6 +10829,18 @@ def sync_once() -> dict[str, Any]:
     counters = make_sync_counters(sends=sends)
     caps = make_sync_caps()
     pinned_status_updated = 0
+    workspace_labels = workspace_label_map()
+    orphan_pruned = prune_orphan_spaces(
+        state,
+        chat_id,
+        telegram,
+        set(workspace_labels),
+        panes,
+        delete_cap=DUPLICATE_TOPIC_DELETE_LIMIT,
+    )
+    if orphan_pruned:
+        changed = True
+        save_state(state, mirror_bak=True)
 
     if not panes:
         pinned_result = reconcile_pinned_status_views(state, chat_id, panes, counters, caps["max_sends"])
