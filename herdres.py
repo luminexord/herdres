@@ -2065,12 +2065,12 @@ def gitmoot_delegation_ref_from_pane(pane) -> tuple[str, str] | None:
     return root_job_id, delegation_id
 
 
-def gitmoot_job_show(job_ref, *, timeout=3) -> dict | None:
+def gitmoot_job_show(job_ref, *, timeout=3) -> str | None:
     ref = str(job_ref or "").strip()
     if not ref:
         return None
     try:
-        proc = run_cmd(["gitmoot", "job", "show", ref, "--json"], timeout=timeout)
+        proc = run_cmd(["gitmoot", "job", "show", ref], timeout=timeout)
     except (subprocess.TimeoutExpired, OSError):
         return None
     if getattr(proc, "returncode", 1) != 0:
@@ -2078,27 +2078,34 @@ def gitmoot_job_show(job_ref, *, timeout=3) -> dict | None:
     stdout = getattr(proc, "stdout", "") or ""
     if isinstance(stdout, bytes):
         stdout = stdout.decode("utf-8", "replace")
-    try:
-        payload = json.loads(str(stdout))
-    except (TypeError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) and payload else None
+    text = str(stdout).strip()
+    return text or None
 
 
-def _gitmoot_job_payload(job_json: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(job_json, dict):
+GITMOOT_JOB_TEXT_HEADER_RE = re.compile(r"^([a-z_][a-z0-9_]*)\s*:\s?(.*)$")
+
+
+def _parse_gitmoot_job_text(text) -> dict:
+    if not isinstance(text, str):
         return {}
-    result = job_json.get("result")
-    if isinstance(result, dict):
-        job = result.get("job")
-        if isinstance(job, dict):
-            return job
-        return result
-    job = job_json.get("job")
-    if isinstance(job, dict):
-        return job
-    return job_json
+    fields: dict[str, str] = {}
+    key = ""
+    chunks: list[str] = []
 
+    def flush() -> None:
+        if key:
+            fields[key] = "\n".join(chunks).strip()
+
+    for line in text.splitlines():
+        match = GITMOOT_JOB_TEXT_HEADER_RE.match(line)
+        if match:
+            flush()
+            key = match.group(1)
+            chunks = [match.group(2)]
+        elif key:
+            chunks.append(line)
+    flush()
+    return fields
 
 def _gitmoot_filtered_model_text(value: Any) -> str:
     if not isinstance(value, str):
@@ -2106,40 +2113,10 @@ def _gitmoot_filtered_model_text(value: Any) -> str:
     lines = [line.rstrip() for line in sanitize_text(value, FINAL_REPLY_MAX_CHARS).splitlines() if not is_gitmoot_workflow_event(line)]
     return sanitize_text("\n".join(lines[:FINAL_REPLY_MAX_LINES]).strip(), FINAL_REPLY_MAX_CHARS).strip()
 
-
-def _gitmoot_raw_output_text(raw_outputs: Any) -> str:
-    if not isinstance(raw_outputs, list):
+def gitmoot_job_model_content(fields) -> str:
+    if not isinstance(fields, dict):
         return ""
-    chunks: list[str] = []
-    for item in raw_outputs:
-        if is_gitmoot_workflow_event(item):
-            continue
-        if isinstance(item, str):
-            text = _gitmoot_filtered_model_text(item)
-        elif isinstance(item, dict):
-            text = ""
-            for key in ("artifact_body", "summary", "text", "content", "body", "output", "stdout"):
-                candidate = item.get(key)
-                if isinstance(candidate, str):
-                    text = _gitmoot_filtered_model_text(candidate)
-                    if text:
-                        break
-        else:
-            text = ""
-        if text:
-            chunks.append(text)
-    return _gitmoot_filtered_model_text("\n".join(chunks))
-
-
-def gitmoot_job_model_content(job_json) -> str:
-    payload = _gitmoot_job_payload(job_json)
-    if not payload:
-        return ""
-    for key in ("artifact_body", "summary"):
-        text = _gitmoot_filtered_model_text(payload.get(key))
-        if text:
-            return text
-    return _gitmoot_raw_output_text(payload.get("raw_outputs"))
+    return _gitmoot_filtered_model_text(fields.get("summary", ""))
 
 
 def gitmoot_council_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
@@ -2151,20 +2128,20 @@ def gitmoot_council_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> di
     root_job_id, delegation_id = ref_parts
     job_ref = f"{root_job_id}/delegation/{delegation_id}"
     try:
-        job_json = gitmoot_job_show(job_ref)
-        content = gitmoot_job_model_content(job_json)
+        job_text = gitmoot_job_show(job_ref)
+        fields = _parse_gitmoot_job_text(job_text or "")
+        content = gitmoot_job_model_content(fields)
     except Exception:
         return None
     if not content:
         return None
-    payload = _gitmoot_job_payload(job_json or {})
     revision = ""
     for key in ("revision", "rev", "version", "updated_at", "completed_at", "finished_at"):
-        value = str(payload.get(key) or "").strip()
+        value = str(fields.get(key) or "").strip()
         if value:
             revision = sanitize_text(value, 80)
             break
-    stable_ref = sanitize_text(str(payload.get("job_ref") or payload.get("ref") or job_ref), 180)
+    stable_ref = sanitize_text(str(fields.get("job_ref") or fields.get("ref") or job_ref), 180)
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
     marker = f"{stable_ref}@{revision}:{content_hash}" if revision else f"{stable_ref}:{content_hash}"
     if str(entry.get("last_council_job_ref") or "") == marker:

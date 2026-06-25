@@ -56,12 +56,24 @@ class CouncilGitmootOutputTests(unittest.TestCase):
                 self.assertTrue(herdres.is_gitmoot_workflow_event(f'{{"event":"{event}"}}'))
                 self.assertFalse(herdres.is_gitmoot_workflow_event(f"The model discussed {event} as prose."))
 
+    def test_gitmoot_job_show_invokes_plain_text_command_and_strips_stdout(self) -> None:
+        run_cmd = Mock(return_value=SimpleNamespace(returncode=0, stdout="\n summary: Council answer \n\n"))
+
+        with patch.object(herdres, "run_cmd", run_cmd):
+            self.assertEqual(
+                herdres.gitmoot_job_show(" root_1/delegation/d1 ", timeout=0.01),
+                "summary: Council answer",
+            )
+
+        run_cmd.assert_called_once_with(["gitmoot", "job", "show", "root_1/delegation/d1"], timeout=0.01)
+        self.assertNotIn("--json", run_cmd.call_args.args[0])
+
     def test_gitmoot_job_show_fails_closed(self) -> None:
         cases = [
             subprocess.TimeoutExpired(["gitmoot"], 3),
-            SimpleNamespace(returncode=1, stdout='{"ok":true}'),
-            SimpleNamespace(returncode=0, stdout="not-json"),
-            FileNotFoundError("gitmoot"),
+            SimpleNamespace(returncode=1, stdout="summary: ignored"),
+            SimpleNamespace(returncode=0, stdout=" \n\t"),
+            OSError("gitmoot"),
         ]
 
         for outcome in cases:
@@ -70,35 +82,77 @@ class CouncilGitmootOutputTests(unittest.TestCase):
                 with patch.object(herdres, "run_cmd", run_cmd):
                     self.assertIsNone(herdres.gitmoot_job_show("root_1/delegation/d1", timeout=0.01))
 
-    def test_gitmoot_job_model_content_prefers_and_filters_model_text(self) -> None:
-        self.assertEqual(
-            herdres.gitmoot_job_model_content({"job": {"artifact_body": "advance_started\nArtifact answer", "summary": "Summary answer"}}),
-            "Artifact answer",
+    def test_gitmoot_job_text_parser_keeps_multiline_summary_until_next_header(self) -> None:
+        fields = herdres._parse_gitmoot_job_text(
+            "job_ref: root_1/delegation/d1\n"
+            "revision: rev1\n"
+            "summary: First line\n"
+            "advance_started\n"
+            '{"event":"advance_completed"}\n'
+            "Final line\n"
+            " detail: still summary\n"
+            "agent: codex\n"
+            "payload: ignored\n"
         )
+
         self.assertEqual(
-            herdres.gitmoot_job_model_content({"result": {"job": {"summary": "advance_completed\nSummary answer"}}}),
-            "Summary answer",
+            fields["summary"],
+            'First line\nadvance_started\n{"event":"advance_completed"}\nFinal line\n detail: still summary',
         )
+        self.assertEqual(fields["agent"], "codex")
+        self.assertEqual(fields["payload"], "ignored")
+        self.assertNotIn("agent:", fields["summary"])
+
+    def test_gitmoot_job_model_content_uses_summary_only_and_filters_lifecycle(self) -> None:
+        fields = {
+            "summary": (
+                "advance_started\n"
+                "Council answer\n"
+                '{"event":"advance_completed"}\n'
+                "delegation_worktree_removed\n"
+                "Final line"
+            ),
+            "payload": "Payload answer",
+            "raw_outputs": ["Raw answer"],
+            "artifact_body": "Artifact answer",
+        }
+
+        self.assertEqual(herdres.gitmoot_job_model_content(fields), "Council answer\nFinal line")
         self.assertEqual(
             herdres.gitmoot_job_model_content({
-                "job": {
-                    "raw_outputs": [
-                        {"event": "advance_failed", "message": "ignored workflow row"},
-                        "delegation_worktree_created: /tmp/worktree",
-                        "Raw answer",
-                        {"summary": "delegation_worktree_removed\nDict answer"},
-                    ]
-                }
+                "payload": "Payload answer",
+                "raw_outputs": ["Raw answer"],
+                "artifact_body": "Artifact answer",
             }),
-            "Raw answer\nDict answer",
+            "",
         )
+        self.assertEqual(herdres.gitmoot_job_model_content({"summary": ""}), "")
+
+    def test_gitmoot_council_feed_item_returns_none_for_empty_or_missing_summary(self) -> None:
+        pane = self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/root_1/d1/repo")
+        cases = [
+            "job_ref: root_1/delegation/d1\nrevision: rev1\nagent: codex\n",
+            "job_ref: root_1/delegation/d1\nsummary: \nagent: codex\n",
+        ]
+
+        for job_text in cases:
+            with self.subTest(job_text=job_text), patch.object(herdres, "gitmoot_job_show", Mock(return_value=job_text)):
+                self.assertIsNone(herdres.gitmoot_council_feed_item(pane, {}))
 
     def test_sync_posts_gitmoot_council_output_once_via_resolved_seat_bot(self) -> None:
         pane = self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/root_1/d1/repo")
         telegram = {"managed_bots": {"codex": {"token": "CODEX_TOKEN", "enabled": True}}}
-        job = {"result": {"job": {"job_ref": "root_1/delegation/d1", "revision": "rev1", "artifact_body": "Council answer"}}}
+        job_text = (
+            "job_ref: root_1/delegation/d1\n"
+            "revision: rev1\n"
+            "agent: codex\n"
+            "summary: Council answer\n"
+            "payload: Payload answer\n"
+            "raw_outputs: Raw answer\n"
+            "artifact_body: Artifact answer\n"
+        )
         send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
-        gitmoot_job_show = Mock(return_value=job)
+        gitmoot_job_show = Mock(return_value=job_text)
 
         with patch.object(herdres, "per_agent_topics_enabled", Mock(return_value=False)):
             space_key = herdres.space_key(pane)
@@ -142,65 +196,134 @@ class CouncilGitmootOutputTests(unittest.TestCase):
                 second_changed = herdres.sync_pane_once(state, "-1001", telegram, pane, counters, caps)
 
         self.assertTrue(first_changed)
-        self.assertTrue(second_changed)
+        self.assertFalse(second_changed)
         send_feed_item.assert_called_once()
         sent_item = send_feed_item.call_args.args[1]
         self.assertEqual(sent_item["assistant_final_text"], "Council answer")
+        self.assertNotIn("Payload answer", sent_item["assistant_final_text"])
+        self.assertNotIn("Raw answer", sent_item["assistant_final_text"])
+        self.assertNotIn("Artifact answer", sent_item["assistant_final_text"])
         self.assertEqual(send_feed_item.call_args.kwargs["thread_id"], "77")
         self.assertEqual(send_feed_item.call_args.kwargs["api_token"], "CODEX_TOKEN")
         self.assertEqual(gitmoot_job_show.call_args_list[0].args, ("root_1/delegation/d1",))
+        self.assertEqual(gitmoot_job_show.call_count, 2)
         entry = state["panes"][pane_key]
         self.assertTrue(entry["last_council_job_ref"].startswith("root_1/delegation/d1@rev1:"))
         self.assertEqual(state["panes"]["sibling-pane"]["last_council_job_ref"], "sibling-marker")
         self.assertEqual(counters["feed_sends"], 1)
 
-    def test_sync_ignores_gitmoot_query_failure_without_posting(self) -> None:
-        pane = self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/root_1/d1/repo")
-        telegram = {"managed_bots": {"codex": {"token": "CODEX_TOKEN", "enabled": True}}}
-        with patch.object(herdres, "per_agent_topics_enabled", Mock(return_value=False)):
-            space_key = herdres.space_key(pane)
-            pane_key = herdres.pane_key(pane)
-            state = {
-                "version": 1,
-                "telegram": telegram,
-                "spaces": {
-                    space_key: {
-                        "space_key": space_key,
-                        "topic_id": "77",
-                        "topic_name": herdres.council_space_topic_name(pane, space_key),
-                        "origin": "council",
-                        "voice_mode": "per_agent",
-                        "pane_keys": [pane_key],
-                        "message_routes": {},
-                    }
-                },
-                "panes": {},
-            }
-            counters, caps = self._sync_caps()
-            send_feed_item = Mock()
-            with patch.multiple(
-                herdres,
-                gitmoot_job_show=Mock(return_value=None),
-                extract_turn_feed_item=Mock(return_value=None),
-                send_pending_prompt_message=Mock(return_value={"changed": False, "topic_missing": False, "pane_root_missing": False}),
-                send_feed_item=send_feed_item,
-                save_state=Mock(),
-                apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
-                fold_superseded_turns=Mock(return_value=False),
-                flush_pending_plan_doc=Mock(return_value=False),
-                flush_pending_speech_reply=Mock(return_value=False),
-                pane_root_messages_enabled=Mock(return_value=False),
-                CLEAN_FEED_ENABLED=True,
-                TURN_FEED_ENABLED=True,
-                LIVE_CARD_ENABLED=False,
-                STATUS_MARKER_ENABLED=False,
-                STATUS_ICON_ENABLED=False,
-            ):
-                changed = herdres.sync_pane_once(state, "-1001", telegram, pane, counters, caps)
+    def test_sync_ignores_gitmoot_query_failure_or_empty_summary_without_posting(self) -> None:
+        cases = [
+            None,
+            "job_ref: root_1/delegation/d1\nrevision: rev1\nagent: codex\n",
+            "job_ref: root_1/delegation/d1\nsummary: \nagent: codex\n",
+        ]
 
-        self.assertTrue(changed)
-        send_feed_item.assert_not_called()
-        self.assertNotIn("last_council_job_ref", state["panes"][pane_key])
+        for job_text in cases:
+            with self.subTest(job_text=job_text):
+                pane = self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/root_1/d1/repo")
+                telegram = {"managed_bots": {"codex": {"token": "CODEX_TOKEN", "enabled": True}}}
+                with patch.object(herdres, "per_agent_topics_enabled", Mock(return_value=False)):
+                    space_key = herdres.space_key(pane)
+                    pane_key = herdres.pane_key(pane)
+                    state = {
+                        "version": 1,
+                        "telegram": telegram,
+                        "spaces": {
+                            space_key: {
+                                "space_key": space_key,
+                                "topic_id": "77",
+                                "topic_name": herdres.council_space_topic_name(pane, space_key),
+                                "origin": "council",
+                                "voice_mode": "per_agent",
+                                "pane_keys": [pane_key],
+                                "message_routes": {},
+                            }
+                        },
+                        "panes": {},
+                    }
+                    counters, caps = self._sync_caps()
+                    send_feed_item = Mock()
+                    with patch.multiple(
+                        herdres,
+                        gitmoot_job_show=Mock(return_value=job_text),
+                        extract_turn_feed_item=Mock(return_value=None),
+                        send_pending_prompt_message=Mock(return_value={"changed": False, "topic_missing": False, "pane_root_missing": False}),
+                        send_feed_item=send_feed_item,
+                        save_state=Mock(),
+                        apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+                        fold_superseded_turns=Mock(return_value=False),
+                        flush_pending_plan_doc=Mock(return_value=False),
+                        flush_pending_speech_reply=Mock(return_value=False),
+                        pane_root_messages_enabled=Mock(return_value=False),
+                        CLEAN_FEED_ENABLED=True,
+                        TURN_FEED_ENABLED=True,
+                        LIVE_CARD_ENABLED=False,
+                        STATUS_MARKER_ENABLED=False,
+                        STATUS_ICON_ENABLED=False,
+                    ):
+                        changed = herdres.sync_pane_once(state, "-1001", telegram, pane, counters, caps)
+
+                self.assertTrue(changed)
+                send_feed_item.assert_not_called()
+                self.assertNotIn("last_council_job_ref", state["panes"][pane_key])
+
+    def test_sync_ignores_gitmoot_job_show_failures_without_posting(self) -> None:
+        outcomes = [
+            subprocess.TimeoutExpired(["gitmoot"], 3),
+            SimpleNamespace(returncode=1, stdout="summary: ignored"),
+            OSError("gitmoot"),
+        ]
+
+        for outcome in outcomes:
+            with self.subTest(outcome=type(outcome).__name__):
+                pane = self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/root_1/d1/repo")
+                telegram = {"managed_bots": {"codex": {"token": "CODEX_TOKEN", "enabled": True}}}
+                with patch.object(herdres, "per_agent_topics_enabled", Mock(return_value=False)):
+                    space_key = herdres.space_key(pane)
+                    pane_key = herdres.pane_key(pane)
+                    state = {
+                        "version": 1,
+                        "telegram": telegram,
+                        "spaces": {
+                            space_key: {
+                                "space_key": space_key,
+                                "topic_id": "77",
+                                "topic_name": herdres.council_space_topic_name(pane, space_key),
+                                "origin": "council",
+                                "voice_mode": "per_agent",
+                                "pane_keys": [pane_key],
+                                "message_routes": {},
+                            }
+                        },
+                        "panes": {},
+                    }
+                    counters, caps = self._sync_caps()
+                    send_feed_item = Mock()
+                    run_cmd = Mock(side_effect=outcome) if isinstance(outcome, Exception) else Mock(return_value=outcome)
+                    with patch.multiple(
+                        herdres,
+                        run_cmd=run_cmd,
+                        extract_turn_feed_item=Mock(return_value=None),
+                        send_pending_prompt_message=Mock(return_value={"changed": False, "topic_missing": False, "pane_root_missing": False}),
+                        send_feed_item=send_feed_item,
+                        save_state=Mock(),
+                        apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+                        fold_superseded_turns=Mock(return_value=False),
+                        flush_pending_plan_doc=Mock(return_value=False),
+                        flush_pending_speech_reply=Mock(return_value=False),
+                        pane_root_messages_enabled=Mock(return_value=False),
+                        CLEAN_FEED_ENABLED=True,
+                        TURN_FEED_ENABLED=True,
+                        LIVE_CARD_ENABLED=False,
+                        STATUS_MARKER_ENABLED=False,
+                        STATUS_ICON_ENABLED=False,
+                    ):
+                        changed = herdres.sync_pane_once(state, "-1001", telegram, pane, counters, caps)
+
+                self.assertTrue(changed)
+                send_feed_item.assert_not_called()
+                self.assertNotIn("last_council_job_ref", state["panes"][pane_key])
 
     def test_clear_clean_feed_state_removes_council_job_ref(self) -> None:
         entry = {"last_clean_hash": "hash", "last_council_job_ref": "marker", "keep": "value"}
