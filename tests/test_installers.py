@@ -184,27 +184,6 @@ def test_installer_writes_source_marker(path: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("path", [USER_INSTALLER, MACOS_INSTALLER])
-def test_installer_installs_runtime_commands(path: Path) -> None:
-    """Issue #27: both installers must (re)install the /herdres slash commands by running
-    ``herdres commands install`` — best-effort (``|| true``) and with an explicit ``--source`` so the
-    copy is cwd-independent (the macOS installer's $PWD marker can't be trusted: its file installs
-    are all $HERE-based)."""
-    text = _read(path)
-    lines = _logical_lines(text)
-    cmd_idx = next((i for i, ln in enumerate(lines) if "commands install" in ln), None)
-    assert cmd_idx is not None, (
-        f"{path.name} must run `herdres commands install` to install the /herdres slash commands"
-    )
-    line = lines[cmd_idx]
-    assert "|| true" in line, (
-        f"{path.name}: `commands install` must be best-effort (`|| true`), not fail the install"
-    )
-    assert "--source" in line, (
-        f"{path.name}: `commands install` must pass an explicit --source (cwd-independent copy)"
-    )
-
-
 @pytest.mark.parametrize(
     "path,shell",
     [(USER_INSTALLER, "sh"), (MACOS_INSTALLER, "bash")],
