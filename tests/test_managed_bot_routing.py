@@ -421,3 +421,84 @@ class ManagedBotRoutingRepairTests(unittest.TestCase):
         self.assertIn("Telegram is rejecting", send_notice.call_args.args[2])
         buttons = send_notice.call_args.kwargs["reply_markup"]["inline_keyboard"][0]
         self.assertEqual(buttons[0]["url"], "https://t.me/herdr_codex_bot?startgroup=herdres")
+
+
+class CouncilSeatRoutingTests(unittest.TestCase):
+    def test_seat_to_kind_via_thread_name_fallback(self) -> None:
+        cases = {
+            "council-codex": "codex",
+            "council-claude": "claude",
+            "council-kimi": "kimi",
+            "council-glm": "glm",
+            "council-implement": "omp",
+            "council-omp-impl": "omp",
+            "council-lead": "claude",
+            "council-gate": "",
+        }
+        for seat, expected in cases.items():
+            with self.subTest(seat=seat):
+                entry = {"agent": "gm-local-as", "pane_thread_name": f"{seat} · d1 · main"}
+                self.assertEqual(herdres.managed_bot_kind_for_entry(entry), expected)
+
+    def test_empty_agent_still_uses_thread_name_fallback(self) -> None:
+        cases = {
+            "council-codex": "codex",
+            "council-claude": "claude",
+            "council-kimi": "kimi",
+            "council-glm": "glm",
+            "council-implement": "omp",
+            "council-omp-impl": "omp",
+            "council-lead": "claude",
+            "council-gate": "",
+        }
+        for seat, expected in cases.items():
+            with self.subTest(seat=seat):
+                entry = {"agent": "", "pane_thread_name": f"{seat} · d1 · main"}
+                self.assertEqual(herdres.managed_bot_kind_for_entry(entry), expected)
+
+    def test_human_topic_form_resolves_to_seat_kind(self) -> None:
+        entry = {"agent": "gm-local-as", "pane_label_topic_name": "Council Codex"}
+        self.assertEqual(herdres.managed_bot_kind_for_entry(entry), "codex")
+
+    def test_pane_thread_name_wins_over_entry_topic_form(self) -> None:
+        pane = {"agent": "gm-local-as", "pane_thread_name": "council-codex · d1 · main"}
+        entry = {"agent": "gm-local-as", "pane_label_topic_name": "Council Claude"}
+        self.assertEqual(herdres.managed_bot_kind_for_entry(entry, pane), "codex")
+
+    def test_real_seat_agent_never_consults_council_fallback(self) -> None:
+        self.assertEqual(herdres.managed_bot_kind_for_entry({"agent": "council-claude"}), "claude")
+        self.assertEqual(herdres.managed_bot_kind_for_entry({"agent": "claude"}), "claude")
+        self.assertEqual(
+            herdres.managed_bot_kind_for_entry(
+                {"agent": "codex", "pane_thread_name": "council-glm · d1 · main"}
+            ),
+            "codex",
+        )
+        self.assertEqual(
+            herdres.managed_bot_kind_for_entry(
+                {"agent": "claude", "pane_thread_name": "council-lead · d1 · main"}
+            ),
+            "claude",
+        )
+
+    def test_non_council_pane_has_no_managed_bot(self) -> None:
+        self.assertEqual(herdres.managed_bot_kind_for_entry({"agent": "", "label": "zsh"}), "")
+
+    def test_council_seat_managed_bot_kind_units(self) -> None:
+        cases = {
+            "council-codex · d1 · main": "codex",
+            "council-claude": "claude",
+            "council-kimi": "kimi",
+            "council-glm": "glm",
+            "council-implement": "omp",
+            "council-omp-impl": "omp",
+            "council-lead": "claude",
+            "council-gate": "",
+            "zsh": "",
+            "codex": "",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(herdres.council_seat_managed_bot_kind(text), expected)
+        self.assertEqual(herdres.council_seat_managed_bot_kind(None), "")
+        self.assertEqual(herdres.council_seat_managed_bot_kind(""), "")
