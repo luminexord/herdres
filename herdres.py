@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover - speech is strictly additive
     herdres_speech = None  # type: ignore
 
 
-HERDRES_VERSION = "0.3.0"
+HERDRES_VERSION = "0.4.0"
 
 DEFAULT_STATE = Path.home() / ".local/share/herdres/state.json"
 DEFAULT_ENV = Path(os.getenv("HERDRES_ENV", str(Path.home() / ".config/herdres/herdres.env"))).expanduser()
