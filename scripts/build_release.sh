@@ -50,10 +50,6 @@ herdres_decision_hook.py
 herdr_turn_adapter.py
 herdr_topic_bridge.py
 herdres-plugin/herdr-plugin.toml
-commands/herdres.md
-commands/herdres-setup.md
-commands/herdres-sync.md
-commands/herdres-status.md
 systemd/user/herdres.service
 systemd/user/herdres.timer
 systemd/user/herdres-gateway.service

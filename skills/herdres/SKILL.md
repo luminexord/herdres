@@ -94,10 +94,9 @@ Full table, idle-vs-busy semantics, plain-text routing, and the inbound-file rul
 
 ## Maintenance
 
-- `herdres status` — **read-only** health + roster snapshot; no Telegram, no writes, no secrets. Backs the `/herdres` slash commands (`herdres commands install`).
 - `herdres sync` — force one reconciliation pass (create/update topics, post pending reports). Driven by the timer; safe to run by hand. Non-blocking lock.
 - `herdres cleanup-duplicates` — **report** legacy duplicate topics (same pane mapped twice), read-only. Then `herdres cleanup-duplicates --delete` to remove them. Always inspect first; it never deletes a live topic, only a proven-dead closed-pane duplicate that strongly matches a live pane. Old topics left by a per-agent⇄per-space mode flip are **not** touched — delete those by hand.
-- `herdres probe [--thread-id <id>]` — send a throwaway rich message and delete it, to confirm wiring/permissions into a topic.
+- `herdres probe [--thread-id <id>]` — send a throwaway rich message and delete it, to confirm wiring and bot permissions into a specific topic.
 
 ## Safety rules
 

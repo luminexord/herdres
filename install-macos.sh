@@ -48,10 +48,6 @@ install -m 644 "$HERE/herdres_routing.py" "$BIN/herdres_routing.py"
 # tappable buttons; register it in ~/.claude/settings.json (idempotent, no-op without Claude Code).
 install_pinned herdres_decision_hook.py herdres-decision-hook
 "$BIN/herdres" hooks install >/dev/null 2>&1 || true
-# Runtime-native slash commands (issue #27): copy commands/herdres*.md -> ~/.claude/commands so
-# /herdres works in Claude Code. --source "$HERE" is the checkout (every install here is $HERE-based
-# and cwd-independent, so $PWD/the marker can't be trusted); no-op if Claude Code isn't installed.
-"$BIN/herdres" commands install --source "$HERE" >/dev/null 2>&1 || true
 
 if [ -d "$HERE/assets/managed-bots" ]; then
     for photo in codex claude kimi omp devin; do
