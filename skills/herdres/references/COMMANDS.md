@@ -165,7 +165,7 @@ Plain text follows the same queue/interrupt rules as `/send` — to a busy agent
 A two-way voice loop over Telegram, **local and on-box** (no cloud), machine-agnostic, and **fail-open** (any speech failure degrades to text — it never breaks routing). "Agents do better the more you tell them — too much to type."
 
 - **You → agent (v1):** send a **Telegram voice message** in a pane topic → herdres transcribes it locally (NVIDIA **Parakeet** via sherpa-onnx) → forwards the text to the pane, same routing as plain text. It echoes **🎙️ Heard: …** so you can see/correct it.
-- **Agent → you (v2):** with replies on, the agent's answer is spoken back as a **Telegram voice message** (**Kokoro** TTS — a short, trimmed version of the final answer with code stripped; the full text turn is unchanged).
+- **Agent → you (v2):** include the phrase **"reply by voice"** in your prompt (typed or spoken) and *that* reply is spoken back as a **Telegram voice message** (**Kokoro** TTS — a short, trimmed version of the final answer with code stripped; the full text turn is unchanged). Default stays text; it's a per-message opt-in, no global flag (configurable via `HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_TRIGGER`; `HERDR_TELEGRAM_TOPICS_SPEECH_REPLIES=1` force-speaks *every* reply).
 
 **Setup:**
 1. `herdres speech install` (downloads the parakeet + Kokoro models) + `pip install --user sherpa-onnx numpy` + ensure `ffmpeg` is present — verify with `herdres speech check`.

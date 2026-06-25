@@ -102,6 +102,19 @@ def speech_echo_transcript_enabled() -> bool:
     return _flag("HERDR_TELEGRAM_TOPICS_SPEECH_ECHO_TRANSCRIPT", "1")
 
 
+def speech_reply_trigger() -> str:
+    """The phrase that opts a single reply into voice (per-message, no global flag). Default
+    "reply by voice"; set HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_TRIGGER to "" to disable the keyword."""
+    return os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_TRIGGER", "reply by voice").strip()
+
+
+def speech_reply_triggered(user_text: str | None) -> bool:
+    """True when the owner's prompt for this turn contains the trigger phrase (case-insensitive), so
+    just THIS reply is spoken back. Default behaviour stays text when the phrase is absent."""
+    trig = speech_reply_trigger().lower()
+    return bool(trig) and trig in str(user_text or "").lower()
+
+
 def speech_models_dir() -> Path:
     override = os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_MODELS_DIR", "").strip()
     if override:
