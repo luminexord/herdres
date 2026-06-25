@@ -2037,6 +2037,8 @@ def gitmoot_delegation_ref_from_pane(pane) -> tuple[str, str] | None:
     if not is_council_pane(pane):
         return None
     cwd = str((pane or {}).get("foreground_cwd") or (pane or {}).get("cwd") or "").strip()
+    if cwd.endswith(" (deleted)"):
+        cwd = cwd[: -len(" (deleted)")].rstrip()
     if not cwd:
         return None
     parts = [part for part in Path(cwd).parts if part not in {"", os.sep}]
