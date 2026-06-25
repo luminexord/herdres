@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socketserver
+import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import herdres_speech
@@ -33,10 +36,52 @@ _MAX_BODY = 1 * 1024 * 1024  # request bodies are tiny JSON; reject anything lar
 _SYNTH_LOCK = threading.Lock()
 _INFLIGHT: set[str] = set()
 _INFLIGHT_GUARD = threading.Lock()
+# When an OGG lands we poke `herdres speech-flush` so the voice note goes out in ~seconds instead of
+# on the next 30s timer sync. Debounced + coalesced: a burst of finished synths triggers one flush.
+_POKE_GUARD = threading.Lock()
+_POKE_PENDING = False
 
 
 def _socket_path() -> Path:
     return herdres_speech.speech_socket_path()
+
+
+def _herdres_bin() -> str | None:
+    """The herdres CLI is installed right next to this sidecar; fall back to PATH (the service sets
+    PATH=~/.local/bin). Returns None if it can't be found — the poke is then skipped and the timer
+    sync still delivers the OGG on its next tick."""
+    try:
+        sibling = Path(sys.argv[0]).resolve().parent / "herdres"
+        if sibling.exists():
+            return str(sibling)
+    except Exception:
+        pass
+    return shutil.which("herdres")
+
+
+def _flush_poker() -> None:
+    global _POKE_PENDING
+    try:
+        time.sleep(0.3)  # coalesce a burst of finished synths into a single flush
+    finally:
+        with _POKE_GUARD:
+            _POKE_PENDING = False  # reset before flushing: a synth finishing now starts a fresh poke
+    herdres = _herdres_bin()
+    if not herdres:
+        return
+    try:
+        subprocess.run([herdres, "speech-flush"], capture_output=True, timeout=30)
+    except Exception:
+        pass  # best-effort; the timer sync is the backstop
+
+
+def _poke_flush_soon() -> None:
+    global _POKE_PENDING
+    with _POKE_GUARD:
+        if _POKE_PENDING:
+            return
+        _POKE_PENDING = True
+    threading.Thread(target=_flush_poker, daemon=True).start()
 
 
 def _bg_synthesize(text: str, dest: str) -> None:
@@ -45,6 +90,7 @@ def _bg_synthesize(text: str, dest: str) -> None:
             tmp = dest + ".part"
             if herdres_speech.synthesize(text, tmp):
                 os.replace(tmp, dest)  # publish atomically so flush never sees a half-written OGG
+                _poke_flush_soon()  # ask herdres to send it NOW, not on the next 30s timer sync
             else:
                 try:
                     os.unlink(tmp)

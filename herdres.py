@@ -8281,6 +8281,36 @@ def flush_pending_speech_reply(
     return True
 
 
+def speech_flush_once() -> dict[str, Any]:
+    """Send every pending spoken reply whose OGG is ready, right now (issue #4 perf). The speech
+    sidecar pokes this the instant a TTS file lands, so the voice note goes out in ~seconds instead
+    of waiting up to a full 30s timer-sync cycle. It holds the lock only for the sends + state write
+    (no preflight/prefetch/icon reconcile — that's the heavy part of a full sync we deliberately
+    skip). Self-healing: anything not ready (or that rate-limits) is left for the next timer sync."""
+    load_dotenv()
+    state = load_state()
+    telegram, chat_id = configure_telegram_state(state)
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    changed = False
+    flushed = 0
+    for _key, entry in list(panes.items()):
+        if not (isinstance(entry, dict) and isinstance(entry.get("pending_speech_reply"), dict)):
+            continue
+        try:
+            api_token = managed_bot_token_for_entry(telegram, entry)
+            if flush_pending_speech_reply(state, entry, telegram, chat_id, api_token=api_token):
+                changed = True
+                flushed += 1
+        except RateLimited:
+            pass  # respect the backoff; the timer sync retries on the next tick
+        except Exception:
+            entry.pop("pending_speech_reply", None)  # never let one bad entry wedge the flush
+            changed = True
+    if changed:
+        save_state(state)
+    return {"ok": True, "changed": changed, "flushed": flushed}
+
+
 def _telegram_error_is_bot_access(exc: Exception) -> bool:
     text = str(exc).lower()
     return (
@@ -12897,6 +12927,45 @@ def enumerate_pane_skills(agent_kind: str, cwd: str | None = None, *,
     return deduped
 
 
+def pretranscribe_voice_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Issue #4 perf: download + transcribe an owner's voice note BEFORE the command takes the global
+    sync lock, so the slow part (network download + STT, 0.5-13s) never pins the lock and stalls the
+    timer sync / other inbound messages. Runs in the same subprocess as command_reply, so the token
+    resolution (telegram_token, from the subprocess env) is identical to the in-lock path.
+
+    Strictly fail-open: on anything unexpected (speech off/unavailable, oversized, download/STT error)
+    we return the payload UNCHANGED and command_reply's existing in-lock arm handles it exactly as
+    before. On success we stash the transcript and a done-flag the voice arm keys on."""
+    try:
+        attachment = payload.get("attachment")
+        if not (isinstance(attachment, dict)
+                and attachment.get("kind") == "voice"
+                and attachment.get("file_id")):
+            return payload
+        if herdres_speech is None or not herdres_speech.speech_input_enabled():
+            return payload  # disabled/unavailable — let the in-lock arm produce the right reply
+        if int(attachment.get("file_size") or 0) > ATTACHMENT_MAX_BYTES:
+            return payload  # oversized — let the in-lock arm produce the size-error reply
+        dest_fd, dest_name = tempfile.mkstemp(prefix="herdres-stt-", suffix=".ogg")
+        os.close(dest_fd)
+        dest = Path(dest_name)
+        try:
+            result = telegram_get_file(str(attachment.get("file_id") or ""))
+            if int(result.get("file_size") or 0) > ATTACHMENT_MAX_BYTES:
+                return payload
+            download_telegram_file(str(result.get("file_path") or ""), dest)
+            transcript = str(herdres_speech.speech_request("stt", {"path": str(dest)}).get("text") or "").strip()
+        finally:
+            _unlink_quietly(dest)
+            _unlink_quietly(dest.with_name(dest.name + ".part"))
+        payload = dict(payload)
+        payload["_speech_transcript"] = transcript
+        payload["_speech_pretranscribed"] = True
+        return payload
+    except Exception:
+        return payload  # fail-open: never block delivery on an off-lock optimization
+
+
 def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     load_dotenv()
     state = load_state()
@@ -13049,35 +13118,42 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     # Fail-open: if speech is unavailable/disabled we tell the owner; we never break the text path.
     if isinstance(attachment, dict) and attachment.get("kind") == "voice" and attachment.get("file_id"):
         caption = str(payload.get("caption") or "").strip()
-        try:
-            speech_on = herdres_speech is not None and herdres_speech.speech_input_enabled()
-        except Exception:  # a flag read must never abort the turn (fail-open)
-            speech_on = False
-        if not speech_on:
-            # Speech off/unavailable: still deliver a caption if the owner attached one, rather than
-            # silently dropping it (parity with the document/photo arm); otherwise explain how to enable.
-            if caption:
-                sent_ok, sent_detail = send_to_pane(pane_id, caption)
-                if not sent_ok:
-                    return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
-                return {"handled": True, "reply": "Voice transcription is off; sent your caption to this pane."}
-            return {"handled": True, "reply": (
-                "Voice transcription is off. Enable it with `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1` "
-                "and `herdres speech install`, or send text.")}
-        ok, detail, dest = deliver_attachment(pane_id, attachment)
-        if not ok or dest is None:
-            return {"handled": True, "reply": f"Could not fetch that voice note: {detail}"}
-        try:
-            transcript = str(herdres_speech.speech_request("stt", {"path": str(dest)}).get("text") or "").strip()
-        except Exception:
-            transcript = ""
+        if payload.get("_speech_pretranscribed"):
+            # The download + STT already ran OFF the global lock (pretranscribe_voice_payload), so the
+            # slow part never pinned the lock. Use that transcript directly.
+            transcript = str(payload.get("_speech_transcript") or "").strip()
+        else:
+            # Fallback (speech was disabled at dispatch, or pretranscribe failed): do it in-lock, the
+            # original path — correctness is preserved even when the off-lock optimization is skipped.
+            try:
+                speech_on = herdres_speech is not None and herdres_speech.speech_input_enabled()
+            except Exception:  # a flag read must never abort the turn (fail-open)
+                speech_on = False
+            if not speech_on:
+                # Speech off/unavailable: still deliver a caption if the owner attached one, rather than
+                # silently dropping it (parity with the document/photo arm); otherwise explain how to enable.
+                if caption:
+                    sent_ok, sent_detail = send_to_pane(pane_id, caption)
+                    if not sent_ok:
+                        return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
+                    return {"handled": True, "reply": "Voice transcription is off; sent your caption to this pane."}
+                return {"handled": True, "reply": (
+                    "Voice transcription is off. Enable it with `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1` "
+                    "and `herdres speech install`, or send text.")}
+            ok, detail, dest = deliver_attachment(pane_id, attachment)
+            if not ok or dest is None:
+                return {"handled": True, "reply": f"Could not fetch that voice note: {detail}"}
+            try:
+                transcript = str(herdres_speech.speech_request("stt", {"path": str(dest)}).get("text") or "").strip()
+            except Exception:
+                transcript = ""
         if not transcript:
             return {"handled": True, "reply": (
                 "Got your voice note, but speech-to-text is unavailable on this host. "
                 "Send text, or run `herdres speech install`.")}
         # The echo is cosmetic — neither the flag read nor the send may abort delivery to the pane.
         try:
-            if herdres_speech.speech_echo_transcript_enabled():
+            if herdres_speech is not None and herdres_speech.speech_echo_transcript_enabled():
                 send_message(chat_id, f"🎙️ Heard: {sanitize_text(transcript, 1000)}",
                              thread_id=topic_id, api_token=pane_api_token)
         except Exception:
@@ -15330,6 +15406,9 @@ def main() -> int:
     speech.add_argument("--force", action="store_true")
     speech.add_argument("--stt-only", dest="stt_only", action="store_true",
                         help="install only the STT model, skipping the larger Kokoro TTS voice")
+    # Lightweight "send any ready spoken reply NOW" — poked by the speech sidecar the instant a TTS
+    # OGG lands, so the voice note goes out in ~seconds instead of waiting for the next timer sync.
+    sub.add_parser("speech-flush")
     update = sub.add_parser("update")
     update.add_argument("--channel", default="edge")
     update.add_argument("--edge", action="store_const", const="edge", dest="channel")
@@ -15347,6 +15426,8 @@ def main() -> int:
             result = with_lock(sync_once)
         elif args.cmd == "event":
             result = with_lock(event_once, blocking=True)
+        elif args.cmd == "speech-flush":
+            result = with_lock(speech_flush_once, blocking=True)
         elif args.cmd == "plugin-enable":
             result = with_lock(lambda: plugin_enable_once(True), blocking=True)
         elif args.cmd == "plugin-disable":
@@ -15355,6 +15436,11 @@ def main() -> int:
             result = with_lock(lambda: cleanup_duplicates_once(delete=args.delete), blocking=True)
         elif args.cmd == "command":
             payload = json.loads(sys.stdin.read() or "{}")
+            # Issue #4 perf: transcribe a voice note OFF the global lock (the download + STT can take
+            # 0.5-13s and would otherwise pin the lock, stalling the timer sync and every other
+            # inbound message). Fail-open — command_reply transcribes in-lock as before if this is
+            # skipped or fails.
+            payload = pretranscribe_voice_payload(payload)
             result = with_lock(lambda: command_reply(payload), blocking=True)
         elif args.cmd == "callback":
             payload = json.loads(sys.stdin.read() or "{}")
