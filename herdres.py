@@ -5938,6 +5938,9 @@ def reconcile_topic_grouping(state: dict[str, Any]) -> bool:
 
 
 def choice_needs_detail(option: dict[str, str]) -> bool:
+    if _boolish(option.get("direct")):
+        return False  # /skills options always run directly, even if the command name (label) or its
+        #               index would otherwise trip the decision-prompt detail heuristics below.
     if _boolish(option.get("needs_detail")):
         return True
     label = str(option.get("label") or "").lower()
@@ -5993,6 +5996,18 @@ def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[
         rows.append([{"text": button_text[:64], "callback_data": safe_callback_data(action, prompt_id, callback_id)}])
     if not has_custom_button:
         rows.append([{"text": "Tell me differently", "callback_data": safe_callback_data("d", prompt_id, "custom")}])
+    return {"inline_keyboard": rows}
+
+
+def skills_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[str, Any]:
+    """Inline keyboard for the /skills picker (issue #27). Every option is a direct ("c") run — never
+    the force-reply detail path choices_reply_markup infers from label keywords — and there is no
+    "Tell me differently" custom row. The button text is the command/skill label as-is."""
+    rows: list[list[dict[str, str]]] = []
+    for idx, opt in enumerate(options[:12], start=1):
+        callback_id = str(opt.get("callback_id") or opt.get("number") or f"s{idx}")
+        label = re.sub(r"\s+", " ", str(opt.get("label") or "")).strip() or f"s{idx}"
+        rows.append([{"text": label[:64], "callback_data": safe_callback_data("c", prompt_id, callback_id)}])
     return {"inline_keyboard": rows}
 
 
@@ -12166,6 +12181,153 @@ def voice_mode_response(state: dict[str, Any], space: dict[str, Any], live: list
     return {"handled": True, "reply": f"Voice mode for this space is now {label}."}
 
 
+# --- Issue #27: enumerate a pane agent's skills/slash-commands for the /skills picker ----------
+# Panes run on the same host as herdres, so this reads the local filesystem for the pane's agent
+# kind + working dir. Claude commands/skills (user, project <cwd>/.claude, enabled plugins) invoke
+# as "/<name>". Codex prompts invoke as "/<name>"; Codex skills are model-invoked, surfaced
+# best-effort with a natural-language send_text. stdlib-only and defensive (never raises — it feeds
+# an interactive command). Returns normalized option dicts; the /skills branch maps them to buttons.
+_SKILL_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.S)
+_SKILL_NAME_RE = re.compile(r"^name\s*:\s*(.+?)\s*$", re.M)
+_SKILL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
+def _skill_slug_ok(name: str) -> bool:
+    return bool(name) and _SKILL_SLUG_RE.fullmatch(name) is not None
+
+
+def _skill_frontmatter_name(skill_md: Path) -> str:
+    """The raw `name:` from a SKILL.md frontmatter, or "" if absent/unreadable. The caller decides
+    whether it's a usable slug and falls back to the directory name otherwise. Only the file HEAD is
+    read (frontmatter is at the very top) so a huge SKILL.md can't drive the lazy frontmatter regex
+    into quadratic backtracking inside the interactive command handler."""
+    try:
+        with skill_md.open(encoding="utf-8") as fh:
+            text = fh.read(8192)
+    except (OSError, ValueError):
+        return ""
+    m = _SKILL_FRONTMATTER_RE.match(text)
+    if m:
+        nm = _SKILL_NAME_RE.search(m.group(1))
+        if nm:
+            return nm.group(1).strip().strip('"').strip("'").strip()
+    return ""
+
+
+def _skill_option(name: str, *, scope: str, kind: str, send_text: str | None = None,
+                  best_effort: bool = False) -> dict[str, Any]:
+    name = name.strip()
+    return {
+        "id": name,
+        "label": (f"{name} (skill)" if best_effort else f"/{name}"),
+        "send_text": (send_text if send_text is not None else f"/{name}"),
+        "scope": scope,        # user | project | plugin:<name>
+        "kind": kind,          # command | skill
+        "best_effort": best_effort,
+    }
+
+
+def _skill_commands_in(dir_path: Path, scope: str) -> list[dict[str, Any]]:
+    # Top-level *.md only. Namespaced subdirectory commands (commands/<ns>/<cmd>.md -> /<ns>:<cmd>)
+    # are deferred (issue #27) — the invocation syntax for nested *user* commands is version-specific
+    # and forwarding a wrong "/ns:cmd" would be worse than omitting it.
+    out: list[dict[str, Any]] = []
+    try:
+        files = sorted(dir_path.glob("*.md"))
+    except OSError:
+        return out
+    for f in files:
+        if _skill_slug_ok(f.stem):
+            out.append(_skill_option(f.stem, scope=scope, kind="command"))
+    return out
+
+
+def _skill_dirs_in(dir_path: Path, scope: str, *, codex: bool = False) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    try:
+        subs = sorted(p for p in dir_path.iterdir() if p.is_dir())
+    except OSError:
+        return out
+    for sub in subs:
+        md = sub / "SKILL.md"
+        if not md.is_file():
+            continue
+        # Prefer the frontmatter name, but fall back to the directory name when it is absent OR
+        # present-but-not-a-usable-slug (e.g. `name: has space`) rather than dropping the skill.
+        fm_name = _skill_frontmatter_name(md)
+        name = fm_name if _skill_slug_ok(fm_name) else sub.name
+        if not _skill_slug_ok(name):
+            continue
+        if codex:  # Codex skills are model-invoked (no slash parser) -> best-effort natural language
+            out.append(_skill_option(name, scope=scope, kind="skill",
+                                     send_text=f"Use the {name} skill.", best_effort=True))
+        else:      # Claude skills surface as /<name>
+            out.append(_skill_option(name, scope=scope, kind="skill"))
+    return out
+
+
+def _enabled_plugin_skills(home: Path) -> list[dict[str, Any]]:
+    """Commands + skills of every plugin enabled in ~/.claude/settings.json, resolved through
+    installed_plugins.json. A plugin we can't resolve is silently skipped."""
+    out: list[dict[str, Any]] = []
+    try:
+        settings = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    enabled = {k for k, v in (settings.get("enabledPlugins") or {}).items() if v}
+    if not enabled:
+        return out
+    try:
+        installed = json.loads(
+            (home / ".claude" / "plugins" / "installed_plugins.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    plugins = installed.get("plugins") if isinstance(installed.get("plugins"), dict) else {}
+    for key in sorted(enabled):
+        entries = plugins.get(key) or []
+        if not isinstance(entries, list) or not entries:
+            continue
+        install_path = Path(str((entries[-1] or {}).get("installPath") or ""))  # latest install
+        if not str(install_path).strip():
+            continue
+        scope = f"plugin:{key.split('@', 1)[0]}"
+        out.extend(_skill_commands_in(install_path / "commands", scope))
+        out.extend(_skill_dirs_in(install_path / "skills", scope))
+    return out
+
+
+def enumerate_pane_skills(agent_kind: str, cwd: str | None = None, *,
+                          home: Path | None = None) -> list[dict[str, Any]]:
+    """Slash-commands/skills available to a pane's agent, as option dicts
+    ``{id, label, send_text, scope, kind, best_effort}`` deduped by send_text (stable order:
+    user, then project, then plugins). Empty for an unknown/unsupported agent kind."""
+    home = Path(home) if home is not None else Path.home()
+    kind = (agent_kind or "").strip().lower()
+    out: list[dict[str, Any]] = []
+    if kind == "claude":
+        out += _skill_commands_in(home / ".claude" / "commands", "user")
+        out += _skill_dirs_in(home / ".claude" / "skills", "user")
+        if cwd and str(cwd).strip():
+            proj = Path(str(cwd))
+            out += _skill_commands_in(proj / ".claude" / "commands", "project")
+            out += _skill_dirs_in(proj / ".claude" / "skills", "project")
+        out += _enabled_plugin_skills(home)
+    elif kind == "codex":
+        out += _skill_commands_in(home / ".codex" / "prompts", "user")        # /<name>, reliable
+        out += _skill_dirs_in(home / ".codex" / "skills", "user", codex=True)  # best-effort
+        # Codex project-level + plugin enumeration is deferred (see issue #27).
+
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for opt in out:
+        st = opt["send_text"]
+        if st in seen:
+            continue
+        seen.add(st)
+        deduped.append(opt)
+    return deduped
+
+
 def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     load_dotenv()
     state = load_state()
@@ -12431,6 +12593,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 "Pane topic commands:\n"
                 "/report or /status - latest clean report/question\n"
                 "/choices - resend active choices or decision buttons\n"
+                "/skills - list this pane agent's skills/commands as tappable buttons\n"
                 "/raw [lines] - sanitized raw visible output\n"
                 "/debug - technical mapping details\n"
                 "/send <text> - send instruction to this pane\n"
@@ -12542,7 +12705,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return {"handled": True, "reply": "No active choices for this pane."}
         if not prompt_id or not options or not prompt_text:
             return {"handled": True, "reply": "No active choices for this pane."}
-        revalidation, fresh_prompt_item = revalidate_pending_decision_prompt(pane_id, prompt)
+        # A /skills picker has no agent decision turn to revalidate against; skip straight to
+        # re-rendering it (the prompt_item path below selects skills_reply_markup for it).
+        if prompt_source(prompt) == "skills":
+            revalidation, fresh_prompt_item = "ok", None
+        else:
+            revalidation, fresh_prompt_item = revalidate_pending_decision_prompt(pane_id, prompt)
         if revalidation == "stale":
             entry.pop("active_prompt", None)
             entry.pop("awaiting_detail", None)
@@ -12588,13 +12756,16 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             }
             prompt_item["options"] = options
             prompt_item["prompt_id"] = prompt_id
+        # A /skills picker re-surfaced via /choices keeps its dedicated all-direct markup (no
+        # "N." prefixes, no "Tell me differently" row); real decision prompts use choices_reply_markup.
+        choices_markup = (skills_reply_markup if prompt_source(prompt) == "skills" else choices_reply_markup)
         result = send_feed_item(
             chat_id,
             prompt_item,
             telegram=telegram,
             thread_id=topic_id,
             notify=True,
-            reply_markup=choices_reply_markup(prompt_id, options),
+            reply_markup=choices_markup(prompt_id, options),
             reply_to_message_id=pane_root_reply_target(entry),
             api_token=pane_api_token,
         )
@@ -12609,6 +12780,86 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             bind_active_prompt_message(entry, prompt, result.get("message_id"))
         save_state(state)
         return {"handled": True, "reply": ""}
+    if command in {"skills", "commands"}:
+        # Issue #27: list the pane agent's slash-commands/skills as tappable buttons; a tap reuses
+        # the active_prompt -> callback("c") -> send_to_pane path verbatim (send_text is "/name", or
+        # a best-effort natural-language invocation for Codex skills).
+        agent_kind = managed_bot_kind_for_agent(entry.get("agent"))
+        if agent_kind not in {"claude", "codex"}:
+            return {"handled": True, "reply": "The skills picker supports Claude Code and Codex panes only."}
+        # Don't clobber a live agent decision prompt sharing the single active_prompt slot.
+        existing = entry.get("active_prompt") if isinstance(entry.get("active_prompt"), dict) else {}
+        if (existing and existing.get("options") and existing.get("source") != "skills"
+                and not prompt_interaction_disabled(existing)):
+            return {"handled": True, "reply": "Answer or dismiss the active question first, then run /skills again."}
+        cwd = str(entry.get("foreground_cwd") or entry.get("cwd") or "").strip()
+        try:
+            found = enumerate_pane_skills(agent_kind, cwd or None)
+        except Exception:  # defensive: a skills picker must never break the command handler
+            found = []
+        if not found:
+            return {"handled": True, "reply": "No skills or slash-commands found for this pane."}
+        cap = 12  # choices_reply_markup truncates at 12; cap + note (pagination is a follow-up)
+        shown, truncated = found[:cap], len(found) > cap
+        options: list[dict[str, str]] = []
+        for idx, sk in enumerate(shown, start=1):
+            # A per-button token (s1..s12), not the skill name: unique (no 32-char-prefix collision),
+            # never a decision keyword, and never matches a skill's own id/label in the tap lookup.
+            token = f"s{idx}"
+            options.append({
+                "number": token,
+                "callback_id": token,
+                "id": token,
+                "label": sanitize_text(str(sk.get("label") or sk.get("id") or token), 120),
+                "send_text": sanitize_text(str(sk.get("send_text") or ""), 500),
+                "direct": "1",  # always run directly (see choice_needs_detail / skills_reply_markup)
+            })
+        prompt_text = "Tap a skill or command to run it on this pane."
+        summary_lines = [prompt_text]
+        if any(sk.get("best_effort") for sk in shown):
+            summary_lines.append("Items marked “(skill)” are best-effort on Codex (no slash invocation).")
+        if truncated:
+            summary_lines.append(f"Showing the first {cap} of {len(found)}.")
+        prompt_id = prompt_id_for(prompt_text, options)
+        prompt_item = {
+            "kind": "choices",
+            "title": "Skills",
+            "summary": "\n".join(summary_lines),
+            "detail": "",
+            "text": prompt_text,
+            "notify": True,
+            "source": "skills",  # keep prompt_interaction_disabled() False so it survives normalize_state
+            "options": options,
+            "prompt_id": prompt_id,
+        }
+        result = send_feed_item(
+            chat_id,
+            prompt_item,
+            telegram=telegram,
+            thread_id=topic_id,
+            notify=True,
+            reply_markup=skills_reply_markup(prompt_id, options),
+            reply_to_message_id=pane_root_reply_target(entry),
+            api_token=pane_api_token,
+        )
+        if result.get("ok"):
+            if result.get("message_id"):
+                record_pane_message_route(
+                    state,
+                    str(entry.get("space_key") or ""),
+                    str(entry.get("pane_key") or ""),
+                    str(result["message_id"]),
+                )
+            bind_active_prompt_message(
+                entry,
+                {"id": prompt_id, "text": prompt_text, "options": options,
+                 "item": prompt_item, "source": "skills"},
+                result.get("message_id"),
+            )
+            save_state(state)
+            return {"handled": True, "reply": ""}
+        save_state(state)
+        return {"handled": True, "reply": "Could not post the skills list."}
     if command in {"raw", "read"}:
         try:
             lines = int(arg.strip() or READ_LINES_COMMAND_DEFAULT)
@@ -13076,16 +13327,20 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     entry.pop("active_prompt", None)
     entry.pop("awaiting_detail", None)
     save_state(state)
+    # For the /skills picker the choice number is an internal token (s1..s12); show the command
+    # label instead. Decision prompts keep the familiar "N) label" / "Selected N." form.
+    direct_skill = _boolish(option.get("direct"))
+    option_label = str(option.get("label") or choice_number)
     send_notice(
         chat_id,
         "Selected",
-        f"{choice_number}) {option.get('label')}",
+        option_label if direct_skill else f"{choice_number}) {option_label}",
         telegram=telegram,
         thread_id=topic_id,
         notify=False,
         api_token=pane_api_token,
     )
-    return {"handled": True, "answer": f"Selected {choice_number}."}
+    return {"handled": True, "answer": f"Sent {option_label}." if direct_skill else f"Selected {choice_number}."}
 
 
 def probe_rich(thread_id: str | None = None) -> dict[str, Any]:

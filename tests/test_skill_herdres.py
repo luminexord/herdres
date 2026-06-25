@@ -42,6 +42,8 @@ NATIVE_PANE_COMMANDS = [
     "report",
     "raw",
     "choices",
+    "skills",
+    "commands",
     "new",
     "debug",
     "help",
