@@ -784,6 +784,29 @@ def devin_model_managed_bot_kind_from_label(value: str | None) -> str:
     return ""
 
 
+def council_seat_managed_bot_kind(text: str | None) -> str:
+    """Resolve a managed-bot kind from a council pane label like
+    'council-codex · d1 · main' or the human 'Council Codex' form.
+    Pure, stdlib-only (re), no I/O, no state. Returns '' when no
+    council-<seat> token is present or the seat has no managed bot."""
+    lowered = str(text or "").lower()
+    if not lowered:
+        return ""
+    match = re.search(r"council[-\s]+([a-z0-9]+(?:-[a-z0-9]+)?)", lowered)
+    if not match:
+        return ""
+    seat = match.group(1).split("-", 1)[0]
+    return {
+        "codex": "codex",
+        "claude": "claude",
+        "kimi": "kimi",
+        "glm": "glm",
+        "implement": "omp",
+        "omp": "omp",
+        "lead": "claude",
+    }.get(seat, "")
+
+
 def pane_agent_status_label(pane: dict[str, Any]) -> str:
     kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
     if kind == "devin":
@@ -974,7 +997,23 @@ def managed_bot_kind_for_entry(entry: dict[str, Any], pane: dict[str, Any] | Non
         )
         if model_kind:
             return model_kind
-    return managed_bot_kind_for_agent(str(entry.get("agent") or ""))
+    entry_kind = managed_bot_kind_for_agent(str(entry.get("agent") or ""))
+    if entry_kind:
+        return entry_kind
+    label_candidates: list[str] = []
+    if pane:
+        label_candidates.extend(
+            str(pane.get(key) or "") for key in ("pane_thread_name", "pane_label_raw", "label", "name", "title")
+        )
+    label_candidates.extend(
+        str(entry.get(key) or "")
+        for key in ("pane_thread_name", "pane_label_raw", "pane_label_topic_name", "topic_name", "label")
+    )
+    for candidate in label_candidates:
+        council_kind = council_seat_managed_bot_kind(candidate)
+        if council_kind:
+            return council_kind
+    return ""
 
 
 def managed_bot_token_for_entry(
