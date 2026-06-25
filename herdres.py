@@ -11127,8 +11127,14 @@ def _sync_pane_clean_feed(
                             reply_to_message_id=str(result.get("message_id") or (message_id if did_edit else "")),
                         )
                     # Issue #4 v2: queue a spoken version of the reply (flushed below, like plan_doc).
+                    # Speak this turn when the owner's prompt contained the trigger phrase ("reply by
+                    # voice"), or when SPEECH_REPLIES force-speaks every reply. Keyword path needs no
+                    # global flag — per-message opt-in, default text.
                     try:
-                        if herdres_speech is not None and herdres_speech.speech_replies_enabled():
+                        if herdres_speech is not None and (
+                            herdres_speech.speech_reply_triggered(item.get("user_text"))
+                            or herdres_speech.speech_replies_enabled()
+                        ):
                             queue_speech_reply(
                                 entry,
                                 turn_id=str(item.get("turn_id") or ""),

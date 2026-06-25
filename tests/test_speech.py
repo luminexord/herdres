@@ -10,6 +10,7 @@ Covers:
 
 from __future__ import annotations
 
+import os
 import unittest
 import unittest.mock as mock
 from pathlib import Path
@@ -482,6 +483,39 @@ class SpeechDirAndCleanupTests(unittest.TestCase):
         herdres.clear_clean_feed_state(entry)
         self.assertNotIn("pending_speech_reply", entry)
         self.assertNotIn("last_speech_reply_turn_id", entry)
+
+
+class SpeechReplyTriggerTests(unittest.TestCase):
+    def _env_without_trigger(self):
+        return {k: v for k, v in os.environ.items() if k != "HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_TRIGGER"}
+
+    def test_default_trigger_matches_case_insensitive(self) -> None:
+        with patch.dict(os.environ, self._env_without_trigger(), clear=True):
+            self.assertTrue(herdres_speech.speech_reply_triggered("What's the deploy status? Reply By Voice"))
+            self.assertTrue(herdres_speech.speech_reply_triggered("reply by voice: summarize"))
+            self.assertFalse(herdres_speech.speech_reply_triggered("what's the status"))
+            self.assertFalse(herdres_speech.speech_reply_triggered(""))
+            self.assertFalse(herdres_speech.speech_reply_triggered(None))
+
+    def test_custom_trigger(self) -> None:
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_TRIGGER": "out loud"}):
+            self.assertTrue(herdres_speech.speech_reply_triggered("give me the summary OUT LOUD"))
+            self.assertFalse(herdres_speech.speech_reply_triggered("reply by voice"))  # not the configured phrase
+
+    def test_empty_trigger_disables_keyword(self) -> None:
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_TRIGGER": ""}):
+            self.assertFalse(herdres_speech.speech_reply_triggered("reply by voice"))
+
+    def test_gate_speaks_on_keyword_without_global_flag(self) -> None:
+        # The hook gate is `speech_reply_triggered(user_text) or speech_replies_enabled()`. With the
+        # global flag OFF, the keyword alone must enable a spoken reply; absent the keyword, it stays text.
+        with patch.dict(os.environ, self._env_without_trigger(), clear=True):
+            os.environ["HERDR_TELEGRAM_TOPICS_SPEECH_REPLIES"] = "0"
+            self.assertFalse(herdres_speech.speech_replies_enabled())
+            self.assertTrue(herdres_speech.speech_reply_triggered("do X, reply by voice")
+                            or herdres_speech.speech_replies_enabled())
+            self.assertFalse(herdres_speech.speech_reply_triggered("do X")
+                             or herdres_speech.speech_replies_enabled())
 
 
 class TtsEngineTests(unittest.TestCase):
