@@ -506,17 +506,44 @@ def _status_age_seconds(last_seen_at: str) -> float | None:
     return (datetime.now(timezone.utc) - seen).total_seconds()
 
 
-def typing_panes(state: dict) -> list[tuple[str, str]]:
-    """(chat_id, topic_id) for each topic with an actively-working, recently-seen pane (issue #44).
-    Deduped per topic; the General topic is never targeted. Always uses the manager token (the
-    gateway's own, always-valid) — the per-pane managed bot is intentionally NOT used: it could be a
-    stale/revoked token (401 spam) or a historical voice that no longer matches the pane."""
+def _typing_token(telegram: dict, entry: dict) -> str | None:
+    """Token to send the typing action with. It MUST be a bot that is a MEMBER of the supergroup —
+    the gateway's manager/poll token is frequently NOT in the group (it only polls DM/managed
+    updates, so sendChatAction returns 400 "chat not found"). So use a managed bot: prefer the pane's
+    own voice bot (the typing bubble then matches the bot the user sees), else ANY enabled managed
+    bot (any in-group bot can sendChatAction to any topic), else None (the manager token — valid only
+    when the manager bot is itself in the group)."""
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+
+    def token_for(kind: object) -> str | None:
+        record = bots.get(str(kind or "").strip().lower())
+        if isinstance(record, dict) and record.get("enabled") is not False:
+            tok = str(record.get("token") or "").strip()
+            return tok or None
+        return None
+
+    if entry.get("managed_voice_active"):
+        for field in ("pane_root_bot_kind", "last_clean_bot_kind", "agent"):
+            tok = token_for(entry.get(field))
+            if tok:
+                return tok
+    for kind in sorted(bots):  # any in-group managed bot can type in any topic
+        tok = token_for(kind)
+        if tok:
+            return tok
+    return None
+
+
+def typing_panes(state: dict) -> list[tuple[str, str, str | None]]:
+    """(chat_id, topic_id, token) for each topic with an actively-working, recently-seen pane
+    (issue #44). Deduped per topic; the General topic is never targeted. The token is an in-group
+    managed-bot token (see _typing_token) — NOT the manager token, which is often not a chat member."""
     telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
     chat_id = str(telegram.get("chat_id") or "").strip()
     if not chat_id:
         return []
     general = str(telegram.get("general_thread_id") or GENERAL_THREAD_ID)
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str | None]] = []
     seen: set[str] = set()
     panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
     for entry in panes.values():
@@ -532,7 +559,7 @@ def typing_panes(state: dict) -> list[tuple[str, str]]:
         if not topic_id or topic_id == general or topic_id in seen:
             continue
         seen.add(topic_id)
-        out.append((chat_id, topic_id))
+        out.append((chat_id, topic_id, _typing_token(telegram, entry)))
     return out
 
 
@@ -545,14 +572,15 @@ def _retry_after_seconds(exc: urllib.error.HTTPError) -> float:
 
 
 def typing_tick(state: dict) -> tuple[int, float]:
-    # One refresh pass: best-effort sendChatAction (manager token) to each working topic. A 429 stops
-    # the pass and returns a backoff so the loop waits Retry-After instead of hammering; any other
-    # per-topic error is isolated so it can't stop the others. Returns (count_sent, backoff_seconds).
+    # One refresh pass: best-effort sendChatAction (per-topic in-group bot token) to each working
+    # topic. A 429 stops the pass and returns a backoff so the loop waits Retry-After instead of
+    # hammering; any other per-topic error is isolated so it can't stop the others. Returns
+    # (count_sent, backoff_seconds).
     sent = 0
-    for chat_id, topic_id in typing_panes(state):
+    for chat_id, topic_id, token in typing_panes(state):
         params = {"chat_id": chat_id, "message_thread_id": topic_id, "action": "typing"}
         try:
-            api("sendChatAction", params, token=None)
+            api("sendChatAction", params, token=token)
             sent += 1
         except urllib.error.HTTPError as exc:
             if getattr(exc, "code", None) == 429:
