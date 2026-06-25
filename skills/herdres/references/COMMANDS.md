@@ -160,15 +160,19 @@ Plain text (no leading `/`) typed in a pane topic is handled by context:
 
 Plain text follows the same queue/interrupt rules as `/send` — to a busy agent it queues.
 
-### 2.7a Voice notes → transcribed to the pane (issue #4, opt-in)
+### 2.7a Two-way voice — a "call" with your agent (issue #4, opt-in)
 
-Send a **Telegram voice message** in a pane topic and herdres transcribes it **locally** (NVIDIA Parakeet via sherpa-onnx — no cloud) and forwards the text to the pane, same routing as plain text ("agents do better the more you tell them — too much to type"). It echoes **🎙️ Heard: …** back so you can see/correct what it heard.
+A two-way voice loop over Telegram, **local and on-box** (no cloud), machine-agnostic, and **fail-open** (any speech failure degrades to text — it never breaks routing). "Agents do better the more you tell them — too much to type."
 
-**Opt-in, machine-agnostic, fail-open** (any speech failure degrades to text — it never breaks routing):
-1. `herdres speech install` (downloads the model) + `pip install --user sherpa-onnx` + ensure `ffmpeg` is present — verify with `herdres speech check`.
-2. Set `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1`.
+- **You → agent (v1):** send a **Telegram voice message** in a pane topic → herdres transcribes it locally (NVIDIA **Parakeet** via sherpa-onnx) → forwards the text to the pane, same routing as plain text. It echoes **🎙️ Heard: …** so you can see/correct it.
+- **Agent → you (v2):** with replies on, the agent's answer is spoken back as a **Telegram voice message** (**Kokoro** TTS — a short, trimmed version of the final answer with code stripped; the full text turn is unchanged).
 
-A later phase adds the reverse — the agent **speaks its reply back** as a voice message (`HERDR_TELEGRAM_TOPICS_SPEECH_REPLIES`). See `.env.example` for all `HERDR_TELEGRAM_TOPICS_SPEECH_*` knobs.
+**Setup:**
+1. `herdres speech install` (downloads the parakeet + Kokoro models) + `pip install --user sherpa-onnx numpy` + ensure `ffmpeg` is present — verify with `herdres speech check`.
+2. Set `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1` (hear you) and/or `HERDR_TELEGRAM_TOPICS_SPEECH_REPLIES=1` (talk back).
+3. **Optional but recommended:** enable the warm sidecar so the models stay in memory (fast, no per-call load): `systemctl --user enable --now herdres-speech.service`.
+
+See `.env.example` for all `HERDR_TELEGRAM_TOPICS_SPEECH_*` knobs (voice/speaker id, reply length, model ids, max audio length).
 
 ### 2.8 Long / multiline input → inbound file
 

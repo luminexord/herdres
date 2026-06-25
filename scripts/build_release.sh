@@ -46,6 +46,8 @@ files="
 herdres.py
 herdres_gateway.py
 herdres_routing.py
+herdres_speech.py
+herdres-speech
 herdres_decision_hook.py
 herdr_turn_adapter.py
 herdr_topic_bridge.py
@@ -53,6 +55,7 @@ herdres-plugin/herdr-plugin.toml
 systemd/user/herdres.service
 systemd/user/herdres.timer
 systemd/user/herdres-gateway.service
+systemd/user/herdres-speech.service
 install-user.sh
 install-macos.sh
 .env.example

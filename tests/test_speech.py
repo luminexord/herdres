@@ -261,12 +261,25 @@ class SpeechCliTests(unittest.TestCase):
 
     def test_speech_install_dispatch(self) -> None:
         from types import SimpleNamespace
-        with patch.object(herdres_speech, "install_stt_model", return_value=(True, "installed")), \
+        with patch.object(herdres_speech, "install_stt_model", return_value=(True, "stt ok")) as stt, \
+             patch.object(herdres_speech, "install_tts_model", return_value=(True, "tts ok")) as tts, \
              patch.object(herdres_speech, "check", return_value={"sherpa_onnx": False, "ffmpeg": True}):
-            result = herdres.speech_once(SimpleNamespace(action="install", force=False))
+            result = herdres.speech_once(SimpleNamespace(action="install", force=False, stt_only=False))
         self.assertTrue(result["ok"])
-        self.assertEqual(result["model"], "installed")
+        self.assertEqual(result["stt_model"], "stt ok")
+        self.assertEqual(result["tts_model"], "tts ok")
+        stt.assert_called_once(); tts.assert_called_once()
         self.assertTrue(any("sherpa-onnx" in h for h in result["next_steps"]))  # sherpa missing -> hint
+
+    def test_speech_install_stt_only_skips_tts(self) -> None:
+        from types import SimpleNamespace
+        with patch.object(herdres_speech, "install_stt_model", return_value=(True, "stt ok")), \
+             patch.object(herdres_speech, "install_tts_model") as tts, \
+             patch.object(herdres_speech, "check", return_value={"sherpa_onnx": True, "ffmpeg": True}):
+            result = herdres.speech_once(SimpleNamespace(action="install", force=False, stt_only=True))
+        self.assertTrue(result["ok"])
+        tts.assert_not_called()
+        self.assertIn("skipped", result["tts_model"])
 
     def test_install_stt_model_downloads_verifies_extracts(self) -> None:
         import hashlib
@@ -328,6 +341,173 @@ class SpeechCliTests(unittest.TestCase):
                 ok, msg = herdres_speech.install_stt_model(log=lambda *_: None)
         self.assertFalse(ok)
         self.assertIn("checksum mismatch", msg)
+
+
+class OutboundSpeechTests(unittest.TestCase):
+    """Issue #4 v2: the agent speaks its reply back (Kokoro TTS → Telegram sendVoice)."""
+
+    def test_send_voice_uses_sendvoice_multipart(self) -> None:
+        with patch.object(herdres, "telegram_api_multipart", return_value={"ok": True, "result": {"message_id": 5}}) as api:
+            herdres.send_voice("-1001", Path("/tmp/r.ogg"), thread_id="77", reply_to_message_id="9", duration=3)
+        method, fields, files = api.call_args.args[0], api.call_args.args[1], api.call_args.args[2]
+        self.assertEqual(method, "sendVoice")
+        self.assertEqual(fields["voice"], "attach://file")
+        self.assertEqual(fields["duration"], "3")
+        self.assertEqual(files["file"][1], "audio/ogg")
+
+    def test_enqueue_speech_reply_returns_path_without_blocking(self) -> None:
+        # The sidecar synthesizes asynchronously, so enqueue returns the (future) dest after a fast
+        # {ok} ack — it must NOT wait for / require the file to exist yet.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            speech = Mock()
+            speech.trim_for_speech.return_value = "the trimmed reply"
+            speech.speech_request.return_value = {"ok": True}  # enqueued; file appears later
+            with patch.object(herdres, "herdres_speech", speech), \
+                 patch.object(herdres, "state_path", return_value=Path(d) / "state.json"):
+                out = herdres.enqueue_speech_reply("turn-1", "Here is the answer. ```code```")
+            self.assertIsNotNone(out)
+            self.assertFalse(out.exists())  # async — not synthesized yet
+            self.assertEqual(speech.speech_request.call_args.args[0], "tts")
+
+    def test_enqueue_speech_reply_none_when_engine_absent(self) -> None:
+        with patch.object(herdres, "herdres_speech", None):
+            self.assertIsNone(herdres.enqueue_speech_reply("t", "hi"))
+
+    def test_enqueue_speech_reply_none_when_no_sidecar(self) -> None:
+        # speech_request("tts") returns {ok:False} when there's no sidecar -> no spoken reply.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            speech = Mock()
+            speech.trim_for_speech.return_value = "x"
+            speech.speech_request.return_value = {"ok": False}
+            with patch.object(herdres, "herdres_speech", speech), \
+                 patch.object(herdres, "state_path", return_value=Path(d) / "state.json"):
+                self.assertIsNone(herdres.enqueue_speech_reply("t", "hi"))
+
+    def test_queue_speech_reply_once_and_dedup(self) -> None:
+        entry = {"pane_id": "p1"}
+        item = {"turn_id": "T1", "assistant_final_text": "the answer"}
+        with patch.object(herdres, "enqueue_speech_reply", return_value=Path("/tmp/r.ogg")):
+            self.assertTrue(herdres.queue_speech_reply(entry, turn_id="T1", item=item, reply_to_message_id="9"))
+            self.assertEqual(entry["pending_speech_reply"]["turn_id"], "T1")
+            self.assertEqual(entry["pending_speech_reply"]["ticks"], 0)
+            self.assertFalse(herdres.queue_speech_reply(entry, turn_id="T1", item=item, reply_to_message_id="9"))
+        entry2 = {"pane_id": "p1", "last_speech_reply_turn_id": "T1"}
+        with patch.object(herdres, "enqueue_speech_reply", return_value=Path("/tmp/r.ogg")) as w:
+            self.assertFalse(herdres.queue_speech_reply(entry2, turn_id="T1", item=item, reply_to_message_id="9"))
+            w.assert_not_called()  # already spoken/given-up — don't even enqueue
+
+    def test_queue_speech_reply_skips_when_unavailable(self) -> None:
+        entry = {"pane_id": "p1"}
+        with patch.object(herdres, "enqueue_speech_reply", return_value=None):
+            self.assertFalse(herdres.queue_speech_reply(entry, turn_id="T1",
+                             item={"turn_id": "T1", "assistant_final_text": "x"}, reply_to_message_id=""))
+        self.assertNotIn("pending_speech_reply", entry)
+
+    def test_flush_speech_reply_sends_and_clears(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            ogg = Path(d) / "r.ogg"; ogg.write_bytes(b"OggS")
+            entry = {"pane_id": "p1", "topic_id": "77", "space_key": "sp", "pane_key": "p1",
+                     "pending_speech_reply": {"turn_id": "T1", "path": str(ogg), "reply_to": "9", "ticks": 0}}
+            with patch.object(herdres, "send_voice", return_value={"ok": True, "result": {"message_id": 5}}) as sv, \
+                 patch.object(herdres, "record_pane_message_route") as route:
+                changed = herdres.flush_pending_speech_reply({}, entry, {}, "-1001", api_token=None)
+            self.assertTrue(changed)
+            sv.assert_called_once()
+            route.assert_called_once()  # record the voice msg as the high-water mark (like plan-doc)
+            self.assertEqual(entry["last_speech_reply_turn_id"], "T1")
+            self.assertNotIn("pending_speech_reply", entry)
+            self.assertFalse(ogg.exists())
+
+    def test_flush_speech_reply_defers_until_synth_lands(self) -> None:
+        # File not ready yet (sidecar still synthesizing) -> defer (tick++), don't send, don't give up.
+        entry = {"pane_id": "p1", "topic_id": "77",
+                 "pending_speech_reply": {"turn_id": "T1", "path": "/no/such/r.ogg", "reply_to": "", "ticks": 0}}
+        with patch.object(herdres, "_speech_flush_wait_seconds", return_value=0.0), \
+             patch.object(herdres, "send_voice") as sv:
+            changed = herdres.flush_pending_speech_reply({}, entry, {}, "-1001")
+        self.assertTrue(changed)
+        sv.assert_not_called()
+        self.assertEqual(entry["pending_speech_reply"]["ticks"], 1)  # waiting
+
+    def test_flush_speech_reply_gives_up_and_marks_done(self) -> None:
+        # File never lands; after the cap, give up AND set last_speech_reply_turn_id so a later render
+        # change does not re-synthesize the same turn.
+        entry = {"pane_id": "p1", "topic_id": "77",
+                 "pending_speech_reply": {"turn_id": "T1", "path": "/no/such/r.ogg", "reply_to": "",
+                                          "ticks": herdres.SPEECH_REPLY_ATTEMPT_CAP - 1}}
+        with patch.object(herdres, "_speech_flush_wait_seconds", return_value=0.0):
+            herdres.flush_pending_speech_reply({}, entry, {}, "-1001")
+        self.assertNotIn("pending_speech_reply", entry)
+        self.assertEqual(entry["last_speech_reply_turn_id"], "T1")  # marked done (no re-synthesis)
+
+    def test_flush_speech_reply_leaves_queue_on_ratelimit(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            ogg = Path(d) / "r.ogg"; ogg.write_bytes(b"OggS")
+            entry = {"pane_id": "p1", "topic_id": "77",
+                     "pending_speech_reply": {"turn_id": "T1", "path": str(ogg), "reply_to": "", "ticks": 0}}
+            with patch.object(herdres, "send_voice", side_effect=herdres.RateLimited(30)):
+                changed = herdres.flush_pending_speech_reply({}, entry, {}, "-1001")
+            self.assertFalse(changed)
+            self.assertIn("pending_speech_reply", entry)  # retried next sync
+            self.assertTrue(ogg.exists())
+
+
+class SpeechDirAndCleanupTests(unittest.TestCase):
+    def test_prune_keeps_recent_ogg_but_spares_fresh_part(self) -> None:
+        # The outbound-speech dir is SHARED; pruning must not delete an in-flight .part another pane's
+        # synthesis is mid-writing. Keep newest 20 .ogg; sweep only STALE .part.
+        import os as _os
+        import tempfile
+        import time as _t
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            for i in range(25):
+                (base / f"r{i}.ogg").write_bytes(b"o")
+            fresh = base / "inflight.part"; fresh.write_bytes(b"p")  # mid-synthesis, just written
+            stale = base / "orphan.part"; stale.write_bytes(b"p")
+            old = _t.time() - 3600
+            _os.utime(stale, (old, old))  # crashed-synth orphan
+            herdres._prune_speech_dir(base, keep=20)
+            self.assertEqual(len(list(base.glob("*.ogg"))), 20)   # trimmed to keep
+            self.assertTrue(fresh.exists())                       # fresh .part spared (race-safe)
+            self.assertFalse(stale.exists())                      # stale orphan swept
+
+    def test_clear_clean_feed_state_drops_pending_speech(self) -> None:
+        entry = {"pending_speech_reply": {"turn_id": "T1"}, "last_speech_reply_turn_id": "T1",
+                 "last_clean_item": {}}
+        herdres.clear_clean_feed_state(entry)
+        self.assertNotIn("pending_speech_reply", entry)
+        self.assertNotIn("last_speech_reply_turn_id", entry)
+
+
+class TtsEngineTests(unittest.TestCase):
+    def test_synthesize_failopen_without_model(self) -> None:
+        # Force the no-model condition (host-independent: a model may be installed locally).
+        with patch.object(herdres_speech, "_TTS_ENGINE", None), \
+             patch.object(herdres_speech, "_TTS_LOAD_FAILED", False), \
+             patch.object(herdres_speech, "tts_model_dir", return_value=Path("/no/such/tts-model")):
+            self.assertFalse(herdres_speech.synthesize("hello", "/tmp/none.ogg"))
+
+    def test_synthesize_empty_text(self) -> None:
+        self.assertFalse(herdres_speech.synthesize("   ", "/tmp/none.ogg"))
+
+    @unittest.skipUnless(__import__("shutil").which("ffmpeg"), "ffmpeg required")
+    def test_encode_pcm_to_ogg_real_ffmpeg(self) -> None:
+        import array
+        import math
+        import tempfile
+        # 0.2s of a 440Hz tone as float32 mono @24k -> a real OGG/Opus file.
+        sr = 24000
+        samples = array.array("f", [0.2 * math.sin(2 * math.pi * 440 * i / sr) for i in range(sr // 5)])
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "tone.ogg"
+            ok = herdres_speech._encode_pcm_to_ogg(samples.tobytes(), sr, dest)
+            self.assertTrue(ok)
+            self.assertTrue(dest.exists() and dest.stat().st_size > 0)
 
 
 if __name__ == "__main__":
