@@ -24,6 +24,10 @@ sed "s#\\[\"herdres\", #\\[\"$HOME/.local/bin/herdres\", #g" \
 # so this script must be run from the checkout root and $PWD *is* that checkout.
 install -d "$HOME/.local/share/herdres"
 printf '%s\n' "$PWD" > "$HOME/.local/share/herdres/source"
+# Runtime-native slash commands (issue #27): copy commands/herdres*.md -> ~/.claude/commands so
+# /herdres works in Claude Code. --source "$PWD" is the checkout (installs above are cwd-relative);
+# no-op for a runtime that isn't installed.
+"$HOME/.local/bin/herdres" commands install --source "$PWD" >/dev/null 2>&1 || true
 mkdir -p "$HOME/.config/systemd/user"
 cp systemd/user/herdres.service systemd/user/herdres.timer systemd/user/herdres-gateway.service "$HOME/.config/systemd/user/"
 

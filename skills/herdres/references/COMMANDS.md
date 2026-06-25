@@ -24,6 +24,8 @@ Invoke as `herdres <subcommand>` (the actual binary lands wherever SETUP.md plac
 | `managed-bot` | Register/refresh a managed child bot token from a Telegram `managed_bot` update. **Reads a JSON payload on stdin.** Gateway-only. See MANAGED_BOTS.md. |
 | `probe` | Send a throwaway "Rich Probe" message to verify rich-message delivery, then delete it. Useful for diagnosing chat/topic wiring. |
 | `probe --thread-id <id>` | Same probe, but target a specific forum topic (thread) id instead of the General thread. |
+| `status` | **Read-only** health + roster snapshot: version, install markers, service state (timer/gateway), config booleans/counts, and the pane/space roster. Never touches Telegram, never writes state, and exposes secrets only as `chat_id_set`/`allowed_users_count`. Safe to run anytime; this is what the `/herdres` and `/herdres-status` slash commands call. |
+| `commands install` | Copy the runtime-native slash commands from this checkout into Claude Code's command dir `~/.claude/commands/` (`herdres*.md`). Optional `--source <dir>` (the installers pass it); otherwise reads the recorded source marker. Idempotent; skips when `~/.claude` is absent. Run by the installers and the update path; rerun by hand to (re)install. (Codex exposure is a separate follow-up — its native form is skills/prompts, not loose command files.) |
 
 **stdin-JSON subcommands** — `command`, `callback`, and `managed-bot` each read a JSON object from stdin (`{}` if empty). These are wired to the Telegram gateway, which spawns a fresh `herdres` per update; you normally never run them by hand.
 
@@ -44,6 +46,19 @@ For a one-shot backfill that creates more topics than the per-run cap, raise the
 ```bash
 HERDR_TELEGRAM_TOPICS_MAX_CREATES=12 herdres sync
 ```
+
+### Runtime-native slash commands (`/herdres`)
+
+The installers (and `herdres update`) drop thin wrappers into Claude Code's command dir (`~/.claude/commands/herdres*.md`) so herdres is reachable as a slash command from inside a Claude Code session. The copy is skipped for a runtime whose dir doesn't exist yet, so **if you install Claude Code _after_ herdres, run `herdres commands install` once** to pick the commands up (the installers only run it at install time).
+
+| Slash command | What it does |
+|---|---|
+| `/herdres` | Read-only status + help (runs `herdres status`); `/herdres setup\|sync\|status` routes to the matching command. |
+| `/herdres-status` | The pane/space roster + install/service health (`herdres status`). |
+| `/herdres-sync` | One reconciliation pass (`herdres sync`) and a summary of what changed. **Mutates state / may post to Telegram.** |
+| `/herdres-setup` | Launch the credential wizard (`herdres setup`). Needs a TTY; never invents credentials. |
+
+These wrappers only ever call the read-only `status` or the documented mutating subcommands — they never print secrets and defer the full guided install to this skill.
 
 ---
 
@@ -176,7 +191,9 @@ This means: you can paste a long brief or a multi-paragraph goal into a pane top
 
 | You want to… | Do this |
 |---|---|
+| Check install/service health + roster | `herdres status` (read-only; or `/herdres` in Claude Code) |
 | Force a reconciliation now | `herdres sync` |
+| (Re)install the `/herdres` slash commands | `herdres commands install` |
 | Enable the plugin event path | `herdres plugin-enable` |
 | Remove duplicate topics | `herdres cleanup-duplicates --delete` (preview first without `--delete`) |
 | Verify delivery into a topic | `herdres probe --thread-id <id>` |
