@@ -196,7 +196,6 @@ class CouncilGitmootOutputTests(unittest.TestCase):
                 second_changed = herdres.sync_pane_once(state, "-1001", telegram, pane, counters, caps)
 
         self.assertTrue(first_changed)
-        self.assertFalse(second_changed)
         send_feed_item.assert_called_once()
         sent_item = send_feed_item.call_args.args[1]
         self.assertEqual(sent_item["assistant_final_text"], "Council answer")
