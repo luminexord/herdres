@@ -24,6 +24,8 @@ Invoke as `herdres <subcommand>` (the actual binary lands wherever SETUP.md plac
 | `managed-bot` | Register/refresh a managed child bot token from a Telegram `managed_bot` update. **Reads a JSON payload on stdin.** Gateway-only. See MANAGED_BOTS.md. |
 | `probe` | Send a throwaway "Rich Probe" message to verify rich-message delivery, then delete it. Useful for diagnosing chat/topic wiring. |
 | `probe --thread-id <id>` | Same probe, but target a specific forum topic (thread) id instead of the General thread. |
+| `speech check` | **Read-only** preflight for the local voice feature (issue #4): is `sherpa-onnx` importable, `ffmpeg` present, the STT model downloaded, the flags on. |
+| `speech install` | Download + SHA256-verify the local STT model (parakeet) into `~/.local/share/herdres/speech-models`, and report what else is needed (`pip install --user sherpa-onnx`, `ffmpeg`). Opt-in; heavy deps are not installed by default. |
 
 **stdin-JSON subcommands** — `command`, `callback`, and `managed-bot` each read a JSON object from stdin (`{}` if empty). These are wired to the Telegram gateway, which spawns a fresh `herdres` per update; you normally never run them by hand.
 
@@ -157,6 +159,16 @@ Plain text (no leading `/`) typed in a pane topic is handled by context:
 - Otherwise herdres replies: *"Not sure which agent this is for. Reply to a message in that agent's thread, send /agents to pick one (replies then route there), or use /send <text>."* (so a stray message isn't silently injected).
 
 Plain text follows the same queue/interrupt rules as `/send` — to a busy agent it queues.
+
+### 2.7a Voice notes → transcribed to the pane (issue #4, opt-in)
+
+Send a **Telegram voice message** in a pane topic and herdres transcribes it **locally** (NVIDIA Parakeet via sherpa-onnx — no cloud) and forwards the text to the pane, same routing as plain text ("agents do better the more you tell them — too much to type"). It echoes **🎙️ Heard: …** back so you can see/correct what it heard.
+
+**Opt-in, machine-agnostic, fail-open** (any speech failure degrades to text — it never breaks routing):
+1. `herdres speech install` (downloads the model) + `pip install --user sherpa-onnx` + ensure `ffmpeg` is present — verify with `herdres speech check`.
+2. Set `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1`.
+
+A later phase adds the reverse — the agent **speaks its reply back** as a voice message (`HERDR_TELEGRAM_TOPICS_SPEECH_REPLIES`). See `.env.example` for all `HERDR_TELEGRAM_TOPICS_SPEECH_*` knobs.
 
 ### 2.8 Long / multiline input → inbound file
 

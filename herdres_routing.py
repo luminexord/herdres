@@ -77,6 +77,18 @@ def is_forwarded_dict(message: dict[str, Any]) -> bool:
 
 def attachment_payload_obj(message: Any) -> dict[str, Any] | None:
     try:
+        voice = getattr(message, "voice", None)  # Telegram voice note (audio/ogg opus) — issue #4
+        if voice is not None:
+            file_id = str(getattr(voice, "file_id", "") or "")
+            if file_id:
+                return {
+                    "kind": "voice",
+                    "file_id": file_id,
+                    "file_name": "",
+                    "mime_type": str(getattr(voice, "mime_type", "") or "audio/ogg"),
+                    "file_size": int(getattr(voice, "file_size", 0) or 0),
+                    "duration": int(getattr(voice, "duration", 0) or 0),
+                }
         document = getattr(message, "document", None)
         if document is not None:
             file_id = str(getattr(document, "file_id", "") or "")
@@ -107,6 +119,18 @@ def attachment_payload_obj(message: Any) -> dict[str, Any] | None:
 
 def attachment_payload_dict(message: dict[str, Any]) -> dict[str, Any] | None:
     try:
+        voice = message.get("voice")  # Telegram voice note (audio/ogg opus) — issue #4
+        if isinstance(voice, dict):
+            file_id = str(voice.get("file_id") or "")
+            if file_id:
+                return {
+                    "kind": "voice",
+                    "file_id": file_id,
+                    "file_name": "",
+                    "mime_type": str(voice.get("mime_type") or "audio/ogg"),
+                    "file_size": int(voice.get("file_size") or 0),
+                    "duration": int(voice.get("duration") or 0),
+                }
         document = message.get("document")
         if isinstance(document, dict):
             file_id = str(document.get("file_id") or "")

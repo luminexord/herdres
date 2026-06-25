@@ -31,6 +31,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+try:
+    # Optional local speech engine (issue #4 — voice notes ↔ panes). If the module/its deps are
+    # absent, speech features are simply off and the text path is unaffected (fail-open).
+    import herdres_speech
+except Exception:  # pragma: no cover - speech is strictly additive
+    herdres_speech = None  # type: ignore
+
 
 HERDRES_VERSION = "0.3.0"
 
@@ -12515,6 +12522,49 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
         return {"handled": True, "reply": "Sent attachment to this pane."}
 
+    # Issue #4: an owner's voice note → transcribe locally (parakeet) → deliver as the pane's input.
+    # Fail-open: if speech is unavailable/disabled we tell the owner; we never break the text path.
+    if isinstance(attachment, dict) and attachment.get("kind") == "voice" and attachment.get("file_id"):
+        caption = str(payload.get("caption") or "").strip()
+        try:
+            speech_on = herdres_speech is not None and herdres_speech.speech_input_enabled()
+        except Exception:  # a flag read must never abort the turn (fail-open)
+            speech_on = False
+        if not speech_on:
+            # Speech off/unavailable: still deliver a caption if the owner attached one, rather than
+            # silently dropping it (parity with the document/photo arm); otherwise explain how to enable.
+            if caption:
+                sent_ok, sent_detail = send_to_pane(pane_id, caption)
+                if not sent_ok:
+                    return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
+                return {"handled": True, "reply": "Voice transcription is off; sent your caption to this pane."}
+            return {"handled": True, "reply": (
+                "Voice transcription is off. Enable it with `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1` "
+                "and `herdres speech install`, or send text.")}
+        ok, detail, dest = deliver_attachment(pane_id, attachment)
+        if not ok or dest is None:
+            return {"handled": True, "reply": f"Could not fetch that voice note: {detail}"}
+        try:
+            transcript = str(herdres_speech.speech_request("stt", {"path": str(dest)}).get("text") or "").strip()
+        except Exception:
+            transcript = ""
+        if not transcript:
+            return {"handled": True, "reply": (
+                "Got your voice note, but speech-to-text is unavailable on this host. "
+                "Send text, or run `herdres speech install`.")}
+        # The echo is cosmetic — neither the flag read nor the send may abort delivery to the pane.
+        try:
+            if herdres_speech.speech_echo_transcript_enabled():
+                send_message(chat_id, f"🎙️ Heard: {sanitize_text(transcript, 1000)}",
+                             thread_id=topic_id, api_token=pane_api_token)
+        except Exception:
+            pass
+        outbound = f"{transcript}\n\n{caption}" if caption else transcript
+        sent_ok, sent_detail = send_to_pane(pane_id, outbound)
+        if not sent_ok:
+            return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
+        return {"handled": True, "reply": "Sent your voice message to this pane."}
+
     if command == "plain":
         implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
         awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
@@ -13587,6 +13637,25 @@ def hooks_once(args: Any) -> dict[str, Any]:
         "settings_path": str(claude_settings_path()),
         "hook_path": str(hook_path),
     }
+
+
+def speech_once(args: Any) -> dict[str, Any]:
+    """`herdres speech check|install` (issue #4): preflight or fetch the local speech models/deps."""
+    action = str(getattr(args, "action", "check") or "check")
+    if herdres_speech is None:
+        return {"ok": False, "error": "herdres_speech is not importable on this host"}
+    if action == "check":
+        return {"ok": True, "action": "check", **herdres_speech.check()}
+    if action == "install":
+        ok, detail = herdres_speech.install_stt_model(force=bool(getattr(args, "force", False)))
+        chk = herdres_speech.check()
+        hints = []
+        if not chk.get("sherpa_onnx"):
+            hints.append("pip install --user sherpa-onnx numpy")
+        if not chk.get("ffmpeg"):
+            hints.append("install ffmpeg (apt-get install ffmpeg / brew install ffmpeg)")
+        return {"ok": ok, "action": "install", "model": detail, "check": chk, "next_steps": hints}
+    return {"ok": False, "error": f"unknown speech action: {action}"}
 
 
 def setup_once(args: Any) -> dict[str, Any]:
@@ -14715,6 +14784,9 @@ def main() -> int:
     sub.add_parser("version")
     hooks = sub.add_parser("hooks")
     hooks.add_argument("action", nargs="?", default="install", choices=["install"])
+    speech = sub.add_parser("speech")
+    speech.add_argument("action", nargs="?", default="check", choices=["check", "install"])
+    speech.add_argument("--force", action="store_true")
     update = sub.add_parser("update")
     update.add_argument("--channel", default="edge")
     update.add_argument("--edge", action="store_const", const="edge", dest="channel")
@@ -14753,6 +14825,8 @@ def main() -> int:
             result = version_once(args)
         elif args.cmd == "hooks":
             result = hooks_once(args)
+        elif args.cmd == "speech":
+            result = speech_once(args)
         elif args.cmd == "update":
             result = update_once(args)
         else:
