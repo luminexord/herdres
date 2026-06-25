@@ -146,7 +146,37 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gaijinjoe.herdres-ga
 
 ---
 
-## 5. Link the Herdr plugin
+## 5. One-tap questions & plan approvals (Claude Code hook)
+
+When a Claude Code pane asks a question (`AskUserQuestion`) or requests plan approval
+(`ExitPlanMode`), Herdres can surface it on Telegram as **tappable buttons** instead of a
+read-only screen the owner has to answer in the terminal (issue #36). Claude Code never writes a
+*pending* prompt to its transcript, so detection rides a small `PreToolUse`/`PostToolUse` hook
+(`herdres-decision-hook`) that records the prompt to a per-session file the turn adapter reads.
+
+Both installers copy the hook script to `~/.local/bin/herdres-decision-hook` and register it in
+`~/.claude/settings.json` automatically. The registration is **idempotent and coexists with other
+hooks** (orca/herdr) — it only adds Herdres' own entries and never touches others. To (re-)assert it
+by hand — e.g. on a host where Claude Code was installed after Herdres, or during a canary deploy:
+
+```bash
+herdres hooks install        # adds PreToolUse/PostToolUse (AskUserQuestion|ExitPlanMode) + UserPromptSubmit/SessionEnd
+```
+
+It is a no-op if `~/.claude/` does not exist (Claude Code not installed). Relevant knobs:
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `HERDRES_TURN_ADAPTER_DECISIONS` | `1` | Master toggle for adapter-emitted decision buttons. |
+| `HERDRES_PLAN_APPROVE_SEND_TEXT` | `1` | Text sent to the pane when the owner taps **Approve & proceed** on a plan. |
+| `HERDRES_PENDING_DIR` | `~/.local/share/herdres/pending` | Where the hook writes per-session pending files. |
+| `HERDRES_PENDING_TTL_SECONDS` | `3600` | Adapter ignores (and the hook's misses are bounded by) pending files older than this. |
+
+See TURN_FEED.md → "How the adapter sees a pending prompt" for the full round-trip.
+
+---
+
+## 6. Link the Herdr plugin
 
 Herdr 0.7.0 plugin events give Herdres a low-latency trigger layer. The included plugin is thin: `pane.agent_status_changed -> herdres event`. It does **not** replace the inbound bridge/gateway for commands and callbacks.
 
@@ -167,7 +197,7 @@ Toggle events independently of normal sync (keep the timer enabled either way as
 
 ---
 
-## 6. Verify
+## 7. Verify
 
 Run a safe dry-run first (no Telegram writes):
 
@@ -193,7 +223,7 @@ If the run is clean, open the supergroup: with Herdr panes running you should se
 
 ---
 
-## 7. State, lock, inbound, and offset locations
+## 8. State, lock, inbound, and offset locations
 
 All Herdres runtime data lives under **`~/.local/share/herdres/`**:
 

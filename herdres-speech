@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""herdres-speech — the warm speech sidecar (issue #4).
+
+A tiny Unix-socket server that holds the parakeet (STT) and Kokoro (TTS) models warm in one
+long-lived process, so the per-message `herdres command` (inbound) and the oneshot `herdres sync`
+(outbound) get fast, warm transcription/synthesis instead of paying a cold model load every time.
+
+It speaks the exact minimal HTTP the in-process client (`herdres_speech.speech_request` →
+`_sidecar_call`) expects: `POST /stt {"path": …} → {"text": …}` and `POST /tts {"text": …,
+"dest": …} → {"ok": bool}`. If this daemon is not running, `speech_request` simply falls back to
+loading the model in-process — so the sidecar is a pure latency optimization, never a dependency.
+
+Opt-in: installed by the installers but NOT enabled by default. Enable with
+`systemctl --user enable --now herdres-speech.service` after `herdres speech install`.
+Requests are handled one at a time (the models aren't assumed thread-safe); for a single owner's
+voice traffic that's plenty.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import herdres_speech
+
+_MAX_BODY = 1 * 1024 * 1024  # request bodies are tiny JSON; reject anything larger
+# TTS is synthesized OFF the request (and OFF the caller's lock): /tts enqueues and returns
+# immediately; the caller's `flush` later picks up the finished OGG. A single worker lock serializes
+# synthesis (the sherpa models aren't assumed thread-safe). `_inflight` dedupes concurrent dests.
+_SYNTH_LOCK = threading.Lock()
+_INFLIGHT: set[str] = set()
+_INFLIGHT_GUARD = threading.Lock()
+# When an OGG lands we poke `herdres speech-flush` so the voice note goes out in ~seconds instead of
+# on the next 30s timer sync. Debounced + coalesced: a burst of finished synths triggers one flush.
+_POKE_GUARD = threading.Lock()
+_POKE_PENDING = False
+
+
+def _socket_path() -> Path:
+    return herdres_speech.speech_socket_path()
+
+
+def _herdres_bin() -> str | None:
+    """The herdres CLI is installed right next to this sidecar; fall back to PATH (the service sets
+    PATH=~/.local/bin). Returns None if it can't be found — the poke is then skipped and the timer
+    sync still delivers the OGG on its next tick."""
+    try:
+        sibling = Path(sys.argv[0]).resolve().parent / "herdres"
+        if sibling.exists():
+            return str(sibling)
+    except Exception:
+        pass
+    return shutil.which("herdres")
+
+
+def _flush_poker() -> None:
+    global _POKE_PENDING
+    try:
+        time.sleep(0.3)  # coalesce a burst of finished synths into a single flush
+    finally:
+        with _POKE_GUARD:
+            _POKE_PENDING = False  # reset before flushing: a synth finishing now starts a fresh poke
+    herdres = _herdres_bin()
+    if not herdres:
+        return
+    try:
+        subprocess.run([herdres, "speech-flush"], capture_output=True, timeout=30)
+    except Exception:
+        pass  # best-effort; the timer sync is the backstop
+
+
+def _poke_flush_soon() -> None:
+    global _POKE_PENDING
+    with _POKE_GUARD:
+        if _POKE_PENDING:
+            return
+        _POKE_PENDING = True
+    threading.Thread(target=_flush_poker, daemon=True).start()
+
+
+def _bg_synthesize(text: str, dest: str) -> None:
+    try:
+        with _SYNTH_LOCK:  # one synthesis at a time
+            tmp = dest + ".part"
+            if herdres_speech.synthesize(text, tmp):
+                os.replace(tmp, dest)  # publish atomically so flush never sees a half-written OGG
+                _poke_flush_soon()  # ask herdres to send it NOW, not on the next 30s timer sync
+            else:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    except Exception as exc:  # never let a synth thread take down the daemon
+        print(f"herdres-speech: tts synth failed: {exc}", file=sys.stderr)
+    finally:
+        with _INFLIGHT_GUARD:
+            _INFLIGHT.discard(dest)
+
+
+def _enqueue_tts(text: str, dest: str) -> dict:
+    if not text.strip() or not dest:
+        return {"ok": False}
+    with _INFLIGHT_GUARD:
+        if dest in _INFLIGHT or os.path.exists(dest):
+            return {"ok": True}  # already done or in progress — idempotent
+        _INFLIGHT.add(dest)
+    threading.Thread(target=_bg_synthesize, args=(text, dest), daemon=True).start()
+    return {"ok": True}
+
+
+class _Handler(socketserver.StreamRequestHandler):
+    timeout = 60  # a request (read + STT transcribe, or a fast TTS enqueue) must not wedge the server
+
+    def handle(self) -> None:
+        out: dict = {}
+        try:
+            request_line = self.rfile.readline(65536).decode("utf-8", "replace")
+            parts = request_line.split()
+            path = parts[1] if len(parts) >= 2 else "/"
+            length = 0
+            while True:  # consume headers; we only need Content-Length
+                line = self.rfile.readline(65536).decode("utf-8", "replace")
+                if line in ("\r\n", "\n", ""):
+                    break
+                if line.lower().startswith("content-length:"):
+                    try:
+                        length = max(0, int(line.split(":", 1)[1].strip() or "0"))
+                    except ValueError:
+                        length = 0
+            if length > _MAX_BODY:
+                length = 0  # refuse an over-declared body rather than block/allocate on a bad client
+            body = self.rfile.read(length) if length else b""
+            payload = json.loads(body.decode("utf-8") or "{}") if body else {}
+            endpoint = path.strip("/")
+            if endpoint == "stt":
+                out = {"text": herdres_speech.transcribe(payload.get("path", ""))}  # synchronous
+            elif endpoint == "tts":
+                out = _enqueue_tts(str(payload.get("text", "")), str(payload.get("dest", "")))  # async
+            elif endpoint == "health":
+                out = {"ok": True}
+        except Exception:
+            out = {}  # never crash the connection; the client degrades
+        data = json.dumps(out).encode("utf-8")
+        try:
+            self.wfile.write(
+                b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(data)).encode("ascii") + b"\r\n\r\n" + data
+            )
+        except Exception:
+            pass
+
+
+class _UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    # Threaded so a synchronous /stt can't head-of-line-block a /tts enqueue (or a health check).
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address) -> None:  # keep serving on a bad request
+        pass
+
+
+def main() -> int:
+    sock = _socket_path()
+    sock.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if sock.exists() or sock.is_symlink():
+            sock.unlink()  # clear a stale socket from a previous run
+    except OSError:
+        pass
+    # Warm both models at boot so the first real request is fast (best-effort; missing models just
+    # mean cold/None until installed — requests still degrade gracefully).
+    try:
+        herdres_speech._load_stt()
+        herdres_speech._load_tts()
+    except Exception:
+        pass
+    server = _UnixHTTPServer(str(sock), _Handler)
+    try:
+        os.chmod(sock, 0o600)
+    except OSError:
+        pass
+    print(f"herdres-speech listening on {sock}", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            sock.unlink()
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

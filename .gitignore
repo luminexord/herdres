@@ -16,3 +16,7 @@ evidence/
 plans/
 node_modules/
 ssh/server/node_modules/
+# Telegram user-session credentials / sessions (temporary debugging; never commit)
+tg-cred.txt
+*.session
+*.session-journal

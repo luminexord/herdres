@@ -228,6 +228,18 @@ def _attachment_payload(message: Any) -> dict[str, Any] | None:
     JSON-safe dict via getattr only. No Telegram calls, no token. Returns None
     when there is no usable attachment; never raises on a malformed object."""
     try:
+        voice = getattr(message, "voice", None)  # Telegram voice note (audio/ogg opus) — issue #4
+        if voice is not None:
+            file_id = str(getattr(voice, "file_id", "") or "")
+            if file_id:
+                return {
+                    "kind": "voice",
+                    "file_id": file_id,
+                    "file_name": "",
+                    "mime_type": str(getattr(voice, "mime_type", "") or "audio/ogg"),
+                    "file_size": int(getattr(voice, "file_size", 0) or 0),
+                    "duration": int(getattr(voice, "duration", 0) or 0),
+                }
         document = getattr(message, "document", None)
         if document is not None:
             file_id = str(getattr(document, "file_id", "") or "")

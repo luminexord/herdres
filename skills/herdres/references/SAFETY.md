@@ -121,6 +121,16 @@ What is safe to render as actionable Telegram buttons:
   exact `send_text`; an empty `send_text` opens a ForceReply custom-instruction prompt).
 - Explicit agent-authored `HERDRES_CHOICES_START … HERDRES_CHOICES_END` blocks.
 
+For Claude Code panes, the adapter's `pending_decision` for a single `AskUserQuestion`
+or an `ExitPlanMode` (issue #36) is built from Claude's **actual structured tool input**,
+captured by the `herdres-decision-hook` `PreToolUse` hook (not a screen scrape) — so each
+button's `send_text` is the exact option label / approve text, and the `visible_readonly`
+model above is untouched. Plan approval stays explicit (separate **Approve** vs **Keep
+planning / revise** buttons; the approve text is `HERDRES_PLAN_APPROVE_SEND_TEXT`). The hook
+is a passive recorder that fails closed (any error → no-op, never blocks or alters a Claude
+turn), is matcher-scoped to those two tools, and bounds stale prompts via `PostToolUse`/
+`SessionEnd` clears plus `HERDRES_PENDING_TTL_SECONDS`.
+
 What is **READ-ONLY** and must never become a button, ForceReply, or key-driving
 callback:
 

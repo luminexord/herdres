@@ -339,7 +339,7 @@ class SpaceTopicSyncTests(unittest.TestCase):
             STATUS_ICON_ENABLED=False,
             LIVE_CARD_ENABLED=False,
             STATUS_MARKER_ENABLED=False,
-            PANE_ROOT_MESSAGES_ENABLED=True,
+            pane_root_messages_enabled=lambda: True,
             TURN_FEED_ENABLED=False,
         ):
             changed_a = herdres.sync_pane_once(state, "-1001", telegram, pane_a, counters, caps, turn_only=True)
@@ -385,7 +385,7 @@ class SpaceTopicSyncTests(unittest.TestCase):
             STATUS_ICON_ENABLED=False,
             LIVE_CARD_ENABLED=False,
             STATUS_MARKER_ENABLED=False,
-            PANE_ROOT_MESSAGES_ENABLED=True,
+            pane_root_messages_enabled=lambda: True,
             TURN_FEED_ENABLED=False,
         ):
             herdres.sync_pane_once(state, "-1001", telegram, pane_a, counters, caps, turn_only=True)
@@ -436,7 +436,7 @@ class SpaceTopicSyncTests(unittest.TestCase):
             STATUS_ICON_ENABLED=False,
             LIVE_CARD_ENABLED=False,
             STATUS_MARKER_ENABLED=False,
-            PANE_ROOT_MESSAGES_ENABLED=True,
+            pane_root_messages_enabled=lambda: True,
             TURN_FEED_ENABLED=False,
             per_agent_topics_enabled=lambda: True,
         ):
@@ -488,7 +488,7 @@ class SpaceTopicSyncTests(unittest.TestCase):
             STATUS_ICON_ENABLED=False,
             LIVE_CARD_ENABLED=False,
             STATUS_MARKER_ENABLED=False,
-            PANE_ROOT_MESSAGES_ENABLED=True,
+            pane_root_messages_enabled=lambda: True,
             TURN_FEED_ENABLED=False,
         ):
             changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps, turn_only=True)
@@ -750,10 +750,20 @@ class PaneThreadRoutingTests(unittest.TestCase):
     def test_pane_root_reply_target_requires_opt_in(self) -> None:
         entry = {"pane_root_message_id": "1001"}
 
-        with patch.object(herdres, "PANE_ROOT_MESSAGES_ENABLED", False):
+        with patch.object(herdres, "pane_root_messages_enabled", lambda: False):
             self.assertIsNone(herdres.pane_root_reply_target(entry))
-        with patch.object(herdres, "PANE_ROOT_MESSAGES_ENABLED", True):
+        with patch.object(herdres, "pane_root_messages_enabled", lambda: True):
             self.assertEqual(herdres.pane_root_reply_target(entry), "1001")
+
+    def test_pane_root_messages_default_is_read_at_runtime(self) -> None:
+        """Must be read at CALL time, not frozen at import. The Herdr plugin runs
+        `herdres event` with no systemd EnvironmentFile, so the flag is set by
+        load_dotenv() AFTER import; a frozen constant would be False and plugin-delivered
+        turns would skip pane-root creation + reply-threading (split message thread)."""
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES": "1"}, clear=False):
+            self.assertTrue(herdres.pane_root_messages_enabled())
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_PANE_ROOT_MESSAGES": "0"}, clear=False):
+            self.assertFalse(herdres.pane_root_messages_enabled())
 
     def test_message_route_index_records_final_prompt_and_notice_messages(self) -> None:
         state, _pane, key, entry = self._pane_state()
@@ -1562,7 +1572,7 @@ class TelegramDraftTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         rich_message = json.loads(calls[0][1]["rich_message"])
-        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", rich_message["html"])
+        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", rich_message["html"])
         self.assertNotIn("<b>Response</b>", rich_message["html"])
 
     def test_request_elapsed_label_formats_minutes_and_hours(self) -> None:
@@ -1613,7 +1623,7 @@ class TelegramDraftTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         rich_message = json.loads(calls[0][1]["rich_message"])
-        self.assertIn("<details open><summary><b>Worklog (2m)</b></summary><blockquote>", rich_message["html"])
+        self.assertIn("<details open><summary><b>Working… (2m)</b></summary><blockquote>", rich_message["html"])
 
     def test_stream_draft_throttle_enforces_min_interval_between_updates(self) -> None:
         telegram = {"rich_messages": {"supported": "yes"}}
@@ -1726,12 +1736,12 @@ class TelegramDraftTests(unittest.TestCase):
         self.assertTrue(first["sent_message"])
         self.assertEqual(entry["last_stream_message_id"], "5001")
         send_rich.assert_called_once()
-        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", send_rich.call_args.args[1])
+        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", send_rich.call_args.args[1])
         self.assertNotIn("<b>Response</b>", send_rich.call_args.args[1])
         self.assertEqual(send_rich.call_args.kwargs["thread_id"], "77")
         self.assertIsNone(send_rich.call_args.kwargs["reply_to_message_id"])
         edit_rich.assert_called_once()
-        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", edit_rich.call_args.args[2])
+        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", edit_rich.call_args.args[2])
         self.assertTrue(second["ok"])
         self.assertFalse(second.get("sent_message", False))
 
@@ -1971,7 +1981,7 @@ class ManagedBotTests(unittest.TestCase):
         rich_message = json.loads(calls[0][1]["rich_message"])
         self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", rich_message["html"])
         self.assertIn("Run the profile.", rich_message["html"])
-        self.assertIn("<details open><summary><b>Worklog</b></summary><blockquote>", rich_message["html"])
+        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", rich_message["html"])
         self.assertNotIn("<b>Response</b>", rich_message["html"])
 
     def test_stream_update_reissues_same_worklog_when_user_block_is_added(self) -> None:
@@ -2127,6 +2137,8 @@ class StreamingIntegrationTests(unittest.TestCase):
             prompt_html = json.loads(send_calls[0][1]["rich_message"])["html"]
             self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", prompt_html)
             self.assertIn(user_text, prompt_html)
+            self.assertIn("<b>Working…</b>", prompt_html)  # issue #3: reasoning indicator on the bare prompt
+            self.assertNotIn("Working… (", prompt_html)    # bare label, no ticking elapsed (no churn)
             self.assertNotIn("<b>Worklog</b>", prompt_html)
             self.assertNotIn("<b>Response</b>", prompt_html)
 
@@ -2141,7 +2153,7 @@ class StreamingIntegrationTests(unittest.TestCase):
             working_html = json.loads(edit_calls[0][1]["rich_message"])["html"]
             self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", working_html)
             self.assertIn(user_text, working_html)
-            self.assertIn("<details open><summary><b>Worklog (1m)</b></summary><blockquote>", working_html)
+            self.assertIn("<details open><summary><b>Working… (1m)</b></summary><blockquote>", working_html)
             self.assertIn(worklog_text, working_html)
             self.assertNotIn("<b>Response</b>", working_html)
 
@@ -2170,6 +2182,50 @@ class StreamingIntegrationTests(unittest.TestCase):
         self.assertNotIn("<blockquote>", final_html[response_start:response_body_start])
         self.assertLess(final_html.index("<b>User:</b>"), final_html.index("<b>Worklog (1m)</b>"))
         self.assertLess(final_html.index("<b>Worklog (1m)</b>"), final_html.index("<b>Response</b>"))
+
+    def _open_no_content_turn(self) -> dict:
+        return {"available": True, "complete": False, "turn_id": "turn-1",
+                "user_text": "Run it.", "assistant_final_text": "", "assistant_stream_text": ""}
+
+    def _first_sync_prompt_html(self, state, pane, *, env=None):
+        api_calls = []
+
+        def telegram_api(method, payload, *, token=None):
+            api_calls.append((method, dict(payload)))
+            return {"ok": True, "result": {"message_id": "9001"} if method == "sendRichMessage" else True}
+
+        state["telegram"]["rich_messages"] = {"supported": "yes"}
+        ctx = patch.dict(os.environ, env or {})
+        with ctx, patch.multiple(
+            herdres,
+            pane_turn=Mock(return_value=self._open_no_content_turn()),
+            telegram_api=telegram_api,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True, CLEAN_FEED_ENABLED=True, LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False, STATUS_ICON_ENABLED=False,
+        ):
+            counters, caps = self._caps()
+            herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+        return [json.loads(p["rich_message"])["html"] for m, p in api_calls if m == "sendRichMessage"]
+
+    def test_working_badge_flag_off_omits_reasoning_indicator(self) -> None:
+        # With HERDR_TELEGRAM_TOPICS_WORKING_BADGE=0 the open-turn prompt has NO "Working…" (the gate
+        # is checked at staging time, not just the render layer).
+        state, pane, _key, _entry = self._state()
+        sends = self._first_sync_prompt_html(state, pane, env={"HERDR_TELEGRAM_TOPICS_WORKING_BADGE": "0"})
+        self.assertTrue(sends)
+        self.assertIn("Run it.", "\n".join(sends))
+        self.assertNotIn("Working", "\n".join(sends))
+
+    def test_blocked_pane_open_turn_omits_reasoning_indicator(self) -> None:
+        # A pane parked on a blocked/awaiting-input prompt is NOT actively working — no "Working…".
+        state, pane, _key, entry = self._state()
+        pane["agent_status"] = "blocked"
+        entry["last_known_status"] = "blocked"
+        sends = self._first_sync_prompt_html(state, pane)
+        for html in sends:
+            self.assertNotIn("Working", html)
 
     def test_stream_message_edits_latest_prompt_anchor_when_stream_message_is_stale(self) -> None:
         _state, _pane, _key, entry = self._state()
@@ -2661,6 +2717,231 @@ class StreamingIntegrationTests(unittest.TestCase):
         self.assertTrue(changed)
         send_feed_item.assert_not_called()
         self.assertEqual(entry["last_clean_hash"], herdres.clean_feed_hash(item))
+
+    def test_worklog_on_delivered_turn_does_not_repost(self) -> None:
+        """A worklog attached to an ALREADY-DELIVERED turn must be a no-op.
+
+        worklog_text is excluded from clean_feed_hash, item_plain_text, and item["text"],
+        so re-parsing a completed turn with a worklog neither re-sends nor edits it.
+        Without this, the worklog flips the dedup hash and re-delivers the turn as a
+        DUPLICATE (the issue #3 live-test regression).
+        """
+        state, pane, _key, entry = self._state()
+        counters, caps = self._caps()
+        delivered = {
+            "available": True,
+            "complete": True,
+            "turn_id": "turn-1",
+            "user_text": "Run tests",
+            "assistant_final_text": "Tests passed.",
+        }
+        item = herdres.make_turn_feed_item(delivered)
+        assert item is not None
+        entry.update({
+            "last_clean_item": item,
+            "last_clean_text": herdres.item_plain_text(item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(item, include_render_version=False),
+            "last_clean_hash": herdres.clean_feed_hash(item),
+            "last_clean_render_hash": herdres.clean_feed_hash(item),
+            "last_clean_message_id": "3001",
+            "last_turn_id": "turn-1",
+        })
+        with_worklog = dict(delivered, worklog_text="Bash go test ./...\nEdit engine.go")
+        worklog_item = herdres.make_turn_feed_item(with_worklog)
+
+        # The worklog must not change any dedup input...
+        self.assertEqual(herdres.clean_feed_hash(item), herdres.clean_feed_hash(worklog_item))
+        self.assertEqual(
+            herdres.clean_feed_hash(item, include_render_version=False),
+            herdres.clean_feed_hash(worklog_item, include_render_version=False),
+        )
+        self.assertEqual(herdres.item_plain_text(item), herdres.item_plain_text(worklog_item))
+        # ...but is still carried on the item for rendering.
+        self.assertIn("Bash go test", worklog_item["worklog_text"])
+
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3002"})
+        edit_feed_item = Mock(return_value={"ok": True})
+        with patch.multiple(
+            herdres,
+            pane_turn=Mock(return_value=with_worklog),
+            send_feed_item=send_feed_item,
+            edit_feed_item=edit_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        # The invariant: NO new message (no duplicate). The worklog may only ride along
+        # as an in-place edit of the turn's OWN existing message (3001), never a fresh send.
+        send_feed_item.assert_not_called()
+        for call in edit_feed_item.call_args_list:
+            self.assertEqual(call.args[1], "3001", "worklog must only edit the turn's own message")
+
+    def test_worklog_label_elapsed_tick_does_not_change_hash(self) -> None:
+        """worklog_label embeds a wall-clock elapsed time ("Worklog (1h 11m)"), so it must
+        stay OUT of the render hash. Otherwise a long-idle pane whose turn still carries a
+        worklog re-render-delivers (edits) its message every minute forever as the clock
+        ticks — the live re-delivery loop this guards against (found via p19)."""
+        base = {"available": True, "complete": True, "turn_id": "t1",
+                "user_text": "q", "assistant_final_text": "done", "worklog_text": "Bash echo hi"}
+        item = herdres.make_turn_feed_item(base)
+        assert item is not None
+        a = dict(item, worklog_label="Worklog (1h 9m)")
+        b = dict(item, worklog_label="Worklog (1h 11m)")
+        self.assertEqual(herdres.clean_feed_hash(a), herdres.clean_feed_hash(b))
+        self.assertEqual(
+            herdres.clean_feed_hash(a, include_render_version=False),
+            herdres.clean_feed_hash(b, include_render_version=False),
+        )
+
+    def test_working_badge_label_is_hash_invariant(self) -> None:
+        """Issue #3: the 'Working…' badge lives only in worklog_label (excluded from the render
+        hash), so swapping 'Worklog' for 'Working…' must NOT change clean_feed_hash/item_plain_text
+        — otherwise the badge would re-deliver/edit-loop the turn (the exact live regression #3 avoids)."""
+        base = {"available": True, "complete": True, "turn_id": "t1",
+                "user_text": "q", "assistant_final_text": "done", "worklog_text": "Bash echo hi"}
+        item = herdres.make_turn_feed_item(base)
+        assert item is not None
+        worklog = dict(item, worklog_label="Worklog (1m)")
+        working = dict(item, worklog_label="Working… (1m)")
+        self.assertEqual(herdres.clean_feed_hash(worklog), herdres.clean_feed_hash(working))
+        self.assertEqual(herdres.item_plain_text(worklog), herdres.item_plain_text(working))
+
+    def test_prompt_item_renders_working_indicator(self) -> None:
+        """Issue #3: a prompt item carrying working_label renders a bare 'Working…' indicator after
+        the User block (the reasoning window); without it the base prompt render is unchanged."""
+        item = herdres.make_prompt_feed_item("turn-1", "Profile the CPU.")
+        base = herdres.render_feed_item_html(item)
+        self.assertNotIn("Working", base)
+        item["working_label"] = herdres.WORKING_LABEL
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", html)
+        self.assertIn("Profile the CPU.", html)
+        self.assertIn("<b>Working…</b>", html)
+        self.assertNotIn("Working… (", html)  # bare label, no ticking elapsed
+
+    def test_prompt_working_label_is_hash_invariant(self) -> None:
+        """The prompt 'Working…' indicator lives in working_label only — excluded from clean_feed_hash
+        and item_plain_text — so it can never churn/re-edit the prompt message."""
+        item = herdres.make_prompt_feed_item("turn-1", "q")
+        with_label = dict(item, working_label=herdres.WORKING_LABEL)
+        self.assertEqual(herdres.clean_feed_hash(item), herdres.clean_feed_hash(with_label))
+        self.assertEqual(herdres.item_plain_text(item), herdres.item_plain_text(with_label))
+
+    def test_worklog_label_working_badge_toggle(self) -> None:
+        """worklog_label_for_turn(working=True) shows 'Working…' when the badge flag is on (default)
+        and reverts to 'Worklog' when working=False or HERDR_TELEGRAM_TOPICS_WORKING_BADGE=0."""
+        entry: dict = {}  # no request_started_at -> bare label, no elapsed suffix
+        self.assertEqual(herdres.worklog_label_for_turn(entry, "t1", working=True), "Working…")
+        self.assertEqual(herdres.worklog_label_for_turn(entry, "t1", working=False), "Worklog")
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_WORKING_BADGE": "0"}):
+            self.assertEqual(herdres.worklog_label_for_turn(entry, "t1", working=True), "Worklog")
+
+    def test_collapse_response_flag_folds_only_the_response(self) -> None:
+        base = {"available": True, "complete": True, "turn_id": "t1",
+                "user_text": "q", "assistant_final_text": "## Heading\nthe answer body"}
+        item = herdres.make_turn_feed_item(base)
+        expanded = herdres.render_turn_item_html(item)
+        collapsed = herdres.render_turn_item_html(dict(item, collapse_response=True))
+        # latest turn: Response details is open
+        self.assertIn("<details open><summary><b>Response</b>", expanded)
+        # previous turn: Response details is folded (no ` open`), with a preview
+        self.assertNotIn("<details open><summary><b>Response</b>", collapsed)
+        self.assertIn("<details><summary><b>Response</b>", collapsed)
+        # the response body is preserved either way (collapse is a fold, not a drop)
+        self.assertIn("the answer body", collapsed)
+
+    def test_new_turn_folds_previous_turn_response_when_enabled(self) -> None:
+        state, pane, _key, entry = self._state()
+        counters, caps = self._caps()
+        space_key = str(entry.get("space_key") or "")
+        state.setdefault("spaces", {}).setdefault(space_key, {})["collapse_previous_responses"] = True
+        prior_item = herdres.make_turn_feed_item(
+            {"available": True, "complete": True, "turn_id": "turn-1",
+             "user_text": "q1", "assistant_final_text": "Answer one."})
+        entry.update({
+            "last_clean_item": prior_item,
+            "last_clean_text": herdres.item_plain_text(prior_item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(prior_item, include_render_version=False),
+            "last_clean_hash": herdres.clean_feed_hash(prior_item),
+            "last_clean_render_hash": herdres.clean_feed_hash(prior_item),
+            "last_clean_message_id": "3001",
+            "last_turn_id": "turn-1",
+        })
+        turn2 = {"available": True, "complete": True, "turn_id": "turn-2",
+                 "user_text": "q2", "assistant_final_text": "Answer two."}
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3002"})
+        edit_feed_item = Mock(return_value={"ok": True})
+        with patch.multiple(
+            herdres,
+            pane_turn=Mock(return_value=turn2),
+            send_feed_item=send_feed_item,
+            edit_feed_item=edit_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True, LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False, STATUS_ICON_ENABLED=False,
+        ):
+            herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        # the new turn was sent as its own fresh message...
+        send_feed_item.assert_called()
+        # ...and the PREVIOUS turn's message (3001) was folded in place
+        folds = [c for c in edit_feed_item.call_args_list if c.args[1] == "3001"]
+        self.assertTrue(folds, "previous turn's message should be folded")
+        folded_item = folds[-1].args[2]
+        self.assertTrue(folded_item.get("collapse_response"))
+        self.assertEqual(str(folded_item.get("turn_id")), "turn-1")
+
+    def test_collapse_default_is_read_at_runtime(self) -> None:
+        """The collapse default must be read at CALL time, not frozen at import. The Herdr
+        plugin runs `herdres event` with no systemd EnvironmentFile, so the flag is set by
+        load_dotenv() AFTER import; a frozen constant would be False and silently skip the
+        fold on every plugin-delivered turn (the bug behind 'previous responses not
+        collapsing'). Mirrors the per_agent_topics_enabled runtime-read fix."""
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS": "1"}, clear=False):
+            self.assertTrue(herdres.response_collapse_previous_default())
+            self.assertTrue(herdres.space_collapse_previous_responses({"spaces": {}}, {"space_key": "s"}))
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS": ""}, clear=False):
+            self.assertFalse(herdres.response_collapse_previous_default())
+            self.assertFalse(herdres.space_collapse_previous_responses({"spaces": {}}, {"space_key": "s"}))
+
+    def test_new_turn_does_not_fold_previous_when_disabled(self) -> None:
+        state, pane, _key, entry = self._state()
+        counters, caps = self._caps()
+        # toggle left at default (off)
+        prior_item = herdres.make_turn_feed_item(
+            {"available": True, "complete": True, "turn_id": "turn-1",
+             "user_text": "q1", "assistant_final_text": "Answer one."})
+        entry.update({
+            "last_clean_item": prior_item,
+            "last_clean_text": herdres.item_plain_text(prior_item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(prior_item, include_render_version=False),
+            "last_clean_hash": herdres.clean_feed_hash(prior_item),
+            "last_clean_render_hash": herdres.clean_feed_hash(prior_item),
+            "last_clean_message_id": "3001",
+            "last_turn_id": "turn-1",
+        })
+        turn2 = {"available": True, "complete": True, "turn_id": "turn-2",
+                 "user_text": "q2", "assistant_final_text": "Answer two."}
+        edit_feed_item = Mock(return_value={"ok": True})
+        with patch.multiple(
+            herdres,
+            pane_turn=Mock(return_value=turn2),
+            send_feed_item=Mock(return_value={"ok": True, "message_id": "3002"}),
+            edit_feed_item=edit_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True, LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False, STATUS_ICON_ENABLED=False,
+        ):
+            herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+        self.assertFalse([c for c in edit_feed_item.call_args_list if c.args[1] == "3001"],
+                         "with the toggle off, the previous turn must not be folded")
 
     def test_sync_streams_open_turn_after_completed_turn_already_delivered(self) -> None:
         state, pane, _key, entry = self._state()
@@ -7471,7 +7752,10 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
                 }
             )
 
-        self.assertEqual(result["reply"], "Reply directly to the detail prompt, or tap the button again.")
+        self.assertEqual(
+            result["reply"],
+            "Reply to the detail prompt above (use Telegram's Reply), or tap the option button again to re-open it.",
+        )
         send_to_pane.assert_not_called()
 
     def test_force_reply_detail_sends_choice_and_clears_prompt(self) -> None:
@@ -7501,6 +7785,204 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         send_to_pane.assert_called_once_with("pane-1", "1\nextra detail")
         self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
         self.assertNotIn("active_prompt", state["panes"]["pane-1"])
+
+    # --- Issue #37: relax the reply gate for a BARE answer in an unambiguous topic ---
+    # A plain typed message (no Telegram "Reply" gesture) is accepted as the answer to the one open
+    # prompt when the topic unambiguously targets a single pane; an explicit reply to a DIFFERENT
+    # message stays strict (it could target a superseded prompt / wrong pane).
+
+    @staticmethod
+    def _single_live_space(state: dict) -> None:
+        """Map topic 77 to a space with exactly one live pane (mirrors prod per-agent topology),
+        so is_single_live_space_pane(...) is True."""
+        state["spaces"] = {
+            "agent:pane-1": {"space_key": "agent:pane-1", "topic_id": "77", "pane_keys": ["pane-1"]}
+        }
+
+    def test_force_reply_detail_accepts_bare_message_in_single_pane_topic(self) -> None:
+        # #37 happy path: no Telegram Reply gesture, no /send — a plain answer resolves the one prompt.
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "extra detail"}
+            )  # NOTE: no reply_to_message_id
+        self.assertEqual(result["reply"], "Sent details.")
+        send_to_pane.assert_called_once_with("pane-1", "1\nextra detail")
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+        self.assertNotIn("active_prompt", state["panes"]["pane-1"])
+
+    def test_force_reply_detail_wrong_reply_still_strict_in_single_pane_topic(self) -> None:
+        # Relaxation is BARE-only: an explicit reply to a DIFFERENT/older message stays strict even in
+        # a single-pane topic, so a reply to a superseded prompt cannot mis-attach to the current one.
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42",
+                 "text": "extra detail", "reply_to_message_id": "123"}  # explicit reply, != force_reply 999
+            )
+        self.assertEqual(
+            result["reply"],
+            "Reply to the detail prompt above (use Telegram's Reply), or tap the option button again to re-open it.",
+        )
+        send_to_pane.assert_not_called()
+        self.assertIn("awaiting_detail", state["panes"]["pane-1"])  # preserved
+
+    def test_force_reply_detail_still_strict_in_multi_pane_topic(self) -> None:
+        # Two live panes share the topic: a mis-targeted reply stays ambiguous, so the gate holds.
+        state = callback_state()
+        state["spaces"] = {
+            "workspace:w1": {
+                "space_key": "workspace:w1", "topic_id": "77",
+                "pane_keys": ["pane-1", "pane-2"], "message_routes": {"123": "pane-1"},
+            }
+        }
+        state["panes"]["pane-2"] = {"pane_id": "pane-2", "topic_id": "77", "last_known_status": "working"}
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42",
+                 "text": "extra detail", "reply_to_message_id": "123"}  # routes to pane-1 but != 999
+            )
+        self.assertEqual(
+            result["reply"],
+            "Reply to the detail prompt above (use Telegram's Reply), or tap the option button again to re-open it.",
+        )
+        send_to_pane.assert_not_called()
+        self.assertIn("awaiting_detail", state["panes"]["pane-1"])  # preserved for a correct reply/re-tap
+
+    def test_force_reply_detail_expired_clears_before_relaxed_gate_in_single_pane_topic(self) -> None:
+        # The expiry guard runs BEFORE the relaxed gate: a stale prompt is cleared, never sent.
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": "2020-01-01T00:00:00Z",
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "extra detail"}
+            )
+        self.assertEqual(result["reply"], "That detail request expired. Use /choices to resend the choices.")
+        send_to_pane.assert_not_called()
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+
+    def test_force_reply_detail_other_owner_bare_message_does_not_answer_prompt(self) -> None:
+        # Cross-user isolation: a different owner's plain text forwards as a fresh instruction and
+        # must NOT consume someone else's open prompt (the choice is not prepended; slot preserved).
+        state = callback_state()
+        self._single_live_space(state)
+        state["telegram"]["owner_user_ids"] = ["42", "99"]
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "99", "text": "unrelated message"}
+            )
+        send_to_pane.assert_called_once_with("pane-1", "unrelated message")  # forwarded raw, not "1\n..."
+        self.assertIn("awaiting_detail", state["panes"]["pane-1"])  # owner 42's prompt untouched
+
+    def test_force_reply_detail_accepts_bare_message_when_agent_picked_in_multi_pane_topic(self) -> None:
+        # Multi-pane topic, but the owner picked this agent via /agents (resolved_active_entry): a bare
+        # answer is unambiguous and accepted, matching how a bare non-prompt message forwards there.
+        state = callback_state()
+        state["spaces"] = {
+            "workspace:w1": {
+                "space_key": "workspace:w1", "topic_id": "77",
+                "pane_keys": ["pane-1", "pane-2"],
+                "active_pane": {"42": {"pane_key": "pane-1", "set_at": herdres.utc_now()}},
+            }
+        }
+        state["panes"]["pane-2"] = {"pane_id": "pane-2", "topic_id": "77", "last_known_status": "working"}
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "extra detail"}
+            )  # bare — resolves via the active pane, not a reply
+        self.assertEqual(result["reply"], "Sent details.")
+        send_to_pane.assert_called_once_with("pane-1", "1\nextra detail")
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+
+    def test_force_reply_detail_bare_send_failure_preserves_slot_in_single_pane_topic(self) -> None:
+        # A transient send failure on the relaxed bare path must NOT consume the prompt (retryable).
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "1",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(False, "boom"))
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "extra detail"}
+            )
+        self.assertEqual(result["reply"], "Send failed: boom")
+        self.assertIn("awaiting_detail", state["panes"]["pane-1"])  # preserved for retry
+        self.assertIn("active_prompt", state["panes"]["pane-1"])
+
+    def test_force_reply_detail_bare_select_choice_in_single_pane_topic(self) -> None:
+        # The relaxed bare path also reaches the select_choice dispatch (keys + detail), not just plain.
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "", "select_choice": "2",
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_choice = Mock(return_value=(True, ""))
+        with callback_patches(state), patch.object(herdres, "send_choice_detail_to_pane", send_choice):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "with detail"}
+            )  # bare
+        self.assertEqual(result["reply"], "Sent details.")
+        send_choice.assert_called_once_with("pane-1", "2", "with detail")
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+
+    def test_force_reply_visible_choice_bare_message_fails_closed_when_prompt_changed(self) -> None:
+        # Visible-prompt re-validation runs AFTER the relaxed gate: a bare answer to a visible choice
+        # whose on-screen options changed is still rejected (fail-closed) and never key-driven.
+        state = callback_state()
+        self._single_live_space(state)
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42", "prompt_id": "prompt1", "choice": "",
+            "visible_choice": "4", "visible_options": [{"number": "4", "label": "Type something."}],
+            "force_reply_message_id": "999", "created_at": herdres.utc_now(),
+        }
+        send_visible = Mock(return_value=(True, ""))
+        with callback_patches(state), patch.multiple(
+            herdres,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=True,
+            send_visible_choice_detail_to_pane=send_visible,
+            visible_prompt_matches_awaiting=Mock(return_value=False),
+        ):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "answer"}
+            )  # bare, no reply_to
+        self.assertIn("choices changed", result["reply"])
+        send_visible.assert_not_called()
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
 
     def test_prompt_feed_renders_user_label_in_open_details_quote(self) -> None:
         item = herdres.make_prompt_feed_item("turn-1", "Why did the bot freeze?\nCheck logs.")
@@ -10630,6 +11112,450 @@ class TopicLatestAnchorTests(unittest.TestCase):
         ):
             herdres.command_reply(payload)
         self.assertNotIn("last_topic_message_id", state["spaces"]["workspace:workspace-1"])
+
+
+class PromptAnchorFallbackTests(unittest.TestCase):
+    """A completed turn must reuse the prompt message even when its turn_id differs from
+    the open-prompt turn_id (the auto-continue case), so one input -> one message, not a
+    duplicate. Reproduces the live 2818/2820 case (prompt 2818 turn '14275889' + finalized
+    turn '18a4d8e5' posted as a separate 2820)."""
+
+    def test_finalize_reuses_prompt_when_turn_id_differs(self) -> None:
+        # Prompt 2818 was just delivered for the open turn; it's the pane's latest message.
+        entry = {
+            "last_prompt_message_id": "2818",
+            "last_prompt_turn_id": "14275889",
+            "last_pane_message_id": "2818",
+        }
+        # The completed turn finalizes under a DIFFERENT turn_id (auto-continue):
+        self.assertEqual(herdres.turn_visible_anchor_message_id(entry, "18a4d8e5"), "2818")
+        # ...and the strict same-turn_id case still works.
+        self.assertEqual(herdres.turn_visible_anchor_message_id(entry, "14275889"), "2818")
+
+    def test_fallback_skipped_when_prompt_not_latest(self) -> None:
+        # Something newer was posted after the prompt -> don't hijack it; send fresh.
+        entry = {
+            "last_prompt_message_id": "2818",
+            "last_prompt_turn_id": "14275889",
+            "last_pane_message_id": "2820",  # a later message buried the prompt
+        }
+        self.assertEqual(herdres.turn_visible_anchor_message_id(entry, "18a4d8e5"), "")
+
+    def test_fallback_skipped_when_stream_anchor_exists(self) -> None:
+        # A live stream anchor is the proper anchor; the loose prompt fallback must not fire.
+        entry = {
+            "last_prompt_message_id": "2818",
+            "last_prompt_turn_id": "14275889",
+            "last_stream_message_id": "2819",
+            "last_stream_turn_id": "other",
+            "last_pane_message_id": "2818",
+        }
+        self.assertEqual(herdres.turn_visible_anchor_message_id(entry, "18a4d8e5"), "")
+
+
+class StreamAnchorFallbackTests(unittest.TestCase):
+    """A turn that streamed a live worklog message must finalize by EDITING that message,
+    not by posting a fresh one. The duplicate (live 3100 -> 3105 case) happens when the
+    completed turn finalizes under a turn_id that differs from the open_turn_id it streamed
+    under: turn_visible_anchor_message_id strict-misses and, because a stream message
+    exists, the #33 prompt fallback is gated off, so the completion orphans the stream
+    message. turn_stream_anchor_fallback reuses it — guarded so an older catch-up turn (which
+    streamed nothing) never hijacks the newer stream message."""
+
+    def _streaming_entry(self) -> dict:
+        # Stream message 3100 was just edited for the open turn; it's the pane's latest.
+        return {
+            "last_stream_message_id": "3100",
+            "last_stream_turn_id": "1ee3de2e-open",
+            "last_pane_message_id": "3100",
+            "last_clean_message_id": "3072",
+        }
+
+    def test_reuses_stream_message_when_completed_turn_id_differs(self) -> None:
+        # The completed turn finalizes under turn.turn_id (== the latest completed turn),
+        # which differs from the open_turn_id the message streamed under.
+        entry = self._streaming_entry()
+        item = {"kind": "turn", "turn_id": "e74fdf39-done"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "3100")
+
+    def test_reuses_stream_message_when_item_is_open_turn(self) -> None:
+        entry = self._streaming_entry()
+        item = {"kind": "turn", "turn_id": "1ee3de2e-open"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "3100")
+
+    def test_skips_older_catch_up_turn(self) -> None:
+        # Catch-up is delivering an OLDER completed turn while a newer turn streamed; its
+        # id is neither the current completed nor the open turn -> must stay its own message.
+        entry = self._streaming_entry()
+        item = {"kind": "turn", "turn_id": "aaaa-older-interrupted"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "")
+
+    def test_skips_when_stream_message_buried(self) -> None:
+        # A later message buried the stream message -> editing it would strand the
+        # completion mid-feed; send a fresh message instead.
+        entry = self._streaming_entry()
+        entry["last_pane_message_id"] = "3104"
+        item = {"kind": "turn", "turn_id": "e74fdf39-done"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "")
+
+    def test_skips_when_already_finalized_as_clean(self) -> None:
+        entry = self._streaming_entry()
+        entry["last_clean_message_id"] = "3100"  # already the finalized clean message
+        item = {"kind": "turn", "turn_id": "e74fdf39-done"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "")
+
+    def test_skips_when_no_stream_message(self) -> None:
+        entry = {"last_pane_message_id": "3100"}
+        item = {"kind": "turn", "turn_id": "e74fdf39-done"}
+        turn = {"turn_id": "e74fdf39-done", "open_turn_id": "1ee3de2e-open"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, turn), "")
+
+    def test_skips_when_turn_unavailable(self) -> None:
+        # No authoritative current-turn ids -> cannot prove the item is the current turn.
+        entry = self._streaming_entry()
+        item = {"kind": "turn", "turn_id": "e74fdf39-done"}
+        self.assertEqual(herdres.turn_stream_anchor_fallback(entry, item, {"available": False}), "")
+
+
+class PruneOrphanedCollidingSpacesTests(unittest.TestCase):
+    """A herdr pane renumber (p16 -> p1H) leaves the old space bound to the topic with a
+    dangling pane_key; sorting first, it shadows the live space and inbound commands get
+    'No live Herdr panes in this topic.' Prune the fully-orphaned space ONLY when a live
+    sibling owns the same topic."""
+
+    def test_prunes_orphan_when_live_sibling_owns_topic(self) -> None:
+        state = {
+            "panes": {"w:p1H:c9": {"last_known_status": "working", "topic_id": "198"}},
+            "spaces": {
+                "agent:w:p16": {"topic_id": "198", "pane_keys": ["w:p16:1f"]},   # dangling
+                "agent:w:p1H": {"topic_id": "198", "pane_keys": ["w:p1H:c9"]},   # live
+            },
+        }
+        self.assertTrue(herdres.prune_orphaned_colliding_spaces(state))
+        self.assertEqual(list(state["spaces"]), ["agent:w:p1H"])
+
+    def test_keeps_sole_orphan_when_no_live_sibling(self) -> None:
+        # The only space for the topic is orphaned -> keep it (don't strand the topic).
+        state = {
+            "panes": {},
+            "spaces": {"agent:w:p16": {"topic_id": "198", "pane_keys": ["w:p16:1f"]}},
+        }
+        self.assertFalse(herdres.prune_orphaned_colliding_spaces(state))
+        self.assertIn("agent:w:p16", state["spaces"])
+
+    def test_keeps_space_with_live_pane(self) -> None:
+        state = {
+            "panes": {"w:p1H:c9": {"last_known_status": "working"}},
+            "spaces": {"agent:w:p1H": {"topic_id": "198", "pane_keys": ["w:p1H:c9"]}},
+        }
+        self.assertFalse(herdres.prune_orphaned_colliding_spaces(state))
+        self.assertIn("agent:w:p1H", state["spaces"])
+
+    def test_ignores_orphan_on_different_topic(self) -> None:
+        # Orphan on topic 200; the live space owns 198 -> no collision, don't prune.
+        state = {
+            "panes": {"w:p1H:c9": {"last_known_status": "working"}},
+            "spaces": {
+                "agent:w:p16": {"topic_id": "200", "pane_keys": ["w:p16:1f"]},
+                "agent:w:p1H": {"topic_id": "198", "pane_keys": ["w:p1H:c9"]},
+            },
+        }
+        self.assertFalse(herdres.prune_orphaned_colliding_spaces(state))
+        self.assertIn("agent:w:p16", state["spaces"])
+
+    def test_does_not_prune_space_without_pane_keys(self) -> None:
+        # A freshly-created space (no pane_keys yet) colliding with a live one is left alone.
+        state = {
+            "panes": {"w:p1H:c9": {"last_known_status": "working"}},
+            "spaces": {
+                "agent:w:new": {"topic_id": "198", "pane_keys": []},
+                "agent:w:p1H": {"topic_id": "198", "pane_keys": ["w:p1H:c9"]},
+            },
+        }
+        self.assertFalse(herdres.prune_orphaned_colliding_spaces(state))
+        self.assertIn("agent:w:new", state["spaces"])
+
+    def test_normalize_state_applies_the_prune(self) -> None:
+        # End-to-end through normalize_state (the load path).
+        state = {
+            "version": 1,
+            "telegram": {},
+            "panes": {"w:p1H:c9": {"last_known_status": "working"}},
+            "spaces": {
+                "agent:w:p16": {"topic_id": "198", "pane_keys": ["w:p16:1f"]},
+                "agent:w:p1H": {"topic_id": "198", "pane_keys": ["w:p1H:c9"]},
+            },
+        }
+        herdres.normalize_state(state)
+        self.assertNotIn("agent:w:p16", state["spaces"])
+        self.assertIn("agent:w:p1H", state["spaces"])
+
+
+class SelfHealingFoldTests(unittest.TestCase):
+    """Self-healing fold: every previously-delivered turn (not the latest) collapses, and a
+    fold missed on delivery heals on the next sync via the per-pane unfolded_turns buffer."""
+
+    def _item(self, tid: str, resp: str = "Answer.") -> dict:
+        return {"kind": "turn", "turn_id": tid, "user_text": "q", "worklog_text": "wl",
+                "assistant_final_text": resp}
+
+    def _state(self, enabled: bool = True) -> dict:
+        return {"spaces": {"s": {"collapse_previous_responses": enabled}}}
+
+    def _entry(self, **kw) -> dict:
+        e = {"space_key": "s"}
+        e.update(kw)
+        return e
+
+    # --- append_unfolded_turn ---
+    def test_append_dedups_by_message_id_and_bounds(self) -> None:
+        entry = self._entry()
+        for i in range(herdres.UNFOLDED_TURNS_CAP + 3):
+            herdres.append_unfolded_turn(entry, f"m{i}", self._item(f"t{i}"))
+        buf = entry["unfolded_turns"]
+        self.assertEqual(len(buf), herdres.UNFOLDED_TURNS_CAP)  # bounded
+        self.assertEqual(buf[-1]["message_id"], f"m{herdres.UNFOLDED_TURNS_CAP + 2}")  # newest kept
+        # re-append an existing message_id -> refreshed in place, not duplicated
+        herdres.append_unfolded_turn(entry, buf[-1]["message_id"], self._item("tX"))
+        ids = [e["message_id"] for e in entry["unfolded_turns"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_append_skips_turn_without_response(self) -> None:
+        entry = self._entry()
+        herdres.append_unfolded_turn(entry, "m1", self._item("t1", resp=""))
+        self.assertNotIn("unfolded_turns", entry)
+
+    def test_trimmed_item_keeps_render_fields(self) -> None:
+        entry = self._entry()
+        herdres.append_unfolded_turn(entry, "m1", {**self._item("t1"), "summary": "x", "lines": ["y"],
+                                                   "prompt_collapse_chars": 50, "worklog_label": "Worklog (2m)"})
+        stored = entry["unfolded_turns"][0]["item"]
+        self.assertEqual(stored["assistant_final_text"], "Answer.")
+        self.assertEqual(stored["worklog_label"], "Worklog (2m)")
+        self.assertEqual(stored["prompt_collapse_chars"], 50)
+        self.assertNotIn("summary", stored)  # dropped to keep state small
+
+    def test_trimmed_item_does_not_truncate_long_response_body(self) -> None:
+        # A response longer than MAX_REPLY_CHARS (3200) but within FINAL_REPLY_MAX_CHARS must be
+        # preserved, so the folded body matches what was delivered (no content loss on expand).
+        # Use varied text (sanitize_text collapses repeated chars, so "x"*N won't do).
+        long_body = " ".join(f"detail-line-{i}" for i in range(700))  # ~9k varied chars
+        self.assertGreater(len(long_body), herdres.MAX_REPLY_CHARS)
+        entry = self._entry()
+        herdres.append_unfolded_turn(entry, "m1", self._item("t1", resp=long_body))
+        stored = entry["unfolded_turns"][0]["item"]
+        # Bug would truncate to MAX_REPLY_CHARS (3200); fix keeps it at FINAL_REPLY_MAX_CHARS.
+        self.assertGreater(len(stored["assistant_final_text"]), herdres.MAX_REPLY_CHARS)
+
+    # --- fold_superseded_turns ---
+    def test_folds_non_latest_and_keeps_latest(self) -> None:
+        entry = self._entry(last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+            {"message_id": "m2", "turn_id": "t2", "item": self._item("t2")},
+        ])
+        edits = []
+        ef = Mock(side_effect=lambda *a, **k: edits.append((a[1], a[2].get("collapse_response"))) or {"ok": True})
+        with patch.multiple(herdres, edit_feed_item=ef, managed_bot_token_for_entry=Mock(return_value="tok")):
+            mutated = herdres.fold_superseded_turns(self._state(), entry, {}, "-1001")
+        self.assertTrue(mutated)
+        self.assertEqual(edits, [("m1", True)])  # only the non-latest folded
+        self.assertEqual([e["message_id"] for e in entry.get("unfolded_turns", [])], ["m2"])  # m1 dropped
+
+    def test_self_heals_stuck_turn_without_a_new_turn(self) -> None:
+        # A prior fold was missed: m1 sits unfolded while m2 is already the latest. A plain
+        # sweep (no new delivery) folds it.
+        entry = self._entry(last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        ef = Mock(return_value={"ok": True})
+        with patch.multiple(herdres, edit_feed_item=ef, managed_bot_token_for_entry=Mock(return_value="tok")):
+            herdres.fold_superseded_turns(self._state(), entry, {}, "-1001")
+        self.assertEqual(ef.call_args.args[1], "m1")
+        self.assertTrue(ef.call_args.args[2].get("collapse_response"))
+
+    def test_skips_latest_by_message_id_on_edit_in_place_reuse(self) -> None:
+        # Edit-in-place reuse: a buffered entry shares the latest's message_id -> never fold it.
+        entry = self._entry(last_clean_message_id="m1", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        ef = Mock(return_value={"ok": True})
+        with patch.multiple(herdres, edit_feed_item=ef, managed_bot_token_for_entry=Mock(return_value="tok")):
+            herdres.fold_superseded_turns(self._state(), entry, {}, "-1001")
+        ef.assert_not_called()
+
+    def test_drops_entry_on_not_found(self) -> None:
+        entry = self._entry(last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        with patch.multiple(herdres, edit_feed_item=Mock(return_value={"ok": False, "not_found": True}),
+                            managed_bot_token_for_entry=Mock(return_value="tok")):
+            herdres.fold_superseded_turns(self._state(), entry, {}, "-1001")
+        self.assertNotIn("unfolded_turns", entry)  # dead message dropped
+
+    def test_retries_then_drops_on_persistent_error(self) -> None:
+        entry = self._entry(last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        with patch.multiple(herdres, edit_feed_item=Mock(return_value={"ok": False}),
+                            managed_bot_token_for_entry=Mock(return_value="tok")):
+            for _ in range(herdres.FOLD_ATTEMPT_CAP):
+                herdres.fold_superseded_turns(self._state(), entry, {}, "-1001")
+        self.assertFalse(entry.get("unfolded_turns"))  # gave up after the attempt cap
+
+    def test_no_fold_when_setting_disabled(self) -> None:
+        entry = self._entry(last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        ef = Mock(return_value={"ok": True})
+        with patch.multiple(herdres, edit_feed_item=ef, managed_bot_token_for_entry=Mock(return_value="tok")):
+            mutated = herdres.fold_superseded_turns(self._state(enabled=False), entry, {}, "-1001")
+        self.assertFalse(mutated)
+        ef.assert_not_called()
+
+    # --- record_delivered_feed_item seeding ---
+    def test_record_seeds_prior_then_appends_new_turn(self) -> None:
+        entry = self._entry(last_clean_item=self._item("t1"), last_clean_message_id="m1", last_turn_id="t1")
+        herdres.record_delivered_feed_item(
+            entry, self._item("t2"), {"ok": True, "message_id": "m2"},
+            pending_active_prompt=None, clear_active_prompt=False)
+        self.assertEqual([e["message_id"] for e in entry["unfolded_turns"]], ["m1", "m2"])
+
+
+class PlanAttachmentTests(unittest.TestCase):
+    """Issue #26: a plan/oversized turn delivers a short summary turn + the full markdown as a
+    .md document attachment, instead of truncating/flattening it inline."""
+
+    def _turn(self, final_text: str) -> dict:
+        return {"kind": "turn", "turn_id": "t1", "user_text": "make a plan",
+                "worklog_text": "thinking", "assistant_final_text": final_text}
+
+    # --- detection ---
+    def test_detects_mermaid(self) -> None:
+        self.assertTrue(herdres.turn_needs_plan_attachment(
+            self._turn("# Plan\n```mermaid\nflowchart TD\nA-->B\n```\n")))
+
+    def test_detects_large_structured(self) -> None:
+        big = "# Plan\n\n" + "\n".join(f"## Section {i}\n- a\n- b" for i in range(400))
+        self.assertGreater(len(big), herdres.PLAN_ATTACH_MIN_CHARS)
+        self.assertTrue(herdres.turn_needs_plan_attachment(self._turn(big)))
+
+    def test_detects_render_over_cap(self) -> None:
+        # Unique paragraphs (no repeated-run collapse) so the rendered HTML exceeds the rich cap.
+        prose = "\n\n".join(f"Paragraph {i} discusses a distinct idea about subject {i} in detail here."
+                            for i in range(400))
+        self.assertTrue(herdres.turn_needs_plan_attachment(self._turn(prose)))
+
+    def test_small_turn_not_attached(self) -> None:
+        self.assertFalse(herdres.turn_needs_plan_attachment(self._turn("# Plan\nshort and sweet.")))
+
+    def test_non_turn_not_attached(self) -> None:
+        self.assertFalse(herdres.turn_needs_plan_attachment(
+            {"kind": "status", "assistant_final_text": "x" * 20000}))
+
+    # --- summary ---
+    def test_summary_item_shortens_and_keeps_user_worklog(self) -> None:
+        big = "# Title\n" + "\n".join(f"line {i}" for i in range(200))
+        item = self._turn(big)
+        summ = herdres.plan_summary_item(item)
+        self.assertEqual(summ["user_text"], item["user_text"])
+        self.assertEqual(summ["worklog_text"], item["worklog_text"])
+        self.assertLess(len(summ["assistant_final_text"]), len(big))
+        self.assertIn("Full plan attached", summ["assistant_final_text"])
+
+    def test_summary_skips_fenced_blocks(self) -> None:
+        text = "# Title\n```mermaid\nflowchart TD\nA-->B\n```\nReal intro line."
+        summ = herdres._plan_summary_text(text)
+        self.assertNotIn("flowchart", summ)
+        self.assertIn("Title", summ)
+
+    # --- mermaid placeholder in the renderer ---
+    def test_mermaid_fence_renders_placeholder_not_raw(self) -> None:
+        html = herdres.render_final_reply_html("before\n```mermaid\nflowchart TD\nA-->B\n```\nafter")
+        self.assertNotIn("language-mermaid", html)
+        self.assertNotIn("flowchart TD", html)
+        self.assertIn("mermaid diagram", html)
+
+    # --- send_document ---
+    def test_send_document_builds_sendDocument_multipart(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "plan.md"
+            p.write_text("# Plan", encoding="utf-8")
+            tam = Mock(return_value={"ok": True, "result": {"message_id": 999}})
+            with patch.object(herdres, "telegram_api_multipart", tam):
+                res = herdres.send_document("-1001", p, caption_text="📎 Plan",
+                                            thread_id="77", reply_to_message_id="500", api_token="tok")
+            self.assertTrue(res["ok"])
+            method, fields, files = tam.call_args.args
+            self.assertEqual(method, "sendDocument")
+            self.assertEqual(fields["document"], "attach://file")
+            self.assertEqual(fields["chat_id"], "-1001")
+            self.assertEqual(fields["message_thread_id"], "77")
+            self.assertIn("reply_parameters", fields)
+            self.assertEqual(fields["caption"], "📎 Plan")
+            self.assertEqual(files["file"][0], p)
+            self.assertEqual(files["file"][1], "text/markdown")
+            self.assertEqual(tam.call_args.kwargs["token"], "tok")
+
+    # --- deliver (queue) / flush (send) dedup + retry ---
+    def test_deliver_queues_and_flush_sends_once_per_turn(self) -> None:
+        entry = {"topic_id": "77", "space_key": "s", "pane_key": "p"}
+        state = {"spaces": {}, "panes": {}}
+        sent = []
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(herdres, "state_path", Mock(return_value=Path(d) / "state.json")), \
+                 patch.object(herdres, "record_pane_message_route", Mock()), \
+                 patch.object(herdres, "send_document",
+                              Mock(side_effect=lambda *a, **k: sent.append(k.get("reply_to_message_id"))
+                                   or {"ok": True, "result": {"message_id": "9"}})):
+                self.assertTrue(herdres.deliver_plan_document(entry, turn_id="t1",
+                                plan_text="# Plan\nbody", reply_to_message_id="500"))
+                self.assertIn("pending_plan_doc", entry)
+                self.assertEqual(len(sent), 0)  # deliver only queues
+                self.assertTrue(herdres.flush_pending_plan_doc(state, entry, {}, "-1001", api_token="tok"))
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(entry.get("last_plan_doc_turn_id"), "t1")
+                self.assertNotIn("pending_plan_doc", entry)  # sent + cleared
+                # re-deliver the same turn -> no new queue
+                self.assertFalse(herdres.deliver_plan_document(entry, turn_id="t1",
+                                 plan_text="# Plan\nbody", reply_to_message_id="500"))
+                herdres.flush_pending_plan_doc(state, entry, {}, "-1001", api_token="tok")
+        self.assertEqual(len(sent), 1)
+
+    def test_flush_retries_then_drops_on_persistent_failure(self) -> None:
+        entry = {"topic_id": "77", "space_key": "s", "pane_key": "p"}
+        state = {"spaces": {}, "panes": {}}
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(herdres, "state_path", Mock(return_value=Path(d) / "state.json")), \
+                 patch.object(herdres, "send_document", Mock(return_value={"ok": False})):
+                herdres.deliver_plan_document(entry, turn_id="t2", plan_text="# Plan", reply_to_message_id="1")
+                self.assertIn("pending_plan_doc", entry)
+                for _ in range(herdres.PLAN_DOC_ATTEMPT_CAP):
+                    herdres.flush_pending_plan_doc(state, entry, {}, "-1001", api_token="tok")
+        self.assertNotIn("pending_plan_doc", entry)  # gave up after the cap
+        self.assertNotEqual(entry.get("last_plan_doc_turn_id"), "t2")
+
+    def test_flush_rate_limited_keeps_queue_without_burning_attempt(self) -> None:
+        entry = {"topic_id": "77", "space_key": "s", "pane_key": "p"}
+        state = {"spaces": {}, "panes": {}}
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(herdres, "state_path", Mock(return_value=Path(d) / "state.json")), \
+                 patch.object(herdres, "send_document", Mock(side_effect=herdres.RateLimited(30))):
+                herdres.deliver_plan_document(entry, turn_id="t3", plan_text="# Plan", reply_to_message_id="1")
+                changed = herdres.flush_pending_plan_doc(state, entry, {}, "-1001", api_token="tok")
+        self.assertFalse(changed)  # rate-limit: no state change
+        self.assertIn("pending_plan_doc", entry)  # kept for next sync
+        self.assertEqual(int(entry["pending_plan_doc"].get("attempts") or 0), 0)  # attempt not burned
+
+    def test_clear_clean_feed_state_clears_plan_doc(self) -> None:
+        entry = {"last_plan_doc_turn_id": "t1", "pending_plan_doc": {"turn_id": "t1"}}
+        herdres.clear_clean_feed_state(entry)
+        self.assertNotIn("last_plan_doc_turn_id", entry)
+        self.assertNotIn("pending_plan_doc", entry)
 
 
 if __name__ == "__main__":
