@@ -94,6 +94,29 @@ class OrphanPruneLifecycleTests(unittest.TestCase):
             ],
         )
 
+    def test_topic_id_invalid_classifies_as_topic_not_found(self) -> None:
+        # Telegram returns TOPIC_ID_INVALID when the forum topic is already deleted; it MUST be
+        # treated as "topic gone" so the prune removes the orphan instead of retrying forever.
+        exc = herdres.BridgeError("Telegram deleteForumTopic failed: Bad Request: TOPIC_ID_INVALID")
+        self.assertEqual(herdres.classify_telegram_error(exc), "topic_not_found")
+
+    def test_prune_removes_orphan_when_topic_already_deleted(self) -> None:
+        # Regression for the prune looping on already-deleted topics (each deleteForumTopic was a slow
+        # 20s TOPIC_ID_INVALID that never cleared the mapping, ballooning syncs to ~100s+).
+        state = orphan_state()
+        boom = Mock(side_effect=herdres.BridgeError(
+            "Telegram deleteForumTopic failed: Bad Request: TOPIC_ID_INVALID"))
+        with patch.object(herdres, "delete_topic", boom), patch.object(
+            herdres, "utc_now", Mock(return_value=FIXED_NOW)
+        ):
+            pruned = herdres.prune_orphan_spaces(
+                state, "-1001", Mock(name="telegram"), {"still-live"}, [], delete_cap=5,
+            )
+        self.assertEqual(pruned, 1)            # removed, not skipped-and-retried
+        self.assertEqual(state["spaces"], {})  # orphan space gone from state
+        self.assertEqual(state["panes"], {})
+        self.assertEqual(state["deleted_orphan_topics"][0]["status"], "topic_not_found")
+
     def test_mirror_backup_prevents_regeneration_when_state_json_is_corrupt(self) -> None:
         state = orphan_state(workspace_id="from-bak", topic_id="88")
 
