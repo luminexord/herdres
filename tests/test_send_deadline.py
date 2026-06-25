@@ -37,6 +37,27 @@ class HerdrCommandTimeoutTests(unittest.TestCase):
         self.assertFalse(turn.get("available"))
 
 
+class SendBudgetBoundTests(unittest.TestCase):
+    """send_to_pane runs UNDER the global sync lock (command_reply is dispatched via
+    with_lock), so its wall-time budget bounds how long a send to a BUSY pane can pin that
+    lock — stalling the 30s timer sync and every other inbound command. Guard the budget
+    against silently regressing to the old long value (which caused the ~40-60s 'ignored
+    messages' stalls). The durable fix moves delivery off the lock entirely."""
+
+    def test_budget_is_bounded_low_to_cap_lock_hold(self) -> None:
+        # A busy-pane send must not pin the global lock for anywhere near a full 30s sync cycle.
+        self.assertLessEqual(herdres.SEND_TO_PANE_BUDGET_SECONDS, 20)
+        # ...but still leave room for at least ~two full-cap herdr calls to actually deliver.
+        self.assertGreater(herdres.SEND_TO_PANE_BUDGET_SECONDS, herdres.SEND_TO_PANE_PER_CALL_CAP * 2)
+
+    def test_budget_stays_under_gateway_command_timeout(self) -> None:
+        # Documented invariant: BUDGET + PER_CALL_CAP <= COMMAND_TIMEOUT(60) - margin(15),
+        # so send_to_pane self-bounds before the gateway SIGKILLs the subprocess.
+        self.assertLessEqual(
+            herdres.SEND_TO_PANE_BUDGET_SECONDS + herdres.SEND_TO_PANE_PER_CALL_CAP, 60 - 15
+        )
+
+
 class FakeClock:
     def __init__(self, start: float = 100.0) -> None:
         self.now = start

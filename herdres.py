@@ -268,11 +268,17 @@ CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_T
 PANE_INPUT_FILE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS", "1200"))
 PANE_INPUT_FILE_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES", "6"))
 PANE_INPUT_FILE_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_MAX_CHARS", "120000"))
-# Wall-time budget for one send_to_pane() call. Kept well under the gateway
-# COMMAND_TIMEOUT (herdres_gateway.py: 60s) so the function self-bounds and
-# returns a real reply before the gateway SIGKILLs the subprocess. Invariant:
-# BUDGET + PER_CALL_CAP <= COMMAND_TIMEOUT - margin (40 + 5 = 45 <= 60 - 15).
-SEND_TO_PANE_BUDGET_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_SEND_BUDGET", "40"))
+# Wall-time budget for one send_to_pane() call. send_to_pane runs UNDER the global
+# sync lock (command_reply is dispatched via with_lock blocking=True), so this budget
+# also bounds how long a send to a BUSY pane can pin that lock — stalling the 30s timer
+# sync and every other inbound command queued behind it. Kept low for that reason
+# (interim mitigation for the busy-pane lock-contention; the durable fix delivers off
+# the lock) and well under the gateway COMMAND_TIMEOUT (herdres_gateway.py: 60s) so the
+# call self-bounds before a SIGKILL. Invariant: BUDGET + PER_CALL_CAP <= COMMAND_TIMEOUT
+# - margin (15 + 5 = 20 <= 60 - 15). A normal idle delivery completes in ~6s (well
+# within 15s); a busy pane gives up sooner with the message still typed and queued (the
+# agent runs queued input at its turn boundary), so delivery semantics are unchanged.
+SEND_TO_PANE_BUDGET_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_SEND_BUDGET", "15"))
 SEND_TO_PANE_PER_CALL_CAP = float(os.getenv("HERDR_TELEGRAM_TOPICS_SEND_CALL_CAP", "5"))
 # Never START a new herdr call (esp. the main `pane run`) with less than this many
 # seconds left — reserve enough for one full-cap call so the actual delivery runs.
