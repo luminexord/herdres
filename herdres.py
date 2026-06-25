@@ -1185,9 +1185,6 @@ def managed_bot_kind_for_entry(entry: dict[str, Any], pane: dict[str, Any] | Non
     if explicit in managed_bot_specs():
         return explicit
     if pane:
-        council_kind = managed_bot_kind_for_council_seat(council_seat_slug_from_entry_like(pane, pane))
-        if council_kind:
-            return council_kind
         if managed_bot_kind_for_agent(str(pane.get("agent") or "")) == "devin":
             model_kind = devin_model_managed_bot_kind_from_label(
                 " ".join(str(pane.get(key) or "") for key in ("label", "name", "title", "pane_thread_name"))
@@ -1197,9 +1194,9 @@ def managed_bot_kind_for_entry(entry: dict[str, Any], pane: dict[str, Any] | Non
         kind = managed_bot_kind_for_agent(str(pane.get("agent") or ""))
         if kind:
             return kind
-    council_kind = managed_bot_kind_for_council_seat(council_seat_slug_from_entry_like(entry))
-    if council_kind:
-        return council_kind
+        council_kind = managed_bot_kind_for_council_seat(council_seat_slug_from_entry_like(pane, pane))
+        if council_kind:
+            return council_kind
     if managed_bot_kind_for_agent(str(entry.get("agent") or "")) == "devin":
         model_kind = devin_model_managed_bot_kind_from_label(
             " ".join(str(entry.get(key) or "") for key in ("pane_label_raw", "pane_thread_name", "topic_name", "label"))
