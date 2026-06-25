@@ -80,6 +80,11 @@ COMMAND_TIMEOUT = int(os.getenv("HERDRES_GATEWAY_COMMAND_TIMEOUT", "60"))
 ERROR_BACKOFF = 3
 NETWORK_ERROR_BACKOFF = float(os.getenv("HERDRES_GATEWAY_NETWORK_ERROR_BACKOFF", "0.5"))
 WORKER_RECONCILE_SECONDS = 1
+# Issue #44: refresh interval for the native "typing…" indicator. Telegram's chat action
+# auto-expires after ~5s, so re-send a bit faster than that to keep the animation continuous.
+TYPING_REFRESH_SECONDS = float(os.getenv("HERDRES_GATEWAY_TYPING_REFRESH_SECONDS", "4"))
+# Statuses that mean a pane is actively producing output (mirrors herdres.ACTIVE_AGENT_STATUSES).
+TYPING_ACTIVE_STATUSES = {"working", "running", "active", "in_progress", "pending"}
 ALLOWED_UPDATES = json.dumps(["message", "callback_query", "managed_bot"])
 PROCESSED_MESSAGE_LIMIT = int(os.getenv("HERDRES_GATEWAY_PROCESSED_LIMIT", "2000"))
 DISPATCH_WORKERS = max(1, int(os.getenv("HERDRES_GATEWAY_DISPATCH_WORKERS", "8")))
@@ -469,6 +474,81 @@ def managed_bot_tokens(state: dict | None = None) -> list[tuple[str, str]]:
         digest = hashlib.sha1(token.encode("utf-8")).hexdigest()[:12]
         records.append((f"managed-{kind}-{digest}", token))
     return records
+
+
+def typing_action_enabled() -> bool:
+    # Runtime read (default OFF) per the import-time flag gotcha; this is the loop's kill switch.
+    return os.getenv("HERDR_TELEGRAM_TOPICS_TYPING_ACTION", "0").strip() == "1"
+
+
+def _typing_pane_token(telegram: dict, entry: dict) -> str | None:
+    # The bot that owns this pane's topic should be the one shown "typing"; fall back to the
+    # manager token (None) when the pane isn't on a managed-bot voice or the bot can't be resolved.
+    if not entry.get("managed_voice_active"):
+        return None
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+    for field in ("pane_root_bot_kind", "last_clean_bot_kind", "last_prompt_bot_kind", "managed_bot_kind"):
+        kind = str(entry.get(field) or "").strip().lower()
+        record = bots.get(kind) if kind else None
+        if isinstance(record, dict) and record.get("enabled") is not False:
+            token = str(record.get("token") or "").strip()
+            if token:
+                return token
+    return None
+
+
+def typing_panes(state: dict) -> list[tuple[str, str, str | None]]:
+    """(chat_id, topic_id, token) for each topic with an actively-working pane (issue #44).
+    Deduped per topic; the General topic is never targeted."""
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    chat_id = str(telegram.get("chat_id") or "").strip()
+    if not chat_id:
+        return []
+    general = str(telegram.get("general_thread_id", GENERAL_THREAD_ID))
+    out: list[tuple[str, str, str | None]] = []
+    seen: set[str] = set()
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    for entry in panes.values():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("last_known_status") or "").strip().lower() not in TYPING_ACTIVE_STATUSES:
+            continue
+        topic_id = str(entry.get("topic_id") or "").strip()
+        if not topic_id or topic_id == general or topic_id in seen:
+            continue
+        seen.add(topic_id)
+        out.append((chat_id, topic_id, _typing_pane_token(telegram, entry)))
+    return out
+
+
+def typing_tick(state: dict) -> int:
+    # One refresh pass: best-effort sendChatAction to each working topic. A 429 / deleted-topic
+    # error on one topic must not stop the others, so each call is isolated. Returns count sent.
+    sent = 0
+    for chat_id, topic_id, token in typing_panes(state):
+        params = {"chat_id": chat_id, "message_thread_id": topic_id, "action": "typing"}
+        try:
+            api("sendChatAction", params, token=token)
+            sent += 1
+        except Exception as exc:
+            log(f"typing action failed for topic {topic_id}: {exc}")
+    return sent
+
+
+def typing_refresh_loop() -> None:
+    # Issue #44: keep a native "typing…" bubble alive in each actively-working pane's topic. Cheap
+    # (sendChatAction is not edit-rate-limited), read-only (never writes state), best-effort, and
+    # self-clearing (when the pane goes idle the status flips and Telegram's own ~5s expiry lets the
+    # bubble lapse — no teardown). The unconditional sleep keeps a transient error from busy-looping.
+    while True:
+        try:
+            if typing_action_enabled():
+                state = load_state()
+                if state is not None:
+                    typing_tick(state)
+        except Exception as exc:
+            log(f"typing refresh loop error: {exc}")
+        time.sleep(TYPING_REFRESH_SECONDS)
 
 
 def managed_bot_kind_for_key(key: str | None) -> str:
@@ -1295,6 +1375,13 @@ def main() -> int:
         log(f"getWebhookInfo startup check failed: {exc}")
 
     log("started; polling getUpdates for manager and managed pane bots")
+    # Issue #44: native "typing…" animation for actively-working panes, refreshed off the main poll
+    # loop in its own daemon thread so a slow getUpdates reconcile can't stall it. Started only when
+    # the flag is on (enabling needs a gateway restart; the loop re-reads the flag so it can still be
+    # disabled at runtime). Gating the START keeps the thread's sleep out of the supervisor's path.
+    if typing_action_enabled():
+        threading.Thread(target=typing_refresh_loop, name="herdres-gateway-typing", daemon=True).start()
+        log("typing-action refresh thread started")
     workers: dict[str, dict[str, object]] = {}
     while True:
         try:

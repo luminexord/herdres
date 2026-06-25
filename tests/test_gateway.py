@@ -2080,5 +2080,121 @@ class GatewayManagedBotTests(unittest.TestCase):
         api.assert_not_called()
 
 
+class TypingActionTests(unittest.TestCase):
+    """Issue #44: the gateway sends a native "typing…" chat action to each actively-working pane's
+    topic (refreshed ~4s) so Telegram renders its own animated dots — no message edits."""
+
+    def _state(self, panes, managed_bots=None):
+        return {"version": 1, "enabled": True, "panes": panes, "telegram": {
+            "chat_id": "-1001", "general_thread_id": "1", "managed_bots": managed_bots or {},
+        }}
+
+    def test_selects_only_working_panes_with_real_topics(self):
+        st = self._state({
+            "a": {"last_known_status": "working", "topic_id": "77"},
+            "b": {"last_known_status": "idle", "topic_id": "78"},      # not working
+            "c": {"last_known_status": "running", "topic_id": "79"},   # active synonym
+            "d": {"last_known_status": "working", "topic_id": ""},     # no topic
+            "e": {"last_known_status": "working", "topic_id": "1"},    # General topic — never targeted
+        })
+        topics = sorted(t for _c, t, _tok in managed_gateway.typing_panes(st))
+        self.assertEqual(topics, ["77", "79"])
+
+    def test_dedupes_per_topic(self):
+        st = self._state({
+            "a": {"last_known_status": "working", "topic_id": "77"},
+            "b": {"last_known_status": "running", "topic_id": "77"},
+        })
+        self.assertEqual(len(managed_gateway.typing_panes(st)), 1)
+
+    def test_no_chat_id_returns_empty(self):
+        st = self._state({"a": {"last_known_status": "working", "topic_id": "77"}})
+        st["telegram"]["chat_id"] = ""
+        self.assertEqual(managed_gateway.typing_panes(st), [])
+
+    def test_per_pane_token_resolution(self):
+        st = self._state(
+            {"a": {"last_known_status": "working", "topic_id": "77",
+                   "managed_voice_active": True, "pane_root_bot_kind": "codex"},
+             "b": {"last_known_status": "working", "topic_id": "78"}},  # no managed voice -> manager token
+            managed_bots={"codex": {"enabled": True, "token": "CODEX_TOK"}},
+        )
+        by_topic = {t: tok for _c, t, tok in managed_gateway.typing_panes(st)}
+        self.assertEqual(by_topic["77"], "CODEX_TOK")  # bubble comes from the pane's own bot
+        self.assertIsNone(by_topic["78"])              # falls back to the manager token
+
+    def test_flag_default_off_and_toggle(self):
+        env = {k: v for k, v in os.environ.items() if k != "HERDR_TELEGRAM_TOPICS_TYPING_ACTION"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertFalse(managed_gateway.typing_action_enabled())
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_TYPING_ACTION": "1"}):
+            self.assertTrue(managed_gateway.typing_action_enabled())
+
+    def test_tick_sends_typing_per_topic_with_clean_payload(self):
+        st = self._state({
+            "a": {"last_known_status": "working", "topic_id": "77"},
+            "b": {"last_known_status": "working", "topic_id": "79"},
+        })
+        calls = []
+
+        def fake_api(method, params=None, timeout=30, *, token=None):
+            calls.append((method, params, token))
+            return {"ok": True}
+
+        with patch.object(managed_gateway, "api", fake_api):
+            sent = managed_gateway.typing_tick(st)
+        self.assertEqual(sent, 2)
+        self.assertTrue(all(m == "sendChatAction" and p["action"] == "typing" for m, p, _t in calls))
+        self.assertEqual(sorted(p["message_thread_id"] for _m, p, _t in calls), ["77", "79"])
+        # sendChatAction rejects extra fields — never send notify/markup
+        self.assertTrue(all("disable_notification" not in p and "reply_markup" not in p for _m, p, _t in calls))
+
+    def test_tick_resilient_to_per_topic_errors(self):
+        st = self._state({
+            "a": {"last_known_status": "working", "topic_id": "77"},
+            "b": {"last_known_status": "working", "topic_id": "79"},
+        })
+        sent = []
+
+        def boom_then_ok(method, params=None, timeout=30, *, token=None):
+            if params["message_thread_id"] == "77":
+                raise RuntimeError("Too Many Requests")
+            sent.append(params["message_thread_id"])
+            return {"ok": True}
+
+        with patch.object(managed_gateway, "api", boom_then_ok):
+            count = managed_gateway.typing_tick(st)
+        self.assertEqual(count, 1)      # the failing topic didn't count
+        self.assertEqual(sent, ["79"])  # but the second topic still got its action
+
+    def test_main_starts_typing_thread_only_when_enabled(self):
+        # The refresh thread is started only when the flag is on at boot (so its sleep never races
+        # the supervisor in the flag-off path); enabling needs a gateway restart.
+        class FakeThread:
+            def __init__(self, *, target=None, name="", daemon=False, args=()):
+                self.name = name
+
+            def start(self):
+                started.append(self.name)
+
+        for flag, expect_started in (("1", True), ("0", False)):
+            started: list[str] = []
+            env = {k: v for k, v in os.environ.items() if k != "HERDR_TELEGRAM_TOPICS_TYPING_ACTION"}
+            env["HERDR_TELEGRAM_TOPICS_TYPING_ACTION"] = flag
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(managed_gateway, "_token", Mock(return_value="MANAGER")), \
+                 patch.object(managed_gateway, "api", Mock(return_value={"ok": True, "result": {"url": ""}})), \
+                 patch.object(managed_gateway, "load_state", Mock(return_value={"version": 1, "enabled": True, "telegram": {}})), \
+                 patch.object(managed_gateway, "sweep_stale_reassembly", Mock(return_value=[])), \
+                 patch.object(managed_gateway, "reconcile_poll_workers", Mock()), \
+                 patch.object(managed_gateway.threading, "Thread", FakeThread), \
+                 patch.object(managed_gateway.time, "sleep", Mock(side_effect=KeyboardInterrupt)):
+                try:
+                    managed_gateway.main()
+                except KeyboardInterrupt:
+                    pass
+            self.assertEqual("herdres-gateway-typing" in started, expect_started, f"flag={flag}")
+
+
 if __name__ == "__main__":
     unittest.main()
