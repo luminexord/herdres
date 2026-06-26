@@ -13141,6 +13141,26 @@ def missing_devin_glm_seat_should_latch(space_entry: dict[str, Any]) -> bool:
         str(space_entry.get("devin_glm_seat_error") or "").strip()
     )
 
+def record_missing_devin_glm_seat_observation(space_entry: dict[str, Any], pane_id: str) -> bool:
+    pane_id = str(pane_id or "").strip()
+    if not pane_id:
+        return False
+    space_entry["devin_glm_seat_missing_pane_id"] = pane_id
+    space_entry["devin_glm_seat_missing_at"] = utc_now()
+    return True
+
+
+def missing_devin_glm_seat_confirmed(space_entry: dict[str, Any], pane_id: str) -> bool:
+    pane_id = str(pane_id or "").strip()
+    return bool(pane_id) and str(space_entry.get("devin_glm_seat_missing_pane_id") or "").strip() == pane_id
+
+
+def clear_missing_devin_glm_seat_observation(space_entry: dict[str, Any]) -> bool:
+    changed = "devin_glm_seat_missing_pane_id" in space_entry or "devin_glm_seat_missing_at" in space_entry
+    space_entry.pop("devin_glm_seat_missing_pane_id", None)
+    space_entry.pop("devin_glm_seat_missing_at", None)
+    return changed
+
 
 def space_has_devin_glm_seat(space_entry: dict[str, Any], space_key_value: str, all_panes: list[dict[str, Any]]) -> bool:
     latched = devin_glm_seat_latched(space_entry)
@@ -13238,6 +13258,8 @@ def start_devin_glm_seat_for_space(
     space_entry["devin_glm_seat_permission_mode"] = devin_glm_seat_permission_mode()
     space_entry.pop("devin_glm_seat_error", None)
     space_entry.pop("devin_glm_seat_error_at", None)
+    space_entry.pop("devin_glm_seat_missing_pane_id", None)
+    space_entry.pop("devin_glm_seat_missing_at", None)
     space_entry.pop("devin_glm_seat_closed_at", None)
     space_entry.pop("devin_glm_seat_closed_pane_id", None)
     space_entry.pop("devin_glm_seat_closed_reason", None)
@@ -13277,11 +13299,16 @@ def ensure_devin_glm_space_seats(state: dict[str, Any], panes: list[dict[str, An
             tracked_pane = tracked_devin_glm_seat_pane(space_entry, all_panes)
             if tracked_pane:
                 closed_reason = devin_glm_seat_closed_reason(tracked_pane)
+                changed = clear_missing_devin_glm_seat_observation(space_entry) or changed
                 if closed_reason:
                     changed = mark_devin_glm_seat_closed(space_entry, tracked_pane_id, closed_reason) or changed
+                continue
+            if missing_devin_glm_seat_should_latch(space_entry):
+                if missing_devin_glm_seat_confirmed(space_entry, tracked_pane_id):
+                    changed = clear_missing_devin_glm_seat_observation(space_entry) or changed
+                    changed = mark_devin_glm_seat_closed(space_entry, tracked_pane_id, "missing_after_ttl") or changed
                     continue
-            elif missing_devin_glm_seat_should_latch(space_entry):
-                changed = mark_devin_glm_seat_closed(space_entry, tracked_pane_id, "missing_after_ttl") or changed
+                changed = record_missing_devin_glm_seat_observation(space_entry, tracked_pane_id) or changed
                 continue
         if space_has_devin_glm_seat(space_entry, str(space_key_value), all_panes):
             continue
