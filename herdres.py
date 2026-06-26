@@ -12131,12 +12131,118 @@ def space_is_council(state: dict[str, Any], space: dict[str, Any]) -> bool:
     return False
 
 
-def prune_orphan_spaces(state, chat_id, telegram, live_workspace_ids, live_panes, *, delete_cap=None) -> int:
-    """Prune herdres spaces whose backing herdr workspace is gone AND that have no
-    live pane. Returns the count pruned. Deletes the Telegram forum topic via the
-    existing delete_topic() before removing space+panes from state. Caller invokes
-    save_state(state, mirror_bak=True) iff this returns > 0."""
+def cleanup_fail_attempt_limit() -> int:
+    """Consecutive non-'gone' delete failures before a topic is abandoned (read at call time, #79)."""
+    try:
+        return max(1, int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEANUP_FAIL_ATTEMPT_LIMIT", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _protected_topic_ids(state: dict[str, Any]) -> set[str]:
+    """Topic ids cleanup must NEVER delete: General + the dashboard/pinned-status topic."""
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    ids = {
+        str(telegram.get("general_thread_id") or DEFAULT_GENERAL_THREAD_ID),
+        str(pinned_status_topic_id(state) or ""),
+    }
+    return {i for i in ids if i}
+
+
+def _record_cleanup_failure(state: dict[str, Any], topic_id, space_key_value, kind: str) -> bool:
+    """Record a non-'gone' delete failure for topic_id; return True once it crosses the abandon
+    threshold. The per-topic counter (state['cleanup_topic_attempts']) lets cleanup give up on a
+    permanently-failing topic instead of retrying it (and re-pinning the global lock) every sync — the
+    #56 outage class, which #71 only fixed for the already-gone (TOPIC_ID_INVALID) case."""
+    attempts = state.get("cleanup_topic_attempts")
+    if not isinstance(attempts, dict):
+        attempts = state["cleanup_topic_attempts"] = {}
+    rec = attempts.setdefault(str(topic_id), {"topic_id": str(topic_id), "attempts": 0})
+    rec["space_key"] = str(space_key_value)
+    rec["attempts"] = int(rec.get("attempts") or 0) + 1
+    rec["last_error_kind"] = kind
+    rec["last_attempt_at"] = utc_now()
+    if rec["attempts"] >= cleanup_fail_attempt_limit() and not rec.get("abandoned"):
+        rec["abandoned"] = True
+        rec["abandoned_at"] = utc_now()
+    return bool(rec.get("abandoned"))
+
+
+def _cleanup_topic_abandoned(state: dict[str, Any], topic_id) -> bool:
+    attempts = state.get("cleanup_topic_attempts")
+    rec = attempts.get(str(topic_id)) if isinstance(attempts, dict) else None
+    return bool(isinstance(rec, dict) and rec.get("abandoned"))
+
+
+def _clear_cleanup_attempts(state: dict[str, Any], topic_id) -> None:
+    attempts = state.get("cleanup_topic_attempts")
+    if isinstance(attempts, dict):
+        attempts.pop(str(topic_id), None)
+
+
+def _space_has_live_backref_pane(state: dict[str, Any], space_key_value: str) -> bool:
+    """True if a pane references this space via a space_key back-reference and is NOT closed. Such a
+    pane (e.g. a renumbered/migrated seat) is absent from space['pane_keys'], so the pane_keys-based
+    liveness checks miss it — but the prune/Tier-0 pane sweep WOULD delete it. Cleanup must not drop a
+    space while a live pane still points at it."""
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    for entry in panes.values():
+        if (isinstance(entry, dict)
+                and str(entry.get("space_key") or "") == str(space_key_value)
+                and str(entry.get("last_known_status") or "").strip().lower() != "closed"):
+            return True
+    return False
+
+
+def reconcile_known_gone_spaces(state: dict[str, Any]) -> int:
+    """Tier 0 (#79): drop state['spaces'] records whose topic was ALREADY audited as gone
+    (deleted_orphan_topics, status deleted/topic_not_found) and that have no live pane — with NO
+    Telegram call. Catches residual records from a partial write; cheap belt-and-suspenders behind the
+    real fix (the abandon-set in prune_orphan_spaces). Returns the count removed."""
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    audit = state.get("deleted_orphan_topics")
+    gone = ({str(a.get("topic_id")) for a in audit
+             if isinstance(a, dict) and a.get("topic_id")
+             and str(a.get("status") or "") in ("deleted", "topic_not_found")}
+            if isinstance(audit, list) else set())
+    if not gone:
+        return 0
+    protected = _protected_topic_ids(state)
+    removed = 0
+    for space_key_value, space in list(spaces.items()):
+        if not isinstance(space, dict):
+            continue
+        tid = str(space.get("topic_id") or "")
+        if not tid or tid not in gone or tid in protected:
+            continue
+        if live_entries_for_space(state, space) or _space_has_live_backref_pane(state, space_key_value):
+            continue  # never drop a space that still backs a live pane (incl. space_key back-refs)
+        removed_pane_keys = {str(x) for x in (space.get("pane_keys") or [])}
+        for pane_key_value, entry in list(panes.items()):
+            if isinstance(entry, dict) and str(entry.get("space_key") or "") == str(space_key_value):
+                removed_pane_keys.add(str(pane_key_value))
+        for pane_key_value in removed_pane_keys:
+            panes.pop(pane_key_value, None)
+        spaces.pop(space_key_value, None)
+        removed += 1
+    return removed
+
+
+def prune_orphan_spaces(state, chat_id, telegram, live_workspace_ids, live_panes, *, delete_cap=None,
+                        result: dict[str, Any] | None = None) -> int:
+    """Prune herdres spaces whose backing herdr workspace is gone AND that have no live pane. Returns
+    the count that CONSUMED the per-run cap (removed + failed). Deletes the Telegram forum topic via
+    delete_topic() before removing space+panes. Caller invokes save_state(state, mirror_bak=True) iff
+    this returns > 0.
+
+    Hardened (#79): a non-'topic_not_found' delete failure (rate_limited/bad_request/transient/
+    permanent) CONSUMES the cap and records an attempt; after CLEANUP_FAIL_ATTEMPT_LIMIT consecutive
+    failures the topic is ABANDONED and skipped with zero Telegram cost — so a stuck/throttled topic
+    can never be retried every sync and re-pin the lock (the #56 outage class)."""
     _ = telegram
+    abandoned = failed = 0
+    last_error_kind = ""
     live_workspace_set = {str(value) for value in (live_workspace_ids or []) if str(value)}
     if not live_workspace_set:
         return 0
@@ -12150,6 +12256,7 @@ def prune_orphan_spaces(state, chat_id, telegram, live_workspace_ids, live_panes
     panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
     live_pane_key_set = {pane_key(pane) for pane in (live_panes or []) if isinstance(pane, dict)}
     live_space_key_set = {space_key(pane) for pane in (live_panes or []) if isinstance(pane, dict)}
+    protected = _protected_topic_ids(state)
     pruned = 0
     for space_key_value, space in list(spaces.items()):
         if pruned >= cap:
@@ -12163,6 +12270,8 @@ def prune_orphan_spaces(state, chat_id, telegram, live_workspace_ids, live_panes
         topic_id = space.get("topic_id")
         if not topic_id:
             continue
+        if str(topic_id) in protected:
+            continue  # never touch General / the dashboard topic
         workspace_id = space_workspace_id(state, str(space_key_value), space)
         if not workspace_id or workspace_id in live_workspace_set:
             continue
@@ -12171,17 +12280,34 @@ def prune_orphan_spaces(state, chat_id, telegram, live_workspace_ids, live_panes
             continue
         if any(key in live_pane_key_set for key in pane_keys) or str(space_key_value) in live_space_key_set:
             continue
+        if _space_has_live_backref_pane(state, space_key_value):
+            continue  # a divergent (renumbered/migrated) pane still points here + isn't closed
+        if _cleanup_topic_abandoned(state, topic_id):
+            continue  # permanently-failing topic: skip with NO Telegram call (the loop-breaker)
         status = ""
         try:
             if delete_topic(chat_id, topic_id):
                 status = "deleted"
             else:
+                # A False return is a failed attempt — consume the cap so a backlog can't be retried
+                # wholesale every sync, and count it toward the abandon threshold.
+                if _record_cleanup_failure(state, topic_id, space_key_value, "delete_failed"):
+                    abandoned += 1
+                failed += 1
+                last_error_kind = "delete_failed"
+                pruned += 1
                 continue
         except Exception as exc:
             kind = classify_telegram_error(exc)
             if kind != "topic_not_found":
+                if _record_cleanup_failure(state, topic_id, space_key_value, kind):
+                    abandoned += 1
+                failed += 1
+                last_error_kind = kind
+                pruned += 1  # CONSUME the cap on failure (the anti-loop fix vs the old bare continue)
                 continue
             status = kind
+        _clear_cleanup_attempts(state, topic_id)  # resolved — forget any prior failures
         removed_pane_keys = set(pane_keys)
         for pane_key_value, entry in list(panes.items()):
             if isinstance(entry, dict) and str(entry.get("space_key") or "") == str(space_key_value):
@@ -12205,6 +12331,11 @@ def prune_orphan_spaces(state, chat_id, telegram, live_workspace_ids, live_panes
         else:
             state["deleted_orphan_topics"] = [audit]
         pruned += 1
+    if isinstance(result, dict):
+        result["pruned"] = pruned
+        result["abandoned"] = abandoned
+        result["failed"] = failed
+        result["last_error_kind"] = last_error_kind
     return pruned
 
 
@@ -12240,6 +12371,10 @@ def sync_once() -> dict[str, Any]:
     caps = make_sync_caps()
     pinned_status_updated = 0
     workspace_labels = workspace_label_map()
+    # Tier 0 (#79): drop residual records whose topic is already audited-gone (NO Telegram call).
+    tier0_pruned = reconcile_known_gone_spaces(state) if parse_bool_env(
+        "HERDR_TELEGRAM_TOPICS_TIER0_PRUNE", "1") else 0
+    prune_stats: dict[str, Any] = {}
     orphan_pruned = prune_orphan_spaces(
         state,
         chat_id,
@@ -12247,9 +12382,12 @@ def sync_once() -> dict[str, Any]:
         set(workspace_labels),
         panes,
         delete_cap=DUPLICATE_TOPIC_DELETE_LIMIT,
+        result=prune_stats,
     )
-    if orphan_pruned:
+    if tier0_pruned or orphan_pruned:
         changed = True
+        state["last_orphan_prune_at"] = utc_now()
+        state["last_orphan_prune_abandoned"] = int(prune_stats.get("abandoned") or 0)
         save_state(state, mirror_bak=True)
 
     if not panes:
@@ -12263,6 +12401,10 @@ def sync_once() -> dict[str, Any]:
             "panes": 0,
             "sent": counters["sends"],
             "pinned_status_updated": pinned_status_updated,
+            "tier0_pruned": tier0_pruned,
+            "orphan_pruned": orphan_pruned,
+            "orphan_abandoned": int(prune_stats.get("abandoned") or 0),
+            "orphan_failed": int(prune_stats.get("failed") or 0),
             "message": "no agent panes",
         }
 
@@ -12351,6 +12493,11 @@ def sync_once() -> dict[str, Any]:
         "icon_updated": counters["icon_updates"],
         "pinned_status_updated": pinned_status_updated,
         "devin_glm_started": devin_glm_started,
+        "tier0_pruned": tier0_pruned,
+        "orphan_pruned": orphan_pruned,
+        "orphan_abandoned": int(prune_stats.get("abandoned") or 0),
+        "orphan_failed": int(prune_stats.get("failed") or 0),
+        "orphan_last_error": prune_stats.get("last_error_kind", ""),
     }
 
 
@@ -12410,17 +12557,31 @@ def cleanup_duplicates_once(*, delete: bool = False) -> dict[str, Any]:
         return {"ok": False, "changed": False, "error": sanitize_text(str(exc), 500), "duplicates": records}
     deleted: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    abandoned: list[dict[str, Any]] = []
     panes = state.setdefault("panes", {})
+    protected = _protected_topic_ids(state)
     for record in records[:DUPLICATE_TOPIC_DELETE_LIMIT]:
         topic_id = record["topic_id"]
+        if str(topic_id) in protected:
+            continue  # never delete General / the dashboard, even if flagged a duplicate
+        if _cleanup_topic_abandoned(state, topic_id):
+            abandoned.append(record)  # gave up after repeated failures — don't re-hit Telegram (#79)
+            continue
         try:
             ok = delete_topic(chat_id, topic_id)
         except Exception as exc:
-            failed.append({**record, "error": sanitize_text(str(exc), 500)})
-            continue
+            kind = classify_telegram_error(exc)
+            if kind == "topic_not_found":
+                ok = True  # already gone — the dedup goal is met; archive + remove, don't retry
+            else:
+                _record_cleanup_failure(state, topic_id, record.get("closed_key", ""), kind)
+                failed.append({**record, "error": sanitize_text(str(exc), 500)})
+                continue
         if not ok:
+            _record_cleanup_failure(state, topic_id, record.get("closed_key", ""), "delete_failed")
             failed.append({**record, "error": "deleteForumTopic returned false"})
             continue
+        _clear_cleanup_attempts(state, topic_id)
         archived = dict(panes.pop(record["closed_key"], {}) or {})
         archived["deleted_duplicate_topic_at"] = utc_now()
         archived["deleted_duplicate_topic_id"] = topic_id
@@ -12428,10 +12589,11 @@ def cleanup_duplicates_once(*, delete: bool = False) -> dict[str, Any]:
         state.setdefault("deleted_duplicate_topics", []).append(archived)
         deleted.append(record)
     changed = bool(deleted)
-    if changed or failed:
+    if changed or failed or abandoned:
         state["last_duplicate_cleanup_at"] = utc_now()
         state["last_duplicate_cleanup_deleted"] = len(deleted)
         state["last_duplicate_cleanup_failed"] = len(failed)
+        state["last_duplicate_cleanup_abandoned"] = len(abandoned)
         save_state(state)
     return {
         "ok": not failed,
@@ -12439,8 +12601,10 @@ def cleanup_duplicates_once(*, delete: bool = False) -> dict[str, Any]:
         "duplicates": records,
         "deleted": deleted,
         "failed": failed,
+        "abandoned": abandoned,
         "deleted_count": len(deleted),
         "failed_count": len(failed),
+        "abandoned_count": len(abandoned),
     }
 
 
