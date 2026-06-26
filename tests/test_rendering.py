@@ -881,6 +881,12 @@ class SharedTopicCommandTests(unittest.TestCase):
             "devin_glm_seat_closed_reason": reason,
         }
 
+    def _devin_glm_missing_marker(self, *, pane_id: str = "pane-devin") -> dict:
+        return {
+            "devin_glm_seat_missing_pane_id": pane_id,
+            "devin_glm_seat_missing_at": herdres.utc_now(),
+        }
+
     def _record_successful_devin_glm_run(self, commands: list[list[str]], *, pane_id: str = "pane-devin"):
         def run_cmd(args, **kwargs):
             commands.append(list(args))
@@ -1224,21 +1230,49 @@ class SharedTopicCommandTests(unittest.TestCase):
             },
             clear=False,
         ), patch.object(herdres, "pane_list", Mock(return_value=panes)), patch.object(herdres, "run_cmd", run_cmd):
-            result = herdres.ensure_devin_glm_space_seats(state, panes)
+            first = herdres.ensure_devin_glm_space_seats(state, panes)
 
-        space = state["spaces"]["workspace:workspace-1"]
-        self.assertTrue(result["changed"])
-        self.assertEqual(result["started"], 0)
-        self.assertIn("devin_glm_seat_closed_at", space)
+            space = state["spaces"]["workspace:workspace-1"]
+            self.assertTrue(first["changed"])
+            self.assertEqual(first["started"], 0)
+            self.assertEqual(space.get("devin_glm_seat_missing_pane_id"), "pane-devin")
+            self.assertTrue(space.get("devin_glm_seat_missing_at"))
+            self.assertNotIn("devin_glm_seat_closed_at", space)
+            self.assertNotIn("devin_glm_seat_closed_pane_id", space)
+            self.assertNotIn("devin_glm_seat_closed_reason", space)
+            run_cmd.assert_not_called()
+
+            second = herdres.ensure_devin_glm_space_seats(state, panes)
+
+            self.assertTrue(second["changed"])
+            self.assertEqual(second["started"], 0)
+            self.assertNotIn("devin_glm_seat_missing_pane_id", space)
+            self.assertNotIn("devin_glm_seat_missing_at", space)
+            self.assertEqual(space.get("devin_glm_seat_closed_pane_id"), "pane-devin")
+            self.assertEqual(space.get("devin_glm_seat_closed_reason"), "missing_after_ttl")
+            self.assertTrue(space.get("devin_glm_seat_closed_at"))
+            sync_after_second = state.get("last_devin_glm_seat_sync_at")
+            self.assertTrue(sync_after_second)
+            closed_at = space.get("devin_glm_seat_closed_at")
+
+            third = herdres.ensure_devin_glm_space_seats(state, panes)
+
+        self.assertFalse(third["changed"])
+        self.assertEqual(third["started"], 0)
+        self.assertEqual(state.get("last_devin_glm_seat_sync_at"), sync_after_second)
+        self.assertEqual(space.get("devin_glm_seat_closed_at"), closed_at)
         self.assertEqual(space.get("devin_glm_seat_closed_pane_id"), "pane-devin")
-        self.assertTrue(space.get("devin_glm_seat_closed_reason"))
-        self.assertTrue(space.get("devin_glm_seat_closed_at"))
+        self.assertEqual(space.get("devin_glm_seat_closed_reason"), "missing_after_ttl")
+        self.assertNotIn("devin_glm_seat_missing_pane_id", space)
+        self.assertNotIn("devin_glm_seat_missing_at", space)
         run_cmd.assert_not_called()
 
     def test_ensure_devin_glm_space_seats_latches_observed_closed_or_exited_and_honors_latch(self) -> None:
         for status in ("closed", "exited"):
             with self.subTest(status=status):
-                state, panes = self._devin_glm_space_state(self._successful_devin_glm_seat_fields())
+                space_fields = self._successful_devin_glm_seat_fields()
+                space_fields.update(self._devin_glm_missing_marker())
+                state, panes = self._devin_glm_space_state(space_fields)
                 tracked_pane = {
                     "pane_id": "pane-devin",
                     "pane_key": "pane-devin",
@@ -1267,11 +1301,93 @@ class SharedTopicCommandTests(unittest.TestCase):
                 self.assertEqual(first["started"], 0)
                 self.assertIn("devin_glm_seat_closed_at", space)
                 self.assertEqual(space.get("devin_glm_seat_closed_pane_id"), "pane-devin")
-                self.assertTrue(space.get("devin_glm_seat_closed_reason"))
+                self.assertEqual(space.get("devin_glm_seat_closed_reason"), status)
                 self.assertTrue(space.get("devin_glm_seat_closed_at"))
+                self.assertNotIn("devin_glm_seat_missing_pane_id", space)
+                self.assertNotIn("devin_glm_seat_missing_at", space)
                 self.assertFalse(second["changed"])
                 self.assertEqual(second["started"], 0)
                 run_cmd.assert_not_called()
+
+    def test_ensure_devin_glm_space_seats_clears_missing_marker_when_pane_reappears(self) -> None:
+        old_created_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=herdres.DEVIN_GLM_SEAT_PENDING_TTL_SECONDS + 1)
+        ).isoformat()
+        space_fields = self._successful_devin_glm_seat_fields(created_at=old_created_at)
+        space_fields.update(self._devin_glm_missing_marker())
+        state, panes = self._devin_glm_space_state(space_fields)
+        tracked_pane = {
+            "pane_id": "pane-devin",
+            "pane_key": "pane-devin",
+            "workspace_id": "workspace-1",
+            "agent": "devin",
+            "agent_status": "working",
+            "label": "GLM Devin",
+        }
+        pane_list = Mock(side_effect=[panes + [tracked_pane], panes])
+        run_cmd = Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+
+        with patch.dict(
+            herdres.os.environ,
+            {
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT": "1",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_RECREATE": "0",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN": "3",
+            },
+            clear=False,
+        ), patch.object(herdres, "pane_list", pane_list), patch.object(herdres, "run_cmd", run_cmd):
+            reappeared = herdres.ensure_devin_glm_space_seats(state, panes)
+
+            space = state["spaces"]["workspace:workspace-1"]
+            self.assertTrue(reappeared["changed"])
+            self.assertEqual(reappeared["started"], 0)
+            self.assertNotIn("devin_glm_seat_missing_pane_id", space)
+            self.assertNotIn("devin_glm_seat_missing_at", space)
+            self.assertNotIn("devin_glm_seat_closed_at", space)
+            self.assertNotIn("devin_glm_seat_closed_pane_id", space)
+            self.assertNotIn("devin_glm_seat_closed_reason", space)
+
+            fresh_missing = herdres.ensure_devin_glm_space_seats(state, panes)
+
+        self.assertTrue(fresh_missing["changed"])
+        self.assertEqual(fresh_missing["started"], 0)
+        self.assertEqual(space.get("devin_glm_seat_missing_pane_id"), "pane-devin")
+        self.assertTrue(space.get("devin_glm_seat_missing_at"))
+        self.assertNotIn("devin_glm_seat_closed_at", space)
+        self.assertNotIn("devin_glm_seat_closed_pane_id", space)
+        self.assertNotIn("devin_glm_seat_closed_reason", space)
+        run_cmd.assert_not_called()
+
+    def test_ensure_devin_glm_space_seats_treats_different_missing_pane_as_fresh_first_miss(self) -> None:
+        old_created_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=herdres.DEVIN_GLM_SEAT_PENDING_TTL_SECONDS + 1)
+        ).isoformat()
+        space_fields = self._successful_devin_glm_seat_fields(created_at=old_created_at)
+        space_fields["devin_glm_seat_pane_id"] = "pane-devin-new"
+        space_fields.update(self._devin_glm_missing_marker(pane_id="pane-devin"))
+        state, panes = self._devin_glm_space_state(space_fields)
+        run_cmd = Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+
+        with patch.dict(
+            herdres.os.environ,
+            {
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT": "1",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_RECREATE": "0",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN": "3",
+            },
+            clear=False,
+        ), patch.object(herdres, "pane_list", Mock(return_value=panes)), patch.object(herdres, "run_cmd", run_cmd):
+            result = herdres.ensure_devin_glm_space_seats(state, panes)
+
+        space = state["spaces"]["workspace:workspace-1"]
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["started"], 0)
+        self.assertEqual(space.get("devin_glm_seat_missing_pane_id"), "pane-devin-new")
+        self.assertTrue(space.get("devin_glm_seat_missing_at"))
+        self.assertNotIn("devin_glm_seat_closed_at", space)
+        self.assertNotIn("devin_glm_seat_closed_pane_id", space)
+        self.assertNotIn("devin_glm_seat_closed_reason", space)
+        run_cmd.assert_not_called()
 
     def test_ensure_devin_glm_space_seats_keeps_recent_missing_pane_pending(self) -> None:
         state, panes = self._devin_glm_space_state(
@@ -1301,12 +1417,63 @@ class SharedTopicCommandTests(unittest.TestCase):
         self.assertNotIn("devin_glm_seat_closed_reason", space)
         run_cmd.assert_not_called()
 
-    def test_ensure_devin_glm_space_seats_recreate_ignores_latch_and_success_clears_closed_marker(self) -> None:
+    def test_ensure_devin_glm_space_seats_recreate_bypasses_missing_debounce(self) -> None:
+        old_created_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=herdres.DEVIN_GLM_SEAT_PENDING_TTL_SECONDS + 1)
+        ).isoformat()
+        space_fields = self._successful_devin_glm_seat_fields(created_at=old_created_at)
+        space_fields.update(self._devin_glm_missing_marker())
+        state, panes = self._devin_glm_space_state(space_fields)
+        commands: list[list[str]] = []
+        _seat_base = tempfile.mkdtemp()
+
+        with patch.dict(
+            herdres.os.environ,
+            {
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT": "1",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_RECREATE": "1",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN": "3",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_MODEL": "glm-5.2",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE": "dangerous",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_COMMAND": "",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_EXTRA_ARGS": "",
+                "HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_BASE": _seat_base,
+            },
+            clear=False,
+        ), patch.object(herdres, "pane_list", Mock(return_value=panes)), patch.object(
+            herdres,
+            "run_cmd",
+            self._record_successful_devin_glm_run(commands, pane_id="pane-devin-new"),
+        ):
+            result = herdres.ensure_devin_glm_space_seats(state, panes)
+
+        space = state["spaces"]["workspace:workspace-1"]
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["started"], 1)
+        self.assertEqual(space["devin_glm_seat_pane_id"], "pane-devin-new")
+        self.assertNotIn("devin_glm_seat_missing_pane_id", space)
+        self.assertNotIn("devin_glm_seat_missing_at", space)
+        self.assertNotIn("devin_glm_seat_closed_at", space)
+        self.assertNotIn("devin_glm_seat_closed_pane_id", space)
+        self.assertNotIn("devin_glm_seat_closed_reason", space)
+        self.assertEqual(
+            commands[-1],
+            [
+                herdres.herdr_bin(),
+                "pane",
+                "run",
+                "pane-devin-new",
+                "devin --model glm-5.2 --permission-mode dangerous",
+            ],
+        )
+
+    def test_ensure_devin_glm_space_seats_recreate_success_clears_closed_and_missing_markers(self) -> None:
         old_created_at = (
             datetime.now(timezone.utc) - timedelta(seconds=herdres.DEVIN_GLM_SEAT_PENDING_TTL_SECONDS + 1)
         ).isoformat()
         space_fields = self._successful_devin_glm_seat_fields(created_at=old_created_at)
         space_fields.update(self._devin_glm_closed_marker(reason="exited"))
+        space_fields.update(self._devin_glm_missing_marker())
         state, panes = self._devin_glm_space_state(space_fields)
         commands: list[list[str]] = []
         _seat_base = tempfile.mkdtemp()
@@ -1338,6 +1505,8 @@ class SharedTopicCommandTests(unittest.TestCase):
         self.assertNotIn("devin_glm_seat_closed_at", space)
         self.assertNotIn("devin_glm_seat_closed_pane_id", space)
         self.assertNotIn("devin_glm_seat_closed_reason", space)
+        self.assertNotIn("devin_glm_seat_missing_pane_id", space)
+        self.assertNotIn("devin_glm_seat_missing_at", space)
         self.assertEqual(
             commands[-1],
             [
@@ -1446,10 +1615,12 @@ class SharedTopicCommandTests(unittest.TestCase):
             ],
         )
 
-    def test_command_reply_new_glm_devin_launches_with_auto_seat_closed_marker(self) -> None:
+    def test_command_reply_new_glm_devin_launches_without_mutating_auto_seat_markers(self) -> None:
         state = self._shared_state()
         state["panes"]["pane-1"]["foreground_cwd"] = "/tmp/project"
-        state["spaces"]["workspace:workspace-1"].update(self._devin_glm_closed_marker(reason="exited"))
+        auto_seat_markers = self._devin_glm_closed_marker(reason="exited")
+        auto_seat_markers.update(self._devin_glm_missing_marker())
+        state["spaces"]["workspace:workspace-1"].update(auto_seat_markers)
         commands: list[list[str]] = []
 
         with callback_patches(state), patch.dict(
@@ -1478,7 +1649,12 @@ class SharedTopicCommandTests(unittest.TestCase):
 
         self.assertTrue(result["handled"])
         self.assertIn("Started GLM Devin through Devin", result["reply"])
-        self.assertEqual(state["spaces"]["workspace:workspace-1"]["devin_glm_seat_closed_pane_id"], "pane-devin")
+        space = state["spaces"]["workspace:workspace-1"]
+        self.assertEqual(space["devin_glm_seat_missing_pane_id"], "pane-devin")
+        self.assertEqual(space["devin_glm_seat_missing_at"], auto_seat_markers["devin_glm_seat_missing_at"])
+        self.assertEqual(space["devin_glm_seat_closed_at"], auto_seat_markers["devin_glm_seat_closed_at"])
+        self.assertEqual(space["devin_glm_seat_closed_pane_id"], "pane-devin")
+        self.assertEqual(space["devin_glm_seat_closed_reason"], "exited")
         self.assertEqual(commands[1], [herdres.herdr_bin(), "pane", "rename", "pane-new", "GLM Devin"])
         self.assertEqual(
             commands[2],
@@ -1537,7 +1713,9 @@ class SharedTopicCommandTests(unittest.TestCase):
     def test_new_pane_picker_callback_launches_glm_through_devin(self) -> None:
         state = self._shared_state()
         state["panes"]["pane-1"]["foreground_cwd"] = "/tmp/project"
-        state["spaces"]["workspace:workspace-1"].update(self._devin_glm_closed_marker(reason="exited"))
+        auto_seat_markers = self._devin_glm_closed_marker(reason="exited")
+        auto_seat_markers.update(self._devin_glm_missing_marker())
+        state["spaces"]["workspace:workspace-1"].update(auto_seat_markers)
         space_token = herdres._callback_id("workspace:workspace-1", "space")[:16]
         commands: list[list[str]] = []
 
@@ -1587,7 +1765,12 @@ class SharedTopicCommandTests(unittest.TestCase):
         )
         telegram_api.assert_called_once()
         self.assertIn("Started GLM Devin through Devin", telegram_api.call_args.args[1]["text"])
-        self.assertEqual(state["spaces"]["workspace:workspace-1"]["devin_glm_seat_closed_pane_id"], "pane-devin")
+        space = state["spaces"]["workspace:workspace-1"]
+        self.assertEqual(space["devin_glm_seat_missing_pane_id"], "pane-devin")
+        self.assertEqual(space["devin_glm_seat_missing_at"], auto_seat_markers["devin_glm_seat_missing_at"])
+        self.assertEqual(space["devin_glm_seat_closed_at"], auto_seat_markers["devin_glm_seat_closed_at"])
+        self.assertEqual(space["devin_glm_seat_closed_pane_id"], "pane-devin")
+        self.assertEqual(space["devin_glm_seat_closed_reason"], "exited")
 
     def test_new_pane_picker_callback_launches_supported_devin_model(self) -> None:
         state = self._shared_state()
