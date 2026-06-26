@@ -219,11 +219,28 @@ class CouncilGitmootOutputTests(unittest.TestCase):
         self.assertEqual(send_feed_item.call_args.kwargs["thread_id"], "77")
         self.assertEqual(send_feed_item.call_args.kwargs["api_token"], "CODEX_TOKEN")
         self.assertEqual(gitmoot_job_show.call_args_list[0].args, ("root_1/delegation/d1",))
-        self.assertEqual(gitmoot_job_show.call_count, 2)
+        self.assertEqual(gitmoot_job_show.call_count, 1)  # Fix E: 2nd sync skips the fetch (already delivered)
         entry = state["panes"][pane_key]
         self.assertTrue(entry["last_council_job_ref"].startswith("root_1/delegation/d1@rev1:"))
         self.assertEqual(state["panes"]["sibling-pane"]["last_council_job_ref"], "sibling-marker")
         self.assertEqual(counters["feed_sends"], 1)
+
+    def test_council_feed_item_skips_closed_and_already_delivered_without_fetch(self) -> None:
+        # Fix E: a council seat's output is final once delivered, so never re-`gitmoot job
+        # show` a delivered pane, and skip closed/done panes. This bounds per-sync subprocess
+        # cost (was O(all ~221 accumulated panes) under sync.lock, which starved inbound).
+        gjs = Mock(return_value="job_ref: root_1/delegation/d1\nsummary: Council answer\n")
+        with patch.object(herdres, "gitmoot_job_show", gjs):
+            pane = self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/root_1/d1/repo")
+            # already-delivered -> skip, no fetch
+            self.assertIsNone(
+                herdres.gitmoot_council_feed_item(pane, {"last_council_job_ref": "root_1/delegation/d1@rev1:deadbeef"})
+            )
+            # closed pane -> skip, no fetch
+            closed = dict(pane)
+            closed["agent_status"] = "closed"
+            self.assertIsNone(herdres.gitmoot_council_feed_item(closed, {}))
+        self.assertEqual(gjs.call_count, 0)
 
     def test_sync_posts_deleted_cwd_gitmoot_council_output_once_via_resolved_seat_bot(self) -> None:
         pane = self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/root_1/d1/repo (deleted)   ")
@@ -286,7 +303,7 @@ class CouncilGitmootOutputTests(unittest.TestCase):
         self.assertEqual(send_feed_item.call_args.kwargs["thread_id"], "77")
         self.assertEqual(send_feed_item.call_args.kwargs["api_token"], "CODEX_TOKEN")
         self.assertEqual(gitmoot_job_show.call_args_list[0].args, ("root_1/delegation/d1",))
-        self.assertEqual(gitmoot_job_show.call_count, 2)
+        self.assertEqual(gitmoot_job_show.call_count, 1)  # Fix E: 2nd sync skips the fetch (already delivered)
         self.assertTrue(state["panes"][pane_key]["last_council_job_ref"].startswith("root_1/delegation/d1@rev1:"))
         self.assertEqual(counters["feed_sends"], 1)
 

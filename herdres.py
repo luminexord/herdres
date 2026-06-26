@@ -1847,6 +1847,8 @@ def cached_pane_turn(pane_id: str) -> dict[str, Any]:
 
 def clear_sync_caches() -> None:
     """Clear per-sync ephemeral caches. Called at the start of each sync."""
+    global _council_fetch_count
+    _council_fetch_count = 0  # Fix E: reset the per-run council fetch budget each sync/event
     with _turn_cache_lock:
         _turn_cache.clear()
     with _pane_read_cache_lock:
@@ -2121,12 +2123,35 @@ def gitmoot_job_model_content(fields) -> str:
     return _gitmoot_filtered_model_text(fields.get("summary", ""))
 
 
+# Fix E cap: max `gitmoot job show` fetches per herdres process invocation (each sync/
+# event is a fresh process, so this resets per run), so a backlog of council panes can
+# never hold sync.lock long enough to starve the inbound handler. Undelivered panes
+# deliver across successive runs. Tune via env.
+COUNCIL_FETCH_CAP = int(os.getenv("HERDR_COUNCIL_FETCH_CAP", "8"))
+_council_fetch_count = 0
+
+
 def gitmoot_council_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
     if not council_seat_slug_from_entry_like(entry, pane):
+        return None
+    # Fix E (perf / inbound-starvation): a council seat's gitmoot output is final once
+    # delivered, so never re-`gitmoot job show` a pane that already delivered, and skip
+    # closed/done panes. Without this, every sync shelled out per council pane for ALL
+    # accumulated panes (~221) while holding sync.lock, starving the inbound `command`
+    # handler (its blocking 60s lock wait timed out). Only live, not-yet-delivered seats
+    # are fetched, bounding per-sync subprocess cost to the active build's handful.
+    if entry.get("last_council_job_ref"):
+        return None
+    if str(pane.get("agent_status") or "").strip().lower() == "closed":
         return None
     ref_parts = gitmoot_delegation_ref_from_pane(pane)
     if not ref_parts:
         return None
+    # Fix E cap: bound real fetches per run so a backlog can't starve inbound.
+    global _council_fetch_count
+    if _council_fetch_count >= COUNCIL_FETCH_CAP:
+        return None
+    _council_fetch_count += 1
     root_job_id, delegation_id = ref_parts
     job_ref = f"{root_job_id}/delegation/{delegation_id}"
     try:
