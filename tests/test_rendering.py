@@ -5371,7 +5371,7 @@ What changed:
         self.assertIn("last_clean_attempt_hash", entry)
         self.assertIn("temporary", entry.get("last_clean_send_error", ""))
 
-    def test_transient_send_is_attempt_throttled(self) -> None:
+    def test_exhausted_transient_send_retries_next_sync_without_attempt_throttle(self) -> None:
         pane = {
             "pane_id": "pane-1",
             "terminal_id": "term-1",
@@ -5388,7 +5388,7 @@ What changed:
             "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
             "panes": {key: entry},
         }
-        send_feed_item = Mock(return_value={"ok": False, "transient": True, "error": "timeout"})
+        send_feed_item = Mock(return_value={"ok": False, "kind": "transient", "transient": True, "error": "timeout"})
         common_patches = {
             "load_dotenv": Mock(),
             "load_state": Mock(return_value=state),
@@ -5403,13 +5403,19 @@ What changed:
             "PINNED_STATUS_ENABLED": False,
         }
 
-        with patch.multiple(herdres, **common_patches):
+        with patch.object(herdres.time, "sleep", Mock()), patch.multiple(herdres, **common_patches):
             first = herdres.sync_once()
+            first_attempts = send_feed_item.call_count
             second = herdres.sync_once()
 
         self.assertTrue(first["changed"])
-        self.assertFalse(second["changed"])
-        send_feed_item.assert_called_once()
+        self.assertTrue(second["changed"])
+        self.assertGreaterEqual(first_attempts, 2)
+        self.assertGreaterEqual(send_feed_item.call_count - first_attempts, 2)
+        self.assertNotIn("last_clean_hash", entry)
+        self.assertNotIn("last_clean_message_id", entry)
+        self.assertNotIn("last_clean_attempt_hash", entry)
+        self.assertIn("timeout", entry.get("last_clean_send_error", ""))
 
     def test_render_only_change_edits_previous_clean_message(self) -> None:
         raw = "HERDRES_REPORT_START\nFix\n- Fixed extraction.\nHERDRES_REPORT_END"
