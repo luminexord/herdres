@@ -3780,7 +3780,7 @@ def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[s
         recent = turn.get("recent_turns")
         if isinstance(recent, list) and len(recent) >= 2:
             last_clean_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
-            last_clean_turn = str(last_clean_item.get("turn_id") or "") if real_turn_item(last_clean_item) else ""
+            last_clean_turn = str(last_clean_item.get("turn_id") or "")
             last_real_turn = str(entry.get("last_real_turn_id") or "")
             streamed = str(entry.get("last_stream_turn_id") or entry.get("pending_stream_turn_id") or "")
             legacy_turn = str(entry.get("last_turn_id") or "")
@@ -4135,13 +4135,11 @@ def extract_turn_feed_item(
     # Visible-screen prompt fallback: never scrape an actively-working pane — its
     # screen is its own in-progress output (spinner, tool noise, the echo of an
     # already-delivered reply), which produced the "Input needed" spam and
-    # whole-screen blobs. Genuine prompts require an awaiting-input marker.
-    if (
-        not item
-        and allow_visible_fallback
-        and status not in ACTIVE_AGENT_STATUSES
-        and turn.get("awaiting_input") is True
-    ):
+    # whole-screen blobs. Prefer structured awaiting-input when available, but
+    # still fall back when the adapter is unavailable or Herdr reports a blocked
+    # pane without structured prompt metadata.
+    visible_fallback_allowed = turn.get("awaiting_input") is True or not available or status == "blocked"
+    if not item and allow_visible_fallback and status not in ACTIVE_AGENT_STATUSES and visible_fallback_allowed:
         if VISIBLE_CHOICE_BUTTONS_ENABLED:
             item = extract_visible_choice_feed_item(pane)
         elif VISIBLE_READONLY_PROMPTS_ENABLED:
@@ -6186,23 +6184,18 @@ def retryable_clean_feed_result(result: dict[str, Any] | None) -> bool:
 
 
 def retry_clean_feed_delivery(deliver: Callable[[], dict[str, Any]], *, managed_bot_context: bool = False) -> dict[str, Any]:
-    result: dict[str, Any] = {"ok": False, "kind": "empty"}
-    for attempt, delay in enumerate((*CLEAN_SEND_RETRY_DELAYS, None)):
-        try:
-            result = deliver()
-        except RateLimited:
-            raise
-        except BridgeError as exc:
-            kind = classify_telegram_error(exc, managed_bot_context=managed_bot_context)
-            result = {"ok": False, "kind": kind, "transient": kind == "transient", "error": str(exc)}
-            if kind == "topic_not_found":
-                result["topic_missing"] = True
-            elif kind == "not_found":
-                result["not_found"] = True
-        if delay is None or not retryable_clean_feed_result(result):
-            return result
-        time.sleep(delay)
-    return result
+    try:
+        return deliver()
+    except RateLimited:
+        raise
+    except BridgeError as exc:
+        kind = classify_telegram_error(exc, managed_bot_context=managed_bot_context)
+        result = {"ok": False, "kind": kind, "transient": kind == "transient", "error": str(exc)}
+        if kind == "topic_not_found":
+            result["topic_missing"] = True
+        elif kind == "not_found":
+            result["not_found"] = True
+        return result
 
 
 def record_clean_delivery_attempt(entry: dict[str, Any], item_hash: str, result: dict[str, Any]) -> bool:
