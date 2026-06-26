@@ -41,6 +41,20 @@ class CouncilGitmootOutputTests(unittest.TestCase):
             with self.subTest(pane=pane):
                 self.assertEqual(herdres.gitmoot_delegation_ref_from_pane(pane), ("root_42", "d1"))
 
+    def test_flattened_continuation_delegation_cwd_parses_nested_job_ref(self) -> None:
+        cases = {
+            "/tmp/.gitmoot/workflows/delegations/root_42_continuation/d1/repo": ("root_42/continuation", "d1"),
+            "/tmp/.gitmoot/workflows/delegations/root_42_continuation_continuation/d2/repo": (
+                "root_42/continuation/continuation",
+                "d2",
+            ),
+        }
+
+        for cwd, expected in cases.items():
+            with self.subTest(cwd=cwd):
+                pane = {**self._council_pane(cwd=cwd), "label": f"council-codex · {expected[1]} · main"}
+                self.assertEqual(herdres.gitmoot_delegation_ref_from_pane(pane), expected)
+
     def test_ambiguous_non_gitmoot_and_non_council_cwds_do_not_parse(self) -> None:
         cases = [
             self._council_pane(cwd="/tmp/.gitmoot/delegations/root_1/d1/delegations/root_2/d2"),
