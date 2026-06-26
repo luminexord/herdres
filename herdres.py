@@ -13014,6 +13014,10 @@ def devin_glm_seat_enabled() -> bool:
     return parse_bool_env("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT", "0")
 
 
+def devin_glm_seat_recreate_enabled() -> bool:
+    return parse_bool_env("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_RECREATE", "0")
+
+
 def devin_glm_seat_model() -> str:
     return os.getenv("HERDR_TELEGRAM_TOPICS_DEVIN_GLM_MODEL", DEVIN_GLM_SEAT_DEFAULT_MODEL).strip() or DEVIN_GLM_SEAT_DEFAULT_MODEL
 
@@ -13086,7 +13090,63 @@ def pane_in_space(pane: dict[str, Any], space_key_value: str) -> bool:
         return False
 
 
+def devin_glm_seat_latched(space_entry: dict[str, Any]) -> bool:
+    return bool(str(space_entry.get("devin_glm_seat_closed_at") or "").strip())
+
+
+def tracked_devin_glm_seat_pane(space_entry: dict[str, Any], all_panes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    tracked_pane_id = str(space_entry.get("devin_glm_seat_pane_id") or "").strip()
+    if not tracked_pane_id:
+        return None
+    for pane in all_panes:
+        if str(pane.get("pane_id") or "") == tracked_pane_id:
+            return pane
+    return None
+
+
+def devin_glm_seat_closed_reason(pane: dict[str, Any]) -> str:
+    status = str(pane.get("agent_status") or "").strip().lower()
+    if status in {"closed", "exited"}:
+        return status
+    if pane.get("exited") or pane.get("process_exited"):
+        return "exited"
+    if pane.get("closed"):
+        return "closed"
+    return ""
+
+
+def mark_devin_glm_seat_closed(space_entry: dict[str, Any], pane_id: str, reason: str) -> bool:
+    if devin_glm_seat_latched(space_entry):
+        return False
+    space_entry["devin_glm_seat_closed_at"] = utc_now()
+    space_entry["devin_glm_seat_closed_pane_id"] = pane_id
+    space_entry["devin_glm_seat_closed_reason"] = reason
+    return True
+
+
+def devin_glm_seat_success_recorded(space_entry: dict[str, Any]) -> bool:
+    return bool(
+        str(space_entry.get("devin_glm_seat_command") or "").strip()
+        or str(space_entry.get("devin_glm_seat_model") or "").strip()
+    )
+
+
+def missing_devin_glm_seat_should_latch(space_entry: dict[str, Any]) -> bool:
+    tracked_pane_id = str(space_entry.get("devin_glm_seat_pane_id") or "").strip()
+    if not tracked_pane_id:
+        return False
+    if cache_fresh(str(space_entry.get("devin_glm_seat_created_at") or ""), DEVIN_GLM_SEAT_PENDING_TTL_SECONDS):
+        return False
+    return devin_glm_seat_success_recorded(space_entry) or not bool(
+        str(space_entry.get("devin_glm_seat_error") or "").strip()
+    )
+
+
 def space_has_devin_glm_seat(space_entry: dict[str, Any], space_key_value: str, all_panes: list[dict[str, Any]]) -> bool:
+    latched = devin_glm_seat_latched(space_entry)
+    recreate = devin_glm_seat_recreate_enabled()
+    if latched and not recreate:
+        return True
     for pane in all_panes:
         if pane_in_space(pane, space_key_value) and pane_is_devin_glm_seat(pane):
             return True
@@ -13096,7 +13156,7 @@ def space_has_devin_glm_seat(space_entry: dict[str, Any], space_key_value: str, 
     for pane in all_panes:
         if str(pane.get("pane_id") or "") == pending_pane_id and not pane_closed_or_exited(pane):
             return True
-    if cache_fresh(str(space_entry.get("devin_glm_seat_created_at") or ""), DEVIN_GLM_SEAT_PENDING_TTL_SECONDS):
+    if not (latched and recreate) and cache_fresh(str(space_entry.get("devin_glm_seat_created_at") or ""), DEVIN_GLM_SEAT_PENDING_TTL_SECONDS):
         return True
     return False
 
@@ -13178,6 +13238,9 @@ def start_devin_glm_seat_for_space(
     space_entry["devin_glm_seat_permission_mode"] = devin_glm_seat_permission_mode()
     space_entry.pop("devin_glm_seat_error", None)
     space_entry.pop("devin_glm_seat_error_at", None)
+    space_entry.pop("devin_glm_seat_closed_at", None)
+    space_entry.pop("devin_glm_seat_closed_pane_id", None)
+    space_entry.pop("devin_glm_seat_closed_reason", None)
     return {"ok": True, "pane_id": new_pane_id, "space_key": space_key_value}
 
 
@@ -13190,6 +13253,7 @@ def ensure_devin_glm_space_seats(state: dict[str, Any], panes: list[dict[str, An
     spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
     if not spaces:
         return {"changed": False, "started": 0}
+    recreate = devin_glm_seat_recreate_enabled()
     try:
         all_panes = pane_list()
     except Exception as exc:
@@ -13201,13 +13265,27 @@ def ensure_devin_glm_space_seats(state: dict[str, Any], panes: list[dict[str, An
     all_grouped = open_panes_by_space(all_panes)
     started = 0
     changed = False
-    for space_key_value in sorted(grouped):
-        if started >= max_allowed:
-            break
-        space_entry = spaces.get(str(space_key_value))
+    for raw_space_key in sorted(spaces, key=lambda value: str(value)):
+        space_key_value = str(raw_space_key)
+        space_entry = spaces.get(raw_space_key)
         if not isinstance(space_entry, dict):
             continue
+        if not recreate:
+            if devin_glm_seat_latched(space_entry):
+                continue
+            tracked_pane_id = str(space_entry.get("devin_glm_seat_pane_id") or "").strip()
+            tracked_pane = tracked_devin_glm_seat_pane(space_entry, all_panes)
+            if tracked_pane:
+                closed_reason = devin_glm_seat_closed_reason(tracked_pane)
+                if closed_reason:
+                    changed = mark_devin_glm_seat_closed(space_entry, tracked_pane_id, closed_reason) or changed
+                    continue
+            elif missing_devin_glm_seat_should_latch(space_entry):
+                changed = mark_devin_glm_seat_closed(space_entry, tracked_pane_id, "missing_after_ttl") or changed
+                continue
         if space_has_devin_glm_seat(space_entry, str(space_key_value), all_panes):
+            continue
+        if started >= max_allowed:
             continue
         if cache_fresh(str(space_entry.get("devin_glm_seat_error_at") or ""), DEVIN_GLM_SEAT_ERROR_RETRY_SECONDS):
             continue
