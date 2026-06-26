@@ -2052,10 +2052,20 @@ def gitmoot_delegation_ref_from_pane(pane) -> tuple[str, str] | None:
         return None
     if not any("gitmoot" in part.lower() for part in parts[: idx + 1]):
         return None
-    root_job_id = parts[idx + 1].strip()
+    raw_root_job_id = parts[idx + 1].strip()
     delegation_id = parts[idx + 2].strip()
     safe = re.compile(r"^[A-Za-z0-9_.:-]+$")
-    if not root_job_id or not delegation_id or not safe.match(root_job_id) or not safe.match(delegation_id):
+    if "_continuation" in raw_root_job_id:
+        root = raw_root_job_id.split("_continuation", 1)[0].strip()
+        continuation_count = raw_root_job_id.count("_continuation")
+        root_job_id = root + ("/continuation" * continuation_count)
+        if not all(component and safe.match(component) for component in root_job_id.split("/")):
+            return None
+    else:
+        root_job_id = raw_root_job_id
+        if not root_job_id or not safe.match(root_job_id):
+            return None
+    if not delegation_id or delegation_id == "_continuation" or not safe.match(delegation_id):
         return None
     label_text = " ".join(str((pane or {}).get(key) or "") for key in ("label", "name", "title", "pane_thread_name"))
     label_match = re.search(r"\bd(\d+)\b", label_text, re.IGNORECASE)
@@ -2163,7 +2173,7 @@ def gitmoot_council_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> di
     if not content:
         return None
     revision = ""
-    for key in ("revision", "rev", "version", "updated_at", "completed_at", "finished_at"):
+    for key in ("revision", "rev", "version"):
         value = str(fields.get(key) or "").strip()
         if value:
             revision = sanitize_text(value, 80)
@@ -3683,6 +3693,93 @@ def merge_visible_choice_item(visible_item: dict[str, Any], recent_item: dict[st
     return merged
 
 
+def feed_item_is_visible_scrape(item: dict[str, Any]) -> bool:
+    source = str(item.get("choice_source") or item.get("source") or "").strip()
+    turn_id = str(item.get("turn_id") or "")
+    return source in {"visible_scrape", "visible_readonly"} or turn_id.startswith((
+        "visible-choice:",
+        "visible-readonly:",
+        "visible-readonly-question:",
+    ))
+
+
+def visible_prompt_text(item: dict[str, Any]) -> str:
+    parts = [str(item.get("summary") or ""), str(item.get("detail") or "")]
+    for opt in list(item.get("options") or []):
+        if not isinstance(opt, dict):
+            continue
+        parts.append(" ".join(str(opt.get(key) or "") for key in ("number", "label", "description")))
+    return "\n".join(part for part in parts if part.strip()).strip()
+
+
+def normalized_visible_prompt_text(text: str) -> str:
+    note = visible_readonly_prompt_note()
+    clean = ANSI_RE.sub("", str(text or "")).replace(note, " ")
+    clean = re.sub(r"\s+", " ", clean).strip().lower()
+    return clean
+
+
+def visible_prompt_key(item: dict[str, Any]) -> str:
+    normalized = normalized_visible_prompt_text(visible_prompt_text(item) or item_plain_text(item))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16] if normalized else ""
+
+
+def attach_visible_prompt_key(item: dict[str, Any]) -> dict[str, Any]:
+    key = visible_prompt_key(item)
+    if key:
+        item["visible_prompt_key"] = key
+    return item
+
+
+def visible_awaiting_input(lines: list[str]) -> bool:
+    if not any(str(line or "").strip() for line in lines):
+        return False
+    if extract_choices(lines):
+        return True
+    if is_action_question(lines):
+        return True
+    tail = compact_block(lines[-10:], max_lines=10, max_chars=1200)
+    return bool(contains_marker(tail, QUESTION_MARKERS) or visible_custom_detail_ready_text("\n".join(lines)))
+
+
+def visible_item_subsumes_delivered(entry: dict[str, Any], item: dict[str, Any]) -> bool:
+    candidates = {
+        normalized_visible_prompt_text(item_plain_text(item)),
+        normalized_visible_prompt_text(visible_prompt_text(item)),
+    }
+    delivered = [
+        str(entry.get("last_clean_text") or ""),
+        str(entry.get("last_prompt_text") or ""),
+        str(entry.get("last_stream_text") or ""),
+    ]
+    last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else None
+    if last_item:
+        delivered.append(item_plain_text(last_item))
+        delivered.append(visible_prompt_text(last_item))
+    normalized_delivered = [normalized_visible_prompt_text(text) for text in delivered]
+    for left in candidates:
+        if not left:
+            continue
+        for right in normalized_delivered:
+            if right and (left == right or left in right or right in left):
+                return True
+    return False
+
+
+def filter_visible_feed_item(entry: dict[str, Any], item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not item or not feed_item_is_visible_scrape(item):
+        return item
+    attach_visible_prompt_key(item)
+    key = str(item.get("visible_prompt_key") or "")
+    previous_key = str(entry.get("last_visible_prompt_key") or "")
+    last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
+    if key and key == (previous_key or str(last_item.get("visible_prompt_key") or "")):
+        return None
+    if visible_item_subsumes_delivered(entry, item):
+        return None
+    return item
+
+
 def extract_visible_choice_feed_item(pane: dict[str, Any]) -> dict[str, Any] | None:
     pane_id = str(pane.get("pane_id") or "")
     if not pane_id:
@@ -3690,7 +3787,10 @@ def extract_visible_choice_feed_item(pane: dict[str, Any]) -> dict[str, Any] | N
     raw = pane_output(pane_id, lines=READ_LINES_COMMAND_MAX, max_chars=FEED_MAX_CHARS, source="visible")
     if not raw.strip():
         return None
-    item = extract_choices(clean_feed_lines(raw))
+    lines = clean_feed_lines(raw)
+    if not visible_awaiting_input(lines):
+        return None
+    item = extract_choices(lines)
     if not item:
         return None
     recent_raw = pane_output(pane_id, lines=READ_LINES_COMMAND_MAX, max_chars=FEED_MAX_CHARS, source="recent-unwrapped")
@@ -3704,6 +3804,7 @@ def extract_visible_choice_feed_item(pane: dict[str, Any]) -> dict[str, Any] | N
         item["decision_id"] = prompt_id
     item["choice_source"] = "visible_scrape"
     item["title"] = "Decision needed"
+    attach_visible_prompt_key(item)
     return item
 
 
@@ -3756,7 +3857,7 @@ def extract_visible_readonly_question_item(pane: dict[str, Any]) -> dict[str, An
     if not raw.strip():
         return None
     lines = clean_feed_lines(raw)
-    if not lines or not is_action_question(lines):
+    if not lines or not visible_awaiting_input(lines) or not is_action_question(lines):
         return None
     question = visible_action_question_text(lines)
     if not question:
@@ -3765,6 +3866,7 @@ def extract_visible_readonly_question_item(pane: dict[str, Any]) -> dict[str, An
     item = make_feed_item("question", "Input needed", f"{question}\n\n{note}", notify=True)
     item["choice_source"] = "visible_readonly"
     item["turn_id"] = f"visible-readonly-question:{hashlib.sha256(question.encode('utf-8')).hexdigest()[:16]}"
+    attach_visible_prompt_key(item)
     return item
 
 
@@ -4148,6 +4250,8 @@ def extract_turn_feed_item(
             item = extract_visible_choice_feed_item(pane)
         elif VISIBLE_READONLY_PROMPTS_ENABLED:
             item = extract_visible_readonly_feed_item(pane)
+        if item:
+            item = filter_visible_feed_item(entry, item)
     return item
 
 
@@ -6015,6 +6119,23 @@ def extract_clean_feed_item(
     return None
 
 
+def completed_turn_identity_key(item: dict[str, Any]) -> str:
+    if str(item.get("kind") or "").lower() != "turn":
+        return str(item.get("turn_id") or "")
+    assistant_final = str(item.get("assistant_final_text") or "").strip()
+    if not assistant_final:
+        return str(item.get("turn_id") or "")
+    council_marker = str(item.get("_council_job_ref") or "")
+    council_ref = council_marker.split(":", 1)[0].split("@", 1)[0] if council_marker else ""
+    payload = {
+        "kind": "turn",
+        "council_ref": council_ref,
+        "user_text": item.get("user_text") or "",
+        "assistant_final_text": assistant_final,
+    }
+    return "turn:" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
 def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True) -> str:
     payload = {
         "kind": item.get("kind"),
@@ -6024,7 +6145,7 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
         "detail": item.get("detail"),
         "lines": item.get("lines") or [],
         "options": item.get("options") or [],
-        "turn_id": item.get("turn_id"),
+        "turn_id": completed_turn_identity_key(item),
         "decision_id": item.get("decision_id"),
         "interaction_id": item.get("interaction_id"),
         "interaction_revision": item.get("interaction_revision"),
@@ -6055,12 +6176,20 @@ def same_delivered_content(entry: dict[str, Any], item: dict[str, Any], item_sem
     previous_semantic_hash = str(entry.get("last_clean_semantic_hash") or "")
     if previous_semantic_hash and previous_semantic_hash == item_semantic_hash:
         return True
+    council_marker = str(item.get("_council_job_ref") or "")
+    if council_marker and council_marker == str(entry.get("last_council_job_ref") or ""):
+        return True
+    current_text = item_plain_text(item).strip()
+    last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
+    previous_text = str(entry.get("last_clean_text") or "").strip()
+    if not previous_text and last_item:
+        previous_text = item_plain_text(last_item).strip()
     turn_id = str(item.get("turn_id") or "")
-    previous_turn_id = str(entry.get("last_turn_id") or (entry.get("last_clean_item") or {}).get("turn_id") or "")
-    if turn_id and previous_turn_id and turn_id == previous_turn_id:
-        previous_text = str(entry.get("last_clean_text") or "").strip()
-        if previous_text and previous_text == item_plain_text(item).strip():
-            return True
+    previous_turn_id = str(entry.get("last_turn_id") or last_item.get("turn_id") or "")
+    if turn_id and previous_turn_id and turn_id == previous_turn_id and previous_text and previous_text == current_text:
+        return True
+    if str(item.get("kind") or "").lower() == "turn" and current_text and previous_text == current_text:
+        return True
     return False
 
 
@@ -6072,6 +6201,30 @@ def recent_attempt(entry: dict[str, Any], item_hash: str, ttl_seconds: int = CLE
     except Exception:
         return False
     return (_dt.datetime.now(tz=_dt.timezone.utc) - then).total_seconds() < ttl_seconds
+
+def clean_feed_result_transient(result: dict[str, Any] | None) -> bool:
+    return isinstance(result, dict) and (bool(result.get("transient")) or str(result.get("kind") or "") == "transient")
+
+
+def clean_feed_delivery_call(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for attempt, delay in enumerate((0.0, 0.25, 0.75)):
+        if delay:
+            time.sleep(delay)
+        try:
+            result = call()
+        except RateLimited:
+            raise
+        except BridgeError as exc:
+            kind = classify_telegram_error(exc)
+            result = {"ok": False, "kind": kind, "transient": kind == "transient", "error": str(exc)}
+        if not clean_feed_result_transient(result):
+            return result
+        if attempt == 2:
+            exhausted = dict(result)
+            exhausted["transient_retry_exhausted"] = True
+            return exhausted
+    return result
 
 
 def feed_text_has_ui_noise(text: str) -> bool:
@@ -6115,6 +6268,7 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_send_error",
         "last_clean_attempt_hash",
         "last_clean_attempt_at",
+        "last_visible_prompt_key",
         "unfolded_turns",
         "last_plan_doc_turn_id",
         "pending_plan_doc",
@@ -6619,7 +6773,9 @@ def record_delivered_feed_item(
     entry["last_clean_text"] = item_plain_text(item)
     entry["last_clean_item"] = item
     entry["last_clean_sent_at"] = utc_now()
-    if item.get("turn_id"):
+    if item.get("visible_prompt_key"):
+        entry["last_visible_prompt_key"] = str(item.get("visible_prompt_key") or "")
+    if item.get("turn_id") and not feed_item_is_visible_scrape(item):
         entry["last_turn_id"] = str(item.get("turn_id") or "")
     entry.pop("last_clean_send_error", None)
     # Record this turn for the self-healing fold sweep. Seed from the prior turn first (only
@@ -11414,8 +11570,6 @@ def _sync_pane_clean_feed(
             and not managed_bot_access_retry_waiting(entry, "last_clean_bot_kind", desired_bot_kind)
         ):
             reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
-            entry["last_clean_attempt_hash"] = item_render_hash
-            entry["last_clean_attempt_at"] = utc_now()
             changed = True
             did_edit = False
             lifecycle_message_id = ""
@@ -11444,19 +11598,19 @@ def _sync_pane_clean_feed(
                 lifecycle_message_id
                 and not message_bot_reissue_due(entry, "last_clean_bot_kind", desired_bot_kind)
             ):
-                result = edit_feed_item(
+                result = clean_feed_delivery_call(lambda: edit_feed_item(
                     chat_id,
                     lifecycle_message_id,
                     item,
                     telegram=telegram,
                     reply_markup=reply_markup,
                     api_token=pane_api_token,
-                )
+                ))
                 if result.get("ok"):
                     did_edit = True
                     message_id = lifecycle_message_id
                 elif result.get("not_found"):
-                    result = send_feed_item(
+                    result = clean_feed_delivery_call(lambda: send_feed_item(
                         chat_id,
                         item,
                         telegram=telegram,
@@ -11465,23 +11619,23 @@ def _sync_pane_clean_feed(
                         reply_markup=reply_markup,
                         reply_to_message_id=pane_root_reply_target(entry),
                         api_token=pane_api_token,
-                    )
+                    ))
                 else:
                     result = {**result, "edit_failed": True}
             elif same_semantic and (render_changed or old_clean_has_noise) and message_id:
-                result = edit_feed_item(
+                result = clean_feed_delivery_call(lambda: edit_feed_item(
                     chat_id,
                     message_id,
                     item,
                     telegram=telegram,
                     reply_markup=reply_markup,
                     api_token=pane_api_token,
-                )
+                ))
                 if result.get("ok"):
                     did_edit = True
                 elif result.get("not_found"):
                     if content_changed:
-                        result = send_feed_item(
+                        result = clean_feed_delivery_call(lambda: send_feed_item(
                             chat_id,
                             item,
                             telegram=telegram,
@@ -11490,7 +11644,7 @@ def _sync_pane_clean_feed(
                             reply_markup=reply_markup,
                             reply_to_message_id=pane_root_reply_target(entry),
                             api_token=pane_api_token,
-                        )
+                        ))
                     else:
                         entry["last_clean_render_hash"] = item_render_hash
                         entry["last_clean_hash"] = item_render_hash
@@ -11504,7 +11658,7 @@ def _sync_pane_clean_feed(
                 else:
                     result = {**result, "edit_failed": True}
             else:
-                result = send_feed_item(
+                result = clean_feed_delivery_call(lambda: send_feed_item(
                     chat_id,
                     item,
                     telegram=telegram,
@@ -11513,7 +11667,14 @@ def _sync_pane_clean_feed(
                     reply_markup=reply_markup,
                     reply_to_message_id=pane_root_reply_target(entry),
                     api_token=pane_api_token,
-                )
+                ))
+            if not result.get("ok"):
+                if clean_feed_result_transient(result):
+                    entry.pop("last_clean_attempt_hash", None)
+                    entry.pop("last_clean_attempt_at", None)
+                elif not result.get("skipped_stale_repost"):
+                    entry["last_clean_attempt_hash"] = item_render_hash
+                    entry["last_clean_attempt_at"] = utc_now()
             if result.get("ok"):
                 counters["sends"] = counters.get("sends", 0) + 1
                 counters["feed_sends"] = counters.get("feed_sends", 0) + 1
