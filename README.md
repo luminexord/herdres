@@ -177,27 +177,28 @@ HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES=6
 HERDR_TELEGRAM_TOPICS_INPUT_FILE_MAX_CHARS=120000
 ```
 
-### Devin GLM Seats
+### Legacy Devin GLM Seats
 
-Herdres can optionally keep one Devin-backed GLM pane in every Herdr space. This is a local provisioner for this host: it does not modify Herdr, replace the Herdr binary, or require Devin API keys. When enabled, a sync run uses Herdr's normal public commands to split a pane in each live space, rename it to the model label, and run Devin:
+The automatic Devin GLM seat provisioner is legacy and default-off. Prefer `/new glm-5.2` for user-driven GLM Devin panes; manual `/new` panes are independent of auto-seat tracking.
+
+If you still want one automatically provisioned Devin-backed GLM pane per Herdr space, enable it only where the Devin CLI is installed and logged in. Herdres uses normal public commands to split, rename, and run:
 
 ```bash
 devin --model glm-5.2 --permission-mode dangerous
 ```
 
-Enable it only on machines where the Devin CLI is installed and logged in:
-
 ```bash
 HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT=1
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_RECREATE=0
 HERDR_TELEGRAM_TOPICS_DEVIN_GLM_MODEL=glm-5.2
 HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE=dangerous
 HERDR_TELEGRAM_TOPICS_DEVIN_GLM_LABEL=GLM Devin
 HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN=1
 ```
 
-`HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN` defaults to `1` so a first rollout does not create many panes at once. Set it higher for a deliberate one-shot backfill across all existing spaces. Herdres records the created pane id per space and treats a recently created unknown/shell pane as pending, so repeated syncs do not duplicate Devin seats while Devin is still starting. Failed start attempts back off for `HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_ERROR_RETRY` seconds, default `300`.
+Leave `HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT=0` (the default) for no auto-start. With the default `HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_RECREATE=0`, when you close/remove a provisioned GLM Devin pane Herdres respects that choice and does not recreate it. Set `HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_RECREATE=1` to restore the legacy continuous recreation behavior. `HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_MAX_PER_RUN` defaults to `1` so a first rollout does not create many panes at once. Failed starts back off for `HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_ERROR_RETRY` seconds, default `300`.
 
-Manual model choices are also available:
+For user-driven seats, use manual model choices:
 
 ```bash
 /new glm-5.2       # opens GLM Devin through Devin
@@ -680,6 +681,7 @@ HERDR_TELEGRAM_TOPICS_NEW_PANE_KIMI_COMMAND=kimi
 HERDR_TELEGRAM_TOPICS_NEW_PANE_OMP_COMMAND=omp
 HERDR_TELEGRAM_TOPICS_NEW_PANE_DEVIN_COMMAND=devin
 HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT=0
+HERDR_TELEGRAM_TOPICS_DEVIN_GLM_SEAT_RECREATE=0
 HERDR_TELEGRAM_TOPICS_DEVIN_GLM_MODEL=glm-5.2
 HERDR_TELEGRAM_TOPICS_DEVIN_GLM_PERMISSION_MODE=dangerous
 HERDR_TELEGRAM_TOPICS_DEVIN_GLM_LABEL=GLM Devin
