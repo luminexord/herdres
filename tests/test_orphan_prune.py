@@ -310,5 +310,142 @@ class CouncilLifecycleContractTests(unittest.TestCase):
         self.assertEqual(len(space["pane_keys"]), 1)
 
 
+class CleanupHardeningTests(unittest.TestCase):
+    """Issue #79: a non-'gone' delete failure must CONSUME the per-run cap and ABANDON the topic after
+    N attempts, so a stuck/throttled topic can't be retried every sync (the #56 outage class)."""
+
+    def _prune(self, state, **kw):
+        return herdres.prune_orphan_spaces(state, "-1001", Mock(name="telegram"), {"still-live"}, [], **kw)
+
+    def test_failed_delete_consumes_cap_and_abandons_after_limit(self):
+        # The headline regression: today the old bare `continue` returned 0 (cap not consumed) and the
+        # topic was retried forever; the fix consumes the cap each failure and gives up after the limit.
+        boom = Mock(side_effect=herdres.RateLimited(20))  # the 429 class that caused the outage
+        state = orphan_state()
+        with patch.object(herdres, "delete_topic", boom), patch.object(herdres, "utc_now", Mock(return_value=FIXED_NOW)):
+            for attempt in (1, 2):  # below the default limit (3)
+                pruned = self._prune(state, delete_cap=5)
+                self.assertEqual(pruned, 1, "a failed delete must consume the per-run cap")
+                self.assertIn("workspace:dead-workspace", state["spaces"], "must NOT orphan a maybe-live topic")
+                self.assertEqual(state["cleanup_topic_attempts"]["77"]["attempts"], attempt)
+                self.assertFalse(state["cleanup_topic_attempts"]["77"].get("abandoned"))
+            self._prune(state, delete_cap=5)  # attempt 3 == limit
+            self.assertTrue(state["cleanup_topic_attempts"]["77"]["abandoned"])
+            calls = boom.call_count
+            self._prune(state, delete_cap=5)  # abandoned -> skipped, NO further Telegram call (loop-breaker)
+            self.assertEqual(boom.call_count, calls)
+
+    def test_cap_bounds_total_delete_calls_under_a_failing_backlog(self):
+        # 30 dead orphans all rate-limited, cap=12 -> at most 12 deleteForumTopic calls in one sync
+        # (failures consume the cap). This is the lock-starvation bound the outage lacked.
+        state = orphan_state()
+        spaces, panes = state["spaces"], state["panes"]
+        for i in range(29):
+            sk = f"workspace:dead-{i}"
+            spaces[sk] = {"space_key": sk, "space_id": f"dead-{i}", "topic_id": str(1000 + i),
+                          "topic_name": f"x{i}", "pane_keys": [f"pane:dead-{i}"]}
+            panes[f"pane:dead-{i}"] = {"pane_key": f"pane:dead-{i}", "space_key": sk,
+                                       "workspace_id": f"dead-{i}", "last_known_status": "closed"}
+        boom = Mock(side_effect=herdres.RateLimited(20))
+        with patch.object(herdres, "delete_topic", boom), patch.object(herdres, "utc_now", Mock(return_value=FIXED_NOW)):
+            self._prune(state, delete_cap=12)
+        self.assertLessEqual(boom.call_count, 12)
+
+    def test_each_non_gone_error_bucket_consumes_cap(self):
+        for exc, kind in [
+            (herdres.RateLimited(5), "rate_limited"),
+            (herdres.BridgeError("Telegram deleteForumTopic failed: Bad Request: CHAT_ADMIN_REQUIRED"), "bad_request"),
+            (herdres.BridgeError("boom"), "transient"),
+        ]:
+            with self.subTest(kind=kind):
+                state = orphan_state()
+                with patch.object(herdres, "delete_topic", Mock(side_effect=exc)), \
+                     patch.object(herdres, "utc_now", Mock(return_value=FIXED_NOW)):
+                    pruned = self._prune(state, delete_cap=5)
+                self.assertEqual(pruned, 1)
+                self.assertEqual(state["cleanup_topic_attempts"]["77"]["last_error_kind"], kind)
+                self.assertIn("workspace:dead-workspace", state["spaces"])
+
+    def test_delete_returns_false_consumes_cap_without_removing(self):
+        state = orphan_state()
+        with patch.object(herdres, "delete_topic", Mock(return_value=False)), \
+             patch.object(herdres, "utc_now", Mock(return_value=FIXED_NOW)):
+            pruned = self._prune(state, delete_cap=5)
+        self.assertEqual(pruned, 1)
+        self.assertIn("workspace:dead-workspace", state["spaces"])
+        self.assertEqual(state["cleanup_topic_attempts"]["77"]["attempts"], 1)
+
+    def test_topic_not_found_removes_and_clears_attempts(self):
+        state = orphan_state()
+        state.setdefault("cleanup_topic_attempts", {})["77"] = {"topic_id": "77", "attempts": 2}
+        boom = Mock(side_effect=herdres.BridgeError("Telegram deleteForumTopic failed: Bad Request: TOPIC_ID_INVALID"))
+        with patch.object(herdres, "delete_topic", boom), patch.object(herdres, "utc_now", Mock(return_value=FIXED_NOW)):
+            pruned = self._prune(state, delete_cap=5)
+        self.assertEqual(pruned, 1)
+        self.assertEqual(state["spaces"], {})            # removed (gone == success)
+        self.assertNotIn("77", state.get("cleanup_topic_attempts", {}))  # prior attempts cleared
+
+    def test_protected_topics_never_pruned(self):
+        state = orphan_state(topic_id="1")               # General thread id
+        state["telegram"]["general_thread_id"] = "1"
+        delete = Mock(return_value=True)
+        with patch.object(herdres, "delete_topic", delete):
+            pruned = self._prune(state, delete_cap=5)
+        self.assertEqual(pruned, 0)
+        delete.assert_not_called()
+        self.assertIn("workspace:dead-workspace", state["spaces"])
+
+    def test_result_out_param_reports_counts(self):
+        state = orphan_state()
+        stats: dict = {}
+        with patch.object(herdres, "delete_topic", Mock(side_effect=herdres.RateLimited(5))), \
+             patch.object(herdres, "utc_now", Mock(return_value=FIXED_NOW)):
+            self._prune(state, delete_cap=5, result=stats)
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["last_error_kind"], "rate_limited")
+
+    def test_tier0_drops_already_gone_record_without_telegram(self):
+        # A space whose topic is already audited-gone + no live pane is dropped with NO delete_topic call.
+        state = orphan_state()
+        state["deleted_orphan_topics"] = [{"topic_id": "77", "status": "deleted"}]
+        delete = Mock(return_value=True)
+        with patch.object(herdres, "delete_topic", delete):
+            removed = herdres.reconcile_known_gone_spaces(state)
+        self.assertEqual(removed, 1)
+        self.assertEqual(state["spaces"], {})
+        delete.assert_not_called()
+
+    def test_tier0_skips_protected_and_unknown_topics(self):
+        state = orphan_state()
+        state["telegram"]["general_thread_id"] = "77"     # now protected
+        state["deleted_orphan_topics"] = [{"topic_id": "77", "status": "deleted"}]
+        removed = herdres.reconcile_known_gone_spaces(state)
+        self.assertEqual(removed, 0)
+        self.assertIn("workspace:dead-workspace", state["spaces"])
+
+    def test_live_backref_pane_blocks_prune(self):
+        # A pane that points at the orphan space by space_key but ISN'T closed (e.g. migrated/renumbered
+        # and live elsewhere) must NOT be swept away — and the space must not be pruned.
+        state = orphan_state()
+        state["panes"]["migrated"] = {"pane_key": "migrated", "space_key": "workspace:dead-workspace",
+                                      "workspace_id": "live-elsewhere", "last_known_status": "working"}
+        delete = Mock(return_value=True)
+        with patch.object(herdres, "delete_topic", delete):
+            pruned = self._prune(state, delete_cap=5)
+        self.assertEqual(pruned, 0)
+        delete.assert_not_called()
+        self.assertIn("migrated", state["panes"])
+
+    def test_tier0_live_backref_pane_blocks_removal(self):
+        state = orphan_state()
+        state["deleted_orphan_topics"] = [{"topic_id": "77", "status": "deleted"}]
+        state["panes"]["migrated"] = {"pane_key": "migrated", "space_key": "workspace:dead-workspace",
+                                      "last_known_status": "idle"}
+        removed = herdres.reconcile_known_gone_spaces(state)
+        self.assertEqual(removed, 0)
+        self.assertIn("workspace:dead-workspace", state["spaces"])
+        self.assertIn("migrated", state["panes"])
+
+
 if __name__ == "__main__":
     unittest.main()
