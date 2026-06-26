@@ -6705,6 +6705,32 @@ Should I patch the timeout guard now?
         self.assertNotIn("Status line", first_item["text"])
         self.assertNotIn("Different status", second_item["text"])
 
+    def test_visible_readonly_skips_stale_scrollback_question_above_idle_prompt(self) -> None:
+        # Regression: an action-question the agent already moved PAST (turn ended, then
+        # compaction + tool activity, now idle at an empty prompt) must NOT be re-delivered
+        # as "input needed". clean_feed_lines strips the idle chrome, which used to surface
+        # the buried question; raw_visible_question_is_live() now guards it.
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        raw = """  Want me to kick off the login flow, or run the migrate for you?
+
+✻ Worked for 5m 59s
+
+❯ /compact
+  ⎿  Compacted (ctrl+o to see full summary)
+  ⎿  Read project/notes.md (31 lines)
+  ⎿  Skills restored
+
+──────────────────
+❯
+──────────────────
+  ? for shortcuts · ← for agents
+"""
+
+        with patch.object(herdres, "pane_output", Mock(return_value=raw)):
+            item = herdres.extract_visible_readonly_feed_item(pane)
+
+        self.assertIsNone(item)
+
     def test_visible_choice_fallback_uses_recent_unwrapped_context(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
         visible = """days, then flip it on — that respects both "instrument first" and your "move faster."
