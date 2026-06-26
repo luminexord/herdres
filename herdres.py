@@ -3445,7 +3445,7 @@ def make_decision_feed_item(turn: dict[str, Any], decision: dict[str, Any]) -> d
     text_parts.append(prompt)
     text_parts.append("")
     text_parts.extend(f"{opt.get('number')}) {opt.get('label')}" for opt in options)
-    return {
+    item = {
         "kind": "decision",
         "title": "Decision needed",
         "summary": prompt,
@@ -3460,6 +3460,7 @@ def make_decision_feed_item(turn: dict[str, Any], decision: dict[str, Any]) -> d
         "options": options,
         "notify": True,
     }
+    return attach_visible_prompt_key(item)
 
 
 def interaction_answer_text(question: dict[str, Any], answer: Any) -> str:
@@ -3508,7 +3509,7 @@ def make_interaction_feed_item(turn: dict[str, Any], interaction: dict[str, Any]
             text_parts.append(line)
         text_parts.append("")
     text_parts.append(note)
-    return {
+    item = {
         "kind": "interaction_readonly",
         "title": "Input needed",
         "summary": prompt,
@@ -3525,6 +3526,7 @@ def make_interaction_feed_item(turn: dict[str, Any], interaction: dict[str, Any]
         "answers": answers,
         "notify": True,
     }
+    return attach_visible_prompt_key(item)
 
 
 def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
@@ -3703,46 +3705,180 @@ def feed_item_is_visible_scrape(item: dict[str, Any]) -> bool:
     ))
 
 
-def visible_prompt_text(item: dict[str, Any]) -> str:
-    parts = [str(item.get("summary") or ""), str(item.get("detail") or "")]
-    for opt in list(item.get("options") or []):
-        if not isinstance(opt, dict):
+_PROMPT_TIMER_TAIL_RE = re.compile(
+    r"\s*(?:\(\s*)?(?:\d+\s*(?:ms|s|m|h|d)(?:\s+\d+\s*(?:ms|s|m|h|d))*\s*)?(?:[·•]\s*)?esc to interrupt\)?\s*$"
+    r"|\s*\(\s*\d+\s*(?:ms|s|m|h|d)(?:\s*[·•][^)]*)?\)\s*$"
+    r"|\s*[·•]\s*\d+\s*(?:ms|s|m|h|d)\s*$",
+    re.IGNORECASE,
+)
+_PROMPT_CURSOR_PREFIX_RE = re.compile(r"^\s*(?:[>›❯➜→▸▶⏵⏸●○◉◌◦•*+\-☐☑☒✓✔]\s*)+")
+_PROMPT_OPTION_PREFIX_RE = re.compile(r"^\s*(?:option\s*)?(?:\d{1,2}|[a-z]|[ivx]{1,4})\s*[.)]\s+", re.IGNORECASE)
+
+
+def _prompt_readonly_note_fragments() -> tuple[str, ...]:
+    notes = [
+        visible_readonly_prompt_note(),
+        f"{INTERACTION_READONLY_WARNING_TITLE}\n{INTERACTION_READONLY_WARNING_BODY}",
+        INTERACTION_READONLY_WARNING_TITLE,
+        INTERACTION_READONLY_WARNING_BODY,
+    ]
+    fragments: list[str] = []
+    for note in notes:
+        clean = str(note or "").strip()
+        if not clean:
             continue
-        parts.append(" ".join(str(opt.get(key) or "") for key in ("number", "label", "description")))
-    return "\n".join(part for part in parts if part.strip()).strip()
+        fragments.append(clean)
+        collapsed = re.sub(r"\s+", " ", clean).strip()
+        if collapsed and collapsed != clean:
+            fragments.append(collapsed)
+        fragments.extend(part.strip() for part in clean.splitlines() if part.strip())
+    return tuple(dict.fromkeys(fragments))
 
 
-def normalized_visible_prompt_text(text: str) -> str:
-    note = visible_readonly_prompt_note()
-    clean = ANSI_RE.sub("", str(text or "")).replace(note, " ")
-    clean = re.sub(r"\s+", " ", clean).strip().lower()
+def _strip_prompt_readonly_notes(text: str) -> str:
+    clean = str(text or "")
+    for note in _prompt_readonly_note_fragments():
+        clean = clean.replace(note, " ")
     return clean
 
 
+def _canonical_prompt_line(line: str) -> str:
+    clean = ANSI_RE.sub("", str(line or ""))
+    clean = _strip_prompt_readonly_notes(clean)
+    clean = TUI_LEADING_CHROME_RE.sub("", clean)
+    clean = re.sub(r"[\u2500-\u257f]+", " ", clean)
+    clean = strip_assistant_reply_marker(clean).strip()
+    if not clean:
+        return ""
+    if SPINNER_STATUS_RE.match(clean) or is_tui_status_noise(clean):
+        return ""
+    clean = _PROMPT_TIMER_TAIL_RE.sub(" ", clean)
+    clean = _PROMPT_CURSOR_PREFIX_RE.sub("", clean).strip()
+    clean = _PROMPT_OPTION_PREFIX_RE.sub("", clean).strip()
+    clean = re.sub(r"^\s*[-*•]\s*", "", clean).strip()
+    clean = _PROMPT_OPTION_PREFIX_RE.sub("", clean).strip()
+    clean = re.sub(r"\s+", " ", clean).strip().lower()
+    if clean in {"question", "questions", "option", "options", "choice", "choices", "decision needed", "input needed"}:
+        return ""
+    return clean
+
+
+def _append_prompt_part(parts: list[str], value: Any, *, seen: set[str] | None = None) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    if seen is not None:
+        key = normalized_visible_prompt_text(text)
+        if key and key in seen:
+            return
+        if key:
+            seen.add(key)
+    parts.append(text)
+
+
+def _append_prompt_option(parts: list[str], option: Any) -> None:
+    if not isinstance(option, dict):
+        _append_prompt_part(parts, option)
+        return
+    label = ""
+    for key in ("label", "text", "title", "value", "send_text"):
+        label = str(option.get(key) or "").strip()
+        if label:
+            break
+    description = str(option.get("description") or "").strip()
+    if label:
+        parts.append(label)
+    if description:
+        parts.append(description)
+    if not label and not description:
+        fallback = str(option.get("id") or option.get("option_id") or option.get("number") or "").strip()
+        if fallback and not fallback.isdigit():
+            parts.append(fallback)
+
+
+def visible_prompt_text(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    seen_prompt_parts: set[str] = set()
+    for key in ("prompt", "summary", "question"):
+        _append_prompt_part(parts, item.get(key), seen=seen_prompt_parts)
+    questions = item.get("questions") if isinstance(item.get("questions"), list) else []
+    for question in questions:
+        if not isinstance(question, dict):
+            _append_prompt_part(parts, question)
+            continue
+        for key in ("prompt", "summary", "title", "question", "text"):
+            _append_prompt_part(parts, question.get(key))
+        for opt in list(question.get("options") or []):
+            _append_prompt_option(parts, opt)
+    for opt in list(item.get("options") or []):
+        _append_prompt_option(parts, opt)
+    if not parts:
+        _append_prompt_part(parts, item.get("text"))
+    return "\n".join(part for part in parts if str(part or "").strip()).strip()
+
+
+def normalized_visible_prompt_text(text: str) -> str:
+    clean = _strip_prompt_readonly_notes(ANSI_RE.sub("", str(text or "")))
+    lines = [_canonical_prompt_line(line) for line in clean.splitlines()]
+    if not lines:
+        lines = [_canonical_prompt_line(clean)]
+    return re.sub(r"\s+", " ", " ".join(line for line in lines if line).strip()).lower()
+
+
 def visible_prompt_key(item: dict[str, Any]) -> str:
-    normalized = normalized_visible_prompt_text(visible_prompt_text(item) or item_plain_text(item))
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16] if normalized else ""
+    signature = normalized_visible_prompt_text(visible_prompt_text(item) or item_plain_text(item))
+    return hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16] if signature else ""
 
 
 def attach_visible_prompt_key(item: dict[str, Any]) -> dict[str, Any]:
-    key = visible_prompt_key(item)
-    if key:
-        item["visible_prompt_key"] = key
+    signature = normalized_visible_prompt_text(visible_prompt_text(item) or item_plain_text(item))
+    if signature:
+        item["prompt_signature"] = signature
+        item["visible_prompt_key"] = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16]
     return item
 
 
-def visible_awaiting_input(lines: list[str]) -> bool:
-    if not any(str(line or "").strip() for line in lines):
+def prompt_like_feed_item(item: dict[str, Any] | None) -> bool:
+    if not isinstance(item, dict):
         return False
-    if extract_choices(lines):
+    return str(item.get("kind") or "").lower() in {"decision", "interaction_readonly"} or feed_item_is_visible_scrape(item)
+
+
+def prompt_like_item_already_delivered(entry: dict[str, Any], item: dict[str, Any]) -> bool:
+    if not prompt_like_feed_item(item):
+        return False
+    attach_visible_prompt_key(item)
+    signature = str(item.get("prompt_signature") or "").strip()
+    key = str(item.get("visible_prompt_key") or "").strip()
+    if signature and signature == str(entry.get("last_prompt_signature") or "").strip():
         return True
-    if is_action_question(lines):
+    if key and key == str(entry.get("last_visible_prompt_key") or "").strip():
         return True
-    tail = compact_block(lines[-10:], max_lines=10, max_chars=1200)
-    return bool(contains_marker(tail, QUESTION_MARKERS) or visible_custom_detail_ready_text("\n".join(lines)))
+    last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
+    if last_item:
+        last_signature = str(last_item.get("prompt_signature") or "").strip()
+        last_key = str(last_item.get("visible_prompt_key") or "").strip()
+        if not last_signature and prompt_like_feed_item(last_item):
+            last_signature = normalized_visible_prompt_text(visible_prompt_text(last_item) or item_plain_text(last_item))
+        if signature and last_signature and signature == last_signature:
+            return True
+        if key and last_key and key == last_key:
+            return True
+    return False
+
+
+def suppress_duplicate_prompt_like_item(entry: dict[str, Any], item: dict[str, Any], reason: str) -> bool:
+    if not prompt_like_item_already_delivered(entry, item):
+        return False
+    entry["last_clean_suppressed_reason"] = sanitize_text(reason, 120)
+    entry["last_clean_suppressed_at"] = utc_now()
+    entry.pop("last_clean_send_error", None)
+    return True
 
 
 def visible_item_subsumes_delivered(entry: dict[str, Any], item: dict[str, Any]) -> bool:
+    if prompt_like_item_already_delivered(entry, item):
+        return True
     candidates = {
         normalized_visible_prompt_text(item_plain_text(item)),
         normalized_visible_prompt_text(visible_prompt_text(item)),
@@ -3751,11 +3887,13 @@ def visible_item_subsumes_delivered(entry: dict[str, Any], item: dict[str, Any])
         str(entry.get("last_clean_text") or ""),
         str(entry.get("last_prompt_text") or ""),
         str(entry.get("last_stream_text") or ""),
+        str(entry.get("last_prompt_signature") or ""),
     ]
     last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else None
     if last_item:
         delivered.append(item_plain_text(last_item))
         delivered.append(visible_prompt_text(last_item))
+        delivered.append(str(last_item.get("prompt_signature") or ""))
     normalized_delivered = [normalized_visible_prompt_text(text) for text in delivered]
     for left in candidates:
         if not left:
@@ -3770,10 +3908,7 @@ def filter_visible_feed_item(entry: dict[str, Any], item: dict[str, Any] | None)
     if not item or not feed_item_is_visible_scrape(item):
         return item
     attach_visible_prompt_key(item)
-    key = str(item.get("visible_prompt_key") or "")
-    previous_key = str(entry.get("last_visible_prompt_key") or "")
-    last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
-    if key and key == (previous_key or str(last_item.get("visible_prompt_key") or "")):
+    if suppress_duplicate_prompt_like_item(entry, item, "duplicate_prompt_signature"):
         return None
     if visible_item_subsumes_delivered(entry, item):
         return None
@@ -3831,7 +3966,7 @@ def mark_visible_prompt_readonly(item: dict[str, Any]) -> dict[str, Any]:
     text = str(readonly.get("text") or "").strip()
     if text and note not in text:
         readonly["text"] = f"{text}\n\n{note}"
-    return readonly
+    return attach_visible_prompt_key(readonly)
 
 
 def visible_action_question_text(lines: list[str]) -> str:
@@ -4141,6 +4276,60 @@ def apply_api_error_warning(
     return {"changed": False, "topic_missing": False}
 
 
+def _turn_has_newer_completed_turn(turn: dict[str, Any], turn_id: str) -> bool:
+    recent = turn.get("recent_turns") if isinstance(turn, dict) else None
+    if not isinstance(recent, list) or not turn_id:
+        return False
+    seen = False
+    for candidate in recent:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("turn_id") or "")
+        if candidate_id == turn_id:
+            seen = True
+            continue
+        if seen and candidate.get("complete") is True and str(candidate.get("assistant_final_text") or "").strip():
+            return True
+    return False
+
+
+def visible_fallback_awaiting_signal(pane: dict[str, Any], turn: dict[str, Any], status: str) -> bool:
+    clean_status = str(status or "").strip().lower().replace("-", "_")
+    pending_structured = isinstance(turn.get("pending_decision"), dict) or isinstance(turn.get("pending_interaction"), dict)
+    if _boolish(turn.get("awaiting_input")):
+        return True
+    if clean_status in ACTIVE_AGENT_STATUSES or clean_status in {"working", "busy", "running"}:
+        return False
+    explicit_awaiting = False
+    for source in (pane, turn):
+        if not isinstance(source, dict):
+            continue
+        for key in ("awaiting_input", "requires_input", "needs_input", "input_required", "waiting_for_input", "pending_input"):
+            value = source.get(key)
+            if _boolish(value) or (key == "pending_input" and bool(value)):
+                explicit_awaiting = True
+                break
+        if explicit_awaiting:
+            break
+    if explicit_awaiting:
+        return True
+    if clean_status in {"blocked", "waiting"}:
+        return True
+    if pending_structured:
+        if clean_status in {"error", "unknown"}:
+            return True
+        return turn.get("complete") is not True
+    open_turn_id = ""
+    if turn.get("has_open_turn") is True:
+        open_turn_id = str(turn.get("open_turn_id") or "")
+    elif turn.get("complete") is False:
+        open_turn_id = str(turn.get("turn_id") or "")
+    open_turn_statuses = {"", "idle", "done", "complete", "completed", "success", "succeeded"}
+    if clean_status in open_turn_statuses and open_turn_id and not _turn_has_newer_completed_turn(turn, open_turn_id):
+        return True
+    return False
+
+
 def extract_turn_feed_item(
     pane: dict[str, Any], entry: dict[str, Any], *, allow_visible_fallback: bool = True
 ) -> dict[str, Any] | None:
@@ -4176,9 +4365,9 @@ def extract_turn_feed_item(
     # if the status momentarily reads non-working while the terminal has already
     # started the next spinner, we deliver the real completed message (deduped
     # downstream) rather than scraping in-progress screen output. Only a
-    # genuinely blocked pane (a real on-screen prompt awaiting the user) bypasses
+    # genuinely blocked/waiting pane (a real on-screen prompt awaiting the user) bypasses
     # this to the visible path.
-    if not item and status != "blocked" and turn.get("complete") is True and turn.get("has_open_turn") is True:
+    if not item and status not in {"blocked", "waiting"} and turn.get("complete") is True and turn.get("has_open_turn") is True:
         item = attach_stream_worklog(make_turn_feed_item({**turn, "has_open_turn": False, "assistant_stream_text": ""}), entry, turn)
     prompt_turn_id, prompt_text = turn_open_prompt(turn)
     if item and str(item.get("turn_id") or "") == prompt_turn_id and str(item.get("kind") or "").lower() in {
@@ -4241,11 +4430,10 @@ def extract_turn_feed_item(
         and status in ACTIVE_AGENT_STATUSES
         and (turn.get("complete") is False or turn.get("has_open_turn") is True)
     )
-    # Visible-screen prompt fallback: never scrape an actively-working pane — its
-    # screen is its own in-progress output (spinner, tool noise, the echo of an
-    # already-delivered reply), which produced the "Input needed" spam and
-    # whole-screen blobs. Genuine prompts surface in blocked/idle states.
-    if not item and allow_visible_fallback and status not in ACTIVE_AGENT_STATUSES:
+    # Visible-screen prompt fallback: never scrape an actively-working pane or an
+    # idle/done leftover. Scrape only when the adapter exposes a genuine awaiting
+    # signal, then the visible parser still has to find an actual prompt.
+    if not item and allow_visible_fallback and visible_fallback_awaiting_signal(pane, turn, status):
         if VISIBLE_CHOICE_BUTTONS_ENABLED:
             item = extract_visible_choice_feed_item(pane)
         elif VISIBLE_READONLY_PROMPTS_ENABLED:
@@ -6179,6 +6367,8 @@ def same_delivered_content(entry: dict[str, Any], item: dict[str, Any], item_sem
     council_marker = str(item.get("_council_job_ref") or "")
     if council_marker and council_marker == str(entry.get("last_council_job_ref") or ""):
         return True
+    if prompt_like_item_already_delivered(entry, item):
+        return True
     current_text = item_plain_text(item).strip()
     last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
     previous_text = str(entry.get("last_clean_text") or "").strip()
@@ -6269,6 +6459,7 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_attempt_hash",
         "last_clean_attempt_at",
         "last_visible_prompt_key",
+        "last_prompt_signature",
         "unfolded_turns",
         "last_plan_doc_turn_id",
         "pending_plan_doc",
@@ -6773,8 +6964,19 @@ def record_delivered_feed_item(
     entry["last_clean_text"] = item_plain_text(item)
     entry["last_clean_item"] = item
     entry["last_clean_sent_at"] = utc_now()
-    if item.get("visible_prompt_key"):
-        entry["last_visible_prompt_key"] = str(item.get("visible_prompt_key") or "")
+    if result.get("ok") and prompt_like_feed_item(item):
+        attach_visible_prompt_key(item)
+        signature = str(item.get("prompt_signature") or "").strip()
+        key = str(item.get("visible_prompt_key") or "").strip()
+        if signature:
+            entry["last_prompt_signature"] = signature
+        if key:
+            entry["last_visible_prompt_key"] = key
+    elif result.get("ok") and str(item.get("kind") or "").lower() == "turn" and not feed_item_is_visible_scrape(item):
+        entry.pop("last_prompt_signature", None)
+        entry.pop("last_visible_prompt_key", None)
+        if item.get("turn_id"):
+            entry["last_turn_id"] = str(item.get("turn_id") or "")
     if item.get("turn_id") and not feed_item_is_visible_scrape(item):
         entry["last_turn_id"] = str(item.get("turn_id") or "")
     entry.pop("last_clean_send_error", None)
@@ -6830,6 +7032,8 @@ def refresh_stale_visible_prompt(
     current_prompt_id = str(current_item.get("prompt_id") or "")
     if not current_prompt_id or current_prompt_id == prompt_id:
         return False
+    item_render_hash = clean_feed_hash(current_item)
+    item_semantic_hash = clean_feed_hash(current_item, include_render_version=False)
     reply_markup, active_prompt, _clear = prompt_delivery_state(current_item)
     result = send_feed_item(
         chat_id,
@@ -6841,19 +7045,16 @@ def refresh_stale_visible_prompt(
         api_token=managed_bot_token_for_entry(telegram, entry),
     )
     if result.get("ok"):
-        if active_prompt:
-            bind_active_prompt_message(entry, active_prompt, result.get("message_id"))
-        entry["last_clean_hash"] = clean_feed_hash(current_item)
-        entry["last_clean_semantic_hash"] = clean_feed_hash(current_item, include_render_version=False)
-        entry["last_clean_render_hash"] = clean_feed_hash(current_item)
-        if result.get("message_id"):
-            entry["last_clean_message_id"] = str(result["message_id"])
-        entry["last_clean_kind"] = str(current_item.get("kind") or "choices")
-        entry["last_clean_text"] = item_plain_text(current_item)
-        entry["last_clean_item"] = current_item
-        entry["last_clean_sent_at"] = utc_now()
+        record_delivered_feed_item(
+            entry,
+            current_item,
+            result,
+            pending_active_prompt=active_prompt,
+            clear_active_prompt=False,
+            item_render_hash=item_render_hash,
+            item_semantic_hash=item_semantic_hash,
+        )
         entry["last_turn_id"] = current_item.get("turn_id") or ""
-        entry.pop("last_clean_send_error", None)
         save_state(state)
     return True
 
@@ -11538,6 +11739,9 @@ def _sync_pane_clean_feed(
     old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
     if should_baseline_new_pane_turn(entry, item, new_entry):
         record_suppressed_clean_item(entry, item, "new_pane_initial_turn_baseline")
+        item = None
+        changed = True
+    if item and suppress_duplicate_prompt_like_item(entry, item, "duplicate_prompt_signature"):
         item = None
         changed = True
     if item:

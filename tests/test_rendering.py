@@ -6240,6 +6240,108 @@ What changed:
         self.assertIsNone(active_prompt)
         self.assertTrue(clear_prompt)
 
+    def test_visible_prompt_text_includes_prompt_questions_and_options(self) -> None:
+        item = {
+            "summary": "Choose a release lane.",
+            "prompt": "Which path should I take?",
+            "questions": [
+                {
+                    "title": "Risk appetite",
+                    "text": "How much risk is acceptable?",
+                    "options": [
+                        {"label": "Fast path", "description": "Ship with higher risk."},
+                        {"label": "Safe path", "description": "Wait for more checks."},
+                    ],
+                }
+            ],
+            "options": [
+                {"number": "1", "label": "Deploy now"},
+                {"number": "2", "label": "Wait"},
+            ],
+        }
+
+        text = herdres.visible_prompt_text(item)
+
+        self.assertIn("Choose a release lane.", text)
+        self.assertIn("Which path should I take?", text)
+        self.assertIn("Risk appetite", text)
+        self.assertIn("How much risk is acceptable?", text)
+        self.assertIn("Fast path", text)
+        self.assertIn("Ship with higher risk.", text)
+        self.assertIn("Deploy now", text)
+
+    def test_visible_prompt_signature_ignores_screen_churn(self) -> None:
+        note = herdres.visible_readonly_prompt_note()
+        stable = {
+            "kind": "choices",
+            "summary": "Should I deploy now?",
+            "options": [
+                {"number": "1", "label": "Deploy now"},
+                {"number": "2", "label": "Wait"},
+            ],
+        }
+        noisy = {
+            "kind": "choices",
+            "prompt": "\x1b[33m❯  Should   I deploy now? (13m)\x1b[0m\n✻ Brewing… (4s · esc to interrupt)",
+            "detail": note,
+            "options": [
+                {"number": "7", "label": " Deploy   now "},
+                {"number": "8", "label": "Wait"},
+            ],
+        }
+
+        herdres.attach_visible_prompt_key(stable)
+        herdres.attach_visible_prompt_key(noisy)
+
+        self.assertEqual(stable["prompt_signature"], noisy["prompt_signature"])
+        self.assertEqual(stable["visible_prompt_key"], noisy["visible_prompt_key"])
+        signature = stable["prompt_signature"]
+        self.assertEqual(signature, signature.lower())
+        self.assertIn("should i deploy now?", signature)
+        self.assertIn("deploy now", signature)
+        self.assertNotIn("\x1b", signature)
+        self.assertNotIn("❯", signature)
+        self.assertNotIn("brewing", signature)
+        self.assertNotIn("4s", signature)
+        self.assertNotIn("13m", signature)
+        self.assertNotIn("visible-screen prompt only", signature)
+        self.assertNotIn(" 1 ", f" {signature} ")
+        self.assertNotIn(" 7 ", f" {signature} ")
+
+    def test_visible_prompt_signature_changes_when_prompt_or_options_change(self) -> None:
+        base = {
+            "kind": "choices",
+            "summary": "Should I deploy now?",
+            "options": [
+                {"number": "1", "label": "Deploy now"},
+                {"number": "2", "label": "Wait"},
+            ],
+        }
+        changed_prompt = {
+            "kind": "choices",
+            "summary": "Should I deploy tomorrow?",
+            "options": [
+                {"number": "1", "label": "Deploy now"},
+                {"number": "2", "label": "Wait"},
+            ],
+        }
+        changed_option = {
+            "kind": "choices",
+            "summary": "Should I deploy now?",
+            "options": [
+                {"number": "1", "label": "Rollback first"},
+                {"number": "2", "label": "Wait"},
+            ],
+        }
+
+        for item in (base, changed_prompt, changed_option):
+            herdres.attach_visible_prompt_key(item)
+
+        self.assertNotEqual(base["prompt_signature"], changed_prompt["prompt_signature"])
+        self.assertNotEqual(base["visible_prompt_key"], changed_prompt["visible_prompt_key"])
+        self.assertNotEqual(base["prompt_signature"], changed_option["prompt_signature"])
+        self.assertNotEqual(base["visible_prompt_key"], changed_option["visible_prompt_key"])
+
     def test_extract_choices_skips_descriptions_between_options(self) -> None:
         raw = """Which is it? This picks the fix lever.
 
@@ -6300,6 +6402,8 @@ Codex thinks your real objection is register, not raw word count. Which is it?
         self.assertEqual(item["title"], "Decision needed")
         self.assertEqual(item["decision_id"], item["prompt_id"])
         self.assertEqual(item["choice_source"], "visible_scrape")
+        self.assertIn("prompt_signature", item)
+        self.assertEqual(item["visible_prompt_key"], herdres.visible_prompt_key(item))
         self.assertEqual(item["turn_id"], f"visible-choice:{item['prompt_id']}")
         self.assertEqual(len(item["options"]), 4)
         self.assertIn("value-ranker", item["detail"])
@@ -6331,6 +6435,8 @@ Codex thinks your real objection is register, not raw word count. Which is it?
         self.assertEqual(item["kind"], "choices")
         self.assertEqual(item["title"], "Input needed")
         self.assertEqual(item["choice_source"], "visible_readonly")
+        self.assertIn("prompt_signature", item)
+        self.assertEqual(item["visible_prompt_key"], herdres.visible_prompt_key(item))
         self.assertNotIn("decision_id", item)
         self.assertTrue(str(item["turn_id"]).startswith("visible-readonly:"))
         self.assertIn("Which is it?", item["summary"])
@@ -6540,6 +6646,8 @@ Which file changed. Should the report include the full diff? Files touched:
         assert item is not None
         self.assertEqual(item["kind"], "decision")
         self.assertEqual(item["decision_id"], "decision-1")
+        self.assertIn("prompt_signature", item)
+        self.assertEqual(item["visible_prompt_key"], herdres.visible_prompt_key(item))
 
     def test_extract_turn_feed_item_delivers_completed_turn_after_auto_continue(self) -> None:
         # The agent finished a reply and immediately auto-pursued a new goal, so a
@@ -7043,6 +7151,8 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         assert item is not None
         self.assertEqual(item["kind"], "interaction_readonly")
         self.assertEqual(item["interaction_revision"], "2")
+        self.assertIn("prompt_signature", item)
+        self.assertEqual(item["visible_prompt_key"], herdres.visible_prompt_key(item))
         self.assertEqual(item["questions"][0]["options"][0]["description"], "The objection is the teacher-like explainer voice.")
         html = herdres.render_feed_item_html(item)
         self.assertIn("<h3>Input needed</h3>", html)

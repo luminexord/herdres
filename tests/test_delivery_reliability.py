@@ -97,6 +97,42 @@ class DeliveryReliabilityBase(unittest.TestCase):
         ):
             return herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
 
+    def _sync_with_sources(
+        self,
+        state: dict,
+        pane: dict,
+        counters: dict,
+        caps: dict,
+        *,
+        turn: dict,
+        visible_reader: Mock | None,
+        send_feed_item: Mock,
+    ) -> bool:
+        space = state["spaces"][herdres.space_key(pane)]
+        with patch.object(herdres.time, "sleep", Mock()), patch.multiple(
+            herdres,
+            ensure_space_topic=Mock(return_value=(space, False)),
+            ensure_pane_root_message=Mock(return_value=(False, {"ok": True})),
+            topic_verify_due=Mock(return_value=False),
+            pane_turn=Mock(return_value=turn),
+            extract_visible_readonly_feed_item=visible_reader or Mock(return_value=None),
+            VISIBLE_CHOICE_BUTTONS_ENABLED=False,
+            VISIBLE_READONLY_PROMPTS_ENABLED=True,
+            send_pending_prompt_message=Mock(return_value={"changed": False, "topic_missing": False, "pane_root_missing": False}),
+            send_feed_item=send_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            fold_superseded_turns=Mock(return_value=False),
+            flush_pending_plan_doc=Mock(return_value=False),
+            flush_pending_speech_reply=Mock(return_value=False),
+            CLEAN_FEED_ENABLED=True,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            return herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
 
 class CleanFeedTransientRetryTests(DeliveryReliabilityBase):
     def test_transient_fail_then_ok_records_one_logical_delivery(self) -> None:
@@ -203,6 +239,42 @@ class VisibleFallbackReliabilityTests(DeliveryReliabilityBase):
         herdres.attach_visible_prompt_key(item)
         return item
 
+    def _visible_choices(self, prompt: str = "Should I deploy now?", *, key: str = "prompt") -> dict:
+        item = {
+            "kind": "choices",
+            "title": "Input needed",
+            "summary": prompt,
+            "options": [
+                {"number": "7", "label": "Deploy now"},
+                {"number": "8", "label": "Wait"},
+            ],
+            "turn_id": f"visible-readonly:{key}",
+            "choice_source": "visible_readonly",
+            "notify": True,
+        }
+        herdres.attach_visible_prompt_key(item)
+        return item
+
+    def _structured_decision_turn(
+        self, *, turn_id: str = "turn-decision", prompt: str = "Should I deploy now?"
+    ) -> dict:
+        return {
+            "available": True,
+            "complete": False,
+            "has_open_turn": True,
+            "awaiting_input": True,
+            "turn_id": turn_id,
+            "assistant_final_text": "I need one decision before continuing.",
+            "pending_decision": {
+                "decision_id": f"{turn_id}:decision",
+                "prompt": prompt,
+                "options": [
+                    {"id": "1", "label": "Deploy now", "send_text": "1"},
+                    {"id": "2", "label": "Wait", "send_text": "2"},
+                ],
+            },
+        }
+
     def test_stale_visible_text_equal_or_subsumed_by_recent_delivery_is_suppressed(self) -> None:
         cases = [
             ("last_clean_text", "Should I deploy now?", "Should I deploy now?"),
@@ -273,6 +345,7 @@ class VisibleFallbackReliabilityTests(DeliveryReliabilityBase):
         send_feed_item.assert_called_once()
         self.assertEqual(entry["last_clean_message_id"], "3001")
         self.assertEqual(entry["last_visible_prompt_key"], visible["visible_prompt_key"])
+        self.assertEqual(entry["last_prompt_signature"], visible["prompt_signature"])
 
     def test_visible_prompt_key_uses_normalized_prompt_and_options(self) -> None:
         first = {
@@ -308,6 +381,204 @@ class VisibleFallbackReliabilityTests(DeliveryReliabilityBase):
                 self.assertIsNone(item)
                 choice_reader.assert_not_called()
                 readonly_reader.assert_not_called()
+
+    def test_idle_done_leftover_visible_text_without_awaiting_signal_does_not_post(self) -> None:
+        for status in ("idle", "done"):
+            with self.subTest(status=status):
+                state, pane, _pane_key, entry, counters, caps = self._state(status=status)
+                visible_reader = Mock(return_value=self._visible_choices(key=status))
+                send_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+
+                self._sync_with_sources(
+                    state,
+                    pane,
+                    counters,
+                    caps,
+                    turn={"available": False, "reason": "no_completed_turn"},
+                    visible_reader=visible_reader,
+                    send_feed_item=send_feed_item,
+                )
+
+                visible_reader.assert_not_called()
+                send_feed_item.assert_not_called()
+                self.assertNotIn("last_prompt_signature", entry)
+                self.assertNotIn("last_visible_prompt_key", entry)
+
+    def test_structured_then_visible_same_prompt_does_not_double_send(self) -> None:
+        state, pane, _pane_key, entry, counters, caps = self._state(status="blocked")
+        visible = self._visible_choices(key="same")
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+
+        self._sync_with_sources(
+            state,
+            pane,
+            counters,
+            caps,
+            turn=self._structured_decision_turn(),
+            visible_reader=Mock(return_value=None),
+            send_feed_item=send_feed_item,
+        )
+        herdres.clear_sync_caches()
+        visible_reader = Mock(return_value=visible)
+        self._sync_with_sources(
+            state,
+            pane,
+            counters,
+            caps,
+            turn={"available": False, "reason": "no_completed_turn"},
+            visible_reader=visible_reader,
+            send_feed_item=send_feed_item,
+        )
+
+        visible_reader.assert_called_once()
+        send_feed_item.assert_called_once()
+        self.assertEqual(entry["last_prompt_signature"], visible["prompt_signature"])
+        self.assertEqual(entry["last_visible_prompt_key"], visible["visible_prompt_key"])
+
+    def test_visible_then_structured_same_prompt_does_not_double_send(self) -> None:
+        state, pane, _pane_key, entry, counters, caps = self._state(status="blocked")
+        visible = self._visible_choices(key="same")
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+
+        self._sync_with_sources(
+            state,
+            pane,
+            counters,
+            caps,
+            turn={"available": False, "reason": "no_completed_turn"},
+            visible_reader=Mock(return_value=visible),
+            send_feed_item=send_feed_item,
+        )
+        herdres.clear_sync_caches()
+        self._sync_with_sources(
+            state,
+            pane,
+            counters,
+            caps,
+            turn=self._structured_decision_turn(turn_id="turn-decision-2"),
+            visible_reader=Mock(return_value=None),
+            send_feed_item=send_feed_item,
+        )
+
+        send_feed_item.assert_called_once()
+        self.assertEqual(entry["last_prompt_signature"], visible["prompt_signature"])
+
+    def test_same_visible_prompt_recurs_after_intervening_real_turn(self) -> None:
+        state, pane, _pane_key, entry, counters, caps = self._state(status="blocked")
+        visible = self._visible_choices(key="repeat")
+        send_feed_item = Mock(side_effect=[
+            {"ok": True, "message_id": "3001"},
+            {"ok": True, "message_id": "3002"},
+            {"ok": True, "message_id": "3003"},
+        ])
+
+        self._sync_with_sources(
+            state,
+            pane,
+            counters,
+            caps,
+            turn={"available": False, "reason": "no_completed_turn"},
+            visible_reader=Mock(return_value=visible),
+            send_feed_item=send_feed_item,
+        )
+        self.assertEqual(entry["last_prompt_signature"], visible["prompt_signature"])
+
+        pane["agent_status"] = "done"
+        herdres.clear_sync_caches()
+        real = self._turn_item("real-turn", answer="The deployment finished.")
+        self._sync_item(state, pane, counters, caps, real, send_feed_item)
+        self.assertNotEqual(entry.get("last_prompt_signature"), visible["prompt_signature"])
+        self.assertNotEqual(entry.get("last_visible_prompt_key"), visible["visible_prompt_key"])
+
+        pane["agent_status"] = "blocked"
+        herdres.clear_sync_caches()
+        self._sync_with_sources(
+            state,
+            pane,
+            counters,
+            caps,
+            turn={"available": False, "reason": "no_completed_turn"},
+            visible_reader=Mock(return_value=visible),
+            send_feed_item=send_feed_item,
+        )
+
+        self.assertEqual(send_feed_item.call_count, 3)
+        self.assertEqual(entry["last_prompt_signature"], visible["prompt_signature"])
+
+    def test_persisted_last_prompt_signature_suppresses_after_state_reuse(self) -> None:
+        state, pane, _pane_key, entry, counters, caps = self._state(status="blocked")
+        visible = self._visible_choices(key="persisted")
+        entry["last_prompt_signature"] = visible["prompt_signature"]
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+
+        self._sync_with_sources(
+            state,
+            pane,
+            counters,
+            caps,
+            turn={"available": False, "reason": "no_completed_turn"},
+            visible_reader=Mock(return_value=visible),
+            send_feed_item=send_feed_item,
+        )
+
+        send_feed_item.assert_not_called()
+        self.assertEqual(entry["last_prompt_signature"], visible["prompt_signature"])
+
+    def test_persisted_legacy_visible_prompt_key_suppresses_after_state_reuse(self) -> None:
+        state, pane, _pane_key, entry, counters, caps = self._state(status="blocked")
+        visible = self._visible_choices(key="legacy")
+        entry["last_visible_prompt_key"] = visible["visible_prompt_key"]
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+
+        self._sync_with_sources(
+            state,
+            pane,
+            counters,
+            caps,
+            turn={"available": False, "reason": "no_completed_turn"},
+            visible_reader=Mock(return_value=visible),
+            send_feed_item=send_feed_item,
+        )
+
+        send_feed_item.assert_not_called()
+        self.assertEqual(entry["last_visible_prompt_key"], visible["visible_prompt_key"])
+
+    def test_failed_visible_prompt_send_does_not_advance_last_prompt_signature(self) -> None:
+        state, pane, _pane_key, entry, counters, caps = self._state(status="blocked")
+        visible = self._visible_choices(key="retry")
+        send_feed_item = Mock(side_effect=[
+            {"ok": False, "kind": "transient", "transient": True},
+            {"ok": False, "kind": "transient", "transient": True},
+            {"ok": False, "kind": "transient", "transient": True},
+            {"ok": True, "message_id": "3002"},
+        ])
+
+        self._sync_with_sources(
+            state,
+            pane,
+            counters,
+            caps,
+            turn={"available": False, "reason": "no_completed_turn"},
+            visible_reader=Mock(return_value=visible),
+            send_feed_item=send_feed_item,
+        )
+
+        self.assertNotIn("last_prompt_signature", entry)
+        self.assertNotEqual(entry.get("last_visible_prompt_key"), visible["visible_prompt_key"])
+
+        herdres.clear_sync_caches()
+        self._sync_with_sources(
+            state,
+            pane,
+            counters,
+            caps,
+            turn={"available": False, "reason": "no_completed_turn"},
+            visible_reader=Mock(return_value=visible),
+            send_feed_item=send_feed_item,
+        )
+
+        self.assertEqual(send_feed_item.call_count, 4)
+        self.assertEqual(entry["last_prompt_signature"], visible["prompt_signature"])
 
 
 class ContentIdentityReliabilityTests(DeliveryReliabilityBase):
@@ -369,7 +640,7 @@ class ContentIdentityReliabilityTests(DeliveryReliabilityBase):
 
         self.assertEqual(entry["last_turn_id"], "real-turn-1")
         self.assertEqual(entry["last_visible_prompt_key"], visible["visible_prompt_key"])
-
+        self.assertEqual(entry["last_prompt_signature"], visible["prompt_signature"])
         real = self._turn_item("real-turn-2", answer="Finished after the prompt.")
         herdres.record_delivered_feed_item(
             entry,
@@ -380,6 +651,8 @@ class ContentIdentityReliabilityTests(DeliveryReliabilityBase):
         )
 
         self.assertEqual(entry["last_turn_id"], "real-turn-2")
+        self.assertNotEqual(entry.get("last_prompt_signature"), visible["prompt_signature"])
+        self.assertNotEqual(entry.get("last_visible_prompt_key"), visible["visible_prompt_key"])
 
 
 if __name__ == "__main__":
