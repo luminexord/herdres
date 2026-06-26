@@ -3849,6 +3849,33 @@ def visible_action_question_text(lines: list[str]) -> str:
     return tail if "?" in tail and ACTION_QUESTION_RE.search(tail) else ""
 
 
+def raw_visible_question_is_live(raw: str) -> bool:
+    """True only if a free-text action-question is still the LIVE on-screen prompt.
+
+    clean_feed_lines() strips terminal chrome — the empty ``❯`` input box, the
+    "? for shortcuts" footer, and post-turn activity (a submitted ``❯ /compact``, tool
+    results, "Compacted"). That can pull a question the agent has already moved PAST down
+    to the cleaned tail, where is_action_question() matches it and we'd deliver a stale
+    "input needed". Guard against that on the RAW screen: locate the most recent
+    action-question, then treat it as stale if the user has SUBMITTED a prompt after it
+    (a non-empty ``❯ <text>`` line) — the agent moved on. The trailing live prompt is an
+    EMPTY ``❯`` (PROMPT_ONLY), so it never trips this. Choice menus go through the choices
+    path and are unaffected.
+    """
+    raw_lines = str(raw or "").splitlines()
+    question_idx: int | None = None
+    for idx in range(len(raw_lines)):
+        block = compact_block(raw_lines[max(0, idx - 1):idx + 1], max_lines=2, max_chars=400)
+        if "?" in block and ACTION_QUESTION_RE.search(block):
+            question_idx = idx
+    if question_idx is None:
+        return False
+    for line in raw_lines[question_idx + 1:]:
+        if PROMPT_WITH_TEXT_RE.match(line) and not PROMPT_PLACEHOLDER_RE.match(line):
+            return False
+    return True
+
+
 def extract_visible_readonly_question_item(pane: dict[str, Any]) -> dict[str, Any] | None:
     pane_id = str(pane.get("pane_id") or "")
     if not pane_id:
@@ -3861,6 +3888,8 @@ def extract_visible_readonly_question_item(pane: dict[str, Any]) -> dict[str, An
         return None
     question = visible_action_question_text(lines)
     if not question:
+        return None
+    if not raw_visible_question_is_live(raw):
         return None
     note = visible_readonly_prompt_note()
     item = make_feed_item("question", "Input needed", f"{question}\n\n{note}", notify=True)
