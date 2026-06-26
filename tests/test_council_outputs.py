@@ -56,6 +56,51 @@ class CouncilGitmootOutputTests(unittest.TestCase):
             with self.subTest(cwd=pane["foreground_cwd"], label=pane.get("label")):
                 self.assertIsNone(herdres.gitmoot_delegation_ref_from_pane(pane))
 
+    def test_continuation_cwds_decode_to_slashed_job_refs_and_keep_r1(self) -> None:
+        cases = [
+            (
+                self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/R1/d1/repo"),
+                ("R1", "d1"),
+                "R1/delegation/d1",
+            ),
+            (
+                self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/R1_continuation-abcdef123/d1/repo"),
+                ("R1/continuation", "d1"),
+                "R1/continuation/delegation/d1",
+            ),
+            (
+                self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/R1_continuation_continuation-abcdef123/d2/repo"),
+                ("R1/continuation/continuation", "d2"),
+                "R1/continuation/continuation/delegation/d2",
+            ),
+        ]
+        cases[2][0]["label"] = "council-codex · d2 · main"
+
+        for pane, expected_parts, expected_job_ref in cases:
+            with self.subTest(cwd=pane["foreground_cwd"]):
+                self.assertEqual(herdres.gitmoot_delegation_ref_from_pane(pane), expected_parts)
+                gitmoot_job_show = Mock(
+                    return_value=f"job_ref: {expected_job_ref}\nagent: codex\nsummary: Continuation answer\n"
+                )
+                with patch.object(herdres, "gitmoot_job_show", gitmoot_job_show):
+                    item = herdres.gitmoot_council_feed_item(pane, {})
+
+                self.assertIsNotNone(item)
+                gitmoot_job_show.assert_called_once_with(expected_job_ref)
+
+    def test_malformed_or_ambiguous_continuation_cwds_do_not_parse(self) -> None:
+        cases = [
+            "/tmp/.gitmoot/workflows/delegations/R1_continuation-nothex/d1/repo",
+            "/tmp/.gitmoot/workflows/delegations/R1_continuation_extra/d1/repo",
+            "/tmp/.gitmoot/workflows/delegations/R1_continuation-abcdef_continuation/d1/repo",
+            "/tmp/.gitmoot/workflows/delegations/_continuation-abcdef/d1/repo",
+            "/tmp/.gitmoot/workflows/delegations/R1_continuation-abcdef/d1/delegations/R2/d1/repo",
+        ]
+
+        for cwd in cases:
+            with self.subTest(cwd=cwd):
+                self.assertIsNone(herdres.gitmoot_delegation_ref_from_pane(self._council_pane(cwd=cwd)))
+
     def test_workflow_event_filter_matches_lifecycle_events_not_model_prose(self) -> None:
         for event in (
             "advance_started",
@@ -152,6 +197,164 @@ class CouncilGitmootOutputTests(unittest.TestCase):
         for job_text in cases:
             with self.subTest(job_text=job_text), patch.object(herdres, "gitmoot_job_show", Mock(return_value=job_text)):
                 self.assertIsNone(herdres.gitmoot_council_feed_item(pane, {}))
+
+    def test_sync_ignores_volatile_fallback_revisions_but_posts_changed_summary(self) -> None:
+        pane = self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/root_1/d1/repo")
+        telegram = {"managed_bots": {"codex": {"token": "CODEX_TOKEN", "enabled": True}}}
+        job_texts = [
+            (
+                "job_ref: root_1/delegation/d1\n"
+                "updated_at: 2026-06-26T10:00:00Z\n"
+                "completed_at: 2026-06-26T10:00:01Z\n"
+                "finished_at: 2026-06-26T10:00:02Z\n"
+                "agent: codex\n"
+                "summary: Council answer\n"
+            ),
+            (
+                "job_ref: root_1/delegation/d1\n"
+                "updated_at: 2026-06-26T10:01:00Z\n"
+                "completed_at: 2026-06-26T10:01:01Z\n"
+                "finished_at: 2026-06-26T10:01:02Z\n"
+                "agent: codex\n"
+                "summary: Council answer\n"
+            ),
+            (
+                "job_ref: root_1/delegation/d1\n"
+                "updated_at: 2026-06-26T10:02:00Z\n"
+                "completed_at: 2026-06-26T10:02:01Z\n"
+                "finished_at: 2026-06-26T10:02:02Z\n"
+                "agent: codex\n"
+                "summary: Changed council answer\n"
+            ),
+        ]
+        send_feed_item = Mock(
+            side_effect=[
+                {"ok": True, "message_id": "2001"},
+                {"ok": True, "message_id": "2002"},
+            ]
+        )
+
+        with patch.object(herdres, "per_agent_topics_enabled", Mock(return_value=False)):
+            space_key = herdres.space_key(pane)
+            pane_key = herdres.pane_key(pane)
+            state = {
+                "version": 1,
+                "telegram": telegram,
+                "spaces": {
+                    space_key: {
+                        "space_key": space_key,
+                        "topic_id": "77",
+                        "topic_name": herdres.council_space_topic_name(pane, space_key),
+                        "origin": "council",
+                        "voice_mode": "per_agent",
+                        "pane_keys": [pane_key],
+                        "message_routes": {},
+                    }
+                },
+                "panes": {},
+            }
+            counters, caps = self._sync_caps()
+            with patch.multiple(
+                herdres,
+                gitmoot_job_show=Mock(side_effect=job_texts),
+                extract_turn_feed_item=Mock(return_value=None),
+                send_pending_prompt_message=Mock(return_value={"changed": False, "topic_missing": False, "pane_root_missing": False}),
+                send_feed_item=send_feed_item,
+                save_state=Mock(),
+                apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+                fold_superseded_turns=Mock(return_value=False),
+                flush_pending_plan_doc=Mock(return_value=False),
+                flush_pending_speech_reply=Mock(return_value=False),
+                pane_root_messages_enabled=Mock(return_value=False),
+                CLEAN_FEED_ENABLED=True,
+                TURN_FEED_ENABLED=True,
+                LIVE_CARD_ENABLED=False,
+                STATUS_MARKER_ENABLED=False,
+                STATUS_ICON_ENABLED=False,
+            ):
+                herdres.sync_pane_once(state, "-1001", telegram, pane, counters, caps)
+                first_marker = state["panes"][pane_key]["last_council_job_ref"]
+                herdres.sync_pane_once(state, "-1001", telegram, pane, counters, caps)
+                second_marker = state["panes"][pane_key]["last_council_job_ref"]
+                herdres.sync_pane_once(state, "-1001", telegram, pane, counters, caps)
+
+        sent_texts = [call.args[1]["assistant_final_text"] for call in send_feed_item.call_args_list]
+        self.assertEqual(sent_texts, ["Council answer", "Changed council answer"])
+        self.assertEqual(first_marker, second_marker)
+        self.assertTrue(first_marker.startswith("root_1/delegation/d1:"))
+        self.assertNotIn("@", first_marker)
+        self.assertNotEqual(first_marker, state["panes"][pane_key]["last_council_job_ref"])
+        self.assertEqual(counters["feed_sends"], 2)
+
+    def test_sync_posts_omp_or_ompi_continuation_through_managed_bot_voice(self) -> None:
+        cases = [
+            ("council-omp-impl · d4 · main", "gm-local-as"),
+            ("council-ompi · d4 · main", "omp"),
+        ]
+
+        for label, agent in cases:
+            with self.subTest(label=label, agent=agent):
+                pane = self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/R1_continuation-abcdef123/d4/repo")
+                pane["label"] = label
+                pane["agent"] = agent
+                telegram = {"managed_bots": {"omp": {"token": "OMP_TOKEN", "enabled": True}}}
+                job_text = (
+                    "job_ref: R1/continuation/delegation/d4\n"
+                    "agent: omp\n"
+                    "summary: OMP continuation answer\n"
+                )
+                send_feed_item = Mock(return_value={"ok": True, "message_id": "2401"})
+                gitmoot_job_show = Mock(return_value=job_text)
+
+                with patch.object(herdres, "per_agent_topics_enabled", Mock(return_value=False)):
+                    space_key = herdres.space_key(pane)
+                    pane_key = herdres.pane_key(pane)
+                    state = {
+                        "version": 1,
+                        "telegram": telegram,
+                        "spaces": {
+                            space_key: {
+                                "space_key": space_key,
+                                "topic_id": "77",
+                                "topic_name": herdres.council_space_topic_name(pane, space_key),
+                                "origin": "council",
+                                "voice_mode": "per_agent",
+                                "pane_keys": [pane_key],
+                                "message_routes": {},
+                            }
+                        },
+                        "panes": {},
+                    }
+                    counters, caps = self._sync_caps()
+                    with patch.multiple(
+                        herdres,
+                        gitmoot_job_show=gitmoot_job_show,
+                        extract_turn_feed_item=Mock(return_value=None),
+                        send_pending_prompt_message=Mock(return_value={"changed": False, "topic_missing": False, "pane_root_missing": False}),
+                        send_feed_item=send_feed_item,
+                        save_state=Mock(),
+                        apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+                        fold_superseded_turns=Mock(return_value=False),
+                        flush_pending_plan_doc=Mock(return_value=False),
+                        flush_pending_speech_reply=Mock(return_value=False),
+                        pane_root_messages_enabled=Mock(return_value=False),
+                        CLEAN_FEED_ENABLED=True,
+                        TURN_FEED_ENABLED=True,
+                        LIVE_CARD_ENABLED=False,
+                        STATUS_MARKER_ENABLED=False,
+                        STATUS_ICON_ENABLED=False,
+                    ):
+                        changed = herdres.sync_pane_once(state, "-1001", telegram, pane, counters, caps)
+
+                self.assertTrue(changed)
+                gitmoot_job_show.assert_called_once_with("R1/continuation/delegation/d4")
+                send_feed_item.assert_called_once()
+                sent_item = send_feed_item.call_args.args[1]
+                self.assertEqual(sent_item["assistant_final_text"], "OMP continuation answer")
+                self.assertEqual(send_feed_item.call_args.kwargs["thread_id"], "77")
+                self.assertEqual(send_feed_item.call_args.kwargs["api_token"], "OMP_TOKEN")
+                self.assertEqual(state["panes"][pane_key]["last_clean_bot_kind"], "omp")
+                self.assertEqual(counters["feed_sends"], 1)
 
     def test_sync_posts_gitmoot_council_output_once_via_resolved_seat_bot(self) -> None:
         pane = self._council_pane(cwd="/tmp/.gitmoot/workflows/delegations/root_1/d1/repo")

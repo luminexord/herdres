@@ -265,6 +265,8 @@ ACTIVE_PANE_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PANE_TTL",
 # space (deleted topic / kicked bot) can't burn a send slot every sync.
 MULTIBOT_OFFER_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_MULTIBOT_OFFER_RETRY", "3600"))
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
+CLEAN_TRANSIENT_ATTEMPT_TTL_SECONDS = 15
+CLEAN_SEND_RETRY_DELAYS = (0.25, 0.75)
 PANE_INPUT_FILE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS", "1200"))
 PANE_INPUT_FILE_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES", "6"))
 PANE_INPUT_FILE_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_MAX_CHARS", "120000"))
@@ -2050,10 +2052,22 @@ def gitmoot_delegation_ref_from_pane(pane) -> tuple[str, str] | None:
         return None
     if not any("gitmoot" in part.lower() for part in parts[: idx + 1]):
         return None
-    root_job_id = parts[idx + 1].strip()
+    raw_root_job_id = parts[idx + 1].strip()
     delegation_id = parts[idx + 2].strip()
     safe = re.compile(r"^[A-Za-z0-9_.:-]+$")
-    if not root_job_id or not delegation_id or not safe.match(root_job_id) or not safe.match(delegation_id):
+    if not raw_root_job_id or not delegation_id or not safe.match(delegation_id):
+        return None
+    root_job_id = raw_root_job_id
+    if "_continuation" in raw_root_job_id:
+        root = raw_root_job_id.split("_continuation", 1)[0].strip()
+        tail = raw_root_job_id[len(root):]
+        if not re.fullmatch(r"(?:_continuation)+(?:-[A-Fa-f0-9]{6,})?", tail or ""):
+            return None
+        count = tail.count("_continuation")
+        if not root or count <= 0 or not safe.match(root):
+            return None
+        root_job_id = root + ("/continuation" * count)
+    elif not safe.match(root_job_id):
         return None
     label_text = " ".join(str((pane or {}).get(key) or "") for key in ("label", "name", "title", "pane_thread_name"))
     label_match = re.search(r"\bd(\d+)\b", label_text, re.IGNORECASE)
@@ -2138,7 +2152,7 @@ def gitmoot_council_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> di
     if not content:
         return None
     revision = ""
-    for key in ("revision", "rev", "version", "updated_at", "completed_at", "finished_at"):
+    for key in ("revision", "rev", "version"):
         value = str(fields.get(key) or "").strip()
         if value:
             revision = sanitize_text(value, 80)
@@ -3765,10 +3779,12 @@ def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[s
     if isinstance(turn, dict):
         recent = turn.get("recent_turns")
         if isinstance(recent, list) and len(recent) >= 2:
-            last_clean_turn = str((entry.get("last_clean_item") or {}).get("turn_id") or "")
+            last_clean_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
+            last_clean_turn = str(last_clean_item.get("turn_id") or "") if real_turn_item(last_clean_item) else ""
+            last_real_turn = str(entry.get("last_real_turn_id") or "")
             streamed = str(entry.get("last_stream_turn_id") or entry.get("pending_stream_turn_id") or "")
             legacy_turn = str(entry.get("last_turn_id") or "")
-            delivered = last_clean_turn or ("" if streamed and legacy_turn == streamed else legacy_turn)
+            delivered = last_real_turn or last_clean_turn or ("" if streamed and legacy_turn == streamed else legacy_turn)
             ids = [str(t.get("turn_id") or "") for t in recent]
             if delivered and delivered in ids:
                 idx = ids.index(delivered)
@@ -3809,6 +3825,8 @@ def record_suppressed_clean_item(entry: dict[str, Any], item: dict[str, Any], re
     entry["last_clean_item"] = item
     entry["last_clean_suppressed_reason"] = sanitize_text(reason, 120)
     entry["last_clean_suppressed_at"] = utc_now()
+    if real_turn_item(item):
+        record_real_turn_cursor(entry, item, item_render_hash, item_semantic_hash)
     entry.pop("last_clean_send_error", None)
 
 
@@ -4117,12 +4135,19 @@ def extract_turn_feed_item(
     # Visible-screen prompt fallback: never scrape an actively-working pane — its
     # screen is its own in-progress output (spinner, tool noise, the echo of an
     # already-delivered reply), which produced the "Input needed" spam and
-    # whole-screen blobs. Genuine prompts surface in blocked/idle states.
-    if not item and allow_visible_fallback and status not in ACTIVE_AGENT_STATUSES:
+    # whole-screen blobs. Genuine prompts require an awaiting-input marker.
+    if (
+        not item
+        and allow_visible_fallback
+        and status not in ACTIVE_AGENT_STATUSES
+        and turn.get("awaiting_input") is True
+    ):
         if VISIBLE_CHOICE_BUTTONS_ENABLED:
             item = extract_visible_choice_feed_item(pane)
         elif VISIBLE_READONLY_PROMPTS_ENABLED:
             item = extract_visible_readonly_feed_item(pane)
+        if item and visible_item_already_delivered(entry, item):
+            item = None
     return item
 
 
@@ -6008,6 +6033,8 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
         "questions": item.get("questions") or [],
         "answers": item.get("answers") or {},
     }
+    if str(item.get("kind") or "").lower() == "turn":
+        payload["turn_id"] = str(item.get("_stable_ref") or item.get("_council_job_ref") or "")
     # worklog_text is deliberately NOT in the dedup payload: it is supplementary
     # render data (the intermediate steps), and the adapter can attach it to an
     # ALREADY-DELIVERED turn (a completed turn re-parsed with the worklog). Hashing
@@ -6025,13 +6052,108 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
         payload["render_version"] = RICH_RENDER_VERSION
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
+def real_turn_item(item: dict[str, Any] | None) -> bool:
+    return isinstance(item, dict) and str(item.get("kind") or "").lower() == "turn"
+
+
+def normalized_delivery_text(value: Any) -> str:
+    text = sanitize_text(str(value or ""), FINAL_REPLY_MAX_CHARS)
+    note = visible_readonly_prompt_note()
+    if note:
+        text = text.replace(note, " ")
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def delivery_text_overlaps(candidate: str, previous: str) -> bool:
+    if not candidate or not previous:
+        return False
+    if candidate == previous:
+        return True
+    return min(len(candidate), len(previous)) >= 12 and (candidate in previous or previous in candidate)
+
+
+def visible_prompt_item(item: dict[str, Any] | None) -> bool:
+    if not isinstance(item, dict):
+        return False
+    source = prompt_source(item)
+    if source in {"visible_readonly", "visible_scrape"}:
+        return True
+    return str(item.get("turn_id") or "").startswith("visible-")
+
+
+def visible_prompt_hash(item: dict[str, Any]) -> str:
+    options = [
+        {
+            "number": str(opt.get("number") or ""),
+            "label": normalized_delivery_text(opt.get("label")),
+            "description": normalized_delivery_text(opt.get("description")),
+        }
+        for opt in list(item.get("options") or [])
+        if isinstance(opt, dict)
+    ]
+    payload = {
+        "source": prompt_source(item),
+        "text": normalized_delivery_text(item_plain_text(item)),
+        "options": options,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def visible_item_already_delivered(entry: dict[str, Any], item: dict[str, Any]) -> bool:
+    item_hash = visible_prompt_hash(item)
+    if item_hash and str(entry.get("last_visible_prompt_hash") or "") == item_hash:
+        return True
+    candidate = normalized_delivery_text(item_plain_text(item))
+    previous_values: list[Any] = [
+        entry.get("last_clean_text"),
+        entry.get("last_prompt_text"),
+        entry.get("pending_prompt_text"),
+        entry.get("last_stream_text"),
+        entry.get("pending_stream_text"),
+    ]
+    clean_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else None
+    if clean_item:
+        previous_values.append(item_plain_text(clean_item))
+    for previous_value in previous_values:
+        if delivery_text_overlaps(candidate, normalized_delivery_text(previous_value)):
+            return True
+    return False
+
+
+def record_real_turn_cursor(
+    entry: dict[str, Any],
+    item: dict[str, Any],
+    item_render_hash: str,
+    item_semantic_hash: str,
+    message_id: str | int | None = None,
+) -> None:
+    entry["last_real_turn_id"] = str(item.get("turn_id") or "")
+    entry["last_real_turn_hash"] = item_render_hash
+    entry["last_real_turn_semantic_hash"] = item_semantic_hash
+    entry["last_real_turn_text"] = item_plain_text(item)
+    if message_id:
+        entry["last_real_turn_message_id"] = str(message_id)
+    if item.get("turn_id"):
+        entry["last_turn_id"] = str(item.get("turn_id") or "")
+
 
 def same_delivered_content(entry: dict[str, Any], item: dict[str, Any], item_semantic_hash: str) -> bool:
+    if real_turn_item(item):
+        previous_real_hash = str(entry.get("last_real_turn_semantic_hash") or "")
+        if previous_real_hash and previous_real_hash == item_semantic_hash:
+            return True
     previous_semantic_hash = str(entry.get("last_clean_semantic_hash") or "")
     if previous_semantic_hash and previous_semantic_hash == item_semantic_hash:
         return True
     turn_id = str(item.get("turn_id") or "")
-    previous_turn_id = str(entry.get("last_turn_id") or (entry.get("last_clean_item") or {}).get("turn_id") or "")
+    last_clean_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
+    previous_turn_id = str(entry.get("last_real_turn_id") or entry.get("last_turn_id") or last_clean_item.get("turn_id") or "")
+    if real_turn_item(item):
+        previous_text = str(entry.get("last_real_turn_text") or "")
+        if not previous_text and real_turn_item(last_clean_item):
+            previous_text = str(entry.get("last_clean_text") or "")
+        if previous_text and previous_text.strip() == item_plain_text(item).strip():
+            return True
     if turn_id and previous_turn_id and turn_id == previous_turn_id:
         previous_text = str(entry.get("last_clean_text") or "").strip()
         if previous_text and previous_text == item_plain_text(item).strip():
@@ -6043,10 +6165,56 @@ def recent_attempt(entry: dict[str, Any], item_hash: str, ttl_seconds: int = CLE
     if entry.get("last_clean_attempt_hash") != item_hash:
         return False
     try:
+        ttl = int(entry.get("last_clean_attempt_ttl_seconds") or ttl_seconds)
+    except (TypeError, ValueError):
+        ttl = ttl_seconds
+    try:
         then = _dt.datetime.fromisoformat(str(entry.get("last_clean_attempt_at", "")).replace("Z", "+00:00"))
     except Exception:
         return False
-    return (_dt.datetime.now(tz=_dt.timezone.utc) - then).total_seconds() < ttl_seconds
+    return (_dt.datetime.now(tz=_dt.timezone.utc) - then).total_seconds() < max(0, ttl)
+
+def retryable_clean_feed_result(result: dict[str, Any] | None) -> bool:
+    if not isinstance(result, dict) or result.get("ok"):
+        return False
+    if result.get("partial_sent") or result.get("topic_missing") or result.get("not_found"):
+        return False
+    kind = str(result.get("kind") or "")
+    if kind in {"rate_limited", "permanent", "topic_not_found", "not_found", "bot_access", "bad_request", "capability"}:
+        return False
+    return bool(result.get("transient")) or kind == "transient"
+
+
+def retry_clean_feed_delivery(deliver: Callable[[], dict[str, Any]], *, managed_bot_context: bool = False) -> dict[str, Any]:
+    result: dict[str, Any] = {"ok": False, "kind": "empty"}
+    for attempt, delay in enumerate((*CLEAN_SEND_RETRY_DELAYS, None)):
+        try:
+            result = deliver()
+        except RateLimited:
+            raise
+        except BridgeError as exc:
+            kind = classify_telegram_error(exc, managed_bot_context=managed_bot_context)
+            result = {"ok": False, "kind": kind, "transient": kind == "transient", "error": str(exc)}
+            if kind == "topic_not_found":
+                result["topic_missing"] = True
+            elif kind == "not_found":
+                result["not_found"] = True
+        if delay is None or not retryable_clean_feed_result(result):
+            return result
+        time.sleep(delay)
+    return result
+
+
+def record_clean_delivery_attempt(entry: dict[str, Any], item_hash: str, result: dict[str, Any]) -> bool:
+    if not item_hash or result_topic_missing(result) or result.get("kind") in {"rate_limited", "bot_access"}:
+        return False
+    entry["last_clean_attempt_hash"] = item_hash
+    entry["last_clean_attempt_at"] = utc_now()
+    if retryable_clean_feed_result(result):
+        entry["last_clean_attempt_ttl_seconds"] = CLEAN_TRANSIENT_ATTEMPT_TTL_SECONDS
+    else:
+        entry.pop("last_clean_attempt_ttl_seconds", None)
+    return True
 
 
 def feed_text_has_ui_noise(text: str) -> bool:
@@ -6090,6 +6258,7 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_send_error",
         "last_clean_attempt_hash",
         "last_clean_attempt_at",
+        "last_clean_attempt_ttl_seconds",
         "unfolded_turns",
         "last_plan_doc_turn_id",
         "pending_plan_doc",
@@ -6100,6 +6269,12 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_turn_reason",
         "active_prompt",
         "last_council_job_ref",
+        "last_visible_prompt_hash",
+        "last_real_turn_id",
+        "last_real_turn_hash",
+        "last_real_turn_semantic_hash",
+        "last_real_turn_text",
+        "last_real_turn_message_id",
         "awaiting_detail",
     ):
         entry.pop(key, None)
@@ -6583,6 +6758,14 @@ def record_delivered_feed_item(
         item_render_hash = clean_feed_hash(item)
     if item_semantic_hash is None:
         item_semantic_hash = clean_feed_hash(item, include_render_version=False)
+    if visible_prompt_item(item) and real_turn_item(prior_clean_item):
+        record_real_turn_cursor(
+            entry,
+            prior_clean_item,
+            str(entry.get("last_clean_render_hash") or entry.get("last_clean_hash") or clean_feed_hash(prior_clean_item)),
+            str(entry.get("last_clean_semantic_hash") or clean_feed_hash(prior_clean_item, include_render_version=False)),
+            prior_clean_mid,
+        )
     entry["last_clean_hash"] = item_render_hash
     entry["last_clean_semantic_hash"] = item_semantic_hash
     entry["last_clean_render_hash"] = item_render_hash
@@ -6594,9 +6777,16 @@ def record_delivered_feed_item(
     entry["last_clean_text"] = item_plain_text(item)
     entry["last_clean_item"] = item
     entry["last_clean_sent_at"] = utc_now()
-    if item.get("turn_id"):
-        entry["last_turn_id"] = str(item.get("turn_id") or "")
-    entry.pop("last_clean_send_error", None)
+    if visible_prompt_item(item):
+        entry["last_visible_prompt_hash"] = visible_prompt_hash(item)
+    if real_turn_item(item):
+        record_real_turn_cursor(
+            entry,
+            item,
+            item_render_hash,
+            item_semantic_hash,
+            result.get("message_id") or fallback_message_id,
+        )
     # Record this turn for the self-healing fold sweep. Seed from the prior turn first (only
     # when the buffer is empty — the transition right after deploy) so the existing previous
     # turn still folds; then append the turn we just delivered (stays open as the latest).
@@ -6671,7 +6861,7 @@ def refresh_stale_visible_prompt(
         entry["last_clean_text"] = item_plain_text(current_item)
         entry["last_clean_item"] = current_item
         entry["last_clean_sent_at"] = utc_now()
-        entry["last_turn_id"] = current_item.get("turn_id") or ""
+        entry["last_visible_prompt_hash"] = visible_prompt_hash(current_item)
         entry.pop("last_clean_send_error", None)
         save_state(state)
     return True
@@ -9907,6 +10097,57 @@ def edit_feed_item(
         rich_payload=True,
     )
 
+def send_feed_item_with_retry(
+    chat_id: str,
+    item: dict[str, Any],
+    *,
+    telegram: dict[str, Any] | None,
+    thread_id: str | int | None,
+    notify: bool = False,
+    reply_markup: dict[str, Any] | None = None,
+    reply_to_message_id: str | int | None = None,
+    live: bool = False,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    return retry_clean_feed_delivery(
+        lambda: send_feed_item(
+            chat_id,
+            item,
+            telegram=telegram,
+            thread_id=thread_id,
+            notify=notify,
+            reply_markup=reply_markup,
+            reply_to_message_id=reply_to_message_id,
+            live=live,
+            api_token=api_token,
+        ),
+        managed_bot_context=bool(api_token),
+    )
+
+
+def edit_feed_item_with_retry(
+    chat_id: str,
+    message_id: str | int,
+    item: dict[str, Any],
+    *,
+    telegram: dict[str, Any] | None,
+    reply_markup: dict[str, Any] | None = None,
+    live: bool = False,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    return retry_clean_feed_delivery(
+        lambda: edit_feed_item(
+            chat_id,
+            message_id,
+            item,
+            telegram=telegram,
+            reply_markup=reply_markup,
+            live=live,
+            api_token=api_token,
+        ),
+        managed_bot_context=bool(api_token),
+    )
+
 
 def send_notice(
     chat_id: str,
@@ -11389,9 +11630,6 @@ def _sync_pane_clean_feed(
             and not managed_bot_access_retry_waiting(entry, "last_clean_bot_kind", desired_bot_kind)
         ):
             reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
-            entry["last_clean_attempt_hash"] = item_render_hash
-            entry["last_clean_attempt_at"] = utc_now()
-            changed = True
             did_edit = False
             lifecycle_message_id = ""
             if str(item.get("kind") or "").lower() == "turn":
@@ -11419,7 +11657,7 @@ def _sync_pane_clean_feed(
                 lifecycle_message_id
                 and not message_bot_reissue_due(entry, "last_clean_bot_kind", desired_bot_kind)
             ):
-                result = edit_feed_item(
+                result = edit_feed_item_with_retry(
                     chat_id,
                     lifecycle_message_id,
                     item,
@@ -11431,7 +11669,7 @@ def _sync_pane_clean_feed(
                     did_edit = True
                     message_id = lifecycle_message_id
                 elif result.get("not_found"):
-                    result = send_feed_item(
+                    result = send_feed_item_with_retry(
                         chat_id,
                         item,
                         telegram=telegram,
@@ -11444,7 +11682,7 @@ def _sync_pane_clean_feed(
                 else:
                     result = {**result, "edit_failed": True}
             elif same_semantic and (render_changed or old_clean_has_noise) and message_id:
-                result = edit_feed_item(
+                result = edit_feed_item_with_retry(
                     chat_id,
                     message_id,
                     item,
@@ -11456,7 +11694,7 @@ def _sync_pane_clean_feed(
                     did_edit = True
                 elif result.get("not_found"):
                     if content_changed:
-                        result = send_feed_item(
+                        result = send_feed_item_with_retry(
                             chat_id,
                             item,
                             telegram=telegram,
@@ -11479,7 +11717,7 @@ def _sync_pane_clean_feed(
                 else:
                     result = {**result, "edit_failed": True}
             else:
-                result = send_feed_item(
+                result = send_feed_item_with_retry(
                     chat_id,
                     item,
                     telegram=telegram,
@@ -11489,6 +11727,8 @@ def _sync_pane_clean_feed(
                     reply_to_message_id=pane_root_reply_target(entry),
                     api_token=pane_api_token,
                 )
+            if record_clean_delivery_attempt(entry, item_render_hash, result):
+                changed = True
             if result.get("ok"):
                 counters["sends"] = counters.get("sends", 0) + 1
                 counters["feed_sends"] = counters.get("feed_sends", 0) + 1
