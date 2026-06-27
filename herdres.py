@@ -261,6 +261,7 @@ INTERACTION_READONLY_WARNING_BODY = (
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
 ACTIVE_PROMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PROMPT_TTL", "900"))
 ACTIVE_PANE_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PANE_TTL", "600"))
+DIRECT_ORIGIN_MARKER_TTL_SECONDS = 1800
 # Cooldown before re-attempting a failed multibot-offer card, so an undeliverable
 # space (deleted topic / kicked bot) can't burn a send slot every sync.
 MULTIBOT_OFFER_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_MULTIBOT_OFFER_RETRY", "3600"))
@@ -3616,6 +3617,123 @@ def stream_user_text_for_turn(entry: dict[str, Any], turn_id: str) -> str:
     return ""
 
 
+DIRECT_ORIGIN_BOUND_FIELDS = ("direct_origin_turn_id", "direct_origin_bound_at")
+DIRECT_ORIGIN_CONSUMED_FIELDS = (
+    "direct_origin_consumed_turn_id",
+    "direct_origin_consumed_hash",
+    "direct_origin_consumed_at",
+)
+DIRECT_ORIGIN_MARKER_FIELDS = (
+    "direct_origin_at",
+    "direct_origin_text_hash",
+    "direct_origin_after_turn_id",
+    *DIRECT_ORIGIN_BOUND_FIELDS,
+    *DIRECT_ORIGIN_CONSUMED_FIELDS,
+)
+
+
+def _clear_direct_origin_marker(entry: dict[str, Any]) -> bool:
+    changed = False
+    for key in DIRECT_ORIGIN_MARKER_FIELDS:
+        if key in entry:
+            entry.pop(key, None)
+            changed = True
+    return changed
+
+
+def _direct_origin_marker_expired(entry: dict[str, Any]) -> bool:
+    if not any(key in entry for key in DIRECT_ORIGIN_MARKER_FIELDS):
+        return False
+    age = _iso_age_seconds(str(entry.get("direct_origin_at") or ""))
+    return age is None or age > DIRECT_ORIGIN_MARKER_TTL_SECONDS
+
+
+def _direct_origin_marker_fresh(entry: dict[str, Any]) -> bool:
+    if _direct_origin_marker_expired(entry):
+        _clear_direct_origin_marker(entry)
+        return False
+    return bool(str(entry.get("direct_origin_at") or ""))
+
+
+def _direct_origin_after_turn_id(entry: dict[str, Any], pane_id: str = "") -> str:
+    clean_pane_id = str(pane_id or "").strip()
+    if clean_pane_id:
+        try:
+            turn = cached_pane_turn(clean_pane_id)
+        except Exception:
+            turn = {}
+        if isinstance(turn, dict):
+            for key in ("open_turn_id", "turn_id"):
+                turn_id = sanitize_text(str(turn.get(key) or ""), 300).strip()
+                if turn_id:
+                    return turn_id
+    last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
+    for key in ("last_turn_id", "pending_stream_turn_id", "last_stream_turn_id", "last_prompt_turn_id"):
+        turn_id = sanitize_text(str(entry.get(key) or ""), 300).strip()
+        if turn_id:
+            return turn_id
+    return sanitize_text(str(last_item.get("turn_id") or ""), 300).strip()
+
+
+def mark_direct_origin_send(entry: dict[str, Any], outbound_text: str, *, after_turn_id: str = "") -> bool:
+    outbound = sanitize_text(str(outbound_text or ""), MAX_REPLY_CHARS).strip()
+    if not outbound:
+        return False
+    changed = False
+    values = {
+        "direct_origin_at": utc_now(),
+        "direct_origin_text_hash": stream_text_hash(outbound),
+        "direct_origin_after_turn_id": sanitize_text(str(after_turn_id or ""), 300).strip() or _direct_origin_after_turn_id(entry),
+    }
+    for key, value in values.items():
+        if entry.get(key) != value:
+            entry[key] = value
+            changed = True
+    for key in (*DIRECT_ORIGIN_BOUND_FIELDS, *DIRECT_ORIGIN_CONSUMED_FIELDS):
+        if key in entry:
+            entry.pop(key, None)
+            changed = True
+    return changed
+
+
+def bind_direct_origin_turn(entry: dict[str, Any], turn_id: str) -> bool:
+    clean_turn_id = sanitize_text(str(turn_id or ""), 300).strip()
+    if not clean_turn_id or not _direct_origin_marker_fresh(entry):
+        return False
+    if entry.get("direct_origin_turn_id"):
+        return False
+    if clean_turn_id == str(entry.get("direct_origin_after_turn_id") or ""):
+        return False
+    entry["direct_origin_turn_id"] = clean_turn_id
+    entry["direct_origin_bound_at"] = utc_now()
+    return True
+
+
+def mark_direct_origin_progress_consumed(entry: dict[str, Any], turn_id: str, stream_hash: str) -> bool:
+    clean_turn_id = sanitize_text(str(turn_id or ""), 300).strip()
+    clean_hash = str(stream_hash or "").strip()
+    if not clean_turn_id or not clean_hash or not _direct_origin_marker_fresh(entry):
+        return False
+    entry["direct_origin_consumed_turn_id"] = clean_turn_id
+    entry["direct_origin_consumed_hash"] = clean_hash
+    entry["direct_origin_consumed_at"] = utc_now()
+    return True
+
+
+def retire_direct_origin_marker(entry: dict[str, Any], turn_id: str = "") -> bool:
+    if _direct_origin_marker_expired(entry):
+        return _clear_direct_origin_marker(entry)
+    clean_turn_id = sanitize_text(str(turn_id or ""), 300).strip()
+    if not clean_turn_id:
+        return False
+    if clean_turn_id in {
+        str(entry.get("direct_origin_turn_id") or ""),
+        str(entry.get("direct_origin_consumed_turn_id") or ""),
+    }:
+        return _clear_direct_origin_marker(entry)
+    return False
+
+
 def apply_worklog_label(item: dict[str, Any] | None, entry: dict[str, Any]) -> dict[str, Any] | None:
     if not item or str(item.get("kind") or "").lower() != "turn":
         return item
@@ -4236,6 +4354,13 @@ def extract_turn_feed_item(
         entry.pop("pending_prompt_turn_id", None)
         entry.pop("pending_prompt_text", None)
         entry.pop("pending_prompt_hash", None)
+    direct_origin_open_turn_id = ""
+    if turn.get("complete") is False:
+        direct_origin_open_turn_id = str(turn.get("turn_id") or "")
+    elif turn.get("has_open_turn") is True:
+        direct_origin_open_turn_id = str(turn.get("open_turn_id") or turn.get("turn_id") or "")
+    if direct_origin_open_turn_id:
+        bind_direct_origin_turn(entry, direct_origin_open_turn_id)
     stream_text = sanitize_text(str(turn.get("assistant_stream_text") or "").strip(), MAX_REPLY_CHARS)
     stream_turn_id = ""
     if stream_text and turn.get("complete") is False:
@@ -6811,6 +6936,12 @@ def record_delivered_feed_item(
     # when the buffer is empty — the transition right after deploy) so the existing previous
     # turn still folds; then append the turn we just delivered (stays open as the latest).
     if str(item.get("kind") or "").lower() == "turn":
+        item_turn_id = str(item.get("turn_id") or "")
+        if item_turn_id:
+            retire_direct_origin_marker(entry, item_turn_id)
+        stream_turn_id = str(entry.get("last_stream_turn_id") or "")
+        if stream_turn_id and stream_turn_id != item_turn_id:
+            retire_direct_origin_marker(entry, stream_turn_id)
         new_mid = str(result.get("message_id") or fallback_message_id or "")
         if (
             not entry.get("unfolded_turns")
@@ -7678,13 +7809,22 @@ def interrupt_and_send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> 
     return send_to_pane(pane_id, text, timeout=timeout, deadline=deadline)
 
 
-def interrupt_and_send_response(pane_id: str, text: str) -> dict[str, Any]:
+def interrupt_and_send_response(
+    pane_id: str,
+    text: str,
+    *,
+    state: dict[str, Any] | None = None,
+    entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     outbound = str(text or "").strip()
     if not outbound:
         return {"handled": True, "reply": "Usage: /send! <instruction> — interrupts the current turn and sends now"}
+    after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if entry is not None else ""
     ok, detail = interrupt_and_send_to_pane(pane_id, outbound)
     if not ok:
         return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
+    if entry is not None and mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id) and state is not None:
+        save_state(state)
     if detail:
         # Esc didn't fully stop the turn — the message queued instead; say so.
         return {"handled": True, "reply": sanitize_text(detail, 300)}
@@ -9258,8 +9398,9 @@ def send_stream_message(
     turn_id: str,
     text: str,
     user_text: str = "",
+    allow_disabled: bool = False,
 ) -> dict[str, Any]:
-    if not stream_config_enabled():
+    if not stream_config_enabled() and not allow_disabled:
         return {"ok": False, "skipped": True, "reason": "streaming_disabled"}
     clean_text = sanitize_text(str(text or "").strip(), MAX_REPLY_CHARS)
     if not clean_text:
@@ -11449,6 +11590,7 @@ def _sync_pane_clean_feed(
             entry.get("last_turn_available"),
             entry.get("last_turn_reason"),
             entry.get("last_turn_id"),
+            tuple(entry.get(key) for key in DIRECT_ORIGIN_MARKER_FIELDS),
         )
         # The plugin/event path (turn_only) must never scrape the visible
         # screen: a status-change event can fire before the turn is flushed,
@@ -11464,6 +11606,7 @@ def _sync_pane_clean_feed(
             entry.get("last_turn_available"),
             entry.get("last_turn_reason"),
             entry.get("last_turn_id"),
+            tuple(entry.get(key) for key in DIRECT_ORIGIN_MARKER_FIELDS),
         )
         if before_turn_state != after_turn_state:
             changed = True
@@ -11531,6 +11674,55 @@ def _sync_pane_clean_feed(
         return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
     if prompt_result.get("changed"):
         changed = True
+    if (
+        not item
+        and pending_stream_text
+        and pending_stream_turn_id
+        and not stream_config_enabled()
+        and counters.get("sends", 0) < max_sends
+        and managed_bot_kind_for_entry(entry, pane) == "claude"
+        and _direct_origin_marker_fresh(entry)
+        and str(entry.get("direct_origin_turn_id") or "") == pending_stream_turn_id
+    ):
+        fallback_stream_hash = stream_render_hash(pending_stream_text, pending_stream_user_text)
+        already_consumed = (
+            str(entry.get("direct_origin_consumed_turn_id") or "") == pending_stream_turn_id
+            and str(entry.get("direct_origin_consumed_hash") or "") == fallback_stream_hash
+        )
+        if not already_consumed:
+            stream_result = send_stream_message(
+                chat_id,
+                telegram,
+                entry,
+                turn_id=pending_stream_turn_id,
+                text=pending_stream_text,
+                user_text=pending_stream_user_text,
+                allow_disabled=True,
+            )
+            if result_topic_missing(stream_result):
+                clear_entry_topic_mapping(state, entry, str(stream_result.get("error") or stream_result))
+                save_state(state)
+                return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
+            if result_pane_root_missing(stream_result):
+                clear_pane_root_message(state, entry, str(stream_result.get("error") or stream_result))
+                save_state(state)
+                return {"early_return": True, "changed": changed, "feed_delivered": feed_delivered_this_pane, "stream_active": stream_active_this_pane}
+            if stream_result.get("ok"):
+                stream_active_this_pane = True
+                if stream_result.get("message_id"):
+                    record_pane_message_route(
+                        state,
+                        str(entry.get("space_key") or ""),
+                        str(entry.get("pane_key") or ""),
+                        str(stream_result["message_id"]),
+                    )
+                if stream_result.get("sent_message"):
+                    counters["sends"] = counters.get("sends", 0) + 1
+                mark_direct_origin_progress_consumed(entry, pending_stream_turn_id, fallback_stream_hash)
+                changed = True
+            elif not stream_result.get("skipped"):
+                entry["last_stream_error"] = sanitize_text(str(stream_result), 500)
+                changed = True
     if not item and pending_stream_text and pending_stream_turn_id and stream_config_enabled():
         stream_result = send_stream_update(
             chat_id,
@@ -12889,13 +13081,23 @@ def topic_entry(
     return entry
 
 
-def forward_text_to_pane_response(pane_id: str, text: str, *, usage: str = "") -> dict[str, Any]:
+def forward_text_to_pane_response(
+    pane_id: str,
+    text: str,
+    *,
+    usage: str = "",
+    state: dict[str, Any] | None = None,
+    entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     outbound = str(text or "").strip()
     if not outbound:
         return {"handled": True, "reply": usage}
+    after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if entry is not None else ""
     ok, detail = send_to_pane(pane_id, outbound)
     if not ok:
         return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
+    if entry is not None and mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id) and state is not None:
+        save_state(state)
     # On a normal submit `detail` is empty (silent success); when the agent was
     # busy it carries the "Queued …" note, which we surface so the sender knows.
     return {"handled": True, "reply": sanitize_text(detail, 300)}
@@ -13807,9 +14009,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         if not ok or dest is None:
             return {"handled": True, "reply": f"Could not deliver that attachment: {detail}"}
         instruction = pane_attachment_instruction(dest, attachment, caption or text)
+        after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
         sent_ok, sent_detail = send_to_pane(pane_id, instruction)
         if not sent_ok:
             return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
+        if mark_direct_origin_send(entry, instruction, after_turn_id=after_turn_id):
+            save_state(state)
         return {"handled": True, "reply": "Sent attachment to this pane."}
 
     # Issue #4: an owner's voice note → transcribe locally (parakeet) → deliver as the pane's input.
@@ -13831,10 +14036,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 # Speech off/unavailable: still deliver a caption if the owner attached one, rather than
                 # silently dropping it (parity with the document/photo arm); otherwise explain how to enable.
                 if caption:
+                    after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
                     sent_ok, sent_detail = send_to_pane(pane_id, caption)
                     if not sent_ok:
                         return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
-                    return {"handled": True, "reply": "Voice transcription is off; sent your caption to this pane."}
+                    if mark_direct_origin_send(entry, caption, after_turn_id=after_turn_id):
+                        save_state(state)
                 return {"handled": True, "reply": (
                     "Voice transcription is off. Enable it with `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1` "
                     "and `herdres speech install`, or send text.")}
@@ -13857,9 +14064,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             pass
         outbound = f"{transcript}\n\n{caption}" if caption else transcript
+        after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
         sent_ok, sent_detail = send_to_pane(pane_id, outbound)
         if not sent_ok:
             return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
+        if mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id):
+            save_state(state)
         return {"handled": True, "reply": "Sent your voice message to this pane."}
 
     if command == "plain":
@@ -13913,6 +14123,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             choice = str(awaiting.get("choice") or "").strip()
             select_choice = str(awaiting.get("select_choice") or "").strip()
             visible_choice = str(awaiting.get("visible_choice") or "").strip()
+            direct_origin_detail_text = arg
             if visible_choice:
                 if not visible_prompt_matches_awaiting(entry, awaiting):
                     entry.pop("awaiting_detail", None)
@@ -13921,20 +14132,27 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                         "handled": True,
                         "reply": "Those choices changed before I could send your answer. Use /choices to resend the current choices.",
                     }
+                direct_origin_after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
                 ok, detail = send_visible_choice_detail_to_pane(
                     pane_id,
                     visible_choice,
                     arg,
                 )
+                direct_origin_detail_text = f"{visible_choice}\n{arg}" if arg else visible_choice
             elif select_choice:
+                direct_origin_after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
                 ok, detail = send_choice_detail_to_pane(pane_id, select_choice, arg)
+                direct_origin_detail_text = f"{select_choice}\n{arg}" if arg else select_choice
             else:
                 outbound = f"{choice}\n{arg}" if choice else arg
+                direct_origin_after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
                 ok, detail = send_to_pane(pane_id, outbound)
+                direct_origin_detail_text = outbound
             if not ok:
                 return {"handled": True, "reply": f"Send failed: {detail}"}
             entry.pop("awaiting_detail", None)
             entry.pop("active_prompt", None)
+            mark_direct_origin_send(entry, direct_origin_detail_text, after_turn_id=direct_origin_after_turn_id)
             save_state(state)
             return {"handled": True, "reply": "Sent details."}
         if str(payload.get("reply_to_message_id") or "").strip():
@@ -13955,9 +14173,9 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     "handled": True,
                     "reply": "That choice prompt is no longer safe from Telegram. Use /send or answer in Herdr.",
                 }
-            return forward_text_to_pane_response(pane_id, arg)
+            return forward_text_to_pane_response(pane_id, arg, state=state, entry=entry)
         if resolved_active_entry or implicit or target_bot_kind or is_single_live_space_pane(state, chat_id, topic_id):
-            return forward_text_to_pane_response(pane_id, arg)
+            return forward_text_to_pane_response(pane_id, arg, state=state, entry=entry)
         return {
             "handled": True,
             "reply": (
@@ -14258,9 +14476,15 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         pane = pane_by_id(pane_id)
         return {"handled": True, "reply": format_debug(pane, entry)}
     if command == "send":
-        return forward_text_to_pane_response(pane_id, arg, usage="Usage: /send <instruction for this pane>")
+        return forward_text_to_pane_response(
+            pane_id,
+            arg,
+            usage="Usage: /send <instruction for this pane>",
+            state=state,
+            entry=entry,
+        )
     if command in ("send!", "interrupt", "isend"):
-        return interrupt_and_send_response(pane_id, arg)
+        return interrupt_and_send_response(pane_id, arg, state=state, entry=entry)
     if command == "keys":
         if not arg:
             return {"handled": True, "reply": "Usage: /keys <key> [key ...]"}
@@ -14301,7 +14525,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             # Pathological (e.g. an enormous state path): refuse rather than let
             # send_to_pane silently file-convert and drop the slash-command.
             return {"handled": True, "reply": f"Could not forward /{command}: the command reference is too long."}
-    return forward_text_to_pane_response(pane_id, forward_text)
+    return forward_text_to_pane_response(pane_id, forward_text, state=state, entry=entry)
 
 
 def handle_onboarding_callback(state, telegram, chat_id, topic_id, message_id, space, parts):
@@ -14369,6 +14593,7 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
         text = str(rec.get("text") or "").strip()
         age = _iso_age_seconds(str(rec.get("set_at") or ""))
         if text and pane_id and (age is None or age <= ACTIVE_PANE_TTL_SECONDS):
+            after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if isinstance(entry, dict) else ""
             try:
                 ok, detail = send_to_pane(pane_id, text)
             except Exception as exc:
@@ -14379,6 +14604,8 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
                 ok, detail = False, sanitize_text(str(exc), 200)
             delivered = ok
             deliver_note = sanitize_text(detail, 200) if ok else ""
+            if ok and isinstance(entry, dict):
+                mark_direct_origin_send(entry, text, after_turn_id=after_turn_id)
     save_state(state)
     label = str((managed_bot_specs().get(managed_bot_kind_for_entry(entry or {})) or {}).get("label")
                 or (entry or {}).get("agent") or "pane")
@@ -14707,11 +14934,13 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     outbound = str(option.get("send_text") if "send_text" in option else choice_number).strip()
     if not outbound:
         return {"handled": True, "answer": "This choice needs details.", "show_alert": True}
+    after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
     ok, detail = send_to_pane(pane_id, outbound)
     if not ok:
         return {"handled": True, "answer": f"Send failed: {detail}", "show_alert": True}
     entry.pop("active_prompt", None)
     entry.pop("awaiting_detail", None)
+    mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id)
     save_state(state)
     # For the /skills picker the choice number is an internal token (s1..s12); show the command
     # label instead. Decision prompts keep the familiar "N) label" / "Selected N." form.

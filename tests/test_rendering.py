@@ -2548,6 +2548,199 @@ class StreamingIntegrationTests(unittest.TestCase):
         caps = {"max_creates": 0, "max_sends": 10, "max_feed_sends": 10, "max_marker_sends": 10, "max_verifies": 0}
         return counters, caps
 
+    def _fresh_direct_origin_marker(
+        self,
+        entry: dict,
+        *,
+        user_text: str = "Run direct task.",
+        after_turn_id: str = "before-turn",
+    ) -> None:
+        entry.update({
+            "direct_origin_at": herdres.utc_now(),
+            "direct_origin_text_hash": herdres.stream_text_hash(user_text),
+            "direct_origin_after_turn_id": after_turn_id,
+        })
+
+    def _assert_direct_origin_fields_cleared(self, entry: dict) -> None:
+        for key in (
+            "direct_origin_at",
+            "direct_origin_text_hash",
+            "direct_origin_after_turn_id",
+            "direct_origin_turn_id",
+            "direct_origin_bound_at",
+            "direct_origin_consumed_turn_id",
+            "direct_origin_consumed_hash",
+            "direct_origin_consumed_at",
+        ):
+            self.assertNotIn(key, entry)
+
+    def _direct_origin_turn(self, *, complete: bool = False) -> dict:
+        if complete:
+            return {
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "Run direct task.",
+                "assistant_final_text": "Final answer.",
+            }
+        return {
+            "available": True,
+            "complete": False,
+            "turn_id": "turn-1",
+            "user_text": "Run direct task.",
+            "assistant_final_text": "",
+            "assistant_stream_text": "Partial answer.",
+        }
+
+    def _direct_origin_stream_patches(self, pane_turn: Mock, **overrides):
+        patches = {
+            "pane_turn": pane_turn,
+            "ensure_pane_root_message": Mock(return_value=(False, {"ok": True})),
+            "save_state": Mock(),
+            "apply_api_error_warning": Mock(return_value={"topic_missing": False, "changed": False}),
+            "TURN_FEED_ENABLED": True,
+            "CLEAN_FEED_ENABLED": True,
+            "STREAMING_DRAFTS_ENABLED": False,
+            "LIVE_CARD_ENABLED": False,
+            "STATUS_MARKER_ENABLED": False,
+            "STATUS_ICON_ENABLED": False,
+            "STREAM_MIN_INTERVAL_SECONDS": 0,
+            "STREAM_MIN_CHARS": 0,
+        }
+        patches.update(overrides)
+        return patch.multiple(herdres, **patches)
+
+    def test_direct_origin_disabled_streaming_calls_message_fallback_with_allow_disabled(self) -> None:
+        state, pane, _key, entry = self._state()
+        pane["agent"] = "claude"
+        entry["agent"] = "claude"
+        self._fresh_direct_origin_marker(entry)
+        counters, caps = self._caps()
+        stream_hash = herdres.stream_render_hash("Partial answer.", "Run direct task.")
+        send_stream_message = Mock(
+            return_value={"ok": True, "sent_message": True, "message_id": "3001", "hash": stream_hash}
+        )
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
+
+        with self._direct_origin_stream_patches(
+            Mock(return_value=self._direct_origin_turn()),
+            send_stream_message=send_stream_message,
+            send_feed_item=send_feed_item,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_stream_message.assert_called_once()
+        self.assertEqual(send_stream_message.call_args.kwargs["turn_id"], "turn-1")
+        self.assertEqual(send_stream_message.call_args.kwargs["text"], "Partial answer.")
+        self.assertEqual(send_stream_message.call_args.kwargs["user_text"], "Run direct task.")
+        self.assertIs(send_stream_message.call_args.kwargs["allow_disabled"], True)
+        self.assertEqual(entry["direct_origin_turn_id"], "turn-1")
+        self.assertIn("direct_origin_bound_at", entry)
+        self.assertEqual(entry["direct_origin_consumed_turn_id"], "turn-1")
+        self.assertEqual(entry["direct_origin_consumed_hash"], stream_hash)
+        self.assertIn("direct_origin_consumed_at", entry)
+
+    def test_direct_origin_disabled_streaming_one_shot_and_final_edits_stream_anchor(self) -> None:
+        state, pane, _key, entry = self._state()
+        pane["agent"] = "claude"
+        entry["agent"] = "claude"
+        self._fresh_direct_origin_marker(entry)
+        pane_turn = Mock(side_effect=[
+            self._direct_origin_turn(),
+            self._direct_origin_turn(),
+            self._direct_origin_turn(complete=True),
+        ])
+        send_rich_message = Mock(return_value={"ok": True, "message_id": "3001"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
+        edit_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+
+        with self._direct_origin_stream_patches(
+            pane_turn,
+            send_rich_message=send_rich_message,
+            send_feed_item=send_feed_item,
+            edit_feed_item=edit_feed_item,
+        ):
+            counters, caps = self._caps()
+            self.assertTrue(herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps))
+            counters, caps = self._caps()
+            self.assertFalse(herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps))
+            prompt_send_count = send_feed_item.call_count
+            counters, caps = self._caps()
+            self.assertTrue(herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps))
+
+        send_rich_message.assert_called_once()
+        rich_html = send_rich_message.call_args.args[1]
+        self.assertIn("Run direct task.", rich_html)
+        self.assertIn("Partial answer.", rich_html)
+        edit_feed_item.assert_called_once()
+        self.assertEqual(edit_feed_item.call_args.args[1], "3001")
+        final_item = edit_feed_item.call_args.args[2]
+        self.assertEqual(final_item["turn_id"], "turn-1")
+        self.assertEqual(final_item["assistant_final_text"], "Final answer.")
+        self.assertEqual(final_item["worklog_text"], "Partial answer.")
+        self.assertEqual(entry["last_clean_message_id"], "3001")
+        self.assertEqual(send_feed_item.call_count, prompt_send_count)
+        self._assert_direct_origin_fields_cleared(entry)
+
+    def test_direct_origin_disabled_streaming_requires_fresh_unconsumed_marker(self) -> None:
+        for case in ("no_marker", "stale_marker", "consumed_marker", "max_sends_exhausted"):
+            with self.subTest(case=case):
+                state, pane, _key, entry = self._state()
+                pane["agent"] = "claude"
+                entry["agent"] = "claude"
+                if case != "no_marker":
+                    self._fresh_direct_origin_marker(entry)
+                if case == "stale_marker":
+                    entry["direct_origin_at"] = (
+                        datetime.now(timezone.utc)
+                        - timedelta(seconds=herdres.DIRECT_ORIGIN_MARKER_TTL_SECONDS + 1)
+                    ).isoformat()
+                if case == "consumed_marker":
+                    entry.update({
+                        "direct_origin_turn_id": "turn-1",
+                        "direct_origin_bound_at": herdres.utc_now(),
+                        "direct_origin_consumed_turn_id": "turn-1",
+                        "direct_origin_consumed_hash": herdres.stream_render_hash(
+                            "Partial answer.",
+                            "Run direct task.",
+                        ),
+                        "direct_origin_consumed_at": herdres.utc_now(),
+                    })
+                counters, caps = self._caps()
+                if case == "max_sends_exhausted":
+                    counters["sends"] = caps["max_sends"]
+                send_stream_message = Mock(return_value={"ok": True, "sent_message": True, "message_id": "3001"})
+                send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
+
+                with self._direct_origin_stream_patches(
+                    Mock(return_value=self._direct_origin_turn()),
+                    send_stream_message=send_stream_message,
+                    send_feed_item=send_feed_item,
+                ):
+                    herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+                send_stream_message.assert_not_called()
+                if case == "stale_marker":
+                    self._assert_direct_origin_fields_cleared(entry)
+
+    def test_clean_feed_hash_ignores_direct_origin_progress_worklog_text(self) -> None:
+        self.assertEqual(herdres.DIRECT_ORIGIN_MARKER_TTL_SECONDS, 1800)
+        base = herdres.make_turn_feed_item({
+            "available": True,
+            "complete": True,
+            "turn_id": "turn-1",
+            "user_text": "Run direct task.",
+            "assistant_final_text": "Final answer.",
+        })
+        assert base is not None
+        with_worklog = dict(base, worklog_text="Partial answer.")
+        self.assertEqual(herdres.clean_feed_hash(base), herdres.clean_feed_hash(with_worklog))
+        self.assertEqual(
+            herdres.clean_feed_hash(base, include_render_version=False),
+            herdres.clean_feed_hash(with_worklog, include_render_version=False),
+        )
+
     def test_sync_turn_lifecycle_renders_user_worklog_response_sequence(self) -> None:
         state, pane, _key, entry = self._state()
         state["telegram"]["rich_messages"] = {"supported": "yes"}
