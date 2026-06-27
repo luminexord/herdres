@@ -398,6 +398,246 @@ def codex_worklog_line(payload: dict[str, Any]) -> str:
     return ""
 
 
+
+_CODEX_PLAN_EVENT_NAMES = ("proposed_plan", "update_plan", "plan_delta")
+_CODEX_PLAN_EVENT_NAME_SET = set(_CODEX_PLAN_EVENT_NAMES)
+_CODEX_PLAN_META_KEYS = {
+    "arguments",
+    "call_id",
+    "completed_at",
+    "id",
+    "input",
+    "item_id",
+    "name",
+    "payload",
+    "started_at",
+    "turn_id",
+    "type",
+}
+_CODEX_PLAN_RENDER_KEY_ORDER = (
+    "title",
+    "explanation",
+    "summary",
+    "message",
+    "proposed_plan",
+    "update_plan",
+    "plan",
+    "steps",
+    "items",
+    "text",
+    "content",
+    "payload",
+)
+
+
+def _codex_plan_event_name(value: Any) -> str:
+    name = str(value or "").strip().lower()
+    return name if name in _CODEX_PLAN_EVENT_NAME_SET else ""
+
+
+def _decode_jsonish(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped[:1] in "{[\"":
+            try:
+                return json.loads(stripped)
+            except Exception:
+                return value
+    return value
+
+
+def _mapping_without_plan_meta(data: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in data.items() if k not in _CODEX_PLAN_META_KEYS and v is not None}
+
+
+def _codex_plan_data_from_mapping(name: str, value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    if name == "plan_delta":
+        for key in ("plan_delta", "delta", "chunk", "text", "content", "payload"):
+            if key in value and value.get(key) is not None:
+                return value.get(key)
+        return _mapping_without_plan_meta(value)
+
+    selected: dict[str, Any] = {}
+    for key in _CODEX_PLAN_RENDER_KEY_ORDER:
+        if key in value and value.get(key) is not None:
+            selected[key] = value.get(key)
+    if len(selected) == 1:
+        return next(iter(selected.values()))
+    if selected:
+        return selected
+    return _mapping_without_plan_meta(value)
+
+
+def _codex_plan_value_from_typed_event(name: str, event: dict[str, Any], payload: dict[str, Any]) -> Any:
+    for candidate in (payload, event):
+        if not isinstance(candidate, dict):
+            continue
+        value = _codex_plan_data_from_mapping(name, candidate)
+        if _codex_plan_has_content(value):
+            return value
+    return None
+
+
+def _codex_plan_updates(event: dict[str, Any], payload: dict[str, Any]) -> list[tuple[str, Any]]:
+    payload_type = str(payload.get("type") or "")
+    if payload_type in ("function_call", "custom_tool_call"):
+        name = _codex_plan_event_name(payload.get("name"))
+        if name:
+            key = "arguments" if payload_type == "function_call" else "input"
+            return [(name, _decode_jsonish(payload.get(key)))]
+
+    found: list[tuple[str, Any]] = []
+    for source in (event, payload):
+        if not isinstance(source, dict):
+            continue
+        for name in _CODEX_PLAN_EVENT_NAMES:
+            if name in source:
+                found.append((name, source.get(name)))
+    if found:
+        return found
+
+    name = _codex_plan_event_name(payload.get("type"))
+    if name:
+        return [(name, _codex_plan_value_from_typed_event(name, event, payload))]
+    name = _codex_plan_event_name(event.get("type"))
+    if name:
+        return [(name, _codex_plan_value_from_typed_event(name, event, payload))]
+    return []
+
+
+def _codex_plan_has_content(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict)):
+        return bool(value)
+    return True
+
+
+def _inline_plan_value(value: Any) -> str:
+    text = sanitize_text(str(value or "")).strip()
+    return " ".join(text.split())
+
+
+def _step_text_from_mapping(data: dict[str, Any]) -> tuple[str, str, set[str]]:
+    step_keys = ("step", "description", "title", "text", "content", "task")
+    status_keys = ("status", "state")
+    used: set[str] = set()
+    step = ""
+    status = ""
+    for key in step_keys:
+        value = data.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            step = _inline_plan_value(value)
+            used.add(key)
+            break
+    for key in status_keys:
+        value = data.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            status = _inline_plan_value(value)
+            used.add(key)
+            break
+    return step, status, used
+
+
+def _ordered_plan_keys(data: dict[str, Any], skip: set[str] | None = None) -> list[str]:
+    skipped = skip or set()
+    preferred = [k for k in _CODEX_PLAN_RENDER_KEY_ORDER if k in data and k not in skipped]
+    rest = sorted(k for k in data if k not in skipped and k not in preferred and k not in _CODEX_PLAN_META_KEYS)
+    return preferred + rest
+
+
+def _codex_plan_bullet_lines(value: Any, depth: int = 0) -> list[str]:
+    indent = "  " * depth
+    if isinstance(value, dict):
+        step, status, used = _step_text_from_mapping(value)
+        if step or status:
+            label = step or f"status: {status}"
+            if step and status:
+                label = f"{step} (status: {status})"
+            lines = [f"{indent}- {label}"]
+            for key in _ordered_plan_keys(value, used):
+                child = value.get(key)
+                if not _codex_plan_has_content(child):
+                    continue
+                if isinstance(child, (dict, list, tuple)):
+                    lines.append(f"{indent}  - {key}:")
+                    lines.extend(_codex_plan_bullet_lines(child, depth + 2))
+                else:
+                    lines.append(f"{indent}  - {key}: {_inline_plan_value(child)}")
+            return lines
+
+        lines: list[str] = []
+        for key in _ordered_plan_keys(value):
+            child = value.get(key)
+            if not _codex_plan_has_content(child):
+                continue
+            if isinstance(child, (dict, list, tuple)):
+                lines.append(f"{indent}- {key}:")
+                lines.extend(_codex_plan_bullet_lines(child, depth + 1))
+            else:
+                lines.append(f"{indent}- {key}: {_inline_plan_value(child)}")
+        return lines
+
+    if isinstance(value, (list, tuple)):
+        lines: list[str] = []
+        for item in value:
+            if not _codex_plan_has_content(item):
+                continue
+            if isinstance(item, (dict, list, tuple)):
+                lines.extend(_codex_plan_bullet_lines(item, depth))
+            else:
+                lines.append(f"{indent}- {_inline_plan_value(item)}")
+        return lines
+
+    text = _inline_plan_value(value)
+    return [f"{indent}- {text}"] if text else []
+
+
+def _render_codex_plan_value(value: Any) -> str:
+    if isinstance(value, str):
+        return sanitize_text(value).strip()
+    lines = _codex_plan_bullet_lines(value)
+    return sanitize_text("\n".join(lines).strip()).strip()
+
+
+def _render_codex_plan_update(name: str, value: Any) -> str:
+    selected = _codex_plan_data_from_mapping(name, value)
+    if name == "plan_delta" and isinstance(selected, str):
+        return sanitize_text(selected)
+    return _render_codex_plan_value(selected)
+
+
+def _codex_current_plan_text(plan_text: str, plan_delta_parts: list[str]) -> str:
+    full = sanitize_text(str(plan_text or "").strip()).strip()
+    delta = sanitize_text("".join(plan_delta_parts).strip()).strip()
+    if full and delta:
+        if delta in full:
+            return full
+        if full in delta:
+            return delta
+        return sanitize_text(f"{full}\n\n{delta}").strip()
+    return full or delta
+
+
+def _codex_final_with_plan(final_text: str, plan_text: str) -> str:
+    final = sanitize_text(str(final_text or "").strip()).strip()
+    plan = sanitize_text(str(plan_text or "").strip()).strip()
+    if not plan:
+        return final
+    if not final:
+        return plan
+    if plan in final:
+        return final
+    return sanitize_text(f"{final}\n\n{plan}").strip()
+
+
+def _codex_is_plan_tool_call(payload: dict[str, Any]) -> bool:
+    return str(payload.get("type") or "") in ("function_call", "custom_tool_call") and bool(_codex_plan_event_name(payload.get("name")))
+
 def devin_tool_call_line(call: Any) -> str:
     """Worklog line for one Devin tool_call entry (OpenAI-style ``function`` or flat)."""
     if not isinstance(call, dict):
@@ -1201,6 +1441,8 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
     completed: list[dict[str, Any]] = []
     open_turn = False
     worklog_parts: list[str] = []  # codex tool calls for the open turn
+    codex_plan_text = ""
+    codex_plan_delta_parts: list[str] = []
 
     with open_jsonl_tail(path, _codex_is_turn_start, _codex_is_turn_end) as handle:
         for raw in handle:
@@ -1221,7 +1463,22 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 last_assistant_text = ""
                 open_turn = True
                 worklog_parts = []
+                codex_plan_text = ""
+                codex_plan_delta_parts = []
                 continue
+            if open_turn:
+                plan_updates = _codex_plan_updates(event, payload)
+                if plan_updates:
+                    for plan_name, plan_value in plan_updates:
+                        rendered_plan = _render_codex_plan_update(plan_name, plan_value)
+                        if not rendered_plan.strip():
+                            continue
+                        if plan_name == "plan_delta":
+                            codex_plan_delta_parts.append(rendered_plan)
+                        else:
+                            codex_plan_text = rendered_plan
+                    if _codex_is_plan_tool_call(payload):
+                        continue
             if event.get("type") == "response_item" and payload.get("type") == "message":
                 role = str(payload.get("role") or "")
                 text = content_text(payload.get("content")).strip()
@@ -1244,9 +1501,11 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                     _accumulate_worklog(worklog_parts, [line])
                 continue
             if event.get("type") == "event_msg" and payload.get("type") == "task_complete":
+                plan_text = _codex_current_plan_text(codex_plan_text, codex_plan_delta_parts)
                 final_text = sanitize_text(str(payload.get("last_agent_message") or "").strip())
-                if not final_text:
+                if not final_text and not plan_text:
                     final_text = last_assistant_text
+                final_text = _codex_final_with_plan(final_text, plan_text)
                 if final_text and current_user_text:
                     turn = {
                         "available": True,
@@ -1268,9 +1527,13 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                             turn["worklog_text"] = worklog
                     completed.append(turn)
                 open_turn = False
+                codex_plan_text = ""
+                codex_plan_delta_parts = []
                 continue
             if event.get("type") == "event_msg" and payload.get("type") == "turn_aborted":
                 open_turn = False
+                codex_plan_text = ""
+                codex_plan_delta_parts = []
 
     if completed:
         recent = completed[-RECENT_TURNS:]

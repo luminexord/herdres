@@ -2553,6 +2553,131 @@ class StreamingIntegrationTests(unittest.TestCase):
         caps = {"max_creates": 0, "max_sends": 10, "max_feed_sends": 10, "max_marker_sends": 10, "max_verifies": 0}
         return counters, caps
 
+    def _completed_turn(self, turn_id: str, answer: str | None = None) -> dict:
+        return {
+            "available": True,
+            "complete": True,
+            "turn_id": turn_id,
+            "user_text": f"Prompt {turn_id}",
+            "assistant_final_text": answer or f"Answer {turn_id}.",
+        }
+
+    def test_select_recent_completed_turn_catches_burst_middle_then_latest(self) -> None:
+        recent = [
+            self._completed_turn("turn-0"),
+            self._completed_turn("turn-1"),
+            self._completed_turn("turn-2"),
+        ]
+        first_item = herdres.make_turn_feed_item(recent[0])
+        assert first_item is not None
+        entry = {
+            "last_clean_item": first_item,
+            "last_clean_text": herdres.item_plain_text(first_item),
+            "last_clean_hash": herdres.clean_feed_hash(first_item),
+            "last_clean_render_hash": herdres.clean_feed_hash(first_item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(first_item, include_render_version=False),
+            "last_turn_id": "turn-0",
+        }
+        turn = {**recent[-1], "recent_turns": recent}
+
+        before_last_clean_item = entry["last_clean_item"]
+        selected = herdres.select_turn_feed_item(turn, entry)
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected["turn_id"], "turn-1")
+        self.assertIs(entry["last_clean_item"], before_last_clean_item)
+        self.assertEqual(entry["last_turn_id"], "turn-0")
+        self.assertNotIn("delivered_turn_identities", entry)
+
+        herdres.record_delivered_feed_item(
+            entry,
+            selected,
+            {"ok": True, "message_id": "3001"},
+            pending_active_prompt=None,
+            clear_active_prompt=True,
+        )
+        self.assertEqual(entry["last_clean_item"]["turn_id"], "turn-1")
+        self.assertTrue(entry.get("turn_feed_backlog_pending"))
+        self.assertIn(herdres.completed_turn_identity_key(selected), entry.get("delivered_turn_identities") or [])
+
+        selected = herdres.select_turn_feed_item(turn, entry)
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected["turn_id"], "turn-2")
+
+    def test_select_recent_completed_turn_without_cursor_uses_latest_only(self) -> None:
+        recent = [
+            self._completed_turn("turn-0"),
+            self._completed_turn("turn-1"),
+            self._completed_turn("turn-2"),
+        ]
+        selected = herdres.select_turn_feed_item({**recent[-1], "recent_turns": recent}, {})
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected["turn_id"], "turn-2")
+
+    def test_select_recent_completed_turn_returns_none_when_window_delivered(self) -> None:
+        recent = [
+            self._completed_turn("turn-0"),
+            self._completed_turn("turn-1"),
+            self._completed_turn("turn-2"),
+        ]
+        first_item = herdres.make_turn_feed_item(recent[0])
+        assert first_item is not None
+        entry = {
+            "last_clean_item": first_item,
+            "last_turn_id": "turn-0",
+            "delivered_turn_identities": [
+                herdres.completed_turn_delivery_identity(herdres.make_turn_feed_item(recent[1]) or {}),
+                herdres.completed_turn_delivery_identity(herdres.make_turn_feed_item(recent[2]) or {}),
+            ],
+        }
+
+        self.assertIsNone(herdres.select_turn_feed_item({**recent[-1], "recent_turns": recent}, entry))
+
+    def test_clear_clean_feed_state_clears_turn_delivery_state(self) -> None:
+        entry = {
+            "delivered_turn_identities": ["turn_id:turn-1"],
+            "turn_feed_backlog_pending": True,
+            "last_clean_item": {"kind": "turn", "turn_id": "turn-1"},
+        }
+
+        herdres.clear_clean_feed_state(entry)
+
+        self.assertNotIn("delivered_turn_identities", entry)
+        self.assertNotIn("turn_feed_backlog_pending", entry)
+
+    def test_select_recent_completed_turn_gap_notice_uses_oldest_in_window(self) -> None:
+        prior = self._completed_turn("turn-old")
+        prior_item = herdres.make_turn_feed_item(prior)
+        assert prior_item is not None
+        recent = [
+            self._completed_turn("turn-1"),
+            self._completed_turn("turn-2"),
+        ]
+        entry = {
+            "last_clean_item": prior_item,
+            "last_clean_text": herdres.item_plain_text(prior_item),
+            "last_clean_hash": herdres.clean_feed_hash(prior_item),
+            "last_clean_render_hash": herdres.clean_feed_hash(prior_item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(prior_item, include_render_version=False),
+            "last_turn_id": "turn-old",
+        }
+
+        selected = herdres.select_turn_feed_item({**recent[-1], "recent_turns": recent}, entry)
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected["turn_id"], "turn-1")
+        plain = herdres.item_plain_text(selected)
+        html = herdres.render_feed_item_html(selected)
+        self.assertIn("outside the recent window (turn-1 to turn-2)", plain)
+        self.assertIn("outside the recent window (turn-1 to turn-2)", html)
+        self.assertIn("Answer turn-1.", plain)
+
     def _fresh_direct_origin_marker(
         self,
         entry: dict,
@@ -7350,14 +7475,14 @@ Which file changed. Should the report include the full diff? Files touched:
         item = herdres.select_turn_feed_item(turn, {"last_clean_item": {"turn_id": "B"}})
         assert item is not None
         self.assertEqual(item["turn_id"], "C")
-        # delivered C (already the latest) -> latest, dedup handles the no-op
+        # delivered C (already the latest) -> nothing left to deliver
         item = herdres.select_turn_feed_item(turn, {"last_clean_item": {"turn_id": "C"}})
-        assert item is not None
-        self.assertEqual(item["turn_id"], "C")
-        # unknown cursor (window overflow / new pane) -> latest only, no history dump
+        self.assertIsNone(item)
+        # known cursor outside the recent window -> oldest available with a visible gap notice
         item = herdres.select_turn_feed_item(turn, {"last_turn_id": "ZZZ"})
         assert item is not None
-        self.assertEqual(item["turn_id"], "C")
+        self.assertEqual(item["turn_id"], "A")
+        self.assertIn("outside the recent window", item.get("assistant_final_text", ""))
         # no recent_turns -> latest
         item = herdres.select_turn_feed_item(c, {})
         assert item is not None
@@ -10549,6 +10674,110 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertEqual(result["feed_sent"], 1)
         self.assertEqual(result["attempts"], 2)
         self.assertEqual(sync_pane_once.call_count, 2)
+
+
+    def test_event_drains_turn_feed_backlog_until_existing_caps(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "done",
+        }
+        key = herdres.pane_key(pane)
+        recent = [
+            {
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-0",
+                "user_text": "Prompt 0",
+                "assistant_final_text": "Answer 0.",
+            },
+            {
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "Prompt 1",
+                "assistant_final_text": "Answer 1.",
+            },
+            {
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-2",
+                "user_text": "Prompt 2",
+                "assistant_final_text": "Answer 2.",
+            },
+        ]
+        first_item = herdres.make_turn_feed_item(recent[0])
+        assert first_item is not None
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "space_key": "workspace:workspace-1",
+            "topic_id": "77",
+            "pane_root_message_id": "1001",
+            "last_known_status": "done",
+            "last_topic_verified_at": herdres.utc_now(),
+            "last_clean_item": first_item,
+            "last_clean_text": herdres.item_plain_text(first_item),
+            "last_clean_hash": herdres.clean_feed_hash(first_item),
+            "last_clean_render_hash": herdres.clean_feed_hash(first_item),
+            "last_clean_semantic_hash": herdres.clean_feed_hash(first_item, include_render_version=False),
+            "last_clean_message_id": "3000",
+            "last_turn_id": "turn-0",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "plugin_event_enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workspace 1",
+                    "pane_keys": [key],
+                    "last_topic_verified_at": herdres.utc_now(),
+                }
+            },
+            "panes": {key: entry},
+        }
+        event_json = herdres.json.dumps({"pane": {"pane_id": "pane-1"}, "agent_status": "done"})
+        send_feed_item = Mock(side_effect=[
+            {"ok": True, "message_id": "3001"},
+            {"ok": True, "message_id": "3002"},
+        ])
+
+        with patch.dict(herdres.os.environ, {"HERDR_PLUGIN_EVENT_JSON": event_json}, clear=False), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=pane),
+            preflight_for_event=Mock(return_value=(True, "")),
+            pane_turn=Mock(return_value={**recent[-1], "recent_turns": recent}),
+            send_feed_item=send_feed_item,
+            ensure_pane_root_message=Mock(return_value=(False, {"ok": True})),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            update_topic_icons_for_spaces=Mock(),
+            reconcile_pinned_status_views=Mock(),
+            TURN_FEED_ENABLED=True,
+            CLEAN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+            EVENT_SETTLE_SECONDS=1.0,
+            EVENT_SETTLE_INTERVAL_SECONDS=0.01,
+        ):
+            result = herdres.event_once()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["feed_sent"], 2)
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual([call.args[1]["turn_id"] for call in send_feed_item.call_args_list], ["turn-1", "turn-2"])
+        self.assertEqual(entry["last_clean_item"]["turn_id"], "turn-2")
+        self.assertNotIn("turn_feed_backlog_pending", entry)
 
     def test_event_keeps_settling_after_initial_turn_unavailable(self) -> None:
         pane = {
