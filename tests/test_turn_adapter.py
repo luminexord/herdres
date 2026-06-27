@@ -62,6 +62,92 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["user_text"], "<literal> What happened?")
         self.assertEqual(turn["assistant_final_text"], "Final answer only.")
 
+    def test_codex_proposed_plan_only_becomes_final_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            plan = "# Plan\n- Inspect the adapter.\n- Add focused tests."
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-plan", "started_at": 10}},
+                    {"type": "response_item", "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "Plan it."}]}},
+                    {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Working on the plan."}]}},
+                    {"type": "event_msg", "payload": {"type": "proposed_plan", "plan": plan}},
+                    {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-plan",
+                        "completed_at": 20, "last_agent_message": ""}},
+                ],
+            )
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["assistant_final_text"], plan)
+
+    def test_codex_plan_delta_chunks_accumulate_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-delta", "started_at": 10}},
+                    {"type": "response_item", "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "Stream the plan."}]}},
+                    {"type": "plan_delta", "payload": "# Plan\n"},
+                    {"type": "event_msg", "payload": {"plan_delta": "- First chunk\n"}},
+                    {"type": "event_msg", "payload": {"type": "plan_delta", "delta": "- Second chunk"}},
+                    {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-delta",
+                        "completed_at": 20, "last_agent_message": ""}},
+                ],
+            )
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["assistant_final_text"], "# Plan\n- First chunk\n- Second chunk")
+
+    def test_codex_update_plan_function_call_renders_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-update", "started_at": 10}},
+                    {"type": "response_item", "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "Update the plan."}]}},
+                    {"type": "response_item", "payload": {"type": "function_call", "name": "update_plan",
+                        "arguments": json.dumps({"plan": [
+                            {"step": "Inspect adapter", "status": "completed"},
+                            {"step": "Render plan updates", "status": "in_progress"},
+                        ]})}},
+                    {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-update",
+                        "completed_at": 20, "last_agent_message": ""}},
+                ],
+            )
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(
+            turn["assistant_final_text"],
+            "- Inspect adapter (status: completed)\n- Render plan updates (status: in_progress)",
+        )
+
+    def test_codex_final_prose_appends_proposed_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            plan = "# Plan\n- Keep the plan visible."
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-both", "started_at": 10}},
+                    {"type": "response_item", "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "Plan then finish."}]}},
+                    {"type": "event_msg", "proposed_plan": plan, "payload": {"type": "agent_reasoning"}},
+                    {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-both",
+                        "completed_at": 20, "last_agent_message": "Finished the implementation."}},
+                ],
+            )
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertIn("Finished the implementation.", turn["assistant_final_text"])
+        self.assertIn(plan, turn["assistant_final_text"])
+
     def test_codex_worklog_captures_tool_calls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"

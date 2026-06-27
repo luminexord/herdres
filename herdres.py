@@ -839,6 +839,7 @@ def space_collapse_previous_responses(state: dict[str, Any], pane_or_entry: dict
 # state it holds just the latest (which stays open); extras appear only when a fold was
 # missed and is being caught up.
 UNFOLDED_TURNS_CAP = 5
+DELIVERED_TURN_IDENTITIES_CAP = 32
 FOLD_ATTEMPT_CAP = 3
 
 
@@ -4127,36 +4128,197 @@ def extract_visible_readonly_feed_item(pane: dict[str, Any]) -> dict[str, Any] |
     return extract_visible_readonly_question_item(pane)
 
 
-def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
-    """Pick the feed item for this turn, catching up on undelivered turns.
+def completed_turn_delivery_identity(item: dict[str, Any]) -> str:
+    """Stable, non-secret identity for a completed turn delivery.
 
-    When the adapter exposes recent completed turns and we have already
-    delivered one of them, emit the OLDEST not-yet-delivered turn so a burst of
-    completions (e.g. a human-prompted reply immediately followed by an
-    auto-pursued turn) is delivered in order across successive sync cycles
-    instead of collapsing to only the newest one. The cursor is the last
-    *confirmed-delivered* turn (last_clean_item), so a failed send re-selects the
-    same turn rather than skipping it. Falls back to the latest turn when there
-    is nothing to catch up on or the delivered cursor is no longer in the window.
+    Reuse the clean-feed semantic identity so volatile turn ids do not cause
+    duplicate replay, while still keeping only a bounded hash/id in pane state.
     """
+    if not isinstance(item, dict):
+        return ""
+    return sanitize_text(completed_turn_identity_key(item), 300).strip()
+
+
+def delivered_turn_identities(entry: dict[str, Any]) -> set[str]:
+    raw = entry.get("delivered_turn_identities")
+    if not isinstance(raw, list):
+        return set()
+    identities: set[str] = set()
+    for value in raw:
+        clean = str(value or "").strip()
+        if clean:
+            identities.add(clean)
+    return identities
+
+
+def record_delivered_turn_identity(entry: dict[str, Any], item: dict[str, Any]) -> bool:
+    identity = completed_turn_delivery_identity(item)
+    if not identity:
+        return False
+    raw = entry.get("delivered_turn_identities")
+    identities = [str(value or "").strip() for value in raw] if isinstance(raw, list) else []
+    identities = [value for value in identities if value and value != identity]
+    identities.append(identity)
+    if len(identities) > DELIVERED_TURN_IDENTITIES_CAP:
+        identities = identities[-DELIVERED_TURN_IDENTITIES_CAP:]
+    if entry.get("delivered_turn_identities") == identities:
+        return False
+    entry["delivered_turn_identities"] = identities
+    return True
+
+
+def delivered_turn_cursor_id(entry: dict[str, Any]) -> str:
+    last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
+    if isinstance(last_item, dict) and str(last_item.get("kind") or "").lower() in {"", "turn"}:
+        turn_id = sanitize_text(str(last_item.get("turn_id") or ""), 300).strip()
+        if turn_id:
+            return turn_id
+    streamed = sanitize_text(
+        str(entry.get("last_stream_turn_id") or entry.get("pending_stream_turn_id") or ""), 300
+    ).strip()
+    legacy_turn = sanitize_text(str(entry.get("last_turn_id") or ""), 300).strip()
+    if legacy_turn and not (streamed and legacy_turn == streamed):
+        return legacy_turn
+    return ""
+
+
+def recent_completed_turn_candidates(
+    recent: list[Any],
+) -> list[tuple[int, dict[str, Any], dict[str, Any], str]]:
+    candidates: list[tuple[int, dict[str, Any], dict[str, Any], str]] = []
+    for idx, candidate in enumerate(recent):
+        if not isinstance(candidate, dict):
+            continue
+        item = make_turn_feed_item(candidate)
+        if not item:
+            continue
+        identity = completed_turn_delivery_identity(item)
+        candidates.append((idx, candidate, item, identity))
+    return candidates
+
+
+def recent_turn_window_label(recent: list[Any]) -> str:
+    ids: list[str] = []
+    for candidate in recent:
+        if not isinstance(candidate, dict):
+            continue
+        turn_id = sanitize_text(str(candidate.get("turn_id") or ""), 80).strip()
+        if turn_id:
+            ids.append(turn_id)
+    if not ids:
+        return "unknown"
+    if len(ids) == 1:
+        return ids[0]
+    return f"{ids[0]} to {ids[-1]}"
+
+
+def attach_recent_turn_gap_notice(
+    item: dict[str, Any],
+    *,
+    cursor_id: str,
+    recent: list[Any],
+) -> dict[str, Any]:
+    window = recent_turn_window_label(recent)
+    clean_cursor = sanitize_text(str(cursor_id or "unknown"), 120).strip() or "unknown"
+    notice = (
+        f"Herdres notice: last delivered turn {clean_cursor} is outside the recent window "
+        f"({window}); delivering the oldest visible completion. Earlier completed turns may "
+        "have fallen out of the window."
+    )
+    assistant_final = str(item.get("assistant_final_text") or "").strip()
+    if not assistant_final or notice in assistant_final:
+        return item
+    updated = dict(item)
+    assistant_final = sanitize_text(f"{notice}\n\n{assistant_final}", FINAL_REPLY_MAX_CHARS).strip()
+    updated["assistant_final_text"] = assistant_final
+    updated["summary"] = compact_block(assistant_final.splitlines()[:4], max_lines=4, max_chars=700)
+    updated["lines"] = assistant_final.splitlines()[:FINAL_REPLY_MAX_LINES]
+    text_parts: list[str] = []
+    user_text = str(updated.get("user_text") or "").strip()
+    if user_text:
+        text_parts.extend([USER_PROMPT_LABEL, user_text, ""])
+    text_parts.append(assistant_final)
+    updated["text"] = "\n".join(text_parts).strip()
+    updated["turn_gap_notice"] = notice
+    return updated
+
+
+def select_recent_completed_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
+    recent = turn.get("recent_turns") if isinstance(turn, dict) else None
+    if not isinstance(recent, list):
+        return None
+    candidates = recent_completed_turn_candidates(recent)
+    if not candidates:
+        return None
+
+    delivered = delivered_turn_identities(entry)
+    raw_ids = [
+        sanitize_text(str(candidate.get("turn_id") or ""), 300).strip() if isinstance(candidate, dict) else ""
+        for candidate in recent
+    ]
+    cursor_id = delivered_turn_cursor_id(entry)
+    streamed_cursor_id = sanitize_text(
+        str(entry.get("last_stream_turn_id") or entry.get("pending_stream_turn_id") or ""), 300
+    ).strip()
+    selected: tuple[int, dict[str, Any], dict[str, Any], str] | None = None
+    attach_gap_notice = False
+
+    if cursor_id:
+        if cursor_id in raw_ids:
+            cursor_idx = raw_ids.index(cursor_id)
+            for candidate in candidates:
+                idx, _turn_obj, _item, identity = candidate
+                if idx <= cursor_idx:
+                    continue
+                if identity and identity in delivered:
+                    continue
+                selected = candidate
+                break
+        else:
+            attach_gap_notice = True
+            for candidate in candidates:
+                _idx, _turn_obj, _item, identity = candidate
+                if identity and identity in delivered:
+                    continue
+                selected = candidate
+                break
+    else:
+        if streamed_cursor_id and streamed_cursor_id in raw_ids:
+            for candidate in candidates:
+                idx, _turn_obj, _item, identity = candidate
+                if raw_ids[idx] != streamed_cursor_id:
+                    continue
+                if identity and identity in delivered:
+                    break
+                selected = candidate
+                break
+        if selected is None:
+            latest = candidates[-1]
+            _idx, _turn_obj, _item, identity = latest
+            if not identity or identity not in delivered:
+                selected = latest
+
+    if selected is None:
+        return None
+
+    selected_idx, _selected_turn, selected_item, _selected_identity = selected
+    item = dict(selected_item)
+    if cursor_id or (streamed_cursor_id and selected_idx < len(raw_ids) and raw_ids[selected_idx] == streamed_cursor_id):
+        item["_turn_feed_backlog_remaining"] = any(
+            idx > selected_idx and (not identity or identity not in delivered)
+            for idx, _turn_obj, _item, identity in candidates
+        )
+    if attach_gap_notice:
+        item = attach_recent_turn_gap_notice(item, cursor_id=cursor_id, recent=recent)
+    return item
+
+
+def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Pick the feed item for this turn, catching up completed recent turns in order."""
     if isinstance(turn, dict):
         recent = turn.get("recent_turns")
-        if isinstance(recent, list) and len(recent) >= 2:
-            last_clean_turn = str((entry.get("last_clean_item") or {}).get("turn_id") or "")
-            streamed = str(entry.get("last_stream_turn_id") or entry.get("pending_stream_turn_id") or "")
-            legacy_turn = str(entry.get("last_turn_id") or "")
-            delivered = last_clean_turn or ("" if streamed and legacy_turn == streamed else legacy_turn)
-            ids = [str(t.get("turn_id") or "") for t in recent]
-            if delivered and delivered in ids:
-                idx = ids.index(delivered)
-                if idx < len(recent) - 1:
-                    catch_up = make_turn_feed_item(recent[idx + 1])
-                    if catch_up:
-                        return catch_up
-            if not delivered and streamed and streamed in ids:
-                streamed_item = make_turn_feed_item(recent[ids.index(streamed)])
-                if streamed_item:
-                    return streamed_item
+        if isinstance(recent, list) and recent_completed_turn_candidates(recent):
+            return select_recent_completed_turn_feed_item(turn, entry)
     return make_turn_feed_item(turn)
 
 
@@ -6536,6 +6698,8 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_attempt_at",
         "last_visible_prompt_key",
         "unfolded_turns",
+        "delivered_turn_identities",
+        "turn_feed_backlog_pending",
         "last_plan_doc_turn_id",
         "pending_plan_doc",
         "last_speech_reply_turn_id",
@@ -7011,6 +7175,7 @@ def record_delivered_feed_item(
     # unfolded-turns buffer can seed from it on the first post-deploy delivery.
     prior_clean_item = entry.get("last_clean_item")
     prior_clean_mid = str(entry.get("last_clean_message_id") or "")
+    backlog_pending = bool(item.pop("_turn_feed_backlog_remaining", False))
     if pending_active_prompt:
         bind_active_prompt_message(
             entry,
@@ -7043,6 +7208,14 @@ def record_delivered_feed_item(
         entry["last_visible_prompt_key"] = str(item.get("visible_prompt_key") or "")
     if item.get("turn_id") and not feed_item_is_visible_scrape(item):
         entry["last_turn_id"] = str(item.get("turn_id") or "")
+    if str(item.get("kind") or "").lower() == "turn":
+        record_delivered_turn_identity(entry, item)
+        if backlog_pending:
+            entry["turn_feed_backlog_pending"] = True
+        else:
+            entry.pop("turn_feed_backlog_pending", None)
+    else:
+        entry.pop("turn_feed_backlog_pending", None)
     entry.pop("last_clean_send_error", None)
     # Record this turn for the self-healing fold sweep. Seed from the prior turn first (only
     # when the buffer is empty — the transition right after deploy) so the existing previous
@@ -13045,14 +13218,22 @@ def event_once() -> dict[str, Any]:
             attempts += 1
             before_feed_sends = counters.get("feed_sends", 0)
             changed = sync_pane_once(state, chat_id, telegram, pane, counters, caps, turn_only=True) or changed
-            if counters.get("feed_sends", 0) > before_feed_sends:
-                break
+            feed_sent_this_attempt = counters.get("feed_sends", 0) > before_feed_sends
             entry = (state.get("panes") or {}).get(pane_key(pane), {})
-            if TURN_FEED_ENABLED and entry.get("last_turn_available") is False and not settle:
+            backlog_pending = bool(isinstance(entry, dict) and entry.get("turn_feed_backlog_pending"))
+            if feed_sent_this_attempt and not backlog_pending:
                 break
-            if not settle or time.monotonic() >= deadline or counters.get("sends", 0) >= caps["max_sends"]:
+            if TURN_FEED_ENABLED and isinstance(entry, dict) and entry.get("last_turn_available") is False and not settle:
                 break
-            time.sleep(max(0.1, EVENT_SETTLE_INTERVAL_SECONDS))
+            if (
+                not settle
+                or counters.get("sends", 0) >= caps["max_sends"]
+                or counters.get("feed_sends", 0) >= caps["max_feed_sends"]
+                or time.monotonic() >= deadline
+            ):
+                break
+            if not feed_sent_this_attempt:
+                time.sleep(max(0.1, EVENT_SETTLE_INTERVAL_SECONDS))
             refreshed = pane_by_id(pane_id)
             if not refreshed or not refreshed.get("agent"):
                 break
