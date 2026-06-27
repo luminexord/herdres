@@ -2080,6 +2080,170 @@ class GatewayManagedBotTests(unittest.TestCase):
         api.assert_not_called()
 
 
+class DirectOriginCommandMarkerTests(unittest.TestCase):
+    DIRECT_ORIGIN_FIELDS = (
+        "direct_origin_at",
+        "direct_origin_text_hash",
+        "direct_origin_after_turn_id",
+        "direct_origin_turn_id",
+        "direct_origin_bound_at",
+        "direct_origin_consumed_turn_id",
+        "direct_origin_consumed_hash",
+        "direct_origin_consumed_at",
+    )
+
+    def _state(self, *, panes: int = 1) -> dict:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {
+                "chat_id": "-1001",
+                "general_thread_id": "1",
+                "owner_user_ids": ["42"],
+            },
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": ["pane-1"],
+                    "message_routes": {"1001": "pane-1"},
+                }
+            },
+            "panes": {
+                "pane-1": {
+                    "pane_key": "pane-1",
+                    "pane_id": "pane-1",
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_root_message_id": "1001",
+                    "last_known_status": "working",
+                    "agent": "claude",
+                    "last_turn_id": "turn-before",
+                }
+            },
+        }
+        if panes > 1:
+            state["spaces"]["workspace:workspace-1"]["pane_keys"].append("pane-2")
+            state["spaces"]["workspace:workspace-1"]["message_routes"]["1002"] = "pane-2"
+            state["panes"]["pane-2"] = {
+                "pane_key": "pane-2",
+                "pane_id": "pane-2",
+                "space_key": "workspace:workspace-1",
+                "topic_id": "77",
+                "pane_root_message_id": "1002",
+                "last_known_status": "working",
+                "agent": "codex",
+            }
+        return state
+
+    def _payload(self, **overrides) -> dict:
+        payload = {
+            "chat_id": "-1001",
+            "topic_id": "77",
+            "message_id": "5000",
+            "reply_to_message_id": "1001",
+            "user_id": "42",
+            "from_bot": False,
+            "forwarded": False,
+            "edited": False,
+            "text": "/send Run direct task.",
+        }
+        payload.update(overrides)
+        return payload
+
+    def _assert_no_direct_origin_marker(self, entry: dict) -> None:
+        for key in self.DIRECT_ORIGIN_FIELDS:
+            self.assertNotIn(key, entry)
+
+    def _command_patches(
+        self,
+        state: dict,
+        *,
+        send_to_pane: Mock | None = None,
+        pane_turn: Mock | None = None,
+        save_state: Mock | None = None,
+    ):
+        return patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=save_state or Mock(),
+            send_to_pane=send_to_pane or Mock(return_value=(True, "")),
+            pane_turn=pane_turn or Mock(return_value={"available": True, "turn_id": "turn-before"}),
+        )
+
+    def test_command_reply_successful_direct_owner_send_sets_marker(self) -> None:
+        state = self._state()
+        entry = state["panes"]["pane-1"]
+        entry.update({
+            "direct_origin_turn_id": "old-turn",
+            "direct_origin_bound_at": "2026-01-01T00:00:00+00:00",
+            "direct_origin_consumed_turn_id": "old-turn",
+            "direct_origin_consumed_hash": "old-hash",
+            "direct_origin_consumed_at": "2026-01-01T00:00:01+00:00",
+        })
+        send_to_pane = Mock(return_value=(True, ""))
+        save_state = Mock()
+        pane_turn = Mock(return_value={"available": True, "turn_id": "turn-before"})
+
+        with self._command_patches(
+            state,
+            send_to_pane=send_to_pane,
+            pane_turn=pane_turn,
+            save_state=save_state,
+        ):
+            result = herdres.command_reply(self._payload())
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        send_to_pane.assert_called_once_with("pane-1", "Run direct task.")
+        self.assertIn("direct_origin_at", entry)
+        self.assertEqual(entry["direct_origin_text_hash"], herdres.stream_text_hash("Run direct task."))
+        self.assertEqual(entry["direct_origin_after_turn_id"], "turn-before")
+        self.assertNotIn("direct_origin_turn_id", entry)
+        self.assertNotIn("direct_origin_bound_at", entry)
+        self.assertNotIn("direct_origin_consumed_turn_id", entry)
+        self.assertNotIn("direct_origin_consumed_hash", entry)
+        self.assertNotIn("direct_origin_consumed_at", entry)
+        self.assertTrue(save_state.called)
+
+    def test_command_reply_failed_direct_send_does_not_set_marker(self) -> None:
+        state = self._state()
+        entry = state["panes"]["pane-1"]
+        send_to_pane = Mock(return_value=(False, "permission denied"))
+
+        with self._command_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(self._payload())
+
+        self.assertTrue(result["handled"])
+        self.assertIn("Send failed", result["reply"])
+        send_to_pane.assert_called_once_with("pane-1", "Run direct task.")
+        self._assert_no_direct_origin_marker(entry)
+
+    def test_command_reply_rejected_messages_do_not_set_direct_marker(self) -> None:
+        cases = (
+            ("forwarded", self._state(), self._payload(forwarded=True)),
+            ("non_owner", self._state(), self._payload(user_id="99")),
+            (
+                "ambiguous",
+                self._state(panes=2),
+                self._payload(reply_to_message_id="", text="/send Run direct task."),
+            ),
+        )
+        for name, state, payload in cases:
+            with self.subTest(name=name):
+                send_to_pane = Mock(return_value=(True, ""))
+                pane_turn = Mock(return_value={"available": True, "turn_id": "turn-before"})
+
+                with self._command_patches(state, send_to_pane=send_to_pane, pane_turn=pane_turn):
+                    result = herdres.command_reply(payload)
+
+                self.assertTrue(result["handled"])
+                send_to_pane.assert_not_called()
+                for entry in state["panes"].values():
+                    self._assert_no_direct_origin_marker(entry)
+
+
 class TypingActionTests(unittest.TestCase):
     """Issue #44: the gateway sends a native "typing…" chat action to each actively-working pane's
     topic (refreshed ~4s) so Telegram renders its own animated dots — no message edits."""
