@@ -2631,6 +2631,7 @@ class StreamingIntegrationTests(unittest.TestCase):
 
         self.assertTrue(changed)
         send_stream_message.assert_called_once()
+        send_feed_item.assert_not_called()
         self.assertEqual(send_stream_message.call_args.kwargs["turn_id"], "turn-1")
         self.assertEqual(send_stream_message.call_args.kwargs["text"], "Partial answer.")
         self.assertEqual(send_stream_message.call_args.kwargs["user_text"], "Run direct task.")
@@ -2723,6 +2724,46 @@ class StreamingIntegrationTests(unittest.TestCase):
                 send_stream_message.assert_not_called()
                 if case == "stale_marker":
                     self._assert_direct_origin_fields_cleared(entry)
+
+    def test_direct_origin_disabled_streaming_requires_matching_open_turn_text(self) -> None:
+        cases = (
+            ("missing_user_text", ""),
+            ("mismatched_user_text", "Different direct task."),
+            ("same_after_turn", "Run direct task."),
+            ("council_origin", "Run direct task."),
+            ("space_council_origin", "Run direct task."),
+        )
+        for case, user_text in cases:
+            with self.subTest(case=case):
+                state, pane, _key, entry = self._state()
+                pane["agent"] = "claude"
+                entry["agent"] = "claude"
+                self._fresh_direct_origin_marker(
+                    entry,
+                    after_turn_id="turn-1" if case == "same_after_turn" else "before-turn",
+                )
+                if case == "council_origin":
+                    entry["origin"] = "council"
+                if case == "space_council_origin":
+                    state["spaces"]["workspace:workspace-1"]["origin"] = "council"
+                turn = self._direct_origin_turn()
+                if user_text:
+                    turn["user_text"] = user_text
+                else:
+                    turn.pop("user_text", None)
+                send_stream_message = Mock(return_value={"ok": True, "sent_message": True, "message_id": "3001"})
+
+                with self._direct_origin_stream_patches(
+                    Mock(return_value=turn),
+                    send_stream_message=send_stream_message,
+                    send_feed_item=Mock(return_value={"ok": True, "message_id": "2001"}),
+                ):
+                    counters, caps = self._caps()
+                    herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+                send_stream_message.assert_not_called()
+                self.assertNotIn("direct_origin_turn_id", entry)
+                self.assertNotIn("direct_origin_bound_at", entry)
 
     def test_clean_feed_hash_ignores_direct_origin_progress_worklog_text(self) -> None:
         self.assertEqual(herdres.DIRECT_ORIGIN_MARKER_TTL_SECONDS, 1800)
