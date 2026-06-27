@@ -11680,6 +11680,7 @@ def _sync_pane_clean_feed(
         and pending_stream_turn_id
         and not stream_config_enabled()
         and counters.get("sends", 0) < max_sends
+        and counters.get("feed_sends", 0) < max_feed_sends
         and managed_bot_kind_for_entry(entry, pane) == "claude"
         and _direct_origin_marker_fresh(entry)
         and str(entry.get("direct_origin_turn_id") or "") == pending_stream_turn_id
@@ -11715,9 +11716,10 @@ def _sync_pane_clean_feed(
                         str(entry.get("space_key") or ""),
                         str(entry.get("pane_key") or ""),
                         str(stream_result["message_id"]),
-                    )
+                )
                 if stream_result.get("sent_message"):
                     counters["sends"] = counters.get("sends", 0) + 1
+                    counters["feed_sends"] = counters.get("feed_sends", 0) + 1
                 mark_direct_origin_progress_consumed(entry, pending_stream_turn_id, fallback_stream_hash)
                 changed = True
             elif not stream_result.get("skipped"):
@@ -14042,6 +14044,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                         return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
                     if mark_direct_origin_send(entry, caption, after_turn_id=after_turn_id):
                         save_state(state)
+                    return {"handled": True, "reply": "Speech is off, so I sent your caption to this pane."}
                 return {"handled": True, "reply": (
                     "Voice transcription is off. Enable it with `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1` "
                     "and `herdres speech install`, or send text.")}
