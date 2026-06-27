@@ -2083,11 +2083,14 @@ class GatewayManagedBotTests(unittest.TestCase):
 class DirectOriginCommandMarkerTests(unittest.TestCase):
     DIRECT_ORIGIN_FIELDS = (
         "direct_origin_at",
+        "direct_origin_origin",
+        "direct_origin_user_text_hash",
         "direct_origin_text_hash",
         "direct_origin_after_turn_id",
         "direct_origin_turn_id",
         "direct_origin_bound_at",
         "direct_origin_consumed_turn_id",
+        "direct_origin_consumed_user_text_hash",
         "direct_origin_consumed_hash",
         "direct_origin_consumed_at",
     )
@@ -2155,59 +2158,231 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
         for key in self.DIRECT_ORIGIN_FIELDS:
             self.assertNotIn(key, entry)
 
+    def _assert_direct_origin_marker(
+        self,
+        entry: dict,
+        outbound_text: str,
+        *,
+        origin: str,
+        after_turn_id: str = "turn-before",
+    ) -> None:
+        expected_hash = herdres.stream_text_hash(outbound_text)
+        self.assertIn("direct_origin_at", entry)
+        self.assertEqual(entry["direct_origin_origin"], origin)
+        self.assertEqual(entry["direct_origin_user_text_hash"], expected_hash)
+        self.assertEqual(entry["direct_origin_text_hash"], expected_hash)
+        self.assertEqual(entry["direct_origin_after_turn_id"], after_turn_id)
+        self.assertNotIn("direct_origin_turn_id", entry)
+        self.assertNotIn("direct_origin_bound_at", entry)
+        self.assertNotIn("direct_origin_consumed_turn_id", entry)
+        self.assertNotIn("direct_origin_consumed_user_text_hash", entry)
+        self.assertNotIn("direct_origin_consumed_hash", entry)
+        self.assertNotIn("direct_origin_consumed_at", entry)
+
     def _command_patches(
         self,
         state: dict,
         *,
         send_to_pane: Mock | None = None,
+        interrupt_and_send_to_pane: Mock | None = None,
         pane_turn: Mock | None = None,
         save_state: Mock | None = None,
+        **overrides,
     ):
-        return patch.multiple(
-            herdres,
-            load_dotenv=Mock(),
-            load_state=Mock(return_value=state),
-            save_state=save_state or Mock(),
-            send_to_pane=send_to_pane or Mock(return_value=(True, "")),
-            pane_turn=pane_turn or Mock(return_value={"available": True, "turn_id": "turn-before"}),
-        )
+        pane_turn = pane_turn or Mock(return_value={"available": True, "turn_id": "turn-before"})
+        patches = {
+            "load_dotenv": Mock(),
+            "load_state": Mock(return_value=state),
+            "save_state": save_state or Mock(),
+            "send_to_pane": send_to_pane or Mock(return_value=(True, "")),
+            "interrupt_and_send_to_pane": interrupt_and_send_to_pane or Mock(return_value=(True, "")),
+            "pane_turn": pane_turn,
+            "cached_pane_turn": pane_turn,
+            "fresh_pane_turn": pane_turn,
+        }
+        patches.update(overrides)
+        return patch.multiple(herdres, **patches)
 
-    def test_command_reply_successful_direct_owner_send_sets_marker(self) -> None:
+    def test_command_reply_successful_owner_text_paths_set_marker_hash_and_origin(self) -> None:
+        cases = (
+            (
+                "send_command",
+                self._payload(text="/send Run direct task."),
+                "Run direct task.",
+                "send",
+                "send_to_pane",
+            ),
+            (
+                "plain_reply",
+                self._payload(text="Run direct task."),
+                "Run direct task.",
+                "send",
+                "send_to_pane",
+            ),
+            (
+                "implicit_plain",
+                self._payload(text="Run direct task.", reply_to_message_id=""),
+                "Run direct task.",
+                "send",
+                "send_to_pane",
+            ),
+            (
+                "interrupt_command",
+                self._payload(text="/send! Interrupt now."),
+                "Interrupt now.",
+                "interrupt",
+                "interrupt_and_send_to_pane",
+            ),
+        )
+        for name, payload, outbound, origin, send_kind in cases:
+            with self.subTest(name=name):
+                state = self._state()
+                state["telegram"]["implicit_send_enabled"] = True
+                entry = state["panes"]["pane-1"]
+                entry.update({
+                    "direct_origin_turn_id": "old-turn",
+                    "direct_origin_bound_at": "2026-01-01T00:00:00+00:00",
+                    "direct_origin_consumed_turn_id": "old-turn",
+                    "direct_origin_consumed_user_text_hash": "old-user-hash",
+                    "direct_origin_consumed_hash": "old-legacy-hash",
+                    "direct_origin_consumed_at": "2026-01-01T00:00:01+00:00",
+                })
+                send_to_pane = Mock(return_value=(True, ""))
+                interrupt_and_send_to_pane = Mock(return_value=(True, ""))
+                save_state = Mock()
+
+                with self._command_patches(
+                    state,
+                    send_to_pane=send_to_pane,
+                    interrupt_and_send_to_pane=interrupt_and_send_to_pane,
+                    save_state=save_state,
+                ):
+                    result = herdres.command_reply(payload)
+
+                self.assertTrue(result["handled"])
+                if send_kind == "send_to_pane":
+                    send_to_pane.assert_called_once_with("pane-1", outbound)
+                    interrupt_and_send_to_pane.assert_not_called()
+                else:
+                    interrupt_and_send_to_pane.assert_called_once_with("pane-1", outbound)
+                    send_to_pane.assert_not_called()
+                self._assert_direct_origin_marker(entry, outbound, origin=origin)
+                self.assertTrue(save_state.called)
+
+    def test_choices_and_detail_success_paths_set_marker_hash_and_origin(self) -> None:
         state = self._state()
         entry = state["panes"]["pane-1"]
-        entry.update({
-            "direct_origin_turn_id": "old-turn",
-            "direct_origin_bound_at": "2026-01-01T00:00:00+00:00",
-            "direct_origin_consumed_turn_id": "old-turn",
-            "direct_origin_consumed_hash": "old-hash",
-            "direct_origin_consumed_at": "2026-01-01T00:00:01+00:00",
-        })
+        entry["active_prompt"] = {
+            "id": "prompt-1",
+            "text": "Choose one",
+            "options": [{"number": "1", "label": "Proceed", "send_text": "Proceed now"}],
+            "message_id": "1001",
+        }
         send_to_pane = Mock(return_value=(True, ""))
-        save_state = Mock()
-        pane_turn = Mock(return_value={"available": True, "turn_id": "turn-before"})
 
         with self._command_patches(
             state,
             send_to_pane=send_to_pane,
-            pane_turn=pane_turn,
-            save_state=save_state,
+            send_notice=Mock(return_value={"ok": True, "message_id": "9001"}),
         ):
-            result = herdres.command_reply(self._payload())
+            result = herdres.callback_reply({
+                "chat_id": "-1001",
+                "topic_id": "77",
+                "message_id": "1001",
+                "user_id": "42",
+                "data": "herdr:c:prompt-1:1",
+            })
 
         self.assertTrue(result["handled"])
-        self.assertEqual(result["reply"], "")
-        send_to_pane.assert_called_once_with("pane-1", "Run direct task.")
-        self.assertIn("direct_origin_at", entry)
-        self.assertEqual(entry["direct_origin_text_hash"], herdres.stream_text_hash("Run direct task."))
-        self.assertEqual(entry["direct_origin_after_turn_id"], "turn-before")
-        self.assertNotIn("direct_origin_turn_id", entry)
-        self.assertNotIn("direct_origin_bound_at", entry)
-        self.assertNotIn("direct_origin_consumed_turn_id", entry)
-        self.assertNotIn("direct_origin_consumed_hash", entry)
-        self.assertNotIn("direct_origin_consumed_at", entry)
-        self.assertTrue(save_state.called)
+        send_to_pane.assert_called_once_with("pane-1", "Proceed now")
+        self._assert_direct_origin_marker(entry, "Proceed now", origin="callback")
 
-    def test_command_reply_failed_direct_send_does_not_set_marker(self) -> None:
+        state = self._state()
+        entry = state["panes"]["pane-1"]
+        state["spaces"]["workspace:workspace-1"]["message_routes"]["9001"] = "pane-1"
+        entry["active_prompt"] = {"id": "prompt-1"}
+        entry["awaiting_detail"] = {
+            "user_id": "42",
+            "prompt_id": "prompt-1",
+            "choice": "Proceed now",
+            "created_at": herdres.utc_now(),
+            "force_reply_message_id": "9001",
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with self._command_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(self._payload(text="with extra detail", reply_to_message_id="9001"))
+
+        self.assertTrue(result["handled"])
+        outbound = "Proceed now\nwith extra detail"
+        send_to_pane.assert_called_once_with("pane-1", outbound)
+        self._assert_direct_origin_marker(entry, outbound, origin="choice")
+
+    def test_attachment_and_voice_success_paths_set_marker_hash_and_origin(self) -> None:
+        attachment_cases = (
+            ("document", "Review uploaded document."),
+            ("photo", "Review uploaded photo."),
+        )
+        for kind, instruction in attachment_cases:
+            with self.subTest(kind=kind):
+                state = self._state()
+                entry = state["panes"]["pane-1"]
+                send_to_pane = Mock(return_value=(True, ""))
+
+                with self._command_patches(
+                    state,
+                    send_to_pane=send_to_pane,
+                    deliver_attachment=Mock(return_value=(True, "", Path(f"/tmp/{kind}.dat"))),
+                    pane_attachment_instruction=Mock(return_value=instruction),
+                ):
+                    result = herdres.command_reply(
+                        self._payload(
+                            text="",
+                            caption="Please inspect this file.",
+                            attachment={"kind": kind, "file_id": f"{kind}-file"},
+                        )
+                    )
+
+                self.assertTrue(result["handled"])
+                send_to_pane.assert_called_once_with("pane-1", instruction)
+                self._assert_direct_origin_marker(entry, instruction, origin="attachment")
+
+        voice_cases = (
+            (
+                "pretranscribed",
+                {
+                    "_speech_pretranscribed": True,
+                    "_speech_transcript": "Summarize the trace.",
+                    "caption": "Preserve the log names.",
+                },
+                "Summarize the trace.\n\nPreserve the log names.",
+            ),
+            (
+                "caption_fallback",
+                {"caption": "Use this caption while speech is off."},
+                "Use this caption while speech is off.",
+            ),
+        )
+        for name, overrides, outbound in voice_cases:
+            with self.subTest(name=name):
+                state = self._state()
+                entry = state["panes"]["pane-1"]
+                send_to_pane = Mock(return_value=(True, ""))
+
+                with self._command_patches(state, send_to_pane=send_to_pane, herdres_speech=None):
+                    result = herdres.command_reply(
+                        self._payload(
+                            text="",
+                            attachment={"kind": "voice", "file_id": "voice-file"},
+                            **overrides,
+                        )
+                    )
+
+                self.assertTrue(result["handled"])
+                send_to_pane.assert_called_once_with("pane-1", outbound)
+                self._assert_direct_origin_marker(entry, outbound, origin="voice")
+
+    def test_command_reply_failed_and_rejected_messages_do_not_set_direct_marker(self) -> None:
         state = self._state()
         entry = state["panes"]["pane-1"]
         send_to_pane = Mock(return_value=(False, "permission denied"))
@@ -2220,27 +2395,37 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
         send_to_pane.assert_called_once_with("pane-1", "Run direct task.")
         self._assert_no_direct_origin_marker(entry)
 
-    def test_command_reply_rejected_messages_do_not_set_direct_marker(self) -> None:
+        conflict_state = self._state()
+        conflict_state["telegram"]["managed_bots"] = {
+            "claude": {"username": "herdr_claude_bot", "enabled": True},
+            "codex": {"username": "herdr_codex_bot", "enabled": True},
+        }
         cases = (
             ("forwarded", self._state(), self._payload(forwarded=True)),
             ("non_owner", self._state(), self._payload(user_id="99")),
+            ("edited", self._state(), self._payload(edited=True)),
+            ("bot", self._state(), self._payload(from_bot=True)),
             (
                 "ambiguous",
                 self._state(panes=2),
                 self._payload(reply_to_message_id="", text="/send Run direct task."),
             ),
+            (
+                "rejected_target_conflict",
+                conflict_state,
+                self._payload(target_bot_kind="codex", text="/send Run direct task @herdr_claude_bot"),
+            ),
         )
-        for name, state, payload in cases:
+        for name, case_state, payload in cases:
             with self.subTest(name=name):
                 send_to_pane = Mock(return_value=(True, ""))
-                pane_turn = Mock(return_value={"available": True, "turn_id": "turn-before"})
 
-                with self._command_patches(state, send_to_pane=send_to_pane, pane_turn=pane_turn):
+                with self._command_patches(case_state, send_to_pane=send_to_pane):
                     result = herdres.command_reply(payload)
 
                 self.assertTrue(result["handled"])
                 send_to_pane.assert_not_called()
-                for entry in state["panes"].values():
+                for entry in case_state["panes"].values():
                     self._assert_no_direct_origin_marker(entry)
 
 
