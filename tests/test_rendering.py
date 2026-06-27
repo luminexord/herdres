@@ -4,11 +4,16 @@ import json
 import os
 import re
 import tempfile
+import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 
 import herdres
 
@@ -2556,11 +2561,15 @@ class StreamingIntegrationTests(unittest.TestCase):
         after_turn_id: str = "before-turn",
         origin: str = "send",
     ) -> None:
-        clean_user = herdres.sanitize_text(str(user_text or ""), herdres.MAX_REPLY_CHARS).strip()
+        clean_user = herdres.sanitize_text(str(user_text or ""), herdres.USER_PROMPT_MAX_CHARS).strip()
         user_hash = herdres.stream_text_hash(clean_user)
+        created_at = herdres.utc_now()
         entry.update({
-            "direct_origin_at": herdres.utc_now(),
+            "direct_origin_at": created_at,
+            "direct_origin_created_at": created_at,
             "direct_origin_origin": origin,
+            "direct_origin_pane_id": str(entry.get("pane_id") or ""),
+            "direct_origin_pane_key": str(entry.get("pane_key") or ""),
             "direct_origin_user_text_hash": user_hash,
             # Legacy compatibility field: it may exist, but it is not the binding/dedupe key.
             "direct_origin_text_hash": user_hash,
@@ -2570,7 +2579,10 @@ class StreamingIntegrationTests(unittest.TestCase):
     def _assert_direct_origin_fields_cleared(self, entry: dict) -> None:
         for key in (
             "direct_origin_at",
+            "direct_origin_created_at",
             "direct_origin_origin",
+            "direct_origin_pane_id",
+            "direct_origin_pane_key",
             "direct_origin_user_text_hash",
             "direct_origin_text_hash",
             "direct_origin_after_turn_id",
@@ -2728,6 +2740,7 @@ class StreamingIntegrationTests(unittest.TestCase):
             "no_marker",
             "disallowed_origin",
             "stale_marker",
+            "legacy_hashless_marker",
             "consumed_marker",
             "user_text_mismatch",
             "replacement_bound_turn",
@@ -2743,6 +2756,8 @@ class StreamingIntegrationTests(unittest.TestCase):
                         entry,
                         origin="status" if case == "disallowed_origin" else "send",
                     )
+                if case == "legacy_hashless_marker":
+                    entry.pop("direct_origin_user_text_hash", None)
                 if case == "stale_marker":
                     entry["direct_origin_at"] = (
                         datetime.now(timezone.utc)
@@ -2782,7 +2797,7 @@ class StreamingIntegrationTests(unittest.TestCase):
                     herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
 
                 send_stream_message.assert_not_called()
-                if case in {"stale_marker", "user_text_mismatch", "replacement_bound_turn"}:
+                if case in {"disallowed_origin", "stale_marker", "legacy_hashless_marker", "user_text_mismatch", "replacement_bound_turn", "final_turn"}:
                     self._assert_direct_origin_fields_cleared(entry)
 
     def test_clean_feed_hash_ignores_direct_origin_progress_worklog_text(self) -> None:
