@@ -2651,13 +2651,13 @@ class StreamingIntegrationTests(unittest.TestCase):
             self._direct_origin_turn(),
             self._direct_origin_turn(complete=True),
         ])
-        send_rich_message = Mock(return_value={"ok": True, "message_id": "3001"})
+        edit_rich_message = Mock(return_value={"ok": True, "message_id": "2001"})
         send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
-        edit_feed_item = Mock(return_value={"ok": True, "message_id": "3001"})
+        edit_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
 
         with self._direct_origin_stream_patches(
             pane_turn,
-            send_rich_message=send_rich_message,
+            edit_rich_message=edit_rich_message,
             send_feed_item=send_feed_item,
             edit_feed_item=edit_feed_item,
         ):
@@ -2669,22 +2669,29 @@ class StreamingIntegrationTests(unittest.TestCase):
             counters, caps = self._caps()
             self.assertTrue(herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps))
 
-        send_rich_message.assert_called_once()
-        rich_html = send_rich_message.call_args.args[1]
+        edit_rich_message.assert_called_once()
+        self.assertEqual(edit_rich_message.call_args.args[1], "2001")
+        rich_html = edit_rich_message.call_args.args[2]
         self.assertIn("Run direct task.", rich_html)
         self.assertIn("Partial answer.", rich_html)
         edit_feed_item.assert_called_once()
-        self.assertEqual(edit_feed_item.call_args.args[1], "3001")
+        self.assertEqual(edit_feed_item.call_args.args[1], "2001")
         final_item = edit_feed_item.call_args.args[2]
         self.assertEqual(final_item["turn_id"], "turn-1")
         self.assertEqual(final_item["assistant_final_text"], "Final answer.")
         self.assertEqual(final_item["worklog_text"], "Partial answer.")
-        self.assertEqual(entry["last_clean_message_id"], "3001")
+        self.assertEqual(entry["last_clean_message_id"], "2001")
         self.assertEqual(send_feed_item.call_count, prompt_send_count)
         self._assert_direct_origin_fields_cleared(entry)
 
     def test_direct_origin_disabled_streaming_requires_fresh_unconsumed_marker(self) -> None:
-        for case in ("no_marker", "stale_marker", "consumed_marker", "max_sends_exhausted"):
+        for case in (
+            "no_marker",
+            "stale_marker",
+            "consumed_marker",
+            "max_sends_exhausted",
+            "max_feed_sends_exhausted",
+        ):
             with self.subTest(case=case):
                 state, pane, _key, entry = self._state()
                 pane["agent"] = "claude"
@@ -2710,6 +2717,8 @@ class StreamingIntegrationTests(unittest.TestCase):
                 counters, caps = self._caps()
                 if case == "max_sends_exhausted":
                     counters["sends"] = caps["max_sends"]
+                if case == "max_feed_sends_exhausted":
+                    counters["feed_sends"] = caps["max_feed_sends"]
                 send_stream_message = Mock(return_value={"ok": True, "sent_message": True, "message_id": "3001"})
                 send_feed_item = Mock(return_value={"ok": True, "message_id": "2001"})
 
