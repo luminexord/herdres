@@ -7682,7 +7682,8 @@ def interrupt_and_send_response(pane_id: str, text: str) -> dict[str, Any]:
     outbound = str(text or "").strip()
     if not outbound:
         return {"handled": True, "reply": "Usage: /send! <instruction> — interrupts the current turn and sends now"}
-    ok, detail = interrupt_and_send_to_pane(pane_id, outbound)
+    with released_lock():  # the Esc + herdr send cascade is the slow part; run it off the global lock
+        ok, detail = interrupt_and_send_to_pane(pane_id, outbound)
     if not ok:
         return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
     if detail:
@@ -12893,7 +12894,8 @@ def forward_text_to_pane_response(pane_id: str, text: str, *, usage: str = "") -
     outbound = str(text or "").strip()
     if not outbound:
         return {"handled": True, "reply": usage}
-    ok, detail = send_to_pane(pane_id, outbound)
+    with released_lock():  # the herdr send touches no state — run it off the global lock
+        ok, detail = send_to_pane(pane_id, outbound)
     if not ok:
         return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
     # On a normal submit `detail` is empty (silent success); when the agent was
@@ -13807,7 +13809,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         if not ok or dest is None:
             return {"handled": True, "reply": f"Could not deliver that attachment: {detail}"}
         instruction = pane_attachment_instruction(dest, attachment, caption or text)
-        sent_ok, sent_detail = send_to_pane(pane_id, instruction)
+        with released_lock():
+            sent_ok, sent_detail = send_to_pane(pane_id, instruction)
         if not sent_ok:
             return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
         return {"handled": True, "reply": "Sent attachment to this pane."}
@@ -13831,7 +13834,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 # Speech off/unavailable: still deliver a caption if the owner attached one, rather than
                 # silently dropping it (parity with the document/photo arm); otherwise explain how to enable.
                 if caption:
-                    sent_ok, sent_detail = send_to_pane(pane_id, caption)
+                    with released_lock():
+                        sent_ok, sent_detail = send_to_pane(pane_id, caption)
                     if not sent_ok:
                         return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
                     return {"handled": True, "reply": "Voice transcription is off; sent your caption to this pane."}
@@ -13857,7 +13861,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             pass
         outbound = f"{transcript}\n\n{caption}" if caption else transcript
-        sent_ok, sent_detail = send_to_pane(pane_id, outbound)
+        with released_lock():
+            sent_ok, sent_detail = send_to_pane(pane_id, outbound)
         if not sent_ok:
             return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
         return {"handled": True, "reply": "Sent your voice message to this pane."}
@@ -13913,6 +13918,10 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             choice = str(awaiting.get("choice") or "").strip()
             select_choice = str(awaiting.get("select_choice") or "").strip()
             visible_choice = str(awaiting.get("visible_choice") or "").strip()
+            # NB: this prompt-reply path stays ON the global lock. It targets a pane that is WAITING
+            # for the answer (blocked/idle, not busy), so the send is fast — no need to drop the lock —
+            # and it must preserve awaiting_detail on a FAILED send (clear only on success) so the owner
+            # can retry, which an off-lock commit-before-send would break.
             if visible_choice:
                 if not visible_prompt_matches_awaiting(entry, awaiting):
                     entry.pop("awaiting_detail", None)
@@ -14364,22 +14373,30 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
     deliver_note = ""
     pend = space.get("pending_pick") if isinstance(space.get("pending_pick"), dict) else {}
     rec = pend.get(str(user_id)) if isinstance(pend, dict) else None
+    send_now = False
+    text = ""
     if isinstance(rec, dict):
         pend.pop(str(user_id), None)
         text = str(rec.get("text") or "").strip()
         age = _iso_age_seconds(str(rec.get("set_at") or ""))
-        if text and pane_id and (age is None or age <= ACTIVE_PANE_TTL_SECONDS):
+        send_now = bool(text and pane_id and (age is None or age <= ACTIVE_PANE_TTL_SECONDS))
+    # Commit ALL state (active pane persists; the pending-pick stays consumed) UNDER the lock BEFORE
+    # the off-lock send, so the slow herdr cascade never pins the global lock and there is no post-send
+    # save to clobber a concurrent writer.
+    save_state(state)
+    if send_now:
+        with released_lock():
             try:
                 ok, detail = send_to_pane(pane_id, text)
             except Exception as exc:
-                # send_to_pane shells out (subprocess timeout=8) and can RAISE, e.g.
-                # TimeoutExpired on a stalled pane. Treat a raise as a failed send so
-                # save_state still runs (active pane persists; pending stays consumed)
-                # and the callback still answers (the inline button clears).
+                # send_to_pane shells out (subprocess timeout) and can RAISE, e.g. TimeoutExpired on a
+                # stalled pane. Treat a raise as a failed send so the callback still answers (the inline
+                # button clears); state was already committed above. The try is scoped to the SEND
+                # only — a released_lock re-acquire failure must propagate (abort the turn) rather than
+                # be swallowed here and let the tail run without the lock.
                 ok, detail = False, sanitize_text(str(exc), 200)
-            delivered = ok
-            deliver_note = sanitize_text(detail, 200) if ok else ""
-    save_state(state)
+        delivered = ok
+        deliver_note = sanitize_text(detail, 200) if ok else ""
     label = str((managed_bot_specs().get(managed_bot_kind_for_entry(entry or {})) or {}).get("label")
                 or (entry or {}).get("agent") or "pane")
     mins = max(1, ACTIVE_PANE_TTL_SECONDS // 60)
@@ -14707,6 +14724,8 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     outbound = str(option.get("send_text") if "send_text" in option else choice_number).strip()
     if not outbound:
         return {"handled": True, "answer": "This choice needs details.", "show_alert": True}
+    # NB: stays ON the global lock (like the detail-reply path) — it targets a pane waiting for the
+    # answer (fast send) and must preserve awaiting_detail on a FAILED send (clear only on success).
     ok, detail = send_to_pane(pane_id, outbound)
     if not ok:
         return {"handled": True, "answer": f"Send failed: {detail}", "show_alert": True}
@@ -14760,7 +14779,53 @@ def probe_rich(thread_id: str | None = None) -> dict[str, Any]:
     return {"ok": bool(result.get("ok")), "format": result.get("format"), "message_id": message_id, "deleted": deleted}
 
 
+# --- inbound delivery off the global lock ------------------------------------
+#
+# command/callback/event/sync all run under ONE global fcntl lock (with_lock). The slow part of an
+# inbound command is send_to_pane()'s herdr CLI cascade, which touches the herdr pane ONLY — never
+# state.json. So we DROP the lock for exactly that send window and re-acquire after, bounding how long
+# a send to a BUSY pane can pin the lock (which otherwise stalls the 30s timer sync and every other
+# inbound command). Invariant: each inbound runs in its own single-threaded `herdres command`
+# subprocess, so a module-global held fd is sufficient (no threadlocal). Caller rule: commit ALL state
+# mutations + save_state UNDER the lock BEFORE entering released_lock(); never save the pre-send
+# in-memory state after the lock was dropped. (Escape hatch, unused today: if a post-send write is ever
+# truly required, re-load state fresh + re-find the entry by key + apply only that delta + save.)
+_HELD_LOCK_FD: int | None = None
+_LOCK_RELEASE_DEPTH = 0
+
+
+class _ReleasedLock:
+    """Drop the global fcntl lock (if held) for the `with` body, then re-acquire it on exit. A no-op
+    when no lock is held (command_reply called directly in tests) or when already nested inside another
+    released window (the depth guard prevents a double-unlock)."""
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+
+    def __enter__(self) -> "_ReleasedLock":
+        global _LOCK_RELEASE_DEPTH
+        if _HELD_LOCK_FD is not None and _LOCK_RELEASE_DEPTH == 0:
+            self._fd = _HELD_LOCK_FD
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            _LOCK_RELEASE_DEPTH += 1
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        global _LOCK_RELEASE_DEPTH
+        if self._fd is not None:
+            _LOCK_RELEASE_DEPTH -= 1
+            # Re-acquire BLOCKING so the caller resumes holding the lock exactly as before. A failure
+            # (the lock file vanished) propagates and aborts the turn rather than continuing unlocked.
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return False
+
+
+def released_lock() -> "_ReleasedLock":
+    return _ReleasedLock()
+
+
 def with_lock(fn, *, blocking: bool = False):
+    global _HELD_LOCK_FD
     path = lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as lock_fh:
@@ -14769,7 +14834,14 @@ def with_lock(fn, *, blocking: bool = False):
             fcntl.flock(lock_fh.fileno(), flags)
         except BlockingIOError:
             return {"ok": True, "changed": False, "message": "another sync is running"}
-        return fn()
+        # Expose the held fd so released_lock() can drop it around the slow off-lock herdr send.
+        # Save/restore (rather than force None) so a nested with_lock can't strand an outer holder.
+        _prev_held_fd = _HELD_LOCK_FD
+        _HELD_LOCK_FD = lock_fh.fileno()
+        try:
+            return fn()
+        finally:
+            _HELD_LOCK_FD = _prev_held_fd
 
 
 # --- setup wizard ------------------------------------------------------------
