@@ -12,6 +12,21 @@ import unittest
 import urllib.error
 from pathlib import Path
 from unittest.mock import Mock, patch
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(ROOT / "tests") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tests"))
+if "pytest" not in sys.modules:
+    class _PytestMark:
+        def parametrize(self, *args, **kwargs):
+            return lambda func: func
+
+    sys.modules["pytest"] = types.SimpleNamespace(
+        fixture=lambda *args, **kwargs: (lambda func: func),
+        mark=_PytestMark(),
+    )
+
 
 import conftest  # noqa: F401
 import herdres
@@ -2083,11 +2098,17 @@ class GatewayManagedBotTests(unittest.TestCase):
 class DirectOriginCommandMarkerTests(unittest.TestCase):
     DIRECT_ORIGIN_FIELDS = (
         "direct_origin_at",
+        "direct_origin_created_at",
+        "direct_origin_origin",
+        "direct_origin_pane_id",
+        "direct_origin_pane_key",
+        "direct_origin_user_text_hash",
         "direct_origin_text_hash",
         "direct_origin_after_turn_id",
         "direct_origin_turn_id",
         "direct_origin_bound_at",
         "direct_origin_consumed_turn_id",
+        "direct_origin_consumed_user_text_hash",
         "direct_origin_consumed_hash",
         "direct_origin_consumed_at",
     )
@@ -2179,6 +2200,7 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
             "direct_origin_turn_id": "old-turn",
             "direct_origin_bound_at": "2026-01-01T00:00:00+00:00",
             "direct_origin_consumed_turn_id": "old-turn",
+            "direct_origin_consumed_user_text_hash": "old-user-hash",
             "direct_origin_consumed_hash": "old-hash",
             "direct_origin_consumed_at": "2026-01-01T00:00:01+00:00",
         })
@@ -2198,14 +2220,33 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
         self.assertEqual(result["reply"], "")
         send_to_pane.assert_called_once_with("pane-1", "Run direct task.")
         self.assertIn("direct_origin_at", entry)
+        self.assertEqual(entry["direct_origin_created_at"], entry["direct_origin_at"])
+        self.assertEqual(entry["direct_origin_origin"], "send")
+        self.assertEqual(entry["direct_origin_pane_id"], "pane-1")
+        self.assertEqual(entry["direct_origin_pane_key"], "pane-1")
+        self.assertEqual(entry["direct_origin_user_text_hash"], herdres.stream_text_hash("Run direct task."))
         self.assertEqual(entry["direct_origin_text_hash"], herdres.stream_text_hash("Run direct task."))
         self.assertEqual(entry["direct_origin_after_turn_id"], "turn-before")
         self.assertNotIn("direct_origin_turn_id", entry)
         self.assertNotIn("direct_origin_bound_at", entry)
         self.assertNotIn("direct_origin_consumed_turn_id", entry)
+        self.assertNotIn("direct_origin_consumed_user_text_hash", entry)
         self.assertNotIn("direct_origin_consumed_hash", entry)
         self.assertNotIn("direct_origin_consumed_at", entry)
         self.assertTrue(save_state.called)
+
+    def test_command_reply_successful_plain_reply_sets_plain_origin(self) -> None:
+        state = self._state()
+        entry = state["panes"]["pane-1"]
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with self._command_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(self._payload(text="Run direct task."))
+
+        self.assertTrue(result["handled"])
+        send_to_pane.assert_called_once_with("pane-1", "Run direct task.")
+        self.assertEqual(entry["direct_origin_origin"], "plain")
+        self.assertEqual(entry["direct_origin_user_text_hash"], herdres.stream_text_hash("Run direct task."))
 
     def test_command_reply_failed_direct_send_does_not_set_marker(self) -> None:
         state = self._state()
@@ -2224,6 +2265,8 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
         cases = (
             ("forwarded", self._state(), self._payload(forwarded=True)),
             ("non_owner", self._state(), self._payload(user_id="99")),
+            ("bot_origin", self._state(), self._payload(from_bot=True)),
+            ("edited", self._state(), self._payload(edited=True)),
             (
                 "ambiguous",
                 self._state(panes=2),
