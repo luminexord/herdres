@@ -1506,7 +1506,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 if not final_text and not plan_text:
                     final_text = last_assistant_text
                 final_text = _codex_final_with_plan(final_text, plan_text)
-                if final_text and current_user_text:
+                if final_text:
                     turn = {
                         "available": True,
                         "pane_id": pane_id,
@@ -1527,6 +1527,11 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                             turn["worklog_text"] = worklog
                     completed.append(turn)
                 open_turn = False
+                current_turn_id = ""
+                current_started_at = None
+                current_user_text = ""
+                last_assistant_text = ""
+                worklog_parts = []
                 codex_plan_text = ""
                 codex_plan_delta_parts = []
                 continue
