@@ -121,7 +121,7 @@ Reply contract (stdout JSON):
 
 ## macOS vs Linux split
 
-- **Linux/systemd**: `install-user.sh` + `systemd/user/*`. Reconcile timer (`herdres.timer`, 60s) + optional `herdres-gateway.service`. Inbound traditionally via the Hermes bridge (`herdr_topic_bridge.py`).
+- **Linux/systemd**: `install-user.sh` + `systemd/user/*`. Reconcile timer (`herdres.timer`, 30s) + optional `herdres-gateway.service`. Inbound traditionally via the Hermes bridge (`herdr_topic_bridge.py`).
 - **macOS/launchd**: `install-macos.sh` + `launchd/*`. Reconcile timer (`com.gaijinjoe.herdres`, 5s) + `com.gaijinjoe.herdres-gateway` (the managed-bots gateway) + optional `com.gaijinjoe.herdres-cockpit` (Tailscale Mini App). The standalone gateway replaces the Hermes bridge.
 
 When editing install scripts or service templates, keep both platforms in sync where the behavior is equivalent.
