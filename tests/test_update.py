@@ -86,6 +86,7 @@ class _SubprocessRouter:
         # Version reported by `git show <ref>:herdres.py` for --check; None => the
         # `git show` "fails" (no upstream), exercising the needs-upstream path.
         self.remote_version = "9.9.9"
+        self.enabled_units = {"herdres.timer": "enabled", "herdres-gateway.service": "enabled"}
         # `systemctl --user is-active herdres-gateway.service` result. "active" by
         # default; flip to "inactive" to simulate a silently-failed re-enable.
         self.gateway_active = "active"
@@ -120,21 +121,20 @@ class _SubprocessRouter:
             elif argv[-1] == "sync":
                 rc = self.sync_returncode
         elif argv[0] in {"systemctl", "launchctl"}:
-            # is-enabled -> "enabled" so the unit is treated as active.
             if "is-enabled" in argv:
-                stdout = "enabled\n"
+                state = self.enabled_units.get(str(argv[-1]), "disabled")
+                stdout = state + "\n"
+                rc = 0 if state in {"enabled", "static", "linked", "enabled-runtime"} else 1
             elif "is-active" in argv:
                 stdout = self.gateway_active + "\n"
                 rc = 0 if self.gateway_active == "active" else 3
-            elif (
-                self.flip_gateway_inactive_on_enable
-                and "enable" in argv
-                and "herdres-gateway.service" in argv
-            ):
-                # One-shot: the apply restart's re-enable silently fails.
-                self.gateway_active = "inactive"
-                self.flip_gateway_inactive_on_enable = False
-            # Every other systemctl/launchctl mutation "succeeds" (rc stays 0).
+            elif "disable" in argv:
+                self.enabled_units[str(argv[-1])] = "disabled"
+            elif "enable" in argv:
+                self.enabled_units[str(argv[-1])] = "enabled"
+                if self.flip_gateway_inactive_on_enable and "herdres-gateway.service" in argv:
+                    self.gateway_active = "inactive"
+                    self.flip_gateway_inactive_on_enable = False
         return subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr="")
 
 
@@ -365,6 +365,18 @@ class EdgeApplyTests(UpdateTestBase):
         enable_idx = next(i for i, c in enumerate(flat) if "enable --now herdres-gateway" in c)
         self.assertLess(reload_idx, disable_idx)
         self.assertLess(disable_idx, enable_idx)
+
+    def test_update_enables_disabled_timer_fallback(self):
+        self._seed_installed()
+        self.router.enabled_units["herdres.timer"] = "disabled"
+
+        result = herdres.update_once(_args(repo=str(self.repo)))
+
+        self.assertTrue(result["ok"], result)
+        timer_calls = [c for c in self.router.calls if c[0] == "systemctl" and c[-1] == "herdres.timer"]
+        self.assertIn(["systemctl", "--user", "is-enabled", "herdres.timer"], timer_calls)
+        self.assertIn(["systemctl", "--user", "enable", "--now", "herdres.timer"], timer_calls)
+        self.assertNotIn(["systemctl", "--user", "restart", "herdres.timer"], timer_calls)
 
 
 class NoRestartTests(UpdateTestBase):

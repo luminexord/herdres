@@ -15906,13 +15906,15 @@ def _gateway_is_active() -> bool:
 
 
 def _restart_services() -> list[str]:
-    """Reload + restart the timer and re-lease the gateway. Returns actions taken.
+    """Reload + ensure timer fallback + re-lease the gateway. Returns actions taken.
 
-    Linux/systemd: daemon-reload; restart herdres.timer; gateway is disabled then
-    re-enabled (disable --now then enable --now) so the single getUpdates lease is
-    released before the new process grabs it. macOS/launchd: bootout then bootstrap
-    the herdres + gateway + cockpit agents. Only units currently active/loaded are
-    touched.
+    Linux/systemd: daemon-reload; restart herdres.timer when enabled, otherwise
+    enable --now it so outbound sync keeps its periodic fallback. The gateway is
+    disabled then re-enabled (disable --now then enable --now) so the single
+    getUpdates lease is released before the new process grabs it. macOS/launchd:
+    bootout then bootstrap the herdres + gateway + cockpit agents. Gateway
+    service state remains operator-controlled; the timer is outbound-only and
+    safe beside gateway polling.
 
     Gateway-health guard: if the gateway was active BEFORE the restart but is not
     active after it (e.g. a silently-failed re-enable), raise BridgeError so callers
@@ -15948,6 +15950,14 @@ def _restart_services() -> list[str]:
             capture_output=True, text=True, check=False,
         )
         actions.append("systemctl --user restart herdres.timer")
+    else:
+        enable_timer = subprocess.run(
+            ["systemctl", "--user", "enable", "--now", "herdres.timer"],
+            capture_output=True, text=True, check=False,
+        )
+        actions.append("systemctl --user enable --now herdres.timer")
+        if enable_timer.returncode != 0:
+            actions.append(f"WARNING: timer enable exited {enable_timer.returncode}")
     if _systemd_unit_active("herdres-gateway.service"):
         # disable --now releases the getUpdates lease, enable --now re-acquires it.
         subprocess.run(
@@ -16393,7 +16403,7 @@ def _apply_from_source(
     if no_restart:
         warnings.append(
             "services not restarted (--no-restart): run 'systemctl --user daemon-reload "
-            "&& systemctl --user restart herdres.timer' and re-enable the gateway to apply"
+            "&& systemctl --user enable --now herdres.timer' and re-enable the gateway to apply"
         )
     if warnings:
         result["warnings"] = warnings
@@ -16438,7 +16448,7 @@ def _update_stable(args: Any, *, no_restart: bool) -> dict[str, Any]:
             if _platform_is_macos()
             else [
                 "systemctl --user daemon-reload",
-                "systemctl --user restart herdres.timer",
+                "systemctl --user enable --now herdres.timer (or restart if already enabled)",
                 "systemctl --user disable --now then enable --now herdres-gateway.service",
             ]
         )
@@ -16574,7 +16584,7 @@ def update_once(args: Any) -> dict[str, Any]:
             if _platform_is_macos()
             else [
                 "systemctl --user daemon-reload",
-                "systemctl --user restart herdres.timer",
+                "systemctl --user enable --now herdres.timer (or restart if already enabled)",
                 "systemctl --user disable --now then enable --now herdres-gateway.service",
             ]
         )

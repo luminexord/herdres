@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import herdres
 import herdr_turn_adapter as adapter
 from conftest import write_jsonl
 
@@ -61,6 +62,44 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["turn_id"], "turn-1")
         self.assertEqual(turn["user_text"], "<literal> What happened?")
         self.assertEqual(turn["assistant_final_text"], "Final answer only.")
+
+
+    def test_codex_includes_automatic_continuation_complete_without_user_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-a", "started_at": 1}},
+                    {"type": "response_item", "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "first prompt"}]}},
+                    {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-a",
+                        "completed_at": 2, "last_agent_message": "first answer"}},
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-b", "started_at": 3}},
+                    {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-b",
+                        "completed_at": 4, "last_agent_message": "automatic final"}},
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-c", "started_at": 5}},
+                    {"type": "response_item", "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "next prompt"}]}},
+                ],
+            )
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertEqual(turn["turn_id"], "turn-b")
+        self.assertEqual(turn["user_text"], "")
+        self.assertEqual(turn["assistant_final_text"], "automatic final")
+        self.assertEqual(turn["completed_at"], 4)
+        self.assertTrue(turn["has_open_turn"])
+        self.assertEqual(turn["open_turn_id"], "turn-c")
+        self.assertEqual(turn["open_user_text"], "next prompt")
+        self.assertEqual([t["turn_id"] for t in turn["recent_turns"]], ["turn-a", "turn-b"])
+        self.assertEqual(turn["recent_turns"][1]["user_text"], "")
+
+        item = herdres.select_turn_feed_item(turn, {"last_clean_item": {"turn_id": "turn-a"}})
+        assert item is not None
+        self.assertEqual(item["turn_id"], "turn-b")
+        self.assertEqual(item["assistant_final_text"], "automatic final")
+        self.assertNotIn(herdres.USER_PROMPT_LABEL, item["text"])
 
     def test_codex_proposed_plan_only_becomes_final_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
