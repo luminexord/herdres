@@ -646,7 +646,9 @@ HERDR_TELEGRAM_TOPICS_PLUGIN_EVENTS=1
 HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_SECONDS=4
 HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_INTERVAL=0.75
 HERDR_TELEGRAM_TOPICS_DUPLICATE_DELETE_LIMIT=12
+HERDRES_TENDWIRE_MODE=off
 HERDRES_TENDWIRE_HYBRID=0
+HERDRES_TENDWIRE_SNAPSHOT=0
 HERDRES_TENDWIRE_BIN=tendwire
 HERDRES_TENDWIRE_TIMEOUT_SECONDS=5
 HERDRES_TENDWIRE_FALLBACK_HERDR=1
@@ -703,6 +705,18 @@ HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD=1
 HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS=0
 HERDR_TELEGRAM_TOPICS_DRY_RUN=0
 ```
+
+Tendwire modes:
+
+| `HERDRES_TENDWIRE_MODE` | PR0 behavior |
+| --- | --- |
+| `off` | Default. Disables Tendwire calls and enrichment. |
+| `enrich` | Enables the current safe enrichment path. Herdres still reads real Herdr panes directly with `pane_list()`, preserves real `pane_id` values, and Tendwire only adds metadata/status to unambiguous real-pane matches. |
+| `commands` | Recognized reserved migration label; safe no-op in PR0. |
+| `source-read` | Recognized reserved migration label; safe no-op in PR0. |
+| `source` | Recognized reserved migration label; safe no-op in PR0. |
+
+Invalid mode values warn and fall back to `off`; they never enable Tendwire behavior. When `HERDRES_TENDWIRE_MODE` is unset, legacy `HERDRES_TENDWIRE_HYBRID=1` or `HERDRES_TENDWIRE_SNAPSHOT=1` aliases to `enrich`. Those legacy names remain compatibility aliases, not the public Tendwire mental model.
 
 ## Probe
 
