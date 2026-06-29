@@ -70,12 +70,13 @@ class TendwireModeTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_MODE": raw}), expected)
 
-    def test_reserved_modes_do_not_enable_enrichment(self) -> None:
+    def test_command_capable_modes_still_enable_enrichment(self) -> None:
         for mode in ("commands", "source-read", "source"):
             with self.subTest(mode=mode), patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": mode}, clear=True):
                 self.assertEqual(herdres.tendwire_mode(), mode)
-                self.assertFalse(herdres.tendwire_enrich_enabled())
-                self.assertFalse(herdres.tendwire_snapshot_enabled())
+                self.assertTrue(herdres.tendwire_enrich_enabled())
+                self.assertTrue(herdres.tendwire_snapshot_enabled())
+                self.assertTrue(herdres.tendwire_commands_enabled())
 
     def test_legacy_aliases_normalize_to_enrich_when_mode_unset(self) -> None:
         self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_HYBRID": "1"}), "enrich")
@@ -84,6 +85,13 @@ class TendwireModeTests(unittest.TestCase):
             herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_HYBRID": "0", "HERDRES_TENDWIRE_SNAPSHOT": "0"}),
             "off",
         )
+
+    def test_legacy_aliases_do_not_enable_command_routing(self) -> None:
+        for key in ("HERDRES_TENDWIRE_HYBRID", "HERDRES_TENDWIRE_SNAPSHOT"):
+            with self.subTest(key=key), patch.dict(os.environ, {key: "1"}, clear=True):
+                self.assertEqual(herdres.tendwire_mode(), "enrich")
+                self.assertTrue(herdres.tendwire_enrich_enabled())
+                self.assertFalse(herdres.tendwire_commands_enabled())
 
     def test_explicit_valid_mode_wins_over_legacy_aliases(self) -> None:
         env = {
@@ -107,8 +115,8 @@ class TendwireModeTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_MODE": invalid}), "off")
 
-    def test_off_reserved_and_invalid_modes_do_not_call_tendwire(self) -> None:
-        for mode in ("off", "commands", "source-read", "source", "hybrid"):
+    def test_off_and_invalid_modes_do_not_call_tendwire(self) -> None:
+        for mode in ("off", "hybrid"):
             with self.subTest(mode=mode), \
                     patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": mode}, clear=True), \
                     patch.object(herdres, "run_cmd") as run_cmd, \
@@ -121,6 +129,25 @@ class TendwireModeTests(unittest.TestCase):
             self.assertEqual([pane["pane_id"] for pane in panes], ["pane-1"])
             self.assertNotIn("_tendwire_enriched", panes[0])
             self.assertFalse(str(panes[0]["pane_id"]).startswith("tendwire:"))
+
+    def test_command_capable_modes_call_tendwire_snapshot_for_enrichment(self) -> None:
+        for mode in ("commands", "source-read", "source"):
+            proc = subprocess.CompletedProcess(
+                ["tendwire", "snapshot", "--json"],
+                0,
+                stdout=json.dumps(_snapshot()),
+                stderr="",
+            )
+            with self.subTest(mode=mode), \
+                    patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": mode}, clear=True), \
+                    patch.object(herdres, "run_cmd", return_value=proc) as run_cmd, \
+                    patch.object(herdres, "pane_list", return_value=[_pane()]):
+                panes = herdres.observed_agent_panes()
+
+            run_cmd.assert_called_once()
+            self.assertEqual([pane["pane_id"] for pane in panes], ["pane-1"])
+            self.assertTrue(panes[0]["_tendwire_enriched"])
+            self.assertEqual(panes[0]["_tendwire_worker_id"], "worker-1")
 
 
 class TendwireConfigTests(unittest.TestCase):
@@ -396,9 +423,16 @@ class TendwireHybridTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         prefetch.assert_called_once_with(["pane-1"])
 
-    def test_tendwire_enriched_entry_send_uses_real_pane_id(self) -> None:
-        entry = {"source": "herdr", "tendwire_worker_id": "worker-1", "pane_id": "pane-1"}
-        with patch.object(herdres, "send_to_pane", return_value=(True, "queued")) as send_to_pane, \
+    def test_enrich_mode_tendwire_enriched_entry_send_uses_real_pane_id(self) -> None:
+        entry = {
+            "source": "herdr",
+            "tendwire_worker_id": "worker-1",
+            "tendwire_fingerprint": "fp-1",
+            "pane_id": "pane-1",
+        }
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "enrich"}, clear=True), \
+                patch.object(herdres, "send_to_pane", return_value=(True, "queued")) as send_to_pane, \
+                patch.object(herdres, "tendwire_command") as tendwire_command, \
                 patch.object(herdres, "save_state") as save_state:
             result = herdres.forward_text_to_pane_response(
                 "pane-1",
@@ -408,6 +442,7 @@ class TendwireHybridTests(unittest.TestCase):
             )
 
         send_to_pane.assert_called_once_with("pane-1", "continue")
+        tendwire_command.assert_not_called()
         save_state.assert_called_once()
         self.assertEqual(result["reply"], "queued")
 

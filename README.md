@@ -656,6 +656,7 @@ HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS=1.0
 # HERDRES_TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.sqlite3
 # HERDRES_TENDWIRE_HOST_ID=
 HERDRES_TENDWIRE_FALLBACK_HERDR=1
+HERDRES_TENDWIRE_DIRECT_FALLBACK=0
 HERDR_TELEGRAM_TOPICS_MAX_CREATES=3
 HERDR_TELEGRAM_TOPICS_MAX_SENDS=8
 HERDR_TELEGRAM_TOPICS_MAX_STATUS_MARKERS=8
@@ -712,15 +713,19 @@ HERDR_TELEGRAM_TOPICS_DRY_RUN=0
 
 Tendwire modes:
 
-| `HERDRES_TENDWIRE_MODE` | PR0 behavior |
+| `HERDRES_TENDWIRE_MODE` | Behavior |
 | --- | --- |
 | `off` | Default. Disables Tendwire calls and enrichment. |
 | `enrich` | Enables the current safe enrichment path. Herdres still reads real Herdr panes directly with `pane_list()`, preserves real `pane_id` values, and Tendwire only adds metadata/status to unambiguous real-pane matches. |
-| `commands` | Recognized reserved migration label; safe no-op in PR0. |
-| `source-read` | Recognized reserved migration label; safe no-op in PR0. |
-| `source` | Recognized reserved migration label; safe no-op in PR0. |
+| `commands` | Keeps real-pane enrichment, then routes normal Telegram text for Tendwire-enriched entries through `tendwire command --json` using the worker id and fingerprint. Entries without Tendwire metadata still use the legacy direct Herdr send path. |
+| `source-read` | Keeps the same enrichment and command-routing behavior as `commands`; source-read behavior itself is not implemented in Herdres. |
+| `source` | Keeps the same enrichment and command-routing behavior as `commands`; source/outbox behavior itself is not implemented in Herdres. |
 
 Invalid mode values warn and fall back to `off`; they never enable Tendwire behavior. When `HERDRES_TENDWIRE_MODE` is unset, legacy `HERDRES_TENDWIRE_HYBRID=1` or `HERDRES_TENDWIRE_SNAPSHOT=1` aliases to `enrich`. Those legacy names remain compatibility aliases, not the public Tendwire mental model.
+
+In `commands` mode and higher, if an enriched real pane has a worker id and fingerprint, Herdres does not direct-send the instruction to Herdr after selecting Tendwire command routing. Stale/ambiguous Tendwire command failures and malformed Tendwire CLI responses fail closed with a safe Telegram note. If an entry has partial Tendwire metadata, such as a worker id without a fingerprint, Herdres also fails closed. `HERDRES_TENDWIRE_DIRECT_FALLBACK=1` is an emergency operator override that allows direct Herdr fallback; it defaults off.
+
+`/send!` is not routed through Tendwire in this phase. For command-mode enriched entries it fails closed because Tendwire interrupt semantics are not represented here yet; use `/send` or interrupt directly in Herdr. Non-enriched entries and `enrich` mode keep the existing `/send!` Herdr interrupt path.
 
 Tendwire config:
 
@@ -729,6 +734,7 @@ Tendwire config:
 - `HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS` defaults to `1.0` and is passed to Tendwire as `TENDWIRE_HERDR_TIMEOUT_SECONDS`; it should stay below the outer timeout.
 - `TENDWIRE_HERDR_BIN` is set for Tendwire from `HERDR_REAL_BIN` when present, otherwise `HERDR_BIN`, otherwise `herdr`.
 - `HERDRES_TENDWIRE_DATA_DIR`, `HERDRES_TENDWIRE_DB_PATH`, and `HERDRES_TENDWIRE_HOST_ID` are optional Herdres-controlled overrides for `TENDWIRE_DATA_DIR`, `TENDWIRE_DB_PATH`, and `TENDWIRE_HOST_ID`. Path values expand `~` and environment variables. Leave them unset to let Tendwire use its own defaults.
+- `HERDRES_TENDWIRE_DIRECT_FALLBACK=1` explicitly permits direct Herdr fallback after Tendwire command routing fails or metadata is partial. Leave it at `0` for normal fail-closed command ownership.
 
 Inspect the resolved Herdres-to-Tendwire config without touching Telegram state:
 

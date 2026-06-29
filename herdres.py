@@ -1821,16 +1821,33 @@ def tendwire_mode() -> str:
     return parse_tendwire_mode(diagnose_invalid=True)
 
 
+def tendwire_mode_at_least(mode: str, env: Any | None = None) -> bool:
+    try:
+        wanted = TENDWIRE_MODE_VALUES.index(str(mode or "").strip().lower())
+    except ValueError:
+        return False
+    current = parse_tendwire_mode(env, diagnose_invalid=(env is None))
+    return TENDWIRE_MODE_VALUES.index(current) >= wanted
+
+
 def tendwire_enrich_enabled() -> bool:
-    return tendwire_mode() == "enrich"
+    return tendwire_mode_at_least("enrich")
 
 
 def tendwire_snapshot_enabled() -> bool:
     return tendwire_enrich_enabled()
 
 
+def tendwire_commands_enabled() -> bool:
+    return tendwire_mode_at_least("commands")
+
+
 def tendwire_fallback_to_herdr_enabled() -> bool:
     return parse_bool_env("HERDRES_TENDWIRE_FALLBACK_HERDR", "1")
+
+
+def tendwire_direct_fallback_enabled() -> bool:
+    return parse_bool_env("HERDRES_TENDWIRE_DIRECT_FALLBACK", "0")
 
 
 def _env_source(env: Any | None = None) -> Any:
@@ -1981,6 +1998,117 @@ def tendwire_snapshot() -> dict[str, Any]:
     if not isinstance(data, dict):
         raise BridgeError("tendwire snapshot returned non-object JSON")
     return data
+
+
+def _json_object_from_stdout(stdout: str, source: str) -> tuple[dict[str, Any] | None, str]:
+    text = str(stdout or "")
+    stripped = text.strip()
+    if not stripped:
+        return None, f"{source} returned empty stdout"
+    try:
+        decoder = json.JSONDecoder()
+        value, idx = decoder.raw_decode(stripped)
+    except json.JSONDecodeError:
+        if stripped[:1] in {"{", "["}:
+            return None, f"{source} returned malformed JSON"
+        return None, f"{source} returned non-JSON stdout"
+    if stripped[idx:].strip():
+        return None, f"{source} returned more than one JSON value"
+    if not isinstance(value, dict):
+        return None, f"{source} returned non-object JSON"
+    return value, ""
+
+
+def tendwire_command(request: dict[str, Any]) -> dict[str, Any]:
+    try:
+        input_text = json.dumps(request, separators=(",", ":")) + "\n"
+        proc = run_cmd(
+            [*tendwire_command_base(), "command", "--json"],
+            timeout=tendwire_timeout_seconds(),
+            input_text=input_text,
+            env=tendwire_child_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "status": "timeout", "error": "tendwire command timed out"}
+    except Exception as exc:
+        return {"ok": False, "status": "subprocess_failed", "error": sanitize_text(str(exc), 300)}
+    if proc.returncode != 0:
+        detail = sanitize_text(proc.stderr or proc.stdout or "tendwire command failed", 500)
+        return {"ok": False, "status": "nonzero_exit", "error": detail}
+    data, error = _json_object_from_stdout(proc.stdout, "tendwire command")
+    if error:
+        status = "malformed_json" if "malformed JSON" in error else "non_json_stdout"
+        if "non-object JSON" in error:
+            status = "non_object_json"
+        return {"ok": False, "status": status, "error": error}
+    return data
+
+
+TENDWIRE_COMMAND_SUCCESS_STATUSES = {"accepted", "queued", "sent", "submitted", "ok", "success"}
+TENDWIRE_COMMAND_FAILURE_STATUSES = {
+    "stale_target",
+    "ambiguous_target",
+    "ambiguous_backend_target",
+    "backend_unavailable",
+    "request_state_uncertain",
+    "backend_unsupported",
+    "backend_failed",
+    "malformed_response",
+    "non_json_stdout",
+    "malformed_json",
+    "non_object_json",
+    "nonzero_exit",
+    "timeout",
+    "subprocess_failed",
+}
+
+
+def _tendwire_response_status(response: dict[str, Any]) -> str:
+    for container in (response, response.get("result") if isinstance(response.get("result"), dict) else {}):
+        for key in ("status", "state", "result_status"):
+            value = str(container.get(key) or "").strip().lower().replace("-", "_")
+            if value:
+                return value
+    return ""
+
+
+def _tendwire_duplicate_payload_matches(response: dict[str, Any]) -> bool:
+    containers = [response]
+    if isinstance(response.get("result"), dict):
+        containers.append(response["result"])
+    for container in containers:
+        for mismatch_key in ("payload_mismatch", "mismatched_payload", "request_mismatch"):
+            if bool(container.get(mismatch_key)):
+                return False
+        for match_key in ("payload_matches", "payload_match", "same_payload", "request_matches"):
+            if container.get(match_key) is True:
+                return True
+    return False
+
+
+def tendwire_command_succeeded(response: dict[str, Any]) -> bool:
+    status = _tendwire_response_status(response)
+    if status == "duplicate_request":
+        return _tendwire_duplicate_payload_matches(response)
+    if status in TENDWIRE_COMMAND_FAILURE_STATUSES:
+        return False
+    if status in TENDWIRE_COMMAND_SUCCESS_STATUSES:
+        return True
+    if response.get("ok") is True and not status:
+        return True
+    return False
+
+
+def tendwire_success_reply(response: dict[str, Any]) -> str:
+    status = _tendwire_response_status(response)
+    if status == "queued":
+        return "Queued for Tendwire worker."
+    message = ""
+    for container in (response, response.get("result") if isinstance(response.get("result"), dict) else {}):
+        message = str(container.get("reply") or container.get("message") or "").strip()
+        if message:
+            break
+    return sanitize_text(message, 300) if message else ""
 
 
 def tendwire_worker_status_for_herdres(status: str) -> str:
@@ -8418,6 +8546,62 @@ def interrupt_and_send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> 
     return send_to_pane(pane_id, text, timeout=timeout, deadline=deadline)
 
 
+def send_direct_text_to_pane_response(
+    pane_id: str,
+    outbound: str,
+    *,
+    state: dict[str, Any] | None = None,
+    entry: dict[str, Any] | None = None,
+    origin: str = "send",
+) -> dict[str, Any]:
+    after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if entry is not None else ""
+    ok, detail = send_to_pane(pane_id, outbound)
+    if not ok:
+        return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
+    if entry is not None and mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin=origin, pane_id=pane_id) and state is not None:
+        save_state(state)
+    # On a normal submit `detail` is empty (silent success); when the agent was
+    # busy it carries the "Queued …" note, which we surface so the sender knows.
+    return {"handled": True, "reply": sanitize_text(detail, 300)}
+
+
+def send_to_tendwire_worker_response(
+    entry: dict[str, Any],
+    text: str,
+    *,
+    state: dict[str, Any] | None = None,
+    origin: str = "send",
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    outbound = str(text or "")
+    pane_id = str(entry.get("pane_id") or "").strip()
+    after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
+    request = build_tendwire_send_instruction_request(
+        entry,
+        outbound,
+        origin=origin,
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+        request_id=request_id,
+    )
+    response = tendwire_command(request)
+    if tendwire_command_succeeded(response):
+        if mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin=origin, pane_id=pane_id) and state is not None:
+            save_state(state)
+        return {"handled": True, "reply": tendwire_success_reply(response)}
+    if tendwire_direct_fallback_enabled():
+        return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
+    return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
+
+
 def interrupt_and_send_response(
     pane_id: str,
     text: str,
@@ -8432,6 +8616,11 @@ def interrupt_and_send_response(
         return {
             "handled": True,
             "reply": "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet.",
+        }
+    if tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) in {"valid", "partial"}:
+        return {
+            "handled": True,
+            "reply": "Tendwire command mode cannot safely interrupt this worker yet; use /send or interrupt in Herdr.",
         }
     after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if entry is not None else ""
     ok, detail = interrupt_and_send_to_pane(pane_id, outbound)
@@ -11705,6 +11894,126 @@ def entry_is_tendwire_source(entry: dict[str, Any] | None) -> bool:
     return str(entry.get("source") or "") == "tendwire" and str(entry.get("pane_id") or "").startswith("tendwire:")
 
 
+TENDWIRE_ENTRY_METADATA_KEYS = (
+    "tendwire_worker_id",
+    "tendwire_fingerprint",
+    "tendwire_status_line",
+    "tendwire_last_seen_at",
+)
+TENDWIRE_SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the target again."
+
+
+def tendwire_entry_metadata_state(entry: dict[str, Any] | None) -> str:
+    if not isinstance(entry, dict) or entry_is_tendwire_source(entry):
+        return "none"
+    has_metadata = any(key in entry for key in TENDWIRE_ENTRY_METADATA_KEYS)
+    if not has_metadata:
+        return "none"
+    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
+    fingerprint = str(entry.get("tendwire_fingerprint") or "").strip()
+    return "valid" if worker_id and fingerprint else "partial"
+
+
+def tendwire_request_component(value: Any, limit: int = 48) -> str:
+    text = sanitize_text(str(value or ""), limit).strip()
+    text = re.sub(r"[^A-Za-z0-9_.:-]+", "-", text).strip(".")
+    return text[:limit] or "none"
+
+
+def tendwire_instruction_text_hash(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def tendwire_instruction_request_id(
+    *,
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+    worker_id: str = "",
+    origin: str = "send",
+    text: str = "",
+) -> str:
+    text_hash = tendwire_instruction_text_hash(text)
+    context = {
+        "source": "telegram",
+        "origin": str(origin or ""),
+        "chat_id": str(chat_id or ""),
+        "topic_id": str(topic_id or ""),
+        "message_id": str(message_id or ""),
+        "reply_to_message_id": str(reply_to_message_id or ""),
+        "callback_message_id": str(callback_message_id or ""),
+        "worker_id": str(worker_id or ""),
+        "text_hash": text_hash,
+    }
+    digest = hashlib.sha256(json.dumps(context, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+    message_component = message_id or callback_message_id or reply_to_message_id or "message"
+    return ":".join((
+        "telegram",
+        tendwire_request_component(chat_id, 32),
+        tendwire_request_component(topic_id, 32),
+        tendwire_request_component(message_component, 32),
+        tendwire_request_component(worker_id, 48),
+        text_hash[:12],
+        digest,
+    ))
+
+
+def build_tendwire_send_instruction_request(
+    entry: dict[str, Any],
+    text: str,
+    *,
+    origin: str = "send",
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
+    fingerprint = str(entry.get("tendwire_fingerprint") or "").strip()
+    final_request_id = request_id or tendwire_instruction_request_id(
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+        worker_id=worker_id,
+        origin=origin,
+        text=text,
+    )
+    params: dict[str, Any] = {
+        "origin": "telegram",
+        "telegram_origin": sanitize_text(str(origin or "send"), 40),
+    }
+    for key, value in (
+        ("pane_id", entry.get("pane_id")),
+        ("pane_key", entry.get("pane_key")),
+        ("chat_id", chat_id),
+        ("topic_id", topic_id),
+        ("message_id", message_id),
+        ("reply_to_message_id", reply_to_message_id),
+        ("callback_message_id", callback_message_id),
+    ):
+        clean = sanitize_text(str(value or ""), 300).strip()
+        if clean:
+            params[key] = clean
+    return {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "request_id": final_request_id,
+        "dry_run": False,
+        "target": {
+            "worker_id": worker_id,
+            "worker_fingerprint": fingerprint,
+        },
+        "instruction": {"text": str(text or "")},
+        "params": params,
+    }
+
+
 def drop_tendwire_source_pane_records(state: dict[str, Any]) -> int:
     panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
     removed: list[dict[str, Any]] = []
@@ -13779,8 +14088,15 @@ def forward_text_to_pane_response(
     state: dict[str, Any] | None = None,
     entry: dict[str, Any] | None = None,
     origin: str = "send",
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+    request_id: str = "",
 ) -> dict[str, Any]:
-    outbound = str(text or "").strip()
+    raw_outbound = str(text or "")
+    outbound = raw_outbound.strip()
     if not outbound:
         return {"handled": True, "reply": usage}
     if entry_is_tendwire_source(entry):
@@ -13788,15 +14104,26 @@ def forward_text_to_pane_response(
             "handled": True,
             "reply": "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet.",
         }
-    after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if entry is not None else ""
-    ok, detail = send_to_pane(pane_id, outbound)
-    if not ok:
-        return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
-    if entry is not None and mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin=origin, pane_id=pane_id) and state is not None:
-        save_state(state)
-    # On a normal submit `detail` is empty (silent success); when the agent was
-    # busy it carries the "Queued …" note, which we surface so the sender knows.
-    return {"handled": True, "reply": sanitize_text(detail, 300)}
+    if tendwire_commands_enabled():
+        metadata_state = tendwire_entry_metadata_state(entry)
+        if metadata_state == "valid" and isinstance(entry, dict):
+            return send_to_tendwire_worker_response(
+                entry,
+                raw_outbound,
+                state=state,
+                origin=origin,
+                chat_id=chat_id,
+                topic_id=topic_id,
+                message_id=message_id,
+                reply_to_message_id=reply_to_message_id,
+                callback_message_id=callback_message_id,
+                request_id=request_id,
+            )
+        if metadata_state == "partial":
+            if tendwire_direct_fallback_enabled():
+                return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
+            return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
+    return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
 
 
 def is_single_live_space_pane(state: dict[str, Any], chat_id: str, topic_id: str) -> bool:
@@ -14663,7 +14990,17 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     if command == "plain" and arg.strip():
                         pend = space.setdefault("pending_pick", {})
                         if isinstance(pend, dict):
-                            pend[str(user_id)] = {"text": arg, "set_at": utc_now()}
+                            pend[str(user_id)] = {
+                                "text": arg,
+                                "set_at": utc_now(),
+                                "request_context": {
+                                    "chat_id": chat_id,
+                                    "topic_id": topic_id,
+                                    "message_id": str(payload.get("message_id") or ""),
+                                    "reply_to_message_id": str(payload.get("reply_to_message_id") or ""),
+                                    "origin": "plain",
+                                },
+                            }
                     save_state(state)
                     space_token = _callback_id(str(space.get("space_key") or ""), "space")[:16]
                     mins = max(1, ACTIVE_PANE_TTL_SECONDS // 60)
@@ -14870,9 +15207,29 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     "handled": True,
                     "reply": "That choice prompt is no longer safe from Telegram. Use /send or answer in Herdr.",
                 }
-            return forward_text_to_pane_response(pane_id, arg, state=state, entry=entry, origin="plain")
+            return forward_text_to_pane_response(
+                pane_id,
+                arg,
+                state=state,
+                entry=entry,
+                origin="plain",
+                chat_id=chat_id,
+                topic_id=topic_id,
+                message_id=str(payload.get("message_id") or ""),
+                reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
+            )
         if resolved_active_entry or implicit or target_bot_kind or is_single_live_space_pane(state, chat_id, topic_id):
-            return forward_text_to_pane_response(pane_id, arg, state=state, entry=entry, origin="plain")
+            return forward_text_to_pane_response(
+                pane_id,
+                arg,
+                state=state,
+                entry=entry,
+                origin="plain",
+                chat_id=chat_id,
+                topic_id=topic_id,
+                message_id=str(payload.get("message_id") or ""),
+                reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
+            )
         return {
             "handled": True,
             "reply": (
@@ -15179,6 +15536,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             usage="Usage: /send <instruction for this pane>",
             state=state,
             entry=entry,
+            origin="send",
+            chat_id=chat_id,
+            topic_id=topic_id,
+            message_id=str(payload.get("message_id") or ""),
+            reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
         )
     if command in ("send!", "interrupt", "isend"):
         return interrupt_and_send_response(pane_id, arg, state=state, entry=entry)
@@ -15227,7 +15589,17 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             # Pathological (e.g. an enormous state path): refuse rather than let
             # send_to_pane silently file-convert and drop the slash-command.
             return {"handled": True, "reply": f"Could not forward /{command}: the command reference is too long."}
-    return forward_text_to_pane_response(pane_id, forward_text, state=state, entry=entry)
+    return forward_text_to_pane_response(
+        pane_id,
+        forward_text,
+        state=state,
+        entry=entry,
+        origin="send",
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=str(payload.get("message_id") or ""),
+        reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
+    )
 
 
 def handle_onboarding_callback(state, telegram, chat_id, topic_id, message_id, space, parts):
@@ -15299,6 +15671,40 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
             if entry_is_tendwire_source(entry):
                 blocked_send = True
                 deliver_note = "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet."
+            elif tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) == "valid" and isinstance(entry, dict):
+                ctx = rec.get("request_context") if isinstance(rec.get("request_context"), dict) else {}
+                result = send_to_tendwire_worker_response(
+                    entry,
+                    text,
+                    origin=str(ctx.get("origin") or "plain"),
+                    chat_id=str(ctx.get("chat_id") or chat_id),
+                    topic_id=str(ctx.get("topic_id") or topic_id),
+                    message_id=str(ctx.get("message_id") or ""),
+                    reply_to_message_id=str(ctx.get("reply_to_message_id") or ""),
+                    callback_message_id=message_id,
+                    request_id=str(rec.get("request_id") or ""),
+                )
+                reply = sanitize_text(str(result.get("reply") or ""), 200)
+                if reply == TENDWIRE_SAFE_SEND_FAILURE_REPLY or reply.startswith("Send failed:"):
+                    blocked_send = True
+                    deliver_note = reply or TENDWIRE_SAFE_SEND_FAILURE_REPLY
+                else:
+                    delivered = True
+                    deliver_note = reply
+            elif tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) == "partial":
+                if tendwire_direct_fallback_enabled():
+                    after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if isinstance(entry, dict) else ""
+                    try:
+                        ok, detail = send_to_pane(pane_id, text)
+                    except Exception as exc:
+                        ok, detail = False, sanitize_text(str(exc), 200)
+                    delivered = ok
+                    deliver_note = sanitize_text(detail, 200) if ok else ""
+                    if ok and isinstance(entry, dict):
+                        mark_direct_origin_send(entry, text, after_turn_id=after_turn_id, origin="plain", pane_id=pane_id)
+                else:
+                    blocked_send = True
+                    deliver_note = TENDWIRE_SAFE_SEND_FAILURE_REPLY
             else:
                 after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if isinstance(entry, dict) else ""
                 try:
@@ -15318,7 +15724,7 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
                 or (entry or {}).get("agent") or "pane")
     mins = max(1, ACTIVE_PANE_TTL_SECONDS // 60)
     if blocked_send:
-        body = f"Messages here show {label} status. Sending commands through Tendwire is not enabled in Herdres yet."
+        body = deliver_note or f"Messages here show {label} status. Sending commands through Tendwire is not enabled in Herdres yet."
         ans = "Not sent."
     elif delivered:
         body = f"Sent to {label}. Messages here go to {label} for {mins} min (no reply or @ needed)."
@@ -15326,7 +15732,7 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
     else:
         body = f"Messages here go to {label} for {mins} min (no reply or @ needed)."
         ans = f"Sending to {label}."
-    if deliver_note:
+    if deliver_note and not blocked_send:
         body = f"{body}\n\n{deliver_note}"
     try:
         telegram_api("editMessageText", {
