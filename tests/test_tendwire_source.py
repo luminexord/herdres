@@ -4,6 +4,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import unittest
 from unittest.mock import Mock, patch
 
@@ -120,6 +121,159 @@ class TendwireModeTests(unittest.TestCase):
             self.assertEqual([pane["pane_id"] for pane in panes], ["pane-1"])
             self.assertNotIn("_tendwire_enriched", panes[0])
             self.assertFalse(str(panes[0]["pane_id"]).startswith("tendwire:"))
+
+
+class TendwireConfigTests(unittest.TestCase):
+    def test_child_env_preserves_parent_and_overrides_only_tendwire_keys(self) -> None:
+        parent = {
+            "PATH": "/bin:/usr/bin",
+            "HOME": "/tmp/herdres-home",
+            "SSH_AUTH_SOCK": "/tmp/ssh.sock",
+            "DEPLOYMENT_FLAG": "kept",
+            "HERDR_REAL_BIN": "/opt/herdr-real",
+            "HERDR_BIN": "/opt/herdr",
+            "HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS": "2.5",
+            "HERDRES_TENDWIRE_DATA_DIR": "~/tw-data",
+            "HERDRES_TENDWIRE_DB_PATH": "$HOME/tw/db.sqlite",
+            "HERDRES_TENDWIRE_HOST_ID": "host-a",
+            "TENDWIRE_HERDR_BIN": "old-herdr",
+            "TENDWIRE_HERDR_TIMEOUT_SECONDS": "9",
+            "TENDWIRE_DATA_DIR": "old-data",
+            "TENDWIRE_DB_PATH": "old-db",
+            "TENDWIRE_HOST_ID": "old-host",
+        }
+
+        child = herdres.tendwire_child_env(parent)
+
+        self.assertEqual(child["PATH"], parent["PATH"])
+        self.assertEqual(child["HOME"], parent["HOME"])
+        self.assertEqual(child["SSH_AUTH_SOCK"], parent["SSH_AUTH_SOCK"])
+        self.assertEqual(child["DEPLOYMENT_FLAG"], parent["DEPLOYMENT_FLAG"])
+        self.assertEqual(child["TENDWIRE_HERDR_BIN"], "/opt/herdr-real")
+        self.assertEqual(child["TENDWIRE_HERDR_TIMEOUT_SECONDS"], "2.5")
+        self.assertEqual(child["TENDWIRE_DATA_DIR"], "/tmp/herdres-home/tw-data")
+        self.assertEqual(child["TENDWIRE_DB_PATH"], "/tmp/herdres-home/tw/db.sqlite")
+        self.assertEqual(child["TENDWIRE_HOST_ID"], "host-a")
+        changed = {key for key, value in child.items() if parent.get(key) != value}
+        changed.update(key for key in parent if key not in child)
+        self.assertLessEqual(
+            changed,
+            {
+                "TENDWIRE_HERDR_BIN",
+                "TENDWIRE_HERDR_TIMEOUT_SECONDS",
+                "TENDWIRE_DATA_DIR",
+                "TENDWIRE_DB_PATH",
+                "TENDWIRE_HOST_ID",
+            },
+        )
+
+    def test_herdr_bin_precedence_for_tendwire(self) -> None:
+        self.assertEqual(
+            herdres.tendwire_herdr_bin({"HERDR_REAL_BIN": "/real/herdr", "HERDR_BIN": "/configured/herdr"}),
+            "/real/herdr",
+        )
+        self.assertEqual(herdres.tendwire_herdr_bin({"HERDR_BIN": "/configured/herdr"}), "/configured/herdr")
+        self.assertEqual(herdres.tendwire_herdr_bin({}), "herdr")
+
+    def test_invalid_inner_timeout_falls_back_to_default(self) -> None:
+        for raw in ("nope", "0", "-2", "nan", "inf"):
+            with self.subTest(raw=raw):
+                env = {"HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS": raw}
+                self.assertEqual(herdres.tendwire_herdr_timeout_seconds(env), 1.0)
+                self.assertEqual(herdres.tendwire_env_overrides(env)["TENDWIRE_HERDR_TIMEOUT_SECONDS"], "1.0")
+
+    def test_optional_tendwire_values_are_passed_only_when_configured(self) -> None:
+        parent = {
+            "PATH": "/bin",
+            "TENDWIRE_DATA_DIR": "old-data",
+            "TENDWIRE_DB_PATH": "old-db",
+            "TENDWIRE_HOST_ID": "old-host",
+        }
+
+        child = herdres.tendwire_child_env(parent)
+        overrides = herdres.tendwire_env_overrides(parent)
+
+        self.assertNotIn("TENDWIRE_DATA_DIR", child)
+        self.assertNotIn("TENDWIRE_DB_PATH", child)
+        self.assertNotIn("TENDWIRE_HOST_ID", child)
+        self.assertNotIn("TENDWIRE_DATA_DIR", overrides)
+        self.assertNotIn("TENDWIRE_DB_PATH", overrides)
+        self.assertNotIn("TENDWIRE_HOST_ID", overrides)
+
+    def test_tendwire_command_base_expands_path_like_executable_and_preserves_args(self) -> None:
+        env = {
+            "HOME": "/tmp/herdres-home",
+            "HERDRES_TENDWIRE_BIN": "~/bin/tendwire --profile local --json-log",
+        }
+
+        self.assertEqual(
+            herdres.tendwire_command_base(env),
+            ["/tmp/herdres-home/bin/tendwire", "--profile", "local", "--json-log"],
+        )
+
+    def test_tendwire_snapshot_passes_explicit_child_env(self) -> None:
+        proc = subprocess.CompletedProcess(["tendwire", "snapshot", "--json"], 0, stdout=json.dumps(_snapshot()), stderr="")
+        env = {
+            "HERDRES_TENDWIRE_MODE": "enrich",
+            "HERDR_REAL_BIN": "/opt/herdr-real",
+            "HERDR_BIN": "/opt/herdr",
+            "HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS": "1.5",
+            "HERDRES_TENDWIRE_TIMEOUT_SECONDS": "4",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(herdres, "run_cmd", return_value=proc) as run_cmd:
+            data = herdres.tendwire_snapshot()
+
+        self.assertEqual(data["host_id"], "host-1")
+        run_cmd.assert_called_once()
+        self.assertEqual(run_cmd.call_args.args[0], ["tendwire", "snapshot", "--json"])
+        self.assertEqual(run_cmd.call_args.kwargs["timeout"], 4)
+        child_env = run_cmd.call_args.kwargs["env"]
+        self.assertEqual(child_env["TENDWIRE_HERDR_BIN"], "/opt/herdr-real")
+        self.assertEqual(child_env["TENDWIRE_HERDR_TIMEOUT_SECONDS"], "1.5")
+
+    def test_diagnostic_config_json_is_valid_and_sanitized(self) -> None:
+        env = {
+            "HOME": "/tmp/herdres-home",
+            "HERDRES_TENDWIRE_MODE": "enrich",
+            "HERDRES_TENDWIRE_BIN": "~/bin/tendwire --profile local",
+            "HERDR_BIN": "/usr/local/bin/herdr",
+            "HERDRES_TENDWIRE_TIMEOUT_SECONDS": "1",
+            "HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS": "2",
+            "HERDRES_TENDWIRE_DATA_DIR": "$HOME/tendwire",
+            "HERDRES_TENDWIRE_DB_PATH": "~/tendwire/db.sqlite",
+            "HERDRES_TENDWIRE_HOST_ID": "host-a",
+            "TELEGRAM_BOT_TOKEN": "123456:" + "A" * 35,
+        }
+        stdout = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(sys, "argv", ["herdres", "tendwire", "config"]), \
+                patch("sys.stdout", stdout):
+            rc = herdres.main()
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        config = payload["config"]
+        for key in (
+            "tendwire_mode",
+            "tendwire_bin",
+            "tendwire_db_path",
+            "tendwire_data_dir",
+            "tendwire_herdr_bin",
+            "tendwire_timeout_seconds",
+            "tendwire_herdr_timeout_seconds",
+        ):
+            self.assertIn(key, config)
+        self.assertEqual(config["tendwire_mode"], "enrich")
+        self.assertEqual(config["tendwire_bin"], "/tmp/herdres-home/bin/tendwire --profile local")
+        self.assertEqual(config["tendwire_data_dir"], "/tmp/herdres-home/tendwire")
+        self.assertEqual(config["tendwire_db_path"], "/tmp/herdres-home/tendwire/db.sqlite")
+        self.assertEqual(config["tendwire_host_id"], "host-a")
+        self.assertEqual(config["tendwire_herdr_bin"], "/usr/local/bin/herdr")
+        self.assertTrue(config["warnings"])
+        text = stdout.getvalue()
+        self.assertNotIn("TELEGRAM_BOT_TOKEN", text)
+        self.assertNotIn(env["TELEGRAM_BOT_TOKEN"], text)
 
 
 class TendwireHybridTests(unittest.TestCase):

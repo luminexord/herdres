@@ -14,6 +14,7 @@ import getpass
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import shlex
@@ -1645,13 +1646,20 @@ def ensure_managed_bot_setup_message(
     return True
 
 
-def run_cmd(args: list[str], *, timeout: int = 10, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+def run_cmd(
+    args: list[str],
+    *,
+    timeout: int = 10,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
         input=input_text,
         text=True,
         capture_output=True,
         timeout=timeout,
+        env=env,
         check=False,
     )
 
@@ -1774,6 +1782,14 @@ def pane_list(deadline: float | None = None) -> list[dict[str, Any]]:
 
 
 TENDWIRE_MODE_VALUES = ("off", "enrich", "commands", "source-read", "source")
+TENDWIRE_OPTIONAL_ENV_KEYS = {
+    "HERDRES_TENDWIRE_DATA_DIR": "TENDWIRE_DATA_DIR",
+    "HERDRES_TENDWIRE_DB_PATH": "TENDWIRE_DB_PATH",
+    "HERDRES_TENDWIRE_HOST_ID": "TENDWIRE_HOST_ID",
+}
+TENDWIRE_OPTIONAL_PATH_KEYS = {"HERDRES_TENDWIRE_DATA_DIR", "HERDRES_TENDWIRE_DB_PATH"}
+TENDWIRE_HERDR_TIMEOUT_DEFAULT = 1.0
+_CONFIG_ENV_VAR_RE = re.compile(r"\$(\w+)|\$\{([^}]+)\}")
 
 
 def _tendwire_bool_env(env: Any, key: str) -> bool:
@@ -1817,24 +1833,145 @@ def tendwire_fallback_to_herdr_enabled() -> bool:
     return parse_bool_env("HERDRES_TENDWIRE_FALLBACK_HERDR", "1")
 
 
-def tendwire_command_base() -> list[str]:
-    raw = os.getenv("HERDRES_TENDWIRE_BIN", "tendwire").strip()
+def _env_source(env: Any | None = None) -> Any:
+    return os.environ if env is None else env
+
+
+def _env_get_str(env: Any, key: str, default: str = "") -> str:
+    value = env.get(key, default)
+    return "" if value is None else str(value)
+
+
+def _expand_config_path(value: str, env: Any | None = None) -> str:
+    source = _env_source(env)
+
+    def repl(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2) or ""
+        replacement = source.get(name)
+        return match.group(0) if replacement is None else str(replacement)
+
+    expanded = _CONFIG_ENV_VAR_RE.sub(repl, str(value))
+    if expanded == "~" or expanded.startswith("~/"):
+        home = _env_get_str(source, "HOME").strip()
+        if home:
+            return home.rstrip("/") + expanded[1:]
+    return os.path.expanduser(expanded)
+
+
+def _tendwire_command_token_path_like(token: str) -> bool:
+    return token.startswith("~") or "/" in token or "\\" in token or "$" in token
+
+
+def tendwire_command_base(env: Any | None = None) -> list[str]:
+    source = _env_source(env)
+    raw = _env_get_str(source, "HERDRES_TENDWIRE_BIN", "tendwire").strip()
     try:
         parts = shlex.split(raw)
     except ValueError:
         parts = []
+    if parts and _tendwire_command_token_path_like(parts[0]):
+        parts[0] = _expand_config_path(parts[0], source)
     return parts or ["tendwire"]
 
 
-def tendwire_timeout_seconds() -> int:
+def tendwire_timeout_seconds(env: Any | None = None) -> int:
+    source = _env_source(env)
     try:
-        return max(1, int(float(os.getenv("HERDRES_TENDWIRE_TIMEOUT_SECONDS", "5"))))
+        return max(1, int(float(_env_get_str(source, "HERDRES_TENDWIRE_TIMEOUT_SECONDS", "5"))))
     except (TypeError, ValueError):
         return 5
 
 
+def tendwire_herdr_bin(env: Any | None = None) -> str:
+    source = _env_source(env)
+    real_bin = _env_get_str(source, "HERDR_REAL_BIN").strip()
+    if real_bin:
+        return real_bin
+    configured = _env_get_str(source, "HERDR_BIN").strip()
+    if configured and "\x00" not in configured:
+        return configured
+    return DEFAULT_HERDR_BIN
+
+
+def tendwire_herdr_timeout_seconds(env: Any | None = None) -> float:
+    source = _env_source(env)
+    try:
+        value = float(_env_get_str(source, "HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS", str(TENDWIRE_HERDR_TIMEOUT_DEFAULT)))
+    except (TypeError, ValueError):
+        return TENDWIRE_HERDR_TIMEOUT_DEFAULT
+    if not math.isfinite(value) or value <= 0:
+        return TENDWIRE_HERDR_TIMEOUT_DEFAULT
+    return value
+
+
+def _tendwire_timeout_env_value(value: float) -> str:
+    return str(float(value))
+
+
+def tendwire_optional_config_value(key: str, env: Any | None = None) -> str | None:
+    source = _env_source(env)
+    raw = source.get(key)
+    if raw is None or str(raw).strip() == "":
+        return None
+    value = str(raw).strip()
+    if key in TENDWIRE_OPTIONAL_PATH_KEYS:
+        return _expand_config_path(value, source)
+    return value
+
+
+def tendwire_env_overrides(env: Any | None = None) -> dict[str, str]:
+    source = _env_source(env)
+    overrides = {
+        "TENDWIRE_HERDR_BIN": tendwire_herdr_bin(source),
+        "TENDWIRE_HERDR_TIMEOUT_SECONDS": _tendwire_timeout_env_value(tendwire_herdr_timeout_seconds(source)),
+    }
+    for herdres_key, tendwire_key in TENDWIRE_OPTIONAL_ENV_KEYS.items():
+        value = tendwire_optional_config_value(herdres_key, source)
+        if value is not None:
+            overrides[tendwire_key] = value
+    return overrides
+
+
+def tendwire_child_env(env: Any | None = None) -> dict[str, str]:
+    source = _env_source(env)
+    child = {str(k): str(v) for k, v in dict(source).items()}
+    for tendwire_key in TENDWIRE_OPTIONAL_ENV_KEYS.values():
+        child.pop(tendwire_key, None)
+    child.update(tendwire_env_overrides(source))
+    return child
+
+
+def tendwire_config_status(env: Any | None = None) -> dict[str, Any]:
+    source = _env_source(env)
+    outer_timeout = tendwire_timeout_seconds(source)
+    herdr_timeout = tendwire_herdr_timeout_seconds(source)
+    warnings: list[str] = []
+    if herdr_timeout >= float(outer_timeout):
+        warnings.append("TENDWIRE_HERDR_TIMEOUT_SECONDS is greater than or equal to the outer Tendwire timeout")
+    return {
+        "tendwire_mode": parse_tendwire_mode(source),
+        "tendwire_bin": shlex.join(tendwire_command_base(source)),
+        "tendwire_db_path": tendwire_optional_config_value("HERDRES_TENDWIRE_DB_PATH", source),
+        "tendwire_data_dir": tendwire_optional_config_value("HERDRES_TENDWIRE_DATA_DIR", source),
+        "tendwire_host_id": tendwire_optional_config_value("HERDRES_TENDWIRE_HOST_ID", source),
+        "tendwire_herdr_bin": tendwire_herdr_bin(source),
+        "tendwire_timeout_seconds": outer_timeout,
+        "tendwire_herdr_timeout_seconds": herdr_timeout,
+        "warnings": warnings,
+    }
+
+
+def tendwire_config_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
+    load_dotenv()
+    return {"ok": True, "config": tendwire_config_status()}
+
+
 def tendwire_snapshot() -> dict[str, Any]:
-    proc = run_cmd([*tendwire_command_base(), "snapshot", "--json"], timeout=tendwire_timeout_seconds())
+    proc = run_cmd(
+        [*tendwire_command_base(), "snapshot", "--json"],
+        timeout=tendwire_timeout_seconds(),
+        env=tendwire_child_env(),
+    )
     if proc.returncode != 0:
         raise BridgeError(sanitize_text(proc.stderr or proc.stdout or "tendwire snapshot failed", 500))
     try:
@@ -16909,6 +17046,9 @@ def main() -> int:
     setup.add_argument("--allowed-users", default="")
     setup.add_argument("--reuse-hermes-token", action="store_true")
     sub.add_parser("version")
+    tendwire = sub.add_parser("tendwire")
+    tendwire_sub = tendwire.add_subparsers(dest="tendwire_cmd", required=True)
+    tendwire_sub.add_parser("config")
     hooks = sub.add_parser("hooks")
     hooks.add_argument("action", nargs="?", default="install", choices=["install"])
     speech = sub.add_parser("speech")
@@ -16962,6 +17102,8 @@ def main() -> int:
             result = setup_once(args)
         elif args.cmd == "version":
             result = version_once(args)
+        elif args.cmd == "tendwire":
+            result = tendwire_config_once(args)
         elif args.cmd == "hooks":
             result = hooks_once(args)
         elif args.cmd == "speech":
