@@ -651,6 +651,10 @@ HERDRES_TENDWIRE_HYBRID=0
 HERDRES_TENDWIRE_SNAPSHOT=0
 HERDRES_TENDWIRE_BIN=tendwire
 HERDRES_TENDWIRE_TIMEOUT_SECONDS=5
+HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS=1.0
+# HERDRES_TENDWIRE_DATA_DIR=~/.local/share/tendwire
+# HERDRES_TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.sqlite3
+# HERDRES_TENDWIRE_HOST_ID=
 HERDRES_TENDWIRE_FALLBACK_HERDR=1
 HERDR_TELEGRAM_TOPICS_MAX_CREATES=3
 HERDR_TELEGRAM_TOPICS_MAX_SENDS=8
@@ -717,6 +721,20 @@ Tendwire modes:
 | `source` | Recognized reserved migration label; safe no-op in PR0. |
 
 Invalid mode values warn and fall back to `off`; they never enable Tendwire behavior. When `HERDRES_TENDWIRE_MODE` is unset, legacy `HERDRES_TENDWIRE_HYBRID=1` or `HERDRES_TENDWIRE_SNAPSHOT=1` aliases to `enrich`. Those legacy names remain compatibility aliases, not the public Tendwire mental model.
+
+Tendwire config:
+
+- `HERDRES_TENDWIRE_BIN` is the Tendwire command base. Herdres parses it with shell-style quoting; when the executable token is path-like, `~` and environment variables are expanded while extra arguments are preserved.
+- `HERDRES_TENDWIRE_TIMEOUT_SECONDS` is Herdres' outer wall-clock timeout for the Tendwire CLI subprocess.
+- `HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS` defaults to `1.0` and is passed to Tendwire as `TENDWIRE_HERDR_TIMEOUT_SECONDS`; it should stay below the outer timeout.
+- `TENDWIRE_HERDR_BIN` is set for Tendwire from `HERDR_REAL_BIN` when present, otherwise `HERDR_BIN`, otherwise `herdr`.
+- `HERDRES_TENDWIRE_DATA_DIR`, `HERDRES_TENDWIRE_DB_PATH`, and `HERDRES_TENDWIRE_HOST_ID` are optional Herdres-controlled overrides for `TENDWIRE_DATA_DIR`, `TENDWIRE_DB_PATH`, and `TENDWIRE_HOST_ID`. Path values expand `~` and environment variables. Leave them unset to let Tendwire use its own defaults.
+
+Inspect the resolved Herdres-to-Tendwire config without touching Telegram state:
+
+```bash
+herdres tendwire config
+```
 
 ## Probe
 
