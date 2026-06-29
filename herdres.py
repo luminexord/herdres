@@ -674,6 +674,8 @@ def load_state() -> dict[str, Any]:
 
 
 def save_state(state, *, mirror_bak=False) -> None:
+    if not isinstance(state, dict) or state.get("version") != 1:
+        raise BridgeError("refusing to save unsupported state schema")
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()

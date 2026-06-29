@@ -268,7 +268,8 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         send_to_pane.assert_not_called()
 
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "commands", "HERDRES_TENDWIRE_DIRECT_FALLBACK": "1"}, clear=True), \
-                patch.object(herdres, "send_to_pane", return_value=(True, "queued")) as send_to_pane:
+                patch.object(herdres, "send_to_pane", return_value=(True, "queued")) as send_to_pane, \
+                patch.object(herdres, "save_state"):
             result = herdres.forward_text_to_pane_response("pane-1", "continue", state={"panes": {}}, entry=entry)
 
         self.assertEqual(result["reply"], "queued")
@@ -280,7 +281,8 @@ class TendwireCommandRoutingTests(unittest.TestCase):
             entry.pop(key, None)
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "commands"}, clear=True), \
                 patch.object(herdres, "send_to_pane", return_value=(True, "queued")) as send_to_pane, \
-                patch.object(herdres, "tendwire_command") as tendwire_command:
+                patch.object(herdres, "tendwire_command") as tendwire_command, \
+                patch.object(herdres, "save_state"):
             result = herdres.forward_text_to_pane_response("pane-1", "continue", state={"panes": {}}, entry=entry)
 
         self.assertEqual(result["reply"], "queued")
