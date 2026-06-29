@@ -1773,8 +1773,44 @@ def pane_list(deadline: float | None = None) -> list[dict[str, Any]]:
     raise BridgeError("unexpected herdr pane list response")
 
 
+TENDWIRE_MODE_VALUES = ("off", "enrich", "commands", "source-read", "source")
+
+
+def _tendwire_bool_env(env: Any, key: str) -> bool:
+    return str(env.get(key, "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _warn_invalid_tendwire_mode(raw: Any) -> None:
+    value = sanitize_text(str(raw), 120)
+    allowed = ", ".join(TENDWIRE_MODE_VALUES)
+    print(f"herdres tendwire warning: invalid HERDRES_TENDWIRE_MODE {value!r}; allowed values: {allowed}; using off", file=sys.stderr)
+
+
+def parse_tendwire_mode(env: Any | None = None, *, diagnose_invalid: bool = False) -> str:
+    source = os.environ if env is None else env
+    raw_mode = source.get("HERDRES_TENDWIRE_MODE")
+    if raw_mode is not None:
+        mode = str(raw_mode).strip().lower()
+        if mode in TENDWIRE_MODE_VALUES:
+            return mode
+        if diagnose_invalid:
+            _warn_invalid_tendwire_mode(raw_mode)
+        return "off"
+    if _tendwire_bool_env(source, "HERDRES_TENDWIRE_HYBRID") or _tendwire_bool_env(source, "HERDRES_TENDWIRE_SNAPSHOT"):
+        return "enrich"
+    return "off"
+
+
+def tendwire_mode() -> str:
+    return parse_tendwire_mode(diagnose_invalid=True)
+
+
+def tendwire_enrich_enabled() -> bool:
+    return tendwire_mode() == "enrich"
+
+
 def tendwire_snapshot_enabled() -> bool:
-    return parse_bool_env("HERDRES_TENDWIRE_HYBRID", os.getenv("HERDRES_TENDWIRE_SNAPSHOT", "0"))
+    return tendwire_enrich_enabled()
 
 
 def tendwire_fallback_to_herdr_enabled() -> bool:
@@ -11070,7 +11106,7 @@ def observed_agent_panes() -> list[dict[str, Any]]:
     all_panes = pane_list()
     include_shells = parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "")
     panes = [pane for pane in all_panes if include_shells or pane.get("agent")]
-    if tendwire_snapshot_enabled():
+    if tendwire_enrich_enabled():
         try:
             panes = tendwire_enrich_panes(panes, tendwire_snapshot())
         except Exception as exc:
