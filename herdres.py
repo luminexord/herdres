@@ -16154,7 +16154,8 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
         text = str(rec.get("text") or "").strip()
         age = _iso_age_seconds(str(rec.get("set_at") or ""))
         if text and pane_id and (age is None or age <= ACTIVE_PANE_TTL_SECONDS):
-            if entry_is_tendwire_source(entry) and not tendwire_source_entry_commands_allowed(entry):
+            source_entry = entry_is_tendwire_source(entry)
+            if source_entry and not tendwire_source_entry_commands_allowed(entry):
                 blocked_send = True
                 deliver_note = "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet."
             elif tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) == "valid" and isinstance(entry, dict):
@@ -16191,6 +16192,9 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
                 else:
                     blocked_send = True
                     deliver_note = TENDWIRE_SAFE_SEND_FAILURE_REPLY
+            elif source_entry:
+                blocked_send = True
+                deliver_note = TENDWIRE_SAFE_SEND_FAILURE_REPLY
             else:
                 after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if isinstance(entry, dict) else ""
                 try:

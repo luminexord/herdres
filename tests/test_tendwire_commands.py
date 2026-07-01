@@ -487,6 +487,42 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         self.assertNotIn("42", space["pending_pick"])
         self.assertEqual(telegram_api.call_args.args[1]["text"], herdres.TENDWIRE_SAFE_SEND_FAILURE_REPLY)
 
+    def test_source_read_agent_picker_missing_metadata_fails_closed(self) -> None:
+        entry = _entry(source="tendwire", pane_id="tendwire:worker-1", agent="codex")
+        for key in herdres.TENDWIRE_ENTRY_METADATA_KEYS:
+            entry.pop(key, None)
+        pane_key = "pane-1"
+        space = {
+            "space_key": "workspace:workspace-1",
+            "pane_keys": [pane_key],
+            "pending_pick": {"42": {"text": "continue", "set_at": herdres.utc_now()}},
+        }
+        state = {"panes": {pane_key: entry}, "spaces": {"workspace:workspace-1": space}}
+        token = herdres.agent_picker_pane_tokens([(pane_key, entry)])[pane_key]
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "run_cmd") as run_cmd, \
+                patch.object(herdres, "send_to_pane", return_value=(True, "")) as send_to_pane, \
+                patch.object(herdres, "save_state") as save_state, \
+                patch.object(herdres, "telegram_api") as telegram_api:
+            result = herdres.handle_agent_pick_callback(
+                state,
+                {},
+                "-1001",
+                "77",
+                "6000",
+                "42",
+                space,
+                ["herdr", "pick", "workspace:workspace-1", token],
+            )
+
+        self.assertEqual(result["answer"], "Not sent.")
+        run_cmd.assert_not_called()
+        send_to_pane.assert_not_called()
+        self.assertNotIn("42", space["pending_pick"])
+        save_state.assert_called_once_with(state)
+        self.assertEqual(telegram_api.call_args.args[1]["text"], herdres.TENDWIRE_SAFE_SEND_FAILURE_REPLY)
+
 
 if __name__ == "__main__":
     unittest.main()
