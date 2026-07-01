@@ -131,7 +131,7 @@ class TendwireModeTests(unittest.TestCase):
             self.assertFalse(str(panes[0]["pane_id"]).startswith("tendwire:"))
 
     def test_command_capable_modes_call_tendwire_snapshot_for_enrichment(self) -> None:
-        for mode in ("commands", "source-read", "source"):
+        for mode in ("commands", "source"):
             proc = subprocess.CompletedProcess(
                 ["tendwire", "snapshot", "--json"],
                 0,
@@ -148,6 +148,31 @@ class TendwireModeTests(unittest.TestCase):
             self.assertEqual([pane["pane_id"] for pane in panes], ["pane-1"])
             self.assertTrue(panes[0]["_tendwire_enriched"])
             self.assertEqual(panes[0]["_tendwire_worker_id"], "worker-1")
+
+    def test_source_read_observed_panes_use_tendwire_snapshot_without_herdr_pane_list(self) -> None:
+        proc = subprocess.CompletedProcess(
+            ["tendwire", "snapshot", "--json"],
+            0,
+            stdout=json.dumps(_snapshot()),
+            stderr="",
+        )
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "run_cmd", return_value=proc) as run_cmd, \
+                patch.object(herdres, "pane_list") as pane_list:
+            panes = herdres.observed_agent_panes()
+
+        pane_list.assert_not_called()
+        run_cmd.assert_called_once()
+        self.assertEqual(len(panes), 1)
+        pane = panes[0]
+        self.assertEqual(pane["pane_id"], "tendwire:worker-1")
+        self.assertEqual(pane["source"], "tendwire")
+        self.assertTrue(pane["_tendwire_source_read"])
+        self.assertTrue(pane["_tendwire_enriched"])
+        self.assertEqual(pane["_tendwire_worker_id"], "worker-1")
+        self.assertEqual(pane["_tendwire_fingerprint"], "fp-1")
+        self.assertEqual(pane["terminal_id"], "")
+        self.assertEqual(pane["summary"], "Working on tests")
 
 
 class TendwireConfigTests(unittest.TestCase):
@@ -422,6 +447,40 @@ class TendwireHybridTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         prefetch.assert_called_once_with(["pane-1"])
+
+    def test_sync_once_source_read_skips_herdr_inventory_helpers(self) -> None:
+        state: dict = {"enabled": True, "panes": {}, "spaces": {}, "telegram": {"chat_id": "-100"}}
+        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "save_state"), \
+                patch.object(herdres, "observed_agent_panes", return_value=[pane]), \
+                patch.object(herdres, "sync_closed_pane_records", return_value={"changed": False, "sent": 0}), \
+                patch.object(herdres, "drop_tendwire_source_pane_records", return_value=1) as drop_stale, \
+                patch.object(herdres, "drain_tendwire_connector_outbox", return_value={"changed": False}), \
+                patch.object(herdres, "workspace_label_map", return_value={"workspace-1": "Workers"}) as labels, \
+                patch.object(herdres, "reconcile_known_gone_spaces", return_value=0), \
+                patch.object(herdres, "prune_orphan_spaces", return_value=0), \
+                patch.object(herdres, "preflight_is_fresh", return_value=True), \
+                patch.object(herdres, "reconcile_pinned_status_views", return_value={"changed": False, "updated": 0}), \
+                patch.object(herdres, "ensure_managed_bot_setup_message", return_value=False), \
+                patch.object(herdres, "ensure_managed_bot_group_access_message", return_value=False), \
+                patch.object(herdres, "ensure_multibot_offer_message", return_value=False), \
+                patch.object(herdres, "prefetch_pane_turns") as prefetch, \
+                patch.object(herdres, "update_topic_icons_for_spaces"), \
+                patch.object(herdres, "sync_pane_once", return_value=False), \
+                patch.object(herdres, "ensure_devin_glm_space_seats") as ensure_devin, \
+                patch.object(herdres, "TURN_FEED_ENABLED", True):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["panes"], 1)
+        self.assertEqual(result["stale_tendwire_pruned"], 0)
+        drop_stale.assert_not_called()
+        labels.assert_not_called()
+        prefetch.assert_not_called()
+        ensure_devin.assert_not_called()
 
     def test_enrich_mode_tendwire_enriched_entry_send_uses_real_pane_id(self) -> None:
         entry = {
