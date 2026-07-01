@@ -388,6 +388,22 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         patched["send_to_pane"].assert_not_called()
         patched["run_cmd"].assert_not_called()
 
+    def test_source_mode_legacy_entry_with_stale_metadata_fails_closed_in_send_helper(self) -> None:
+        entry = _entry(source="herdr", pane_id="pane-1")
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "run_cmd") as run_cmd, \
+                patch.object(herdres, "send_to_pane") as send_to_pane:
+            result = herdres.forward_text_to_pane_response(
+                "pane-1",
+                "continue",
+                state={"panes": {"pane-1": entry}},
+                entry=entry,
+            )
+
+        self.assertIn("legacy Herdr mode", result["reply"])
+        run_cmd.assert_not_called()
+        send_to_pane.assert_not_called()
+
     def test_source_mode_new_and_keys_do_not_call_herdr(self) -> None:
         source_entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", worker_fingerprint="fp-1")
         state = _state(source_entry)

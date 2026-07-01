@@ -14605,6 +14605,11 @@ def forward_text_to_pane_response(
     if not outbound:
         return {"handled": True, "reply": usage}
     source_entry = entry_is_tendwire_source(entry)
+    if tendwire_source_inventory_enabled() and not source_entry:
+        return {
+            "handled": True,
+            "reply": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending.",
+        }
     if source_entry and not tendwire_source_entry_commands_allowed(entry):
         return {
             "handled": True,
