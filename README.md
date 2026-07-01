@@ -657,7 +657,8 @@ HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS=1.0
 # HERDRES_TENDWIRE_HOST_ID=
 HERDRES_TENDWIRE_FALLBACK_HERDR=1
 HERDRES_TENDWIRE_DIRECT_FALLBACK=0
-HERDRES_TENDWIRE_CONNECTOR_OUTBOX=0
+# Leave unset for the mode default: source enables it, earlier modes do not.
+# HERDRES_TENDWIRE_CONNECTOR_OUTBOX=0
 HERDRES_TENDWIRE_CONNECTOR_NAME=attention
 HERDRES_TENDWIRE_CONNECTOR_LIMIT=3
 HERDRES_TENDWIRE_CONNECTOR_LEASE_SECONDS=60
@@ -763,6 +764,114 @@ Inspect the resolved Herdres-to-Tendwire config without touching Telegram state:
 herdres tendwire config
 herdres tendwire outbox --limit 1
 ```
+
+## Tendwire Source Mode Rollout
+
+Use this path when Tendwire should be the source/control plane and Herdres should
+only handle Telegram mapping, formatting, replies, buttons, rate limits, and
+delivery bookkeeping.
+
+1. Run Herdr normally and start a Tendwire daemon with the socket backend and a
+   persistent store:
+
+   ```bash
+   install -d ~/.local/share/tendwire ~/.config/systemd/user
+
+   cat > ~/.config/systemd/user/tendwired.service <<'EOF'
+   [Unit]
+   Description=Tendwire daemon
+   Wants=network-online.target
+   After=network-online.target
+
+   [Service]
+   Type=simple
+   Environment=TENDWIRE_HERDR_BACKEND=socket
+   Environment=TENDWIRE_DB_PATH=%h/.local/share/tendwire/tendwire.sqlite3
+   ExecStart=%h/.local/bin/tendwire daemon --db-path %h/.local/share/tendwire/tendwire.sqlite3
+   Restart=always
+   RestartSec=5s
+
+   [Install]
+   WantedBy=default.target
+   EOF
+
+   systemctl --user daemon-reload
+   systemctl --user enable --now tendwired.service
+   ```
+
+   A non-systemd host can run the same command under launchd, supervisord, or a
+   shell supervisor:
+
+   ```bash
+   TENDWIRE_HERDR_BACKEND=socket \
+     tendwire daemon --db-path ~/.local/share/tendwire/tendwire.sqlite3
+   ```
+
+2. Verify Tendwire before moving Telegram traffic:
+
+   ```bash
+   tendwire doctor --json
+   tendwire snapshot --json --store --db-path ~/.local/share/tendwire/tendwire.sqlite3
+   tendwire store status --db-path ~/.local/share/tendwire/tendwire.sqlite3
+   ```
+
+   Healthy snapshots can be empty during startup, but degraded/unavailable backend
+   health means Herdres source-read/source will preserve the previous Telegram
+   worker inventory instead of closing topics from incomplete data.
+
+3. Run the Herdres Telegram services. The timer performs outbound sync and
+   connector draining; the gateway owns Telegram `getUpdates` for inbound replies
+   and buttons:
+
+   ```bash
+   cp systemd/user/herdres.* ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now herdres.timer herdres-gateway.service
+   ```
+
+   Do not run another long-poll consumer for the same bot token while
+   `herdres-gateway.service` is active.
+
+4. Roll out modes one step at a time in `~/.config/herdres/herdres.env`:
+
+   ```bash
+   HERDRES_TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.sqlite3
+   HERDRES_TENDWIRE_MODE=enrich
+   ```
+
+   - `enrich` keeps legacy direct Herdr sends and only adds Tendwire metadata.
+   - `commands` routes enriched Telegram text/buttons through Tendwire
+     `command.submit`; un-enriched legacy entries still use direct Herdr.
+   - `source-read` renders inventory from Tendwire snapshots, uses Tendwire worker
+     ids/fingerprints instead of pane ids, and keeps the connector outbox off
+     unless `HERDRES_TENDWIRE_CONNECTOR_OUTBOX=1` is set for staging.
+   - `source` is the normal final mode: direct Herdr calls are disabled for normal
+     Telegram behavior, `/keys` is disabled by default, and the Tendwire connector
+     outbox drains unless explicitly set to `0`.
+
+   After changing modes:
+
+   ```bash
+   HERDR_TELEGRAM_TOPICS_DRY_RUN=1 herdres sync
+   herdres tendwire config
+   systemctl --user restart herdres.timer herdres-gateway.service
+   ```
+
+5. Roll back without losing Telegram state by changing only the mode and
+   restarting Herdres:
+
+   ```bash
+   HERDRES_TENDWIRE_MODE=enrich   # keep Tendwire metadata, restore legacy sends
+   # or:
+   HERDRES_TENDWIRE_MODE=off      # pure legacy Herdres/Herdr behavior
+   HERDRES_TENDWIRE_CONNECTOR_OUTBOX=0
+   systemctl --user restart herdres.timer herdres-gateway.service
+   ```
+
+   `off` is the only supported legacy direct mode. Do not keep source/source-read
+   enabled while expecting Herdres to call `pane_list`, `pane_turn`,
+   `send_to_pane`, `herdr pane send-keys`, or `herdr pane read` for normal
+   Telegram behavior.
 
 ## Probe
 
