@@ -131,7 +131,7 @@ class TendwireModeTests(unittest.TestCase):
             self.assertFalse(str(panes[0]["pane_id"]).startswith("tendwire:"))
 
     def test_command_capable_modes_call_tendwire_snapshot_for_enrichment(self) -> None:
-        for mode in ("commands", "source"):
+        for mode in ("commands",):
             proc = subprocess.CompletedProcess(
                 ["tendwire", "snapshot", "--json"],
                 0,
@@ -165,7 +165,11 @@ class TendwireModeTests(unittest.TestCase):
         run_cmd.assert_called_once()
         self.assertEqual(len(panes), 1)
         pane = panes[0]
-        self.assertEqual(pane["pane_id"], "tendwire:worker-1")
+        self.assertEqual(pane["pane_id"], "")
+        self.assertEqual(pane["entry_type"], "worker")
+        self.assertEqual(pane["worker_id"], "worker-1")
+        self.assertEqual(pane["worker_fingerprint"], "fp-1")
+        self.assertFalse(str(pane["pane_id"]).startswith("tendwire:"))
         self.assertEqual(pane["source"], "tendwire")
         self.assertTrue(pane["_tendwire_source_read"])
         self.assertTrue(pane["_tendwire_enriched"])
@@ -173,6 +177,25 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(pane["_tendwire_fingerprint"], "fp-1")
         self.assertEqual(pane["terminal_id"], "")
         self.assertEqual(pane["summary"], "Working on tests")
+
+    def test_source_observed_panes_use_tendwire_snapshot_without_herdr_pane_list(self) -> None:
+        proc = subprocess.CompletedProcess(
+            ["tendwire", "snapshot", "--json"],
+            0,
+            stdout=json.dumps(_snapshot()),
+            stderr="",
+        )
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "run_cmd", return_value=proc) as run_cmd, \
+                patch.object(herdres, "pane_list") as pane_list:
+            panes = herdres.observed_agent_panes()
+
+        pane_list.assert_not_called()
+        run_cmd.assert_called_once()
+        self.assertEqual(len(panes), 1)
+        self.assertEqual(panes[0]["entry_type"], "worker")
+        self.assertEqual(panes[0]["worker_id"], "worker-1")
+        self.assertFalse(str(panes[0]["pane_id"]).startswith("tendwire:"))
 
 
 class TendwireConfigTests(unittest.TestCase):
@@ -506,10 +529,10 @@ class TendwireHybridTests(unittest.TestCase):
         self.assertEqual(result["reply"], "queued")
 
     def test_stale_tendwire_only_entry_remains_read_only(self) -> None:
-        entry = {"source": "tendwire", "pane_id": "tendwire:worker-1", "tendwire_worker_id": "worker-1"}
+        entry = {"source": "tendwire", "entry_type": "worker", "pane_id": "", "tendwire_worker_id": "worker-1"}
         with patch.object(herdres, "send_to_pane") as send_to_pane:
             result = herdres.forward_text_to_pane_response(
-                "tendwire:worker-1",
+                "",
                 "continue",
                 state={"panes": {}},
                 entry=entry,
@@ -527,6 +550,14 @@ class TendwireHybridTests(unittest.TestCase):
                     "space_key": "workspace:w1",
                     "topic_id": "77",
                 },
+                "worker": {
+                    "source": "tendwire",
+                    "entry_type": "worker",
+                    "pane_id": "",
+                    "worker_id": "worker-2",
+                    "space_key": "workspace:w1",
+                    "topic_id": "78",
+                },
                 "live": {
                     "source": "herdr",
                     "pane_id": "pane-1",
@@ -535,17 +566,19 @@ class TendwireHybridTests(unittest.TestCase):
                 },
             },
             "spaces": {
-                "workspace:w1": {"pane_keys": ["stale", "live"]},
+                "workspace:w1": {"pane_keys": ["stale", "worker", "live"]},
             },
         }
 
         removed = herdres.drop_tendwire_source_pane_records(state)
 
-        self.assertEqual(removed, 1)
+        self.assertEqual(removed, 2)
         self.assertNotIn("stale", state["panes"])
+        self.assertNotIn("worker", state["panes"])
         self.assertIn("live", state["panes"])
         self.assertEqual(state["spaces"]["workspace:w1"]["pane_keys"], ["live"])
         self.assertEqual(state["deleted_tendwire_source_panes"][0]["pane_key"], "stale")
+        self.assertEqual(state["deleted_tendwire_source_panes"][1]["worker_id"], "worker-2")
 
     def test_agent_picker_pending_send_uses_real_pane_id_for_enriched_entry(self) -> None:
         entry = {
