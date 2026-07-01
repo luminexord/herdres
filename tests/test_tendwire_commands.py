@@ -513,7 +513,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         run_cmd.assert_not_called()
         save_state.assert_called_once_with(state)
 
-    def test_source_read_callback_detail_choice_fails_closed_without_awaiting_detail(self) -> None:
+    def test_source_read_callback_detail_choice_uses_tendwire_followup(self) -> None:
         entry = _entry(
             source="tendwire",
             entry_type="worker",
@@ -541,20 +541,50 @@ class TendwireCommandRoutingTests(unittest.TestCase):
                 patch.object(herdres, "load_dotenv"), \
                 patch.object(herdres, "load_state", return_value=state), \
                 patch.object(herdres, "save_state") as save_state, \
-                patch.object(herdres, "send_notice") as send_notice, \
+                patch.object(herdres, "send_notice", return_value={"ok": True, "message_id": "2002"}) as send_notice, \
                 patch.object(herdres, "send_to_pane") as send_to_pane, \
                 patch.object(herdres, "run_cmd") as run_cmd:
             result = herdres.callback_reply(payload)
 
-        self.assertEqual(result["answer"], "Custom choice details are not available for Tendwire source entries yet.")
-        self.assertTrue(result["show_alert"])
-        self.assertNotIn("awaiting_detail", entry)
-        send_notice.assert_not_called()
+        self.assertEqual(result["answer"], "Write the details in this topic.")
+        self.assertEqual(entry["awaiting_detail"]["choice"], "yes")
+        self.assertEqual(entry["awaiting_detail"]["force_reply_message_id"], "2002")
+        send_notice.assert_called_once()
         send_to_pane.assert_not_called()
         run_cmd.assert_not_called()
-        save_state.assert_not_called()
+        save_state.assert_any_call(state)
 
-    def test_source_read_callback_option_needing_detail_fails_closed_without_awaiting_detail(self) -> None:
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "save_state") as save_state, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "run_cmd", return_value=_completed({"status": "accepted"})) as run_cmd:
+            followup = herdres.command_reply(
+                _payload(
+                    text="because it is safer",
+                    message_id="5001",
+                    reply_to_message_id="2002",
+                )
+            )
+
+        self.assertEqual(followup["reply"], "Sent details.")
+        self.assertNotIn("awaiting_detail", entry)
+        self.assertNotIn("active_prompt", entry)
+        send_to_pane.assert_not_called()
+        run_cmd.assert_called_once()
+        request = json.loads(run_cmd.call_args.kwargs["input_text"])
+        self.assertEqual(request["action"], "send_instruction")
+        self.assertEqual(request["instruction"]["text"], "yes\nbecause it is safer")
+        self.assertEqual(request["params"]["telegram_origin"], "choice_detail")
+        encoded = json.dumps(request, sort_keys=True)
+        self.assertNotIn("-1001", encoded)
+        self.assertNotIn('"77"', encoded)
+        self.assertNotIn("5001", encoded)
+        self.assertNotIn("2002", encoded)
+        save_state.assert_any_call(state)
+
+    def test_source_read_callback_option_needing_detail_uses_tendwire_followup(self) -> None:
         entry = _entry(
             source="tendwire",
             entry_type="worker",
@@ -582,18 +612,104 @@ class TendwireCommandRoutingTests(unittest.TestCase):
                 patch.object(herdres, "load_dotenv"), \
                 patch.object(herdres, "load_state", return_value=state), \
                 patch.object(herdres, "save_state") as save_state, \
-                patch.object(herdres, "send_notice") as send_notice, \
+                patch.object(herdres, "send_notice", return_value={"ok": True, "message_id": "2003"}) as send_notice, \
                 patch.object(herdres, "send_to_pane") as send_to_pane, \
                 patch.object(herdres, "run_cmd") as run_cmd:
             result = herdres.callback_reply(payload)
 
-        self.assertEqual(result["answer"], "Choice details are not available for Tendwire source entries yet.")
-        self.assertTrue(result["show_alert"])
-        self.assertNotIn("awaiting_detail", entry)
-        send_notice.assert_not_called()
+        self.assertEqual(result["answer"], "Write the details in this topic.")
+        self.assertEqual(entry["awaiting_detail"]["choice"], "yes")
+        self.assertEqual(entry["awaiting_detail"]["force_reply_message_id"], "2003")
+        send_notice.assert_called_once()
         send_to_pane.assert_not_called()
         run_cmd.assert_not_called()
-        save_state.assert_not_called()
+        save_state.assert_called_once_with(state)
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "save_state") as save_state, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "run_cmd", return_value=_completed({"status": "accepted"})) as run_cmd:
+            followup = herdres.command_reply(
+                _payload(
+                    text="extra context",
+                    message_id="5002",
+                    reply_to_message_id="2003",
+                )
+            )
+
+        self.assertEqual(followup["reply"], "Sent details.")
+        self.assertNotIn("awaiting_detail", entry)
+        self.assertNotIn("active_prompt", entry)
+        send_to_pane.assert_not_called()
+        run_cmd.assert_called_once()
+        request = json.loads(run_cmd.call_args.kwargs["input_text"])
+        self.assertEqual(request["instruction"]["text"], "yes\nextra context")
+        self.assertEqual(request["params"]["telegram_origin"], "choice_detail")
+        save_state.assert_any_call(state)
+
+    def test_source_read_callback_custom_detail_uses_tendwire_followup(self) -> None:
+        entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            worker_id="worker-1",
+            worker_fingerprint="fp-1",
+            active_prompt={
+                "id": "prompt-1",
+                "message_id": "1001",
+                "source": "skills",
+                "text": "Choose",
+                "created_at": "9999-01-01T00:00:00+00:00",
+                "options": [{"number": "1", "label": "Yes", "send_text": "yes"}],
+            },
+        )
+        state = _state(entry)
+        payload = {
+            "chat_id": "-1001",
+            "topic_id": "77",
+            "message_id": "1001",
+            "user_id": "42",
+            "data": "herdr:d:prompt-1:custom",
+        }
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "save_state") as save_state, \
+                patch.object(herdres, "send_notice", return_value={"ok": True, "message_id": "2004"}) as send_notice, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "run_cmd") as run_cmd:
+            result = herdres.callback_reply(payload)
+
+        self.assertEqual(result["answer"], "Write the instruction in this topic.")
+        self.assertEqual(entry["awaiting_detail"]["choice"], "")
+        self.assertEqual(entry["awaiting_detail"]["force_reply_message_id"], "2004")
+        send_notice.assert_called_once()
+        send_to_pane.assert_not_called()
+        run_cmd.assert_not_called()
+        save_state.assert_called_once_with(state)
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "save_state") as save_state, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "run_cmd", return_value=_completed({"status": "accepted"})) as run_cmd:
+            followup = herdres.command_reply(
+                _payload(
+                    text="custom instruction",
+                    message_id="5003",
+                    reply_to_message_id="2004",
+                )
+            )
+
+        self.assertEqual(followup["reply"], "Sent details.")
+        send_to_pane.assert_not_called()
+        request = json.loads(run_cmd.call_args.kwargs["input_text"])
+        self.assertEqual(request["instruction"]["text"], "custom instruction")
+        self.assertEqual(request["params"]["telegram_origin"], "choice_detail")
+        save_state.assert_any_call(state)
 
     def test_send_force_fails_closed_for_command_mode_enriched_entry(self) -> None:
         entry = _entry()

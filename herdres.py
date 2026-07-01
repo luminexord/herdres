@@ -15758,11 +15758,6 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
         awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
         if awaiting and str(awaiting.get("user_id") or "") == user_id:
-            if source_entry:
-                entry.pop("awaiting_detail", None)
-                entry.pop("active_prompt", None)
-                save_state(state)
-                return {"handled": True, "reply": "No active choices for this pane."}
             awaiting_source = awaiting_detail_source(awaiting)
             if awaiting_source and prompt_interaction_disabled({"choice_source": awaiting_source}):
                 entry.pop("awaiting_detail", None)
@@ -15811,6 +15806,32 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             select_choice = str(awaiting.get("select_choice") or "").strip()
             visible_choice = str(awaiting.get("visible_choice") or "").strip()
             direct_origin_detail_text = arg
+            if source_entry:
+                if tendwire_entry_metadata_state(entry) != "valid":
+                    entry.pop("awaiting_detail", None)
+                    entry.pop("active_prompt", None)
+                    save_state(state)
+                    return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
+                source_choice = choice or select_choice or visible_choice
+                outbound = f"{source_choice}\n{arg}" if source_choice and arg else (source_choice or arg)
+                if not str(outbound or "").strip():
+                    return {"handled": True, "reply": "Write the details to send with this choice."}
+                send_result = send_to_tendwire_worker_response(
+                    entry,
+                    outbound,
+                    state=None,
+                    origin="choice_detail",
+                    chat_id=chat_id,
+                    topic_id=topic_id,
+                    message_id=str(payload.get("message_id") or ""),
+                    reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
+                )
+                if str(send_result.get("reply") or "") == TENDWIRE_SAFE_SEND_FAILURE_REPLY:
+                    return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
+                entry.pop("awaiting_detail", None)
+                entry.pop("active_prompt", None)
+                save_state(state)
+                return {"handled": True, "reply": "Sent details."}
             if visible_choice:
                 if not visible_prompt_matches_awaiting(entry, awaiting):
                     entry.pop("awaiting_detail", None)
@@ -16610,12 +16631,6 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     if action == "d":
-        if source_entry:
-            return {
-                "handled": True,
-                "answer": "Custom choice details are not available for Tendwire source entries yet.",
-                "show_alert": True,
-            }
         choice_text = ""
         select_choice = ""
         visible_choice = ""
@@ -16688,12 +16703,6 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "answer": "Choice not found."}
 
     if choice_needs_detail(option):
-        if source_entry:
-            return {
-                "handled": True,
-                "answer": "Choice details are not available for Tendwire source entries yet.",
-                "show_alert": True,
-            }
         choice_text = str(option.get("send_text") or "").strip() if "send_text" in option else ""
         select_choice = ""
         visible_choice = ""
