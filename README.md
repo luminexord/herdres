@@ -732,6 +732,12 @@ In `commands` mode and higher, if an enriched real pane has a worker id and fing
 
 In `source-read` and `source` modes, the same emergency fallback does not apply to Tendwire worker entries. Source entries are not real Herdr pane ids; missing worker metadata, failed Tendwire sends, attachments, `/raw`, `/read`, stale choices, and picker callbacks that cannot be routed through Tendwire all fail closed instead of calling Herdr directly. Existing legacy `tendwire:<worker>` pseudo-pane records are pruned when source inventory mode is not active.
 
+When Tendwire reports degraded or unavailable backend health, or when the
+snapshot command fails while source entries already exist, Herdres preserves the
+existing source worker topics from its local state for that sync instead of
+marking them closed from incomplete inventory. Fresh healthy snapshots clear
+that preservation state.
+
 `/send!` is not routed through Tendwire in this phase. For command-mode enriched entries and source inventory modes it fails closed because Tendwire interrupt semantics are not represented here yet; use `/send` or interrupt directly in Herdr when running outside source mode. Non-enriched entries and `enrich` mode keep the existing `/send!` Herdr interrupt path.
 
 Tendwire config:
