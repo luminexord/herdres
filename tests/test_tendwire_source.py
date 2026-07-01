@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -451,27 +452,30 @@ class TendwireHybridTests(unittest.TestCase):
     def test_sync_once_source_read_skips_herdr_inventory_helpers(self) -> None:
         state: dict = {"enabled": True, "panes": {}, "spaces": {}, "telegram": {"chat_id": "-100"}}
         pane = herdres.tendwire_source_read_panes(_snapshot())[0]
-        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
-                patch.object(herdres, "load_dotenv"), \
-                patch.object(herdres, "load_state", return_value=state), \
-                patch.object(herdres, "save_state"), \
-                patch.object(herdres, "observed_agent_panes", return_value=[pane]), \
-                patch.object(herdres, "sync_closed_pane_records", return_value={"changed": False, "sent": 0}), \
-                patch.object(herdres, "drop_tendwire_source_pane_records", return_value=1) as drop_stale, \
-                patch.object(herdres, "drain_tendwire_connector_outbox", return_value={"changed": False}), \
-                patch.object(herdres, "workspace_label_map", return_value={"workspace-1": "Workers"}) as labels, \
-                patch.object(herdres, "reconcile_known_gone_spaces", return_value=0), \
-                patch.object(herdres, "prune_orphan_spaces", return_value=0), \
-                patch.object(herdres, "preflight_is_fresh", return_value=True), \
-                patch.object(herdres, "reconcile_pinned_status_views", return_value={"changed": False, "updated": 0}), \
-                patch.object(herdres, "ensure_managed_bot_setup_message", return_value=False), \
-                patch.object(herdres, "ensure_managed_bot_group_access_message", return_value=False), \
-                patch.object(herdres, "ensure_multibot_offer_message", return_value=False), \
-                patch.object(herdres, "prefetch_pane_turns") as prefetch, \
-                patch.object(herdres, "update_topic_icons_for_spaces"), \
-                patch.object(herdres, "sync_pane_once", return_value=False), \
-                patch.object(herdres, "ensure_devin_glm_space_seats") as ensure_devin, \
-                patch.object(herdres, "TURN_FEED_ENABLED", True):
+        # 21 context managers exceed CPython's 20 static-block nesting limit as a single
+        # `with`, so enter them through an ExitStack (one block) instead.
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True))
+            stack.enter_context(patch.object(herdres, "load_dotenv"))
+            stack.enter_context(patch.object(herdres, "load_state", return_value=state))
+            stack.enter_context(patch.object(herdres, "save_state"))
+            stack.enter_context(patch.object(herdres, "observed_agent_panes", return_value=[pane]))
+            stack.enter_context(patch.object(herdres, "sync_closed_pane_records", return_value={"changed": False, "sent": 0}))
+            drop_stale = stack.enter_context(patch.object(herdres, "drop_tendwire_source_pane_records", return_value=1))
+            stack.enter_context(patch.object(herdres, "drain_tendwire_connector_outbox", return_value={"changed": False}))
+            labels = stack.enter_context(patch.object(herdres, "workspace_label_map", return_value={"workspace-1": "Workers"}))
+            stack.enter_context(patch.object(herdres, "reconcile_known_gone_spaces", return_value=0))
+            stack.enter_context(patch.object(herdres, "prune_orphan_spaces", return_value=0))
+            stack.enter_context(patch.object(herdres, "preflight_is_fresh", return_value=True))
+            stack.enter_context(patch.object(herdres, "reconcile_pinned_status_views", return_value={"changed": False, "updated": 0}))
+            stack.enter_context(patch.object(herdres, "ensure_managed_bot_setup_message", return_value=False))
+            stack.enter_context(patch.object(herdres, "ensure_managed_bot_group_access_message", return_value=False))
+            stack.enter_context(patch.object(herdres, "ensure_multibot_offer_message", return_value=False))
+            prefetch = stack.enter_context(patch.object(herdres, "prefetch_pane_turns"))
+            stack.enter_context(patch.object(herdres, "update_topic_icons_for_spaces"))
+            stack.enter_context(patch.object(herdres, "sync_pane_once", return_value=False))
+            ensure_devin = stack.enter_context(patch.object(herdres, "ensure_devin_glm_space_seats"))
+            stack.enter_context(patch.object(herdres, "TURN_FEED_ENABLED", True))
             result = herdres.sync_once()
 
         self.assertTrue(result["ok"])
