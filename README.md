@@ -657,6 +657,11 @@ HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS=1.0
 # HERDRES_TENDWIRE_HOST_ID=
 HERDRES_TENDWIRE_FALLBACK_HERDR=1
 HERDRES_TENDWIRE_DIRECT_FALLBACK=0
+HERDRES_TENDWIRE_CONNECTOR_OUTBOX=0
+HERDRES_TENDWIRE_CONNECTOR_NAME=attention
+HERDRES_TENDWIRE_CONNECTOR_LIMIT=3
+HERDRES_TENDWIRE_CONNECTOR_LEASE_SECONDS=60
+HERDRES_TENDWIRE_CONNECTOR_FAILURE_DELAY_SECONDS=60
 HERDR_TELEGRAM_TOPICS_MAX_CREATES=3
 HERDR_TELEGRAM_TOPICS_MAX_SENDS=8
 HERDR_TELEGRAM_TOPICS_MAX_STATUS_MARKERS=8
@@ -736,10 +741,19 @@ Tendwire config:
 - `HERDRES_TENDWIRE_DATA_DIR`, `HERDRES_TENDWIRE_DB_PATH`, and `HERDRES_TENDWIRE_HOST_ID` are optional Herdres-controlled overrides for `TENDWIRE_DATA_DIR`, `TENDWIRE_DB_PATH`, and `TENDWIRE_HOST_ID`. Path values expand `~` and environment variables. Leave them unset to let Tendwire use its own defaults.
 - `HERDRES_TENDWIRE_DIRECT_FALLBACK=1` explicitly permits direct Herdr fallback after Tendwire command routing fails or metadata is partial. Leave it at `0` for normal fail-closed command ownership.
 
+Tendwire connector outbox:
+
+- `HERDRES_TENDWIRE_CONNECTOR_OUTBOX=1` enables the optional neutral connector drain during `herdres sync`; the default is `0` for staged rollout.
+- `HERDRES_TENDWIRE_CONNECTOR_NAME=attention` selects the Tendwire connector queue. The current consumer posts sanitized attention lifecycle notices to the configured General topic.
+- `HERDRES_TENDWIRE_CONNECTOR_LIMIT`, `HERDRES_TENDWIRE_CONNECTOR_LEASE_SECONDS`, and `HERDRES_TENDWIRE_CONNECTOR_FAILURE_DELAY_SECONDS` bound per-sync leases and retries.
+
+The connector drain uses `tendwire connector poll/ack/fail/defer` through the same `HERDRES_TENDWIRE_BIN` command base and optional Tendwire env overrides. It does not require or enable `source-read`/`source` mode, does not create pseudo panes, does not persist opaque refs in Herdres state, and sends only public-safe ack/fail data back to Tendwire. If Telegram is not configured, it does not lease Tendwire work.
+
 Inspect the resolved Herdres-to-Tendwire config without touching Telegram state:
 
 ```bash
 herdres tendwire config
+herdres tendwire outbox --limit 1
 ```
 
 ## Probe
