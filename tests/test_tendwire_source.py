@@ -135,6 +135,21 @@ class TendwireModeTests(unittest.TestCase):
                 self.assertTrue(herdres.tendwire_snapshot_enabled())
                 self.assertTrue(herdres.tendwire_commands_enabled())
 
+    def test_source_mode_enables_connector_outbox_by_default(self) -> None:
+        self.assertFalse(herdres.tendwire_connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "source-read"}))
+        self.assertFalse(herdres.tendwire_connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "commands"}))
+        self.assertTrue(herdres.tendwire_connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "source"}))
+        self.assertFalse(
+            herdres.tendwire_connector_outbox_enabled(
+                {"HERDRES_TENDWIRE_MODE": "source", "HERDRES_TENDWIRE_CONNECTOR_OUTBOX": "0"}
+            )
+        )
+        self.assertTrue(
+            herdres.tendwire_connector_outbox_enabled(
+                {"HERDRES_TENDWIRE_MODE": "source-read", "HERDRES_TENDWIRE_CONNECTOR_OUTBOX": "1"}
+            )
+        )
+
     def test_legacy_aliases_normalize_to_enrich_when_mode_unset(self) -> None:
         self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_HYBRID": "1"}), "enrich")
         self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_SNAPSHOT": "1"}), "enrich")

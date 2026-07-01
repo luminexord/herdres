@@ -724,7 +724,7 @@ Tendwire modes:
 | `enrich` | Enables the current safe enrichment path. Herdres still reads real Herdr panes directly with `pane_list()`, preserves real `pane_id` values, and Tendwire only adds metadata/status to unambiguous real-pane matches. |
 | `commands` | Keeps real-pane enrichment, then routes normal Telegram text for Tendwire-enriched entries through `tendwire command --json` using the worker id and fingerprint. Entries without Tendwire metadata still use the legacy direct Herdr send path. |
 | `source-read` | Uses the Tendwire public snapshot as the pane inventory instead of `pane_list()`, creates read-only worker entries (`entry_type=worker`, `worker_id`, `worker_fingerprint`) without inventing `tendwire:<worker>` pane ids, skips Herdr pane read/feed/turn inventory helpers for those entries, and routes text only through `tendwire command --json` when worker id/fingerprint metadata is present. Attachments, raw reads, picker callbacks, stale choices, `/new`, `/send!`, `/keys`, and direct Herdr fallback for source entries fail closed. |
-| `source` | Full source mode. Uses the same Tendwire snapshot inventory and worker entries as `source-read`, routes normal Telegram text/buttons through Tendwire, drains the Tendwire connector outbox when enabled, and does not use direct Herdr calls for normal Telegram behavior. Legacy direct mode remains available only by switching `HERDRES_TENDWIRE_MODE=off`. |
+| `source` | Full source mode. Uses the same Tendwire snapshot inventory and worker entries as `source-read`, routes normal Telegram text/buttons through Tendwire, drains the Tendwire connector outbox by default, and does not use direct Herdr calls for normal Telegram behavior. Legacy direct mode remains available only by switching `HERDRES_TENDWIRE_MODE=off`. |
 
 Invalid mode values warn and fall back to `off`; they never enable Tendwire behavior. When `HERDRES_TENDWIRE_MODE` is unset, legacy `HERDRES_TENDWIRE_HYBRID=1` or `HERDRES_TENDWIRE_SNAPSHOT=1` aliases to `enrich`. Those legacy names remain compatibility aliases, not the public Tendwire mental model.
 
@@ -751,7 +751,7 @@ Tendwire config:
 
 Tendwire connector outbox:
 
-- `HERDRES_TENDWIRE_CONNECTOR_OUTBOX=1` enables the optional neutral connector drain during `herdres sync`; the default is `0` for staged rollout.
+- `HERDRES_TENDWIRE_CONNECTOR_OUTBOX` controls the neutral connector drain during `herdres sync`. When unset, it defaults on only in `HERDRES_TENDWIRE_MODE=source` and remains off in earlier modes. Set `0` to disable it explicitly or `1` to enable it in `source-read` during staged testing.
 - `HERDRES_TENDWIRE_CONNECTOR_NAME=attention` selects the Tendwire connector queue. The current consumer posts sanitized attention lifecycle notices to the configured General topic.
 - `HERDRES_TENDWIRE_CONNECTOR_LIMIT`, `HERDRES_TENDWIRE_CONNECTOR_LEASE_SECONDS`, and `HERDRES_TENDWIRE_CONNECTOR_FAILURE_DELAY_SECONDS` bound per-sync leases and retries.
 
