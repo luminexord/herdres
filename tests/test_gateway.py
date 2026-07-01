@@ -2263,7 +2263,6 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
 
     def test_command_reply_rejected_messages_do_not_set_direct_marker(self) -> None:
         cases = (
-            ("forwarded", self._state(), self._payload(forwarded=True)),
             ("non_owner", self._state(), self._payload(user_id="99")),
             ("bot_origin", self._state(), self._payload(from_bot=True)),
             ("edited", self._state(), self._payload(edited=True)),
@@ -2285,6 +2284,22 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
                 send_to_pane.assert_not_called()
                 for entry in state["panes"].values():
                     self._assert_no_direct_origin_marker(entry)
+
+    def test_command_reply_forwarded_owner_message_routes_and_sets_marker(self) -> None:
+        # A forwarded owner message is now processed like a direct one: it routes to the
+        # pane and sets the direct-origin marker (previously it was rejected outright).
+        state = self._state()
+        entry = state["panes"]["pane-1"]
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with self._command_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(self._payload(forwarded=True))
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        send_to_pane.assert_called_once_with("pane-1", "Run direct task.")
+        self.assertIn("direct_origin_at", entry)
+        self.assertEqual(entry["direct_origin_pane_id"], "pane-1")
 
 
 class TypingActionTests(unittest.TestCase):

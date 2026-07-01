@@ -621,44 +621,70 @@ class OneSpaceOneVoiceAgentsTests(unittest.TestCase):
         send_message.assert_called_once()
         send_to_pane.assert_not_called()
 
-    def test_active_pane_forwarded_and_edited_messages_do_not_forward(self) -> None:
-        for key, value, expected_reply in (
-            ("forwarded", True, "Ignored non-direct owner message in pane topic."),
-            ("edited", True, ""),
+    def test_active_pane_edited_message_does_not_forward(self) -> None:
+        state = osov_state()
+        herdres.set_active_pane(state["spaces"]["workspace:one"], "pane-2", "42")
+        send_to_pane = Mock(return_value=(True, ""))
+        results = []
+
+        def run_script(payload, mode):
+            self.assertEqual(mode, "command")
+            result = herdres.command_reply(payload)
+            results.append(result)
+            return result
+
+        message = {
+            "message_id": 8301,
+            "message_thread_id": 77,
+            "chat": {"id": -1001, "is_forum": True},
+            "from": {"id": 42, "is_bot": False},
+            "text": "go",
+            "edit_date": 1,
+        }
+
+        with command_patches(state, send_to_pane=send_to_pane), patch.object(
+            managed_gateway, "load_state", Mock(return_value=state)
+        ), patch.object(managed_gateway, "run_script", Mock(side_effect=run_script)), patch.object(
+            managed_gateway, "api", Mock()
         ):
-            with self.subTest(key=key):
-                state = osov_state()
-                herdres.set_active_pane(state["spaces"]["workspace:one"], "pane-2", "42")
-                send_to_pane = Mock(return_value=(True, ""))
-                results = []
+            managed_gateway.handle_message(message, bot_token="MANAGER_TOKEN")
 
-                def run_script(payload, mode):
-                    self.assertEqual(mode, "command")
-                    result = herdres.command_reply(payload)
-                    results.append(result)
-                    return result
+        self.assertEqual(results[0]["reply"], "")
+        send_to_pane.assert_not_called()
 
-                message = {
-                    "message_id": 8300 if key == "forwarded" else 8301,
-                    "message_thread_id": 77,
-                    "chat": {"id": -1001, "is_forum": True},
-                    "from": {"id": 42, "is_bot": False},
-                    "text": "go",
-                }
-                if key == "forwarded":
-                    message["forward_date"] = 1
-                else:
-                    message["edit_date"] = 1
+    def test_active_pane_forwarded_message_is_processed(self) -> None:
+        # A forwarded owner message (Telegram stamps forward_date → payload["forwarded"])
+        # is now treated as direct input and routes to the active pane, same as if typed.
+        state = osov_state()
+        herdres.set_active_pane(state["spaces"]["workspace:one"], "pane-2", "42")
+        send_to_pane = Mock(return_value=(True, ""))
+        results = []
 
-                with command_patches(state, send_to_pane=send_to_pane), patch.object(
-                    managed_gateway, "load_state", Mock(return_value=state)
-                ), patch.object(managed_gateway, "run_script", Mock(side_effect=run_script)), patch.object(
-                    managed_gateway, "api", Mock()
-                ):
-                    managed_gateway.handle_message(message, bot_token="MANAGER_TOKEN")
+        def run_script(payload, mode):
+            self.assertEqual(mode, "command")
+            self.assertTrue(payload.get("forwarded"))
+            result = herdres.command_reply(payload)
+            results.append(result)
+            return result
 
-                self.assertEqual(results[0]["reply"], expected_reply)
-                send_to_pane.assert_not_called()
+        message = {
+            "message_id": 8300,
+            "message_thread_id": 77,
+            "chat": {"id": -1001, "is_forum": True},
+            "from": {"id": 42, "is_bot": False},
+            "text": "go",
+            "forward_date": 1,
+        }
+
+        with command_patches(state, send_to_pane=send_to_pane), patch.object(
+            managed_gateway, "load_state", Mock(return_value=state)
+        ), patch.object(managed_gateway, "run_script", Mock(side_effect=run_script)), patch.object(
+            managed_gateway, "api", Mock()
+        ):
+            managed_gateway.handle_message(message, bot_token="MANAGER_TOKEN")
+
+        self.assertEqual(results[0]["reply"], "")
+        send_to_pane.assert_called_once_with("pane-2", "go")
 
     def test_active_pane_expires_after_ttl(self) -> None:
         state = osov_state()
