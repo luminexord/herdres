@@ -692,6 +692,51 @@ class TendwireHybridTests(unittest.TestCase):
         ensure_devin.assert_not_called()
         save_state.assert_called()
 
+    def test_source_modes_skip_direct_herdr_plugin_event_handling(self) -> None:
+        for mode in ("source-read", "source"):
+            with self.subTest(mode=mode):
+                state: dict = {
+                    "enabled": True,
+                    "plugin_event_enabled": True,
+                    "telegram": {"chat_id": "-100", "general_thread_id": "1"},
+                }
+                with patch.dict(
+                    os.environ,
+                    {
+                        "HERDRES_TENDWIRE_MODE": mode,
+                        "HERDR_PLUGIN_EVENT_JSON": '{"pane_id":"pane-secret"}',
+                    },
+                    clear=True,
+                ), \
+                        patch.object(herdres, "load_dotenv"), \
+                        patch.object(herdres, "load_state", return_value=state), \
+                        patch.object(
+                            herdres,
+                            "configure_telegram_state",
+                            return_value=({"chat_id": "-100", "general_thread_id": "1"}, "-100"),
+                        ), \
+                        patch.object(herdres, "reconcile_topic_grouping", return_value=False) as grouping, \
+                        patch.object(herdres, "parse_plugin_json_env") as parse_plugin, \
+                        patch.object(herdres, "pane_by_id") as pane_by_id, \
+                        patch.object(herdres, "sync_pane_once") as sync_pane_once, \
+                        patch.object(herdres, "observed_agent_panes") as observed_agent_panes, \
+                        patch.object(herdres, "save_state") as save_state:
+                    result = herdres.event_once()
+
+                self.assertTrue(result["ok"])
+                self.assertFalse(result["changed"])
+                self.assertEqual(result["message"], "plugin event skipped in Tendwire source mode")
+                self.assertEqual(result["tendwire_mode"], mode)
+                self.assertNotIn("pane-secret", json.dumps(result, sort_keys=True))
+                self.assertIn("last_tendwire_source_plugin_event_skipped_at", state)
+                self.assertEqual(state["last_tendwire_source_plugin_event_mode"], mode)
+                grouping.assert_called_once()
+                parse_plugin.assert_not_called()
+                pane_by_id.assert_not_called()
+                sync_pane_once.assert_not_called()
+                observed_agent_panes.assert_not_called()
+                save_state.assert_called_once_with(state)
+
     def test_enrich_mode_tendwire_enriched_entry_send_uses_real_pane_id(self) -> None:
         entry = {
             "source": "herdr",
