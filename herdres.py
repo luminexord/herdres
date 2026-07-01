@@ -2654,6 +2654,92 @@ def tendwire_source_read_panes(snapshot: dict[str, Any]) -> list[dict[str, Any]]
     return panes
 
 
+def tendwire_snapshot_backend_degraded(snapshot: dict[str, Any]) -> bool:
+    """True when Tendwire says the public snapshot is not freshly authoritative."""
+    health_items = snapshot.get("backend_health") if isinstance(snapshot.get("backend_health"), list) else []
+    for item in health_items:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        if status and status != "healthy":
+            return True
+    status = str(snapshot.get("status") or "").strip().lower()
+    return status in {"degraded", "unavailable"}
+
+
+def tendwire_source_entry_as_pane(pane_key_value: str, entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Reconstruct a source worker pane from Herdres state when Tendwire is degraded."""
+    if not entry_is_tendwire_source(entry):
+        return None
+    worker_id = str(entry.get("worker_id") or entry.get("tendwire_worker_id") or "").strip()
+    pane_id = str(entry.get("pane_id") or "").strip()
+    if not worker_id and pane_id.startswith("tendwire:"):
+        worker_id = pane_id.split(":", 1)[1].strip()
+    if not worker_id:
+        return None
+    fingerprint = str(entry.get("worker_fingerprint") or entry.get("tendwire_fingerprint") or "").strip()
+    space_id = str(entry.get("workspace") or "").strip()
+    pane = {
+        "_preserved_pane_key": str(pane_key_value),
+        "entry_type": "worker",
+        "worker_id": worker_id,
+        "worker_fingerprint": fingerprint,
+        "pane_id": "",
+        "terminal_id": "",
+        "workspace_id": space_id,
+        "space_id": space_id,
+        "tab_id": str(entry.get("tab") or ""),
+        "agent": str(entry.get("agent") or "worker"),
+        "agent_status": str(entry.get("last_known_status") or "unknown"),
+        "label": str(entry.get("pane_thread_name") or entry.get("agent") or "Tendwire Worker"),
+        "name": str(entry.get("pane_thread_name") or entry.get("agent") or "Tendwire Worker"),
+        "foreground_cwd": str(entry.get("foreground_cwd") or ""),
+        "space_name": str(entry.get("topic_name") or ""),
+        "workspace_label": str(entry.get("topic_name") or ""),
+        "summary": str(entry.get("tendwire_status_line") or ""),
+        "source": "tendwire",
+        "_tendwire_source_read": True,
+        "_tendwire_enriched": True,
+        "_tendwire_worker_id": worker_id,
+        "_tendwire_fingerprint": fingerprint,
+        "_tendwire_status_line": str(entry.get("tendwire_status_line") or ""),
+        "_tendwire_last_seen_at": str(entry.get("tendwire_last_seen_at") or ""),
+        "_tendwire_preserved_from_state": True,
+    }
+    return pane
+
+
+def tendwire_source_state_panes(state: dict[str, Any]) -> list[dict[str, Any]]:
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    preserved: list[dict[str, Any]] = []
+    for key, entry in panes.items():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("last_known_status") or "").strip().lower() == "closed":
+            continue
+        pane = tendwire_source_entry_as_pane(str(key), entry)
+        if pane is not None:
+            preserved.append(pane)
+    return preserved
+
+
+def merge_preserved_source_panes(
+    state: dict[str, Any],
+    panes: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    merged = list(panes)
+    live_keys = {pane_key(pane) for pane in merged}
+    preserved_count = 0
+    for pane in tendwire_source_state_panes(state):
+        key = pane_key(pane)
+        if key in live_keys:
+            continue
+        merged.append(pane)
+        live_keys.add(key)
+        preserved_count += 1
+    return merged, preserved_count
+
+
 def pane_is_tendwire_source_read(pane: dict[str, Any] | None) -> bool:
     return isinstance(pane, dict) and bool(pane.get("_tendwire_source_read"))
 
@@ -2771,6 +2857,9 @@ def _worker_key_component(value: Any, *, fallback: str = "worker") -> str:
 
 
 def pane_key(pane: dict[str, Any]) -> str:
+    preserved_key = str(pane.get("_preserved_pane_key") or "").strip()
+    if preserved_key and str(pane.get("source") or "") == "tendwire":
+        return preserved_key
     if str(pane.get("source") or "") == "tendwire" and str(pane.get("entry_type") or "") == "worker":
         worker_id = str(pane.get("worker_id") or pane.get("_tendwire_worker_id") or "").strip()
         fingerprint = str(pane.get("worker_fingerprint") or pane.get("_tendwire_fingerprint") or "").strip()
@@ -11889,9 +11978,31 @@ def sync_space_pinned_statuses(
     return {"changed": changed, "updated": updated}
 
 
-def observed_agent_panes() -> list[dict[str, Any]]:
+def observed_agent_panes(state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     if tendwire_source_read_enabled():
-        return tendwire_source_read_panes(tendwire_snapshot())
+        try:
+            snapshot = tendwire_snapshot()
+        except Exception as exc:
+            if isinstance(state, dict):
+                preserved = tendwire_source_state_panes(state)
+                if preserved:
+                    state["tendwire_source_inventory_last_error"] = sanitize_text(str(exc), 500)
+                    state["tendwire_source_inventory_preserved_at"] = utc_now()
+                    return preserved
+            raise
+        panes = tendwire_source_read_panes(snapshot)
+        if isinstance(state, dict):
+            state.pop("tendwire_source_inventory_last_error", None)
+            state.pop("tendwire_source_inventory_preserved_at", None)
+        if isinstance(state, dict) and tendwire_snapshot_backend_degraded(snapshot):
+            panes, preserved_count = merge_preserved_source_panes(state, panes)
+            state["tendwire_source_inventory_degraded_at"] = utc_now()
+            state["tendwire_source_inventory_preserved"] = preserved_count
+        else:
+            if isinstance(state, dict):
+                state.pop("tendwire_source_inventory_degraded_at", None)
+                state.pop("tendwire_source_inventory_preserved", None)
+        return panes
     all_panes = pane_list()
     include_shells = parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "")
     panes = [pane for pane in all_panes if include_shells or pane.get("agent")]
@@ -12053,7 +12164,7 @@ def reconcile_missing_event_pane(
             "error": preflight_error,
         }
 
-    panes = observed_agent_panes()
+    panes = observed_agent_panes(state=state)
     caps = make_sync_caps(event=True)
     closed_result = sync_closed_pane_records(
         state,
@@ -14020,7 +14131,7 @@ def sync_once() -> dict[str, Any]:
     if stale_tendwire_pruned:
         changed = True
 
-    panes = observed_agent_panes()
+    panes = observed_agent_panes(state=state)
     closed_result = sync_closed_pane_records(
         state,
         chat_id,
@@ -14157,7 +14268,7 @@ def sync_once() -> dict[str, Any]:
         changed = True
         devin_glm_started = int(devin_glm_result.get("started") or 0)
         if devin_glm_started:
-            panes = observed_agent_panes()
+            panes = observed_agent_panes(state=state)
     pinned_result = reconcile_pinned_status_views(state, chat_id, panes, counters, caps["max_sends"])
     changed, pinned_status_updated = add_pinned_reconcile_result(changed, pinned_status_updated, pinned_result)
     sends = counters["sends"]
@@ -14448,7 +14559,7 @@ def event_once() -> dict[str, Any]:
     # waiting for the next timer sync — so a working/blocked/idle transition shows
     # promptly (Codex cadence fix). One pane-list read drives both aggregate passes.
     try:
-        event_panes = observed_agent_panes()
+        event_panes = observed_agent_panes(state=state)
         update_topic_icons_for_spaces(state, chat_id, telegram, event_panes, counters)
         reconcile_pinned_status_views(state, chat_id, event_panes, counters, caps["max_sends"])
     except Exception:

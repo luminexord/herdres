@@ -54,6 +54,63 @@ def _snapshot(*workers: dict) -> dict:
     }
 
 
+def _degraded_snapshot() -> dict:
+    return {
+        "schema_version": 2,
+        "host_id": "host-1",
+        "spaces": [{"id": "workspace-1", "name": "Workers", "status": "active"}],
+        "workers": [],
+        "backend_health": [
+            {
+                "name": "herdr",
+                "status": "degraded",
+                "outcome": "timeout",
+                "message": "Herdr observation is degraded",
+            }
+        ],
+    }
+
+
+def _source_state() -> tuple[dict, str]:
+    pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+    key = herdres.pane_key(pane)
+    state = {
+        "enabled": True,
+        "telegram": {"chat_id": "-100", "general_thread_id": "1"},
+        "spaces": {
+            "agent:worker:worker-1": {
+                "space_key": "agent:worker:worker-1",
+                "pane_keys": [key],
+                "topic_id": "77",
+                "topic_name": "Workers",
+            },
+        },
+        "panes": {
+            key: {
+                "pane_key": key,
+                "source": "tendwire",
+                "entry_type": "worker",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "pane_id": "",
+                "terminal_id": "",
+                "agent": "codex",
+                "workspace": "workspace-1",
+                "tab": "workspace-1:t1",
+                "space_key": "agent:worker:worker-1",
+                "topic_id": "77",
+                "topic_name": "Workers",
+                "last_known_status": "working",
+                "tendwire_worker_id": "worker-1",
+                "tendwire_fingerprint": "fp-1",
+                "tendwire_status_line": "Working on tests",
+                "tendwire_last_seen_at": "2026-06-28T12:00:00+00:00",
+            },
+        },
+    }
+    return state, key
+
+
 class TendwireModeTests(unittest.TestCase):
     def test_parse_tendwire_mode_defaults_to_off(self) -> None:
         self.assertEqual(herdres.parse_tendwire_mode({}), "off")
@@ -196,6 +253,78 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(panes[0]["entry_type"], "worker")
         self.assertEqual(panes[0]["worker_id"], "worker-1")
         self.assertFalse(str(panes[0]["pane_id"]).startswith("tendwire:"))
+
+    def test_source_read_degraded_snapshot_preserves_existing_source_entries(self) -> None:
+        state, key = _source_state()
+        proc = subprocess.CompletedProcess(
+            ["tendwire", "snapshot", "--json"],
+            0,
+            stdout=json.dumps(_degraded_snapshot()),
+            stderr="",
+        )
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "run_cmd", return_value=proc) as run_cmd, \
+                patch.object(herdres, "pane_list") as pane_list:
+            panes = herdres.observed_agent_panes(state=state)
+
+        pane_list.assert_not_called()
+        run_cmd.assert_called_once()
+        self.assertEqual([herdres.pane_key(pane) for pane in panes], [key])
+        self.assertTrue(panes[0]["_tendwire_preserved_from_state"])
+        self.assertEqual(state["tendwire_source_inventory_preserved"], 1)
+        self.assertIn("tendwire_source_inventory_degraded_at", state)
+
+        closed = herdres.sync_closed_pane_records(
+            state,
+            "-100",
+            {},
+            panes,
+            sends=0,
+            max_sends=0,
+        )
+        self.assertFalse(closed["changed"])
+        self.assertEqual(state["panes"][key]["last_known_status"], "working")
+
+    def test_source_read_snapshot_failure_preserves_existing_source_entries(self) -> None:
+        state, key = _source_state()
+        proc = subprocess.CompletedProcess(["tendwire", "snapshot", "--json"], 1, stdout="", stderr="socket down")
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "run_cmd", return_value=proc), \
+                patch.object(herdres, "pane_list") as pane_list:
+            panes = herdres.observed_agent_panes(state=state)
+
+        pane_list.assert_not_called()
+        self.assertEqual([herdres.pane_key(pane) for pane in panes], [key])
+        self.assertTrue(panes[0]["_tendwire_preserved_from_state"])
+        self.assertIn("socket down", state["tendwire_source_inventory_last_error"])
+        self.assertIn("tendwire_source_inventory_preserved_at", state)
+
+    def test_source_read_degraded_snapshot_preserves_legacy_pseudo_source_entries(self) -> None:
+        state = {
+            "panes": {
+                "legacy": {
+                    "pane_key": "legacy",
+                    "source": "tendwire",
+                    "pane_id": "tendwire:worker-legacy",
+                    "agent": "codex",
+                    "last_known_status": "working",
+                    "topic_id": "77",
+                },
+            },
+        }
+        proc = subprocess.CompletedProcess(
+            ["tendwire", "snapshot", "--json"],
+            0,
+            stdout=json.dumps(_degraded_snapshot()),
+            stderr="",
+        )
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "run_cmd", return_value=proc):
+            panes = herdres.observed_agent_panes(state=state)
+
+        self.assertEqual([herdres.pane_key(pane) for pane in panes], ["legacy"])
+        self.assertEqual(panes[0]["worker_id"], "worker-legacy")
+        self.assertEqual(panes[0]["pane_id"], "")
 
 
 class TendwireConfigTests(unittest.TestCase):
@@ -504,6 +633,49 @@ class TendwireHybridTests(unittest.TestCase):
         labels.assert_not_called()
         prefetch.assert_not_called()
         ensure_devin.assert_not_called()
+
+    def test_sync_once_source_read_degraded_snapshot_does_not_close_existing_source_entry(self) -> None:
+        state, key = _source_state()
+        proc = subprocess.CompletedProcess(
+            ["tendwire", "snapshot", "--json"],
+            0,
+            stdout=json.dumps(_degraded_snapshot()),
+            stderr="",
+        )
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "save_state") as save_state, \
+                patch.object(herdres, "run_cmd", return_value=proc), \
+                patch.object(herdres, "drop_tendwire_source_pane_records") as drop_stale, \
+                patch.object(herdres, "drain_tendwire_connector_outbox", return_value={"changed": False}), \
+                patch.object(herdres, "workspace_label_map") as labels, \
+                patch.object(herdres, "reconcile_known_gone_spaces", return_value=0), \
+                patch.object(herdres, "prune_orphan_spaces", return_value=0), \
+                patch.object(herdres, "preflight_is_fresh", return_value=True), \
+                patch.object(herdres, "reconcile_pinned_status_views", return_value={"changed": False, "updated": 0}), \
+                patch.object(herdres, "ensure_managed_bot_setup_message", return_value=False), \
+                patch.object(herdres, "ensure_managed_bot_group_access_message", return_value=False), \
+                patch.object(herdres, "ensure_multibot_offer_message", return_value=False), \
+                patch.object(herdres, "prefetch_pane_turns") as prefetch, \
+                patch.object(herdres, "update_topic_icons_for_spaces"), \
+                patch.object(herdres, "sync_pane_once", return_value=False), \
+                patch.object(herdres, "ensure_devin_glm_space_seats") as ensure_devin, \
+                patch.object(herdres, "send_notice") as send_notice, \
+                patch.object(herdres, "TURN_FEED_ENABLED", True):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["panes"], 1)
+        self.assertEqual(state["panes"][key]["last_known_status"], "working")
+        self.assertNotIn("closed_at", state["panes"][key])
+        self.assertEqual(state["tendwire_source_inventory_preserved"], 1)
+        send_notice.assert_not_called()
+        drop_stale.assert_not_called()
+        labels.assert_not_called()
+        prefetch.assert_not_called()
+        ensure_devin.assert_not_called()
+        save_state.assert_called()
 
     def test_enrich_mode_tendwire_enriched_entry_send_uses_real_pane_id(self) -> None:
         entry = {
