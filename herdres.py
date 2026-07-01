@@ -1844,6 +1844,10 @@ def tendwire_commands_enabled() -> bool:
     return tendwire_mode_at_least("commands")
 
 
+def tendwire_source_read_enabled() -> bool:
+    return tendwire_mode() == "source-read"
+
+
 def tendwire_fallback_to_herdr_enabled() -> bool:
     return parse_bool_env("HERDRES_TENDWIRE_FALLBACK_HERDR", "1")
 
@@ -2588,6 +2592,62 @@ def tendwire_enrich_panes(panes: list[dict[str, Any]], snapshot: dict[str, Any])
         worker = tendwire_match_worker(pane, index)
         enriched.append(tendwire_enrich_pane(pane, worker) if worker else pane)
     return enriched
+
+
+def _tendwire_public_id(value: Any, *, prefix: str, limit: int = 120) -> str:
+    text = sanitize_text(str(value or ""), limit).strip()
+    text = re.sub(r"[^A-Za-z0-9_.:-]+", "-", text).strip(".:-_")
+    return text or prefix
+
+
+def tendwire_source_read_panes(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build read-only pane-like records from Tendwire's public snapshot."""
+    spaces = {
+        str(space.get("id") or ""): space
+        for space in snapshot.get("spaces") or []
+        if isinstance(space, dict) and str(space.get("id") or "")
+    }
+    panes: list[dict[str, Any]] = []
+    for worker in snapshot.get("workers") or []:
+        if not isinstance(worker, dict):
+            continue
+        worker_id = str(worker.get("id") or "").strip()
+        if not worker_id:
+            continue
+        meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+        space_id = str(worker.get("space_id") or "").strip()
+        space = spaces.get(space_id) or {}
+        space_name = sanitize_text(str(space.get("name") or space.get("label") or ""), 120).strip()
+        agent = tendwire_worker_agent(worker) or sanitize_text(str(worker.get("name") or "worker"), 80)
+        status_line = sanitize_text(str(worker.get("status_line") or worker.get("summary") or ""), 500)
+        pane = {
+            "pane_id": f"tendwire:{_tendwire_public_id(worker_id, prefix='worker')}",
+            "terminal_id": "",
+            "workspace_id": space_id,
+            "space_id": space_id,
+            "tab_id": sanitize_text(str(meta.get("tab_id") or ""), 120).strip(),
+            "agent": agent,
+            "agent_status": tendwire_worker_status_for_herdres(str(worker.get("status") or "unknown")),
+            "label": sanitize_text(str(worker.get("name") or agent or "Tendwire Worker"), 120),
+            "name": sanitize_text(str(worker.get("name") or agent or "Tendwire Worker"), 120),
+            "foreground_cwd": str(meta.get("foreground_cwd") or meta.get("cwd") or ""),
+            "space_name": space_name,
+            "workspace_label": space_name,
+            "summary": status_line,
+            "source": "tendwire",
+            "_tendwire_source_read": True,
+            "_tendwire_enriched": True,
+            "_tendwire_worker_id": worker_id,
+            "_tendwire_fingerprint": str(worker.get("fingerprint") or ""),
+            "_tendwire_status_line": status_line,
+            "_tendwire_last_seen_at": str(worker.get("last_seen_at") or ""),
+        }
+        panes.append(pane)
+    return panes
+
+
+def pane_is_tendwire_source_read(pane: dict[str, Any] | None) -> bool:
+    return isinstance(pane, dict) and bool(pane.get("_tendwire_source_read"))
 
 
 def pane_by_id(pane_id: str, deadline: float | None = None) -> dict[str, Any] | None:
@@ -4534,7 +4594,7 @@ def _direct_origin_marker_same_pane(entry: dict[str, Any], pane: dict[str, Any] 
 
 def _direct_origin_after_turn_id(entry: dict[str, Any], pane_id: str = "") -> str:
     clean_pane_id = str(pane_id or "").strip()
-    if clean_pane_id:
+    if clean_pane_id and not clean_pane_id.startswith("tendwire:"):
         try:
             turn = fresh_cached_pane_turn(clean_pane_id)
         except Exception:
@@ -8963,7 +9023,7 @@ def send_to_tendwire_worker_response(
         if mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin=origin, pane_id=pane_id) and state is not None:
             save_state(state)
         return {"handled": True, "reply": tendwire_success_reply(response)}
-    if tendwire_direct_fallback_enabled():
+    if tendwire_direct_fallback_enabled() and not entry_is_tendwire_source(entry):
         return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
     return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
 
@@ -8981,7 +9041,7 @@ def interrupt_and_send_response(
     if entry_is_tendwire_source(entry):
         return {
             "handled": True,
-            "reply": "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet.",
+            "reply": "Tendwire command mode cannot safely interrupt this worker yet; use /send.",
         }
     if tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) in {"valid", "partial"}:
         return {
@@ -11795,6 +11855,8 @@ def sync_space_pinned_statuses(
 
 
 def observed_agent_panes() -> list[dict[str, Any]]:
+    if tendwire_source_read_enabled():
+        return tendwire_source_read_panes(tendwire_snapshot())
     all_panes = pane_list()
     include_shells = parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "")
     panes = [pane for pane in all_panes if include_shells or pane.get("agent")]
@@ -12162,6 +12224,7 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
     panes = state.setdefault("panes", {})
     entry = panes.get(key)
     created = False
+    source = "tendwire" if pane_is_tendwire_source_read(pane) else "herdr"
     if not isinstance(entry, dict):
         reusable = find_reusable_closed_entry(panes, key, pane)
         if reusable:
@@ -12191,7 +12254,7 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
         "agent": str(pane.get("agent") or ""),
         "workspace": str(pane.get("workspace_id") or ""),
         "tab": str(pane.get("tab_id") or ""),
-        "source": "herdr",
+        "source": source,
         # Persist the cwd so migrate_legacy_pane_topics() can reconstruct a
         # faithful pane_like; per-agent topic names ("<agent> · <folder>") are
         # derived from it and would degrade to a bare "<agent>" without it.
@@ -12260,6 +12323,10 @@ def entry_is_tendwire_source(entry: dict[str, Any] | None) -> bool:
     return str(entry.get("source") or "") == "tendwire" and str(entry.get("pane_id") or "").startswith("tendwire:")
 
 
+def tendwire_source_entry_commands_allowed(entry: dict[str, Any] | None) -> bool:
+    return entry_is_tendwire_source(entry) and tendwire_source_read_enabled() and tendwire_commands_enabled()
+
+
 TENDWIRE_ENTRY_METADATA_KEYS = (
     "tendwire_worker_id",
     "tendwire_fingerprint",
@@ -12270,7 +12337,9 @@ TENDWIRE_SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and ch
 
 
 def tendwire_entry_metadata_state(entry: dict[str, Any] | None) -> str:
-    if not isinstance(entry, dict) or entry_is_tendwire_source(entry):
+    if not isinstance(entry, dict):
+        return "none"
+    if entry_is_tendwire_source(entry) and not tendwire_source_entry_commands_allowed(entry):
         return "none"
     has_metadata = any(key in entry for key in TENDWIRE_ENTRY_METADATA_KEYS)
     if not has_metadata:
@@ -12918,6 +12987,13 @@ def _sync_pane_clean_feed(
     early_return is True when the topic or pane-root went missing (caller
     must return True immediately); None means continue.
     """
+    if pane_is_tendwire_source_read(pane):
+        return {
+            "early_return": None,
+            "changed": changed,
+            "feed_delivered": False,
+            "stream_active": False,
+        }
     feed_delivered_this_pane = False
     stream_active_this_pane = False
     item = None
@@ -13894,7 +13970,8 @@ def sync_once() -> dict[str, Any]:
     # changes, forget all existing topic mappings so fresh topics are created.
     if reconcile_topic_grouping(state):
         changed = True
-    stale_tendwire_pruned = drop_tendwire_source_pane_records(state)
+    source_read = tendwire_source_read_enabled()
+    stale_tendwire_pruned = 0 if source_read else drop_tendwire_source_pane_records(state)
     if stale_tendwire_pruned:
         changed = True
 
@@ -13922,7 +13999,13 @@ def sync_once() -> dict[str, Any]:
     if tendwire_outbox_result.get("changed"):
         changed = True
     pinned_status_updated = 0
-    workspace_labels = workspace_label_map()
+    workspace_labels = {
+        str(pane.get("workspace_id") or pane.get("space_id") or ""): str(
+            pane.get("space_name") or pane.get("workspace_label") or ""
+        )
+        for pane in panes
+        if source_read and str(pane.get("workspace_id") or pane.get("space_id") or "")
+    } if source_read else workspace_label_map()
     # Tier 0 (#79): drop residual records whose topic is already audited-gone (NO Telegram call).
     tier0_pruned = reconcile_known_gone_spaces(state) if parse_bool_env(
         "HERDR_TELEGRAM_TOPICS_TIER0_PRUNE", "1") else 0
@@ -14008,7 +14091,7 @@ def sync_once() -> dict[str, Any]:
         changed = True
     if ensure_multibot_offer_message(state, chat_id, telegram, counters, caps["max_sends"], panes):
         changed = True
-    if TURN_FEED_ENABLED:
+    if TURN_FEED_ENABLED and not source_read:
         prefetch_pane_turns([
             str(p.get("pane_id") or "")
             for p in panes
@@ -14024,7 +14107,7 @@ def sync_once() -> dict[str, Any]:
         if sync_pane_once(state, chat_id, telegram, pane, counters, caps):
             changed = True
     devin_glm_started = 0
-    devin_glm_result = ensure_devin_glm_space_seats(state, panes)
+    devin_glm_result = {"changed": False, "started": 0} if source_read else ensure_devin_glm_space_seats(state, panes)
     if devin_glm_result.get("changed"):
         changed = True
         devin_glm_started = int(devin_glm_result.get("started") or 0)
@@ -14476,7 +14559,8 @@ def forward_text_to_pane_response(
     outbound = raw_outbound.strip()
     if not outbound:
         return {"handled": True, "reply": usage}
-    if entry_is_tendwire_source(entry):
+    source_entry = entry_is_tendwire_source(entry)
+    if source_entry and not tendwire_source_entry_commands_allowed(entry):
         return {
             "handled": True,
             "reply": "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet.",
@@ -14497,9 +14581,11 @@ def forward_text_to_pane_response(
                 request_id=request_id,
             )
         if metadata_state == "partial":
-            if tendwire_direct_fallback_enabled():
+            if not source_entry and tendwire_direct_fallback_enabled():
                 return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
             return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
+    if source_entry:
+        return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
     return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
 
 
@@ -15406,6 +15492,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     pane_id = str(entry.get("pane_id") or "")
     if not pane_id or entry.get("last_known_status") == "closed":
         return {"handled": True, "reply": "This topic is mapped to a closed or unavailable Herdr pane."}
+    source_entry = entry_is_tendwire_source(entry)
     pane_api_token = managed_bot_token_for_entry(telegram, entry)
     if command == "agents":
         label = str((managed_bot_specs().get(managed_bot_kind_for_entry(entry)) or {}).get("label")
@@ -15413,6 +15500,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "reply": f"Only one agent here ({label}) — your messages already route to it."}
 
     attachment = payload.get("attachment")
+    if source_entry and isinstance(attachment, dict) and attachment.get("kind") in {"document", "photo", "voice"}:
+        return {
+            "handled": True,
+            "reply": "Attachments and voice notes are not available in Tendwire source-read mode yet; send text with /send.",
+        }
     if isinstance(attachment, dict) and attachment.get("kind") in {"document", "photo"} and attachment.get("file_id"):
         caption = str(payload.get("caption") or "")
         ok, detail, dest = deliver_attachment(pane_id, attachment)
@@ -15487,6 +15579,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
         awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
         if awaiting and str(awaiting.get("user_id") or "") == user_id:
+            if source_entry:
+                entry.pop("awaiting_detail", None)
+                entry.pop("active_prompt", None)
+                save_state(state)
+                return {"handled": True, "reply": "No active choices for this pane."}
             awaiting_source = awaiting_detail_source(awaiting)
             if awaiting_source and prompt_interaction_disabled({"choice_source": awaiting_source}):
                 entry.pop("awaiting_detail", None)
@@ -15640,7 +15737,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     if command in {"status", "report"}:
-        pane = pane_by_id(pane_id)
+        pane = None if source_entry else pane_by_id(pane_id)
         if TURN_FEED_ENABLED:
             item = latest_turn_item(entry, pane)
             if item:
@@ -15729,6 +15826,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return {"handled": True, "reply": ""}
         return {"handled": True, "reply": latest_clean_report(entry, pane)}
     if command == "choices":
+        if source_entry:
+            return {"handled": True, "reply": "No active choices for this pane."}
         prompt = entry.get("active_prompt") if isinstance(entry.get("active_prompt"), dict) else {}
         options = list(prompt.get("options") or [])
         prompt_id = str(prompt.get("id") or "")
@@ -15816,6 +15915,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         save_state(state)
         return {"handled": True, "reply": ""}
     if command in {"skills", "commands"}:
+        if source_entry:
+            return {
+                "handled": True,
+                "reply": "The skills picker is not available for Tendwire source-read entries yet; use /send.",
+            }
         # Issue #27: list the pane agent's slash-commands/skills as tappable buttons; a tap reuses
         # the active_prompt -> callback("c") -> send_to_pane path verbatim (send_text is "/name", or
         # a best-effort natural-language invocation for Codex skills).
@@ -15896,6 +16000,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         save_state(state)
         return {"handled": True, "reply": "Could not post the skills list."}
     if command in {"raw", "read"}:
+        if source_entry:
+            return {
+                "handled": True,
+                "reply": "Raw pane output is not available in Tendwire source-read mode.",
+            }
         try:
             lines = int(arg.strip() or READ_LINES_COMMAND_DEFAULT)
         except ValueError:
@@ -15904,7 +16013,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         text_out = recent_tail(pane_id, lines=lines, max_chars=MAX_REPLY_CHARS - 300)
         return {"handled": True, "reply": text_out or "No visible output available."}
     if command == "debug":
-        pane = pane_by_id(pane_id)
+        pane = None if source_entry else pane_by_id(pane_id)
         return {"handled": True, "reply": format_debug(pane, entry)}
     if command == "send":
         return forward_text_to_pane_response(
@@ -15944,7 +16053,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     # as commands instead of being rejected as "unknown". Only the leading
     # @botname (added by Telegram in groups) is stripped.
     forward_text = re.sub(r"^(/\S+?)@\S+", r"\1", text.strip())
-    if pane_input_needs_file(forward_text):
+    if pane_input_needs_file(forward_text) and not source_entry:
         # Long/multiline command: the command token MUST stay on a short single
         # line so the agent registers it as a slash-command — a long/multiline
         # paste becomes an opaque "[Pasted text]" block and the command is lost.
@@ -16045,7 +16154,8 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
         text = str(rec.get("text") or "").strip()
         age = _iso_age_seconds(str(rec.get("set_at") or ""))
         if text and pane_id and (age is None or age <= ACTIVE_PANE_TTL_SECONDS):
-            if entry_is_tendwire_source(entry):
+            source_entry = entry_is_tendwire_source(entry)
+            if source_entry and not tendwire_source_entry_commands_allowed(entry):
                 blocked_send = True
                 deliver_note = "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet."
             elif tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) == "valid" and isinstance(entry, dict):
@@ -16069,7 +16179,7 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
                     delivered = True
                     deliver_note = reply
             elif tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) == "partial":
-                if tendwire_direct_fallback_enabled():
+                if not entry_is_tendwire_source(entry) and tendwire_direct_fallback_enabled():
                     after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if isinstance(entry, dict) else ""
                     try:
                         ok, detail = send_to_pane(pane_id, text)
@@ -16082,6 +16192,9 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
                 else:
                     blocked_send = True
                     deliver_note = TENDWIRE_SAFE_SEND_FAILURE_REPLY
+            elif source_entry:
+                blocked_send = True
+                deliver_note = TENDWIRE_SAFE_SEND_FAILURE_REPLY
             else:
                 after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if isinstance(entry, dict) else ""
                 try:
@@ -16247,11 +16360,20 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
     if user_id not in owners:
         return {"handled": True, "answer": "Not authorized.", "show_alert": True}
-    refresh_entry_managed_voice(state, entry, None)
 
     parts = data.split(":")
     if len(parts) != 4 or parts[1] not in {"c", "d"}:
         return {"handled": True, "answer": "Unknown Herdr action."}
+    if entry_is_tendwire_source(entry):
+        entry.pop("active_prompt", None)
+        entry.pop("awaiting_detail", None)
+        save_state(state)
+        return {
+            "handled": True,
+            "answer": "Choices are not available for Tendwire source-read entries yet.",
+            "show_alert": True,
+        }
+    refresh_entry_managed_voice(state, entry, None)
     action = parts[1]
     prompt_id = parts[2]
     choice_number = parts[3]

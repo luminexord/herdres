@@ -723,12 +723,14 @@ Tendwire modes:
 | `off` | Default. Disables Tendwire calls and enrichment. |
 | `enrich` | Enables the current safe enrichment path. Herdres still reads real Herdr panes directly with `pane_list()`, preserves real `pane_id` values, and Tendwire only adds metadata/status to unambiguous real-pane matches. |
 | `commands` | Keeps real-pane enrichment, then routes normal Telegram text for Tendwire-enriched entries through `tendwire command --json` using the worker id and fingerprint. Entries without Tendwire metadata still use the legacy direct Herdr send path. |
-| `source-read` | Keeps the same enrichment and command-routing behavior as `commands`; source-read behavior itself is not implemented in Herdres. |
+| `source-read` | Uses the Tendwire public snapshot as the pane inventory instead of `pane_list()`, creates read-only `tendwire:<worker>` pseudo entries, skips Herdr pane read/feed/turn inventory helpers for those entries, and routes text only through `tendwire command --json` when worker id/fingerprint metadata is present. Attachments, raw reads, picker callbacks, stale choices, and direct Herdr fallback for pseudo entries fail closed. |
 | `source` | Keeps the same enrichment and command-routing behavior as `commands`; source/outbox behavior itself is not implemented in Herdres. |
 
 Invalid mode values warn and fall back to `off`; they never enable Tendwire behavior. When `HERDRES_TENDWIRE_MODE` is unset, legacy `HERDRES_TENDWIRE_HYBRID=1` or `HERDRES_TENDWIRE_SNAPSHOT=1` aliases to `enrich`. Those legacy names remain compatibility aliases, not the public Tendwire mental model.
 
 In `commands` mode and higher, if an enriched real pane has a worker id and fingerprint, Herdres does not direct-send the instruction to Herdr after selecting Tendwire command routing. Stale/ambiguous Tendwire command failures and malformed Tendwire CLI responses fail closed with a safe Telegram note. If an entry has partial Tendwire metadata, such as a worker id without a fingerprint, Herdres also fails closed. `HERDRES_TENDWIRE_DIRECT_FALLBACK=1` is an emergency operator override that allows direct Herdr fallback; it defaults off.
+
+In `source-read` mode, the same emergency fallback does not apply to Tendwire pseudo entries. Source-read entries are not real Herdr pane ids; missing worker metadata, failed Tendwire sends, attachments, `/raw`, `/read`, stale choices, and picker callbacks that cannot be routed through Tendwire all fail closed instead of calling Herdr directly.
 
 `/send!` is not routed through Tendwire in this phase. For command-mode enriched entries it fails closed because Tendwire interrupt semantics are not represented here yet; use `/send` or interrupt directly in Herdr. Non-enriched entries and `enrich` mode keep the existing `/send!` Herdr interrupt path.
 
