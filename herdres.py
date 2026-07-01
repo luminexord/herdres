@@ -2064,6 +2064,88 @@ def tendwire_outbox_once(args: Any) -> dict[str, Any]:
     return {"ok": True, "tendwire_outbox": result, "sent": counters["sends"]}
 
 
+def _last_json_line(stdout: str) -> tuple[dict[str, Any] | None, int]:
+    parsed: dict[str, Any] | None = None
+    count = 0
+    for raw in str(stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            count += 1
+            parsed = obj
+    return parsed, count
+
+
+def tendwire_source_smoke_once(args: Any) -> dict[str, Any]:
+    """Run a source-mode dry-run sync against copied state and fail on direct Herdr calls."""
+    load_dotenv()
+    source_state = state_path()
+    timeout = max(1, int(getattr(args, "timeout", 30) or 30))
+    with tempfile.TemporaryDirectory(prefix="herdres-source-smoke-") as tmp_name:
+        work_dir = Path(tmp_name)
+        smoke_state = work_dir / "state.json"
+        smoke_lock = work_dir / "state.lock"
+        direct_log = work_dir / "direct-herdr.log"
+        direct_bin = work_dir / "herdr-direct-forbidden"
+        if source_state.exists():
+            smoke_state.write_bytes(source_state.read_bytes())
+        else:
+            smoke_state.write_text(json.dumps(initial_state(), sort_keys=True) + "\n", encoding="utf-8")
+        direct_bin.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$HERDRES_SOURCE_SMOKE_DIRECT_HERDR_LOG\"\n"
+            "exit 127\n",
+            encoding="utf-8",
+        )
+        direct_bin.chmod(0o700)
+        child_env = {str(key): str(value) for key, value in os.environ.items()}
+        if not str(child_env.get("HERDR_REAL_BIN") or "").strip():
+            child_env["HERDR_REAL_BIN"] = str(child_env.get("HERDR_BIN") or DEFAULT_HERDR_BIN)
+        child_env.update(
+            {
+                "HERDR_TELEGRAM_TOPICS_STATE": str(smoke_state),
+                "HERDR_TELEGRAM_TOPICS_LOCK": str(smoke_lock),
+                "HERDR_TELEGRAM_TOPICS_DRY_RUN": "1",
+                "HERDRES_TENDWIRE_MODE": "source",
+                "HERDR_BIN": str(direct_bin),
+                "HERDRES_SOURCE_SMOKE_DIRECT_HERDR_LOG": str(direct_log),
+            }
+        )
+        if not bool(getattr(args, "with_outbox", False)):
+            child_env["HERDRES_TENDWIRE_CONNECTOR_OUTBOX"] = "0"
+        proc = run_cmd(
+            [sys.executable, str(Path(__file__).resolve()), "sync"],
+            timeout=timeout,
+            env=child_env,
+        )
+        sync_result, json_lines = _last_json_line(proc.stdout)
+        direct_calls = 0
+        if direct_log.exists():
+            direct_calls = len([line for line in direct_log.read_text(encoding="utf-8").splitlines() if line.strip()])
+        ok = proc.returncode == 0 and bool((sync_result or {}).get("ok")) and direct_calls == 0
+        status = "ok" if ok else ("direct_herdr_called" if direct_calls else "sync_failed")
+        result = {
+            "ok": ok,
+            "status": status,
+            "mode": "source",
+            "dry_run": True,
+            "state_copied": source_state.exists(),
+            "with_outbox": bool(getattr(args, "with_outbox", False)),
+            "direct_herdr_calls": direct_calls,
+            "sync_returncode": int(proc.returncode),
+            "sync_result": sync_result or {},
+            "json_lines": json_lines,
+        }
+        if proc.returncode != 0:
+            result["stderr"] = sanitize_text(proc.stderr or "", 500)
+        return result
+
+
 def tendwire_snapshot() -> dict[str, Any]:
     proc = run_cmd(
         [*tendwire_command_base(), "snapshot", "--json"],
@@ -18206,6 +18288,14 @@ def main() -> int:
     tendwire_sub.add_parser("config")
     tendwire_outbox = tendwire_sub.add_parser("outbox")
     tendwire_outbox.add_argument("--limit", type=int, default=None)
+    tendwire_source_smoke = tendwire_sub.add_parser("source-smoke")
+    tendwire_source_smoke.add_argument("--timeout", type=int, default=30)
+    tendwire_source_smoke.add_argument(
+        "--with-outbox",
+        dest="with_outbox",
+        action="store_true",
+        help="allow the smoke to drain connector outbox from the copied state",
+    )
     hooks = sub.add_parser("hooks")
     hooks.add_argument("action", nargs="?", default="install", choices=["install"])
     speech = sub.add_parser("speech")
@@ -18262,8 +18352,10 @@ def main() -> int:
         elif args.cmd == "tendwire":
             if args.tendwire_cmd == "config":
                 result = tendwire_config_once(args)
-            else:
+            elif args.tendwire_cmd == "outbox":
                 result = with_lock(lambda: tendwire_outbox_once(args), blocking=True)
+            else:
+                result = tendwire_source_smoke_once(args)
         elif args.cmd == "hooks":
             result = hooks_once(args)
         elif args.cmd == "speech":
