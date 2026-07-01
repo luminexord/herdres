@@ -12086,12 +12086,13 @@ class TopicLatestAnchorTests(unittest.TestCase):
 
     def test_command_reply_forwarded_owner_message_still_advances_mark(self) -> None:
         # GLM finding: a forwarded owner message creates a real message that physically
-        # buries the anchor, even though command_reply rejects its CONTENT ("Ignored ...").
-        # The high-water mark must still advance (the advance is before the forwarded gate).
+        # buries the anchor. Its CONTENT is now processed like a direct message (no longer
+        # rejected), but the high-water mark must still advance regardless.
         state, _pane, _key, entry = self._state()
         entry["last_pane_message_id"] = "2001"
         state["spaces"]["workspace:workspace-1"]["last_topic_message_id"] = "2001"
         saved = []
+        send_to_pane = Mock(return_value=(True, ""))
         payload = {"chat_id": "-1001", "topic_id": "77", "user_id": "42",
                    "message_id": "2044", "text": "fwd", "forwarded": True}
         with patch.multiple(
@@ -12099,12 +12100,14 @@ class TopicLatestAnchorTests(unittest.TestCase):
             load_state=Mock(return_value=state),
             save_state=Mock(side_effect=lambda s: saved.append(True)),
             load_dotenv=Mock(),
+            send_to_pane=send_to_pane,
         ):
             result = herdres.command_reply(payload)
         self.assertEqual(state["spaces"]["workspace:workspace-1"]["last_topic_message_id"], "2044")
         self.assertTrue(saved, "forwarded owner message must still persist the advanced mark")
-        # content is still rejected
-        self.assertIn("Ignored", result.get("reply", ""))
+        # content is no longer rejected — it routes to the single live pane like direct input
+        self.assertEqual(result.get("reply", ""), "")
+        send_to_pane.assert_called_once_with("pane-1", "fwd")
 
     def test_command_reply_edited_owner_message_does_not_advance_mark(self) -> None:
         # An edited message does NOT create a new feed position, so it must NOT advance.

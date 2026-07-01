@@ -15412,8 +15412,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if not owners:
         owners = {p.strip() for p in os.getenv("TELEGRAM_ALLOWED_USERS", DEFAULT_OWNER_ID).split(",") if p.strip()}
     # Advance the shared-topic high-water mark for ANY new owner message that lands in a
-    # mapped pane topic — INCLUDING forwarded or bot-mismatch messages that are rejected
-    # by the gates below — because the message physically occupies a feed position and
+    # mapped pane topic — INCLUDING messages later rejected by the gates below (e.g. a
+    # bot-mismatch) — because the message physically occupies a feed position and
     # buries any in-place turn anchor placed before it, so the next finalize must re-anchor
     # to the bottom instead of editing a now-buried message. Edited messages are skipped
     # (they create no new feed position); from_bot is skipped (the bot's own outbound sends
@@ -15449,8 +15449,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "reply": ""}
     if user_id not in owners:
         return {"handled": True, "reply": ""}
-    if payload.get("forwarded"):
-        return {"handled": True, "reply": "Ignored non-direct owner message in pane topic."}
+    # A message the owner FORWARDS into a pane topic (Telegram stamps forward_origin/
+    # forward_date, so payload["forwarded"] is True) is treated as direct input: forwarded
+    # voice → transcribed, forwarded media → delivered, forwarded text → routed to the pane.
+    # payload["text"] is the clean body (forward metadata lives in separate fields), so no
+    # "Forwarded from …" header pollutes the instruction.
 
     if command == "new":
         if tendwire_source_inventory_enabled():
