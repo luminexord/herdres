@@ -16548,15 +16548,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     parts = data.split(":")
     if len(parts) != 4 or parts[1] not in {"c", "d"}:
         return {"handled": True, "answer": "Unknown Herdr action."}
-    if entry_is_tendwire_source(entry):
-        entry.pop("active_prompt", None)
-        entry.pop("awaiting_detail", None)
-        save_state(state)
-        return {
-            "handled": True,
-            "answer": "Choices are not available for Tendwire source-read entries yet.",
-            "show_alert": True,
-        }
+    source_entry = entry_is_tendwire_source(entry)
     refresh_entry_managed_voice(state, entry, None)
     action = parts[1]
     prompt_id = parts[2]
@@ -16595,8 +16587,15 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     options = list(prompt.get("options") or [])
 
     pane_id = str(entry.get("pane_id") or "")
-    if not pane_id or entry.get("last_known_status") == "closed":
+    if not source_entry and (not pane_id or entry.get("last_known_status") == "closed"):
         return {"handled": True, "answer": "This pane is no longer live.", "show_alert": True}
+    if source_entry and entry.get("last_known_status") == "closed":
+        return {"handled": True, "answer": "This worker is no longer live.", "show_alert": True}
+    if source_entry and tendwire_entry_metadata_state(entry) != "valid":
+        entry.pop("active_prompt", None)
+        entry.pop("awaiting_detail", None)
+        save_state(state)
+        return {"handled": True, "answer": TENDWIRE_SAFE_SEND_FAILURE_REPLY, "show_alert": True}
     pane_api_token = managed_bot_token_for_entry(telegram, entry)
 
     option = next(
@@ -16611,6 +16610,12 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     if action == "d":
+        if source_entry:
+            return {
+                "handled": True,
+                "answer": "Custom choice details are not available for Tendwire source entries yet.",
+                "show_alert": True,
+            }
         choice_text = ""
         select_choice = ""
         visible_choice = ""
@@ -16683,6 +16688,12 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "answer": "Choice not found."}
 
     if choice_needs_detail(option):
+        if source_entry:
+            return {
+                "handled": True,
+                "answer": "Choice details are not available for Tendwire source entries yet.",
+                "show_alert": True,
+            }
         choice_text = str(option.get("send_text") or "").strip() if "send_text" in option else ""
         select_choice = ""
         visible_choice = ""
@@ -16733,6 +16744,33 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     outbound = str(option.get("send_text") if "send_text" in option else choice_number).strip()
     if not outbound:
         return {"handled": True, "answer": "This choice needs details.", "show_alert": True}
+    if source_entry:
+        send_result = send_to_tendwire_worker_response(
+            entry,
+            outbound,
+            state=None,
+            origin="choice",
+            chat_id=chat_id,
+            topic_id=topic_id,
+            callback_message_id=message_id,
+        )
+        if str(send_result.get("reply") or "") == TENDWIRE_SAFE_SEND_FAILURE_REPLY:
+            return {"handled": True, "answer": TENDWIRE_SAFE_SEND_FAILURE_REPLY, "show_alert": True}
+        entry.pop("active_prompt", None)
+        entry.pop("awaiting_detail", None)
+        save_state(state)
+        direct_skill = _boolish(option.get("direct"))
+        option_label = str(option.get("label") or choice_number)
+        send_notice(
+            chat_id,
+            "Selected",
+            option_label if direct_skill else f"{choice_number}) {option_label}",
+            telegram=telegram,
+            thread_id=topic_id,
+            notify=False,
+            api_token=pane_api_token,
+        )
+        return {"handled": True, "answer": f"Sent {option_label}." if direct_skill else f"Selected {choice_number}."}
     after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
     ok, detail = send_to_pane(pane_id, outbound)
     if not ok:
