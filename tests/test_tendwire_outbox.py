@@ -172,6 +172,58 @@ class TendwireOutboxTests(unittest.TestCase):
         self.assertEqual(result["tendwire_outbox"]["delivered"], 1)
         save_state.assert_called()
 
+    def test_sync_once_source_mode_drains_outbox_by_default(self) -> None:
+        state = _state()
+
+        def connector_call(action: str, params: dict | None = None):
+            if action == "poll":
+                return {"ok": True, "items": [_item()]}
+            if action == "ack":
+                return {"ok": True, "status": "acknowledged"}
+            return {"ok": False, "status": "unexpected"}
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source", "TELEGRAM_BOT_TOKEN": "123:token"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "save_state") as save_state, \
+                patch.object(herdres, "observed_agent_panes", return_value=[]), \
+                patch.object(herdres, "sync_closed_pane_records", return_value={"changed": False, "sent": 0}), \
+                patch.object(herdres, "reconcile_known_gone_spaces", return_value=0), \
+                patch.object(herdres, "prune_orphan_spaces", return_value=0), \
+                patch.object(herdres, "reconcile_pinned_status_views", return_value={"changed": False, "updated": 0}), \
+                patch.object(herdres, "tendwire_connector_call", side_effect=connector_call), \
+                patch.object(herdres, "send_rich_message", return_value={"ok": True, "message_id": "55"}):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tendwire_outbox"]["enabled"], True)
+        self.assertEqual(result["tendwire_outbox"]["delivered"], 1)
+        self.assertEqual(result["tendwire_outbox"]["acked"], 1)
+        self.assertEqual(result["sent"], 1)
+        save_state.assert_called()
+
+    def test_sync_once_source_mode_respects_explicit_outbox_disable(self) -> None:
+        state = _state()
+        with patch.dict(
+            os.environ,
+            {"HERDRES_TENDWIRE_MODE": "source", "HERDRES_TENDWIRE_CONNECTOR_OUTBOX": "0", "TELEGRAM_BOT_TOKEN": "123:token"},
+            clear=True,
+        ), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "save_state"), \
+                patch.object(herdres, "observed_agent_panes", return_value=[]), \
+                patch.object(herdres, "sync_closed_pane_records", return_value={"changed": False, "sent": 0}), \
+                patch.object(herdres, "reconcile_known_gone_spaces", return_value=0), \
+                patch.object(herdres, "prune_orphan_spaces", return_value=0), \
+                patch.object(herdres, "reconcile_pinned_status_views", return_value={"changed": False, "updated": 0}), \
+                patch.object(herdres, "tendwire_connector_call") as connector_call:
+            result = herdres.sync_once()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tendwire_outbox"]["enabled"], False)
+        connector_call.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

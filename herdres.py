@@ -1860,8 +1860,11 @@ def tendwire_direct_fallback_enabled() -> bool:
     return parse_bool_env("HERDRES_TENDWIRE_DIRECT_FALLBACK", "0")
 
 
-def tendwire_connector_outbox_enabled() -> bool:
-    return parse_bool_env("HERDRES_TENDWIRE_CONNECTOR_OUTBOX", "0")
+def tendwire_connector_outbox_enabled(env: Any | None = None) -> bool:
+    source = os.environ if env is None else env
+    if source.get("HERDRES_TENDWIRE_CONNECTOR_OUTBOX") is not None:
+        return _tendwire_bool_env(source, "HERDRES_TENDWIRE_CONNECTOR_OUTBOX")
+    return parse_tendwire_mode(source) == "source"
 
 
 def _bounded_int_env(
@@ -2022,7 +2025,7 @@ def tendwire_config_status(env: Any | None = None) -> dict[str, Any]:
         "tendwire_herdr_bin": tendwire_herdr_bin(source),
         "tendwire_timeout_seconds": outer_timeout,
         "tendwire_herdr_timeout_seconds": herdr_timeout,
-        "tendwire_connector_outbox": _tendwire_bool_env(source, "HERDRES_TENDWIRE_CONNECTOR_OUTBOX"),
+        "tendwire_connector_outbox": tendwire_connector_outbox_enabled(source),
         "tendwire_connector_name": str(source.get("HERDRES_TENDWIRE_CONNECTOR_NAME") or "attention"),
         "tendwire_connector_limit": _bounded_int_env(
             "HERDRES_TENDWIRE_CONNECTOR_LIMIT", 3, minimum=1, maximum=20, env=source
