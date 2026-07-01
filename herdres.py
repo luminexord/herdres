@@ -1852,6 +1852,44 @@ def tendwire_direct_fallback_enabled() -> bool:
     return parse_bool_env("HERDRES_TENDWIRE_DIRECT_FALLBACK", "0")
 
 
+def tendwire_connector_outbox_enabled() -> bool:
+    return parse_bool_env("HERDRES_TENDWIRE_CONNECTOR_OUTBOX", "0")
+
+
+def _bounded_int_env(
+    key: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: int = 100,
+    env: Any | None = None,
+) -> int:
+    source = os.environ if env is None else env
+    try:
+        parsed = int(float(str(source.get(key, str(default)) or str(default))))
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def tendwire_connector_name() -> str:
+    raw = os.getenv("HERDRES_TENDWIRE_CONNECTOR_NAME", "attention").strip() or "attention"
+    clean = re.sub(r"[^A-Za-z0-9_.:-]+", "-", raw).strip(".:-_")
+    return clean[:64] or "attention"
+
+
+def tendwire_connector_limit() -> int:
+    return _bounded_int_env("HERDRES_TENDWIRE_CONNECTOR_LIMIT", 3, minimum=1, maximum=20)
+
+
+def tendwire_connector_lease_seconds() -> int:
+    return _bounded_int_env("HERDRES_TENDWIRE_CONNECTOR_LEASE_SECONDS", 60, minimum=1, maximum=86400)
+
+
+def tendwire_connector_failure_delay_seconds() -> int:
+    return _bounded_int_env("HERDRES_TENDWIRE_CONNECTOR_FAILURE_DELAY_SECONDS", 60, minimum=0, maximum=86400)
+
+
 def _env_source(env: Any | None = None) -> Any:
     return os.environ if env is None else env
 
@@ -1976,6 +2014,17 @@ def tendwire_config_status(env: Any | None = None) -> dict[str, Any]:
         "tendwire_herdr_bin": tendwire_herdr_bin(source),
         "tendwire_timeout_seconds": outer_timeout,
         "tendwire_herdr_timeout_seconds": herdr_timeout,
+        "tendwire_connector_outbox": _tendwire_bool_env(source, "HERDRES_TENDWIRE_CONNECTOR_OUTBOX"),
+        "tendwire_connector_name": str(source.get("HERDRES_TENDWIRE_CONNECTOR_NAME") or "attention"),
+        "tendwire_connector_limit": _bounded_int_env(
+            "HERDRES_TENDWIRE_CONNECTOR_LIMIT", 3, minimum=1, maximum=20, env=source
+        ),
+        "tendwire_connector_lease_seconds": _bounded_int_env(
+            "HERDRES_TENDWIRE_CONNECTOR_LEASE_SECONDS", 60, minimum=1, maximum=86400, env=source
+        ),
+        "tendwire_connector_failure_delay_seconds": _bounded_int_env(
+            "HERDRES_TENDWIRE_CONNECTOR_FAILURE_DELAY_SECONDS", 60, minimum=0, maximum=86400, env=source
+        ),
         "warnings": warnings,
     }
 
@@ -1983,6 +2032,25 @@ def tendwire_config_status(env: Any | None = None) -> dict[str, Any]:
 def tendwire_config_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
     load_dotenv()
     return {"ok": True, "config": tendwire_config_status()}
+
+
+def tendwire_outbox_once(args: Any) -> dict[str, Any]:
+    load_dotenv()
+    state = load_state()
+    telegram, chat_id = configure_telegram_state(state)
+    counters = make_sync_counters()
+    result = drain_tendwire_connector_outbox(
+        state,
+        chat_id,
+        telegram,
+        counters,
+        max_sends=MAX_SENDS_PER_RUN,
+        enabled=True,
+        limit=int(getattr(args, "limit", 0) or tendwire_connector_limit()),
+    )
+    if result.get("changed"):
+        save_state(state)
+    return {"ok": True, "tendwire_outbox": result, "sent": counters["sends"]}
 
 
 def tendwire_snapshot() -> dict[str, Any]:
@@ -2044,6 +2112,302 @@ def tendwire_command(request: dict[str, Any]) -> dict[str, Any]:
             status = "non_object_json"
         return {"ok": False, "status": status, "error": error}
     return data
+
+
+def tendwire_connector_call(action: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    data = dict(params or {})
+    clean_action = str(action or "").strip().lower()
+    name = str(data.get("name") or tendwire_connector_name()).strip() or "attention"
+    args = [*tendwire_command_base(), "connector", clean_action, "--name", name]
+    if clean_action == "poll":
+        try:
+            poll_limit = max(1, int(data.get("limit") or tendwire_connector_limit()))
+        except (TypeError, ValueError):
+            poll_limit = tendwire_connector_limit()
+        args.extend(["--limit", str(poll_limit)])
+        lease_seconds = data.get("lease_seconds")
+        if lease_seconds is not None:
+            try:
+                lease_value = max(1, int(lease_seconds))
+            except (TypeError, ValueError):
+                lease_value = tendwire_connector_lease_seconds()
+            args.extend(["--lease-seconds", str(lease_value)])
+    elif clean_action in {"ack", "fail", "defer"}:
+        ref = str(data.get("ref") or "").strip()
+        if not ref:
+            return {"ok": False, "status": "invalid_ref", "error": "missing connector ref"}
+        args.extend(["--ref", ref])
+        response = data.get("response")
+        if isinstance(response, dict) and response:
+            args.extend(["--response-json", json.dumps(response, sort_keys=True, separators=(",", ":"))])
+        if clean_action in {"fail", "defer"}:
+            reason = sanitize_text(str(data.get("reason") or ""), 120).strip()
+            if reason:
+                args.extend(["--reason", reason])
+            if data.get("available_at"):
+                args.extend(["--available-at", str(data.get("available_at"))])
+            if data.get("delay_seconds") is not None:
+                try:
+                    delay_value = max(0, int(data.get("delay_seconds") or 0))
+                except (TypeError, ValueError):
+                    delay_value = tendwire_connector_failure_delay_seconds()
+                args.extend(["--delay-seconds", str(delay_value)])
+    elif clean_action != "reclaim":
+        return {"ok": False, "status": "unknown_method", "error": "unknown connector action"}
+    try:
+        proc = run_cmd(args, timeout=tendwire_timeout_seconds(), env=tendwire_child_env())
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "status": "timeout", "error": "tendwire connector call timed out"}
+    except Exception as exc:
+        return {"ok": False, "status": "subprocess_failed", "error": sanitize_text(str(exc), 300)}
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "status": "nonzero_exit",
+            "error": sanitize_text(proc.stderr or proc.stdout or "tendwire connector call failed", 500),
+        }
+    parsed, error = _json_object_from_stdout(proc.stdout, f"tendwire connector {clean_action}")
+    if error:
+        status = "malformed_json" if "malformed JSON" in error else "non_json_stdout"
+        if "non-object JSON" in error:
+            status = "non_object_json"
+        return {"ok": False, "status": status, "error": error}
+    return parsed
+
+
+def _tendwire_attention_payload(item: dict[str, Any]) -> dict[str, Any]:
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _tendwire_attention_event_type(payload: dict[str, Any]) -> str:
+    return sanitize_text(str(payload.get("event_type") or "attention"), 80).strip() or "attention"
+
+
+def tendwire_attention_notice_text(payload: dict[str, Any]) -> str:
+    attention = payload.get("attention") if isinstance(payload.get("attention"), dict) else {}
+    event_type = _tendwire_attention_event_type(payload)
+    title = "Tendwire attention escalated" if event_type == "attention_escalated" else "Tendwire attention"
+    lines = [title]
+    for label, key, limit in (
+        ("Severity", "severity", 80),
+        ("Status", "status", 80),
+        ("Kind", "kind", 120),
+        ("Reason", "reason", 500),
+        ("Updated", "last_changed_at", 80),
+        ("Signals", "signal_count", 40),
+    ):
+        value = attention.get(key) if isinstance(attention, dict) else None
+        text = sanitize_text(str(value or ""), limit).strip()
+        if text:
+            lines.append(f"{label}: {text}")
+    transition_at = sanitize_text(str(payload.get("transition_at") or ""), 80).strip()
+    if transition_at:
+        lines.append(f"Observed: {transition_at}")
+    return "\n".join(lines)
+
+
+def tendwire_attention_notice_html(payload: dict[str, Any]) -> str:
+    plain = tendwire_attention_notice_text(payload)
+    lines = plain.splitlines()
+    if not lines:
+        return "<b>Tendwire attention</b>"
+    head, rest = lines[0], lines[1:]
+    blocks = [f"<h3>{html.escape(head)}</h3>"]
+    for line in rest:
+        label, sep, value = line.partition(":")
+        if sep:
+            blocks.append(f"<p><b>{html.escape(label.strip())}</b>: {html.escape(value.strip())}</p>")
+        else:
+            blocks.append(f"<p>{html.escape(line)}</p>")
+    return "".join(blocks)
+
+
+def tendwire_outbox_item_identity(item: dict[str, Any]) -> str:
+    payload = _tendwire_attention_payload(item)
+    body = {"key": str(item.get("key") or ""), "payload": payload}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+
+
+def tendwire_outbox_delivered_identities(state: dict[str, Any]) -> set[str]:
+    audit = state.get("tendwire_outbox") if isinstance(state.get("tendwire_outbox"), dict) else {}
+    identities = audit.get("delivered_identities") if isinstance(audit.get("delivered_identities"), list) else []
+    return {str(value) for value in identities if str(value)}
+
+
+def tendwire_outbox_audit(state: dict[str, Any], event: dict[str, Any]) -> None:
+    audit = state.setdefault("tendwire_outbox", {})
+    if not isinstance(audit, dict):
+        audit = {}
+        state["tendwire_outbox"] = audit
+    audit["last_checked_at"] = utc_now()
+    deliveries = audit.get("recent") if isinstance(audit.get("recent"), list) else []
+    deliveries.append(event)
+    audit["recent"] = deliveries[-50:]
+    identity = str(event.get("identity") or "")
+    if identity and str(event.get("status") or "") == "delivered":
+        identities = audit.get("delivered_identities") if isinstance(audit.get("delivered_identities"), list) else []
+        identities.append(identity)
+        audit["delivered_identities"] = list(dict.fromkeys(str(value) for value in identities if str(value)))[-200:]
+
+
+def deliver_tendwire_outbox_item(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _tendwire_attention_payload(item)
+    html_text = tendwire_attention_notice_html(payload)
+    fallback_text = tendwire_attention_notice_text(payload)
+    result = send_rich_message(
+        chat_id,
+        html_text,
+        telegram=telegram,
+        fallback_text=fallback_text,
+        thread_id=telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID),
+        notify=True,
+    )
+    if result.get("ok"):
+        tendwire_outbox_audit(
+            state,
+            {
+                "event_type": _tendwire_attention_event_type(payload),
+                "attempt": int(item.get("attempt") or 0),
+                "status": "delivered",
+                "delivered_at": utc_now(),
+            },
+        )
+    return result
+
+
+def drain_tendwire_connector_outbox(
+    state: dict[str, Any],
+    chat_id: str,
+    telegram: dict[str, Any],
+    counters: dict[str, int],
+    *,
+    max_sends: int,
+    enabled: bool | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    if enabled is None:
+        enabled = tendwire_connector_outbox_enabled()
+    result: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "polled": 0,
+        "delivered": 0,
+        "acked": 0,
+        "failed": 0,
+        "deferred": 0,
+        "changed": False,
+    }
+    if not enabled:
+        return result
+    if not str(chat_id or "").strip():
+        result["status"] = "telegram_unconfigured"
+        return result
+    if not (os.getenv("HERDRES_OUTBOUND_BOT_TOKEN", "").strip() or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()):
+        result["status"] = "telegram_unconfigured"
+        return result
+    remaining = max(0, int(max_sends) - int(counters.get("sends", 0)))
+    if remaining <= 0:
+        result["status"] = "send_cap_exhausted"
+        return result
+    poll_limit = min(max(1, int(limit or tendwire_connector_limit())), remaining)
+    poll = tendwire_connector_call(
+        "poll",
+        {
+            "name": tendwire_connector_name(),
+            "limit": poll_limit,
+            "lease_seconds": tendwire_connector_lease_seconds(),
+        },
+    )
+    if not poll.get("ok"):
+        result["status"] = str(poll.get("status") or "poll_failed")
+        result["error"] = sanitize_text(str(poll.get("error") or ""), 300)
+        tendwire_outbox_audit(state, {"status": result["status"], "checked_at": utc_now()})
+        result["changed"] = True
+        return result
+    items = [item for item in poll.get("items", []) if isinstance(item, dict)]
+    result["polled"] = len(items)
+    for item in items:
+        ref = str(item.get("ref") or "").strip()
+        if not ref:
+            continue
+        identity = tendwire_outbox_item_identity(item)
+        if identity in tendwire_outbox_delivered_identities(state):
+            ack = tendwire_connector_call(
+                "ack",
+                {
+                    "name": tendwire_connector_name(),
+                    "ref": ref,
+                    "response": {
+                        "sent": True,
+                        "deduplicated": True,
+                        "event_type": _tendwire_attention_event_type(_tendwire_attention_payload(item)),
+                    },
+                },
+            )
+            if ack.get("ok"):
+                result["acked"] += 1
+            else:
+                result["failed"] += 1
+            result["changed"] = True
+            continue
+        try:
+            sent = deliver_tendwire_outbox_item(state, chat_id, telegram, item)
+        except RateLimited as exc:
+            deferred = tendwire_connector_call(
+                "defer",
+                {
+                    "name": tendwire_connector_name(),
+                    "ref": ref,
+                    "reason": "rate_limited",
+                    "delay_seconds": max(1, int(exc.retry_after)),
+                    "response": {"sent": False},
+                },
+            )
+            result["deferred"] += 1 if deferred.get("ok") else 0
+            result["changed"] = True
+            continue
+        except Exception as exc:
+            sent = {"ok": False, "error": sanitize_text(str(exc), 300)}
+        if sent.get("ok"):
+            counters["sends"] = counters.get("sends", 0) + 1
+            result["delivered"] += 1
+            tendwire_outbox_audit(state, {"identity": identity, "status": "delivered", "recorded_at": utc_now()})
+            ack = tendwire_connector_call(
+                "ack",
+                {
+                    "name": tendwire_connector_name(),
+                    "ref": ref,
+                    "response": {
+                        "sent": True,
+                        "event_type": _tendwire_attention_event_type(_tendwire_attention_payload(item)),
+                    },
+                },
+            )
+            if ack.get("ok"):
+                result["acked"] += 1
+            else:
+                result["failed"] += 1
+            result["changed"] = True
+            continue
+        failed = tendwire_connector_call(
+            "fail",
+            {
+                "name": tendwire_connector_name(),
+                "ref": ref,
+                "reason": "send_failed",
+                "delay_seconds": tendwire_connector_failure_delay_seconds(),
+                "response": {"sent": False},
+            },
+        )
+        if failed.get("ok"):
+            result["failed"] += 1
+        result["changed"] = True
+    return result
 
 
 TENDWIRE_COMMAND_SUCCESS_STATUSES = {"accepted", "queued", "sent", "submitted", "ok", "success"}
@@ -13548,6 +13912,15 @@ def sync_once() -> dict[str, Any]:
     sends = int(closed_result.get("sent") or 0)
     counters = make_sync_counters(sends=sends)
     caps = make_sync_caps()
+    tendwire_outbox_result = drain_tendwire_connector_outbox(
+        state,
+        chat_id,
+        telegram,
+        counters,
+        max_sends=caps["max_sends"],
+    )
+    if tendwire_outbox_result.get("changed"):
+        changed = True
     pinned_status_updated = 0
     workspace_labels = workspace_label_map()
     # Tier 0 (#79): drop residual records whose topic is already audited-gone (NO Telegram call).
@@ -13580,6 +13953,7 @@ def sync_once() -> dict[str, Any]:
             "panes": 0,
             "sent": counters["sends"],
             "pinned_status_updated": pinned_status_updated,
+            "tendwire_outbox": tendwire_outbox_result,
             "tier0_pruned": tier0_pruned,
             "stale_tendwire_pruned": stale_tendwire_pruned,
             "orphan_pruned": orphan_pruned,
@@ -13676,6 +14050,7 @@ def sync_once() -> dict[str, Any]:
         "marker_sent": counters["marker_sends"],
         "icon_updated": counters["icon_updates"],
         "pinned_status_updated": pinned_status_updated,
+        "tendwire_outbox": tendwire_outbox_result,
         "devin_glm_started": devin_glm_started,
         "tier0_pruned": tier0_pruned,
         "stale_tendwire_pruned": stale_tendwire_pruned,
@@ -17457,6 +17832,8 @@ def main() -> int:
     tendwire = sub.add_parser("tendwire")
     tendwire_sub = tendwire.add_subparsers(dest="tendwire_cmd", required=True)
     tendwire_sub.add_parser("config")
+    tendwire_outbox = tendwire_sub.add_parser("outbox")
+    tendwire_outbox.add_argument("--limit", type=int, default=None)
     hooks = sub.add_parser("hooks")
     hooks.add_argument("action", nargs="?", default="install", choices=["install"])
     speech = sub.add_parser("speech")
@@ -17511,7 +17888,10 @@ def main() -> int:
         elif args.cmd == "version":
             result = version_once(args)
         elif args.cmd == "tendwire":
-            result = tendwire_config_once(args)
+            if args.tendwire_cmd == "config":
+                result = tendwire_config_once(args)
+            else:
+                result = with_lock(lambda: tendwire_outbox_once(args), blocking=True)
         elif args.cmd == "hooks":
             result = hooks_once(args)
         elif args.cmd == "speech":
