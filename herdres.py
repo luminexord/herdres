@@ -18354,8 +18354,10 @@ def main() -> int:
                 result = tendwire_config_once(args)
             elif args.tendwire_cmd == "outbox":
                 result = with_lock(lambda: tendwire_outbox_once(args), blocking=True)
-            else:
+            elif args.tendwire_cmd == "source-smoke":
                 result = tendwire_source_smoke_once(args)
+            else:
+                result = {"ok": False, "error": f"unknown tendwire action: {args.tendwire_cmd}"}
         elif args.cmd == "hooks":
             result = hooks_once(args)
         elif args.cmd == "speech":
