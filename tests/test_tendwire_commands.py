@@ -149,7 +149,12 @@ class TendwireRequestBuilderTests(unittest.TestCase):
         self.assertEqual(request["params"]["telegram_origin"], "plain")
         self.assertEqual(request["request_id"], again["request_id"])
         self.assertNotEqual(request["request_id"], changed["request_id"])
-        self.assertIn("telegram:-1001:77:5000:worker-1", request["request_id"])
+        self.assertTrue(request["request_id"].startswith("herdres:worker-1:"))
+        encoded = json.dumps(request, sort_keys=True)
+        self.assertNotIn("-1001", encoded)
+        self.assertNotIn('"77"', encoded)
+        self.assertNotIn("5000", encoded)
+        self.assertNotIn("1001", encoded)
 
 
 class TendwireCommandRoutingTests(unittest.TestCase):
@@ -186,7 +191,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         self.assertEqual(state["panes"]["pane-1"]["direct_origin_origin"], "send")
 
     def test_source_read_send_uses_tendwire_command_not_send_to_pane(self) -> None:
-        entry = _entry(source="tendwire", pane_id="tendwire:worker-1")
+        entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", worker_fingerprint="fp-1")
         state = _state(entry)
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
                 self._command_patches(state) as patched:
@@ -201,9 +206,15 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         self.assertEqual(request["action"], "send_instruction")
         self.assertEqual(request["target"]["worker_id"], "worker-1")
         self.assertEqual(request["target"]["worker_fingerprint"], "fp-1")
-        self.assertEqual(request["params"]["pane_id"], "tendwire:worker-1")
+        self.assertEqual(request["params"]["entry_type"], "worker")
+        self.assertEqual(request["params"]["pane_key"], "pane-1")
+        self.assertNotIn("pane_id", request["params"])
+        self.assertNotIn("chat_id", request["params"])
+        self.assertNotIn("topic_id", request["params"])
+        self.assertNotIn("message_id", request["params"])
         self.assertEqual(request["instruction"]["text"], "first line\nsecond line")
-        self.assertEqual(state["panes"]["pane-1"]["direct_origin_pane_id"], "tendwire:worker-1")
+        self.assertEqual(state["panes"]["pane-1"]["direct_origin_pane_id"], "")
+        self.assertEqual(state["panes"]["pane-1"]["direct_origin_pane_key"], "pane-1")
 
     def test_commands_mode_plain_reply_uses_tendwire_command_not_send_to_pane(self) -> None:
         state = _state()
@@ -321,7 +332,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         tendwire_command.assert_not_called()
 
     def test_source_read_tendwire_failure_never_uses_direct_fallback(self) -> None:
-        entry = _entry(source="tendwire", pane_id="tendwire:worker-1")
+        entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", worker_fingerprint="fp-1")
         with patch.dict(
             os.environ,
             {"HERDRES_TENDWIRE_MODE": "source-read", "HERDRES_TENDWIRE_DIRECT_FALLBACK": "1"},
@@ -330,7 +341,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
                 patch.object(herdres, "tendwire_command", return_value={"status": "stale_target"}), \
                 patch.object(herdres, "send_to_pane") as send_to_pane:
             result = herdres.forward_text_to_pane_response(
-                "tendwire:worker-1",
+                "",
                 "continue",
                 state={"panes": {}},
                 entry=entry,
@@ -340,7 +351,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         send_to_pane.assert_not_called()
 
     def test_source_read_attachment_and_raw_do_not_call_herdr(self) -> None:
-        entry = _entry(source="tendwire", pane_id="tendwire:worker-1")
+        entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", worker_fingerprint="fp-1")
         state = _state(entry)
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
                 self._command_patches(state) as patched, \
@@ -364,10 +375,47 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         patched["send_to_pane"].assert_not_called()
         patched["run_cmd"].assert_not_called()
 
+    def test_source_mode_legacy_entry_does_not_call_herdr_or_tendwire(self) -> None:
+        entry = _entry(source="herdr", pane_id="pane-1")
+        for key in herdres.TENDWIRE_ENTRY_METADATA_KEYS:
+            entry.pop(key, None)
+        state = _state(entry)
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                self._command_patches(state) as patched:
+            result = herdres.command_reply(_payload())
+
+        self.assertIn("legacy Herdr mode", result["reply"])
+        patched["send_to_pane"].assert_not_called()
+        patched["run_cmd"].assert_not_called()
+
+    def test_source_mode_new_and_keys_do_not_call_herdr(self) -> None:
+        source_entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", worker_fingerprint="fp-1")
+        state = _state(source_entry)
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                self._command_patches(state) as patched, \
+                patch.object(herdres, "new_agent_pane_response") as new_agent:
+            new_result = herdres.command_reply(_payload(text="/new codex"))
+
+        self.assertIn("disabled in Tendwire source mode", new_result["reply"])
+        new_agent.assert_not_called()
+        patched["send_to_pane"].assert_not_called()
+        patched["run_cmd"].assert_not_called()
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                self._command_patches(state) as patched:
+            keys_result = herdres.command_reply(_payload(text="/keys enter"))
+
+        self.assertIn("Raw key delivery is not available", keys_result["reply"])
+        patched["send_to_pane"].assert_not_called()
+        patched["run_cmd"].assert_not_called()
+
     def test_source_read_callback_choice_does_not_call_herdr(self) -> None:
         entry = _entry(
             source="tendwire",
-            pane_id="tendwire:worker-1",
+            entry_type="worker",
+            pane_id="",
+            worker_id="worker-1",
+            worker_fingerprint="fp-1",
             active_prompt={
                 "id": "prompt-1",
                 "message_id": "1001",
@@ -449,8 +497,10 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         run_cmd.assert_called_once()
         request = json.loads(run_cmd.call_args.kwargs["input_text"])
         self.assertEqual(request["instruction"]["text"], "continue")
-        self.assertEqual(request["params"]["message_id"], "5000")
-        self.assertEqual(request["params"]["callback_message_id"], "6000")
+        self.assertNotIn("message_id", request["params"])
+        self.assertNotIn("callback_message_id", request["params"])
+        self.assertNotIn("5000", json.dumps(request, sort_keys=True))
+        self.assertNotIn("6000", json.dumps(request, sort_keys=True))
         self.assertNotIn("42", space["pending_pick"])
         save_state.assert_called_once_with(state)
         telegram_api.assert_called_once()
@@ -488,7 +538,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         self.assertEqual(telegram_api.call_args.args[1]["text"], herdres.TENDWIRE_SAFE_SEND_FAILURE_REPLY)
 
     def test_source_read_agent_picker_missing_metadata_fails_closed(self) -> None:
-        entry = _entry(source="tendwire", pane_id="tendwire:worker-1", agent="codex")
+        entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", worker_fingerprint="fp-1", agent="codex")
         for key in herdres.TENDWIRE_ENTRY_METADATA_KEYS:
             entry.pop(key, None)
         pane_key = "pane-1"
@@ -522,6 +572,62 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         self.assertNotIn("42", space["pending_pick"])
         save_state.assert_called_once_with(state)
         self.assertEqual(telegram_api.call_args.args[1]["text"], herdres.TENDWIRE_SAFE_SEND_FAILURE_REPLY)
+
+    def test_source_mode_agent_picker_legacy_entry_does_not_call_herdr_or_tendwire(self) -> None:
+        entry = _entry(source="herdr", pane_id="pane-1", agent="codex")
+        for key in herdres.TENDWIRE_ENTRY_METADATA_KEYS:
+            entry.pop(key, None)
+        pane_key = "pane-1"
+        space = {
+            "space_key": "workspace:workspace-1",
+            "pane_keys": [pane_key],
+            "pending_pick": {"42": {"text": "continue", "set_at": herdres.utc_now()}},
+        }
+        state = {"panes": {pane_key: entry}, "spaces": {"workspace:workspace-1": space}}
+        token = herdres.agent_picker_pane_tokens([(pane_key, entry)])[pane_key]
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "run_cmd") as run_cmd, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "save_state") as save_state, \
+                patch.object(herdres, "telegram_api") as telegram_api:
+            result = herdres.handle_agent_pick_callback(
+                state,
+                {},
+                "-1001",
+                "77",
+                "6000",
+                "42",
+                space,
+                ["herdr", "pick", "workspace:workspace-1", token],
+            )
+
+        self.assertEqual(result["answer"], "Not sent.")
+        run_cmd.assert_not_called()
+        send_to_pane.assert_not_called()
+        self.assertNotIn("42", space["pending_pick"])
+        save_state.assert_called_once_with(state)
+        self.assertIn("legacy Herdr mode", telegram_api.call_args.args[1]["text"])
+
+    def test_source_mode_stale_new_pane_picker_does_not_call_herdr(self) -> None:
+        space = {"space_key": "workspace:workspace-1"}
+        state = {"panes": {}, "spaces": {"workspace:workspace-1": space}}
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "new_agent_pane_response") as new_agent:
+            result = herdres.handle_new_pane_picker_callback(
+                state,
+                {},
+                "-1001",
+                "77",
+                "6000",
+                space,
+                ["herdr", "new", "workspace:workspace-1", "codex"],
+            )
+
+        self.assertTrue(result["show_alert"])
+        self.assertIn("disabled in Tendwire source mode", result["answer"])
+        new_agent.assert_not_called()
 
 
 if __name__ == "__main__":

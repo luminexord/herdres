@@ -1845,7 +1845,11 @@ def tendwire_commands_enabled() -> bool:
 
 
 def tendwire_source_read_enabled() -> bool:
-    return tendwire_mode() == "source-read"
+    return tendwire_mode() in {"source-read", "source"}
+
+
+def tendwire_source_inventory_enabled() -> bool:
+    return tendwire_source_read_enabled()
 
 
 def tendwire_fallback_to_herdr_enabled() -> bool:
@@ -2620,8 +2624,12 @@ def tendwire_source_read_panes(snapshot: dict[str, Any]) -> list[dict[str, Any]]
         space_name = sanitize_text(str(space.get("name") or space.get("label") or ""), 120).strip()
         agent = tendwire_worker_agent(worker) or sanitize_text(str(worker.get("name") or "worker"), 80)
         status_line = sanitize_text(str(worker.get("status_line") or worker.get("summary") or ""), 500)
+        fingerprint = str(worker.get("fingerprint") or "")
         pane = {
-            "pane_id": f"tendwire:{_tendwire_public_id(worker_id, prefix='worker')}",
+            "entry_type": "worker",
+            "worker_id": worker_id,
+            "worker_fingerprint": fingerprint,
+            "pane_id": "",
             "terminal_id": "",
             "workspace_id": space_id,
             "space_id": space_id,
@@ -2638,7 +2646,7 @@ def tendwire_source_read_panes(snapshot: dict[str, Any]) -> list[dict[str, Any]]
             "_tendwire_source_read": True,
             "_tendwire_enriched": True,
             "_tendwire_worker_id": worker_id,
-            "_tendwire_fingerprint": str(worker.get("fingerprint") or ""),
+            "_tendwire_fingerprint": fingerprint,
             "_tendwire_status_line": status_line,
             "_tendwire_last_seen_at": str(worker.get("last_seen_at") or ""),
         }
@@ -2756,7 +2764,25 @@ def pane_agent_session_id(pane: dict[str, Any]) -> str:
     return ""
 
 
+def _worker_key_component(value: Any, *, fallback: str = "worker") -> str:
+    text = sanitize_text(str(value or ""), 120).strip()
+    text = re.sub(r"[^A-Za-z0-9_.:-]+", "-", text).strip(".:-_")
+    return text or fallback
+
+
 def pane_key(pane: dict[str, Any]) -> str:
+    if str(pane.get("source") or "") == "tendwire" and str(pane.get("entry_type") or "") == "worker":
+        worker_id = str(pane.get("worker_id") or pane.get("_tendwire_worker_id") or "").strip()
+        fingerprint = str(pane.get("worker_fingerprint") or pane.get("_tendwire_fingerprint") or "").strip()
+        parts = [
+            worker_id,
+            fingerprint,
+            str(pane.get("space_id") or pane.get("workspace_id") or ""),
+            str(pane.get("tab_id") or ""),
+        ]
+        raw = "|".join(parts)
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+        return f"worker:{_worker_key_component(worker_id)}:{digest}"
     parts = [
         str(pane.get("pane_id") or ""),
         str(pane.get("terminal_id") or ""),
@@ -2781,6 +2807,10 @@ def space_key(pane: dict[str, Any]) -> str:
         # One topic per Herdr agent: group by the stable pane id (which both live
         # panes and the reconstructed pane_like dicts in migrate carry), not by
         # pane_key, whose digest folds in terminal_id that migrate does not have.
+        if str(pane.get("source") or "") == "tendwire" and str(pane.get("entry_type") or "") == "worker":
+            worker_id = _space_component(str(pane.get("worker_id") or pane.get("_tendwire_worker_id") or ""))
+            if worker_id:
+                return f"agent:worker:{worker_id}"
         pane_id = _space_component(str(pane.get("pane_id") or ""))
         if pane_id:
             return f"agent:{pane_id}"
@@ -4594,7 +4624,7 @@ def _direct_origin_marker_same_pane(entry: dict[str, Any], pane: dict[str, Any] 
 
 def _direct_origin_after_turn_id(entry: dict[str, Any], pane_id: str = "") -> str:
     clean_pane_id = str(pane_id or "").strip()
-    if clean_pane_id and not clean_pane_id.startswith("tendwire:"):
+    if clean_pane_id and not entry_is_tendwire_source(entry):
         try:
             turn = fresh_cached_pane_turn(clean_pane_id)
         except Exception:
@@ -9038,6 +9068,11 @@ def interrupt_and_send_response(
     outbound = str(text or "").strip()
     if not outbound:
         return {"handled": True, "reply": "Usage: /send! <instruction> — interrupts the current turn and sends now"}
+    if tendwire_source_inventory_enabled():
+        return {
+            "handled": True,
+            "reply": "Tendwire source mode cannot safely interrupt workers from Telegram; use /send.",
+        }
     if entry_is_tendwire_source(entry):
         return {
             "handled": True,
@@ -12260,6 +12295,14 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
         # derived from it and would degrade to a bare "<agent>" without it.
         "foreground_cwd": str(pane.get("foreground_cwd") or pane.get("cwd") or ""),
     })
+    if source == "tendwire":
+        entry["entry_type"] = str(pane.get("entry_type") or "worker")
+        entry["worker_id"] = str(pane.get("worker_id") or pane.get("_tendwire_worker_id") or "")
+        entry["worker_fingerprint"] = str(pane.get("worker_fingerprint") or pane.get("_tendwire_fingerprint") or "")
+    else:
+        entry.pop("entry_type", None)
+        entry.pop("worker_id", None)
+        entry.pop("worker_fingerprint", None)
     if pane.get("_tendwire_enriched"):
         entry["tendwire_worker_id"] = str(pane.get("_tendwire_worker_id") or "")
         entry["tendwire_fingerprint"] = str(pane.get("_tendwire_fingerprint") or "")
@@ -12320,7 +12363,13 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
 def entry_is_tendwire_source(entry: dict[str, Any] | None) -> bool:
     if not isinstance(entry, dict):
         return False
-    return str(entry.get("source") or "") == "tendwire" and str(entry.get("pane_id") or "").startswith("tendwire:")
+    if str(entry.get("source") or "") != "tendwire":
+        return False
+    if str(entry.get("entry_type") or "") == "worker":
+        return True
+    if str(entry.get("pane_id") or "").startswith("tendwire:"):
+        return True
+    return bool(str(entry.get("tendwire_worker_id") or "").strip())
 
 
 def tendwire_source_entry_commands_allowed(entry: dict[str, Any] | None) -> bool:
@@ -12383,12 +12432,8 @@ def tendwire_instruction_request_id(
         "text_hash": text_hash,
     }
     digest = hashlib.sha256(json.dumps(context, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
-    message_component = message_id or callback_message_id or reply_to_message_id or "message"
     return ":".join((
-        "telegram",
-        tendwire_request_component(chat_id, 32),
-        tendwire_request_component(topic_id, 32),
-        tendwire_request_component(message_component, 32),
+        "herdres",
         tendwire_request_component(worker_id, 48),
         text_hash[:12],
         digest,
@@ -12424,13 +12469,8 @@ def build_tendwire_send_instruction_request(
         "telegram_origin": sanitize_text(str(origin or "send"), 40),
     }
     for key, value in (
-        ("pane_id", entry.get("pane_id")),
+        ("entry_type", entry.get("entry_type")),
         ("pane_key", entry.get("pane_key")),
-        ("chat_id", chat_id),
-        ("topic_id", topic_id),
-        ("message_id", message_id),
-        ("reply_to_message_id", reply_to_message_id),
-        ("callback_message_id", callback_message_id),
     ):
         clean = sanitize_text(str(value or ""), 300).strip()
         if clean:
@@ -12460,6 +12500,8 @@ def drop_tendwire_source_pane_records(state: dict[str, Any]) -> int:
         removed.append({
             "pane_key": str(key),
             "pane_id": str(entry.get("pane_id") or ""),
+            "entry_type": str(entry.get("entry_type") or ""),
+            "worker_id": str(entry.get("worker_id") or entry.get("tendwire_worker_id") or ""),
             "space_key": str(entry.get("space_key") or ""),
             "topic_id": str(entry.get("topic_id") or ""),
             "removed_at": utc_now(),
@@ -12475,6 +12517,7 @@ def pane_root_message_text(pane: dict[str, Any], entry: dict[str, Any]) -> str:
     council_label = council_display_label_for_entry_like(entry, pane)
     title = council_label or str(entry.get("pane_thread_name") or pane_thread_name(pane))
     pane_id = str(pane.get("pane_id") or entry.get("pane_id") or "")
+    worker_id = str(pane.get("worker_id") or entry.get("tendwire_worker_id") or "")
     agent = council_label or str(pane.get("agent") or "")
     cwd = compact_path(pane.get("cwd") or pane.get("foreground_cwd") or "")
     lines = [
@@ -12483,6 +12526,8 @@ def pane_root_message_text(pane: dict[str, Any], entry: dict[str, Any]) -> str:
     ]
     if pane_id:
         lines.append(f"Pane id: {pane_id}")
+    elif worker_id:
+        lines.append(f"Worker id: {worker_id}")
     if agent:
         lines.append(f"Agent: {agent}")
     if cwd:
@@ -14584,6 +14629,8 @@ def forward_text_to_pane_response(
             if not source_entry and tendwire_direct_fallback_enabled():
                 return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
             return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
+        if tendwire_source_inventory_enabled():
+            return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
     if source_entry:
         return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
     return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
@@ -15406,6 +15453,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "reply": "Ignored non-direct owner message in pane topic."}
 
     if command == "new":
+        if tendwire_source_inventory_enabled():
+            return {
+                "handled": True,
+                "reply": "Starting new Herdr panes from Telegram is disabled in Tendwire source mode.",
+            }
         if state_changed:
             save_state(state)
         return new_agent_pane_response(state, chat_id, topic_id, payload, arg)
@@ -15490,10 +15542,15 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "reply": "This pane has no shared space voice setting."}
 
     pane_id = str(entry.get("pane_id") or "")
-    if not pane_id or entry.get("last_known_status") == "closed":
-        return {"handled": True, "reply": "This topic is mapped to a closed or unavailable Herdr pane."}
     source_entry = entry_is_tendwire_source(entry)
+    if (not pane_id and not source_entry) or entry.get("last_known_status") == "closed":
+        return {"handled": True, "reply": "This topic is mapped to a closed or unavailable Herdr pane."}
     pane_api_token = managed_bot_token_for_entry(telegram, entry)
+    if tendwire_source_inventory_enabled() and not source_entry:
+        return {
+            "handled": True,
+            "reply": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending.",
+        }
     if command == "agents":
         label = str((managed_bot_specs().get(managed_bot_kind_for_entry(entry)) or {}).get("label")
                     or entry.get("agent") or entry.get("pane_id") or "pane")
@@ -16153,9 +16210,12 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
         pend.pop(str(user_id), None)
         text = str(rec.get("text") or "").strip()
         age = _iso_age_seconds(str(rec.get("set_at") or ""))
-        if text and pane_id and (age is None or age <= ACTIVE_PANE_TTL_SECONDS):
-            source_entry = entry_is_tendwire_source(entry)
-            if source_entry and not tendwire_source_entry_commands_allowed(entry):
+        source_entry = entry_is_tendwire_source(entry)
+        if text and (pane_id or source_entry) and (age is None or age <= ACTIVE_PANE_TTL_SECONDS):
+            if tendwire_source_inventory_enabled() and not source_entry:
+                blocked_send = True
+                deliver_note = "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending."
+            elif source_entry and not tendwire_source_entry_commands_allowed(entry):
                 blocked_send = True
                 deliver_note = "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet."
             elif tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) == "valid" and isinstance(entry, dict):
@@ -16238,6 +16298,8 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
 def handle_new_pane_picker_callback(state, telegram, chat_id, topic_id, message_id, space, parts):
     if len(parts) != 4:
         return {"handled": True, "answer": "Unknown Herdr action."}
+    if tendwire_source_inventory_enabled():
+        return {"handled": True, "answer": "Starting new Herdr panes is disabled in Tendwire source mode.", "show_alert": True}
     target = str(parts[3] or "")
     space_token = _callback_id(str(space.get("space_key") or ""), "space")[:16]
     if str(parts[2] or "") != space_token:
