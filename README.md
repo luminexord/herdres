@@ -873,6 +873,50 @@ delivery bookkeeping.
    `send_to_pane`, `herdr pane send-keys`, or `herdr pane read` for normal
    Telegram behavior.
 
+6. Before leaving source mode on, run a restart/event-storm smoke. A 24-hour soak
+   is best; if that is not practical, run this checklist and keep the command
+   output with the rollout notes:
+
+   ```bash
+   # 1. Herdr restart: use your Herdr supervisor, then verify Tendwire still
+   #    observes workers through its own source path.
+   tendwire snapshot --json --store --db-path ~/.local/share/tendwire/tendwire.sqlite3
+
+   # 2. Tendwire restart.
+   systemctl --user restart tendwired.service
+   tendwire doctor --json
+   tendwire store status --db-path ~/.local/share/tendwire/tendwire.sqlite3
+
+   # 3. SQLite integrity.
+   sqlite3 ~/.local/share/tendwire/tendwire.sqlite3 'PRAGMA integrity_check;'
+
+   # 4. Herdres source-mode dry run with direct Herdr intentionally disabled
+   #    for Herdres itself. HERDR_REAL_BIN keeps Tendwire's child process able
+   #    to observe Herdr while proving Herdres does not use direct pane calls.
+   HERDR_REAL_BIN="${HERDR_REAL_BIN:-$(command -v herdr)}" \
+   HERDR_BIN=/bin/false \
+   HERDRES_TENDWIRE_MODE=source \
+   HERDR_TELEGRAM_TOPICS_DRY_RUN=1 \
+     herdres sync
+
+   # 5. Herdres restart and one real sync.
+   systemctl --user restart herdres.timer herdres-gateway.service
+   HERDRES_TENDWIRE_MODE=source herdres sync
+
+   # 6. Connector duplicate-delivery check. Run twice; the second pass must not
+   #    post the same Tendwire item again. Confirm the Telegram General topic
+   #    has no duplicate notice and Tendwire outbox counts are stable or lower.
+   herdres tendwire outbox --limit 3
+   herdres tendwire outbox --limit 3
+   tendwire store status --db-path ~/.local/share/tendwire/tendwire.sqlite3
+   ```
+
+   If step 4 fails because `/bin/false` was invoked by Herdres, source mode is
+   still leaking a direct Herdr path and should not be promoted. Roll back to
+   `commands` or `enrich` until the failing entry point is fixed. If step 6
+   duplicates a Telegram delivery, leave `HERDRES_TENDWIRE_CONNECTOR_OUTBOX=0`
+   and inspect the Tendwire connector outbox before retrying.
+
 ## Probe
 
 To verify rich delivery against a scratch topic:
