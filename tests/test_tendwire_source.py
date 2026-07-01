@@ -5,7 +5,9 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import herdres
@@ -736,6 +738,69 @@ class TendwireHybridTests(unittest.TestCase):
                 sync_pane_once.assert_not_called()
                 observed_agent_panes.assert_not_called()
                 save_state.assert_called_once_with(state)
+
+    def test_tendwire_source_smoke_runs_source_dry_run_against_copied_state(self) -> None:
+        captured: dict[str, str] = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text(json.dumps({"enabled": True, "telegram": {"chat_id": "-100"}}), encoding="utf-8")
+
+            def fake_run_cmd(args, *, timeout=10, input_text=None, env=None):
+                del input_text
+                assert env is not None
+                captured.update(env)
+                self.assertEqual(timeout, 12)
+                self.assertEqual(args[-1], "sync")
+                self.assertNotEqual(env["HERDR_TELEGRAM_TOPICS_STATE"], str(state_path))
+                self.assertTrue(Path(env["HERDR_TELEGRAM_TOPICS_STATE"]).exists())
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout='{"dry_run_method":"sendMessage","payload":{}}\n{"ok":true,"panes":1}\n',
+                    stderr="",
+                )
+
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.object(herdres, "load_dotenv"), \
+                    patch.object(herdres, "state_path", return_value=state_path), \
+                    patch.object(herdres, "run_cmd", side_effect=fake_run_cmd):
+                result = herdres.tendwire_source_smoke_once(
+                    type("Args", (), {"timeout": 12, "with_outbox": False})()
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["direct_herdr_calls"], 0)
+        self.assertEqual(result["json_lines"], 2)
+        self.assertEqual(result["sync_result"]["panes"], 1)
+        self.assertEqual(captured["HERDRES_TENDWIRE_MODE"], "source")
+        self.assertEqual(captured["HERDR_TELEGRAM_TOPICS_DRY_RUN"], "1")
+        self.assertEqual(captured["HERDRES_TENDWIRE_CONNECTOR_OUTBOX"], "0")
+        self.assertEqual(captured["HERDR_REAL_BIN"], "herdr")
+        self.assertNotEqual(captured["HERDR_BIN"], captured["HERDR_REAL_BIN"])
+
+    def test_tendwire_source_smoke_fails_when_direct_herdr_is_called(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text(json.dumps({"enabled": True}), encoding="utf-8")
+
+            def fake_run_cmd(args, *, timeout=10, input_text=None, env=None):
+                del timeout, input_text
+                assert env is not None
+                Path(env["HERDRES_SOURCE_SMOKE_DIRECT_HERDR_LOG"]).write_text("pane list\n", encoding="utf-8")
+                return subprocess.CompletedProcess(args, 0, stdout='{"ok":true}\n', stderr="")
+
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.object(herdres, "load_dotenv"), \
+                    patch.object(herdres, "state_path", return_value=state_path), \
+                    patch.object(herdres, "run_cmd", side_effect=fake_run_cmd):
+                result = herdres.tendwire_source_smoke_once(
+                    type("Args", (), {"timeout": 30, "with_outbox": False})()
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "direct_herdr_called")
+        self.assertEqual(result["direct_herdr_calls"], 1)
 
     def test_enrich_mode_tendwire_enriched_entry_send_uses_real_pane_id(self) -> None:
         entry = {

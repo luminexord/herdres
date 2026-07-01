@@ -891,13 +891,11 @@ delivery bookkeeping.
    sqlite3 ~/.local/share/tendwire/tendwire.sqlite3 'PRAGMA integrity_check;'
 
    # 4. Herdres source-mode dry run with direct Herdr intentionally disabled
-   #    for Herdres itself. HERDR_REAL_BIN keeps Tendwire's child process able
-   #    to observe Herdr while proving Herdres does not use direct pane calls.
-   HERDR_REAL_BIN="${HERDR_REAL_BIN:-$(command -v herdr)}" \
-   HERDR_BIN=/bin/false \
-   HERDRES_TENDWIRE_MODE=source \
-   HERDR_TELEGRAM_TOPICS_DRY_RUN=1 \
-     herdres sync
+   #    for Herdres itself. This copies state to a temp file, sets
+   #    HERDR_BIN to a fail-closed recorder, keeps Tendwire observation on the
+   #    real Herdr binary through HERDR_REAL_BIN, and fails if Herdres invokes
+   #    any direct pane helper.
+   herdres tendwire source-smoke
 
    # 5. Herdres restart and one real sync.
    systemctl --user restart herdres.timer herdres-gateway.service
@@ -911,11 +909,13 @@ delivery bookkeeping.
    tendwire store status --db-path ~/.local/share/tendwire/tendwire.sqlite3
    ```
 
-   If step 4 fails because `/bin/false` was invoked by Herdres, source mode is
-   still leaking a direct Herdr path and should not be promoted. Roll back to
+   If step 4 reports `direct_herdr_calls` greater than `0`, source mode is still
+   leaking a direct Herdr path and should not be promoted. Roll back to
    `commands` or `enrich` until the failing entry point is fixed. If step 6
    duplicates a Telegram delivery, leave `HERDRES_TENDWIRE_CONNECTOR_OUTBOX=0`
-   and inspect the Tendwire connector outbox before retrying.
+   and inspect the Tendwire connector outbox before retrying. Pass
+   `--with-outbox` to `source-smoke` only when you intentionally want the copied
+   smoke run to exercise connector draining.
 
 ## Probe
 
