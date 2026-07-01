@@ -8254,6 +8254,8 @@ def active_prompt_message_rejection(prompt: dict[str, Any], callback_message_id:
 def current_visible_choice_item_for_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
     if not VISIBLE_CHOICE_BUTTONS_ENABLED:
         return None
+    if tendwire_source_inventory_enabled() or entry_is_tendwire_source(entry):
+        return None
     pane_id = str(entry.get("pane_id") or "")
     if not pane_id:
         return None
@@ -16581,6 +16583,12 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if len(parts) != 4 or parts[1] not in {"c", "d"}:
         return {"handled": True, "answer": "Unknown Herdr action."}
     source_entry = entry_is_tendwire_source(entry)
+    if tendwire_source_inventory_enabled() and not source_entry:
+        return {
+            "handled": True,
+            "answer": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending.",
+            "show_alert": True,
+        }
     refresh_entry_managed_voice(state, entry, None)
     action = parts[1]
     prompt_id = parts[2]

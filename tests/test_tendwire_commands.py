@@ -513,6 +513,84 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         run_cmd.assert_not_called()
         save_state.assert_called_once_with(state)
 
+    def test_source_mode_legacy_callback_fails_closed_without_herdr(self) -> None:
+        entry = _entry(
+            source="herdr",
+            pane_id="pane-1",
+            active_prompt={
+                "id": "prompt-1",
+                "message_id": "1001",
+                "text": "Choose",
+                "created_at": "9999-01-01T00:00:00+00:00",
+                "options": [{"number": "1", "label": "Yes", "send_text": "yes"}],
+            },
+        )
+        state = _state(entry)
+        payload = {
+            "chat_id": "-1001",
+            "topic_id": "77",
+            "message_id": "1001",
+            "user_id": "42",
+            "data": "herdr:c:prompt-1:1",
+        }
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "clear_disabled_visible_choice_state", return_value=False), \
+                patch.object(herdres, "save_state") as save_state, \
+                patch.object(herdres, "pane_by_id") as pane_by_id, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "run_cmd") as run_cmd:
+            result = herdres.callback_reply(payload)
+
+        self.assertIn("legacy Herdr mode", result["answer"])
+        self.assertTrue(result["show_alert"])
+        pane_by_id.assert_not_called()
+        send_to_pane.assert_not_called()
+        run_cmd.assert_not_called()
+        save_state.assert_not_called()
+
+    def test_source_read_visible_choice_callback_does_not_refresh_from_herdr(self) -> None:
+        entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            worker_id="worker-1",
+            worker_fingerprint="fp-1",
+            active_prompt={
+                "id": "oldprompt",
+                "message_id": "1001",
+                "text": "Choose",
+                "created_at": "9999-01-01T00:00:00+00:00",
+                "item": {"kind": "choices", "turn_id": "visible-choice:oldprompt"},
+                "options": [{"number": "1", "label": "Yes", "send_text": "yes"}],
+            },
+        )
+        state = _state(entry)
+        payload = {
+            "chat_id": "-1001",
+            "topic_id": "77",
+            "message_id": "1001",
+            "user_id": "42",
+            "data": "herdr:c:oldprompt:1",
+        }
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "clear_disabled_visible_choice_state", return_value=False), \
+                patch.object(herdres, "save_state") as save_state, \
+                patch.object(herdres, "pane_by_id") as pane_by_id, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "VISIBLE_CHOICE_BUTTONS_ENABLED", True), \
+                patch.object(herdres, "run_cmd", return_value=_completed({"status": "accepted"})) as run_cmd:
+            result = herdres.callback_reply(payload)
+
+        self.assertEqual(result["answer"], "Selected 1.")
+        pane_by_id.assert_not_called()
+        send_to_pane.assert_not_called()
+        run_cmd.assert_called_once()
+        save_state.assert_called_once_with(state)
+
     def test_source_read_callback_detail_choice_uses_tendwire_followup(self) -> None:
         entry = _entry(
             source="tendwire",
