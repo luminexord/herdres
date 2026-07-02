@@ -64,6 +64,12 @@ class DocumentationRenderTests(unittest.TestCase):
         self.assertIn("HERDR_TELEGRAM_TOPICS_STREAM_MIN_CHARS=80", env_example)
         self.assertIn("HERDR_TELEGRAM_TOPICS_MAX_DRAFTS=8", env_example)
 
+    def test_env_example_documents_notification_controls(self) -> None:
+        env_example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("HERDR_TELEGRAM_TOPICS_NOTIFY_TURNS=1", env_example)
+        self.assertIn("HERDR_TELEGRAM_TOPICS_NOTIFY_REPORTS=1", env_example)
+
     def test_env_example_documents_managed_bot_controls(self) -> None:
         env_example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
 
@@ -4633,6 +4639,21 @@ noise after
         self.assertIn("Shipped the topic bridge.", text)
         self.assertNotIn("noise before", text)
         self.assertNotIn("noise after", text)
+        self.assertTrue(item["notify"])
+
+    def test_bounded_report_notifications_can_be_disabled(self) -> None:
+        raw = """HERDRES_REPORT_START
+Deployment
+- Shipped the topic bridge.
+HERDRES_REPORT_END
+"""
+
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_NOTIFY_REPORTS": "0"}, clear=True):
+            item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw, allow_unbounded_reports=True)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertFalse(item["notify"])
 
     def test_bounded_report_rejects_bullet_as_title(self) -> None:
         raw = """HERDRES_REPORT_START
@@ -7474,6 +7495,22 @@ Which file changed. Should the report include the full diff? Files touched:
         self.assertEqual(item["kind"], "turn")
         self.assertEqual(item["turn_id"], "current-turn")
         self.assertIn("Current completed final answer", item["assistant_final_text"])
+        self.assertTrue(item["notify"])
+
+    def test_make_turn_feed_item_notifications_can_be_disabled(self) -> None:
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_NOTIFY_TURNS": "0"}, clear=True):
+            item = herdres.make_turn_feed_item(
+                {
+                    "available": True,
+                    "complete": True,
+                    "turn_id": "current-turn",
+                    "assistant_final_text": "Current completed final answer.",
+                }
+            )
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertFalse(item["notify"])
 
     def test_make_turn_feed_item_allows_structured_decision_when_open_turn_exists(self) -> None:
         item = herdres.make_turn_feed_item(

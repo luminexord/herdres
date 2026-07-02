@@ -3959,6 +3959,16 @@ def make_feed_item(kind: str, title: str, body: str, *, notify: bool) -> dict[st
     }
 
 
+def report_notifications_enabled() -> bool:
+    # Runtime env read: bare CLI/tests import before load_dotenv(), while service entry
+    # points load env first. Keep this aligned with the other runtime feature switches.
+    return parse_bool_env("HERDR_TELEGRAM_TOPICS_NOTIFY_REPORTS", "1")
+
+
+def turn_notifications_enabled() -> bool:
+    return parse_bool_env("HERDR_TELEGRAM_TOPICS_NOTIFY_TURNS", "1")
+
+
 def _boolish(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -4311,7 +4321,7 @@ def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
         "user_text": user_text,
         "worklog_text": worklog_text,
         "assistant_final_text": assistant_final,
-        "notify": False,
+        "notify": turn_notifications_enabled(),
     }
 
 
@@ -7344,7 +7354,7 @@ def extract_clean_feed_item(
     if bounded_report and status in {"done", "idle"}:
         title, body = bounded_report
         if body.strip():
-            return make_feed_item("report", title, body, notify=False)
+            return make_feed_item("report", title, body, notify=report_notifications_enabled())
         return None
 
     lines = clean_feed_lines(raw_text)
@@ -7360,7 +7370,7 @@ def extract_clean_feed_item(
         if report_idx is not None and status in {"done", "idle"}:
             title, body = report_title_and_body(lines)
             if body.strip():
-                return make_feed_item("report", title, body, notify=False)
+                return make_feed_item("report", title, body, notify=report_notifications_enabled())
             return None
 
     choices = extract_choices_from_raw(raw_text) or extract_choices(lines)
