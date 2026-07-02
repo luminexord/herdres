@@ -1900,92 +1900,9 @@ def tendwire_direct_fallback_enabled() -> bool:
     return parse_bool_env("HERDRES_TENDWIRE_DIRECT_FALLBACK", "0")
 
 
-def tendwire_connector_outbox_enabled(env: Any | None = None) -> bool:
-    return herdres_tendwire.connector_outbox_enabled(env)
-
-
-def _bounded_int_env(
-    key: str,
-    default: int,
-    *,
-    minimum: int = 1,
-    maximum: int = 100,
-    env: Any | None = None,
-) -> int:
-    return herdres_tendwire.bounded_int_env(key, default, minimum=minimum, maximum=maximum, env=env)
-
-
-def tendwire_connector_name() -> str:
-    return herdres_tendwire.connector_name()
-
-
-def tendwire_connector_limit() -> int:
-    return _bounded_int_env("HERDRES_TENDWIRE_CONNECTOR_LIMIT", 3, minimum=1, maximum=20)
-
-
-def tendwire_connector_lease_seconds() -> int:
-    return _bounded_int_env("HERDRES_TENDWIRE_CONNECTOR_LEASE_SECONDS", 60, minimum=1, maximum=86400)
-
-
-def tendwire_connector_failure_delay_seconds() -> int:
-    return _bounded_int_env("HERDRES_TENDWIRE_CONNECTOR_FAILURE_DELAY_SECONDS", 60, minimum=0, maximum=86400)
-
-
-def _env_source(env: Any | None = None) -> Any:
-    return os.environ if env is None else env
-
-
-def _env_get_str(env: Any, key: str, default: str = "") -> str:
-    return "" if env.get(key, default) is None else str(env.get(key, default))
-
-
-def _expand_config_path(value: str, env: Any | None = None) -> str:
-    return herdres_tendwire._expand_config_path(value, env)
-
-
-def _tendwire_command_token_path_like(token: str) -> bool:
-    return herdres_tendwire._command_token_path_like(token)
-
-
-def tendwire_command_base(env: Any | None = None) -> list[str]:
-    return herdres_tendwire.command_base(env)
-
-
-def tendwire_timeout_seconds(env: Any | None = None) -> int:
-    return herdres_tendwire.timeout_seconds(env)
-
-
-def tendwire_herdr_bin(env: Any | None = None) -> str:
-    return herdres_tendwire.herdr_bin(env, default=DEFAULT_HERDR_BIN)
-
-
-def tendwire_herdr_timeout_seconds(env: Any | None = None) -> float:
-    return herdres_tendwire.herdr_timeout_seconds(env)
-
-
-def _tendwire_timeout_env_value(value: float) -> str:
-    return herdres_tendwire._timeout_env_value(value)
-
-
-def tendwire_optional_config_value(key: str, env: Any | None = None) -> str | None:
-    return herdres_tendwire.optional_config_value(key, env)
-
-
-def tendwire_env_overrides(env: Any | None = None) -> dict[str, str]:
-    return herdres_tendwire.env_overrides(env, default_herdr_bin=DEFAULT_HERDR_BIN)
-
-
-def tendwire_child_env(env: Any | None = None) -> dict[str, str]:
-    return herdres_tendwire.child_env(env, default_herdr_bin=DEFAULT_HERDR_BIN)
-
-
-def tendwire_config_status(env: Any | None = None) -> dict[str, Any]:
-    return herdres_tendwire.config_status(env, default_herdr_bin=DEFAULT_HERDR_BIN)
-
-
 def tendwire_config_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
     load_dotenv()
-    return {"ok": True, "config": tendwire_config_status()}
+    return {"ok": True, "config": herdres_tendwire.config_status(default_herdr_bin=DEFAULT_HERDR_BIN)}
 
 
 def tendwire_outbox_once(args: Any) -> dict[str, Any]:
@@ -2000,7 +1917,7 @@ def tendwire_outbox_once(args: Any) -> dict[str, Any]:
         counters,
         max_sends=MAX_SENDS_PER_RUN,
         enabled=True,
-        limit=int(getattr(args, "limit", 0) or tendwire_connector_limit()),
+        limit=int(getattr(args, "limit", 0) or herdres_tendwire.connector_limit()),
     )
     if result.get("changed"):
         save_state(state)
@@ -2231,7 +2148,7 @@ def drain_tendwire_connector_outbox(
     limit: int | None = None,
 ) -> dict[str, Any]:
     if enabled is None:
-        enabled = tendwire_connector_outbox_enabled()
+        enabled = herdres_tendwire.connector_outbox_enabled()
     prepared = herdres_tendwire.outbox_prepare_drain(
         enabled=bool(enabled),
         max_sends=max_sends,

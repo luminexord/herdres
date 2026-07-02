@@ -140,16 +140,16 @@ class TendwireModeTests(unittest.TestCase):
                 self.assertTrue(herdres.tendwire_commands_enabled())
 
     def test_source_mode_enables_connector_outbox_by_default(self) -> None:
-        self.assertFalse(herdres.tendwire_connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "source-read"}))
-        self.assertFalse(herdres.tendwire_connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "commands"}))
-        self.assertTrue(herdres.tendwire_connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "source"}))
+        self.assertFalse(herdres_tendwire.connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "source-read"}))
+        self.assertFalse(herdres_tendwire.connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "commands"}))
+        self.assertTrue(herdres_tendwire.connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "source"}))
         self.assertFalse(
-            herdres.tendwire_connector_outbox_enabled(
+            herdres_tendwire.connector_outbox_enabled(
                 {"HERDRES_TENDWIRE_MODE": "source", "HERDRES_TENDWIRE_CONNECTOR_OUTBOX": "0"}
             )
         )
         self.assertTrue(
-            herdres.tendwire_connector_outbox_enabled(
+            herdres_tendwire.connector_outbox_enabled(
                 {"HERDRES_TENDWIRE_MODE": "source-read", "HERDRES_TENDWIRE_CONNECTOR_OUTBOX": "1"}
             )
         )
@@ -1533,7 +1533,7 @@ class TendwireConfigTests(unittest.TestCase):
             "TENDWIRE_HOST_ID": "old-host",
         }
 
-        child = herdres.tendwire_child_env(parent)
+        child = herdres_tendwire.child_env(parent)
 
         self.assertEqual(child["PATH"], parent["PATH"])
         self.assertEqual(child["HOME"], parent["HOME"])
@@ -1559,18 +1559,18 @@ class TendwireConfigTests(unittest.TestCase):
 
     def test_herdr_bin_precedence_for_tendwire(self) -> None:
         self.assertEqual(
-            herdres.tendwire_herdr_bin({"HERDR_REAL_BIN": "/real/herdr", "HERDR_BIN": "/configured/herdr"}),
+            herdres_tendwire.herdr_bin({"HERDR_REAL_BIN": "/real/herdr", "HERDR_BIN": "/configured/herdr"}),
             "/real/herdr",
         )
-        self.assertEqual(herdres.tendwire_herdr_bin({"HERDR_BIN": "/configured/herdr"}), "/configured/herdr")
-        self.assertEqual(herdres.tendwire_herdr_bin({}), "herdr")
+        self.assertEqual(herdres_tendwire.herdr_bin({"HERDR_BIN": "/configured/herdr"}), "/configured/herdr")
+        self.assertEqual(herdres_tendwire.herdr_bin({}), "herdr")
 
     def test_invalid_inner_timeout_falls_back_to_default(self) -> None:
         for raw in ("nope", "0", "-2", "nan", "inf"):
             with self.subTest(raw=raw):
                 env = {"HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS": raw}
-                self.assertEqual(herdres.tendwire_herdr_timeout_seconds(env), 1.0)
-                self.assertEqual(herdres.tendwire_env_overrides(env)["TENDWIRE_HERDR_TIMEOUT_SECONDS"], "1.0")
+                self.assertEqual(herdres_tendwire.herdr_timeout_seconds(env), 1.0)
+                self.assertEqual(herdres_tendwire.env_overrides(env)["TENDWIRE_HERDR_TIMEOUT_SECONDS"], "1.0")
 
     def test_optional_tendwire_values_are_passed_only_when_configured(self) -> None:
         parent = {
@@ -1580,8 +1580,8 @@ class TendwireConfigTests(unittest.TestCase):
             "TENDWIRE_HOST_ID": "old-host",
         }
 
-        child = herdres.tendwire_child_env(parent)
-        overrides = herdres.tendwire_env_overrides(parent)
+        child = herdres_tendwire.child_env(parent)
+        overrides = herdres_tendwire.env_overrides(parent)
 
         self.assertNotIn("TENDWIRE_DATA_DIR", child)
         self.assertNotIn("TENDWIRE_DB_PATH", child)
@@ -1597,7 +1597,7 @@ class TendwireConfigTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            herdres.tendwire_command_base(env),
+            herdres_tendwire.command_base(env),
             ["/tmp/herdres-home/bin/tendwire", "--profile", "local", "--json-log"],
         )
 
