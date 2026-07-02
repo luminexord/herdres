@@ -865,6 +865,7 @@ def space_collapse_previous_responses(state: dict[str, Any], pane_or_entry: dict
 # missed and is being caught up.
 UNFOLDED_TURNS_CAP = 5
 DELIVERED_TURN_IDENTITIES_CAP = 32
+SOURCE_TURN_DELIVERY_LEDGER_CAP = 1000
 FOLD_ATTEMPT_CAP = 3
 
 
@@ -4895,6 +4896,159 @@ def delivered_turn_identities(entry: dict[str, Any]) -> set[str]:
         if clean:
             identities.add(clean)
     return identities
+
+
+def source_turn_delivery_ledger(state: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+    ledger = state.get("tendwire_source_delivered_turns")
+    if not isinstance(ledger, dict):
+        ledger = {}
+        state["tendwire_source_delivered_turns"] = ledger
+    return ledger
+
+
+def source_turn_delivery_key(worker_id: str, identity: str) -> str:
+    clean_worker = sanitize_text(str(worker_id or ""), 120).strip()
+    clean_identity = sanitize_text(str(identity or ""), 300).strip()
+    if not clean_worker or not clean_identity:
+        return ""
+    payload = {"source": "tendwire", "worker_id": clean_worker, "turn_identity": clean_identity}
+    return "source-turn:" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def source_turn_worker_id(pane: dict[str, Any] | None, entry: dict[str, Any] | None) -> str:
+    for obj in (entry, pane):
+        if not isinstance(obj, dict):
+            continue
+        value = str(obj.get("tendwire_worker_id") or obj.get("worker_id") or obj.get("_tendwire_worker_id") or "").strip()
+        if value:
+            return sanitize_text(value, 120).strip()
+    return ""
+
+
+def source_turn_delivery_seen(
+    state: dict[str, Any] | None,
+    pane: dict[str, Any] | None,
+    entry: dict[str, Any] | None,
+    item: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(state, dict) or not isinstance(item, dict):
+        return False
+    identity = completed_turn_delivery_identity(item)
+    key = source_turn_delivery_key(source_turn_worker_id(pane, entry), identity)
+    ledger = state.get("tendwire_source_delivered_turns")
+    return bool(key and isinstance(ledger, dict) and key in ledger)
+
+
+def prune_source_turn_delivery_ledger(ledger: dict[str, Any]) -> None:
+    if len(ledger) <= SOURCE_TURN_DELIVERY_LEDGER_CAP:
+        return
+
+    def sort_key(item: tuple[str, Any]) -> str:
+        record = item[1]
+        if isinstance(record, dict):
+            return str(record.get("updated_at") or record.get("delivered_at") or "")
+        return ""
+
+    kept = dict(sorted(ledger.items(), key=sort_key)[-SOURCE_TURN_DELIVERY_LEDGER_CAP:])
+    ledger.clear()
+    ledger.update(kept)
+
+
+def note_source_turn_delivery_identity(
+    state: dict[str, Any] | None,
+    pane: dict[str, Any] | None,
+    entry: dict[str, Any] | None,
+    identity: str,
+    *,
+    item: dict[str, Any] | None = None,
+    delivered_at: str | None = None,
+) -> bool:
+    worker_id = source_turn_worker_id(pane, entry)
+    key = source_turn_delivery_key(worker_id, identity)
+    if not isinstance(state, dict) or not key:
+        return False
+    ledger = source_turn_delivery_ledger(state)
+    now = delivered_at or utc_now()
+    record = ledger.get(key)
+    if not isinstance(record, dict):
+        record = {"delivered_at": now}
+        ledger[key] = record
+        changed = True
+    else:
+        changed = False
+    values = {
+        "worker_id": worker_id,
+        "turn_identity": sanitize_text(str(identity or ""), 300).strip(),
+        "turn_id": sanitize_text(str((item or {}).get("turn_id") or ""), 200).strip(),
+        "semantic_hash": clean_feed_hash(item, include_render_version=False) if isinstance(item, dict) else "",
+    }
+    if item is not None or delivered_at is not None or not record.get("updated_at"):
+        values["updated_at"] = now
+    for field, value in values.items():
+        if record.get(field) != value:
+            record[field] = value
+            changed = True
+    prune_source_turn_delivery_ledger(ledger)
+    return changed
+
+
+def note_source_turn_delivery(
+    state: dict[str, Any] | None,
+    pane: dict[str, Any] | None,
+    entry: dict[str, Any] | None,
+    item: dict[str, Any] | None,
+    *,
+    delivered_at: str | None = None,
+) -> bool:
+    if not isinstance(item, dict) or str(item.get("kind") or "").lower() != "turn":
+        return False
+    identity = completed_turn_delivery_identity(item)
+    return note_source_turn_delivery_identity(
+        state,
+        pane,
+        entry,
+        identity,
+        item=item,
+        delivered_at=delivered_at,
+    )
+
+
+def seed_source_turn_delivery_ledger_from_entries(state: dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict):
+        return False
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    changed = False
+    for entry in panes.values():
+        if not isinstance(entry, dict) or not entry_is_tendwire_source(entry):
+            continue
+        worker_id = source_turn_worker_id(None, entry)
+        if not worker_id:
+            continue
+        for identity in delivered_turn_identities(entry):
+            changed = note_source_turn_delivery_identity(state, None, entry, identity) or changed
+    return changed
+
+
+def suppress_globally_delivered_source_turn(
+    state: dict[str, Any] | None,
+    pane: dict[str, Any] | None,
+    entry: dict[str, Any],
+    item: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(item, dict) or str(item.get("kind") or "").lower() != "turn":
+        return False
+    if not source_turn_delivery_seen(state, pane, entry, item):
+        return False
+    record_suppressed_clean_item(entry, item, "source_turn_global_delivered")
+    record_delivered_turn_identity(entry, item)
+    if item.get("turn_id"):
+        entry["last_turn_id"] = str(item.get("turn_id") or "")
+    note_source_turn_delivery(state, pane, entry, item)
+    return True
 
 
 def record_delivered_turn_identity(entry: dict[str, Any], item: dict[str, Any]) -> bool:
@@ -13334,6 +13488,9 @@ def _sync_pane_clean_feed(
             changed = True
 
     old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
+    if source_read_pane and suppress_globally_delivered_source_turn(state, pane, entry, item):
+        item = None
+        changed = True
     if should_baseline_new_pane_turn(entry, item, new_entry):
         record_suppressed_clean_item(entry, item, "new_pane_initial_turn_baseline")
         item = None
@@ -13487,6 +13644,8 @@ def _sync_pane_clean_feed(
                     item_semantic_hash=item_semantic_hash,
                     fallback_message_id=message_id if did_edit else None,
                 )
+                if source_read_pane and str(item.get("kind") or "").lower() == "turn":
+                    changed = note_source_turn_delivery(state, pane, entry, item) or changed
                 council_marker = str(item.get("_council_job_ref") or "")
                 if council_marker:
                     entry["last_council_job_ref"] = council_marker
@@ -14124,6 +14283,8 @@ def sync_once() -> dict[str, Any]:
     if reconcile_topic_grouping(state):
         changed = True
     source_read = tendwire_source_read_enabled()
+    if source_read and seed_source_turn_delivery_ledger_from_entries(state):
+        changed = True
     stale_tendwire_pruned = 0 if source_read else drop_tendwire_source_pane_records(state)
     if stale_tendwire_pruned:
         changed = True

@@ -548,9 +548,98 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(sent_items[0]["turn_id"], "turn-public-1")
         self.assertIn("Herdres was skipping Tendwire turn text", sent_items[0]["assistant_final_text"])
         self.assertEqual(entry["last_clean_message_id"], "501")
+        self.assertEqual(len(state.get("tendwire_source_delivered_turns") or {}), 1)
         extract_turn_feed_item.assert_not_called()
         cached_pane_turn.assert_not_called()
         pane_feed_output.assert_not_called()
+
+    def test_source_read_clean_feed_global_ledger_suppresses_rebuilt_entry_replay(self) -> None:
+        state, key = _source_state()
+        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        entry = state["panes"][key]
+        entry["prompt_collapse_chars"] = 0
+        sent_items: list[dict] = []
+        turns_payload = {
+            "schema_version": 1,
+            "turns": [
+                {
+                    "id": "turn-public-1",
+                    "worker_id": "worker-1",
+                    "worker_fingerprint": "fp-1",
+                    "user_text": "Why does Telegram show old source text?",
+                    "assistant_final_text": "Because the source entry was rebuilt without its local turn cursor.",
+                    "assistant_stream_text": "",
+                    "complete": True,
+                    "has_open_turn": False,
+                }
+            ],
+        }
+
+        def fake_send_feed_item(chat_id: str, item: dict, **kwargs) -> dict:
+            sent_items.append(item)
+            return {"ok": True, "message_id": str(500 + len(sent_items))}
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "TURN_FEED_ENABLED", True), \
+                patch.object(herdres, "tendwire_turns", return_value=turns_payload), \
+                patch.object(herdres, "send_pending_prompt_message", return_value={"changed": False}), \
+                patch.object(herdres, "send_feed_item", side_effect=fake_send_feed_item), \
+                patch.object(herdres, "fold_superseded_turns", return_value=False), \
+                patch.object(herdres, "flush_pending_plan_doc", return_value=False), \
+                patch.object(herdres, "flush_pending_speech_reply", return_value=False):
+            first = herdres._sync_pane_clean_feed(
+                state,
+                "-100",
+                {},
+                pane,
+                entry,
+                {"sends": 0, "feed_sends": 0},
+                pane_api_token=None,
+                turn_only=False,
+                new_entry=False,
+                max_sends=10,
+                max_feed_sends=10,
+                stable_obj_hash="status-hash",
+                changed=False,
+            )
+            for field in (
+                "delivered_turn_identities",
+                "last_clean_hash",
+                "last_clean_semantic_hash",
+                "last_clean_render_hash",
+                "last_clean_message_id",
+                "last_clean_kind",
+                "last_clean_text",
+                "last_clean_item",
+                "last_clean_sent_at",
+                "last_turn_id",
+            ):
+                entry.pop(field, None)
+            counters = {"sends": 0, "feed_sends": 0}
+            second = herdres._sync_pane_clean_feed(
+                state,
+                "-100",
+                {},
+                pane,
+                entry,
+                counters,
+                pane_api_token=None,
+                turn_only=False,
+                new_entry=False,
+                max_sends=10,
+                max_feed_sends=10,
+                stable_obj_hash="status-hash",
+                changed=False,
+            )
+
+        self.assertTrue(first["feed_delivered"])
+        self.assertEqual(len(sent_items), 1)
+        self.assertFalse(second["feed_delivered"])
+        self.assertEqual(counters["sends"], 0)
+        self.assertEqual(counters["feed_sends"], 0)
+        self.assertEqual(entry["last_clean_suppressed_reason"], "source_turn_global_delivered")
+        self.assertEqual(entry["last_turn_id"], "turn-public-1")
+        self.assertTrue(entry.get("delivered_turn_identities"))
 
     def test_sync_once_source_delivers_completed_tendwire_turn_without_direct_herdr(self) -> None:
         state = {
