@@ -167,6 +167,37 @@ class TendwireOutboxTests(unittest.TestCase):
         self.assertNotIn("twref1.safeopaque", encoded_state)
         self.assertNotIn("message_id", json.dumps(ack_responses, sort_keys=True).lower())
 
+    def test_worker_scoped_outbox_uses_configured_managed_bot_and_topic(self) -> None:
+        item = _item()
+        item["payload"]["attention"]["source"] = "worker:codex-1"
+        item["payload"]["attention"]["meta"] = {"worker_id": "codex-1", "space_id": "w1"}
+        state = _state()
+        state["telegram"]["managed_bots"] = {
+            "codex": {"token": "CODEX_TOKEN", "enabled": True},
+        }
+        state["panes"]["worker:codex-1"] = {
+            "source": "tendwire",
+            "entry_type": "worker",
+            "worker_id": "codex-1",
+            "agent": "codex",
+            "space_key": "workspace:w1",
+            "topic_id": "77",
+            "pane_root_message_id": "700",
+            "managed_voice_active": True,
+        }
+
+        with patch.object(herdres, "send_rich_message", return_value={"ok": True, "message_id": "55"}) as send_rich:
+            result = herdres.deliver_tendwire_outbox_item(
+                state,
+                "-1001",
+                state["telegram"],
+                item,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(send_rich.call_args.kwargs["thread_id"], "77")
+        self.assertEqual(send_rich.call_args.kwargs["api_token"], "CODEX_TOKEN")
+
     def test_drain_does_not_lease_when_telegram_is_unconfigured(self) -> None:
         state = _state()
         counters = herdres.make_sync_counters()
