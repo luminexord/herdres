@@ -655,6 +655,46 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             "ok",
         )
 
+    def test_new_and_raw_keys_preflight_helpers_block_source_mode_direct_paths(self) -> None:
+        legacy_entry = _entry(source="herdr", pane_id="pane-1")
+        source_entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            tendwire_worker_id="worker-1",
+            tendwire_fingerprint="fp-1",
+        )
+
+        self.assertEqual(
+            herdres_tendwire.new_pane_preflight_for_env({"HERDRES_TENDWIRE_MODE": "source"}),
+            "source_new_disabled",
+        )
+        self.assertEqual(
+            herdres_tendwire.new_pane_preflight_for_env({"HERDRES_TENDWIRE_MODE": "off"}),
+            "ok",
+        )
+        self.assertEqual(
+            herdres_tendwire.raw_keys_preflight_for_entry(
+                legacy_entry,
+                {"HERDRES_TENDWIRE_MODE": "source"},
+            ),
+            "legacy_source_block",
+        )
+        self.assertEqual(
+            herdres_tendwire.raw_keys_preflight_for_entry(
+                source_entry,
+                {"HERDRES_TENDWIRE_MODE": "source-read"},
+            ),
+            "source_keys_unsupported",
+        )
+        self.assertEqual(
+            herdres_tendwire.raw_keys_preflight_for_entry(
+                legacy_entry,
+                {"HERDRES_TENDWIRE_MODE": "off"},
+            ),
+            "ok",
+        )
+
 
 class TendwireCommandRoutingTests(unittest.TestCase):
     @contextmanager
@@ -1255,6 +1295,16 @@ class TendwireCommandRoutingTests(unittest.TestCase):
             keys_result = herdres.command_reply(_payload(text="/keys enter"))
 
         self.assertIn("Raw key delivery is not available", keys_result["reply"])
+        patched["send_to_pane"].assert_not_called()
+        patched["run_cmd"].assert_not_called()
+
+        legacy_entry = _entry(source="herdr", pane_id="pane-1")
+        legacy_state = _state(legacy_entry)
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                self._command_patches(legacy_state) as patched:
+            legacy_keys_result = herdres.command_reply(_payload(text="/keys enter"))
+
+        self.assertIn("legacy Herdr mode", legacy_keys_result["reply"])
         patched["send_to_pane"].assert_not_called()
         patched["run_cmd"].assert_not_called()
 

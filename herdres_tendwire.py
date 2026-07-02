@@ -1406,6 +1406,50 @@ def raw_read_preflight_for_entry(
     )
 
 
+def new_pane_preflight_policy(*, source_inventory_enabled: bool) -> str:
+    """Classify new-pane creation before any direct Herdr pane start path."""
+    if source_inventory_enabled:
+        return "source_new_disabled"
+    return "ok"
+
+
+def new_pane_preflight_for_env(
+    env: Any | None = None,
+    *,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> str:
+    mode = parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
+    return new_pane_preflight_policy(source_inventory_enabled=mode_enables_source_inventory(mode))
+
+
+def raw_keys_preflight_policy(
+    *,
+    source_inventory_enabled: bool,
+    source_entry: bool,
+) -> str:
+    """Classify /keys before any direct Herdr send-keys path."""
+    if source_inventory_enabled and not source_entry:
+        return "legacy_source_block"
+    if source_entry:
+        return "source_keys_unsupported"
+    return "ok"
+
+
+def raw_keys_preflight_for_entry(
+    entry: dict[str, Any] | None,
+    env: Any | None = None,
+    *,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> str:
+    mode = parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
+    return raw_keys_preflight_policy(
+        source_inventory_enabled=mode_enables_source_inventory(mode),
+        source_entry=is_source_entry(entry),
+    )
+
+
 def same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
     if response_status(response) != "stale_target":
         return None

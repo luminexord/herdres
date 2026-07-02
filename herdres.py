@@ -15245,7 +15245,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     # "Forwarded from …" header pollutes the instruction.
 
     if command == "new":
-        if tendwire_source_inventory_enabled():
+        if herdres_tendwire.new_pane_preflight_for_env() == "source_new_disabled":
             return {
                 "handled": True,
                 "reply": "Starting new Herdr panes from Telegram is disabled in Tendwire source mode.",
@@ -15912,7 +15912,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if command in ("send!", "interrupt", "isend"):
         return interrupt_and_send_response(pane_id, arg, state=state, entry=entry)
     if command == "keys":
-        if entry_is_tendwire_source(entry):
+        raw_keys_policy = herdres_tendwire.raw_keys_preflight_for_entry(entry)
+        if raw_keys_policy == "legacy_source_block":
+            return {
+                "handled": True,
+                "reply": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending raw keys.",
+            }
+        if raw_keys_policy == "source_keys_unsupported":
             return {
                 "handled": True,
                 "reply": "This is a Tendwire status entry. Raw key delivery is not available.",
@@ -16110,7 +16116,7 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
 def handle_new_pane_picker_callback(state, telegram, chat_id, topic_id, message_id, space, parts):
     if len(parts) != 4:
         return {"handled": True, "answer": "Unknown Herdr action."}
-    if tendwire_source_inventory_enabled():
+    if herdres_tendwire.new_pane_preflight_for_env() == "source_new_disabled":
         return {"handled": True, "answer": "Starting new Herdr panes is disabled in Tendwire source mode.", "show_alert": True}
     target = str(parts[3] or "")
     space_token = _callback_id(str(space.get("space_key") or ""), "space")[:16]
