@@ -2684,3 +2684,33 @@ def source_turn_feed_item(
     if isinstance(item, dict):
         item["prompt_collapse_chars"] = int(entry.get("prompt_collapse_chars") or 0)
     return item
+
+
+def source_turn_feed_item_from_loader(
+    pane: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    load_turns: Callable[[], dict[str, Any]],
+    make_feed_item: FeedItemFactory,
+    text_hash: TextHash,
+    sanitize: Sanitizer = _default_sanitize,
+    final_reply_max_chars: int,
+    user_prompt_max_chars: int,
+    max_reply_chars: int,
+) -> dict[str, Any] | None:
+    """Load Tendwire turns and build one feed item for a source worker pane."""
+    try:
+        turn = source_turn_for_pane(pane, load_turns())
+    except Exception as exc:
+        note_source_turn_unavailable(entry, str(exc), sanitize=sanitize)
+        return None
+    return source_turn_feed_item(
+        turn,
+        entry,
+        make_feed_item=make_feed_item,
+        text_hash=text_hash,
+        sanitize=sanitize,
+        final_reply_max_chars=final_reply_max_chars,
+        user_prompt_max_chars=user_prompt_max_chars,
+        max_reply_chars=max_reply_chars,
+    )

@@ -1851,6 +1851,63 @@ class TendwireHybridTests(unittest.TestCase):
         self.assertEqual([call["has_open_turn"] for call in calls], [True, False])
         self.assertEqual(calls[1]["assistant_stream_text"], "")
 
+    def test_source_turn_feed_item_from_loader_uses_tendwire_turn_payload(self) -> None:
+        entry = {"prompt_collapse_chars": 2}
+        pane = {"worker_id": "worker-1", "worker_fingerprint": "fp-current"}
+
+        item = herdres_tendwire.source_turn_feed_item_from_loader(
+            pane,
+            entry,
+            load_turns=lambda: {
+                "turns": [
+                    {
+                        "id": "old",
+                        "worker_id": "worker-1",
+                        "worker_fingerprint": "fp-old",
+                        "assistant_final_text": "old",
+                    },
+                    {
+                        "id": "current",
+                        "worker_id": "worker-1",
+                        "worker_fingerprint": "fp-current",
+                        "assistant_final_text": "final",
+                    },
+                ],
+            },
+            make_feed_item=lambda source: {"kind": "turn", "turn_id": source["turn_id"]},
+            text_hash=lambda text: f"hash:{text}",
+            sanitize=lambda value, limit: str(value or "")[:limit],
+            final_reply_max_chars=100,
+            user_prompt_max_chars=100,
+            max_reply_chars=100,
+        )
+
+        self.assertEqual(item, {"kind": "turn", "turn_id": "current", "prompt_collapse_chars": 2})
+        self.assertTrue(entry["last_turn_available"])
+        self.assertNotIn("last_turn_reason", entry)
+
+    def test_source_turn_feed_item_from_loader_marks_unavailable_on_loader_failure(self) -> None:
+        def fail_loader() -> dict:
+            raise RuntimeError("private path /tmp/very-secret-db.sqlite")
+
+        entry: dict = {}
+
+        item = herdres_tendwire.source_turn_feed_item_from_loader(
+            {"worker_id": "worker-1"},
+            entry,
+            load_turns=fail_loader,
+            make_feed_item=lambda _source: {"kind": "turn"},
+            text_hash=lambda text: text,
+            sanitize=lambda value, limit: str(value or "").replace("secret", "[redacted]")[:limit],
+            final_reply_max_chars=100,
+            user_prompt_max_chars=100,
+            max_reply_chars=100,
+        )
+
+        self.assertIsNone(item)
+        self.assertFalse(entry["last_turn_available"])
+        self.assertEqual(entry["last_turn_reason"], "private path /tmp/very-[redacted]-db.sqlite")
+
     def test_tendwire_enriches_real_pane_without_replacing_id(self) -> None:
         panes = herdres.tendwire_enrich_panes([_pane()], _snapshot())
 

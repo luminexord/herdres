@@ -2423,29 +2423,11 @@ def pane_is_tendwire_source_read(pane: dict[str, Any] | None) -> bool:
     return herdres_tendwire.is_source_read_pane(pane)
 
 
-def tendwire_source_turn_for_pane(pane: dict[str, Any]) -> dict[str, Any] | None:
-    payload = tendwire_turns()
-    return herdres_tendwire.source_turn_for_pane(pane, payload)
-
-
-def tendwire_source_turn_feed_source(turn: dict[str, Any]) -> dict[str, Any]:
-    return herdres_tendwire.source_turn_feed_source(
-        turn,
-        sanitize=sanitize_text,
-        final_reply_max_chars=FINAL_REPLY_MAX_CHARS,
-        user_prompt_max_chars=USER_PROMPT_MAX_CHARS,
-    )
-
-
 def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
-    try:
-        turn = tendwire_source_turn_for_pane(pane)
-    except BridgeError as exc:
-        herdres_tendwire.note_source_turn_unavailable(entry, str(exc), sanitize=sanitize_text)
-        return None
-    return herdres_tendwire.source_turn_feed_item(
-        turn,
+    return herdres_tendwire.source_turn_feed_item_from_loader(
+        pane,
         entry,
+        load_turns=tendwire_turns,
         make_feed_item=make_turn_feed_item,
         text_hash=stream_text_hash,
         sanitize=sanitize_text,
