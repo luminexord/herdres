@@ -961,6 +961,48 @@ def entry_send_text_policy(
     )
 
 
+def entry_send_text_decision(
+    entry: dict[str, Any] | None,
+    env: Any | None = None,
+    *,
+    safe_failure_reply: str,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> dict[str, Any]:
+    """Translate text-send policy into a caller-neutral delivery action."""
+    policy = entry_send_text_policy(
+        entry,
+        env,
+        diagnose_invalid=diagnose_invalid,
+        warn_invalid=warn_invalid,
+    )
+    source_entry = is_source_entry(entry)
+    if policy == "legacy_source_block":
+        return {
+            "action": "reply",
+            "policy": policy,
+            "blocked": True,
+            "reply": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending.",
+        }
+    if policy == "source_commands_disabled":
+        return {
+            "action": "reply",
+            "policy": policy,
+            "blocked": True,
+            "reply": "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet.",
+        }
+    if policy == "tendwire" and isinstance(entry, dict):
+        return {"action": "tendwire", "policy": policy, "blocked": False, "reply": ""}
+    if policy == "safe_failure" or source_entry:
+        return {
+            "action": "reply",
+            "policy": policy,
+            "blocked": True,
+            "reply": str(safe_failure_reply or ""),
+        }
+    return {"action": "direct", "policy": policy, "blocked": False, "reply": ""}
+
+
 def callback_choice_preflight_policy(
     *,
     source_inventory_enabled: bool,

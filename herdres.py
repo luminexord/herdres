@@ -14721,23 +14721,15 @@ def forward_text_to_pane_response(
     outbound = raw_outbound.strip()
     if not outbound:
         return {"handled": True, "reply": usage}
-    source_entry = entry_is_tendwire_source(entry)
-    policy = herdres_tendwire.entry_send_text_policy(
+    decision = herdres_tendwire.entry_send_text_decision(
         entry,
+        safe_failure_reply=TENDWIRE_SAFE_SEND_FAILURE_REPLY,
         diagnose_invalid=True,
         warn_invalid=_warn_invalid_tendwire_mode,
     )
-    if policy == "legacy_source_block":
-        return {
-            "handled": True,
-            "reply": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending.",
-        }
-    if policy == "source_commands_disabled":
-        return {
-            "handled": True,
-            "reply": "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet.",
-        }
-    if policy == "tendwire" and isinstance(entry, dict):
+    if decision.get("action") == "reply":
+        return {"handled": True, "reply": str(decision.get("reply") or TENDWIRE_SAFE_SEND_FAILURE_REPLY)}
+    if decision.get("action") == "tendwire" and isinstance(entry, dict):
         return send_to_tendwire_worker_response(
             entry,
             raw_outbound,
@@ -14750,8 +14742,6 @@ def forward_text_to_pane_response(
             callback_message_id=callback_message_id,
             request_id=request_id,
         )
-    if policy == "safe_failure" or source_entry:
-        return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
     return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
 
 
@@ -16361,18 +16351,16 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
         age = _iso_age_seconds(str(rec.get("set_at") or ""))
         source_entry = entry_is_tendwire_source(entry)
         if text and (pane_id or source_entry) and (age is None or age <= ACTIVE_PANE_TTL_SECONDS):
-            policy = herdres_tendwire.entry_send_text_policy(
+            decision = herdres_tendwire.entry_send_text_decision(
                 entry,
+                safe_failure_reply=TENDWIRE_SAFE_SEND_FAILURE_REPLY,
                 diagnose_invalid=True,
                 warn_invalid=_warn_invalid_tendwire_mode,
             )
-            if policy == "legacy_source_block":
+            if decision.get("action") == "reply":
                 blocked_send = True
-                deliver_note = "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending."
-            elif policy == "source_commands_disabled":
-                blocked_send = True
-                deliver_note = "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet."
-            elif policy == "tendwire" and isinstance(entry, dict):
+                deliver_note = str(decision.get("reply") or TENDWIRE_SAFE_SEND_FAILURE_REPLY)
+            elif decision.get("action") == "tendwire" and isinstance(entry, dict):
                 ctx = rec.get("request_context") if isinstance(rec.get("request_context"), dict) else {}
                 result = send_to_tendwire_worker_response(
                     entry,
@@ -16394,9 +16382,6 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
                 else:
                     delivered = True
                     deliver_note = reply
-            elif policy == "safe_failure":
-                blocked_send = True
-                deliver_note = TENDWIRE_SAFE_SEND_FAILURE_REPLY
             else:
                 after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if isinstance(entry, dict) else ""
                 try:
