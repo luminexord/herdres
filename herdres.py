@@ -453,12 +453,12 @@ MANAGED_BOT_SPECS: dict[str, dict[str, Any]] = {
     },
     "glm": {
         "request_id": MANAGED_BOT_REQUEST_BASE_ID + 6,
-        "label": "GLM Devin",
-        "name": "Guremi",
-        "suggested_username": "Guremi_bot",
-        "description": "GLM Devin pane bot for Herdres, running through Devin.",
-        "short_description": "GLM Devin panes.",
-        "aliases": ("glm", "glm5", "glm5.2", "glm-5.2", "guremi"),
+        "label": "GLM",
+        "name": "Herdr GLM",
+        "suggested_username": "herdr_glm_bot",
+        "description": "GLM pane bot for Herdres.",
+        "short_description": "GLM panes in Herdr.",
+        "aliases": ("glm", "glm5", "glm5.2", "glm-5.2"),
     },
 }
 NEW_PANE_AGENT_COMMANDS = {kind: kind for kind in MANAGED_BOT_SPECS}
@@ -1040,7 +1040,7 @@ def devin_model_managed_bot_kind_from_label(value: str | None) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return ""
-    if "glm" in text or "guremi" in text:
+    if "glm" in text:
         return "glm"
     if "kimi" in text:
         return "kimi"

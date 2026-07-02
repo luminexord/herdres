@@ -523,7 +523,7 @@ HERDR_TELEGRAM_TOPICS_DRY_RUN=1 ~/.local/bin/herdres sync
 
 ## Managed Pane Bots
 
-When `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1`, Herdres posts managed-bot setup links in General only for AI types that currently have open panes and do not already have a stored child-bot token. Supported pane bots are Codex, Claude, Kimi, OMP, Devin, and GLM Devin. After Telegram sends the manager bot a `managed_bot` update, Herdres calls `getManagedBotToken`, stores the child token under `telegram.managed_bots`, and updates the child bot profile.
+When `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1`, Herdres posts managed-bot setup links in General only for AI types that currently have open panes and do not already have a stored child-bot token. Supported pane bots are Codex, Claude, Kimi, OMP, Devin, and GLM. After Telegram sends the manager bot a `managed_bot` update, Herdres calls `getManagedBotToken`, stores the child token under `telegram.managed_bots`, and updates the child bot profile.
 
 Telegram still requires each child bot to have access to the forum group. If a child token is registered but Telegram rejects pane messages from it, Herdres posts add-to-group buttons in General and does not send that pane traffic as the manager bot.
 
@@ -553,12 +553,12 @@ HERDR_TELEGRAM_TOPICS_MANAGED_BOT_DEVIN_PHOTO=~/.config/herdres/managed-bots/dev
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_PHOTO=~/.config/herdres/managed-bots/glm.jpg
 ```
 
-If a child bot was created outside Telegram's managed-bot request flow, assign it manually by token. For example, to assign a bot named Guremi to GLM:
+If a child bot was created outside Telegram's managed-bot request flow, assign it manually by token. For example, to assign a custom bot to GLM:
 
 ```bash
 HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_TOKEN=123456:...
-HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_USERNAME=Guremi_bot
-HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_NAME=Guremi
+HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_USERNAME=your_glm_bot
+HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_NAME="Herdr GLM"
 ```
 
 For local deployments that need this before Herdr exposes the endpoint upstream, Herdres includes `herdr_turn_adapter.py`. It is a wrapper, not a Herdr patch:

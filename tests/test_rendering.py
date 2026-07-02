@@ -2367,21 +2367,21 @@ class ManagedBotTests(unittest.TestCase):
 
         self.assertEqual(herdres.managed_bot_kind_for_entry(entry), "kimi")
 
-    def test_guremi_managed_bot_payload_infers_glm(self) -> None:
+    def test_generic_glm_managed_bot_payload_infers_glm(self) -> None:
         self.assertEqual(
-            herdres.managed_bot_kind_for_payload({"username": "Guremi_bot", "first_name": "Guremi"}),
+            herdres.managed_bot_kind_for_payload({"username": "herdr_glm_bot", "first_name": "Herdr GLM"}),
             "glm",
         )
 
-    def test_env_managed_bot_token_assigns_guremi_to_glm(self) -> None:
+    def test_env_managed_bot_token_assigns_custom_bot_to_glm(self) -> None:
         telegram = {"managed_bots": {}}
 
         with patch.dict(
             herdres.os.environ,
             {
                 "HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_TOKEN": "GLM_TOKEN",
-                "HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_USERNAME": "Guremi_bot",
-                "HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_NAME": "Guremi",
+                "HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_USERNAME": "custom_glm_bot",
+                "HERDR_TELEGRAM_TOPICS_MANAGED_BOT_GLM_NAME": "Custom GLM",
             },
             clear=False,
         ):
@@ -2389,8 +2389,8 @@ class ManagedBotTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(telegram["managed_bots"]["glm"]["token"], "GLM_TOKEN")
-        self.assertEqual(telegram["managed_bots"]["glm"]["username"], "Guremi_bot")
-        self.assertEqual(telegram["managed_bots"]["glm"]["name"], "Guremi")
+        self.assertEqual(telegram["managed_bots"]["glm"]["username"], "custom_glm_bot")
+        self.assertEqual(telegram["managed_bots"]["glm"]["name"], "Custom GLM")
         self.assertEqual(telegram["managed_bots"]["glm"]["source"], "manual-env")
 
     def test_managed_bot_update_fetches_token_and_configures_profile(self) -> None:
