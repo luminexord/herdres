@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -245,12 +246,65 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(pane["worker_fingerprint"], "fp-1")
         self.assertFalse(str(pane["pane_id"]).startswith("tendwire:"))
         self.assertEqual(pane["source"], "tendwire")
+        self.assertEqual(herdres.space_key(pane), "workspace:workspace-1")
         self.assertTrue(pane["_tendwire_source_read"])
         self.assertTrue(pane["_tendwire_enriched"])
         self.assertEqual(pane["_tendwire_worker_id"], "worker-1")
         self.assertEqual(pane["_tendwire_fingerprint"], "fp-1")
         self.assertEqual(pane["terminal_id"], "")
         self.assertEqual(pane["summary"], "Working on tests")
+
+    def test_source_read_worker_pane_key_survives_fingerprint_change(self) -> None:
+        first = herdres.tendwire_source_read_panes(
+            _snapshot(
+                {
+                    "id": "worker-1",
+                    "space_id": "workspace-1",
+                    "name": "codex",
+                    "status": "active",
+                    "fingerprint": "fp-old",
+                    "meta": {"agent": "codex", "tab_id": "workspace-1:t1"},
+                }
+            )
+        )[0]
+        second = herdres.tendwire_source_read_panes(
+            _snapshot(
+                {
+                    "id": "worker-1",
+                    "space_id": "workspace-1",
+                    "name": "codex",
+                    "status": "active",
+                    "fingerprint": "fp-new",
+                    "meta": {"agent": "codex", "tab_id": "workspace-1:t1"},
+                }
+            )
+        )[0]
+
+        self.assertEqual(herdres.pane_key(first), herdres.pane_key(second))
+        self.assertEqual(first["worker_fingerprint"], "fp-old")
+        self.assertEqual(second["worker_fingerprint"], "fp-new")
+
+    def test_source_read_raw_herdr_space_id_does_not_become_topic_title(self) -> None:
+        panes = herdres.tendwire_source_read_panes(
+            {
+                "spaces": [{"id": "w653e50b41be581", "name": "w653e50b41be581"}],
+                "workers": [
+                    {
+                        "id": "worker-1",
+                        "space_id": "w653e50b41be581",
+                        "name": "codex",
+                        "status": "active",
+                        "fingerprint": "fp-1",
+                        "meta": {"agent": "codex", "cwd": "/home/smith/tendwire"},
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(len(panes), 1)
+        self.assertEqual(panes[0]["space_name"], "")
+        self.assertEqual(panes[0]["workspace_label"], "")
+        self.assertEqual(herdres.space_name_for_pane(panes[0]), "Tendwire")
 
     def test_source_observed_panes_use_tendwire_snapshot_without_herdr_pane_list(self) -> None:
         proc = subprocess.CompletedProcess(
@@ -270,6 +324,28 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(panes[0]["entry_type"], "worker")
         self.assertEqual(panes[0]["worker_id"], "worker-1")
         self.assertFalse(str(panes[0]["pane_id"]).startswith("tendwire:"))
+
+    def test_source_read_panes_skip_closed_tendwire_workers(self) -> None:
+        panes = herdres.tendwire_source_read_panes(
+            _snapshot(
+                {
+                    "id": "worker-live",
+                    "space_id": "workspace-1",
+                    "name": "codex",
+                    "status": "active",
+                    "fingerprint": "fp-live",
+                },
+                {
+                    "id": "worker-closed",
+                    "space_id": "workspace-1",
+                    "name": "codex",
+                    "status": "closed",
+                    "fingerprint": "fp-closed",
+                },
+            )
+        )
+
+        self.assertEqual([pane["worker_id"] for pane in panes], ["worker-live"])
 
     def test_source_read_degraded_snapshot_preserves_existing_source_entries(self) -> None:
         state, key = _source_state()
@@ -301,6 +377,220 @@ class TendwireModeTests(unittest.TestCase):
         )
         self.assertFalse(closed["changed"])
         self.assertEqual(state["panes"][key]["last_known_status"], "working")
+
+    def test_source_read_removed_worker_closes_entry_without_closed_notice(self) -> None:
+        state, key = _source_state()
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "send_notice") as send_notice:
+            closed = herdres.sync_closed_pane_records(
+                state,
+                "-100",
+                {},
+                [],
+                sends=0,
+                max_sends=10,
+            )
+
+        self.assertTrue(closed["changed"])
+        self.assertEqual(closed["sent"], 0)
+        self.assertEqual(state["panes"][key]["last_known_status"], "closed")
+        self.assertIn("closed_notice_suppressed_at", state["panes"][key])
+        send_notice.assert_not_called()
+
+    def test_prune_closed_tendwire_source_records_removes_space_membership(self) -> None:
+        state, key = _source_state()
+        active_key = "worker:active"
+        state["panes"][key]["last_known_status"] = "closed"
+        state["panes"][active_key] = {
+            **state["panes"][key],
+            "pane_key": active_key,
+            "worker_id": "worker-active",
+            "tendwire_worker_id": "worker-active",
+            "last_known_status": "working",
+        }
+        state["spaces"]["agent:worker:worker-1"]["pane_keys"] = [key, active_key]
+
+        removed = herdres.prune_closed_tendwire_source_records(state)
+
+        self.assertEqual(removed, 1)
+        self.assertNotIn(key, state["panes"])
+        self.assertIn(active_key, state["panes"])
+        self.assertEqual(state["spaces"]["agent:worker:worker-1"]["pane_keys"], [active_key])
+
+    def test_prune_closed_tendwire_source_records_preserves_live_space_topic(self) -> None:
+        state, key = _source_state()
+        state["panes"][key]["last_known_status"] = "closed"
+        state["spaces"]["agent:worker:worker-1"]["pane_keys"] = [key]
+
+        removed = herdres.prune_closed_tendwire_source_records(
+            state,
+            active_space_keys={"agent:worker:worker-1"},
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertNotIn(key, state["panes"])
+        self.assertIn("agent:worker:worker-1", state["spaces"])
+        self.assertEqual(state["spaces"]["agent:worker:worker-1"]["topic_id"], "77")
+        self.assertEqual(state["spaces"]["agent:worker:worker-1"]["pane_keys"], [])
+
+    def test_source_read_clean_feed_delivers_tendwire_turn_without_direct_herdr(self) -> None:
+        state, key = _source_state()
+        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        entry = state["panes"][key]
+        entry["prompt_collapse_chars"] = 0
+        counters = {"sends": 0, "feed_sends": 0}
+        sent_items: list[dict] = []
+        turns_payload = {
+            "schema_version": 1,
+            "turns": [
+                {
+                    "id": "turn-public-1",
+                    "worker_id": "worker-1",
+                    "worker_fingerprint": "fp-1",
+                    "user_text": "Why does Telegram show closed status?",
+                    "assistant_final_text": "Because Herdres was skipping Tendwire turn text.",
+                    "assistant_stream_text": "Checked source mode.",
+                    "complete": True,
+                    "has_open_turn": True,
+                }
+            ],
+        }
+
+        def fake_send_feed_item(chat_id: str, item: dict, **kwargs) -> dict:
+            sent_items.append(item)
+            return {"ok": True, "message_id": "501"}
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "TURN_FEED_ENABLED", True), \
+                patch.object(herdres, "tendwire_turns", return_value=turns_payload), \
+                patch.object(herdres, "extract_turn_feed_item") as extract_turn_feed_item, \
+                patch.object(herdres, "cached_pane_turn") as cached_pane_turn, \
+                patch.object(herdres, "pane_feed_output") as pane_feed_output, \
+                patch.object(herdres, "send_pending_prompt_message", return_value={"changed": False}), \
+                patch.object(herdres, "send_feed_item", side_effect=fake_send_feed_item), \
+                patch.object(herdres, "fold_superseded_turns", return_value=False), \
+                patch.object(herdres, "flush_pending_plan_doc", return_value=False), \
+                patch.object(herdres, "flush_pending_speech_reply", return_value=False):
+            result = herdres._sync_pane_clean_feed(
+                state,
+                "-100",
+                {},
+                pane,
+                entry,
+                counters,
+                pane_api_token=None,
+                turn_only=False,
+                new_entry=False,
+                max_sends=10,
+                max_feed_sends=10,
+                stable_obj_hash="status-hash",
+                changed=False,
+            )
+
+        self.assertIsNone(result["early_return"])
+        self.assertTrue(result["feed_delivered"])
+        self.assertEqual(counters["sends"], 1)
+        self.assertEqual(counters["feed_sends"], 1)
+        self.assertEqual(sent_items[0]["turn_id"], "turn-public-1")
+        self.assertIn("Herdres was skipping Tendwire turn text", sent_items[0]["assistant_final_text"])
+        self.assertEqual(entry["last_clean_message_id"], "501")
+        extract_turn_feed_item.assert_not_called()
+        cached_pane_turn.assert_not_called()
+        pane_feed_output.assert_not_called()
+
+    def test_sync_once_source_delivers_completed_tendwire_turn_without_direct_herdr(self) -> None:
+        state = {
+            "enabled": True,
+            "telegram": {"chat_id": "-100", "general_thread_id": "1"},
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "topic_name": "Workers",
+                    "pane_keys": [],
+                    "last_topic_verified_at": "9999-01-01T00:00:00+00:00",
+                }
+            },
+            "panes": {},
+        }
+        turns_payload = {
+            "schema_version": 1,
+            "turns": [
+                {
+                    "id": "turn-public-1",
+                    "worker_id": "worker-1",
+                    "worker_fingerprint": "fp-1",
+                    "user_text": "Summarize the source-mode delivery.",
+                    "assistant_final_text": "Completed Tendwire turn text reached Telegram.",
+                    "assistant_stream_text": "",
+                    "complete": True,
+                    "has_open_turn": False,
+                }
+            ],
+        }
+        sent_items: list[dict] = []
+
+        def fake_send_feed_item(chat_id: str, item: dict, **kwargs) -> dict:
+            sent_items.append(item)
+            return {"ok": True, "message_id": "501"}
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True))
+            stack.enter_context(patch.object(herdres, "load_dotenv"))
+            stack.enter_context(patch.object(herdres, "load_state", return_value=state))
+            save_state = stack.enter_context(patch.object(herdres, "save_state"))
+            stack.enter_context(patch.object(herdres, "tendwire_snapshot", return_value=_snapshot()))
+            stack.enter_context(patch.object(herdres, "tendwire_turns", return_value=turns_payload))
+            outbox = stack.enter_context(
+                patch.object(
+                    herdres,
+                    "drain_tendwire_connector_outbox",
+                    return_value={"changed": False, "polled": 0},
+                )
+            )
+            pane_list = stack.enter_context(patch.object(herdres, "pane_list"))
+            pane_turn = stack.enter_context(patch.object(herdres, "pane_turn"))
+            prefetch = stack.enter_context(patch.object(herdres, "prefetch_pane_turns"))
+            send_to_pane = stack.enter_context(patch.object(herdres, "send_to_pane"))
+            labels = stack.enter_context(patch.object(herdres, "workspace_label_map"))
+            stack.enter_context(patch.object(herdres, "reconcile_known_gone_spaces", return_value=0))
+            stack.enter_context(patch.object(herdres, "prune_orphan_spaces", return_value=0))
+            stack.enter_context(patch.object(herdres, "preflight_is_fresh", return_value=True))
+            stack.enter_context(
+                patch.object(herdres, "reconcile_pinned_status_views", return_value={"changed": False, "updated": 0})
+            )
+            stack.enter_context(patch.object(herdres, "ensure_managed_bot_setup_message", return_value=False))
+            stack.enter_context(patch.object(herdres, "ensure_managed_bot_group_access_message", return_value=False))
+            stack.enter_context(patch.object(herdres, "ensure_multibot_offer_message", return_value=False))
+            stack.enter_context(patch.object(herdres, "update_topic_icons_for_spaces"))
+            stack.enter_context(patch.object(herdres, "ensure_pane_root_message", return_value=(False, {"ok": True})))
+            stack.enter_context(patch.object(herdres, "send_pending_prompt_message", return_value={"changed": False}))
+            stack.enter_context(patch.object(herdres, "send_feed_item", side_effect=fake_send_feed_item))
+            stack.enter_context(patch.object(herdres, "fold_superseded_turns", return_value=False))
+            stack.enter_context(patch.object(herdres, "flush_pending_plan_doc", return_value=False))
+            stack.enter_context(patch.object(herdres, "flush_pending_speech_reply", return_value=False))
+            create_topic = stack.enter_context(patch.object(herdres, "create_topic"))
+            stack.enter_context(patch.object(herdres, "TURN_FEED_ENABLED", True))
+            stack.enter_context(patch.object(herdres, "CLEAN_FEED_ENABLED", True))
+            stack.enter_context(patch.object(herdres, "LIVE_CARD_ENABLED", False))
+            stack.enter_context(patch.object(herdres, "STATUS_MARKER_ENABLED", False))
+            stack.enter_context(patch.object(herdres, "STATUS_ICON_ENABLED", False))
+            result = herdres.sync_once()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["feed_sent"], 1)
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(sent_items[0]["turn_id"], "turn-public-1")
+        self.assertIn("Completed Tendwire turn text", sent_items[0]["assistant_final_text"])
+        self.assertEqual(state["panes"][herdres.pane_key(herdres.tendwire_source_read_panes(_snapshot())[0])]["last_clean_message_id"], "501")
+        outbox.assert_called_once()
+        pane_list.assert_not_called()
+        pane_turn.assert_not_called()
+        prefetch.assert_not_called()
+        send_to_pane.assert_not_called()
+        labels.assert_not_called()
+        create_topic.assert_not_called()
+        save_state.assert_called()
 
     def test_source_read_snapshot_failure_preserves_existing_source_entries(self) -> None:
         state, key = _source_state()

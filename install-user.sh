@@ -11,6 +11,7 @@ install -Dm644 herdr_topic_bridge.py "$HOME/.local/share/herdres/herdr_topic_bri
 # herdres_routing.py must sit next to it on the import path.
 install -Dm755 herdres_gateway.py "$HOME/.local/bin/herdres-gateway"
 install -Dm644 herdres_routing.py "$HOME/.local/bin/herdres_routing.py"
+install -Dm644 herdres_tendwire.py "$HOME/.local/bin/herdres_tendwire.py"
 # Optional local speech engine (issue #4): herdres imports it best-effort, so it must sit next to the
 # CLI on the import path. Heavy deps (sherpa-onnx + models) are opt-in via `herdres speech install`.
 install -Dm644 herdres_speech.py "$HOME/.local/bin/herdres_speech.py"

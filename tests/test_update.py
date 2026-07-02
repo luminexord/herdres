@@ -34,6 +34,7 @@ SOURCE_FILES = {
     "herdres.py": f'#!/usr/bin/env python3\nHERDRES_VERSION = "9.9.9"\n',
     "herdres_gateway.py": "# gateway\n",
     "herdres_routing.py": "# routing\n",
+    "herdres_tendwire.py": "# tendwire\n",
     "herdres_speech.py": "# speech\n",
     "herdres-speech": "# speech sidecar\n",
     "herdres_decision_hook.py": "# decision hook\n",
@@ -87,6 +88,7 @@ class _SubprocessRouter:
         # `git show` "fails" (no upstream), exercising the needs-upstream path.
         self.remote_version = "9.9.9"
         self.enabled_units = {"herdres.timer": "enabled", "herdres-gateway.service": "enabled"}
+        self.active_units = {"herdres-gateway.service": "active", "herdr-telegram-topics.timer": "inactive"}
         # `systemctl --user is-active herdres-gateway.service` result. "active" by
         # default; flip to "inactive" to simulate a silently-failed re-enable.
         self.gateway_active = "active"
@@ -126,15 +128,25 @@ class _SubprocessRouter:
                 stdout = state + "\n"
                 rc = 0 if state in {"enabled", "static", "linked", "enabled-runtime"} else 1
             elif "is-active" in argv:
-                stdout = self.gateway_active + "\n"
-                rc = 0 if self.gateway_active == "active" else 3
+                unit = str(argv[-1])
+                state = self.gateway_active if unit == "herdres-gateway.service" else self.active_units.get(unit, "inactive")
+                stdout = state + "\n"
+                rc = 0 if state == "active" else 3
             elif "disable" in argv:
-                self.enabled_units[str(argv[-1])] = "disabled"
+                unit = str(argv[-1])
+                self.enabled_units[unit] = "disabled"
+                self.active_units[unit] = "inactive"
+                if unit == "herdres-gateway.service":
+                    self.gateway_active = "inactive"
             elif "enable" in argv:
-                self.enabled_units[str(argv[-1])] = "enabled"
+                unit = str(argv[-1])
+                self.enabled_units[unit] = "enabled"
+                self.active_units[unit] = "active"
                 if self.flip_gateway_inactive_on_enable and "herdres-gateway.service" in argv:
                     self.gateway_active = "inactive"
                     self.flip_gateway_inactive_on_enable = False
+                elif unit == "herdres-gateway.service":
+                    self.gateway_active = "active"
         return subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr="")
 
 
@@ -212,6 +224,47 @@ class VersionTests(unittest.TestCase):
     def test_version_returns_constant(self):
         result = herdres.version_once(_args())
         self.assertEqual(result, {"ok": True, "version": herdres.HERDRES_VERSION})
+
+
+class DoctorTests(UpdateTestBase):
+    def test_doctor_warns_when_legacy_timer_active_in_source_mode(self):
+        self.router.active_units["herdr-telegram-topics.timer"] = "active"
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True):
+            result = herdres.legacy_topic_timer_doctor()
+
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(result["legacy_timer"]["active"])
+        self.assertTrue(result["legacy_timer"]["conflict"])
+        self.assertIn("systemctl --user disable --now herdr-telegram-topics.timer", result["legacy_timer"]["disable_command"])
+        self.assertNotIn(
+            ["systemctl", "--user", "disable", "--now", "herdr-telegram-topics.timer"],
+            self.router.calls,
+        )
+
+    def test_doctor_fix_disables_active_legacy_timer_in_commands_mode(self):
+        self.router.active_units["herdr-telegram-topics.timer"] = "active"
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "commands"}, clear=True):
+            result = herdres.legacy_topic_timer_doctor(fix=True)
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["legacy_timer"]["active"])
+        self.assertFalse(result["legacy_timer"]["conflict"])
+        self.assertIn(
+            ["systemctl", "--user", "disable", "--now", "herdr-telegram-topics.timer"],
+            self.router.calls,
+        )
+
+    def test_doctor_allows_legacy_timer_in_enrich_mode(self):
+        self.router.active_units["herdr-telegram-topics.timer"] = "active"
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "enrich"}, clear=True):
+            result = herdres.legacy_topic_timer_doctor()
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["legacy_timer"]["active"])
+        self.assertFalse(result["legacy_timer"]["conflict"])
 
 
 class SourceResolutionTests(UpdateTestBase):

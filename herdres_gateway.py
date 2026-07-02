@@ -768,6 +768,12 @@ def live_entries_for_space(state: dict, space: dict) -> list[tuple[str, dict]]:
     return entries
 
 
+def entry_is_live_route_target(entry: dict | None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    return str(entry.get("last_known_status") or "").strip().lower() != "closed"
+
+
 def route_message_entry(state: dict, chat_id: str, thread_id: str | None, message_id: str | int | None) -> tuple[str, dict] | None:
     message_key = str(message_id or "").strip()
     if not message_key:
@@ -780,7 +786,7 @@ def route_message_entry(state: dict, chat_id: str, thread_id: str | None, messag
     routes = space.get("message_routes") if isinstance(space.get("message_routes"), dict) else {}
     routed_key = str(routes.get(message_key) or "")
     routed_entry = panes.get(routed_key)
-    if routed_key and isinstance(routed_entry, dict):
+    if routed_key and entry_is_live_route_target(routed_entry):
         return routed_key, routed_entry
     for pane_key, entry in live_entries_for_space(state, space):
         if str(entry.get("pane_root_message_id") or "") == message_key:
@@ -811,9 +817,19 @@ def resolve_mapped_entry(
         if len(live_entries) == 1:
             return live_entries[0]
         return None
+    matching_entries: list[tuple[str, dict]] = []
+    closed_entries: list[tuple[str, dict]] = []
     for entry in (state.get("panes") or {}).values():
         if isinstance(entry, dict) and str(entry.get("topic_id") or "") == str(thread_id):
-            return str(entry.get("pane_key") or ""), entry
+            item = (str(entry.get("pane_key") or ""), entry)
+            if entry_is_live_route_target(entry):
+                matching_entries.append(item)
+            else:
+                closed_entries.append(item)
+    if len(matching_entries) == 1:
+        return matching_entries[0]
+    if not matching_entries and len(closed_entries) == 1:
+        return closed_entries[0]
     return None
 
 

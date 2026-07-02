@@ -46,6 +46,7 @@ files="
 herdres.py
 herdres_gateway.py
 herdres_routing.py
+herdres_tendwire.py
 herdres_speech.py
 herdres-speech
 herdres_decision_hook.py

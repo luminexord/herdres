@@ -171,6 +171,53 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         with patch.multiple(herdres, **mocks):
             yield mocks
 
+    def _shared_source_state(self) -> dict:
+        claude = _entry(
+            pane_key="worker:claude-1:current",
+            pane_id="",
+            source="tendwire",
+            entry_type="worker",
+            agent="claude",
+            worker_id="claude-1",
+            worker_fingerprint="claude-fp",
+            tendwire_worker_id="claude-1",
+            tendwire_fingerprint="claude-fp",
+            pane_root_message_id="1001",
+        )
+        codex = _entry(
+            pane_key="worker:codex-1:current",
+            pane_id="",
+            source="tendwire",
+            entry_type="worker",
+            agent="codex",
+            worker_id="codex-1",
+            worker_fingerprint="codex-fp",
+            tendwire_worker_id="codex-1",
+            tendwire_fingerprint="codex-fp",
+            pane_root_message_id="1002",
+        )
+        return {
+            "version": 1,
+            "enabled": True,
+            "telegram": {
+                "chat_id": "-1001",
+                "general_thread_id": "1",
+                "owner_user_ids": ["42"],
+            },
+            "spaces": {
+                "workspace:workspace-1": {
+                    "space_key": "workspace:workspace-1",
+                    "topic_id": "77",
+                    "pane_keys": ["worker:claude-1:current", "worker:codex-1:current"],
+                    "message_routes": {},
+                }
+            },
+            "panes": {
+                "worker:claude-1:current": claude,
+                "worker:codex-1:current": codex,
+            },
+        }
+
     def test_commands_mode_send_uses_tendwire_command_not_send_to_pane(self) -> None:
         state = _state()
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "commands"}, clear=True), self._command_patches(state) as patched:
@@ -216,6 +263,96 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         self.assertEqual(state["panes"]["pane-1"]["direct_origin_pane_id"], "")
         self.assertEqual(state["panes"]["pane-1"]["direct_origin_pane_key"], "pane-1")
 
+    def test_source_shared_topic_target_bot_kind_routes_to_current_worker(self) -> None:
+        state = self._shared_source_state()
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                self._command_patches(state) as patched, \
+                patch.object(herdres, "send_message") as send_message:
+            result = herdres.command_reply(
+                _payload(
+                    text="hello claude",
+                    reply_to_message_id="",
+                    target_bot_kind="claude",
+                )
+            )
+
+        self.assertEqual(result["reply"], "")
+        send_message.assert_not_called()
+        patched["send_to_pane"].assert_not_called()
+        patched["run_cmd"].assert_called_once()
+        request = json.loads(patched["run_cmd"].call_args.kwargs["input_text"])
+        self.assertEqual(request["target"], {"worker_id": "claude-1", "worker_fingerprint": "claude-fp"})
+        self.assertEqual(request["params"]["telegram_origin"], "plain")
+
+    def test_source_shared_topic_target_bot_kind_prefers_single_active_same_agent_worker(self) -> None:
+        state = self._shared_source_state()
+        state["panes"]["worker:claude-1:current"]["last_known_status"] = "done"
+        active = _entry(
+            pane_key="worker:claude:active",
+            pane_id="",
+            source="tendwire",
+            entry_type="worker",
+            agent="claude",
+            worker_id="claude",
+            worker_fingerprint="active-fp",
+            tendwire_worker_id="claude",
+            tendwire_fingerprint="active-fp",
+            last_known_status="working",
+        )
+        state["panes"]["worker:claude:active"] = active
+        state["spaces"]["workspace:workspace-1"]["pane_keys"].append("worker:claude:active")
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                self._command_patches(state) as patched, \
+                patch.object(herdres, "send_message") as send_message:
+            result = herdres.command_reply(
+                _payload(
+                    text="hello active claude",
+                    reply_to_message_id="",
+                    target_bot_kind="claude",
+                )
+            )
+
+        self.assertEqual(result["reply"], "")
+        send_message.assert_not_called()
+        patched["send_to_pane"].assert_not_called()
+        request = json.loads(patched["run_cmd"].call_args.kwargs["input_text"])
+        self.assertEqual(request["target"], {"worker_id": "claude", "worker_fingerprint": "active-fp"})
+
+    def test_source_shared_topic_stale_message_route_does_not_shadow_picker(self) -> None:
+        state = self._shared_source_state()
+        state["panes"]["worker:claude-1:old"] = _entry(
+            pane_key="worker:claude-1:old",
+            pane_id="",
+            source="tendwire",
+            entry_type="worker",
+            agent="claude",
+            worker_id="claude-1",
+            worker_fingerprint="old-fp",
+            tendwire_worker_id="claude-1",
+            tendwire_fingerprint="old-fp",
+            last_known_status="closed",
+        )
+        state["spaces"]["workspace:workspace-1"]["message_routes"]["999"] = "worker:claude-1:old"
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                self._command_patches(state) as patched, \
+                patch.object(herdres, "send_message") as send_message:
+            result = herdres.command_reply(
+                _payload(
+                    text="this needs a picker",
+                    reply_to_message_id="999",
+                    target_bot_kind="",
+                )
+            )
+
+        self.assertEqual(result["reply"], "")
+        send_message.assert_called_once()
+        patched["send_to_pane"].assert_not_called()
+        patched["run_cmd"].assert_not_called()
+        self.assertEqual(
+            state["spaces"]["workspace:workspace-1"]["pending_pick"]["42"]["text"],
+            "this needs a picker",
+        )
+
     def test_commands_mode_plain_reply_uses_tendwire_command_not_send_to_pane(self) -> None:
         state = _state()
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "commands"}, clear=True), self._command_patches(state) as patched:
@@ -260,6 +397,49 @@ class TendwireCommandRoutingTests(unittest.TestCase):
             self.assertEqual(result["reply"], herdres.TENDWIRE_SAFE_SEND_FAILURE_REPLY)
             send_to_pane.assert_not_called()
             self.assertNotIn("direct_origin_at", entry)
+
+    def test_stale_target_same_worker_retries_with_current_fingerprint(self) -> None:
+        entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", tendwire_fingerprint="old-fp")
+        state = _state(entry)
+        stale = {
+            "status": "stale_target",
+            "result": {
+                "candidates": [
+                    {
+                        "worker_id": "worker-1",
+                        "worker_fingerprint": "new-fp",
+                        "status": "idle",
+                    }
+                ]
+            },
+        }
+        accepted = {"status": "accepted", "ok": True}
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                patch.object(herdres, "tendwire_command", side_effect=[stale, accepted]) as tendwire_command, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "save_state") as save_state:
+            result = herdres.send_to_tendwire_worker_response(
+                entry,
+                "continue",
+                state=state,
+                origin="plain",
+                chat_id="-1001",
+                topic_id="77",
+                message_id="5000",
+            )
+
+        self.assertEqual(result["reply"], "")
+        self.assertEqual(tendwire_command.call_count, 2)
+        first = tendwire_command.call_args_list[0].args[0]
+        second = tendwire_command.call_args_list[1].args[0]
+        self.assertEqual(first["target"]["worker_fingerprint"], "old-fp")
+        self.assertEqual(second["target"]["worker_fingerprint"], "new-fp")
+        self.assertEqual(second["target"]["worker_id"], "worker-1")
+        self.assertNotEqual(second["request_id"], first["request_id"])
+        self.assertIn(":retry:", second["request_id"])
+        self.assertEqual(entry["tendwire_fingerprint"], "new-fp")
+        save_state.assert_called_once_with(state)
+        send_to_pane.assert_not_called()
 
     def test_duplicate_request_mismatched_payload_fails_without_direct_fallback(self) -> None:
         entry = _entry()

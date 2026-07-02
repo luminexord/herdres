@@ -39,6 +39,8 @@ try:
 except Exception:  # pragma: no cover - speech is strictly additive
     herdres_speech = None  # type: ignore
 
+import herdres_tendwire
+
 
 HERDRES_VERSION = "0.4.0"
 
@@ -1783,19 +1785,16 @@ def pane_list(deadline: float | None = None) -> list[dict[str, Any]]:
     raise BridgeError("unexpected herdr pane list response")
 
 
-TENDWIRE_MODE_VALUES = ("off", "enrich", "commands", "source-read", "source")
-TENDWIRE_OPTIONAL_ENV_KEYS = {
-    "HERDRES_TENDWIRE_DATA_DIR": "TENDWIRE_DATA_DIR",
-    "HERDRES_TENDWIRE_DB_PATH": "TENDWIRE_DB_PATH",
-    "HERDRES_TENDWIRE_HOST_ID": "TENDWIRE_HOST_ID",
-}
-TENDWIRE_OPTIONAL_PATH_KEYS = {"HERDRES_TENDWIRE_DATA_DIR", "HERDRES_TENDWIRE_DB_PATH"}
-TENDWIRE_HERDR_TIMEOUT_DEFAULT = 1.0
-_CONFIG_ENV_VAR_RE = re.compile(r"\$(\w+)|\$\{([^}]+)\}")
+TENDWIRE_MODE_VALUES = herdres_tendwire.MODE_VALUES
+TENDWIRE_LEGACY_TIMER_CONFLICT_MODES = herdres_tendwire.LEGACY_TIMER_CONFLICT_MODES
+LEGACY_HERDR_TOPIC_TIMER = herdres_tendwire.LEGACY_HERDR_TOPIC_TIMER
+TENDWIRE_OPTIONAL_ENV_KEYS = herdres_tendwire.OPTIONAL_ENV_KEYS
+TENDWIRE_OPTIONAL_PATH_KEYS = herdres_tendwire.OPTIONAL_PATH_KEYS
+TENDWIRE_HERDR_TIMEOUT_DEFAULT = herdres_tendwire.HERDR_TIMEOUT_DEFAULT
 
 
 def _tendwire_bool_env(env: Any, key: str) -> bool:
-    return str(env.get(key, "0")).strip().lower() in {"1", "true", "yes", "on"}
+    return herdres_tendwire.bool_env(env, key)
 
 
 def _warn_invalid_tendwire_mode(raw: Any) -> None:
@@ -1805,18 +1804,11 @@ def _warn_invalid_tendwire_mode(raw: Any) -> None:
 
 
 def parse_tendwire_mode(env: Any | None = None, *, diagnose_invalid: bool = False) -> str:
-    source = os.environ if env is None else env
-    raw_mode = source.get("HERDRES_TENDWIRE_MODE")
-    if raw_mode is not None:
-        mode = str(raw_mode).strip().lower()
-        if mode in TENDWIRE_MODE_VALUES:
-            return mode
-        if diagnose_invalid:
-            _warn_invalid_tendwire_mode(raw_mode)
-        return "off"
-    if _tendwire_bool_env(source, "HERDRES_TENDWIRE_HYBRID") or _tendwire_bool_env(source, "HERDRES_TENDWIRE_SNAPSHOT"):
-        return "enrich"
-    return "off"
+    return herdres_tendwire.parse_mode(
+        env,
+        diagnose_invalid=diagnose_invalid,
+        warn_invalid=_warn_invalid_tendwire_mode,
+    )
 
 
 def tendwire_mode() -> str:
@@ -1824,12 +1816,12 @@ def tendwire_mode() -> str:
 
 
 def tendwire_mode_at_least(mode: str, env: Any | None = None) -> bool:
-    try:
-        wanted = TENDWIRE_MODE_VALUES.index(str(mode or "").strip().lower())
-    except ValueError:
-        return False
-    current = parse_tendwire_mode(env, diagnose_invalid=(env is None))
-    return TENDWIRE_MODE_VALUES.index(current) >= wanted
+    return herdres_tendwire.mode_at_least(
+        mode,
+        env,
+        diagnose_invalid=(env is None),
+        warn_invalid=_warn_invalid_tendwire_mode,
+    )
 
 
 def tendwire_enrich_enabled() -> bool:
@@ -1861,10 +1853,7 @@ def tendwire_direct_fallback_enabled() -> bool:
 
 
 def tendwire_connector_outbox_enabled(env: Any | None = None) -> bool:
-    source = os.environ if env is None else env
-    if source.get("HERDRES_TENDWIRE_CONNECTOR_OUTBOX") is not None:
-        return _tendwire_bool_env(source, "HERDRES_TENDWIRE_CONNECTOR_OUTBOX")
-    return parse_tendwire_mode(source) == "source"
+    return herdres_tendwire.connector_outbox_enabled(env)
 
 
 def _bounded_int_env(
@@ -1875,18 +1864,11 @@ def _bounded_int_env(
     maximum: int = 100,
     env: Any | None = None,
 ) -> int:
-    source = os.environ if env is None else env
-    try:
-        parsed = int(float(str(source.get(key, str(default)) or str(default))))
-    except (TypeError, ValueError):
-        parsed = default
-    return max(minimum, min(parsed, maximum))
+    return herdres_tendwire.bounded_int_env(key, default, minimum=minimum, maximum=maximum, env=env)
 
 
 def tendwire_connector_name() -> str:
-    raw = os.getenv("HERDRES_TENDWIRE_CONNECTOR_NAME", "attention").strip() or "attention"
-    clean = re.sub(r"[^A-Za-z0-9_.:-]+", "-", raw).strip(".:-_")
-    return clean[:64] or "attention"
+    return herdres_tendwire.connector_name()
 
 
 def tendwire_connector_limit() -> int:
@@ -1906,138 +1888,51 @@ def _env_source(env: Any | None = None) -> Any:
 
 
 def _env_get_str(env: Any, key: str, default: str = "") -> str:
-    value = env.get(key, default)
-    return "" if value is None else str(value)
+    return "" if env.get(key, default) is None else str(env.get(key, default))
 
 
 def _expand_config_path(value: str, env: Any | None = None) -> str:
-    source = _env_source(env)
-
-    def repl(match: re.Match[str]) -> str:
-        name = match.group(1) or match.group(2) or ""
-        replacement = source.get(name)
-        return match.group(0) if replacement is None else str(replacement)
-
-    expanded = _CONFIG_ENV_VAR_RE.sub(repl, str(value))
-    if expanded == "~" or expanded.startswith("~/"):
-        home = _env_get_str(source, "HOME").strip()
-        if home:
-            return home.rstrip("/") + expanded[1:]
-    return os.path.expanduser(expanded)
+    return herdres_tendwire._expand_config_path(value, env)
 
 
 def _tendwire_command_token_path_like(token: str) -> bool:
-    return token.startswith("~") or "/" in token or "\\" in token or "$" in token
+    return herdres_tendwire._command_token_path_like(token)
 
 
 def tendwire_command_base(env: Any | None = None) -> list[str]:
-    source = _env_source(env)
-    raw = _env_get_str(source, "HERDRES_TENDWIRE_BIN", "tendwire").strip()
-    try:
-        parts = shlex.split(raw)
-    except ValueError:
-        parts = []
-    if parts and _tendwire_command_token_path_like(parts[0]):
-        parts[0] = _expand_config_path(parts[0], source)
-    return parts or ["tendwire"]
+    return herdres_tendwire.command_base(env)
 
 
 def tendwire_timeout_seconds(env: Any | None = None) -> int:
-    source = _env_source(env)
-    try:
-        return max(1, int(float(_env_get_str(source, "HERDRES_TENDWIRE_TIMEOUT_SECONDS", "5"))))
-    except (TypeError, ValueError):
-        return 5
+    return herdres_tendwire.timeout_seconds(env)
 
 
 def tendwire_herdr_bin(env: Any | None = None) -> str:
-    source = _env_source(env)
-    real_bin = _env_get_str(source, "HERDR_REAL_BIN").strip()
-    if real_bin:
-        return real_bin
-    configured = _env_get_str(source, "HERDR_BIN").strip()
-    if configured and "\x00" not in configured:
-        return configured
-    return DEFAULT_HERDR_BIN
+    return herdres_tendwire.herdr_bin(env, default=DEFAULT_HERDR_BIN)
 
 
 def tendwire_herdr_timeout_seconds(env: Any | None = None) -> float:
-    source = _env_source(env)
-    try:
-        value = float(_env_get_str(source, "HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS", str(TENDWIRE_HERDR_TIMEOUT_DEFAULT)))
-    except (TypeError, ValueError):
-        return TENDWIRE_HERDR_TIMEOUT_DEFAULT
-    if not math.isfinite(value) or value <= 0:
-        return TENDWIRE_HERDR_TIMEOUT_DEFAULT
-    return value
+    return herdres_tendwire.herdr_timeout_seconds(env)
 
 
 def _tendwire_timeout_env_value(value: float) -> str:
-    return str(float(value))
+    return herdres_tendwire._timeout_env_value(value)
 
 
 def tendwire_optional_config_value(key: str, env: Any | None = None) -> str | None:
-    source = _env_source(env)
-    raw = source.get(key)
-    if raw is None or str(raw).strip() == "":
-        return None
-    value = str(raw).strip()
-    if key in TENDWIRE_OPTIONAL_PATH_KEYS:
-        return _expand_config_path(value, source)
-    return value
+    return herdres_tendwire.optional_config_value(key, env)
 
 
 def tendwire_env_overrides(env: Any | None = None) -> dict[str, str]:
-    source = _env_source(env)
-    overrides = {
-        "TENDWIRE_HERDR_BIN": tendwire_herdr_bin(source),
-        "TENDWIRE_HERDR_TIMEOUT_SECONDS": _tendwire_timeout_env_value(tendwire_herdr_timeout_seconds(source)),
-    }
-    for herdres_key, tendwire_key in TENDWIRE_OPTIONAL_ENV_KEYS.items():
-        value = tendwire_optional_config_value(herdres_key, source)
-        if value is not None:
-            overrides[tendwire_key] = value
-    return overrides
+    return herdres_tendwire.env_overrides(env, default_herdr_bin=DEFAULT_HERDR_BIN)
 
 
 def tendwire_child_env(env: Any | None = None) -> dict[str, str]:
-    source = _env_source(env)
-    child = {str(k): str(v) for k, v in dict(source).items()}
-    for tendwire_key in TENDWIRE_OPTIONAL_ENV_KEYS.values():
-        child.pop(tendwire_key, None)
-    child.update(tendwire_env_overrides(source))
-    return child
+    return herdres_tendwire.child_env(env, default_herdr_bin=DEFAULT_HERDR_BIN)
 
 
 def tendwire_config_status(env: Any | None = None) -> dict[str, Any]:
-    source = _env_source(env)
-    outer_timeout = tendwire_timeout_seconds(source)
-    herdr_timeout = tendwire_herdr_timeout_seconds(source)
-    warnings: list[str] = []
-    if herdr_timeout >= float(outer_timeout):
-        warnings.append("TENDWIRE_HERDR_TIMEOUT_SECONDS is greater than or equal to the outer Tendwire timeout")
-    return {
-        "tendwire_mode": parse_tendwire_mode(source),
-        "tendwire_bin": shlex.join(tendwire_command_base(source)),
-        "tendwire_db_path": tendwire_optional_config_value("HERDRES_TENDWIRE_DB_PATH", source),
-        "tendwire_data_dir": tendwire_optional_config_value("HERDRES_TENDWIRE_DATA_DIR", source),
-        "tendwire_host_id": tendwire_optional_config_value("HERDRES_TENDWIRE_HOST_ID", source),
-        "tendwire_herdr_bin": tendwire_herdr_bin(source),
-        "tendwire_timeout_seconds": outer_timeout,
-        "tendwire_herdr_timeout_seconds": herdr_timeout,
-        "tendwire_connector_outbox": tendwire_connector_outbox_enabled(source),
-        "tendwire_connector_name": str(source.get("HERDRES_TENDWIRE_CONNECTOR_NAME") or "attention"),
-        "tendwire_connector_limit": _bounded_int_env(
-            "HERDRES_TENDWIRE_CONNECTOR_LIMIT", 3, minimum=1, maximum=20, env=source
-        ),
-        "tendwire_connector_lease_seconds": _bounded_int_env(
-            "HERDRES_TENDWIRE_CONNECTOR_LEASE_SECONDS", 60, minimum=1, maximum=86400, env=source
-        ),
-        "tendwire_connector_failure_delay_seconds": _bounded_int_env(
-            "HERDRES_TENDWIRE_CONNECTOR_FAILURE_DELAY_SECONDS", 60, minimum=0, maximum=86400, env=source
-        ),
-        "warnings": warnings,
-    }
+    return herdres_tendwire.config_status(env, default_herdr_bin=DEFAULT_HERDR_BIN)
 
 
 def tendwire_config_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
@@ -2147,125 +2042,59 @@ def tendwire_source_smoke_once(args: Any) -> dict[str, Any]:
 
 
 def tendwire_snapshot() -> dict[str, Any]:
-    proc = run_cmd(
-        [*tendwire_command_base(), "snapshot", "--json"],
-        timeout=tendwire_timeout_seconds(),
-        env=tendwire_child_env(),
-    )
-    if proc.returncode != 0:
-        raise BridgeError(sanitize_text(proc.stderr or proc.stdout or "tendwire snapshot failed", 500))
     try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise BridgeError("tendwire snapshot returned non-JSON") from exc
-    if not isinstance(data, dict):
-        raise BridgeError("tendwire snapshot returned non-object JSON")
+        return herdres_tendwire.snapshot_payload(
+            runner=run_cmd,
+            sanitize=sanitize_text,
+            default_herdr_bin=DEFAULT_HERDR_BIN,
+        )
+    except herdres_tendwire.TendwireCallError as exc:
+        raise BridgeError(str(exc)) from exc
+
+
+_tendwire_turns_cache: dict[str, Any] | None = None
+_tendwire_turns_cache_lock = threading.Lock()
+
+
+def tendwire_turns() -> dict[str, Any]:
+    global _tendwire_turns_cache
+    with _tendwire_turns_cache_lock:
+        if _tendwire_turns_cache is not None:
+            return _tendwire_turns_cache
+    try:
+        data = herdres_tendwire.turns_payload(
+            runner=run_cmd,
+            sanitize=sanitize_text,
+            default_herdr_bin=DEFAULT_HERDR_BIN,
+        )
+    except herdres_tendwire.TendwireCallError as exc:
+        raise BridgeError(str(exc)) from exc
+    with _tendwire_turns_cache_lock:
+        _tendwire_turns_cache = data
     return data
 
 
 def _json_object_from_stdout(stdout: str, source: str) -> tuple[dict[str, Any] | None, str]:
-    text = str(stdout or "")
-    stripped = text.strip()
-    if not stripped:
-        return None, f"{source} returned empty stdout"
-    try:
-        decoder = json.JSONDecoder()
-        value, idx = decoder.raw_decode(stripped)
-    except json.JSONDecodeError:
-        if stripped[:1] in {"{", "["}:
-            return None, f"{source} returned malformed JSON"
-        return None, f"{source} returned non-JSON stdout"
-    if stripped[idx:].strip():
-        return None, f"{source} returned more than one JSON value"
-    if not isinstance(value, dict):
-        return None, f"{source} returned non-object JSON"
-    return value, ""
+    return herdres_tendwire.json_object_from_stdout(stdout, source)
 
 
 def tendwire_command(request: dict[str, Any]) -> dict[str, Any]:
-    try:
-        input_text = json.dumps(request, separators=(",", ":")) + "\n"
-        proc = run_cmd(
-            [*tendwire_command_base(), "command", "--json"],
-            timeout=tendwire_timeout_seconds(),
-            input_text=input_text,
-            env=tendwire_child_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "status": "timeout", "error": "tendwire command timed out"}
-    except Exception as exc:
-        return {"ok": False, "status": "subprocess_failed", "error": sanitize_text(str(exc), 300)}
-    if proc.returncode != 0:
-        detail = sanitize_text(proc.stderr or proc.stdout or "tendwire command failed", 500)
-        return {"ok": False, "status": "nonzero_exit", "error": detail}
-    data, error = _json_object_from_stdout(proc.stdout, "tendwire command")
-    if error:
-        status = "malformed_json" if "malformed JSON" in error else "non_json_stdout"
-        if "non-object JSON" in error:
-            status = "non_object_json"
-        return {"ok": False, "status": status, "error": error}
-    return data
+    return herdres_tendwire.command_submit(
+        request,
+        runner=run_cmd,
+        sanitize=sanitize_text,
+        default_herdr_bin=DEFAULT_HERDR_BIN,
+    )
 
 
 def tendwire_connector_call(action: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    data = dict(params or {})
-    clean_action = str(action or "").strip().lower()
-    name = str(data.get("name") or tendwire_connector_name()).strip() or "attention"
-    args = [*tendwire_command_base(), "connector", clean_action, "--name", name]
-    if clean_action == "poll":
-        try:
-            poll_limit = max(1, int(data.get("limit") or tendwire_connector_limit()))
-        except (TypeError, ValueError):
-            poll_limit = tendwire_connector_limit()
-        args.extend(["--limit", str(poll_limit)])
-        lease_seconds = data.get("lease_seconds")
-        if lease_seconds is not None:
-            try:
-                lease_value = max(1, int(lease_seconds))
-            except (TypeError, ValueError):
-                lease_value = tendwire_connector_lease_seconds()
-            args.extend(["--lease-seconds", str(lease_value)])
-    elif clean_action in {"ack", "fail", "defer"}:
-        ref = str(data.get("ref") or "").strip()
-        if not ref:
-            return {"ok": False, "status": "invalid_ref", "error": "missing connector ref"}
-        args.extend(["--ref", ref])
-        response = data.get("response")
-        if isinstance(response, dict) and response:
-            args.extend(["--response-json", json.dumps(response, sort_keys=True, separators=(",", ":"))])
-        if clean_action in {"fail", "defer"}:
-            reason = sanitize_text(str(data.get("reason") or ""), 120).strip()
-            if reason:
-                args.extend(["--reason", reason])
-            if data.get("available_at"):
-                args.extend(["--available-at", str(data.get("available_at"))])
-            if data.get("delay_seconds") is not None:
-                try:
-                    delay_value = max(0, int(data.get("delay_seconds") or 0))
-                except (TypeError, ValueError):
-                    delay_value = tendwire_connector_failure_delay_seconds()
-                args.extend(["--delay-seconds", str(delay_value)])
-    elif clean_action != "reclaim":
-        return {"ok": False, "status": "unknown_method", "error": "unknown connector action"}
-    try:
-        proc = run_cmd(args, timeout=tendwire_timeout_seconds(), env=tendwire_child_env())
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "status": "timeout", "error": "tendwire connector call timed out"}
-    except Exception as exc:
-        return {"ok": False, "status": "subprocess_failed", "error": sanitize_text(str(exc), 300)}
-    if proc.returncode != 0:
-        return {
-            "ok": False,
-            "status": "nonzero_exit",
-            "error": sanitize_text(proc.stderr or proc.stdout or "tendwire connector call failed", 500),
-        }
-    parsed, error = _json_object_from_stdout(proc.stdout, f"tendwire connector {clean_action}")
-    if error:
-        status = "malformed_json" if "malformed JSON" in error else "non_json_stdout"
-        if "non-object JSON" in error:
-            status = "non_object_json"
-        return {"ok": False, "status": status, "error": error}
-    return parsed
+    return herdres_tendwire.connector_call(
+        action,
+        params,
+        runner=run_cmd,
+        sanitize=sanitize_text,
+        default_herdr_bin=DEFAULT_HERDR_BIN,
+    )
 
 
 def _tendwire_attention_payload(item: dict[str, Any]) -> dict[str, Any]:
@@ -2503,59 +2332,28 @@ def drain_tendwire_connector_outbox(
     return result
 
 
-TENDWIRE_COMMAND_SUCCESS_STATUSES = {"accepted", "queued", "sent", "submitted", "ok", "success"}
-TENDWIRE_COMMAND_FAILURE_STATUSES = {
-    "stale_target",
-    "ambiguous_target",
-    "ambiguous_backend_target",
-    "backend_unavailable",
-    "request_state_uncertain",
-    "backend_unsupported",
-    "backend_failed",
-    "malformed_response",
-    "non_json_stdout",
-    "malformed_json",
-    "non_object_json",
-    "nonzero_exit",
-    "timeout",
-    "subprocess_failed",
-}
+TENDWIRE_COMMAND_SUCCESS_STATUSES = herdres_tendwire.COMMAND_SUCCESS_STATUSES
+TENDWIRE_COMMAND_FAILURE_STATUSES = herdres_tendwire.COMMAND_FAILURE_STATUSES
 
 
 def _tendwire_response_status(response: dict[str, Any]) -> str:
-    for container in (response, response.get("result") if isinstance(response.get("result"), dict) else {}):
-        for key in ("status", "state", "result_status"):
-            value = str(container.get(key) or "").strip().lower().replace("-", "_")
-            if value:
-                return value
-    return ""
+    return herdres_tendwire.response_status(response)
 
 
 def _tendwire_duplicate_payload_matches(response: dict[str, Any]) -> bool:
-    containers = [response]
-    if isinstance(response.get("result"), dict):
-        containers.append(response["result"])
-    for container in containers:
-        for mismatch_key in ("payload_mismatch", "mismatched_payload", "request_mismatch"):
-            if bool(container.get(mismatch_key)):
-                return False
-        for match_key in ("payload_matches", "payload_match", "same_payload", "request_matches"):
-            if container.get(match_key) is True:
-                return True
-    return False
+    return herdres_tendwire.duplicate_payload_matches(response)
 
 
 def tendwire_command_succeeded(response: dict[str, Any]) -> bool:
-    status = _tendwire_response_status(response)
-    if status == "duplicate_request":
-        return _tendwire_duplicate_payload_matches(response)
-    if status in TENDWIRE_COMMAND_FAILURE_STATUSES:
-        return False
-    if status in TENDWIRE_COMMAND_SUCCESS_STATUSES:
-        return True
-    if response.get("ok") is True and not status:
-        return True
-    return False
+    return herdres_tendwire.command_succeeded(response)
+
+
+def _same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
+    return herdres_tendwire.same_worker_stale_target_candidate(response, worker_id)
+
+
+def _retry_tendwire_request_id(base_request_id: str, candidate: dict[str, str]) -> str:
+    return herdres_tendwire.retry_request_id(base_request_id, candidate)
 
 
 def tendwire_success_reply(response: dict[str, Any]) -> str:
@@ -2571,116 +2369,43 @@ def tendwire_success_reply(response: dict[str, Any]) -> str:
 
 
 def tendwire_worker_status_for_herdres(status: str) -> str:
-    value = str(status or "unknown").strip().lower().replace("-", "_")
-    if value in {"active", "running", "working", "busy"}:
-        return "working"
-    if value in {"failed", "failure", "error"}:
-        return "error"
-    if value in {"done", "complete", "completed", "success", "succeeded"}:
-        return "done"
-    if value in {"closed", "exited", "terminated", "stopped"}:
-        return "closed"
-    if value in {"blocked", "waiting", "idle", "warning", "unknown"}:
-        return value
-    return "unknown"
+    return herdres_tendwire.worker_status_for_herdres(status)
 
 
 def tendwire_normalized_label(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+    return herdres_tendwire.normalized_label(value)
 
 
 def tendwire_normalized_path(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    return os.path.normpath(os.path.expanduser(text))
+    return herdres_tendwire.normalized_path(value)
 
 
 def tendwire_worker_agent(worker: dict[str, Any]) -> str:
-    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
-    return sanitize_text(str(meta.get("agent") or worker.get("name") or ""), 80)
+    return herdres_tendwire.worker_agent(worker, sanitize=sanitize_text)
 
 
 def tendwire_worker_match_keys(worker: dict[str, Any]) -> list[tuple[str, str, str, str]]:
-    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
-    space_id = str(worker.get("space_id") or "").strip()
-    tab_id = str(meta.get("tab_id") or "").strip()
-    agent = tendwire_normalized_label(tendwire_worker_agent(worker))
-    cwd = tendwire_normalized_path(meta.get("foreground_cwd") or meta.get("cwd") or "")
-    keys: list[tuple[str, str, str, str]] = []
-    if space_id and tab_id and agent:
-        keys.append(("space_tab_agent", space_id, tab_id, agent))
-    if space_id and tab_id:
-        keys.append(("space_tab", space_id, tab_id, ""))
-    if space_id and cwd and agent:
-        keys.append(("space_cwd_agent", space_id, cwd, agent))
-    return keys
+    return herdres_tendwire.worker_match_keys(worker, sanitize=sanitize_text)
 
 
 def tendwire_pane_match_keys(pane: dict[str, Any]) -> list[tuple[str, str, str, str]]:
-    workspace_id = str(pane.get("workspace_id") or pane.get("space_id") or "").strip()
-    tab_id = str(pane.get("tab_id") or "").strip()
-    agent = tendwire_normalized_label(pane.get("agent") or pane.get("label") or pane.get("name") or "")
-    cwd = tendwire_normalized_path(pane.get("foreground_cwd") or pane.get("cwd") or "")
-    keys: list[tuple[str, str, str, str]] = []
-    if workspace_id and tab_id and agent:
-        keys.append(("space_tab_agent", workspace_id, tab_id, agent))
-    if workspace_id and tab_id:
-        keys.append(("space_tab", workspace_id, tab_id, ""))
-    if workspace_id and cwd and agent:
-        keys.append(("space_cwd_agent", workspace_id, cwd, agent))
-    return keys
+    return herdres_tendwire.pane_match_keys(pane)
 
 
 def tendwire_worker_index(snapshot: dict[str, Any]) -> dict[tuple[str, str, str, str], list[dict[str, Any]]]:
-    index: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
-    for worker in snapshot.get("workers") or []:
-        if not isinstance(worker, dict):
-            continue
-        worker_id = str(worker.get("id") or "").strip()
-        if not worker_id:
-            continue
-        for key in tendwire_worker_match_keys(worker):
-            index.setdefault(key, []).append(worker)
-    return index
+    return herdres_tendwire.worker_index(snapshot, sanitize=sanitize_text)
 
 
 def tendwire_match_worker(pane: dict[str, Any], index: dict[tuple[str, str, str, str], list[dict[str, Any]]]) -> dict[str, Any] | None:
-    for key in tendwire_pane_match_keys(pane):
-        matches = index.get(key) or []
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            return None
-    return None
+    return herdres_tendwire.match_worker(pane, index)
 
 
 def tendwire_enrich_pane(pane: dict[str, Any], worker: dict[str, Any]) -> dict[str, Any]:
-    item = dict(pane)
-    worker_id = str(worker.get("id") or "").strip()
-    item["_tendwire_enriched"] = True
-    item["_tendwire_worker_id"] = worker_id
-    item["_tendwire_fingerprint"] = str(worker.get("fingerprint") or "")
-    status_line = sanitize_text(str(worker.get("status_line") or worker.get("summary") or ""), 500)
-    if status_line:
-        item["summary"] = status_line
-        item["_tendwire_status_line"] = status_line
-    status = tendwire_worker_status_for_herdres(str(worker.get("status") or "unknown"))
-    if status and status != "unknown" and str(item.get("agent_status") or "").strip().lower() in {"", "unknown"}:
-        item["agent_status"] = status
-    last_seen_at = str(worker.get("last_seen_at") or "").strip()
-    if last_seen_at:
-        item["_tendwire_last_seen_at"] = last_seen_at
-    return item
+    return herdres_tendwire.enrich_pane(pane, worker, sanitize=sanitize_text)
 
 
 def tendwire_enrich_panes(panes: list[dict[str, Any]], snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    index = tendwire_worker_index(snapshot)
-    enriched: list[dict[str, Any]] = []
-    for pane in panes:
-        worker = tendwire_match_worker(pane, index)
-        enriched.append(tendwire_enrich_pane(pane, worker) if worker else pane)
-    return enriched
+    return herdres_tendwire.enrich_panes(panes, snapshot, sanitize=sanitize_text)
 
 
 def _tendwire_public_id(value: Any, *, prefix: str, limit: int = 120) -> str:
@@ -2691,107 +2416,25 @@ def _tendwire_public_id(value: Any, *, prefix: str, limit: int = 120) -> str:
 
 def tendwire_source_read_panes(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     """Build read-only pane-like records from Tendwire's public snapshot."""
-    spaces = {
-        str(space.get("id") or ""): space
-        for space in snapshot.get("spaces") or []
-        if isinstance(space, dict) and str(space.get("id") or "")
-    }
-    panes: list[dict[str, Any]] = []
-    for worker in snapshot.get("workers") or []:
-        if not isinstance(worker, dict):
-            continue
-        worker_id = str(worker.get("id") or "").strip()
-        if not worker_id:
-            continue
-        meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
-        space_id = str(worker.get("space_id") or "").strip()
-        space = spaces.get(space_id) or {}
-        space_name = sanitize_text(str(space.get("name") or space.get("label") or ""), 120).strip()
-        agent = tendwire_worker_agent(worker) or sanitize_text(str(worker.get("name") or "worker"), 80)
-        status_line = sanitize_text(str(worker.get("status_line") or worker.get("summary") or ""), 500)
-        fingerprint = str(worker.get("fingerprint") or "")
-        pane = {
-            "entry_type": "worker",
-            "worker_id": worker_id,
-            "worker_fingerprint": fingerprint,
-            "pane_id": "",
-            "terminal_id": "",
-            "workspace_id": space_id,
-            "space_id": space_id,
-            "tab_id": sanitize_text(str(meta.get("tab_id") or ""), 120).strip(),
-            "agent": agent,
-            "agent_status": tendwire_worker_status_for_herdres(str(worker.get("status") or "unknown")),
-            "label": sanitize_text(str(worker.get("name") or agent or "Tendwire Worker"), 120),
-            "name": sanitize_text(str(worker.get("name") or agent or "Tendwire Worker"), 120),
-            "foreground_cwd": str(meta.get("foreground_cwd") or meta.get("cwd") or ""),
-            "space_name": space_name,
-            "workspace_label": space_name,
-            "summary": status_line,
-            "source": "tendwire",
-            "_tendwire_source_read": True,
-            "_tendwire_enriched": True,
-            "_tendwire_worker_id": worker_id,
-            "_tendwire_fingerprint": fingerprint,
-            "_tendwire_status_line": status_line,
-            "_tendwire_last_seen_at": str(worker.get("last_seen_at") or ""),
-        }
-        panes.append(pane)
-    return panes
+    return herdres_tendwire.source_read_panes(
+        snapshot,
+        sanitize=sanitize_text,
+        raw_space_id_predicate=_looks_like_raw_herdr_space_id,
+    )
 
 
 def tendwire_snapshot_backend_degraded(snapshot: dict[str, Any]) -> bool:
     """True when Tendwire says the public snapshot is not freshly authoritative."""
-    health_items = snapshot.get("backend_health") if isinstance(snapshot.get("backend_health"), list) else []
-    for item in health_items:
-        if not isinstance(item, dict):
-            continue
-        status = str(item.get("status") or "").strip().lower()
-        if status and status != "healthy":
-            return True
-    status = str(snapshot.get("status") or "").strip().lower()
-    return status in {"degraded", "unavailable"}
+    return herdres_tendwire.snapshot_backend_degraded(snapshot)
 
 
 def tendwire_source_entry_as_pane(pane_key_value: str, entry: dict[str, Any]) -> dict[str, Any] | None:
     """Reconstruct a source worker pane from Herdres state when Tendwire is degraded."""
-    if not entry_is_tendwire_source(entry):
-        return None
-    worker_id = str(entry.get("worker_id") or entry.get("tendwire_worker_id") or "").strip()
-    pane_id = str(entry.get("pane_id") or "").strip()
-    if not worker_id and pane_id.startswith("tendwire:"):
-        worker_id = pane_id.split(":", 1)[1].strip()
-    if not worker_id:
-        return None
-    fingerprint = str(entry.get("worker_fingerprint") or entry.get("tendwire_fingerprint") or "").strip()
-    space_id = str(entry.get("workspace") or "").strip()
-    pane = {
-        "_preserved_pane_key": str(pane_key_value),
-        "entry_type": "worker",
-        "worker_id": worker_id,
-        "worker_fingerprint": fingerprint,
-        "pane_id": "",
-        "terminal_id": "",
-        "workspace_id": space_id,
-        "space_id": space_id,
-        "tab_id": str(entry.get("tab") or ""),
-        "agent": str(entry.get("agent") or "worker"),
-        "agent_status": str(entry.get("last_known_status") or "unknown"),
-        "label": str(entry.get("pane_thread_name") or entry.get("agent") or "Tendwire Worker"),
-        "name": str(entry.get("pane_thread_name") or entry.get("agent") or "Tendwire Worker"),
-        "foreground_cwd": str(entry.get("foreground_cwd") or ""),
-        "space_name": str(entry.get("topic_name") or ""),
-        "workspace_label": str(entry.get("topic_name") or ""),
-        "summary": str(entry.get("tendwire_status_line") or ""),
-        "source": "tendwire",
-        "_tendwire_source_read": True,
-        "_tendwire_enriched": True,
-        "_tendwire_worker_id": worker_id,
-        "_tendwire_fingerprint": fingerprint,
-        "_tendwire_status_line": str(entry.get("tendwire_status_line") or ""),
-        "_tendwire_last_seen_at": str(entry.get("tendwire_last_seen_at") or ""),
-        "_tendwire_preserved_from_state": True,
-    }
-    return pane
+    return herdres_tendwire.source_entry_as_pane(
+        pane_key_value,
+        entry,
+        is_source_entry=entry_is_tendwire_source,
+    )
 
 
 def tendwire_source_state_panes(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2827,6 +2470,65 @@ def merge_preserved_source_panes(
 
 def pane_is_tendwire_source_read(pane: dict[str, Any] | None) -> bool:
     return isinstance(pane, dict) and bool(pane.get("_tendwire_source_read"))
+
+
+def tendwire_source_turn_for_pane(pane: dict[str, Any]) -> dict[str, Any] | None:
+    worker_id = str(pane.get("worker_id") or pane.get("_tendwire_worker_id") or "").strip()
+    if not worker_id:
+        return None
+    fingerprint = str(pane.get("worker_fingerprint") or pane.get("_tendwire_fingerprint") or "").strip()
+    payload = tendwire_turns()
+    turns = payload.get("turns") if isinstance(payload.get("turns"), list) else []
+    fallback: dict[str, Any] | None = None
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        if str(turn.get("worker_id") or "").strip() != worker_id:
+            continue
+        if fingerprint and str(turn.get("worker_fingerprint") or "").strip() == fingerprint:
+            return turn
+        if fallback is None:
+            fallback = turn
+    return fallback
+
+
+def tendwire_source_turn_feed_source(turn: dict[str, Any]) -> dict[str, Any]:
+    assistant_final = sanitize_text(str(turn.get("assistant_final_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
+    assistant_stream = sanitize_text(str(turn.get("assistant_stream_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
+    user_text = sanitize_text(str(turn.get("user_text") or ""), USER_PROMPT_MAX_CHARS).strip()
+    complete = turn.get("complete") if isinstance(turn.get("complete"), bool) else bool(assistant_final)
+    has_open_turn = turn.get("has_open_turn") if isinstance(turn.get("has_open_turn"), bool) else False
+    return {
+        "available": True,
+        "turn_id": str(turn.get("id") or turn.get("turn_id") or turn.get("fingerprint") or ""),
+        "user_text": user_text,
+        "assistant_final_text": assistant_final,
+        "assistant_stream_text": assistant_stream,
+        "complete": complete,
+        "has_open_turn": has_open_turn,
+    }
+
+
+def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        turn = tendwire_source_turn_for_pane(pane)
+    except BridgeError as exc:
+        entry["last_turn_available"] = False
+        entry["last_turn_reason"] = sanitize_text(str(exc), 300)
+        return None
+    if not isinstance(turn, dict):
+        entry["last_turn_available"] = False
+        entry["last_turn_reason"] = "no_tendwire_turn"
+        return None
+    entry["last_turn_available"] = True
+    entry.pop("last_turn_reason", None)
+    feed_source = tendwire_source_turn_feed_source(turn)
+    item = make_turn_feed_item(feed_source)
+    if not item and feed_source.get("complete") is True and feed_source.get("has_open_turn") is True:
+        item = make_turn_feed_item({**feed_source, "has_open_turn": False, "assistant_stream_text": ""})
+    if isinstance(item, dict):
+        item["prompt_collapse_chars"] = int(entry.get("prompt_collapse_chars") or 0)
+    return item
 
 
 def pane_by_id(pane_id: str, deadline: float | None = None) -> dict[str, Any] | None:
@@ -2920,12 +2622,14 @@ def fresh_cached_pane_turn(pane_id: str) -> dict[str, Any]:
 
 def clear_sync_caches() -> None:
     """Clear per-sync ephemeral caches. Called at the start of each sync."""
-    global _council_fetch_count
+    global _council_fetch_count, _tendwire_turns_cache
     _council_fetch_count = 0  # Fix E: reset the per-run council fetch budget each sync/event
     with _turn_cache_lock:
         _turn_cache.clear()
     with _pane_read_cache_lock:
         _pane_read_cache.clear()
+    with _tendwire_turns_cache_lock:
+        _tendwire_turns_cache = None
 
 
 def pane_agent_session_id(pane: dict[str, Any]) -> str:
@@ -2947,10 +2651,8 @@ def pane_key(pane: dict[str, Any]) -> str:
         return preserved_key
     if str(pane.get("source") or "") == "tendwire" and str(pane.get("entry_type") or "") == "worker":
         worker_id = str(pane.get("worker_id") or pane.get("_tendwire_worker_id") or "").strip()
-        fingerprint = str(pane.get("worker_fingerprint") or pane.get("_tendwire_fingerprint") or "").strip()
         parts = [
             worker_id,
-            fingerprint,
             str(pane.get("space_id") or pane.get("workspace_id") or ""),
             str(pane.get("tab_id") or ""),
         ]
@@ -3327,22 +3029,26 @@ def agent_topic_name_for_pane(pane: dict[str, Any]) -> str:
     return "Herdr Agent"
 
 
+def _looks_like_raw_herdr_space_id(value: Any) -> bool:
+    return bool(re.fullmatch(r"w[0-9a-f]{8,}", str(value or "").strip(), flags=re.IGNORECASE))
+
+
 def space_name_for_pane(pane: dict[str, Any]) -> str:
     key = space_key(pane)
     if is_council_pane(pane):
         return council_space_topic_name(pane, key)
     if per_agent_topics_enabled():
         return agent_topic_name_for_pane(pane)
-    explicit_name = clean_space_topic_title(
-        str(pane.get("space_name") or pane.get("workspace_label") or pane.get("workspace_name") or ""),
-        fallback="",
-    )
+    raw_name = str(pane.get("space_name") or pane.get("workspace_label") or pane.get("workspace_name") or "")
+    explicit_name = "" if _looks_like_raw_herdr_space_id(raw_name) else clean_space_topic_title(raw_name, fallback="")
     if explicit_name:
         return explicit_name
-    explicit_space = clean_label_topic_title(str(pane.get("space_id") or ""), fallback="")
+    raw_space_id = str(pane.get("space_id") or "")
+    explicit_space = "" if _looks_like_raw_herdr_space_id(raw_space_id) else clean_label_topic_title(raw_space_id, fallback="")
     if explicit_space:
         return explicit_space
-    workspace = clean_label_topic_title(str(pane.get("workspace_id") or pane.get("workspace") or ""), fallback="")
+    raw_workspace_id = str(pane.get("workspace_id") or pane.get("workspace") or "")
+    workspace = "" if _looks_like_raw_herdr_space_id(raw_workspace_id) else clean_label_topic_title(raw_workspace_id, fallback="")
     if workspace:
         return workspace
     cwd_value = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
@@ -3532,7 +3238,7 @@ def ensure_space_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str
     if not current_topic_name:
         entry["topic_name"] = topic_name
         changed = True
-    elif (workspace_label or council) and current_topic_name != topic_name:
+    elif (workspace_label or council or _looks_like_raw_herdr_space_id(current_topic_name)) and current_topic_name != topic_name:
         entry["topic_name"] = topic_name
         entry["topic_title_source"] = "council" if council else "workspace-label"
         if entry.get("topic_id"):
@@ -5532,6 +5238,8 @@ def suppress_duplicate_native_session_item(entry: dict[str, Any], item: dict[str
 
 def should_baseline_new_pane_turn(entry: dict[str, Any], item: dict[str, Any] | None, new_entry: bool) -> bool:
     if not new_entry or not item:
+        return False
+    if entry_is_tendwire_source(entry):
         return False
     if str(item.get("kind") or "").lower() != "turn":
         return False
@@ -9213,6 +8921,7 @@ def send_to_tendwire_worker_response(
     outbound = str(text or "")
     pane_id = str(entry.get("pane_id") or "").strip()
     after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
+    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
     request = build_tendwire_send_instruction_request(
         entry,
         outbound,
@@ -9225,6 +8934,25 @@ def send_to_tendwire_worker_response(
         request_id=request_id,
     )
     response = tendwire_command(request)
+    if _tendwire_response_status(response) == "stale_target":
+        candidate = _same_worker_stale_target_candidate(response, worker_id)
+        if candidate is not None:
+            retry_entry = dict(entry)
+            retry_entry["tendwire_fingerprint"] = candidate["worker_fingerprint"]
+            retry_request = build_tendwire_send_instruction_request(
+                retry_entry,
+                outbound,
+                origin=origin,
+                chat_id=chat_id,
+                topic_id=topic_id,
+                message_id=message_id,
+                reply_to_message_id=reply_to_message_id,
+                callback_message_id=callback_message_id,
+                request_id=_retry_tendwire_request_id(str(request.get("request_id") or request_id), candidate),
+            )
+            response = tendwire_command(retry_request)
+            if tendwire_command_succeeded(response):
+                entry["tendwire_fingerprint"] = candidate["worker_fingerprint"]
     if tendwire_command_succeeded(response):
         if mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin=origin, pane_id=pane_id) and state is not None:
             save_state(state)
@@ -12145,6 +11873,11 @@ def sync_closed_pane_records(
             entry["closed_topic_finalized"] = True
             entry["closed_topic_preserved_at"] = utc_now()
             changed = True
+        if entry_is_tendwire_source(entry) and tendwire_source_read_enabled():
+            if newly_closed:
+                entry["closed_notice_suppressed_at"] = utc_now()
+                changed = True
+            continue
         if newly_closed and topic_id and sent < max_sends and not closed_notice_already_sent(state, str(key), entry):
             closed_notice = send_notice(
                 chat_id,
@@ -12597,13 +12330,11 @@ def tendwire_entry_metadata_state(entry: dict[str, Any] | None) -> str:
 
 
 def tendwire_request_component(value: Any, limit: int = 48) -> str:
-    text = sanitize_text(str(value or ""), limit).strip()
-    text = re.sub(r"[^A-Za-z0-9_.:-]+", "-", text).strip(".")
-    return text[:limit] or "none"
+    return herdres_tendwire.request_component(value, limit, sanitize=sanitize_text)
 
 
 def tendwire_instruction_text_hash(text: str) -> str:
-    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:16]
+    return herdres_tendwire.instruction_text_hash(text)
 
 
 def tendwire_instruction_request_id(
@@ -12617,25 +12348,17 @@ def tendwire_instruction_request_id(
     origin: str = "send",
     text: str = "",
 ) -> str:
-    text_hash = tendwire_instruction_text_hash(text)
-    context = {
-        "source": "telegram",
-        "origin": str(origin or ""),
-        "chat_id": str(chat_id or ""),
-        "topic_id": str(topic_id or ""),
-        "message_id": str(message_id or ""),
-        "reply_to_message_id": str(reply_to_message_id or ""),
-        "callback_message_id": str(callback_message_id or ""),
-        "worker_id": str(worker_id or ""),
-        "text_hash": text_hash,
-    }
-    digest = hashlib.sha256(json.dumps(context, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
-    return ":".join((
-        "herdres",
-        tendwire_request_component(worker_id, 48),
-        text_hash[:12],
-        digest,
-    ))
+    return herdres_tendwire.instruction_request_id(
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+        worker_id=worker_id,
+        origin=origin,
+        text=text,
+        sanitize=sanitize_text,
+    )
 
 
 def build_tendwire_send_instruction_request(
@@ -12650,41 +12373,18 @@ def build_tendwire_send_instruction_request(
     callback_message_id: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
-    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
-    fingerprint = str(entry.get("tendwire_fingerprint") or "").strip()
-    final_request_id = request_id or tendwire_instruction_request_id(
+    return herdres_tendwire.build_send_instruction_request(
+        entry,
+        text,
+        origin=origin,
         chat_id=chat_id,
         topic_id=topic_id,
         message_id=message_id,
         reply_to_message_id=reply_to_message_id,
         callback_message_id=callback_message_id,
-        worker_id=worker_id,
-        origin=origin,
-        text=text,
+        request_id=request_id,
+        sanitize=sanitize_text,
     )
-    params: dict[str, Any] = {
-        "origin": "telegram",
-        "telegram_origin": sanitize_text(str(origin or "send"), 40),
-    }
-    for key, value in (
-        ("entry_type", entry.get("entry_type")),
-        ("pane_key", entry.get("pane_key")),
-    ):
-        clean = sanitize_text(str(value or ""), 300).strip()
-        if clean:
-            params[key] = clean
-    return {
-        "schema_version": 1,
-        "action": "send_instruction",
-        "request_id": final_request_id,
-        "dry_run": False,
-        "target": {
-            "worker_id": worker_id,
-            "worker_fingerprint": fingerprint,
-        },
-        "instruction": {"text": str(text or "")},
-        "params": params,
-    }
 
 
 def drop_tendwire_source_pane_records(state: dict[str, Any]) -> int:
@@ -12708,6 +12408,54 @@ def drop_tendwire_source_pane_records(state: dict[str, Any]) -> int:
         audit = state.get("deleted_tendwire_source_panes")
         prior = audit if isinstance(audit, list) else []
         state["deleted_tendwire_source_panes"] = (prior + removed)[-100:]
+    return len(removed)
+
+
+def prune_closed_tendwire_source_records(
+    state: dict[str, Any],
+    *,
+    active_space_keys: set[str] | None = None,
+) -> int:
+    """Drop closed Tendwire source records so source mode cannot recreate stale topics."""
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    removed: list[dict[str, Any]] = []
+    for key, entry in list(panes.items()):
+        if not isinstance(entry, dict):
+            continue
+        if not entry_is_tendwire_source(entry):
+            continue
+        if str(entry.get("last_known_status") or "").strip().lower() != "closed":
+            continue
+        remove_pane_from_space_memberships(state, str(key))
+        panes.pop(key, None)
+        removed.append(
+            {
+                "pane_key": str(key),
+                "entry_type": str(entry.get("entry_type") or ""),
+                "worker_id": str(entry.get("worker_id") or entry.get("tendwire_worker_id") or ""),
+                "space_key": str(entry.get("space_key") or ""),
+                "topic_id": str(entry.get("topic_id") or ""),
+                "removed_at": utc_now(),
+            }
+        )
+    if not removed:
+        return 0
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    for key, space in list(spaces.items()):
+        if not isinstance(space, dict):
+            continue
+        pane_keys = space.get("pane_keys") if isinstance(space.get("pane_keys"), list) else []
+        kept = [str(value) for value in pane_keys if str(value) in panes]
+        if kept:
+            space["pane_keys"] = kept
+        elif str(key) in (active_space_keys or set()):
+            space["pane_keys"] = []
+        else:
+            spaces.pop(key, None)
+    audit = state.get("pruned_tendwire_source_panes")
+    prior = audit if isinstance(audit, list) else []
+    state["pruned_tendwire_source_panes"] = (prior + removed)[-200:]
+    state["last_tendwire_source_prune_at"] = utc_now()
     return len(removed)
 
 
@@ -13043,11 +12791,11 @@ def route_message_to_pane(
         routes = space.get("message_routes") if isinstance(space.get("message_routes"), dict) else {}
         routed_key = str(routes.get(message_key) or "")
         routed_entry = panes.get(routed_key)
-        if routed_key and isinstance(routed_entry, dict):
+        if routed_key and entry_is_live_route_target(routed_entry):
             return routed_key, routed_entry
         for pane_key_value in space.get("pane_keys") or []:
             entry = panes.get(str(pane_key_value))
-            if isinstance(entry, dict) and str(entry.get("pane_root_message_id") or "") == message_key:
+            if entry_is_live_route_target(entry) and str(entry.get("pane_root_message_id") or "") == message_key:
                 return str(pane_key_value), entry
     return None
 
@@ -13230,17 +12978,25 @@ def _sync_pane_clean_feed(
     early_return is True when the topic or pane-root went missing (caller
     must return True immediately); None means continue.
     """
-    if pane_is_tendwire_source_read(pane):
-        return {
-            "early_return": None,
-            "changed": changed,
-            "feed_delivered": False,
-            "stream_active": False,
-        }
+    source_read_pane = pane_is_tendwire_source_read(pane)
     feed_delivered_this_pane = False
     stream_active_this_pane = False
     item = None
-    if TURN_FEED_ENABLED:
+    if source_read_pane and TURN_FEED_ENABLED:
+        before_turn_state = (
+            entry.get("last_turn_available"),
+            entry.get("last_turn_reason"),
+            entry.get("last_turn_id"),
+        )
+        item = tendwire_source_turn_feed_item(pane, entry)
+        after_turn_state = (
+            entry.get("last_turn_available"),
+            entry.get("last_turn_reason"),
+            entry.get("last_turn_id"),
+        )
+        if before_turn_state != after_turn_state:
+            changed = True
+    elif TURN_FEED_ENABLED:
         before_turn_state = (
             entry.get("last_turn_available"),
             entry.get("last_turn_reason"),
@@ -13265,7 +13021,11 @@ def _sync_pane_clean_feed(
         )
         if before_turn_state != after_turn_state:
             changed = True
-    elif not turn_only and str(pane.get("agent_status") or "").strip().lower() not in ACTIVE_AGENT_STATUSES:
+    elif (
+        not source_read_pane
+        and not turn_only
+        and str(pane.get("agent_status") or "").strip().lower() not in ACTIVE_AGENT_STATUSES
+    ):
         raw = pane_feed_output(str(pane.get("pane_id") or ""))
         bounded_report = extract_bounded_report_from_raw(raw)
         if bounded_report:
@@ -13294,7 +13054,7 @@ def _sync_pane_clean_feed(
                 allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
             )
 
-    if not item and TURN_FEED_ENABLED:
+    if not source_read_pane and not item and TURN_FEED_ENABLED:
         item = gitmoot_council_feed_item(pane, entry)
         if isinstance(item, dict):
             item["prompt_collapse_chars"] = int(entry.get("prompt_collapse_chars") or 0)
@@ -13463,7 +13223,7 @@ def _sync_pane_clean_feed(
             lifecycle_message_id = ""
             if str(item.get("kind") or "").lower() == "turn":
                 lifecycle_message_id = turn_visible_anchor_message_id(entry, str(item.get("turn_id") or ""))
-                if not lifecycle_message_id and entry.get("last_stream_message_id"):
+                if not source_read_pane and not lifecycle_message_id and entry.get("last_stream_message_id"):
                     lifecycle_message_id = turn_stream_anchor_fallback(
                         entry, item, cached_pane_turn(str(pane.get("pane_id") or ""))
                     )
@@ -14229,6 +13989,14 @@ def sync_once() -> dict[str, Any]:
     )
     if closed_result.get("changed"):
         changed = True
+    active_source_space_keys = {space_key(pane) for pane in panes} if source_read else set()
+    closed_source_pruned = (
+        prune_closed_tendwire_source_records(state, active_space_keys=active_source_space_keys)
+        if source_read
+        else 0
+    )
+    if closed_source_pruned:
+        changed = True
     sends = int(closed_result.get("sent") or 0)
     counters = make_sync_counters(sends=sends)
     caps = make_sync_caps()
@@ -14282,6 +14050,7 @@ def sync_once() -> dict[str, Any]:
             "tendwire_outbox": tendwire_outbox_result,
             "tier0_pruned": tier0_pruned,
             "stale_tendwire_pruned": stale_tendwire_pruned,
+            "closed_source_pruned": closed_source_pruned,
             "orphan_pruned": orphan_pruned,
             "orphan_abandoned": int(prune_stats.get("abandoned") or 0),
             "orphan_failed": int(prune_stats.get("failed") or 0),
@@ -14380,6 +14149,7 @@ def sync_once() -> dict[str, Any]:
         "devin_glm_started": devin_glm_started,
         "tier0_pruned": tier0_pruned,
         "stale_tendwire_pruned": stale_tendwire_pruned,
+        "closed_source_pruned": closed_source_pruned,
         "orphan_pruned": orphan_pruned,
         "orphan_abandoned": int(prune_stats.get("abandoned") or 0),
         "orphan_failed": int(prune_stats.get("failed") or 0),
@@ -14721,6 +14491,26 @@ def live_entries_for_space(state: dict[str, Any], space: dict[str, Any]) -> list
     return entries
 
 
+def entry_is_live_route_target(entry: dict[str, Any] | None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    return str(entry.get("last_known_status") or "").strip().lower() != "closed"
+
+
+def preferred_active_route_entry(
+    entries: list[tuple[str, dict[str, Any]]],
+) -> tuple[str, dict[str, Any]] | None:
+    active_statuses = {"active", "busy", "in_progress", "pending", "running", "working"}
+    active = [
+        item
+        for item in entries
+        if str(item[1].get("last_known_status") or "").strip().lower().replace("-", "_") in active_statuses
+    ]
+    if len(active) == 1:
+        return active[0]
+    return None
+
+
 def resolve_topic_entry(
     state: dict[str, Any],
     chat_id: str,
@@ -14750,6 +14540,10 @@ def resolve_topic_entry(
         ]
         if len(live_entries) == 1:
             return live_entries[0]
+        if clean_target_bot_kind:
+            preferred = preferred_active_route_entry(live_entries)
+            if preferred is not None:
+                return preferred
         return None
     telegram = state.get("telegram") or {}
     if str(telegram.get("chat_id")) != str(chat_id):
@@ -14757,15 +14551,19 @@ def resolve_topic_entry(
     if str(topic_id) == str(telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID)):
         return None
     matching_entries: list[tuple[str, dict[str, Any]]] = []
+    closed_entries: list[tuple[str, dict[str, Any]]] = []
     for entry in (state.get("panes") or {}).values():
         if str(entry.get("topic_id") or "") == str(topic_id):
             pane_key_value = str(entry.get("pane_key") or "")
-            if not clean_target_bot_kind:
-                return pane_key_value, entry
             if entry_matches_managed_bot_kind(entry, clean_target_bot_kind):
-                matching_entries.append((pane_key_value, entry))
+                if entry_is_live_route_target(entry):
+                    matching_entries.append((pane_key_value, entry))
+                else:
+                    closed_entries.append((pane_key_value, entry))
     if len(matching_entries) == 1:
         return matching_entries[0]
+    if not matching_entries and len(closed_entries) == 1:
+        return closed_entries[0]
     return None
 
 
@@ -17336,6 +17134,7 @@ def _update_files_plan() -> list[dict[str, Any]]:
         {"src": "herdres.py", "dest": _installed_bin(), "mode": 0o755},
         {"src": "herdres_gateway.py", "dest": INSTALL_BIN_DIR / "herdres-gateway", "mode": 0o755},
         {"src": "herdres_routing.py", "dest": INSTALL_BIN_DIR / "herdres_routing.py", "mode": 0o644},
+        {"src": "herdres_tendwire.py", "dest": INSTALL_BIN_DIR / "herdres_tendwire.py", "mode": 0o644},
         # Local speech engine + warm sidecar (issue #4). herdres imports herdres_speech best-effort;
         # the sidecar is opt-in (its unit is shipped but not enabled). Heavy deps/models are not here.
         {"src": "herdres_speech.py", "dest": INSTALL_BIN_DIR / "herdres_speech.py", "mode": 0o644},
@@ -17542,6 +17341,90 @@ def _gateway_is_active() -> bool:
         check=False,
     )
     return proc.returncode == 0 and proc.stdout.strip() == "active"
+
+
+def _systemd_unit_is_active(unit: str) -> tuple[bool, str, int]:
+    proc = subprocess.run(
+        ["systemctl", "--user", "is-active", unit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    status = (proc.stdout or proc.stderr or "").strip() or "unknown"
+    return proc.returncode == 0 and status == "active", status, int(proc.returncode)
+
+
+def legacy_topic_timer_doctor(*, fix: bool = False, env: Any | None = None) -> dict[str, Any]:
+    mode = parse_tendwire_mode(os.environ if env is None else env, diagnose_invalid=True)
+    conflict_mode = mode in TENDWIRE_LEGACY_TIMER_CONFLICT_MODES
+    result: dict[str, Any] = {
+        "ok": True,
+        "mode": mode,
+        "legacy_timer": {
+            "unit": LEGACY_HERDR_TOPIC_TIMER,
+            "active": False,
+            "status": "unknown",
+            "conflict": False,
+        },
+        "actions": [],
+    }
+    if _platform_is_macos():
+        result["legacy_timer"]["status"] = "unsupported"
+        return result
+
+    active, status, returncode = _systemd_unit_is_active(LEGACY_HERDR_TOPIC_TIMER)
+    result["legacy_timer"].update(
+        {
+            "active": active,
+            "status": status,
+            "returncode": returncode,
+            "conflict": bool(conflict_mode and active),
+        }
+    )
+    if not conflict_mode or not active:
+        return result
+
+    result["ok"] = False
+    result["legacy_timer"]["message"] = (
+        f"{LEGACY_HERDR_TOPIC_TIMER} is active while HERDRES_TENDWIRE_MODE={mode}; "
+        "disable it so source-mode Herdres does not run the legacy direct Herdr topic refresher."
+    )
+    result["legacy_timer"]["disable_command"] = f"systemctl --user disable --now {LEGACY_HERDR_TOPIC_TIMER}"
+    if not fix:
+        return result
+
+    proc = subprocess.run(
+        ["systemctl", "--user", "disable", "--now", LEGACY_HERDR_TOPIC_TIMER],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    result["actions"].append(f"systemctl --user disable --now {LEGACY_HERDR_TOPIC_TIMER}")
+    active_after, status_after, returncode_after = _systemd_unit_is_active(LEGACY_HERDR_TOPIC_TIMER)
+    result["legacy_timer"].update(
+        {
+            "active": active_after,
+            "status": status_after,
+            "returncode": returncode_after,
+            "conflict": bool(conflict_mode and active_after),
+            "disable_returncode": int(proc.returncode),
+        }
+    )
+    if proc.returncode != 0:
+        result["legacy_timer"]["disable_error"] = sanitize_text(proc.stderr or proc.stdout or "", 500)
+    result["ok"] = proc.returncode == 0 and not active_after
+    return result
+
+
+def doctor_once(args: Any) -> dict[str, Any]:
+    load_dotenv()
+    legacy_timer = legacy_topic_timer_doctor(fix=bool(getattr(args, "fix", False)))
+    return {
+        "ok": bool(legacy_timer.get("ok")),
+        "checks": {
+            "legacy_topic_timer": legacy_timer,
+        },
+    }
 
 
 def _restart_services() -> list[str]:
@@ -18275,6 +18158,8 @@ def main() -> int:
     sub.add_parser("command")
     sub.add_parser("callback")
     sub.add_parser("managed-bot")
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--fix", action="store_true")
     probe = sub.add_parser("probe")
     probe.add_argument("--thread-id", default=None)
     setup = sub.add_parser("setup")
@@ -18345,6 +18230,8 @@ def main() -> int:
         elif args.cmd == "managed-bot":
             payload = json.loads(sys.stdin.read() or "{}")
             result = with_lock(lambda: managed_bot_update(payload), blocking=True)
+        elif args.cmd == "doctor":
+            result = doctor_once(args)
         elif args.cmd == "setup":
             result = setup_once(args)
         elif args.cmd == "version":

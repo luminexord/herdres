@@ -729,9 +729,13 @@ Tendwire modes:
 
 Invalid mode values warn and fall back to `off`; they never enable Tendwire behavior. When `HERDRES_TENDWIRE_MODE` is unset, legacy `HERDRES_TENDWIRE_HYBRID=1` or `HERDRES_TENDWIRE_SNAPSHOT=1` aliases to `enrich`. Those legacy names remain compatibility aliases, not the public Tendwire mental model.
 
-In `commands` mode and higher, if an enriched real pane has a worker id and fingerprint, Herdres does not direct-send the instruction to Herdr after selecting Tendwire command routing. Stale/ambiguous Tendwire command failures and malformed Tendwire CLI responses fail closed with a safe Telegram note. If an entry has partial Tendwire metadata, such as a worker id without a fingerprint, Herdres also fails closed. `HERDRES_TENDWIRE_DIRECT_FALLBACK=1` is an emergency operator override that allows direct Herdr fallback; it defaults off.
+In `commands` mode and higher, if an enriched real pane has a worker id and fingerprint, Herdres does not direct-send the instruction to Herdr after selecting Tendwire command routing. Ambiguous Tendwire command failures and malformed Tendwire CLI responses fail closed with a safe Telegram note. If Tendwire reports `stale_target` with exactly one current candidate for the same worker id, Herdres retries once through Tendwire with that returned worker fingerprint; otherwise stale targets fail closed. If an entry has partial Tendwire metadata, such as a worker id without a fingerprint, Herdres also fails closed. `HERDRES_TENDWIRE_DIRECT_FALLBACK=1` is an emergency operator override that allows direct Herdr fallback; it defaults off.
 
 In `source-read` and `source` modes, the same emergency fallback does not apply to Tendwire worker entries. Source entries are not real Herdr pane ids; missing worker metadata, failed Tendwire sends, attachments, `/raw`, `/read`, stale choices, and picker callbacks that cannot be routed through Tendwire all fail closed instead of calling Herdr directly. Existing legacy `tendwire:<worker>` pseudo-pane records are pruned when source inventory mode is not active.
+
+The Tendwire mode helpers live in `herdres_tendwire.py`; keep it installed next
+to `herdres` and `herdres-gateway` when deploying from source or release
+tarballs.
 
 When Tendwire reports degraded or unavailable backend health, or when the
 snapshot command fails while source entries already exist, Herdres preserves the
