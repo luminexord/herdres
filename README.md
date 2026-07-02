@@ -749,6 +749,10 @@ marking them closed from incomplete inventory. Fresh healthy snapshots clear
 that preservation state. Source-mode completed-turn delivery is also tracked in
 a bounded global ledger keyed by Tendwire worker and semantic turn identity, so
 rebuilding a worker entry does not repost old completed turn text to Telegram.
+Open-turn assistant stream text is accumulated in a bounded adapter buffer before
+Herdres edits the Telegram stream message, so a detailed status report is not
+lost just because a later short progress note arrives in the same in-progress
+turn.
 
 `/send!` is not routed through Tendwire in this phase. For command-mode enriched entries and source inventory modes it fails closed because Tendwire interrupt semantics are not represented here yet; use `/send` or interrupt directly in Herdr when running outside source mode. Non-enriched entries and `enrich` mode keep the existing `/send!` Herdr interrupt path.
 
@@ -917,6 +921,12 @@ delivery bookkeeping.
 
    # 3. SQLite integrity.
    sqlite3 ~/.local/share/tendwire/tendwire.db 'PRAGMA integrity_check;'
+   # If sqlite3 is not installed:
+   python3 - <<'PY'
+   import sqlite3
+   with sqlite3.connect('/home/smith/.local/share/tendwire/tendwire.db') as conn:
+       print(conn.execute('PRAGMA integrity_check').fetchone()[0])
+   PY
 
    # 4. Herdres source-mode dry run with direct Herdr intentionally disabled
    #    for Herdres itself. This copies state to a temp file, sets
