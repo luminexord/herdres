@@ -1856,7 +1856,38 @@ class TendwireHybridTests(unittest.TestCase):
         captured: dict[str, str] = {}
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
-            state_path.write_text(json.dumps({"enabled": True, "telegram": {"chat_id": "-100"}}), encoding="utf-8")
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "telegram": {"chat_id": "-100"},
+                        "panes": {
+                            "worker:one": {
+                                "source": "tendwire",
+                                "entry_type": "worker",
+                                "worker_id": "worker-1",
+                                "agent": "codex",
+                                "last_clean_message_id": "12345",
+                                "last_clean_sent_at": "2026-07-02T00:00:00+00:00",
+                                "last_clean_bot_kind": "codex",
+                                "last_clean_text": "completed source text",
+                                "delivered_turn_identities": ["turn:abc"],
+                            }
+                        },
+                        "tendwire_source_delivered_turns": {
+                            "source-turn:one": {
+                                "worker_id": "worker-1",
+                                "turn_id": "turn-1",
+                                "turn_identity": "turn:abc",
+                                "semantic_hash": "semantic",
+                                "delivered_at": "2026-07-02T00:00:00+00:00",
+                                "updated_at": "2026-07-02T00:00:01+00:00",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             def fake_run_cmd(args, *, timeout=10, input_text=None, env=None):
                 del input_text
@@ -1886,6 +1917,13 @@ class TendwireHybridTests(unittest.TestCase):
         self.assertEqual(result["direct_herdr_calls"], 0)
         self.assertEqual(result["json_lines"], 2)
         self.assertEqual(result["sync_result"]["panes"], 1)
+        self.assertEqual(result["delivery_evidence"]["source_entry_count"], 1)
+        self.assertEqual(result["delivery_evidence"]["entries_with_message"], 1)
+        self.assertEqual(result["delivery_evidence"]["delivered_turn_count"], 1)
+        self.assertEqual(result["delivery_evidence"]["latest_message"]["worker_id"], "worker-1")
+        self.assertEqual(result["delivery_evidence"]["latest_message"]["bot_kind"], "codex")
+        self.assertNotIn("12345", json.dumps(result, sort_keys=True))
+        self.assertNotIn("-100", json.dumps(result, sort_keys=True))
         self.assertEqual(captured["HERDRES_TENDWIRE_MODE"], "source")
         self.assertEqual(captured["HERDR_TELEGRAM_TOPICS_DRY_RUN"], "1")
         self.assertEqual(captured["HERDRES_TENDWIRE_CONNECTOR_OUTBOX"], "0")

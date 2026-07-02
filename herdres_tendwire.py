@@ -2073,6 +2073,67 @@ def record_entry_delivered_turn_identity(
     return True
 
 
+def source_delivery_evidence(
+    state: dict[str, Any] | None,
+    *,
+    sanitize: Sanitizer = _default_sanitize,
+) -> dict[str, Any]:
+    """Return public-safe evidence about source-mode turn delivery state."""
+    panes = state.get("panes") if isinstance(state, dict) and isinstance(state.get("panes"), dict) else {}
+    ledger = (
+        state.get("tendwire_source_delivered_turns")
+        if isinstance(state, dict) and isinstance(state.get("tendwire_source_delivered_turns"), dict)
+        else {}
+    )
+    source_entries = [entry for entry in panes.values() if isinstance(entry, dict) and is_source_entry(entry)]
+    message_entries = [
+        entry
+        for entry in source_entries
+        if str(entry.get("last_clean_message_id") or "").strip()
+        and str(entry.get("last_clean_text") or "").strip()
+    ]
+    latest_message_entry = max(
+        message_entries,
+        key=lambda entry: str(entry.get("last_clean_sent_at") or ""),
+        default=None,
+    )
+    latest_message: dict[str, Any] | None = None
+    if isinstance(latest_message_entry, dict):
+        text = str(latest_message_entry.get("last_clean_text") or "")
+        identities = entry_delivered_turn_identities(latest_message_entry)
+        latest_message = {
+            "worker_id": source_turn_worker_id(None, latest_message_entry, sanitize=sanitize),
+            "agent": sanitize(str(latest_message_entry.get("agent") or ""), 80).strip(),
+            "sent_at": str(latest_message_entry.get("last_clean_sent_at") or ""),
+            "bot_kind": sanitize(str(latest_message_entry.get("last_clean_bot_kind") or ""), 80).strip(),
+            "text_chars": len(text),
+            "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12] if text else "",
+            "delivered_identity_count": len(identities),
+        }
+    ledger_records = [record for record in ledger.values() if isinstance(record, dict)]
+    latest_ledger = max(
+        ledger_records,
+        key=lambda record: str(record.get("updated_at") or record.get("delivered_at") or ""),
+        default=None,
+    )
+    latest_ledger_summary: dict[str, Any] | None = None
+    if isinstance(latest_ledger, dict):
+        latest_ledger_summary = {
+            "worker_id": sanitize(str(latest_ledger.get("worker_id") or ""), 120).strip(),
+            "turn_id": sanitize(str(latest_ledger.get("turn_id") or ""), 200).strip(),
+            "delivered_at": str(latest_ledger.get("delivered_at") or ""),
+            "updated_at": str(latest_ledger.get("updated_at") or ""),
+            "semantic_hash": str(latest_ledger.get("semantic_hash") or ""),
+        }
+    return {
+        "source_entry_count": len(source_entries),
+        "entries_with_message": len(message_entries),
+        "delivered_turn_count": len(ledger_records),
+        "latest_message": latest_message,
+        "latest_ledger": latest_ledger_summary,
+    }
+
+
 def source_turn_for_pane(
     pane: dict[str, Any],
     turns_payload: dict[str, Any],

@@ -2070,6 +2070,16 @@ def tendwire_source_smoke_once(args: Any) -> dict[str, Any]:
         direct_calls = 0
         if direct_log.exists():
             direct_calls = len([line for line in direct_log.read_text(encoding="utf-8").splitlines() if line.strip()])
+        delivery_evidence: dict[str, Any] = {}
+        try:
+            smoke_state_data = json.loads(smoke_state.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            smoke_state_data = {}
+        if isinstance(smoke_state_data, dict):
+            delivery_evidence = herdres_tendwire.source_delivery_evidence(
+                smoke_state_data,
+                sanitize=sanitize_text,
+            )
         ok = proc.returncode == 0 and bool((sync_result or {}).get("ok")) and direct_calls == 0
         status = "ok" if ok else ("direct_herdr_called" if direct_calls else "sync_failed")
         result = {
@@ -2082,6 +2092,7 @@ def tendwire_source_smoke_once(args: Any) -> dict[str, Any]:
             "direct_herdr_calls": direct_calls,
             "sync_returncode": int(proc.returncode),
             "sync_result": sync_result or {},
+            "delivery_evidence": delivery_evidence,
             "json_lines": json_lines,
         }
         if proc.returncode != 0:
