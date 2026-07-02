@@ -14,6 +14,7 @@ import shlex
 import hashlib
 import json
 import subprocess
+import sys
 import threading
 from typing import Any, Callable
 
@@ -22,6 +23,7 @@ MODE_VALUES = ("off", "enrich", "commands", "source-read", "source")
 LEGACY_TIMER_CONFLICT_MODES = {"commands", "source-read", "source"}
 SOURCE_ROUTE_BLOCK_MODES = LEGACY_TIMER_CONFLICT_MODES
 LEGACY_HERDR_TOPIC_TIMER = "herdr-telegram-topics.timer"
+SOURCE_REQUIRED_SYSTEMD_UNITS = ("tendwired.service", "herdres.timer", "herdres-gateway.service")
 OPTIONAL_ENV_KEYS = {
     "HERDRES_TENDWIRE_DATA_DIR": "TENDWIRE_DATA_DIR",
     "HERDRES_TENDWIRE_DB_PATH": "TENDWIRE_DB_PATH",
@@ -647,6 +649,186 @@ def config_status(env: Any | None = None, *, default_herdr_bin: str = DEFAULT_HE
         "tendwire_connector_failure_delay_seconds": connector_failure_delay_seconds(source),
         "warnings": warnings,
     }
+
+
+def _systemd_unit_is_active(unit: str, *, runner: Runner = subprocess.run) -> tuple[bool, str, int]:
+    proc = runner(
+        ["systemctl", "--user", "is-active", unit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    status = (getattr(proc, "stdout", "") or getattr(proc, "stderr", "") or "").strip() or "unknown"
+    return getattr(proc, "returncode", 1) == 0 and status == "active", status, int(getattr(proc, "returncode", 1))
+
+
+def _systemd_unit_is_enabled(unit: str, *, runner: Runner = subprocess.run) -> tuple[bool, str, int]:
+    proc = runner(
+        ["systemctl", "--user", "is-enabled", unit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    status = (getattr(proc, "stdout", "") or getattr(proc, "stderr", "") or "").strip() or "unknown"
+    enabled = status in {"enabled", "static", "linked", "enabled-runtime"}
+    return getattr(proc, "returncode", 1) == 0 and enabled, status, int(getattr(proc, "returncode", 1))
+
+
+def service_health_record(unit: str, *, required: bool, runner: Runner = subprocess.run) -> dict[str, Any]:
+    active, active_status, active_returncode = _systemd_unit_is_active(unit, runner=runner)
+    enabled, enabled_status, enabled_returncode = _systemd_unit_is_enabled(unit, runner=runner)
+    return {
+        "unit": unit,
+        "required": bool(required),
+        "active": bool(active),
+        "active_status": active_status,
+        "active_returncode": active_returncode,
+        "enabled": bool(enabled),
+        "enabled_status": enabled_status,
+        "enabled_returncode": enabled_returncode,
+        "conflict": bool(required and (not active or not enabled)),
+    }
+
+
+def source_services_doctor(
+    *,
+    fix: bool = False,
+    env: Any | None = None,
+    is_macos: Callable[[], bool] | None = None,
+    runner: Runner = subprocess.run,
+    sanitize: Sanitizer = _default_sanitize,
+    required_units: tuple[str, ...] = SOURCE_REQUIRED_SYSTEMD_UNITS,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> dict[str, Any]:
+    mode = parse_mode(
+        os.environ if env is None else env,
+        diagnose_invalid=True,
+        warn_invalid=warn_invalid,
+    )
+    required = mode in LEGACY_TIMER_CONFLICT_MODES
+    result: dict[str, Any] = {
+        "ok": True,
+        "mode": mode,
+        "required": bool(required),
+        "services": {},
+        "actions": [],
+    }
+    macos = is_macos() if is_macos is not None else sys.platform == "darwin"
+    if macos:
+        result["status"] = "unsupported"
+        return result
+    for unit in required_units:
+        record = service_health_record(unit, required=required, runner=runner)
+        if required and record["conflict"]:
+            record["message"] = f"{unit} should be active and enabled while HERDRES_TENDWIRE_MODE={mode}."
+            record["fix_command"] = f"systemctl --user enable --now {unit}"
+            result["ok"] = False
+        result["services"][unit] = record
+    if not fix or not required:
+        return result
+
+    for unit, record in list(result["services"].items()):
+        if not record.get("conflict"):
+            continue
+        proc = runner(
+            ["systemctl", "--user", "enable", "--now", str(unit)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        result["actions"].append(f"systemctl --user enable --now {unit}")
+        updated = service_health_record(str(unit), required=required, runner=runner)
+        updated["enable_returncode"] = int(getattr(proc, "returncode", 1))
+        if getattr(proc, "returncode", 1) != 0:
+            updated["enable_error"] = sanitize(
+                getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "",
+                500,
+            )
+        result["services"][unit] = updated
+    result["ok"] = not any(
+        bool(record.get("conflict"))
+        for record in result["services"].values()
+        if isinstance(record, dict)
+    )
+    return result
+
+
+def legacy_topic_timer_doctor(
+    *,
+    fix: bool = False,
+    env: Any | None = None,
+    is_macos: Callable[[], bool] | None = None,
+    runner: Runner = subprocess.run,
+    sanitize: Sanitizer = _default_sanitize,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> dict[str, Any]:
+    mode = parse_mode(
+        os.environ if env is None else env,
+        diagnose_invalid=True,
+        warn_invalid=warn_invalid,
+    )
+    conflict_mode = mode in LEGACY_TIMER_CONFLICT_MODES
+    result: dict[str, Any] = {
+        "ok": True,
+        "mode": mode,
+        "legacy_timer": {
+            "unit": LEGACY_HERDR_TOPIC_TIMER,
+            "active": False,
+            "status": "unknown",
+            "conflict": False,
+        },
+        "actions": [],
+    }
+    macos = is_macos() if is_macos is not None else sys.platform == "darwin"
+    if macos:
+        result["legacy_timer"]["status"] = "unsupported"
+        return result
+
+    active, status, returncode = _systemd_unit_is_active(LEGACY_HERDR_TOPIC_TIMER, runner=runner)
+    result["legacy_timer"].update(
+        {
+            "active": active,
+            "status": status,
+            "returncode": returncode,
+            "conflict": bool(conflict_mode and active),
+        }
+    )
+    if not conflict_mode or not active:
+        return result
+
+    result["ok"] = False
+    result["legacy_timer"]["message"] = (
+        f"{LEGACY_HERDR_TOPIC_TIMER} is active while HERDRES_TENDWIRE_MODE={mode}; "
+        "disable it so source-mode Herdres does not run the legacy direct Herdr topic refresher."
+    )
+    result["legacy_timer"]["disable_command"] = f"systemctl --user disable --now {LEGACY_HERDR_TOPIC_TIMER}"
+    if not fix:
+        return result
+
+    proc = runner(
+        ["systemctl", "--user", "disable", "--now", LEGACY_HERDR_TOPIC_TIMER],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    result["actions"].append(f"systemctl --user disable --now {LEGACY_HERDR_TOPIC_TIMER}")
+    active_after, status_after, returncode_after = _systemd_unit_is_active(LEGACY_HERDR_TOPIC_TIMER, runner=runner)
+    result["legacy_timer"].update(
+        {
+            "active": active_after,
+            "status": status_after,
+            "returncode": returncode_after,
+            "conflict": bool(conflict_mode and active_after),
+            "disable_returncode": int(getattr(proc, "returncode", 1)),
+        }
+    )
+    if getattr(proc, "returncode", 1) != 0:
+        result["legacy_timer"]["disable_error"] = sanitize(
+            getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "",
+            500,
+        )
+    result["ok"] = getattr(proc, "returncode", 1) == 0 and not active_after
+    return result
 
 
 def json_object_from_stdout(stdout: str, source: str) -> tuple[dict[str, Any] | None, str]:

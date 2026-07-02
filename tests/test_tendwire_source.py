@@ -154,6 +154,102 @@ class TendwireModeTests(unittest.TestCase):
             )
         )
 
+    def test_tendwire_helper_reports_missing_source_services(self) -> None:
+        def runner(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            action = cmd[2]
+            if action == "is-active":
+                return subprocess.CompletedProcess(cmd, 3, stdout="inactive\n", stderr="")
+            if action == "is-enabled":
+                return subprocess.CompletedProcess(cmd, 1, stdout="disabled\n", stderr="")
+            self.fail(f"unexpected command: {cmd}")
+
+        result = herdres_tendwire.source_services_doctor(
+            env={"HERDRES_TENDWIRE_MODE": "source"},
+            is_macos=lambda: False,
+            runner=runner,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["required"])
+        self.assertEqual(set(result["services"]), set(herdres_tendwire.SOURCE_REQUIRED_SYSTEMD_UNITS))
+        self.assertTrue(all(record["conflict"] for record in result["services"].values()))
+        self.assertIn("systemctl --user enable --now", result["services"]["tendwired.service"]["fix_command"])
+
+    def test_tendwire_helper_fix_enables_source_services(self) -> None:
+        units = {
+            unit: {"active": False, "enabled": False}
+            for unit in herdres_tendwire.SOURCE_REQUIRED_SYSTEMD_UNITS
+        }
+        actions: list[str] = []
+
+        def runner(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            action = cmd[2]
+            unit = cmd[3]
+            if action == "is-active":
+                state = units[unit]
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0 if state["active"] else 3,
+                    stdout="active\n" if state["active"] else "inactive\n",
+                    stderr="",
+                )
+            if action == "is-enabled":
+                state = units[unit]
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0 if state["enabled"] else 1,
+                    stdout="enabled\n" if state["enabled"] else "disabled\n",
+                    stderr="",
+                )
+            if action == "enable":
+                unit = cmd[4]
+                units[unit] = {"active": True, "enabled": True}
+                actions.append(" ".join(cmd))
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            self.fail(f"unexpected command: {cmd}")
+
+        result = herdres_tendwire.source_services_doctor(
+            fix=True,
+            env={"HERDRES_TENDWIRE_MODE": "source"},
+            is_macos=lambda: False,
+            runner=runner,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(actions), len(herdres_tendwire.SOURCE_REQUIRED_SYSTEMD_UNITS))
+        self.assertFalse(any(record["conflict"] for record in result["services"].values()))
+
+    def test_tendwire_helper_fix_disables_legacy_topic_timer(self) -> None:
+        active = {"value": True}
+        actions: list[str] = []
+
+        def runner(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            action = cmd[2]
+            if action == "is-active":
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0 if active["value"] else 3,
+                    stdout="active\n" if active["value"] else "inactive\n",
+                    stderr="",
+                )
+            if action == "disable":
+                active["value"] = False
+                actions.append(" ".join(cmd))
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            self.fail(f"unexpected command: {cmd}")
+
+        result = herdres_tendwire.legacy_topic_timer_doctor(
+            fix=True,
+            env={"HERDRES_TENDWIRE_MODE": "source-read"},
+            is_macos=lambda: False,
+            runner=runner,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(actions, ["systemctl --user disable --now herdr-telegram-topics.timer"])
+        self.assertFalse(result["legacy_timer"]["active"])
+        self.assertFalse(result["legacy_timer"]["conflict"])
+
     def test_legacy_aliases_normalize_to_enrich_when_mode_unset(self) -> None:
         self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_HYBRID": "1"}), "enrich")
         self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_SNAPSHOT": "1"}), "enrich")
