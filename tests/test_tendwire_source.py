@@ -683,6 +683,36 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual([pane["worker_id"] for pane in merged], ["worker-1", "worker-preserved"])
         self.assertEqual(preserved_count, 1)
 
+    def test_tendwire_helper_builds_degraded_source_inventory_with_preserved_panes(self) -> None:
+        state, key = _source_state()
+        state["panes"]["worker:preserved"] = {
+            **state["panes"][key],
+            "pane_key": "worker:preserved",
+            "worker_id": "worker-preserved",
+            "tendwire_worker_id": "worker-preserved",
+            "worker_fingerprint": "fp-preserved",
+            "tendwire_fingerprint": "fp-preserved",
+        }
+        preserved = herdres_tendwire.source_state_panes(
+            state,
+            is_source_entry=herdres.entry_is_tendwire_source,
+        )
+
+        result = herdres_tendwire.source_inventory_panes(
+            _degraded_snapshot(),
+            preserved_panes=preserved,
+            pane_key=herdres.pane_key,
+            sanitize=herdres.sanitize_text,
+            raw_space_id_predicate=herdres._looks_like_raw_herdr_space_id,
+        )
+
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["preserved_count"], 2)
+        self.assertEqual(
+            [pane["worker_id"] for pane in result["panes"]],
+            ["worker-1", "worker-preserved"],
+        )
+
 
 class TendwireConfigTests(unittest.TestCase):
     def test_child_env_preserves_parent_and_overrides_only_tendwire_keys(self) -> None:

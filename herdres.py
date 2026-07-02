@@ -11777,14 +11777,21 @@ def observed_agent_panes(state: dict[str, Any] | None = None) -> list[dict[str, 
                     state["tendwire_source_inventory_preserved_at"] = utc_now()
                     return preserved
             raise
-        panes = tendwire_source_read_panes(snapshot)
+        preserved = tendwire_source_state_panes(state) if isinstance(state, dict) else []
+        inventory = herdres_tendwire.source_inventory_panes(
+            snapshot,
+            preserved_panes=preserved,
+            pane_key=pane_key,
+            sanitize=sanitize_text,
+            raw_space_id_predicate=_looks_like_raw_herdr_space_id,
+        )
+        panes = list(inventory.get("panes") or [])
         if isinstance(state, dict):
             state.pop("tendwire_source_inventory_last_error", None)
             state.pop("tendwire_source_inventory_preserved_at", None)
-        if isinstance(state, dict) and tendwire_snapshot_backend_degraded(snapshot):
-            panes, preserved_count = merge_preserved_source_panes(state, panes)
+        if isinstance(state, dict) and bool(inventory.get("degraded")):
             state["tendwire_source_inventory_degraded_at"] = utc_now()
-            state["tendwire_source_inventory_preserved"] = preserved_count
+            state["tendwire_source_inventory_preserved"] = int(inventory.get("preserved_count") or 0)
         else:
             if isinstance(state, dict):
                 state.pop("tendwire_source_inventory_degraded_at", None)

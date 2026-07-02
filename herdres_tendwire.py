@@ -1096,6 +1096,36 @@ def merge_preserved_source_panes(
     return merged, preserved_count
 
 
+def source_inventory_panes(
+    snapshot: dict[str, Any],
+    *,
+    preserved_panes: list[dict[str, Any]] | None = None,
+    pane_key: PaneKey | None = None,
+    sanitize: Sanitizer = _default_sanitize,
+    raw_space_id_predicate: RawSpacePredicate | None = None,
+) -> dict[str, Any]:
+    panes = source_read_panes(
+        snapshot,
+        sanitize=sanitize,
+        raw_space_id_predicate=raw_space_id_predicate,
+    )
+    degraded = snapshot_backend_degraded(snapshot)
+    preserved_count = 0
+    if degraded and preserved_panes:
+        if pane_key is None:
+            raise ValueError("pane_key is required when preserved_panes are supplied")
+        panes, preserved_count = merge_preserved_source_panes(
+            panes,
+            preserved_panes,
+            pane_key=pane_key,
+        )
+    return {
+        "panes": panes,
+        "degraded": degraded,
+        "preserved_count": preserved_count,
+    }
+
+
 def is_source_read_pane(pane: dict[str, Any] | None) -> bool:
     return isinstance(pane, dict) and bool(pane.get("_tendwire_source_read"))
 
