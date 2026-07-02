@@ -16460,7 +16460,14 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if len(parts) != 4 or parts[1] not in {"c", "d"}:
         return {"handled": True, "answer": "Unknown Herdr action."}
     source_entry = entry_is_tendwire_source(entry)
-    if tendwire_source_inventory_enabled() and not source_entry:
+    preflight = herdres_tendwire.callback_choice_preflight_policy(
+        source_inventory_enabled=tendwire_source_inventory_enabled(),
+        source_entry=source_entry,
+        pane_id=str(entry.get("pane_id") or ""),
+        last_known_status=str(entry.get("last_known_status") or ""),
+        metadata_state=tendwire_entry_metadata_state(entry),
+    )
+    if preflight == "legacy_source_block":
         return {
             "handled": True,
             "answer": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending.",
@@ -16504,11 +16511,11 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     options = list(prompt.get("options") or [])
 
     pane_id = str(entry.get("pane_id") or "")
-    if not source_entry and (not pane_id or entry.get("last_known_status") == "closed"):
+    if preflight == "pane_not_live":
         return {"handled": True, "answer": "This pane is no longer live.", "show_alert": True}
-    if source_entry and entry.get("last_known_status") == "closed":
+    if preflight == "source_not_live":
         return {"handled": True, "answer": "This worker is no longer live.", "show_alert": True}
-    if source_entry and tendwire_entry_metadata_state(entry) != "valid":
+    if preflight == "safe_failure":
         entry.pop("active_prompt", None)
         entry.pop("awaiting_detail", None)
         save_state(state)

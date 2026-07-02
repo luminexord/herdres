@@ -203,6 +203,58 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             "direct",
         )
 
+    def test_callback_choice_preflight_policy_keeps_source_mode_fail_closed(self) -> None:
+        self.assertEqual(
+            herdres_tendwire.callback_choice_preflight_policy(
+                source_inventory_enabled=True,
+                source_entry=False,
+                pane_id="pane-1",
+                last_known_status="working",
+                metadata_state="valid",
+            ),
+            "legacy_source_block",
+        )
+        self.assertEqual(
+            herdres_tendwire.callback_choice_preflight_policy(
+                source_inventory_enabled=False,
+                source_entry=False,
+                pane_id="",
+                last_known_status="working",
+                metadata_state="none",
+            ),
+            "pane_not_live",
+        )
+        self.assertEqual(
+            herdres_tendwire.callback_choice_preflight_policy(
+                source_inventory_enabled=True,
+                source_entry=True,
+                pane_id="",
+                last_known_status="closed",
+                metadata_state="valid",
+            ),
+            "source_not_live",
+        )
+        self.assertEqual(
+            herdres_tendwire.callback_choice_preflight_policy(
+                source_inventory_enabled=True,
+                source_entry=True,
+                pane_id="",
+                last_known_status="working",
+                metadata_state="partial",
+            ),
+            "safe_failure",
+        )
+        self.assertEqual(
+            herdres_tendwire.callback_choice_preflight_policy(
+                source_inventory_enabled=True,
+                source_entry=True,
+                pane_id="",
+                last_known_status="working",
+                metadata_state="valid",
+            ),
+            "ok",
+        )
+
 
 class TendwireCommandRoutingTests(unittest.TestCase):
     @contextmanager

@@ -567,6 +567,27 @@ def send_text_policy(
     return "direct"
 
 
+def callback_choice_preflight_policy(
+    *,
+    source_inventory_enabled: bool,
+    source_entry: bool,
+    pane_id: str,
+    last_known_status: str,
+    metadata_state: str,
+) -> str:
+    """Classify callback choice safety before any Telegram/state side effects."""
+    status = str(last_known_status or "").strip().lower()
+    if source_inventory_enabled and not source_entry:
+        return "legacy_source_block"
+    if not source_entry and (not str(pane_id or "").strip() or status == "closed"):
+        return "pane_not_live"
+    if source_entry and status == "closed":
+        return "source_not_live"
+    if source_entry and str(metadata_state or "").strip().lower() != "valid":
+        return "safe_failure"
+    return "ok"
+
+
 def same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
     if response_status(response) != "stale_target":
         return None
