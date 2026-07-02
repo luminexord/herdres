@@ -253,6 +253,57 @@ class TendwireOutboxTests(unittest.TestCase):
         self.assertEqual(result["failed"], 2)
         self.assertTrue(result["changed"])
 
+    def test_tendwire_outbox_connector_plans_live_in_tendwire_module(self) -> None:
+        item = _item()
+        env = {"HERDRES_TENDWIRE_CONNECTOR_NAME": "attention.main"}
+        action = herdres_tendwire.outbox_item_action(item, set())
+
+        duplicate = herdres_tendwire.outbox_connector_plan(
+            item,
+            action,
+            "duplicate",
+            env=env,
+        )
+        self.assertEqual(duplicate["action"], "ack")
+        self.assertEqual(duplicate["record"], "ack")
+        self.assertEqual(duplicate["params"]["name"], "attention.main")
+        self.assertTrue(duplicate["params"]["response"]["deduplicated"])
+
+        delivered = herdres_tendwire.outbox_connector_plan(
+            item,
+            action,
+            "delivered",
+            env=env,
+        )
+        self.assertEqual(delivered["action"], "ack")
+        self.assertEqual(delivered["record"], "ack")
+        self.assertNotIn("deduplicated", delivered["params"]["response"])
+
+        rate_limited = herdres_tendwire.outbox_connector_plan(
+            item,
+            action,
+            "rate_limited",
+            retry_after=7,
+            env=env,
+        )
+        self.assertEqual(rate_limited["action"], "defer")
+        self.assertEqual(rate_limited["record"], "defer")
+        self.assertEqual(rate_limited["params"]["delay_seconds"], 7)
+        self.assertEqual(rate_limited["params"]["reason"], "rate_limited")
+
+        failed = herdres_tendwire.outbox_connector_plan(
+            item,
+            action,
+            "failed",
+            env=env,
+        )
+        self.assertEqual(failed["action"], "fail")
+        self.assertEqual(failed["record"], "fail")
+
+        result = herdres_tendwire.outbox_drain_result(True)
+        herdres_tendwire.outbox_record_connector_response(result, delivered, {"ok": True})
+        self.assertEqual(result["acked"], 1)
+
     def test_drain_posts_attention_and_acks_public_response(self) -> None:
         calls: list[list[str]] = []
         ack_responses: list[dict] = []

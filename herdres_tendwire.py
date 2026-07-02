@@ -357,6 +357,66 @@ def outbox_record_fail_response(result: dict[str, Any], response: dict[str, Any]
     return result
 
 
+def outbox_connector_plan(
+    item: dict[str, Any],
+    action: dict[str, Any],
+    outcome: str,
+    *,
+    retry_after: int | None = None,
+    sanitize: Sanitizer = _default_sanitize,
+    env: Any | None = None,
+) -> dict[str, Any]:
+    """Build the neutral connector call needed after an outbox item outcome."""
+    ref = str(action.get("ref") or "").strip()
+    if not ref:
+        return {"action": "", "params": {}, "record": ""}
+    normalized = str(outcome or "").strip().lower()
+    if normalized == "duplicate":
+        return {
+            "action": "ack",
+            "params": outbox_ack_params(ref, item, deduplicated=True, sanitize=sanitize, env=env),
+            "record": "ack",
+        }
+    if normalized == "delivered":
+        return {
+            "action": "ack",
+            "params": outbox_ack_params(ref, item, sanitize=sanitize, env=env),
+            "record": "ack",
+        }
+    if normalized == "rate_limited":
+        return {
+            "action": "defer",
+            "params": outbox_defer_params(
+                ref,
+                reason="rate_limited",
+                delay_seconds=max(1, int(retry_after or 1)),
+                sanitize=sanitize,
+                env=env,
+            ),
+            "record": "defer",
+        }
+    return {
+        "action": "fail",
+        "params": outbox_fail_params(ref, sanitize=sanitize, env=env),
+        "record": "fail",
+    }
+
+
+def outbox_record_connector_response(
+    result: dict[str, Any],
+    plan: dict[str, Any],
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    record = str(plan.get("record") or "").strip().lower()
+    if record == "ack":
+        return outbox_record_ack_response(result, response)
+    if record == "defer":
+        return outbox_record_defer_response(result, response)
+    if record == "fail":
+        return outbox_record_fail_response(result, response)
+    return result
+
+
 def outbox_poll_params(
     *,
     remaining_sends: int,

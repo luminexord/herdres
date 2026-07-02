@@ -2279,6 +2279,12 @@ def drain_tendwire_connector_outbox(
     if audit_event is not None:
         tendwire_outbox_audit(state, {"status": audit_event.get("status"), "checked_at": utc_now()})
         return result
+
+    def execute_outbox_connector_plan(plan: dict[str, Any]) -> None:
+        params = plan.get("params") if isinstance(plan.get("params"), dict) else {}
+        response = tendwire_connector_call(str(plan.get("action") or ""), params)
+        herdres_tendwire.outbox_record_connector_response(result, plan, response)
+
     for item in items:
         action = herdres_tendwire.outbox_item_action(item, tendwire_outbox_delivered_identities(state))
         ref = str(action.get("ref") or "")
@@ -2286,30 +2292,20 @@ def drain_tendwire_connector_outbox(
             continue
         identity = str(action.get("identity") or "")
         if action.get("action") == "ack_duplicate":
-            ack = tendwire_connector_call(
-                "ack",
-                herdres_tendwire.outbox_ack_params(
-                    ref,
-                    item,
-                    deduplicated=True,
-                    sanitize=sanitize_text,
-                ),
-            )
-            herdres_tendwire.outbox_record_ack_response(result, ack)
+            plan = herdres_tendwire.outbox_connector_plan(item, action, "duplicate", sanitize=sanitize_text)
+            execute_outbox_connector_plan(plan)
             continue
         try:
             sent = deliver_tendwire_outbox_item(state, chat_id, telegram, item)
         except RateLimited as exc:
-            deferred = tendwire_connector_call(
-                "defer",
-                herdres_tendwire.outbox_defer_params(
-                    ref,
-                    reason="rate_limited",
-                    delay_seconds=max(1, int(exc.retry_after)),
-                    sanitize=sanitize_text,
-                ),
+            plan = herdres_tendwire.outbox_connector_plan(
+                item,
+                action,
+                "rate_limited",
+                retry_after=max(1, int(exc.retry_after)),
+                sanitize=sanitize_text,
             )
-            herdres_tendwire.outbox_record_defer_response(result, deferred)
+            execute_outbox_connector_plan(plan)
             continue
         except Exception as exc:
             sent = {"ok": False, "error": sanitize_text(str(exc), 300)}
@@ -2317,17 +2313,11 @@ def drain_tendwire_connector_outbox(
             counters["sends"] = counters.get("sends", 0) + 1
             herdres_tendwire.outbox_record_delivery_success(result)
             tendwire_outbox_audit(state, {"identity": identity, "status": "delivered", "recorded_at": utc_now()})
-            ack = tendwire_connector_call(
-                "ack",
-                herdres_tendwire.outbox_ack_params(ref, item, sanitize=sanitize_text),
-            )
-            herdres_tendwire.outbox_record_ack_response(result, ack)
+            plan = herdres_tendwire.outbox_connector_plan(item, action, "delivered", sanitize=sanitize_text)
+            execute_outbox_connector_plan(plan)
             continue
-        failed = tendwire_connector_call(
-            "fail",
-            herdres_tendwire.outbox_fail_params(ref, sanitize=sanitize_text),
-        )
-        herdres_tendwire.outbox_record_fail_response(result, failed)
+        plan = herdres_tendwire.outbox_connector_plan(item, action, "failed", sanitize=sanitize_text)
+        execute_outbox_connector_plan(plan)
     return result
 
 
