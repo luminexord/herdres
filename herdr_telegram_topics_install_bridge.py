@@ -24,7 +24,7 @@ CALL_SNIPPET = "        if await self._maybe_handle_herdr_topic_message(msg):\n 
 CALLBACK_CALL_SNIPPET = "        if await self._maybe_handle_herdr_topic_callback(query):\n            return\n"
 
 METHOD_SNIPPET = '''    async def _maybe_handle_herdr_topic_message(self, message: Message) -> bool:
-        """Route mapped Arasaka Herdr pane-topic commands outside the LLM path."""
+        """Route mapped Herdr pane-topic commands outside the LLM path."""
         try:
             from gateway.herdr_topic_bridge import maybe_handle_herdr_topic_message
         except Exception:
@@ -39,7 +39,7 @@ METHOD_SNIPPET = '''    async def _maybe_handle_herdr_topic_message(self, messag
 '''
 
 CALLBACK_METHOD_SNIPPET = '''    async def _maybe_handle_herdr_topic_callback(self, query: Any) -> bool:
-        """Route mapped Arasaka Herdr pane-topic callbacks outside the LLM path."""
+        """Route mapped Herdr pane-topic callbacks outside the LLM path."""
         try:
             from gateway.herdr_topic_bridge import maybe_handle_herdr_topic_callback
         except Exception:
