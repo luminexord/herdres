@@ -86,6 +86,46 @@ class TendwireOutboxTests(unittest.TestCase):
         self.assertEqual(herdres_tendwire.outbox_delivered_identities(state), {"abc123"})
         self.assertEqual(herdres.tendwire_outbox_delivered_identities(state), {"abc123"})
 
+    def test_tendwire_outbox_connector_params_live_in_tendwire_module(self) -> None:
+        item = _item()
+        env = {
+            "HERDRES_TENDWIRE_CONNECTOR_NAME": "attention.main",
+            "HERDRES_TENDWIRE_CONNECTOR_LEASE_SECONDS": "45",
+            "HERDRES_TENDWIRE_CONNECTOR_FAILURE_DELAY_SECONDS": "9",
+        }
+
+        self.assertEqual(herdres_tendwire.outbox_drain_result(True)["enabled"], True)
+        self.assertEqual(
+            herdres_tendwire.outbox_preflight_status(delivery_configured=False, remaining_sends=2),
+            "telegram_unconfigured",
+        )
+        self.assertEqual(
+            herdres_tendwire.outbox_preflight_status(delivery_configured=True, remaining_sends=0),
+            "send_cap_exhausted",
+        )
+        self.assertEqual(
+            herdres_tendwire.outbox_poll_params(remaining_sends=2, limit=5, env=env),
+            {"name": "attention.main", "limit": 2, "lease_seconds": 45},
+        )
+
+        ack = herdres_tendwire.outbox_ack_params("twref1.safeopaque", item, deduplicated=True, env=env)
+        self.assertEqual(ack["name"], "attention.main")
+        self.assertEqual(ack["response"], {"sent": True, "event_type": "attention_created", "deduplicated": True})
+        self.assertEqual(
+            herdres_tendwire.outbox_defer_params("twref1.safeopaque", reason="rate_limited", delay_seconds=4, env=env),
+            {
+                "name": "attention.main",
+                "ref": "twref1.safeopaque",
+                "reason": "rate_limited",
+                "delay_seconds": 4,
+                "response": {"sent": False},
+            },
+        )
+        self.assertEqual(
+            herdres_tendwire.outbox_fail_params("twref1.safeopaque", env=env)["delay_seconds"],
+            9,
+        )
+
     def test_drain_posts_attention_and_acks_public_response(self) -> None:
         calls: list[list[str]] = []
         ack_responses: list[dict] = []

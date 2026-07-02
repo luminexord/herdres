@@ -182,6 +182,100 @@ def note_outbox_audit(
         )[-max(1, int(delivered_limit)):]
 
 
+def outbox_drain_result(enabled: bool) -> dict[str, Any]:
+    return {
+        "enabled": bool(enabled),
+        "polled": 0,
+        "delivered": 0,
+        "acked": 0,
+        "failed": 0,
+        "deferred": 0,
+        "changed": False,
+    }
+
+
+def outbox_preflight_status(
+    *,
+    delivery_configured: bool,
+    remaining_sends: int,
+) -> str:
+    if not delivery_configured:
+        return "telegram_unconfigured"
+    if int(remaining_sends) <= 0:
+        return "send_cap_exhausted"
+    return ""
+
+
+def outbox_poll_params(
+    *,
+    remaining_sends: int,
+    limit: int | None = None,
+    env: Any | None = None,
+) -> dict[str, Any]:
+    remaining = max(1, int(remaining_sends))
+    requested_limit = connector_limit(env) if limit is None else max(1, int(limit))
+    return {
+        "name": connector_name(env),
+        "limit": min(requested_limit, remaining),
+        "lease_seconds": connector_lease_seconds(env),
+    }
+
+
+def outbox_ack_params(
+    ref: str,
+    item: dict[str, Any],
+    *,
+    sent: bool = True,
+    deduplicated: bool = False,
+    sanitize: Sanitizer = _default_sanitize,
+    env: Any | None = None,
+) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "sent": bool(sent),
+        "event_type": outbox_event_type(outbox_item_payload(item), sanitize=sanitize),
+    }
+    if deduplicated:
+        response["deduplicated"] = True
+    return {"name": connector_name(env), "ref": str(ref or ""), "response": response}
+
+
+def outbox_defer_params(
+    ref: str,
+    *,
+    reason: str,
+    delay_seconds: int,
+    sent: bool = False,
+    sanitize: Sanitizer = _default_sanitize,
+    env: Any | None = None,
+) -> dict[str, Any]:
+    return {
+        "name": connector_name(env),
+        "ref": str(ref or ""),
+        "reason": sanitize(str(reason or "deferred"), 120).strip() or "deferred",
+        "delay_seconds": max(0, int(delay_seconds)),
+        "response": {"sent": bool(sent)},
+    }
+
+
+def outbox_fail_params(
+    ref: str,
+    *,
+    reason: str = "send_failed",
+    delay_seconds: int | None = None,
+    sent: bool = False,
+    sanitize: Sanitizer = _default_sanitize,
+    env: Any | None = None,
+) -> dict[str, Any]:
+    delay = connector_failure_delay_seconds(env) if delay_seconds is None else max(0, int(delay_seconds))
+    return {
+        "name": connector_name(env),
+        "ref": str(ref or ""),
+        "reason": sanitize(str(reason or "send_failed"), 120).strip() or "send_failed",
+        "delay_seconds": delay,
+        "response": {"sent": bool(sent)},
+    }
+
+
 def _env_source(env: Any | None = None) -> Any:
     return os.environ if env is None else env
 

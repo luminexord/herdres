@@ -2219,35 +2219,26 @@ def drain_tendwire_connector_outbox(
 ) -> dict[str, Any]:
     if enabled is None:
         enabled = tendwire_connector_outbox_enabled()
-    result: dict[str, Any] = {
-        "enabled": bool(enabled),
-        "polled": 0,
-        "delivered": 0,
-        "acked": 0,
-        "failed": 0,
-        "deferred": 0,
-        "changed": False,
-    }
+    result: dict[str, Any] = herdres_tendwire.outbox_drain_result(bool(enabled))
     if not enabled:
         return result
-    if not str(chat_id or "").strip():
-        result["status"] = "telegram_unconfigured"
-        return result
-    if not (os.getenv("HERDRES_OUTBOUND_BOT_TOKEN", "").strip() or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()):
-        result["status"] = "telegram_unconfigured"
-        return result
     remaining = max(0, int(max_sends) - int(counters.get("sends", 0)))
-    if remaining <= 0:
-        result["status"] = "send_cap_exhausted"
+    preflight_status = herdres_tendwire.outbox_preflight_status(
+        delivery_configured=bool(
+            str(chat_id or "").strip()
+            and (
+                os.getenv("HERDRES_OUTBOUND_BOT_TOKEN", "").strip()
+                or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+            )
+        ),
+        remaining_sends=remaining,
+    )
+    if preflight_status:
+        result["status"] = preflight_status
         return result
-    poll_limit = min(max(1, int(limit or tendwire_connector_limit())), remaining)
     poll = tendwire_connector_call(
         "poll",
-        {
-            "name": tendwire_connector_name(),
-            "limit": poll_limit,
-            "lease_seconds": tendwire_connector_lease_seconds(),
-        },
+        herdres_tendwire.outbox_poll_params(remaining_sends=remaining, limit=limit),
     )
     if not poll.get("ok"):
         result["status"] = str(poll.get("status") or "poll_failed")
@@ -2265,15 +2256,12 @@ def drain_tendwire_connector_outbox(
         if identity in tendwire_outbox_delivered_identities(state):
             ack = tendwire_connector_call(
                 "ack",
-                {
-                    "name": tendwire_connector_name(),
-                    "ref": ref,
-                    "response": {
-                        "sent": True,
-                        "deduplicated": True,
-                        "event_type": _tendwire_attention_event_type(_tendwire_attention_payload(item)),
-                    },
-                },
+                herdres_tendwire.outbox_ack_params(
+                    ref,
+                    item,
+                    deduplicated=True,
+                    sanitize=sanitize_text,
+                ),
             )
             if ack.get("ok"):
                 result["acked"] += 1
@@ -2286,13 +2274,12 @@ def drain_tendwire_connector_outbox(
         except RateLimited as exc:
             deferred = tendwire_connector_call(
                 "defer",
-                {
-                    "name": tendwire_connector_name(),
-                    "ref": ref,
-                    "reason": "rate_limited",
-                    "delay_seconds": max(1, int(exc.retry_after)),
-                    "response": {"sent": False},
-                },
+                herdres_tendwire.outbox_defer_params(
+                    ref,
+                    reason="rate_limited",
+                    delay_seconds=max(1, int(exc.retry_after)),
+                    sanitize=sanitize_text,
+                ),
             )
             result["deferred"] += 1 if deferred.get("ok") else 0
             result["changed"] = True
@@ -2305,14 +2292,7 @@ def drain_tendwire_connector_outbox(
             tendwire_outbox_audit(state, {"identity": identity, "status": "delivered", "recorded_at": utc_now()})
             ack = tendwire_connector_call(
                 "ack",
-                {
-                    "name": tendwire_connector_name(),
-                    "ref": ref,
-                    "response": {
-                        "sent": True,
-                        "event_type": _tendwire_attention_event_type(_tendwire_attention_payload(item)),
-                    },
-                },
+                herdres_tendwire.outbox_ack_params(ref, item, sanitize=sanitize_text),
             )
             if ack.get("ok"):
                 result["acked"] += 1
@@ -2322,13 +2302,7 @@ def drain_tendwire_connector_outbox(
             continue
         failed = tendwire_connector_call(
             "fail",
-            {
-                "name": tendwire_connector_name(),
-                "ref": ref,
-                "reason": "send_failed",
-                "delay_seconds": tendwire_connector_failure_delay_seconds(),
-                "response": {"sent": False},
-            },
+            herdres_tendwire.outbox_fail_params(ref, sanitize=sanitize_text),
         )
         if failed.get("ok"):
             result["failed"] += 1
