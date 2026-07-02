@@ -2357,15 +2357,7 @@ def _retry_tendwire_request_id(base_request_id: str, candidate: dict[str, str]) 
 
 
 def tendwire_success_reply(response: dict[str, Any]) -> str:
-    status = _tendwire_response_status(response)
-    if status == "queued":
-        return "Queued for Tendwire worker."
-    message = ""
-    for container in (response, response.get("result") if isinstance(response.get("result"), dict) else {}):
-        message = str(container.get("reply") or container.get("message") or "").strip()
-        if message:
-            break
-    return sanitize_text(message, 300) if message else ""
+    return herdres_tendwire.success_reply(response, sanitize=sanitize_text)
 
 
 def tendwire_worker_status_for_herdres(status: str) -> str:
@@ -8912,24 +8904,23 @@ def send_to_tendwire_worker_response(
     )
     response = tendwire_command(request)
     if _tendwire_response_status(response) == "stale_target":
-        candidate = _same_worker_stale_target_candidate(response, worker_id)
-        if candidate is not None:
-            retry_entry = dict(entry)
-            retry_entry["tendwire_fingerprint"] = candidate["worker_fingerprint"]
-            retry_request = build_tendwire_send_instruction_request(
-                retry_entry,
-                outbound,
-                origin=origin,
-                chat_id=chat_id,
-                topic_id=topic_id,
-                message_id=message_id,
-                reply_to_message_id=reply_to_message_id,
-                callback_message_id=callback_message_id,
-                request_id=_retry_tendwire_request_id(str(request.get("request_id") or request_id), candidate),
-            )
+        retry = build_tendwire_retry_send_instruction_request(
+            entry,
+            outbound,
+            response,
+            origin=origin,
+            chat_id=chat_id,
+            topic_id=topic_id,
+            message_id=message_id,
+            reply_to_message_id=reply_to_message_id,
+            callback_message_id=callback_message_id,
+            base_request_id=str(request.get("request_id") or request_id),
+        )
+        if retry is not None:
+            retry_entry, retry_request = retry
             response = tendwire_command(retry_request)
             if tendwire_command_succeeded(response):
-                entry["tendwire_fingerprint"] = candidate["worker_fingerprint"]
+                entry["tendwire_fingerprint"] = str(retry_entry.get("tendwire_fingerprint") or "")
     if tendwire_command_succeeded(response):
         if mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin=origin, pane_id=pane_id) and state is not None:
             save_state(state)
@@ -12360,6 +12351,34 @@ def build_tendwire_send_instruction_request(
         reply_to_message_id=reply_to_message_id,
         callback_message_id=callback_message_id,
         request_id=request_id,
+        sanitize=sanitize_text,
+    )
+
+
+def build_tendwire_retry_send_instruction_request(
+    entry: dict[str, Any],
+    text: str,
+    response: dict[str, Any],
+    *,
+    origin: str = "send",
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+    base_request_id: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    return herdres_tendwire.retry_send_instruction_request(
+        entry,
+        text,
+        response,
+        origin=origin,
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+        base_request_id=base_request_id,
         sanitize=sanitize_text,
     )
 

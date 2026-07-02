@@ -491,6 +491,22 @@ def command_succeeded(response: dict[str, Any]) -> bool:
     return False
 
 
+def success_reply(
+    response: dict[str, Any],
+    *,
+    sanitize: Sanitizer = _default_sanitize,
+    limit: int = 300,
+) -> str:
+    status = response_status(response)
+    if status == "queued":
+        return "Queued for Tendwire worker."
+    for container in (response, response.get("result") if isinstance(response.get("result"), dict) else {}):
+        message = str(container.get("reply") or container.get("message") or "").strip()
+        if message:
+            return sanitize(message, limit)
+    return ""
+
+
 def same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
     if response_status(response) != "stale_target":
         return None
@@ -622,6 +638,41 @@ def build_send_instruction_request(
         "instruction": {"text": str(text or "")},
         "params": params,
     }
+
+
+def retry_send_instruction_request(
+    entry: dict[str, Any],
+    text: str,
+    response: dict[str, Any],
+    *,
+    origin: str = "send",
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+    base_request_id: str = "",
+    sanitize: Sanitizer = _default_sanitize,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
+    candidate = same_worker_stale_target_candidate(response, worker_id)
+    if candidate is None:
+        return None
+    retry_entry = dict(entry)
+    retry_entry["tendwire_fingerprint"] = candidate["worker_fingerprint"]
+    retry_request = build_send_instruction_request(
+        retry_entry,
+        text,
+        origin=origin,
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+        request_id=retry_request_id(base_request_id, candidate),
+        sanitize=sanitize,
+    )
+    return retry_entry, retry_request
 
 
 def worker_status_for_herdres(status: str) -> str:

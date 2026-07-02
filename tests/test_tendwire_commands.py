@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 import herdres
+import herdres_tendwire
 
 
 def _entry(**extra) -> dict:
@@ -440,6 +441,49 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         self.assertEqual(entry["tendwire_fingerprint"], "new-fp")
         save_state.assert_called_once_with(state)
         send_to_pane.assert_not_called()
+
+    def test_tendwire_helper_builds_same_worker_retry_request(self) -> None:
+        entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", tendwire_fingerprint="old-fp")
+        stale = {
+            "status": "stale_target",
+            "result": {
+                "candidates": [
+                    {"worker_id": "worker-1", "worker_fingerprint": "new-fp"},
+                    {"worker_id": "worker-2", "worker_fingerprint": "other-fp"},
+                ]
+            },
+        }
+
+        retry = herdres_tendwire.retry_send_instruction_request(
+            entry,
+            "continue",
+            stale,
+            chat_id="-1001",
+            topic_id="77",
+            message_id="5000",
+            base_request_id="base-request",
+        )
+
+        self.assertIsNotNone(retry)
+        retry_entry, retry_request = retry
+        self.assertEqual(entry["tendwire_fingerprint"], "old-fp")
+        self.assertEqual(retry_entry["tendwire_fingerprint"], "new-fp")
+        self.assertEqual(retry_request["target"]["worker_id"], "worker-1")
+        self.assertEqual(retry_request["target"]["worker_fingerprint"], "new-fp")
+        self.assertTrue(retry_request["request_id"].startswith("base-request:retry:"))
+
+        stale["result"]["candidates"] = [{"worker_id": "worker-2", "worker_fingerprint": "other-fp"}]
+        self.assertIsNone(herdres_tendwire.retry_send_instruction_request(entry, "continue", stale))
+
+    def test_tendwire_helper_success_reply(self) -> None:
+        self.assertEqual(herdres_tendwire.success_reply({"status": "queued"}), "Queued for Tendwire worker.")
+        self.assertEqual(
+            herdres_tendwire.success_reply(
+                {"status": "accepted", "result": {"message": "Accepted for delivery"}},
+                sanitize=lambda text, limit=300: text[:limit].lower(),
+            ),
+            "accepted for delivery",
+        )
 
     def test_duplicate_request_mismatched_payload_fails_without_direct_fallback(self) -> None:
         entry = _entry()
