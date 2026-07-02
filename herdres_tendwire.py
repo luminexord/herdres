@@ -597,7 +597,15 @@ def turns_payload(
     )
 
 
-COMMAND_SUCCESS_STATUSES = {"accepted", "queued", "sent", "submitted", "ok", "success"}
+COMMAND_SUCCESS_STATUSES = {
+    "accepted",
+    "duplicate_instruction",
+    "queued",
+    "sent",
+    "submitted",
+    "ok",
+    "success",
+}
 COMMAND_FAILURE_STATUSES = {
     "stale_target",
     "ambiguous_target",
@@ -712,6 +720,8 @@ def success_reply(
     result = response.get("result") if isinstance(response.get("result"), dict) else {}
     if str(result.get("delivery_state") or "").strip().lower() == "queued":
         return "Queued for Tendwire worker."
+    if str(result.get("delivery_state") or "").strip().lower() == "duplicate_suppressed":
+        return ""
     if status == "queued":
         return "Queued for Tendwire worker."
     for container in (response, result):
