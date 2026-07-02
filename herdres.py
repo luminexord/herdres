@@ -8890,11 +8890,24 @@ def send_to_tendwire_worker_response(
     reply_to_message_id: str = "",
     callback_message_id: str = "",
     request_id: str = "",
+    persist: bool = True,
 ) -> dict[str, Any]:
     outbound = str(text or "")
     pane_id = str(entry.get("pane_id") or "").strip()
     after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
     worker_id = str(entry.get("tendwire_worker_id") or "").strip()
+    submission_identity = _tendwire_command_submission_identity(
+        entry,
+        outbound,
+        origin=origin,
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+    )
+    if tendwire_command_submission_seen(state, submission_identity):
+        return {"handled": True, "reply": ""}
     request = build_tendwire_send_instruction_request(
         entry,
         outbound,
@@ -8905,6 +8918,15 @@ def send_to_tendwire_worker_response(
         reply_to_message_id=reply_to_message_id,
         callback_message_id=callback_message_id,
         request_id=request_id,
+    )
+    ledger_changed = note_tendwire_command_submission(
+        state,
+        submission_identity,
+        request_id=str(request.get("request_id") or request_id),
+        worker_id=worker_id,
+        origin=origin,
+        text=outbound,
+        status="attempted",
     )
     response = tendwire_command(request)
     if _tendwire_response_status(response) == "stale_target":
@@ -8923,14 +8945,37 @@ def send_to_tendwire_worker_response(
         if retry is not None:
             retry_entry, retry_request = retry
             response = tendwire_command(retry_request)
+            ledger_changed = note_tendwire_command_submission(
+                state,
+                submission_identity,
+                request_id=str(retry_request.get("request_id") or request.get("request_id") or request_id),
+                worker_id=worker_id,
+                origin=origin,
+                text=outbound,
+                status=_tendwire_response_status(response) or "attempted",
+            ) or ledger_changed
             if tendwire_command_succeeded(response):
                 entry["tendwire_fingerprint"] = str(retry_entry.get("tendwire_fingerprint") or "")
+    else:
+        ledger_changed = note_tendwire_command_submission(
+            state,
+            submission_identity,
+            request_id=str(request.get("request_id") or request_id),
+            worker_id=worker_id,
+            origin=origin,
+            text=outbound,
+            status=_tendwire_response_status(response) or "attempted",
+        ) or ledger_changed
     if tendwire_command_succeeded(response):
-        if mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin=origin, pane_id=pane_id) and state is not None:
+        if mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin=origin, pane_id=pane_id):
+            ledger_changed = True
+        if ledger_changed and persist and state is not None:
             save_state(state)
         return {"handled": True, "reply": tendwire_success_reply(response)}
     if tendwire_direct_fallback_enabled() and not entry_is_tendwire_source(entry):
         return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
+    if ledger_changed and persist and state is not None:
+        save_state(state)
     return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
 
 
@@ -12324,6 +12369,117 @@ def tendwire_instruction_request_id(
         text=text,
         sanitize=sanitize_text,
     )
+
+
+TENDWIRE_COMMAND_SUBMISSION_LEDGER_LIMIT = 500
+
+
+def tendwire_instruction_submission_identity(
+    *,
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+    worker_id: str = "",
+    origin: str = "send",
+    text: str = "",
+) -> str:
+    return herdres_tendwire.instruction_submission_identity(
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+        worker_id=worker_id,
+        origin=origin,
+        text=text,
+    )
+
+
+def _tendwire_command_submission_identity(
+    entry: dict[str, Any],
+    text: str,
+    *,
+    origin: str = "send",
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+) -> str:
+    if not (str(message_id or "").strip() or str(callback_message_id or "").strip()):
+        return ""
+    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
+    if not worker_id:
+        return ""
+    return tendwire_instruction_submission_identity(
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+        worker_id=worker_id,
+        origin=origin,
+        text=text,
+    )
+
+
+def _tendwire_command_submission_ledger(state: dict[str, Any]) -> dict[str, Any]:
+    ledger = state.get("tendwire_command_submissions")
+    if not isinstance(ledger, dict):
+        ledger = {}
+        state["tendwire_command_submissions"] = ledger
+    return ledger
+
+
+def tendwire_command_submission_seen(state: dict[str, Any] | None, identity: str) -> bool:
+    if not isinstance(state, dict) or not identity:
+        return False
+    ledger = state.get("tendwire_command_submissions")
+    return isinstance(ledger, dict) and identity in ledger
+
+
+def note_tendwire_command_submission(
+    state: dict[str, Any] | None,
+    identity: str,
+    *,
+    request_id: str = "",
+    worker_id: str = "",
+    origin: str = "",
+    text: str = "",
+    status: str = "",
+) -> bool:
+    if not isinstance(state, dict) or not identity:
+        return False
+    ledger = _tendwire_command_submission_ledger(state)
+    record = ledger.get(identity)
+    if not isinstance(record, dict):
+        record = {"submitted_at": utc_now()}
+        ledger[identity] = record
+        changed = True
+    else:
+        changed = False
+    values = {
+        "request_id": sanitize_text(str(request_id or ""), 200).strip(),
+        "worker_id": sanitize_text(str(worker_id or ""), 120).strip(),
+        "origin": sanitize_text(str(origin or ""), 40).strip(),
+        "text_hash": tendwire_instruction_text_hash(text),
+        "status": sanitize_text(str(status or "attempted"), 80).strip() or "attempted",
+        "updated_at": utc_now(),
+    }
+    for key, value in values.items():
+        if record.get(key) != value:
+            record[key] = value
+            changed = True
+    while len(ledger) > TENDWIRE_COMMAND_SUBMISSION_LEDGER_LIMIT:
+        oldest_key = min(
+            ledger,
+            key=lambda item: str((ledger.get(item) if isinstance(ledger.get(item), dict) else {}).get("updated_at") or ""),
+        )
+        ledger.pop(oldest_key, None)
+        changed = True
+    return changed
 
 
 def build_tendwire_send_instruction_request(
@@ -15774,12 +15930,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 send_result = send_to_tendwire_worker_response(
                     entry,
                     outbound,
-                    state=None,
+                    state=state,
                     origin="choice_detail",
                     chat_id=chat_id,
                     topic_id=topic_id,
                     message_id=str(payload.get("message_id") or ""),
                     reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
+                    persist=False,
                 )
                 if str(send_result.get("reply") or "") == TENDWIRE_SAFE_SEND_FAILURE_REPLY:
                     return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
@@ -16329,6 +16486,7 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
                 result = send_to_tendwire_worker_response(
                     entry,
                     text,
+                    state=state,
                     origin=str(ctx.get("origin") or "plain"),
                     chat_id=str(ctx.get("chat_id") or chat_id),
                     topic_id=str(ctx.get("topic_id") or topic_id),
@@ -16336,6 +16494,7 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
                     reply_to_message_id=str(ctx.get("reply_to_message_id") or ""),
                     callback_message_id=message_id,
                     request_id=str(rec.get("request_id") or ""),
+                    persist=False,
                 )
                 reply = sanitize_text(str(result.get("reply") or ""), 200)
                 if reply == TENDWIRE_SAFE_SEND_FAILURE_REPLY or reply.startswith("Send failed:"):
@@ -16719,11 +16878,12 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         send_result = send_to_tendwire_worker_response(
             entry,
             outbound,
-            state=None,
+            state=state,
             origin="choice",
             chat_id=chat_id,
             topic_id=topic_id,
             callback_message_id=message_id,
+            persist=False,
         )
         if str(send_result.get("reply") or "") == TENDWIRE_SAFE_SEND_FAILURE_REPLY:
             return {"handled": True, "answer": TENDWIRE_SAFE_SEND_FAILURE_REPLY, "show_alert": True}

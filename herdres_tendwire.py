@@ -749,6 +749,31 @@ def instruction_request_id(
     )
 
 
+def instruction_submission_identity(
+    *,
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+    worker_id: str = "",
+    origin: str = "send",
+    text: str = "",
+) -> str:
+    context = {
+        "source": "telegram",
+        "origin": str(origin or ""),
+        "chat_id": str(chat_id or ""),
+        "topic_id": str(topic_id or ""),
+        "message_id": str(message_id or ""),
+        "reply_to_message_id": str(reply_to_message_id or ""),
+        "callback_message_id": str(callback_message_id or ""),
+        "worker_id": str(worker_id or ""),
+        "text_hash": instruction_text_hash(text),
+    }
+    return hashlib.sha256(json.dumps(context, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+
+
 def build_send_instruction_request(
     entry: dict[str, Any],
     text: str,

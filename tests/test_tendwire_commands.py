@@ -408,6 +408,31 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         self.assertEqual(state["panes"]["pane-1"]["direct_origin_pane_id"], "")
         self.assertEqual(state["panes"]["pane-1"]["direct_origin_pane_key"], "pane-1")
 
+    def test_source_read_same_telegram_message_is_submitted_once(self) -> None:
+        entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", worker_fingerprint="fp-1")
+        state = _state(entry)
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                self._command_patches(state) as patched:
+            first = herdres.command_reply(_payload())
+            second = herdres.command_reply(_payload())
+            third = herdres.command_reply(_payload(message_id="5001"))
+
+        self.assertEqual(first["reply"], "")
+        self.assertEqual(second["reply"], "")
+        self.assertEqual(third["reply"], "")
+        patched["send_to_pane"].assert_not_called()
+        self.assertEqual(patched["run_cmd"].call_count, 2)
+        ledger = state.get("tendwire_command_submissions")
+        self.assertIsInstance(ledger, dict)
+        self.assertEqual(len(ledger), 2)
+        for record in ledger.values():
+            self.assertNotIn("chat_id", record)
+            self.assertNotIn("topic_id", record)
+            self.assertNotIn("message_id", record)
+            self.assertEqual(record["worker_id"], "worker-1")
+            self.assertEqual(record["origin"], "send")
+            self.assertEqual(record["status"], "accepted")
+
     def test_source_shared_topic_target_bot_kind_routes_to_current_worker(self) -> None:
         state = self._shared_source_state()
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
