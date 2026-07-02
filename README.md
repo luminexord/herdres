@@ -527,7 +527,7 @@ When `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1`, Herdres posts managed-bot setup lin
 
 Telegram still requires each child bot to have access to the forum group. If a child token is registered but Telegram rejects pane messages from it, Herdres posts add-to-group buttons in General and does not send that pane traffic as the manager bot.
 
-Pane output is sent by the matching child bot when configured. In Tendwire `source` and `source-read` modes, source workers with a matching child bot use that per-agent voice by default (`HERDR_TELEGRAM_TOPICS_SOURCE_MANAGED_VOICE=1`) so Codex/Claude/Kimi/etc. replies appear from the correct bot instead of the shared manager. Add each child bot to the Telegram forum group so replies to that child bot are delivered to the gateway; if a child bot is not yet allowed to post, Herdres falls back to the manager bot for that send.
+Pane output is sent by the matching child bot when configured. In Tendwire `source` and `source-read` modes, source workers with a matching child bot use that per-agent voice by default (`HERDR_TELEGRAM_TOPICS_SOURCE_MANAGED_VOICE=1`) so Codex/Claude/Kimi/etc. replies appear from the correct configured bot instead of the shared manager. Add each child bot to the Telegram forum group so replies to that child bot are delivered to the gateway. If a child bot is configured but Telegram has not granted it group access yet, Herdres records the access problem and prompts for setup instead of silently posting that pane traffic as the manager. If no matching child bot is configured, the shared manager remains the fallback voice.
 
 The standalone gateway runs one long-poll worker for the manager bot and one worker for each registered child bot. Telegram returns a long poll immediately when a message arrives, and each child bot is isolated from other bot-token waits or reconnect backoff:
 
@@ -768,7 +768,7 @@ Tendwire config:
 Tendwire connector outbox:
 
 - `HERDRES_TENDWIRE_CONNECTOR_OUTBOX` controls the neutral connector drain during `herdres sync`. When unset, it defaults on only in `HERDRES_TENDWIRE_MODE=source` and remains off in earlier modes. Set `0` to disable it explicitly or `1` to enable it in `source-read` during staged testing.
-- `HERDRES_TENDWIRE_CONNECTOR_NAME=attention` selects the Tendwire connector queue. The current consumer posts sanitized attention lifecycle notices to the configured General topic.
+- `HERDRES_TENDWIRE_CONNECTOR_NAME=attention` selects the Tendwire connector queue. The current consumer posts sanitized attention lifecycle notices. Worker-scoped notices with public `worker_id`/`space_id` metadata are delivered to the matching source worker topic and use that worker's configured managed bot when one exists; notices without a source-worker route go to the configured General topic through the shared manager bot.
 - `HERDRES_TENDWIRE_CONNECTOR_LIMIT`, `HERDRES_TENDWIRE_CONNECTOR_LEASE_SECONDS`, and `HERDRES_TENDWIRE_CONNECTOR_FAILURE_DELAY_SECONDS` bound per-sync leases and retries.
 
 The connector drain uses `tendwire connector poll/ack/fail/defer` through the same `HERDRES_TENDWIRE_BIN` command base and optional Tendwire env overrides. It does not require or enable `source-read`/`source` mode, does not create pseudo panes, does not persist opaque refs in Herdres state, and sends only public-safe ack/fail data back to Tendwire. If Telegram is not configured, it does not lease Tendwire work.
