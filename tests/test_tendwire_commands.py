@@ -344,6 +344,46 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             "direct",
         )
 
+    def test_entry_send_text_policy_reads_mode_and_metadata_without_telegram_state(self) -> None:
+        source_entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            tendwire_worker_id="worker-1",
+            tendwire_fingerprint="fp-1",
+        )
+        partial_source_entry = dict(source_entry, tendwire_fingerprint="")
+        legacy_entry = _entry(source="herdr", pane_id="pane-1")
+
+        self.assertEqual(
+            herdres_tendwire.entry_send_text_policy(
+                source_entry,
+                {"HERDRES_TENDWIRE_MODE": "source"},
+            ),
+            "tendwire",
+        )
+        self.assertEqual(
+            herdres_tendwire.entry_send_text_policy(
+                partial_source_entry,
+                {"HERDRES_TENDWIRE_MODE": "source", "HERDRES_TENDWIRE_DIRECT_FALLBACK": "1"},
+            ),
+            "safe_failure",
+        )
+        self.assertEqual(
+            herdres_tendwire.entry_send_text_policy(
+                legacy_entry,
+                {"HERDRES_TENDWIRE_MODE": "source"},
+            ),
+            "legacy_source_block",
+        )
+        self.assertEqual(
+            herdres_tendwire.entry_send_text_policy(
+                legacy_entry,
+                {"HERDRES_TENDWIRE_MODE": "commands", "HERDRES_TENDWIRE_DIRECT_FALLBACK": "1"},
+            ),
+            "tendwire",
+        )
+
     def test_callback_choice_preflight_policy_keeps_source_mode_fail_closed(self) -> None:
         self.assertEqual(
             herdres_tendwire.callback_choice_preflight_policy(

@@ -85,6 +85,15 @@ def mode_at_least(
     return MODE_VALUES.index(current) >= wanted
 
 
+def mode_enables_commands(mode: str) -> bool:
+    normalized = str(mode or "").strip().lower()
+    return normalized in MODE_VALUES and MODE_VALUES.index(normalized) >= MODE_VALUES.index("commands")
+
+
+def mode_enables_source_inventory(mode: str) -> bool:
+    return str(mode or "").strip().lower() in {"source-read", "source"}
+
+
 def source_mode_blocks_closed_direct_routes(env: Any | None = None) -> bool:
     return parse_mode(env) in SOURCE_ROUTE_BLOCK_MODES
 
@@ -796,6 +805,39 @@ def send_text_policy(
     if source_entry:
         return "safe_failure"
     return "direct"
+
+
+def entry_send_text_policy(
+    entry: dict[str, Any] | None,
+    env: Any | None = None,
+    *,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> str:
+    """Classify a text send for one stored pane/source entry from Tendwire mode state."""
+    mode = parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
+    source_inventory = mode_enables_source_inventory(mode)
+    commands = mode_enables_commands(mode)
+    source_entry = is_source_entry(entry)
+    commands_allowed = source_entry_commands_allowed(
+        entry,
+        source_read_enabled=source_inventory,
+        commands_enabled=commands,
+    )
+    metadata = entry_metadata_state(
+        entry,
+        source_read_enabled=source_inventory,
+        commands_enabled=commands,
+    )
+    source = os.environ if env is None else env
+    return send_text_policy(
+        source_inventory_enabled=source_inventory,
+        source_entry=source_entry,
+        source_entry_commands_allowed=commands_allowed,
+        commands_enabled=commands,
+        metadata_state=metadata,
+        direct_fallback_enabled=bool_env(source, "HERDRES_TENDWIRE_DIRECT_FALLBACK"),
+    )
 
 
 def callback_choice_preflight_policy(

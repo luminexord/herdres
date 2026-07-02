@@ -14901,16 +14901,10 @@ def forward_text_to_pane_response(
     if not outbound:
         return {"handled": True, "reply": usage}
     source_entry = entry_is_tendwire_source(entry)
-    source_entry_commands_allowed = tendwire_source_entry_commands_allowed(entry)
-    commands_enabled = tendwire_commands_enabled()
-    metadata_state = tendwire_entry_metadata_state(entry)
-    policy = herdres_tendwire.send_text_policy(
-        source_inventory_enabled=tendwire_source_inventory_enabled(),
-        source_entry=source_entry,
-        source_entry_commands_allowed=source_entry_commands_allowed,
-        commands_enabled=commands_enabled,
-        metadata_state=metadata_state,
-        direct_fallback_enabled=tendwire_direct_fallback_enabled(),
+    policy = herdres_tendwire.entry_send_text_policy(
+        entry,
+        diagnose_invalid=True,
+        warn_invalid=_warn_invalid_tendwire_mode,
     )
     if policy == "legacy_source_block":
         return {
@@ -16541,13 +16535,10 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
         age = _iso_age_seconds(str(rec.get("set_at") or ""))
         source_entry = entry_is_tendwire_source(entry)
         if text and (pane_id or source_entry) and (age is None or age <= ACTIVE_PANE_TTL_SECONDS):
-            policy = herdres_tendwire.send_text_policy(
-                source_inventory_enabled=tendwire_source_inventory_enabled(),
-                source_entry=source_entry,
-                source_entry_commands_allowed=tendwire_source_entry_commands_allowed(entry),
-                commands_enabled=tendwire_commands_enabled(),
-                metadata_state=tendwire_entry_metadata_state(entry),
-                direct_fallback_enabled=tendwire_direct_fallback_enabled(),
+            policy = herdres_tendwire.entry_send_text_policy(
+                entry,
+                diagnose_invalid=True,
+                warn_invalid=_warn_invalid_tendwire_mode,
             )
             if policy == "legacy_source_block":
                 blocked_send = True
