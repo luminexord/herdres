@@ -58,6 +58,14 @@ def _snapshot(*workers: dict) -> dict:
     }
 
 
+def _source_read_panes(snapshot: dict) -> list[dict]:
+    return herdres_tendwire.source_read_panes(snapshot, sanitize=herdres.sanitize_text)
+
+
+def _enrich_panes(panes: list[dict], snapshot: dict) -> list[dict]:
+    return herdres_tendwire.enrich_panes(panes, snapshot, sanitize=herdres.sanitize_text)
+
+
 def _degraded_snapshot() -> dict:
     return {
         "schema_version": 2,
@@ -76,7 +84,7 @@ def _degraded_snapshot() -> dict:
 
 
 def _source_state() -> tuple[dict, str]:
-    pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+    pane = _source_read_panes(_snapshot())[0]
     key = herdres.pane_key(pane)
     state = {
         "enabled": True,
@@ -352,7 +360,7 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(pane["summary"], "Working on tests")
 
     def test_source_read_worker_pane_key_survives_fingerprint_change(self) -> None:
-        first = herdres.tendwire_source_read_panes(
+        first = _source_read_panes(
             _snapshot(
                 {
                     "id": "worker-1",
@@ -364,7 +372,7 @@ class TendwireModeTests(unittest.TestCase):
                 }
             )
         )[0]
-        second = herdres.tendwire_source_read_panes(
+        second = _source_read_panes(
             _snapshot(
                 {
                     "id": "worker-1",
@@ -382,7 +390,7 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(second["worker_fingerprint"], "fp-new")
 
     def test_source_read_raw_herdr_space_id_does_not_become_topic_title(self) -> None:
-        panes = herdres.tendwire_source_read_panes(
+        panes = _source_read_panes(
             {
                 "spaces": [{"id": "w653e50b41be581", "name": "w653e50b41be581"}],
                 "workers": [
@@ -423,7 +431,7 @@ class TendwireModeTests(unittest.TestCase):
         self.assertFalse(str(panes[0]["pane_id"]).startswith("tendwire:"))
 
     def test_source_read_panes_skip_closed_tendwire_workers(self) -> None:
-        panes = herdres.tendwire_source_read_panes(
+        panes = _source_read_panes(
             _snapshot(
                 {
                     "id": "worker-live",
@@ -655,7 +663,7 @@ class TendwireModeTests(unittest.TestCase):
 
     def test_source_read_clean_feed_delivers_tendwire_turn_without_direct_herdr(self) -> None:
         state, key = _source_state()
-        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        pane = _source_read_panes(_snapshot())[0]
         entry = state["panes"][key]
         entry["prompt_collapse_chars"] = 0
         counters = {"sends": 0, "feed_sends": 0}
@@ -721,7 +729,7 @@ class TendwireModeTests(unittest.TestCase):
 
     def test_source_read_clean_feed_delivers_tendwire_pending_decision_without_direct_herdr(self) -> None:
         state, key = _source_state()
-        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        pane = _source_read_panes(_snapshot())[0]
         entry = state["panes"][key]
         entry["prompt_collapse_chars"] = 0
         counters = {"sends": 0, "feed_sends": 0}
@@ -809,7 +817,7 @@ class TendwireModeTests(unittest.TestCase):
 
     def test_source_read_clean_feed_global_ledger_suppresses_rebuilt_entry_replay(self) -> None:
         state, key = _source_state()
-        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        pane = _source_read_panes(_snapshot())[0]
         entry = state["panes"][key]
         entry["prompt_collapse_chars"] = 0
         sent_items: list[dict] = []
@@ -897,7 +905,7 @@ class TendwireModeTests(unittest.TestCase):
 
     def test_source_read_global_ledger_still_delivers_open_stream_update(self) -> None:
         state, key = _source_state()
-        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        pane = _source_read_panes(_snapshot())[0]
         entry = state["panes"][key]
         entry["prompt_collapse_chars"] = 0
         final_turn = {
@@ -1093,7 +1101,7 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(result["sent"], 1)
         self.assertEqual(sent_items[0]["turn_id"], "turn-public-1")
         self.assertIn("Completed Tendwire turn text", sent_items[0]["assistant_final_text"])
-        self.assertEqual(state["panes"][herdres.pane_key(herdres.tendwire_source_read_panes(_snapshot())[0])]["last_clean_message_id"], "501")
+        self.assertEqual(state["panes"][herdres.pane_key(_source_read_panes(_snapshot())[0])]["last_clean_message_id"], "501")
         outbox.assert_called_once()
         pane_list.assert_not_called()
         pane_turn.assert_not_called()
@@ -1153,7 +1161,7 @@ class TendwireModeTests(unittest.TestCase):
         state["telegram"]["managed_bots"] = {
             "codex": {"token": "CODEX_TOKEN", "enabled": True},
         }
-        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        pane = _source_read_panes(_snapshot())[0]
 
         with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_SOURCE_MANAGED_VOICE": "1"}, clear=False):
             herdres.refresh_entry_managed_voice(state, entry, pane)
@@ -1163,7 +1171,7 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(herdres.desired_message_bot_kind(state["telegram"], entry, pane), "codex")
 
     def test_source_worker_space_migrates_to_per_agent_voice_when_child_bot_exists(self) -> None:
-        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        pane = _source_read_panes(_snapshot())[0]
         state = {
             "telegram": {"managed_bots": {"codex": {"token": "CODEX_TOKEN", "enabled": True}}},
             "spaces": {},
@@ -1210,7 +1218,7 @@ class TendwireModeTests(unittest.TestCase):
             "worker_fingerprint": "fp-preserved",
             "tendwire_fingerprint": "fp-preserved",
         }
-        live = herdres.tendwire_source_read_panes(_snapshot())
+        live = _source_read_panes(_snapshot())
         preserved = herdres_tendwire.source_state_panes(
             state,
             is_source_entry=herdres.entry_is_tendwire_source,
@@ -1454,7 +1462,7 @@ class TendwireModeTests(unittest.TestCase):
     def test_tendwire_helper_tracks_source_turn_delivery_ledger(self) -> None:
         state, key = _source_state()
         entry = state["panes"][key]
-        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        pane = _source_read_panes(_snapshot())[0]
         identity = "turn-semantic-1"
         entry["delivered_turn_identities"] = [identity]
 
@@ -1909,7 +1917,7 @@ class TendwireHybridTests(unittest.TestCase):
         self.assertEqual(entry["last_turn_reason"], "private path /tmp/very-[redacted]-db.sqlite")
 
     def test_tendwire_enriches_real_pane_without_replacing_id(self) -> None:
-        panes = herdres.tendwire_enrich_panes([_pane()], _snapshot())
+        panes = _enrich_panes([_pane()], _snapshot())
 
         self.assertEqual(len(panes), 1)
         self.assertEqual(panes[0]["pane_id"], "pane-1")
@@ -1922,7 +1930,7 @@ class TendwireHybridTests(unittest.TestCase):
         worker = _snapshot()["workers"][0]
         duplicate = dict(worker, id="worker-2", fingerprint="fp-2")
 
-        panes = herdres.tendwire_enrich_panes([_pane()], _snapshot(worker, duplicate))
+        panes = _enrich_panes([_pane()], _snapshot(worker, duplicate))
 
         self.assertEqual(panes[0]["pane_id"], "pane-1")
         self.assertNotIn("_tendwire_enriched", panes[0])
@@ -1975,7 +1983,7 @@ class TendwireHybridTests(unittest.TestCase):
         self.assertEqual(panes, herdr_panes)
 
     def test_sync_pane_once_tendwire_enriched_pane_uses_clean_feed(self) -> None:
-        pane = herdres.tendwire_enrich_panes([_pane()], _snapshot())[0]
+        pane = _enrich_panes([_pane()], _snapshot())[0]
         state: dict = {"panes": {}, "spaces": {}}
         counters = herdres.make_sync_counters()
         caps = herdres.make_sync_caps()
@@ -2003,7 +2011,7 @@ class TendwireHybridTests(unittest.TestCase):
 
     def test_sync_once_prefetches_real_pane_id_for_tendwire_enriched_pane(self) -> None:
         state: dict = {"enabled": True, "panes": {}, "spaces": {}, "telegram": {"chat_id": "-100"}}
-        pane = herdres.tendwire_enrich_panes([_pane()], _snapshot())[0]
+        pane = _enrich_panes([_pane()], _snapshot())[0]
         with patch.object(herdres, "load_dotenv"), \
                 patch.object(herdres, "load_state", return_value=state), \
                 patch.object(herdres, "save_state"), \
@@ -2029,7 +2037,7 @@ class TendwireHybridTests(unittest.TestCase):
 
     def test_sync_once_source_read_skips_herdr_inventory_helpers(self) -> None:
         state: dict = {"enabled": True, "panes": {}, "spaces": {}, "telegram": {"chat_id": "-100"}}
-        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        pane = _source_read_panes(_snapshot())[0]
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
                 patch.object(herdres, "load_dotenv"), \
                 patch.object(herdres, "load_state", return_value=state), \

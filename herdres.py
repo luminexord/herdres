@@ -2231,96 +2231,6 @@ TENDWIRE_COMMAND_SUCCESS_STATUSES = herdres_tendwire.COMMAND_SUCCESS_STATUSES
 TENDWIRE_COMMAND_FAILURE_STATUSES = herdres_tendwire.COMMAND_FAILURE_STATUSES
 
 
-def tendwire_worker_status_for_herdres(status: str) -> str:
-    return herdres_tendwire.worker_status_for_herdres(status)
-
-
-def tendwire_normalized_label(value: Any) -> str:
-    return herdres_tendwire.normalized_label(value)
-
-
-def tendwire_normalized_path(value: Any) -> str:
-    return herdres_tendwire.normalized_path(value)
-
-
-def tendwire_worker_agent(worker: dict[str, Any]) -> str:
-    return herdres_tendwire.worker_agent(worker, sanitize=sanitize_text)
-
-
-def tendwire_worker_match_keys(worker: dict[str, Any]) -> list[tuple[str, str, str, str]]:
-    return herdres_tendwire.worker_match_keys(worker, sanitize=sanitize_text)
-
-
-def tendwire_pane_match_keys(pane: dict[str, Any]) -> list[tuple[str, str, str, str]]:
-    return herdres_tendwire.pane_match_keys(pane)
-
-
-def tendwire_worker_index(snapshot: dict[str, Any]) -> dict[tuple[str, str, str, str], list[dict[str, Any]]]:
-    return herdres_tendwire.worker_index(snapshot, sanitize=sanitize_text)
-
-
-def tendwire_match_worker(pane: dict[str, Any], index: dict[tuple[str, str, str, str], list[dict[str, Any]]]) -> dict[str, Any] | None:
-    return herdres_tendwire.match_worker(pane, index)
-
-
-def tendwire_enrich_pane(pane: dict[str, Any], worker: dict[str, Any]) -> dict[str, Any]:
-    return herdres_tendwire.enrich_pane(pane, worker, sanitize=sanitize_text)
-
-
-def tendwire_enrich_panes(panes: list[dict[str, Any]], snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    return herdres_tendwire.enrich_panes(panes, snapshot, sanitize=sanitize_text)
-
-
-def _tendwire_public_id(value: Any, *, prefix: str, limit: int = 120) -> str:
-    text = sanitize_text(str(value or ""), limit).strip()
-    text = re.sub(r"[^A-Za-z0-9_.:-]+", "-", text).strip(".:-_")
-    return text or prefix
-
-
-def tendwire_source_read_panes(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    """Build read-only pane-like records from Tendwire's public snapshot."""
-    return herdres_tendwire.source_read_panes(
-        snapshot,
-        sanitize=sanitize_text,
-    )
-
-
-def tendwire_snapshot_backend_degraded(snapshot: dict[str, Any]) -> bool:
-    """True when Tendwire says the public snapshot is not freshly authoritative."""
-    return herdres_tendwire.snapshot_backend_degraded(snapshot)
-
-
-def tendwire_source_entry_as_pane(pane_key_value: str, entry: dict[str, Any]) -> dict[str, Any] | None:
-    """Reconstruct a source worker pane from Herdres state when Tendwire is degraded."""
-    return herdres_tendwire.source_entry_as_pane(
-        pane_key_value,
-        entry,
-        is_source_entry=entry_is_tendwire_source,
-    )
-
-
-def tendwire_source_state_panes(state: dict[str, Any]) -> list[dict[str, Any]]:
-    return herdres_tendwire.source_state_panes(
-        state,
-        is_source_entry=entry_is_tendwire_source,
-    )
-
-
-def merge_preserved_source_panes(
-    state: dict[str, Any],
-    panes: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int]:
-    return herdres_tendwire.merge_preserved_source_panes(
-        panes,
-        tendwire_source_state_panes(state),
-        pane_key=pane_key,
-    )
-
-
-def pane_is_tendwire_source_read(pane: dict[str, Any] | None) -> bool:
-    return herdres_tendwire.is_source_read_pane(pane)
-
-
 def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
     return herdres_tendwire.source_turn_feed_item_from_loader(
         pane,
@@ -12087,7 +11997,7 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
     panes = state.setdefault("panes", {})
     entry = panes.get(key)
     created = False
-    source = "tendwire" if pane_is_tendwire_source_read(pane) else "herdr"
+    source = "tendwire" if herdres_tendwire.is_source_read_pane(pane) else "herdr"
     if not isinstance(entry, dict):
         reusable = find_reusable_closed_entry(panes, key, pane)
         if reusable:
@@ -12851,7 +12761,7 @@ def _sync_pane_clean_feed(
     early_return is True when the topic or pane-root went missing (caller
     must return True immediately); None means continue.
     """
-    source_read_pane = pane_is_tendwire_source_read(pane)
+    source_read_pane = herdres_tendwire.is_source_read_pane(pane)
     feed_delivered_this_pane = False
     stream_active_this_pane = False
     item = None
