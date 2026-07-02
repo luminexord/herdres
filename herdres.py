@@ -16251,13 +16251,21 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
         age = _iso_age_seconds(str(rec.get("set_at") or ""))
         source_entry = entry_is_tendwire_source(entry)
         if text and (pane_id or source_entry) and (age is None or age <= ACTIVE_PANE_TTL_SECONDS):
-            if tendwire_source_inventory_enabled() and not source_entry:
+            policy = herdres_tendwire.send_text_policy(
+                source_inventory_enabled=tendwire_source_inventory_enabled(),
+                source_entry=source_entry,
+                source_entry_commands_allowed=tendwire_source_entry_commands_allowed(entry),
+                commands_enabled=tendwire_commands_enabled(),
+                metadata_state=tendwire_entry_metadata_state(entry),
+                direct_fallback_enabled=tendwire_direct_fallback_enabled(),
+            )
+            if policy == "legacy_source_block":
                 blocked_send = True
                 deliver_note = "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending."
-            elif source_entry and not tendwire_source_entry_commands_allowed(entry):
+            elif policy == "source_commands_disabled":
                 blocked_send = True
                 deliver_note = "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet."
-            elif tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) == "valid" and isinstance(entry, dict):
+            elif policy == "tendwire" and isinstance(entry, dict):
                 ctx = rec.get("request_context") if isinstance(rec.get("request_context"), dict) else {}
                 result = send_to_tendwire_worker_response(
                     entry,
@@ -16277,21 +16285,7 @@ def handle_agent_pick_callback(state, telegram, chat_id, topic_id, message_id, u
                 else:
                     delivered = True
                     deliver_note = reply
-            elif tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) == "partial":
-                if not entry_is_tendwire_source(entry) and tendwire_direct_fallback_enabled():
-                    after_turn_id = _direct_origin_after_turn_id(entry, pane_id) if isinstance(entry, dict) else ""
-                    try:
-                        ok, detail = send_to_pane(pane_id, text)
-                    except Exception as exc:
-                        ok, detail = False, sanitize_text(str(exc), 200)
-                    delivered = ok
-                    deliver_note = sanitize_text(detail, 200) if ok else ""
-                    if ok and isinstance(entry, dict):
-                        mark_direct_origin_send(entry, text, after_turn_id=after_turn_id, origin="plain", pane_id=pane_id)
-                else:
-                    blocked_send = True
-                    deliver_note = TENDWIRE_SAFE_SEND_FAILURE_REPLY
-            elif source_entry:
+            elif policy == "safe_failure":
                 blocked_send = True
                 deliver_note = TENDWIRE_SAFE_SEND_FAILURE_REPLY
             else:
