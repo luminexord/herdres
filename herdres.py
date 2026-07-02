@@ -12460,16 +12460,20 @@ def archive_legacy_direct_pane_records_for_source(
         return 0
     spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
     active_keys = active_space_keys or set()
+    existing_pane_keys = {str(value) for value in panes}
     for key, space in list(spaces.items()):
         if not isinstance(space, dict):
             continue
-        pane_keys = [str(value) for value in space.get("pane_keys") or [] if str(value) in panes]
-        if pane_keys:
-            space["pane_keys"] = pane_keys
-        elif str(key) in active_keys:
-            space["pane_keys"] = []
-        else:
+        plan = herdres_tendwire.source_cleanup_space_plan(
+            str(key),
+            space,
+            existing_pane_keys=existing_pane_keys,
+            active_space_keys=active_keys,
+        )
+        if plan["action"] == "drop":
             spaces.pop(key, None)
+        else:
+            space["pane_keys"] = list(plan.get("pane_keys") or [])
     herdres_tendwire.append_bounded_audit(
         state,
         "archived_legacy_direct_panes",
@@ -12499,17 +12503,21 @@ def prune_closed_tendwire_source_records(
     if not removed:
         return 0
     spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    active_keys = active_space_keys or set()
+    existing_pane_keys = {str(value) for value in panes}
     for key, space in list(spaces.items()):
         if not isinstance(space, dict):
             continue
-        pane_keys = space.get("pane_keys") if isinstance(space.get("pane_keys"), list) else []
-        kept = [str(value) for value in pane_keys if str(value) in panes]
-        if kept:
-            space["pane_keys"] = kept
-        elif str(key) in (active_space_keys or set()):
-            space["pane_keys"] = []
-        else:
+        plan = herdres_tendwire.source_cleanup_space_plan(
+            str(key),
+            space,
+            existing_pane_keys=existing_pane_keys,
+            active_space_keys=active_keys,
+        )
+        if plan["action"] == "drop":
             spaces.pop(key, None)
+        else:
+            space["pane_keys"] = list(plan.get("pane_keys") or [])
     herdres_tendwire.append_bounded_audit(
         state,
         "pruned_tendwire_source_panes",

@@ -1188,6 +1188,24 @@ def should_prune_closed_source_record(entry: dict[str, Any] | None) -> bool:
     return str((entry or {}).get("last_known_status") or "").strip().lower() == "closed"
 
 
+def source_cleanup_space_plan(
+    space_key_value: str,
+    space: dict[str, Any],
+    *,
+    existing_pane_keys: set[str],
+    active_space_keys: set[str] | None = None,
+) -> dict[str, Any]:
+    """Decide how a source-mode cleanup should update one Telegram space record."""
+    active_keys = {str(value) for value in (active_space_keys or set())}
+    raw_pane_keys = space.get("pane_keys") if isinstance(space.get("pane_keys"), list) else []
+    kept = [str(value) for value in raw_pane_keys if str(value) in existing_pane_keys]
+    if kept:
+        return {"action": "keep", "pane_keys": kept}
+    if str(space_key_value) in active_keys:
+        return {"action": "clear", "pane_keys": []}
+    return {"action": "drop", "pane_keys": []}
+
+
 def legacy_direct_archive_record(
     pane_key_value: str,
     entry: dict[str, Any],

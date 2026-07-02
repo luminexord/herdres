@@ -1292,6 +1292,33 @@ class TendwireModeTests(unittest.TestCase):
                 {"source": "tendwire", "entry_type": "worker", "worker_id": "worker-1", "last_known_status": "working"}
             )
         )
+        self.assertEqual(
+            herdres_tendwire.source_cleanup_space_plan(
+                "workspace:w1",
+                {"pane_keys": ["gone", "kept"]},
+                existing_pane_keys={"kept"},
+                active_space_keys=set(),
+            ),
+            {"action": "keep", "pane_keys": ["kept"]},
+        )
+        self.assertEqual(
+            herdres_tendwire.source_cleanup_space_plan(
+                "workspace:w1",
+                {"pane_keys": ["gone"]},
+                existing_pane_keys=set(),
+                active_space_keys={"workspace:w1"},
+            ),
+            {"action": "clear", "pane_keys": []},
+        )
+        self.assertEqual(
+            herdres_tendwire.source_cleanup_space_plan(
+                "workspace:w1",
+                {"pane_keys": ["gone"]},
+                existing_pane_keys=set(),
+                active_space_keys=set(),
+            ),
+            {"action": "drop", "pane_keys": []},
+        )
 
         legacy = herdres_tendwire.legacy_direct_archive_record(
             "legacy-key",
