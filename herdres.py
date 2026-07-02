@@ -11934,32 +11934,15 @@ def sync_space_pinned_statuses(
 
 def observed_agent_panes(state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     if tendwire_source_read_enabled():
-        try:
-            snapshot = tendwire_snapshot()
-        except Exception as exc:
-            if isinstance(state, dict):
-                preserved = tendwire_source_state_panes(state)
-                if preserved:
-                    herdres_tendwire.note_source_inventory_snapshot_failure(
-                        state,
-                        exc,
-                        preserved,
-                        now=utc_now(),
-                        sanitize=sanitize_text,
-                    )
-                    return preserved
-            raise
-        preserved = tendwire_source_state_panes(state) if isinstance(state, dict) else []
-        inventory = herdres_tendwire.source_inventory_panes(
-            snapshot,
-            preserved_panes=preserved,
+        return herdres_tendwire.source_inventory_from_snapshot_loader(
+            state,
+            load_snapshot=tendwire_snapshot,
             pane_key=pane_key,
+            is_source_entry=entry_is_tendwire_source,
+            now=utc_now(),
             sanitize=sanitize_text,
             raw_space_id_predicate=_looks_like_raw_herdr_space_id,
         )
-        panes = list(inventory.get("panes") or [])
-        herdres_tendwire.note_source_inventory_result(state, inventory, now=utc_now())
-        return panes
     all_panes = pane_list()
     include_shells = parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "")
     panes = [pane for pane in all_panes if include_shells or pane.get("agent")]

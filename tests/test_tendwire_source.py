@@ -1133,6 +1133,26 @@ class TendwireModeTests(unittest.TestCase):
             ["worker-1", "worker-preserved"],
         )
 
+    def test_tendwire_helper_source_inventory_loader_preserves_on_snapshot_failure(self) -> None:
+        state, key = _source_state()
+
+        def fail_snapshot() -> dict:
+            raise RuntimeError("socket down")
+
+        panes = herdres_tendwire.source_inventory_from_snapshot_loader(
+            state,
+            load_snapshot=fail_snapshot,
+            pane_key=herdres.pane_key,
+            is_source_entry=herdres.entry_is_tendwire_source,
+            now="2026-07-02T00:00:00+00:00",
+            sanitize=herdres.sanitize_text,
+            raw_space_id_predicate=herdres._looks_like_raw_herdr_space_id,
+        )
+
+        self.assertEqual([pane["worker_id"] for pane in panes], [state["panes"][key]["worker_id"]])
+        self.assertIn("socket down", state["tendwire_source_inventory_last_error"])
+        self.assertEqual(state["tendwire_source_inventory_preserved_at"], "2026-07-02T00:00:00+00:00")
+
     def test_tendwire_helper_updates_source_inventory_state_fields(self) -> None:
         state: dict = {}
         preserved = [{"worker_id": "worker-1"}]

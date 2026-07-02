@@ -1502,6 +1502,44 @@ def note_source_inventory_result(
     return changed
 
 
+def source_inventory_from_snapshot_loader(
+    state: dict[str, Any] | None,
+    *,
+    load_snapshot: Callable[[], dict[str, Any]],
+    pane_key: PaneKey,
+    is_source_entry: SourceEntryPredicate,
+    now: str,
+    sanitize: Sanitizer = _default_sanitize,
+    raw_space_id_predicate: RawSpacePredicate | None = None,
+) -> list[dict[str, Any]]:
+    """Return source inventory panes while preserving state on backend failure/degrade."""
+    try:
+        snapshot = load_snapshot()
+    except Exception as exc:
+        if isinstance(state, dict):
+            preserved = source_state_panes(state, is_source_entry=is_source_entry)
+            if preserved:
+                note_source_inventory_snapshot_failure(
+                    state,
+                    exc,
+                    preserved,
+                    now=now,
+                    sanitize=sanitize,
+                )
+                return preserved
+        raise
+    preserved = source_state_panes(state, is_source_entry=is_source_entry) if isinstance(state, dict) else []
+    inventory = source_inventory_panes(
+        snapshot,
+        preserved_panes=preserved,
+        pane_key=pane_key,
+        sanitize=sanitize,
+        raw_space_id_predicate=raw_space_id_predicate,
+    )
+    note_source_inventory_result(state, inventory, now=now)
+    return list(inventory.get("panes") or [])
+
+
 def is_source_read_pane(pane: dict[str, Any] | None) -> bool:
     return isinstance(pane, dict) and bool(pane.get("_tendwire_source_read"))
 
