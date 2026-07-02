@@ -857,9 +857,13 @@ delivery bookkeeping.
    systemctl --user is-active herdr-telegram-topics.timer || true
    ```
 
-   `herdres doctor` reports this guard without touching Telegram messages. With
-   `--fix`, it disables an active `herdr-telegram-topics.timer` only when the
-   current Tendwire mode conflicts with the legacy refresher.
+   `herdres doctor` reports this guard and the required source-mode service
+   shape without touching Telegram messages. In `source`, `source-read`, or
+   `commands` mode it expects `tendwired.service`, `herdres.timer`, and
+   `herdres-gateway.service` to be active and enabled, and it expects
+   `herdr-telegram-topics.timer` to be inactive. With `--fix`, it enables and
+   starts missing required services and disables an active legacy timer only
+   when the current Tendwire mode conflicts with the legacy refresher.
 
 4. Roll out modes one step at a time in `~/.config/herdres/herdres.env`:
 

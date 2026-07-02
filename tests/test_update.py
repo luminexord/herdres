@@ -266,6 +266,40 @@ class DoctorTests(UpdateTestBase):
         self.assertTrue(result["legacy_timer"]["active"])
         self.assertFalse(result["legacy_timer"]["conflict"])
 
+    def test_source_services_doctor_warns_when_required_service_inactive_or_disabled(self):
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True):
+            result = herdres.source_services_doctor()
+
+        self.assertFalse(result["ok"], result)
+        services = result["services"]
+        self.assertTrue(services["tendwired.service"]["conflict"])
+        self.assertFalse(services["tendwired.service"]["active"])
+        self.assertFalse(services["tendwired.service"]["enabled"])
+        self.assertTrue(services["herdres.timer"]["conflict"])
+        self.assertFalse(services["herdres.timer"]["active"])
+        self.assertTrue(services["herdres.timer"]["enabled"])
+        self.assertFalse(services["herdres-gateway.service"]["conflict"])
+
+    def test_source_services_doctor_fix_enables_and_starts_required_units(self):
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True):
+            result = herdres.source_services_doctor(fix=True)
+
+        self.assertTrue(result["ok"], result)
+        for unit in ("tendwired.service", "herdres.timer", "herdres-gateway.service"):
+            self.assertFalse(result["services"][unit]["conflict"], unit)
+        self.assertIn(["systemctl", "--user", "enable", "--now", "tendwired.service"], self.router.calls)
+        self.assertIn(["systemctl", "--user", "enable", "--now", "herdres.timer"], self.router.calls)
+        self.assertNotIn(["systemctl", "--user", "enable", "--now", "herdres-gateway.service"], self.router.calls)
+
+    def test_source_services_doctor_does_not_require_services_in_enrich_mode(self):
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "enrich"}, clear=True):
+            result = herdres.source_services_doctor()
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["required"])
+        self.assertFalse(result["services"]["tendwired.service"]["conflict"])
+        self.assertFalse(result["services"]["herdres.timer"]["conflict"])
+
 
 class SourceResolutionTests(UpdateTestBase):
     def test_repo_flag_wins(self):
