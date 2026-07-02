@@ -2457,6 +2457,12 @@ def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) 
     entry["last_turn_available"] = True
     entry.pop("last_turn_reason", None)
     feed_source = tendwire_source_turn_feed_source(turn)
+    stream_text = sanitize_text(str(feed_source.get("assistant_stream_text") or ""), MAX_REPLY_CHARS).strip()
+    stream_turn_id = sanitize_text(str(feed_source.get("turn_id") or ""), 300).strip()
+    if stream_text and stream_turn_id and feed_source.get("has_open_turn") is True:
+        entry["pending_stream_turn_id"] = stream_turn_id
+        entry["pending_stream_text"] = stream_text
+        entry["pending_stream_revision"] = stream_text_hash(stream_text)
     item = make_turn_feed_item(feed_source)
     if not item and feed_source.get("complete") is True and feed_source.get("has_open_turn") is True:
         item = make_turn_feed_item({**feed_source, "has_open_turn": False, "assistant_stream_text": ""})
@@ -13278,6 +13284,9 @@ def _sync_pane_clean_feed(
         item = gitmoot_council_feed_item(pane, entry)
         if isinstance(item, dict):
             item["prompt_collapse_chars"] = int(entry.get("prompt_collapse_chars") or 0)
+    if source_read_pane and suppress_globally_delivered_source_turn(state, pane, entry, item):
+        item = None
+        changed = True
     duplicate_owner_key = duplicate_native_session_owner_key(state, entry)
     if duplicate_owner_key:
         if suppress_duplicate_native_session_item(entry, item, duplicate_owner_key):
@@ -13404,9 +13413,6 @@ def _sync_pane_clean_feed(
             changed = True
 
     old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
-    if source_read_pane and suppress_globally_delivered_source_turn(state, pane, entry, item):
-        item = None
-        changed = True
     if should_baseline_new_pane_turn(entry, item, new_entry):
         record_suppressed_clean_item(entry, item, "new_pane_initial_turn_baseline")
         item = None
