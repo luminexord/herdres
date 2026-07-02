@@ -1017,6 +1017,75 @@ class GatewayManagedBotTests(unittest.TestCase):
         self.assertEqual(run_script.call_count, 2)
         self.assertEqual([call.args[0]["text"] for call in run_script.call_args_list], [first, breaker])
 
+    def test_execute_dispatch_replies_with_configured_target_bot(self) -> None:
+        state = self.single_pane_space_state()
+        state["telegram"]["managed_bots"] = {"codex": {"token": "CODEX_TOKEN", "enabled": True}}
+        state["panes"]["pane-1"]["agent"] = "codex"
+        ready = managed_gateway.ReadyDispatch(
+            message={"message_id": 4000},
+            bot_token="MANAGER_TOKEN",
+            bot_key="manager",
+            received_at=time.monotonic(),
+            dispatch_texts=["hello"],
+            pane_key="pane-1",
+            thread_id="77",
+            chat_id="-1001",
+            user_id="42",
+            from_bot=False,
+            target_bot_kind="",
+            reply_to_message_id="",
+            attachment=None,
+        )
+        calls = []
+
+        def fake_api(method, params=None, timeout=30, *, token=None):
+            calls.append((method, params, token))
+            return {"ok": True}
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", Mock(return_value={"handled": True, "reply": "Sent."})
+        ), patch.object(managed_gateway, "api", fake_api):
+            managed_gateway.execute_dispatch(ready)
+
+        self.assertEqual([(method, token) for method, _params, token in calls], [("sendMessage", "CODEX_TOKEN")])
+
+    def test_execute_dispatch_falls_back_to_manager_when_target_bot_reply_fails(self) -> None:
+        state = self.single_pane_space_state()
+        state["telegram"]["managed_bots"] = {"codex": {"token": "CODEX_TOKEN", "enabled": True}}
+        state["panes"]["pane-1"]["agent"] = "codex"
+        ready = managed_gateway.ReadyDispatch(
+            message={"message_id": 4000},
+            bot_token="MANAGER_TOKEN",
+            bot_key="manager",
+            received_at=time.monotonic(),
+            dispatch_texts=["hello"],
+            pane_key="pane-1",
+            thread_id="77",
+            chat_id="-1001",
+            user_id="42",
+            from_bot=False,
+            target_bot_kind="",
+            reply_to_message_id="",
+            attachment=None,
+        )
+        calls = []
+
+        def fake_api(method, params=None, timeout=30, *, token=None):
+            calls.append((method, params, token))
+            if token == "CODEX_TOKEN":
+                raise RuntimeError("bot has no group access")
+            return {"ok": True}
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", Mock(return_value={"handled": True, "reply": "Sent."})
+        ), patch.object(managed_gateway, "api", fake_api):
+            managed_gateway.execute_dispatch(ready)
+
+        self.assertEqual(
+            [(method, token) for method, _params, token in calls],
+            [("sendMessage", "CODEX_TOKEN"), ("sendMessage", "MANAGER_TOKEN")],
+        )
+
     def test_held_fragment_persists_before_offset(self) -> None:
         state = self.single_pane_space_state()
         body = "a" * 4041

@@ -485,6 +485,21 @@ def managed_bot_tokens(state: dict | None = None) -> list[tuple[str, str]]:
     return records
 
 
+def managed_bot_token_for_kind(state: dict | None, kind: str) -> str | None:
+    if not state:
+        return None
+    clean_kind = str(kind or "").strip().lower()
+    if clean_kind not in MANAGED_BOT_SUGGESTED_USERNAMES:
+        return None
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+    record = bots.get(clean_kind) if isinstance(bots, dict) else None
+    if not isinstance(record, dict) or record.get("enabled") is False:
+        return None
+    token = str(record.get("token") or "").strip()
+    return token or None
+
+
 def typing_action_enabled() -> bool:
     # Runtime read (default OFF) per the import-time flag gotcha. In prod the env comes from the
     # service EnvironmentFile, so disabling needs a gateway restart; this in-loop check still lets a
@@ -877,7 +892,7 @@ def send_reply(
     text: str,
     *,
     reply_to_message_id: str = "",
-) -> None:
+) -> bool:
     """Send a plain sendMessage reply in a mapped topic, logging failures."""
     params: dict = {"chat_id": chat_id, "text": text}
     if reply_to_message_id:
@@ -886,8 +901,26 @@ def send_reply(
         params["message_thread_id"] = thread_id
     try:
         api("sendMessage", params, token=bot_token)
+        return True
     except Exception as exc:
         log(f"sendMessage reply failed: {exc}")
+        return False
+
+
+def reply_bot_token_for_dispatch(state: dict | None, ready: ReadyDispatch) -> str | None:
+    if not state:
+        return None
+    token = managed_bot_token_for_kind(state, str(ready.target_bot_kind or ""))
+    if token:
+        return token
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    entry = panes.get(str(ready.pane_key or ""))
+    if isinstance(entry, dict):
+        kind = managed_bot_kind_for_entry(entry)
+        token = managed_bot_token_for_kind(state, kind)
+        if token:
+            return token
+    return None
 
 
 def answer_callback_query(bot_token: str | None, callback_query_id: str, result: dict) -> None:
@@ -1166,7 +1199,23 @@ def execute_dispatch(ready: ReadyDispatch) -> None:
         reply = str(result.get("reply") or "").strip()
         if not reply:
             continue
-        send_reply(ready.bot_token, ready.chat_id, ready.thread_id, reply, reply_to_message_id=payload["message_id"])
+        reply_state = load_state()
+        reply_token = reply_bot_token_for_dispatch(reply_state, ready) or ready.bot_token
+        sent = send_reply(
+            reply_token,
+            ready.chat_id,
+            ready.thread_id,
+            reply,
+            reply_to_message_id=payload["message_id"],
+        )
+        if not sent and reply_token and reply_token != ready.bot_token:
+            send_reply(
+                ready.bot_token,
+                ready.chat_id,
+                ready.thread_id,
+                reply,
+                reply_to_message_id=payload["message_id"],
+            )
 
 
 def handle_message(message: dict, *, bot_token: str | None = None, bot_key: str | None = None) -> None:
