@@ -2192,45 +2192,6 @@ def tendwire_attention_notice_html(payload: dict[str, Any]) -> str:
     return "".join(blocks)
 
 
-def tendwire_outbox_worker_route_entry(
-    state: dict[str, Any],
-    payload: dict[str, Any],
-) -> dict[str, Any] | None:
-    attention = payload.get("attention") if isinstance(payload.get("attention"), dict) else {}
-    meta = attention.get("meta") if isinstance(attention.get("meta"), dict) else {}
-    worker_id = sanitize_text(str(meta.get("worker_id") or ""), 160).strip()
-    if not worker_id:
-        source = sanitize_text(str(attention.get("source") or ""), 160).strip()
-        if source.startswith("worker:"):
-            worker_id = source.split(":", 1)[1].strip()
-    if not worker_id:
-        return None
-
-    space_id = sanitize_text(str(meta.get("space_id") or ""), 160).strip()
-    acceptable_space_keys = {space_id, f"workspace:{space_id}"} if space_id else set()
-    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
-    matches: list[dict[str, Any]] = []
-    for entry in panes.values():
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("worker_id") or "") != worker_id:
-            continue
-        if not (
-            entry.get("_tendwire_source_read")
-            or str(entry.get("source") or "").strip().lower() == "tendwire"
-            or str(entry.get("entry_type") or "").strip().lower() == "worker"
-        ):
-            continue
-        matches.append(entry)
-    if not matches:
-        return None
-    if acceptable_space_keys:
-        for entry in matches:
-            if str(entry.get("space_key") or "") in acceptable_space_keys:
-                return entry
-    return matches[0]
-
-
 def tendwire_outbox_item_identity(item: dict[str, Any]) -> str:
     return herdres_tendwire.outbox_item_identity(item)
 
@@ -2252,7 +2213,7 @@ def deliver_tendwire_outbox_item(
     payload = _tendwire_attention_payload(item)
     html_text = tendwire_attention_notice_html(payload)
     fallback_text = tendwire_attention_notice_text(payload)
-    route_entry = tendwire_outbox_worker_route_entry(state, payload)
+    route_entry = herdres_tendwire.outbox_worker_route_entry(state, payload, sanitize=sanitize_text)
     if route_entry is not None:
         thread_id = route_entry.get("topic_id") or telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID)
         reply_to_message_id = pane_root_reply_target(route_entry)

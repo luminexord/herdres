@@ -63,6 +63,31 @@ class TendwireOutboxTests(unittest.TestCase):
         self.assertEqual(herdres.tendwire_outbox_item_identity(item), herdres_tendwire.outbox_item_identity(item))
         self.assertEqual(herdres_tendwire.outbox_item_identity(item), herdres_tendwire.outbox_item_identity(dict(item)))
 
+    def test_tendwire_outbox_worker_route_resolution_lives_in_tendwire_module(self) -> None:
+        item = _item()
+        payload = herdres_tendwire.outbox_item_payload(item)
+        payload["attention"]["source"] = "worker:codex-1"
+        payload["attention"]["meta"] = {"space_id": "w1"}
+        state = _state()
+        state["panes"]["other"] = {
+            "source": "tendwire",
+            "entry_type": "worker",
+            "tendwire_worker_id": "codex-1",
+            "space_key": "workspace:other",
+            "topic_id": "11",
+        }
+        state["panes"]["match"] = {
+            "source": "tendwire",
+            "entry_type": "worker",
+            "worker_id": "codex-1",
+            "space_key": "workspace:w1",
+            "topic_id": "77",
+        }
+
+        route = herdres_tendwire.outbox_worker_route_entry(state, payload)
+
+        self.assertIs(route, state["panes"]["match"])
+
     def test_tendwire_outbox_audit_state_helpers_live_in_tendwire_module(self) -> None:
         state = _state()
         herdres_tendwire.note_outbox_audit(

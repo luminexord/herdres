@@ -151,6 +151,44 @@ def outbox_item_identity(item: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
 
 
+def outbox_worker_route_entry(
+    state: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    sanitize: Sanitizer = _default_sanitize,
+) -> dict[str, Any] | None:
+    attention = payload.get("attention") if isinstance(payload.get("attention"), dict) else {}
+    meta = attention.get("meta") if isinstance(attention.get("meta"), dict) else {}
+    worker_id = sanitize(str(meta.get("worker_id") or ""), 160).strip()
+    if not worker_id:
+        source = sanitize(str(attention.get("source") or ""), 160).strip()
+        if source.startswith("worker:"):
+            worker_id = source.split(":", 1)[1].strip()
+    if not worker_id:
+        return None
+
+    space_id = sanitize(str(meta.get("space_id") or ""), 160).strip()
+    acceptable_space_keys = {space_id, f"workspace:{space_id}"} if space_id else set()
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    matches: list[dict[str, Any]] = []
+    for entry in panes.values():
+        if not isinstance(entry, dict):
+            continue
+        entry_worker_id = str(entry.get("worker_id") or entry.get("tendwire_worker_id") or "").strip()
+        if entry_worker_id != worker_id:
+            continue
+        if not is_source_entry(entry):
+            continue
+        matches.append(entry)
+    if not matches:
+        return None
+    if acceptable_space_keys:
+        for entry in matches:
+            if str(entry.get("space_key") or "") in acceptable_space_keys:
+                return entry
+    return matches[0]
+
+
 def outbox_delivered_identities(state: dict[str, Any]) -> set[str]:
     audit = state.get("tendwire_outbox") if isinstance(state.get("tendwire_outbox"), dict) else {}
     identities = audit.get("delivered_identities") if isinstance(audit.get("delivered_identities"), list) else []
