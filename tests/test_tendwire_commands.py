@@ -588,6 +588,41 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             "ok",
         )
 
+    def test_attachment_preflight_for_entry_reads_mode_and_source_state(self) -> None:
+        legacy_entry = _entry(source="herdr", pane_id="pane-1")
+        source_entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            tendwire_worker_id="worker-1",
+            tendwire_fingerprint="fp-1",
+        )
+
+        self.assertEqual(
+            herdres_tendwire.attachment_send_preflight_for_entry(
+                legacy_entry,
+                "document",
+                {"HERDRES_TENDWIRE_MODE": "source"},
+            ),
+            "legacy_source_block",
+        )
+        self.assertEqual(
+            herdres_tendwire.attachment_send_preflight_for_entry(
+                source_entry,
+                "voice",
+                {"HERDRES_TENDWIRE_MODE": "source-read"},
+            ),
+            "source_attachment_unsupported",
+        )
+        self.assertEqual(
+            herdres_tendwire.attachment_send_preflight_for_entry(
+                legacy_entry,
+                "photo",
+                {"HERDRES_TENDWIRE_MODE": "off"},
+            ),
+            "ok",
+        )
+
 
 class TendwireCommandRoutingTests(unittest.TestCase):
     @contextmanager

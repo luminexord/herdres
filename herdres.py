@@ -15339,10 +15339,9 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "reply": "This topic is mapped to a closed or unavailable Herdr pane."}
     pane_api_token = managed_bot_token_for_entry(telegram, entry)
     attachment = payload.get("attachment")
-    attachment_policy = herdres_tendwire.attachment_send_preflight_policy(
-        source_inventory_enabled=tendwire_source_inventory_enabled(),
-        source_entry=source_entry,
-        attachment_kind=str(attachment.get("kind") or "") if isinstance(attachment, dict) else "",
+    attachment_policy = herdres_tendwire.attachment_send_preflight_for_entry(
+        entry,
+        str(attachment.get("kind") or "") if isinstance(attachment, dict) else "",
     )
     if attachment_policy == "legacy_source_block":
         return {

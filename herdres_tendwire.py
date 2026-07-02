@@ -1363,6 +1363,22 @@ def attachment_send_preflight_policy(
     return "ok"
 
 
+def attachment_send_preflight_for_entry(
+    entry: dict[str, Any] | None,
+    attachment_kind: str,
+    env: Any | None = None,
+    *,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> str:
+    mode = parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
+    return attachment_send_preflight_policy(
+        source_inventory_enabled=mode_enables_source_inventory(mode),
+        source_entry=is_source_entry(entry),
+        attachment_kind=attachment_kind,
+    )
+
+
 def same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
     if response_status(response) != "stale_target":
         return None
