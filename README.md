@@ -529,7 +529,11 @@ Telegram still requires each child bot to have access to the forum group. If a c
 
 Pane output is sent by the matching child bot when configured. In Tendwire `source` and `source-read` modes, source workers with a matching child bot use that per-agent voice by default (`HERDR_TELEGRAM_TOPICS_SOURCE_MANAGED_VOICE=1`) so Codex/Claude/Kimi/etc. replies appear from the correct configured bot instead of the shared manager. Short Telegram acknowledgments for commands also use the target worker's configured child bot when one exists, with manager fallback if the child bot is absent or cannot post. Add each child bot to the Telegram forum group so replies to that child bot are delivered to the gateway. If a child bot is configured but Telegram has not granted it group access yet, Herdres records the access problem and prompts for setup instead of silently posting that pane traffic as the manager. If no matching child bot is configured, the shared manager remains the fallback voice.
 
-Per-agent child bots are optional and entirely installation-configured. Herdres ships agent-kind routing rules, but it does not hard-code your bot identities or require every install to create separate bots.
+Per-agent child bots are optional and entirely installation-configured. Herdres
+ships agent-kind routing rules, but it does not hard-code bot identities, token
+values, usernames, or a requirement that every install create separate bots.
+Keep those choices in your local environment/state, and leave managed bots off
+when a single shared manager bot is the desired setup.
 
 The standalone gateway runs one long-poll worker for the manager bot and one worker for each registered child bot. Telegram returns a long poll immediately when a message arrives, and each child bot is isolated from other bot-token waits or reconnect backoff:
 
@@ -930,7 +934,9 @@ delivery bookkeeping.
    # If sqlite3 is not installed:
    python3 - <<'PY'
    import sqlite3
-   with sqlite3.connect('/home/smith/.local/share/tendwire/tendwire.db') as conn:
+   from pathlib import Path
+   db_path = Path.home() / '.local/share/tendwire/tendwire.db'
+   with sqlite3.connect(db_path) as conn:
        print(conn.execute('PRAGMA integrity_check').fetchone()[0])
    PY
 
