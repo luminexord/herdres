@@ -319,6 +319,22 @@ SECRET_PATTERNS = [
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
     re.compile(r"(?i)([?&](?:access_token|api[_-]?key|auth[_-]?token|token|signature|sig)=)([^&#\s]+)"),
 ]
+PRIVATE_FIELD_VALUE_RE = re.compile(
+    r"(?i)(\b(?:"
+    r"pane_id|terminal_id|backend_target|target_value|raw_target|"
+    r"chat_id|topic_id|message_id|reply_to_message_id|callback_message_id|"
+    r"socket_path|db_path|argv|env|stdout|stderr|private_state|route_blob"
+    r")\b\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+)
+PRIVATE_JSON_FIELD_RE = re.compile(
+    r"(?i)((?:\"|')(?:"
+    r"pane_id|terminal_id|backend_target|target_value|raw_target|"
+    r"chat_id|topic_id|message_id|reply_to_message_id|callback_message_id|"
+    r"socket_path|db_path|argv|env|stdout|stderr|private_state|route_blob"
+    r")(?:\"|')\s*:\s*)(\"[^\"]*\"|'[^']*'|[^\s,}]+)"
+)
+PRIVATE_SOCKET_PATH_RE = re.compile(r"(?<![\w.-])(?:~|/)[^\s'\"<>]*\.sock\b")
+PRIVATE_ROUTE_BLOB_RE = re.compile(r"\bherdr:(?:ag|np|ob|mb):[A-Za-z0-9:_-]+\b")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 TUI_LEADING_CHROME_RE = re.compile(r"^\s*[│┃└┌┐┘├┤╭╮╰╯⎿]\s*")
@@ -713,6 +729,10 @@ def sanitize_text(text: str, max_chars: int = MAX_REPLY_CHARS) -> str:
             out = pat.sub(lambda m: f"{m.group(1)}=***", out)
         else:
             out = pat.sub("***", out)
+    out = PRIVATE_JSON_FIELD_RE.sub(lambda m: f"{m.group(1)}\"***\"", out)
+    out = PRIVATE_FIELD_VALUE_RE.sub(lambda m: f"{m.group(1)}***", out)
+    out = PRIVATE_SOCKET_PATH_RE.sub("[socket-path]", out)
+    out = PRIVATE_ROUTE_BLOB_RE.sub("herdr:<route>", out)
     out = ANSI_RE.sub("", out)
     out = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", out)
     if len(out) > max_chars:

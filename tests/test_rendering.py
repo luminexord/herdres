@@ -71,6 +71,35 @@ class DocumentationRenderTests(unittest.TestCase):
         self.assertIn("HERDR_TELEGRAM_TOPICS_MANAGED_BOT_CODEX_PHOTO=", env_example)
 
 
+class PublicSanitizerTests(unittest.TestCase):
+    def test_sanitize_text_redacts_high_confidence_private_surface_fields(self) -> None:
+        text = (
+            'pane_id="w123:p456" terminal_id=term-secret backend_target=/dev/pts/9 '
+            'chat_id=-1001234567890 topic_id=77 message_id=3001 '
+            '{"socket_path": "/home/smith/.config/herdr/herdr.sock", "stdout": "raw pane output"} '
+            "route herdr:ag:space-token:pane-token"
+        )
+
+        sanitized = herdres.sanitize_text(text, 1000)
+
+        self.assertNotIn("w123:p456", sanitized)
+        self.assertNotIn("term-secret", sanitized)
+        self.assertNotIn("/dev/pts/9", sanitized)
+        self.assertNotIn("-1001234567890", sanitized)
+        self.assertNotIn("topic_id=77", sanitized)
+        self.assertNotIn("3001", sanitized)
+        self.assertNotIn("/home/smith/.config/herdr/herdr.sock", sanitized)
+        self.assertNotIn("raw pane output", sanitized)
+        self.assertNotIn("herdr:ag:space-token:pane-token", sanitized)
+        self.assertIn("pane_id=***", sanitized)
+        self.assertIn("herdr:<route>", sanitized)
+
+    def test_sanitize_text_preserves_normal_product_display_text(self) -> None:
+        text = "Herdres reports: Herdr backend degraded; Telegram connector degraded."
+
+        self.assertEqual(herdres.sanitize_text(text, 1000), text)
+
+
 class SpaceTopicStateTests(unittest.TestCase):
     def test_space_key_prefers_space_id_then_workspace_then_cwd_default(self) -> None:
         self.assertEqual(herdres.space_key({"space_id": "alpha"}), "space:alpha")
