@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import herdres
+import herdres_tendwire
 
 
 def _completed(payload: dict, returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -51,6 +52,17 @@ def _state() -> dict:
 
 
 class TendwireOutboxTests(unittest.TestCase):
+    def test_tendwire_outbox_helpers_normalize_payload_and_identity(self) -> None:
+        item = _item()
+        payload = herdres_tendwire.outbox_item_payload(item)
+
+        self.assertEqual(payload["event_type"], "attention_created")
+        self.assertEqual(herdres_tendwire.outbox_event_type(payload), "attention_created")
+        self.assertEqual(herdres_tendwire.outbox_event_type({}), "attention")
+        self.assertEqual(herdres_tendwire.outbox_item_payload({"payload": "not-public-json"}), {})
+        self.assertEqual(herdres.tendwire_outbox_item_identity(item), herdres_tendwire.outbox_item_identity(item))
+        self.assertEqual(herdres_tendwire.outbox_item_identity(item), herdres_tendwire.outbox_item_identity(dict(item)))
+
     def test_drain_posts_attention_and_acks_public_response(self) -> None:
         calls: list[list[str]] = []
         ack_responses: list[dict] = []

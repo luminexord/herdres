@@ -2098,12 +2098,11 @@ def tendwire_connector_call(action: str, params: dict[str, Any] | None = None) -
 
 
 def _tendwire_attention_payload(item: dict[str, Any]) -> dict[str, Any]:
-    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-    return dict(payload) if isinstance(payload, dict) else {}
+    return herdres_tendwire.outbox_item_payload(item)
 
 
 def _tendwire_attention_event_type(payload: dict[str, Any]) -> str:
-    return sanitize_text(str(payload.get("event_type") or "attention"), 80).strip() or "attention"
+    return herdres_tendwire.outbox_event_type(payload, sanitize=sanitize_text)
 
 
 def tendwire_attention_notice_text(payload: dict[str, Any]) -> str:
@@ -2146,9 +2145,7 @@ def tendwire_attention_notice_html(payload: dict[str, Any]) -> str:
 
 
 def tendwire_outbox_item_identity(item: dict[str, Any]) -> str:
-    payload = _tendwire_attention_payload(item)
-    body = {"key": str(item.get("key") or ""), "payload": payload}
-    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+    return herdres_tendwire.outbox_item_identity(item)
 
 
 def tendwire_outbox_delivered_identities(state: dict[str, Any]) -> set[str]:

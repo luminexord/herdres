@@ -131,6 +131,20 @@ def connector_failure_delay_seconds(env: Any | None = None) -> int:
     )
 
 
+def outbox_item_payload(item: dict[str, Any]) -> dict[str, Any]:
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def outbox_event_type(payload: dict[str, Any], *, sanitize: Sanitizer = _default_sanitize) -> str:
+    return sanitize(str(payload.get("event_type") or "attention"), 80).strip() or "attention"
+
+
+def outbox_item_identity(item: dict[str, Any]) -> str:
+    body = {"key": str(item.get("key") or ""), "payload": outbox_item_payload(item)}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+
+
 def _env_source(env: Any | None = None) -> Any:
     return os.environ if env is None else env
 
