@@ -224,6 +224,35 @@ class TendwireOutboxTests(unittest.TestCase):
             },
         )
 
+    def test_tendwire_outbox_result_transitions_live_in_tendwire_module(self) -> None:
+        result = herdres_tendwire.outbox_drain_result(True)
+
+        herdres_tendwire.outbox_record_delivery_success(result)
+        self.assertEqual(result["delivered"], 1)
+        self.assertTrue(result["changed"])
+
+        herdres_tendwire.outbox_record_ack_response(result, {"ok": True})
+        self.assertEqual(result["acked"], 1)
+        self.assertEqual(result["failed"], 0)
+
+        herdres_tendwire.outbox_record_ack_response(result, {"ok": False})
+        self.assertEqual(result["acked"], 1)
+        self.assertEqual(result["failed"], 1)
+
+        herdres_tendwire.outbox_record_defer_response(result, {"ok": True})
+        self.assertEqual(result["deferred"], 1)
+
+        herdres_tendwire.outbox_record_defer_response(result, {"ok": False})
+        self.assertEqual(result["deferred"], 1)
+        self.assertTrue(result["changed"])
+
+        herdres_tendwire.outbox_record_fail_response(result, {"ok": True})
+        self.assertEqual(result["failed"], 2)
+
+        herdres_tendwire.outbox_record_fail_response(result, {"ok": False})
+        self.assertEqual(result["failed"], 2)
+        self.assertTrue(result["changed"])
+
     def test_drain_posts_attention_and_acks_public_response(self) -> None:
         calls: list[list[str]] = []
         ack_responses: list[dict] = []

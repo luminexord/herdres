@@ -2295,11 +2295,7 @@ def drain_tendwire_connector_outbox(
                     sanitize=sanitize_text,
                 ),
             )
-            if ack.get("ok"):
-                result["acked"] += 1
-            else:
-                result["failed"] += 1
-            result["changed"] = True
+            herdres_tendwire.outbox_record_ack_response(result, ack)
             continue
         try:
             sent = deliver_tendwire_outbox_item(state, chat_id, telegram, item)
@@ -2313,32 +2309,25 @@ def drain_tendwire_connector_outbox(
                     sanitize=sanitize_text,
                 ),
             )
-            result["deferred"] += 1 if deferred.get("ok") else 0
-            result["changed"] = True
+            herdres_tendwire.outbox_record_defer_response(result, deferred)
             continue
         except Exception as exc:
             sent = {"ok": False, "error": sanitize_text(str(exc), 300)}
         if sent.get("ok"):
             counters["sends"] = counters.get("sends", 0) + 1
-            result["delivered"] += 1
+            herdres_tendwire.outbox_record_delivery_success(result)
             tendwire_outbox_audit(state, {"identity": identity, "status": "delivered", "recorded_at": utc_now()})
             ack = tendwire_connector_call(
                 "ack",
                 herdres_tendwire.outbox_ack_params(ref, item, sanitize=sanitize_text),
             )
-            if ack.get("ok"):
-                result["acked"] += 1
-            else:
-                result["failed"] += 1
-            result["changed"] = True
+            herdres_tendwire.outbox_record_ack_response(result, ack)
             continue
         failed = tendwire_connector_call(
             "fail",
             herdres_tendwire.outbox_fail_params(ref, sanitize=sanitize_text),
         )
-        if failed.get("ok"):
-            result["failed"] += 1
-        result["changed"] = True
+        herdres_tendwire.outbox_record_fail_response(result, failed)
     return result
 
 

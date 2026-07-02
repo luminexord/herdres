@@ -324,6 +324,39 @@ def outbox_item_action(item: dict[str, Any], delivered_identities: set[str]) -> 
     return {"action": "deliver", "reason": "due", "ref": ref, "identity": identity}
 
 
+def _outbox_increment(result: dict[str, Any], key: str, amount: int = 1) -> None:
+    result[key] = int(result.get(key) or 0) + int(amount)
+
+
+def outbox_record_delivery_success(result: dict[str, Any]) -> dict[str, Any]:
+    _outbox_increment(result, "delivered")
+    result["changed"] = True
+    return result
+
+
+def outbox_record_ack_response(result: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    if response.get("ok"):
+        _outbox_increment(result, "acked")
+    else:
+        _outbox_increment(result, "failed")
+    result["changed"] = True
+    return result
+
+
+def outbox_record_defer_response(result: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    if response.get("ok"):
+        _outbox_increment(result, "deferred")
+    result["changed"] = True
+    return result
+
+
+def outbox_record_fail_response(result: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    if response.get("ok"):
+        _outbox_increment(result, "failed")
+    result["changed"] = True
+    return result
+
+
 def outbox_poll_params(
     *,
     remaining_sends: int,
