@@ -125,7 +125,7 @@ def _source_state() -> tuple[dict, str]:
 
 class TendwireModeTests(unittest.TestCase):
     def test_parse_tendwire_mode_defaults_to_off(self) -> None:
-        self.assertEqual(herdres.parse_tendwire_mode({}), "off")
+        self.assertEqual(herdres_tendwire.parse_mode({}), "off")
 
     def test_parse_tendwire_mode_accepts_public_modes_case_insensitively(self) -> None:
         cases = {
@@ -137,15 +137,15 @@ class TendwireModeTests(unittest.TestCase):
         }
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
-                self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_MODE": raw}), expected)
+                self.assertEqual(herdres_tendwire.parse_mode({"HERDRES_TENDWIRE_MODE": raw}), expected)
 
     def test_command_capable_modes_still_enable_enrichment(self) -> None:
         for mode in ("commands", "source-read", "source"):
-            with self.subTest(mode=mode), patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": mode}, clear=True):
-                self.assertEqual(herdres.tendwire_mode(), mode)
-                self.assertTrue(herdres.tendwire_enrich_enabled())
-                self.assertTrue(herdres.tendwire_snapshot_enabled())
-                self.assertTrue(herdres.tendwire_commands_enabled())
+            with self.subTest(mode=mode):
+                env = {"HERDRES_TENDWIRE_MODE": mode}
+                self.assertEqual(herdres_tendwire.parse_mode(env), mode)
+                self.assertTrue(herdres_tendwire.mode_at_least("enrich", env))
+                self.assertTrue(herdres_tendwire.mode_at_least("commands", env))
 
     def test_tendwire_helper_owns_source_inventory_mode_check(self) -> None:
         self.assertFalse(herdres_tendwire.source_inventory_enabled_for_env({"HERDRES_TENDWIRE_MODE": "off"}))
@@ -287,19 +287,20 @@ class TendwireModeTests(unittest.TestCase):
         self.assertFalse(result["legacy_timer"]["conflict"])
 
     def test_legacy_aliases_normalize_to_enrich_when_mode_unset(self) -> None:
-        self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_HYBRID": "1"}), "enrich")
-        self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_SNAPSHOT": "1"}), "enrich")
+        self.assertEqual(herdres_tendwire.parse_mode({"HERDRES_TENDWIRE_HYBRID": "1"}), "enrich")
+        self.assertEqual(herdres_tendwire.parse_mode({"HERDRES_TENDWIRE_SNAPSHOT": "1"}), "enrich")
         self.assertEqual(
-            herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_HYBRID": "0", "HERDRES_TENDWIRE_SNAPSHOT": "0"}),
+            herdres_tendwire.parse_mode({"HERDRES_TENDWIRE_HYBRID": "0", "HERDRES_TENDWIRE_SNAPSHOT": "0"}),
             "off",
         )
 
     def test_legacy_aliases_do_not_enable_command_routing(self) -> None:
         for key in ("HERDRES_TENDWIRE_HYBRID", "HERDRES_TENDWIRE_SNAPSHOT"):
-            with self.subTest(key=key), patch.dict(os.environ, {key: "1"}, clear=True):
-                self.assertEqual(herdres.tendwire_mode(), "enrich")
-                self.assertTrue(herdres.tendwire_enrich_enabled())
-                self.assertFalse(herdres.tendwire_commands_enabled())
+            with self.subTest(key=key):
+                env = {key: "1"}
+                self.assertEqual(herdres_tendwire.parse_mode(env), "enrich")
+                self.assertTrue(herdres_tendwire.mode_at_least("enrich", env))
+                self.assertFalse(herdres_tendwire.mode_at_least("commands", env))
 
     def test_explicit_valid_mode_wins_over_legacy_aliases(self) -> None:
         env = {
@@ -307,21 +308,28 @@ class TendwireModeTests(unittest.TestCase):
             "HERDRES_TENDWIRE_HYBRID": "1",
             "HERDRES_TENDWIRE_SNAPSHOT": "1",
         }
-        self.assertEqual(herdres.parse_tendwire_mode(env), "off")
+        self.assertEqual(herdres_tendwire.parse_mode(env), "off")
         env["HERDRES_TENDWIRE_MODE"] = "source-read"
-        self.assertEqual(herdres.parse_tendwire_mode(env), "source-read")
+        self.assertEqual(herdres_tendwire.parse_mode(env), "source-read")
 
     def test_invalid_modes_fall_back_to_off_with_diagnostic(self) -> None:
         stderr = io.StringIO()
         env = {"HERDRES_TENDWIRE_MODE": "hybrid"}
         with patch("sys.stderr", stderr):
-            self.assertEqual(herdres.parse_tendwire_mode(env, diagnose_invalid=True), "off")
+            self.assertEqual(
+                herdres_tendwire.parse_mode(
+                    env,
+                    diagnose_invalid=True,
+                    warn_invalid=herdres._warn_invalid_tendwire_mode,
+                ),
+                "off",
+            )
         text = stderr.getvalue()
         self.assertIn("invalid HERDRES_TENDWIRE_MODE 'hybrid'", text)
         self.assertIn("off, enrich, commands, source-read, source", text)
         for invalid in ("snapshot", "enabled", ""):
             with self.subTest(invalid=invalid):
-                self.assertEqual(herdres.parse_tendwire_mode({"HERDRES_TENDWIRE_MODE": invalid}), "off")
+                self.assertEqual(herdres_tendwire.parse_mode({"HERDRES_TENDWIRE_MODE": invalid}), "off")
 
     def test_off_and_invalid_modes_do_not_call_tendwire(self) -> None:
         for mode in ("off", "hybrid"):

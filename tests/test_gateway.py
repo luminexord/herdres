@@ -2275,7 +2275,6 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
             save_state=save_state or Mock(),
             send_to_pane=send_to_pane or Mock(return_value=(True, "")),
             pane_turn=pane_turn or Mock(return_value={"available": True, "turn_id": "turn-before"}),
-            tendwire_commands_enabled=Mock(return_value=False),
         )
 
     def test_command_reply_successful_direct_owner_send_sets_marker(self) -> None:

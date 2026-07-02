@@ -1851,39 +1851,6 @@ def _warn_invalid_tendwire_mode(raw: Any) -> None:
     print(f"herdres tendwire warning: invalid HERDRES_TENDWIRE_MODE {value!r}; allowed values: {allowed}; using off", file=sys.stderr)
 
 
-def parse_tendwire_mode(env: Any | None = None, *, diagnose_invalid: bool = False) -> str:
-    return herdres_tendwire.parse_mode(
-        env,
-        diagnose_invalid=diagnose_invalid,
-        warn_invalid=_warn_invalid_tendwire_mode,
-    )
-
-
-def tendwire_mode() -> str:
-    return parse_tendwire_mode(diagnose_invalid=True)
-
-
-def tendwire_mode_at_least(mode: str, env: Any | None = None) -> bool:
-    return herdres_tendwire.mode_at_least(
-        mode,
-        env,
-        diagnose_invalid=(env is None),
-        warn_invalid=_warn_invalid_tendwire_mode,
-    )
-
-
-def tendwire_enrich_enabled() -> bool:
-    return tendwire_mode_at_least("enrich")
-
-
-def tendwire_snapshot_enabled() -> bool:
-    return tendwire_enrich_enabled()
-
-
-def tendwire_commands_enabled() -> bool:
-    return tendwire_mode_at_least("commands")
-
-
 def tendwire_config_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
     load_dotenv()
     return {"ok": True, "config": herdres_tendwire.config_status(default_herdr_bin=DEFAULT_HERDR_BIN)}
@@ -11610,7 +11577,10 @@ def observed_agent_panes(state: dict[str, Any] | None = None) -> list[dict[str, 
 
     return herdres_tendwire.observed_panes(
         state,
-        mode=tendwire_mode(),
+        mode=herdres_tendwire.parse_mode(
+            diagnose_invalid=True,
+            warn_invalid=_warn_invalid_tendwire_mode,
+        ),
         load_snapshot=tendwire_snapshot,
         load_real_panes=pane_list,
         include_shells=parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", ""),
