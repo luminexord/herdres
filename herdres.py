@@ -12415,23 +12415,18 @@ def archive_legacy_direct_pane_records_for_source(
     for key, entry in list(panes.items()):
         if not isinstance(entry, dict):
             continue
-        if entry_is_tendwire_source(entry):
-            continue
         pane_key_value = str(key)
+        audit = herdres_tendwire.legacy_direct_archive_record(
+            pane_key_value,
+            entry,
+            now=utc_now(),
+            is_source_entry=entry_is_tendwire_source,
+        )
+        if audit is None:
+            continue
         remove_pane_from_space_memberships(state, pane_key_value)
         panes.pop(key, None)
-        removed.append(
-            {
-                "pane_key_hash": hashlib.sha256(pane_key_value.encode("utf-8")).hexdigest()[:16],
-                "source": str(entry.get("source") or "herdr"),
-                "entry_type": str(entry.get("entry_type") or ""),
-                "status": str(entry.get("last_known_status") or ""),
-                "space_key": str(entry.get("space_key") or ""),
-                "had_topic": bool(str(entry.get("topic_id") or "")),
-                "had_private_pane": bool(str(entry.get("pane_id") or "")),
-                "removed_at": utc_now(),
-            }
-        )
+        removed.append(audit)
     if not removed:
         return 0
     spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
@@ -14554,7 +14549,7 @@ def entry_is_live_route_target(entry: dict[str, Any] | None) -> bool:
 
 
 def source_mode_blocks_closed_direct_routes() -> bool:
-    return tendwire_mode() in {"commands", "source-read", "source"}
+    return herdres_tendwire.source_mode_blocks_closed_direct_routes()
 
 
 def preferred_active_route_entry(

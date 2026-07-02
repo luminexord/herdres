@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 MODE_VALUES = ("off", "enrich", "commands", "source-read", "source")
 LEGACY_TIMER_CONFLICT_MODES = {"commands", "source-read", "source"}
+SOURCE_ROUTE_BLOCK_MODES = LEGACY_TIMER_CONFLICT_MODES
 LEGACY_HERDR_TOPIC_TIMER = "herdr-telegram-topics.timer"
 OPTIONAL_ENV_KEYS = {
     "HERDRES_TENDWIRE_DATA_DIR": "TENDWIRE_DATA_DIR",
@@ -82,6 +83,10 @@ def mode_at_least(
         return False
     current = parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
     return MODE_VALUES.index(current) >= wanted
+
+
+def source_mode_blocks_closed_direct_routes(env: Any | None = None) -> bool:
+    return parse_mode(env) in SOURCE_ROUTE_BLOCK_MODES
 
 
 def connector_outbox_enabled(env: Any | None = None) -> bool:
@@ -670,6 +675,28 @@ def retry_request_id(base_request_id: str, candidate: dict[str, str]) -> str:
     fingerprint = str(candidate.get("worker_fingerprint") or "")
     digest = hashlib.sha256(f"{base}:{fingerprint}".encode("utf-8")).hexdigest()[:10]
     return f"{base}:retry:{digest}"
+
+
+def legacy_direct_archive_record(
+    pane_key_value: str,
+    entry: dict[str, Any],
+    *,
+    now: str,
+    is_source_entry: SourceEntryPredicate,
+) -> dict[str, Any] | None:
+    """Build a public-safe audit record for a legacy direct pane archived in source mode."""
+    if is_source_entry(entry):
+        return None
+    return {
+        "pane_key_hash": hashlib.sha256(str(pane_key_value).encode("utf-8")).hexdigest()[:16],
+        "source": str(entry.get("source") or "herdr"),
+        "entry_type": str(entry.get("entry_type") or ""),
+        "status": str(entry.get("last_known_status") or ""),
+        "space_key": str(entry.get("space_key") or ""),
+        "had_topic": bool(str(entry.get("topic_id") or "")),
+        "had_private_pane": bool(str(entry.get("pane_id") or "")),
+        "removed_at": now,
+    }
 
 
 def request_component(
