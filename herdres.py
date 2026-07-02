@@ -9004,21 +9004,25 @@ def send_to_tendwire_worker_response(
         request_id=request_id,
         sanitize=sanitize_text,
     )
-    if attempt.get("duplicate"):
-        return {"handled": True, "reply": ""}
-    response = attempt["response"] if isinstance(attempt.get("response"), dict) else {}
-    ledger_changed = bool(attempt.get("ledger_changed"))
-    if tendwire_command_succeeded(response):
+    result = herdres_tendwire.send_instruction_attempt_result(
+        attempt,
+        safe_failure_reply=TENDWIRE_SAFE_SEND_FAILURE_REPLY,
+        sanitize=sanitize_text,
+    )
+    if result.get("duplicate"):
+        return {"handled": True, "reply": str(result.get("reply") or "")}
+    ledger_changed = bool(result.get("ledger_changed"))
+    if result.get("succeeded"):
         if mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin=origin, pane_id=pane_id):
             ledger_changed = True
         if ledger_changed and persist and state is not None:
             save_state(state)
-        return {"handled": True, "reply": tendwire_success_reply(response)}
+        return {"handled": True, "reply": str(result.get("reply") or "")}
     if tendwire_direct_fallback_enabled() and not entry_is_tendwire_source(entry):
         return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
     if ledger_changed and persist and state is not None:
         save_state(state)
-    return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
+    return {"handled": True, "reply": str(result.get("reply") or TENDWIRE_SAFE_SEND_FAILURE_REPLY)}
 
 
 def interrupt_and_send_response(

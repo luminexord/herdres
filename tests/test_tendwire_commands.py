@@ -836,6 +836,33 @@ class TendwireCommandRoutingTests(unittest.TestCase):
             "accepted for delivery",
         )
 
+    def test_tendwire_helper_attempt_result_returns_public_send_reply(self) -> None:
+        duplicate = herdres_tendwire.send_instruction_attempt_result(
+            {"duplicate": True, "response": {"status": "accepted"}, "ledger_changed": True},
+            safe_failure_reply=herdres.TENDWIRE_SAFE_SEND_FAILURE_REPLY,
+        )
+        self.assertTrue(duplicate["duplicate"])
+        self.assertTrue(duplicate["succeeded"])
+        self.assertEqual(duplicate["reply"], "")
+        self.assertFalse(duplicate["ledger_changed"])
+
+        queued = herdres_tendwire.send_instruction_attempt_result(
+            {"response": {"status": "accepted", "result": {"delivery_state": "queued"}}, "ledger_changed": True},
+            safe_failure_reply=herdres.TENDWIRE_SAFE_SEND_FAILURE_REPLY,
+        )
+        self.assertFalse(queued["duplicate"])
+        self.assertTrue(queued["succeeded"])
+        self.assertTrue(queued["ledger_changed"])
+        self.assertEqual(queued["reply"], "Queued for Tendwire worker.")
+
+        failed = herdres_tendwire.send_instruction_attempt_result(
+            {"response": {"status": "backend_unavailable"}, "ledger_changed": True},
+            safe_failure_reply=herdres.TENDWIRE_SAFE_SEND_FAILURE_REPLY,
+        )
+        self.assertFalse(failed["succeeded"])
+        self.assertEqual(failed["status"], "backend_unavailable")
+        self.assertEqual(failed["reply"], herdres.TENDWIRE_SAFE_SEND_FAILURE_REPLY)
+
     def test_duplicate_request_mismatched_payload_fails_without_direct_fallback(self) -> None:
         entry = _entry()
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "commands"}, clear=True), \

@@ -1328,6 +1328,44 @@ def submit_send_instruction_attempt(
     }
 
 
+def send_instruction_attempt_result(
+    attempt: dict[str, Any] | None,
+    *,
+    safe_failure_reply: str,
+    sanitize: Sanitizer = _default_sanitize,
+) -> dict[str, Any]:
+    """Translate a submitted command attempt into public send response state."""
+    data = attempt if isinstance(attempt, dict) else {}
+    response = data.get("response") if isinstance(data.get("response"), dict) else {}
+    if data.get("duplicate"):
+        return {
+            "duplicate": True,
+            "succeeded": True,
+            "ledger_changed": False,
+            "reply": "",
+            "response": response,
+            "status": "duplicate",
+        }
+    ledger_changed = bool(data.get("ledger_changed"))
+    if command_succeeded(response):
+        return {
+            "duplicate": False,
+            "succeeded": True,
+            "ledger_changed": ledger_changed,
+            "reply": success_reply(response, sanitize=sanitize),
+            "response": response,
+            "status": response_status(response) or "accepted",
+        }
+    return {
+        "duplicate": False,
+        "succeeded": False,
+        "ledger_changed": ledger_changed,
+        "reply": str(safe_failure_reply or ""),
+        "response": response,
+        "status": response_status(response) or "failed",
+    }
+
+
 def worker_status_for_herdres(status: str) -> str:
     value = str(status or "unknown").strip().lower().replace("-", "_")
     if value in {"active", "running", "working", "busy"}:
