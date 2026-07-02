@@ -15678,7 +15678,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if (not pane_id and not source_entry) or entry.get("last_known_status") == "closed":
         return {"handled": True, "reply": "This topic is mapped to a closed or unavailable Herdr pane."}
     pane_api_token = managed_bot_token_for_entry(telegram, entry)
-    if tendwire_source_inventory_enabled() and not source_entry:
+    attachment = payload.get("attachment")
+    attachment_policy = herdres_tendwire.attachment_send_preflight_policy(
+        source_inventory_enabled=tendwire_source_inventory_enabled(),
+        source_entry=source_entry,
+        attachment_kind=str(attachment.get("kind") or "") if isinstance(attachment, dict) else "",
+    )
+    if attachment_policy == "legacy_source_block":
         return {
             "handled": True,
             "reply": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending.",
@@ -15688,8 +15694,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     or entry.get("agent") or entry.get("pane_id") or "pane")
         return {"handled": True, "reply": f"Only one agent here ({label}) — your messages already route to it."}
 
-    attachment = payload.get("attachment")
-    if source_entry and isinstance(attachment, dict) and attachment.get("kind") in {"document", "photo", "voice"}:
+    if attachment_policy == "source_attachment_unsupported":
         return {
             "handled": True,
             "reply": "Attachments and voice notes are not available in Tendwire source-read mode yet; send text with /send.",

@@ -436,6 +436,32 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             "ok",
         )
 
+    def test_attachment_preflight_policy_keeps_source_mode_out_of_direct_herdr(self) -> None:
+        self.assertEqual(
+            herdres_tendwire.attachment_send_preflight_policy(
+                source_inventory_enabled=True,
+                source_entry=False,
+                attachment_kind="document",
+            ),
+            "legacy_source_block",
+        )
+        self.assertEqual(
+            herdres_tendwire.attachment_send_preflight_policy(
+                source_inventory_enabled=True,
+                source_entry=True,
+                attachment_kind="voice",
+            ),
+            "source_attachment_unsupported",
+        )
+        self.assertEqual(
+            herdres_tendwire.attachment_send_preflight_policy(
+                source_inventory_enabled=False,
+                source_entry=False,
+                attachment_kind="photo",
+            ),
+            "ok",
+        )
+
 
 class TendwireCommandRoutingTests(unittest.TestCase):
     @contextmanager
@@ -1024,6 +1050,29 @@ class TendwireCommandRoutingTests(unittest.TestCase):
             keys_result = herdres.command_reply(_payload(text="/keys enter"))
 
         self.assertIn("Raw key delivery is not available", keys_result["reply"])
+        patched["send_to_pane"].assert_not_called()
+        patched["run_cmd"].assert_not_called()
+
+    def test_source_mode_voice_attachment_fails_before_direct_herdr_delivery(self) -> None:
+        source_entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            worker_id="worker-1",
+            worker_fingerprint="fp-1",
+        )
+        state = _state(source_entry)
+        payload = _payload(
+            text="",
+            attachment={"kind": "voice", "file_id": "voice-file"},
+        )
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                self._command_patches(state) as patched, \
+                patch.object(herdres, "deliver_attachment") as deliver_attachment:
+            result = herdres.command_reply(payload)
+
+        self.assertIn("not available in Tendwire source-read mode", result["reply"])
+        deliver_attachment.assert_not_called()
         patched["send_to_pane"].assert_not_called()
         patched["run_cmd"].assert_not_called()
 

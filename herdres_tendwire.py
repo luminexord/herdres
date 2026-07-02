@@ -941,6 +941,20 @@ def callback_choice_preflight_policy(
     return "ok"
 
 
+def attachment_send_preflight_policy(
+    *,
+    source_inventory_enabled: bool,
+    source_entry: bool,
+    attachment_kind: str,
+) -> str:
+    """Classify attachment/voice sends before any direct Herdr delivery path."""
+    if source_inventory_enabled and not source_entry:
+        return "legacy_source_block"
+    if source_entry and str(attachment_kind or "").strip().lower() in {"document", "photo", "voice"}:
+        return "source_attachment_unsupported"
+    return "ok"
+
+
 def same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
     if response_status(response) != "stale_target":
         return None
