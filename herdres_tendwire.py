@@ -484,6 +484,55 @@ COMMAND_FAILURE_STATUSES = {
     "timeout",
     "subprocess_failed",
 }
+ENTRY_METADATA_KEYS = (
+    "tendwire_worker_id",
+    "tendwire_fingerprint",
+    "tendwire_status_line",
+    "tendwire_last_seen_at",
+)
+
+
+def is_source_entry(entry: dict[str, Any] | None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    if str(entry.get("source") or "") != "tendwire":
+        return False
+    if str(entry.get("entry_type") or "") == "worker":
+        return True
+    if str(entry.get("pane_id") or "").startswith("tendwire:"):
+        return True
+    return bool(str(entry.get("tendwire_worker_id") or "").strip())
+
+
+def source_entry_commands_allowed(
+    entry: dict[str, Any] | None,
+    *,
+    source_read_enabled: bool,
+    commands_enabled: bool,
+) -> bool:
+    return is_source_entry(entry) and bool(source_read_enabled) and bool(commands_enabled)
+
+
+def entry_metadata_state(
+    entry: dict[str, Any] | None,
+    *,
+    source_read_enabled: bool,
+    commands_enabled: bool,
+) -> str:
+    if not isinstance(entry, dict):
+        return "none"
+    if is_source_entry(entry) and not source_entry_commands_allowed(
+        entry,
+        source_read_enabled=source_read_enabled,
+        commands_enabled=commands_enabled,
+    ):
+        return "none"
+    has_metadata = any(key in entry for key in ENTRY_METADATA_KEYS)
+    if not has_metadata:
+        return "none"
+    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
+    fingerprint = str(entry.get("tendwire_fingerprint") or "").strip()
+    return "valid" if worker_id and fingerprint else "partial"
 
 
 def response_status(response: dict[str, Any]) -> str:

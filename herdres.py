@@ -12264,41 +12264,27 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
 
 
 def entry_is_tendwire_source(entry: dict[str, Any] | None) -> bool:
-    if not isinstance(entry, dict):
-        return False
-    if str(entry.get("source") or "") != "tendwire":
-        return False
-    if str(entry.get("entry_type") or "") == "worker":
-        return True
-    if str(entry.get("pane_id") or "").startswith("tendwire:"):
-        return True
-    return bool(str(entry.get("tendwire_worker_id") or "").strip())
+    return herdres_tendwire.is_source_entry(entry)
 
 
 def tendwire_source_entry_commands_allowed(entry: dict[str, Any] | None) -> bool:
-    return entry_is_tendwire_source(entry) and tendwire_source_read_enabled() and tendwire_commands_enabled()
+    return herdres_tendwire.source_entry_commands_allowed(
+        entry,
+        source_read_enabled=tendwire_source_read_enabled(),
+        commands_enabled=tendwire_commands_enabled(),
+    )
 
 
-TENDWIRE_ENTRY_METADATA_KEYS = (
-    "tendwire_worker_id",
-    "tendwire_fingerprint",
-    "tendwire_status_line",
-    "tendwire_last_seen_at",
-)
+TENDWIRE_ENTRY_METADATA_KEYS = herdres_tendwire.ENTRY_METADATA_KEYS
 TENDWIRE_SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the target again."
 
 
 def tendwire_entry_metadata_state(entry: dict[str, Any] | None) -> str:
-    if not isinstance(entry, dict):
-        return "none"
-    if entry_is_tendwire_source(entry) and not tendwire_source_entry_commands_allowed(entry):
-        return "none"
-    has_metadata = any(key in entry for key in TENDWIRE_ENTRY_METADATA_KEYS)
-    if not has_metadata:
-        return "none"
-    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
-    fingerprint = str(entry.get("tendwire_fingerprint") or "").strip()
-    return "valid" if worker_id and fingerprint else "partial"
+    return herdres_tendwire.entry_metadata_state(
+        entry,
+        source_read_enabled=tendwire_source_read_enabled(),
+        commands_enabled=tendwire_commands_enabled(),
+    )
 
 
 def tendwire_request_component(value: Any, limit: int = 48) -> str:

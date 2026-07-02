@@ -157,6 +157,52 @@ class TendwireRequestBuilderTests(unittest.TestCase):
         self.assertNotIn("5000", encoded)
         self.assertNotIn("1001", encoded)
 
+    def test_entry_metadata_classification_lives_in_tendwire_helper(self) -> None:
+        legacy = _entry(source="herdr")
+        source_entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            worker_id="worker-1",
+            worker_fingerprint="fp-1",
+        )
+        pseudo_source = _entry(source="tendwire", pane_id="tendwire:worker-1")
+        self.assertFalse(herdres_tendwire.is_source_entry(legacy))
+        self.assertTrue(herdres_tendwire.is_source_entry(source_entry))
+        self.assertTrue(herdres_tendwire.is_source_entry(pseudo_source))
+        self.assertFalse(
+            herdres_tendwire.source_entry_commands_allowed(
+                source_entry,
+                source_read_enabled=True,
+                commands_enabled=False,
+            )
+        )
+        self.assertEqual(
+            herdres_tendwire.entry_metadata_state(
+                source_entry,
+                source_read_enabled=False,
+                commands_enabled=True,
+            ),
+            "none",
+        )
+        self.assertEqual(
+            herdres_tendwire.entry_metadata_state(
+                source_entry,
+                source_read_enabled=True,
+                commands_enabled=True,
+            ),
+            "valid",
+        )
+        partial = dict(legacy, tendwire_worker_id="worker-1", tendwire_fingerprint="")
+        self.assertEqual(
+            herdres_tendwire.entry_metadata_state(
+                partial,
+                source_read_enabled=False,
+                commands_enabled=True,
+            ),
+            "partial",
+        )
+
     def test_send_text_policy_keeps_source_mode_fail_closed(self) -> None:
         self.assertEqual(
             herdres_tendwire.send_text_policy(
