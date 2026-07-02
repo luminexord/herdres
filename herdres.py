@@ -11850,26 +11850,22 @@ def sync_space_pinned_statuses(
 
 
 def observed_agent_panes(state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    if tendwire_source_read_enabled():
-        return herdres_tendwire.source_inventory_from_snapshot_loader(
-            state,
-            load_snapshot=tendwire_snapshot,
-            pane_key=pane_key,
-            is_source_entry=entry_is_tendwire_source,
-            now=utc_now(),
-            sanitize=sanitize_text,
-        )
-    all_panes = pane_list()
-    include_shells = parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "")
-    panes = [pane for pane in all_panes if include_shells or pane.get("agent")]
-    if tendwire_enrich_enabled():
-        try:
-            panes = tendwire_enrich_panes(panes, tendwire_snapshot())
-        except Exception as exc:
-            if not tendwire_fallback_to_herdr_enabled():
-                raise
-            print(f"herdres tendwire warning: {sanitize_text(str(exc), 500)}", file=sys.stderr)
-    return panes
+    def warn_tendwire_inventory_error(exc: Exception) -> None:
+        print(f"herdres tendwire warning: {sanitize_text(str(exc), 500)}", file=sys.stderr)
+
+    return herdres_tendwire.observed_panes(
+        state,
+        mode=tendwire_mode(),
+        load_snapshot=tendwire_snapshot,
+        load_real_panes=pane_list,
+        include_shells=parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", ""),
+        fallback_to_herdr=tendwire_fallback_to_herdr_enabled(),
+        warn=warn_tendwire_inventory_error,
+        pane_key=pane_key,
+        is_source_entry=entry_is_tendwire_source,
+        now=utc_now(),
+        sanitize=sanitize_text,
+    )
 
 
 def state_has_pane_id(state: dict[str, Any], pane_id: str) -> bool:

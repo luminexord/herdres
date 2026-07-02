@@ -1177,6 +1177,52 @@ class TendwireModeTests(unittest.TestCase):
         self.assertIn("socket down", state["tendwire_source_inventory_last_error"])
         self.assertEqual(state["tendwire_source_inventory_preserved_at"], "2026-07-02T00:00:00+00:00")
 
+    def test_tendwire_helper_observed_panes_source_skips_real_pane_loader(self) -> None:
+        load_snapshot = Mock(return_value=_snapshot())
+        load_real_panes = Mock(return_value=[_pane()])
+
+        panes = herdres_tendwire.observed_panes(
+            {},
+            mode="source",
+            load_snapshot=load_snapshot,
+            load_real_panes=load_real_panes,
+            include_shells=False,
+            fallback_to_herdr=True,
+            warn=None,
+            pane_key=herdres.pane_key,
+            is_source_entry=herdres.entry_is_tendwire_source,
+            now="2026-07-02T00:00:00+00:00",
+            sanitize=herdres.sanitize_text,
+        )
+
+        load_snapshot.assert_called_once()
+        load_real_panes.assert_not_called()
+        self.assertEqual([pane["worker_id"] for pane in panes], ["worker-1"])
+
+    def test_tendwire_helper_observed_panes_commands_falls_back_to_real_panes(self) -> None:
+        load_snapshot = Mock(side_effect=RuntimeError("snapshot down"))
+        load_real_panes = Mock(return_value=[_pane(), _pane(pane_id="shell", agent="")])
+        warn = Mock()
+
+        panes = herdres_tendwire.observed_panes(
+            None,
+            mode="commands",
+            load_snapshot=load_snapshot,
+            load_real_panes=load_real_panes,
+            include_shells=False,
+            fallback_to_herdr=True,
+            warn=warn,
+            pane_key=herdres.pane_key,
+            is_source_entry=herdres.entry_is_tendwire_source,
+            now="2026-07-02T00:00:00+00:00",
+            sanitize=herdres.sanitize_text,
+        )
+
+        load_real_panes.assert_called_once()
+        load_snapshot.assert_called_once()
+        warn.assert_called_once()
+        self.assertEqual([pane["pane_id"] for pane in panes], ["pane-1"])
+
     def test_tendwire_helper_updates_source_inventory_state_fields(self) -> None:
         state: dict = {}
         preserved = [{"worker_id": "worker-1"}]

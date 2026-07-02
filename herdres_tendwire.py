@@ -88,9 +88,21 @@ def mode_at_least(
     return MODE_VALUES.index(current) >= wanted
 
 
+def mode_value_at_least(current: str, wanted: str) -> bool:
+    try:
+        wanted_index = MODE_VALUES.index(str(wanted or "").strip().lower())
+        current_index = MODE_VALUES.index(str(current or "").strip().lower())
+    except ValueError:
+        return False
+    return current_index >= wanted_index
+
+
+def mode_enables_enrich(mode: str) -> bool:
+    return mode_value_at_least(mode, "enrich")
+
+
 def mode_enables_commands(mode: str) -> bool:
-    normalized = str(mode or "").strip().lower()
-    return normalized in MODE_VALUES and MODE_VALUES.index(normalized) >= MODE_VALUES.index("commands")
+    return mode_value_at_least(mode, "commands")
 
 
 def mode_enables_source_inventory(mode: str) -> bool:
@@ -1900,6 +1912,45 @@ def source_inventory_from_snapshot_loader(
     )
     note_source_inventory_result(state, inventory, now=now)
     return list(inventory.get("panes") or [])
+
+
+def observed_panes(
+    state: dict[str, Any] | None,
+    *,
+    mode: str,
+    load_snapshot: Callable[[], dict[str, Any]],
+    load_real_panes: Callable[[], list[dict[str, Any]]],
+    include_shells: bool,
+    fallback_to_herdr: bool,
+    warn: Callable[[Exception], None] | None,
+    pane_key: PaneKey,
+    is_source_entry: SourceEntryPredicate,
+    now: str,
+    sanitize: Sanitizer = _default_sanitize,
+    raw_space_id_predicate: RawSpacePredicate | None = None,
+) -> list[dict[str, Any]]:
+    """Select source, enrich, or legacy inventory without owning Telegram state."""
+    if mode_enables_source_inventory(mode):
+        return source_inventory_from_snapshot_loader(
+            state,
+            load_snapshot=load_snapshot,
+            pane_key=pane_key,
+            is_source_entry=is_source_entry,
+            now=now,
+            sanitize=sanitize,
+            raw_space_id_predicate=raw_space_id_predicate,
+        )
+
+    panes = [pane for pane in load_real_panes() if include_shells or pane.get("agent")]
+    if mode_enables_enrich(mode):
+        try:
+            return enrich_panes(panes, load_snapshot(), sanitize=sanitize)
+        except Exception as exc:
+            if not fallback_to_herdr:
+                raise
+            if warn is not None:
+                warn(exc)
+    return panes
 
 
 def is_source_read_pane(pane: dict[str, Any] | None) -> bool:
