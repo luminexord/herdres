@@ -466,6 +466,81 @@ class GatewayManagedBotTests(unittest.TestCase):
         self.assertTrue(tokens[0][0].startswith("managed-codex-"))
         self.assertEqual(tokens[0][1], "CODEX_TOKEN")
 
+    def test_gateway_managed_bot_kind_resolves_glm_and_labels(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"managed_bots": {"glm": {"token": "GLM_TOKEN", "enabled": True}}},
+        }
+
+        self.assertEqual(managed_gateway.managed_bot_kind_for_key("managed-glm-deadbeef"), "glm")
+        self.assertEqual(managed_gateway.managed_bot_token_for_kind(state, "glm"), "GLM_TOKEN")
+        self.assertEqual(managed_gateway.managed_bot_kind_for_entry({"managed_bot_kind": "glm"}), "glm")
+        self.assertEqual(
+            managed_gateway.managed_bot_kind_for_entry(
+                {"agent": "devin", "pane_thread_name": "GLM Devin"}
+            ),
+            "glm",
+        )
+        self.assertEqual(
+            managed_gateway.managed_bot_kind_for_entry(
+                {"agent": "gm-local-as", "pane_thread_name": "council-codex · d1 · main"}
+            ),
+            "codex",
+        )
+
+    def test_manager_reply_uses_configured_explicit_glm_child_bot(self) -> None:
+        state = self.single_pane_space_state()
+        state["telegram"]["managed_bots"] = {"glm": {"token": "GLM_TOKEN", "enabled": True}}
+        state["panes"]["pane-1"].update({"agent": "", "managed_bot_kind": "glm"})
+        run_script = Mock(return_value={"handled": True, "reply": "done"})
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", api):
+            managed_gateway.handle_message(
+                {
+                    "message_id": 4000,
+                    "message_thread_id": 77,
+                    "chat": {"id": -1001, "is_forum": True},
+                    "from": {"id": 42, "is_bot": False},
+                    "text": "status",
+                },
+                bot_token="MANAGER_TOKEN",
+                bot_key="manager",
+            )
+
+        api.assert_called_once()
+        self.assertEqual(api.call_args.kwargs["token"], "GLM_TOKEN")
+
+    def test_manager_reply_uses_council_label_child_bot(self) -> None:
+        state = self.single_pane_space_state()
+        state["telegram"]["managed_bots"] = {"codex": {"token": "CODEX_TOKEN", "enabled": True}}
+        state["panes"]["pane-1"].update(
+            {"agent": "gm-local-as", "pane_thread_name": "council-codex · d1 · main"}
+        )
+        run_script = Mock(return_value={"handled": True, "reply": "done"})
+        api = Mock(return_value={"ok": True, "result": True})
+
+        with patch.object(managed_gateway, "load_state", Mock(return_value=state)), patch.object(
+            managed_gateway, "run_script", run_script
+        ), patch.object(managed_gateway, "api", api):
+            managed_gateway.handle_message(
+                {
+                    "message_id": 4000,
+                    "message_thread_id": 77,
+                    "chat": {"id": -1001, "is_forum": True},
+                    "from": {"id": 42, "is_bot": False},
+                    "text": "status",
+                },
+                bot_token="MANAGER_TOKEN",
+                bot_key="manager",
+            )
+
+        api.assert_called_once()
+        self.assertEqual(api.call_args.kwargs["token"], "CODEX_TOKEN")
+
     def test_source_mode_does_not_route_single_closed_legacy_topic(self) -> None:
         state = managed_multi_pane_space_state()
         state["spaces"] = {}

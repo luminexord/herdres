@@ -61,6 +61,7 @@ MANAGED_BOT_SUGGESTED_USERNAMES = {
     "codex": "herdr_codex_bot",
     "claude": "herdr_claude_bot",
     "kimi": "herdr_kimi_bot",
+    "glm": "herdr_glm_bot",
     "omp": "herdr_omp_bot",
     "devin": "herdr_devin_bot",
 }
@@ -68,6 +69,7 @@ MANAGED_BOT_ALIASES = {
     "codex": ("codex", "gpt", "openai"),
     "claude": ("claude", "anthropic"),
     "kimi": ("kimi", "moonshot"),
+    "glm": ("glm",),
     "omp": ("omp",),
     "devin": ("devin", "cognition"),
 }
@@ -664,11 +666,56 @@ def managed_bot_kind_for_agent(value: str | None) -> str:
     return ""
 
 
+def devin_model_managed_bot_kind_from_label(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if "glm" in text:
+        return "glm"
+    if "kimi" in text:
+        return "kimi"
+    return ""
+
+
+def council_seat_managed_bot_kind(text: str | None) -> str:
+    lowered = str(text or "").lower()
+    if not lowered:
+        return ""
+    match = re.search(r"council[-\s]+([a-z0-9]+(?:-[a-z0-9]+)?)", lowered)
+    if not match:
+        return ""
+    seat = match.group(1).split("-", 1)[0]
+    return {
+        "codex": "codex",
+        "claude": "claude",
+        "kimi": "kimi",
+        "glm": "glm",
+        "implement": "omp",
+        "omp": "omp",
+        "lead": "claude",
+    }.get(seat, "")
+
+
 def managed_bot_kind_for_entry(entry: dict) -> str:
     explicit = str(entry.get("managed_bot_kind") or "").strip().lower()
     if explicit in MANAGED_BOT_SUGGESTED_USERNAMES:
         return explicit
-    return managed_bot_kind_for_agent(str(entry.get("agent") or ""))
+    agent_kind = managed_bot_kind_for_agent(str(entry.get("agent") or ""))
+    label_candidates = [
+        str(entry.get(key) or "")
+        for key in ("pane_thread_name", "pane_label_raw", "pane_label_topic_name", "topic_name", "label", "name", "title")
+    ]
+    if agent_kind == "devin":
+        model_kind = devin_model_managed_bot_kind_from_label(" ".join(label_candidates))
+        if model_kind:
+            return model_kind
+    if agent_kind:
+        return agent_kind
+    for candidate in label_candidates:
+        council_kind = council_seat_managed_bot_kind(candidate)
+        if council_kind:
+            return council_kind
+    return ""
 
 
 def managed_bot_has_token(state: dict, kind: str) -> bool:
