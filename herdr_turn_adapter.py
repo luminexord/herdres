@@ -50,6 +50,7 @@ WORKLOG_LINE_MAX_CHARS = int(os.getenv("HERDRES_TURN_ADAPTER_WORKLOG_LINE_MAX_CH
 # Cap the accumulator itself (not just the emitted join) so a very long turn can't grow
 # worklog_parts without bound; we keep the most recent lines (closest to the answer).
 WORKLOG_MAX_LINES = int(os.getenv("HERDRES_TURN_ADAPTER_WORKLOG_MAX_LINES", "400"))
+STREAM_MAX_PARTS = int(os.getenv("HERDRES_TURN_ADAPTER_STREAM_MAX_PARTS", "40"))
 
 # Issue #36: surface Claude Code AskUserQuestion / ExitPlanMode prompts as structured
 # pending_decision/pending_interaction turns, so herdres renders tappable buttons instead of
@@ -190,6 +191,21 @@ def add_stream_fields(
     turn["stream_updated_at"] = updated_at or ""
     turn["stream_source"] = source
     return turn
+
+
+def append_stream_part(parts: list[str], text: str) -> None:
+    cleaned = sanitize_text(str(text or "").strip())
+    if not cleaned:
+        return
+    if parts and parts[-1] == cleaned:
+        return
+    parts.append(cleaned)
+    if len(parts) > STREAM_MAX_PARTS:
+        del parts[: len(parts) - STREAM_MAX_PARTS]
+
+
+def joined_stream_text(parts: list[str]) -> str:
+    return sanitize_text("\n\n".join(part for part in parts if part).strip())
 
 
 def content_text(content: Any) -> str:
@@ -1441,6 +1457,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
     completed: list[dict[str, Any]] = []
     open_turn = False
     worklog_parts: list[str] = []  # codex tool calls for the open turn
+    stream_parts: list[str] = []
     codex_plan_text = ""
     codex_plan_delta_parts: list[str] = []
 
@@ -1463,6 +1480,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 last_assistant_text = ""
                 open_turn = True
                 worklog_parts = []
+                stream_parts = []
                 codex_plan_text = ""
                 codex_plan_delta_parts = []
                 continue
@@ -1486,6 +1504,8 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                     current_user_text = sanitize_text(text)
                 elif role == "assistant" and text:
                     last_assistant_text = sanitize_text(text)
+                    if open_turn:
+                        append_stream_part(stream_parts, last_assistant_text)
                 continue
             # Tool calls between task_started and task_complete are the worklog. (codex
             # reasoning summaries are encrypted/empty, and the final reply is itself an
@@ -1532,6 +1552,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 current_user_text = ""
                 last_assistant_text = ""
                 worklog_parts = []
+                stream_parts = []
                 codex_plan_text = ""
                 codex_plan_delta_parts = []
                 continue
@@ -1539,6 +1560,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 open_turn = False
                 codex_plan_text = ""
                 codex_plan_delta_parts = []
+                stream_parts = []
 
     if completed:
         recent = completed[-RECENT_TURNS:]
@@ -1548,7 +1570,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
             latest["open_turn_id"] = current_turn_id
             if current_user_text:
                 latest["open_user_text"] = current_user_text
-            add_stream_fields(latest, last_assistant_text, "codex")
+            add_stream_fields(latest, joined_stream_text(stream_parts) or last_assistant_text, "codex")
         latest["recent_turns"] = recent
         if current_model:
             latest["model"] = current_model
@@ -1566,7 +1588,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
         }
         if current_model:
             turn["model"] = current_model
-        return add_stream_fields(turn, last_assistant_text, "codex")
+        return add_stream_fields(turn, joined_stream_text(stream_parts) or last_assistant_text, "codex")
     return {
         "available": True,
         "pane_id": pane_id,
@@ -1585,6 +1607,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
     incomplete_user = False
     pending_api_error: dict[str, Any] | None = None  # set if an API error is the latest unresolved event
     latest_stream_text = ""
+    latest_stream_parts: list[str] = []
     latest_stream_updated_at: Any = ""
     current_model = ""  # latest model seen (every assistant message carries message.model)
     worklog_parts: list[str] = []  # intermediate tool_use + text for the open turn
@@ -1619,7 +1642,9 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         # accumulated content (a pure-reasoning interrupt): the resulting turn EDITS the
                         # prompt message, which clears the "Working…" reasoning indicator (issue #3) —
                         # without it, a bare prompt message would keep "Working…" forever after an Esc.
-                        final_text = sanitize_text(latest_stream_text).strip() or "(interrupted)"
+                        final_text = sanitize_text(
+                            joined_stream_text(latest_stream_parts) or latest_stream_text
+                        ).strip() or "(interrupted)"
                         turn = {
                             "available": True,
                             "pane_id": pane_id,
@@ -1646,6 +1671,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     incomplete_user = False
                     pending_api_error = None
                     latest_stream_text = ""
+                    latest_stream_parts = []
                     latest_stream_updated_at = ""
                     worklog_parts = []
                     continue
@@ -1658,6 +1684,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     incomplete_user = True
                     pending_api_error = None
                     latest_stream_text = ""
+                    latest_stream_parts = []
                     latest_stream_updated_at = ""
                     worklog_parts = []
                 else:
@@ -1671,6 +1698,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         pending_user_uuid = uuid
                         incomplete_user = True
                         latest_stream_text = ""
+                        latest_stream_parts = []
                         latest_stream_updated_at = ""
                         worklog_parts = []
                 continue
@@ -1722,6 +1750,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     incomplete_user = False
                     pending_api_error = None  # a real completion supersedes any prior API error
                     latest_stream_text = ""
+                    latest_stream_parts = []
                     latest_stream_updated_at = ""
                 elif pending_user_text:
                     # Intermediate step (tool_use and/or interim text) inside an open
@@ -1734,6 +1763,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                             del worklog_parts[: len(worklog_parts) - WORKLOG_MAX_LINES]
                     if text and incomplete_user:
                         latest_stream_text = sanitize_text(text)
+                        append_stream_part(latest_stream_parts, latest_stream_text)
                         latest_stream_updated_at = event.get("timestamp") or ""
 
     if DECISIONS_ENABLED and incomplete_user:
@@ -1772,7 +1802,12 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             latest["open_turn_id"] = pending_user_uuid
             if pending_user_text:
                 latest["open_user_text"] = pending_user_text
-            add_stream_fields(latest, latest_stream_text, "claude", latest_stream_updated_at)
+            add_stream_fields(
+                latest,
+                joined_stream_text(latest_stream_parts) or latest_stream_text,
+                "claude",
+                latest_stream_updated_at,
+            )
         latest["recent_turns"] = recent
         if pending_api_error:
             latest["api_error"] = pending_api_error
@@ -1794,7 +1829,12 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             result["api_error"] = pending_api_error
         if current_model:
             result["model"] = current_model
-        add_stream_fields(result, latest_stream_text, "claude", latest_stream_updated_at)
+        add_stream_fields(
+            result,
+            joined_stream_text(latest_stream_parts) or latest_stream_text,
+            "claude",
+            latest_stream_updated_at,
+        )
         return result
     result = {
         "available": True,

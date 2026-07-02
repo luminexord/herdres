@@ -63,6 +63,56 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["user_text"], "<literal> What happened?")
         self.assertEqual(turn["assistant_final_text"], "Final answer only.")
 
+    def test_codex_open_turn_accumulates_stream_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-06-15T00-00-00-session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-open", "started_at": 10}},
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Send status while working."}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Status table with useful details."}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Status table with useful details."}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Short follow-up progress note."}],
+                        },
+                    },
+                ],
+            )
+
+            turn = adapter.extract_codex_turn(path, "pane-1", "session-1")
+
+        self.assertFalse(turn["complete"])
+        stream = turn["assistant_stream_text"]
+        self.assertIn("Status table with useful details.", stream)
+        self.assertIn("Short follow-up progress note.", stream)
+        self.assertEqual(stream.count("Status table with useful details."), 1)
+
 
     def test_codex_includes_automatic_continuation_complete_without_user_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -573,6 +623,58 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["turn_id"], "assistant-1")
         self.assertEqual(turn["user_text"], "Diagnose it.")
         self.assertEqual(turn["assistant_final_text"], "Final diagnosis.")
+
+    def test_claude_open_turn_accumulates_stream_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "user",
+                        "uuid": "user-1",
+                        "message": {"role": "user", "content": "Keep me updated."},
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-1",
+                        "timestamp": "2026-06-15T10:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "stop_reason": "tool_use",
+                            "content": [{"type": "text", "text": "Detailed status table."}],
+                        },
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-2",
+                        "timestamp": "2026-06-15T10:00:05Z",
+                        "message": {
+                            "role": "assistant",
+                            "stop_reason": "tool_use",
+                            "content": [{"type": "text", "text": "Detailed status table."}],
+                        },
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-3",
+                        "timestamp": "2026-06-15T10:00:10Z",
+                        "message": {
+                            "role": "assistant",
+                            "stop_reason": "tool_use",
+                            "content": [{"type": "text", "text": "Short progress note."}],
+                        },
+                    },
+                ],
+            )
+
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertFalse(turn["complete"])
+        stream = turn["assistant_stream_text"]
+        self.assertIn("Detailed status table.", stream)
+        self.assertIn("Short progress note.", stream)
+        self.assertEqual(stream.count("Detailed status table."), 1)
 
     def _claude_turn_with_tools(self):
         return [
