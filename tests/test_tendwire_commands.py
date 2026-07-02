@@ -623,6 +623,38 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             "ok",
         )
 
+    def test_raw_read_preflight_for_entry_blocks_direct_reads_in_source_mode(self) -> None:
+        legacy_entry = _entry(source="herdr", pane_id="pane-1")
+        source_entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            tendwire_worker_id="worker-1",
+            tendwire_fingerprint="fp-1",
+        )
+
+        self.assertEqual(
+            herdres_tendwire.raw_read_preflight_for_entry(
+                legacy_entry,
+                {"HERDRES_TENDWIRE_MODE": "source"},
+            ),
+            "legacy_source_block",
+        )
+        self.assertEqual(
+            herdres_tendwire.raw_read_preflight_for_entry(
+                source_entry,
+                {"HERDRES_TENDWIRE_MODE": "source-read"},
+            ),
+            "source_raw_unsupported",
+        )
+        self.assertEqual(
+            herdres_tendwire.raw_read_preflight_for_entry(
+                legacy_entry,
+                {"HERDRES_TENDWIRE_MODE": "off"},
+            ),
+            "ok",
+        )
+
 
 class TendwireCommandRoutingTests(unittest.TestCase):
     @contextmanager
@@ -1160,6 +1192,18 @@ class TendwireCommandRoutingTests(unittest.TestCase):
             result = herdres.command_reply(_payload(text="/raw 20"))
 
         self.assertIn("Raw pane output is not available", result["reply"])
+        recent_tail.assert_not_called()
+        patched["send_to_pane"].assert_not_called()
+        patched["run_cmd"].assert_not_called()
+
+        legacy_entry = _entry(source="herdr", pane_id="pane-1")
+        legacy_state = _state(legacy_entry)
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source-read"}, clear=True), \
+                self._command_patches(legacy_state) as patched, \
+                patch.object(herdres, "recent_tail") as recent_tail:
+            result = herdres.command_reply(_payload(text="/raw 20"))
+
+        self.assertIn("legacy Herdr mode", result["reply"])
         recent_tail.assert_not_called()
         patched["send_to_pane"].assert_not_called()
         patched["run_cmd"].assert_not_called()

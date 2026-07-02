@@ -15875,7 +15875,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         save_state(state)
         return {"handled": True, "reply": "Could not post the skills list."}
     if command in {"raw", "read"}:
-        if source_entry:
+        raw_read_policy = herdres_tendwire.raw_read_preflight_for_entry(entry)
+        if raw_read_policy == "legacy_source_block":
+            return {
+                "handled": True,
+                "reply": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before reading raw output.",
+            }
+        if raw_read_policy == "source_raw_unsupported":
             return {
                 "handled": True,
                 "reply": "Raw pane output is not available in Tendwire source-read mode.",
