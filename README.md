@@ -741,7 +741,9 @@ When Tendwire reports degraded or unavailable backend health, or when the
 snapshot command fails while source entries already exist, Herdres preserves the
 existing source worker topics from its local state for that sync instead of
 marking them closed from incomplete inventory. Fresh healthy snapshots clear
-that preservation state.
+that preservation state. Source-mode completed-turn delivery is also tracked in
+a bounded global ledger keyed by Tendwire worker and semantic turn identity, so
+rebuilding a worker entry does not repost old completed turn text to Telegram.
 
 `/send!` is not routed through Tendwire in this phase. For command-mode enriched entries and source inventory modes it fails closed because Tendwire interrupt semantics are not represented here yet; use `/send` or interrupt directly in Herdr when running outside source mode. Non-enriched entries and `enrich` mode keep the existing `/send!` Herdr interrupt path.
 
@@ -918,8 +920,10 @@ delivery bookkeeping.
    #    any direct pane helper.
    herdres tendwire source-smoke
 
-   # 5. Herdres restart and one real sync.
+   # 5. Herdres restart and two real syncs. The second pass must not repost old
+   #    Tendwire completed-turn text when there are no new completed turns.
    systemctl --user restart herdres.timer herdres-gateway.service
+   HERDRES_TENDWIRE_MODE=source herdres sync
    HERDRES_TENDWIRE_MODE=source herdres sync
    herdres doctor
 
