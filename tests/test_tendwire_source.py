@@ -398,6 +398,32 @@ class TendwireModeTests(unittest.TestCase):
         self.assertIn("closed_notice_suppressed_at", state["panes"][key])
         send_notice.assert_not_called()
 
+    def test_source_worker_send_force_fails_closed_without_direct_herdr(self) -> None:
+        state, _key = _source_state()
+        state["telegram"]["owner_user_ids"] = ["42"]
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "save_state"), \
+                patch.object(herdres, "interrupt_and_send_to_pane") as interrupt_and_send, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "run_cmd") as run_cmd:
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-100",
+                    "topic_id": "77",
+                    "user_id": "42",
+                    "message_id": "5000",
+                    "text": "/send! stop now",
+                }
+            )
+
+        self.assertIn("cannot safely interrupt", result["reply"])
+        interrupt_and_send.assert_not_called()
+        send_to_pane.assert_not_called()
+        run_cmd.assert_not_called()
+
     def test_prune_closed_tendwire_source_records_removes_space_membership(self) -> None:
         state, key = _source_state()
         active_key = "worker:active"
