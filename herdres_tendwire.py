@@ -1712,7 +1712,7 @@ def source_turn_feed_source(
     user_text = sanitize(str(turn.get("user_text") or ""), user_prompt_max_chars).strip()
     complete = turn.get("complete") if isinstance(turn.get("complete"), bool) else bool(assistant_final)
     has_open_turn = turn.get("has_open_turn") if isinstance(turn.get("has_open_turn"), bool) else False
-    return {
+    feed_source = {
         "available": True,
         "turn_id": str(turn.get("id") or turn.get("turn_id") or turn.get("fingerprint") or ""),
         "user_text": user_text,
@@ -1721,3 +1721,10 @@ def source_turn_feed_source(
         "complete": complete,
         "has_open_turn": has_open_turn,
     }
+    if isinstance(turn.get("awaiting_input"), bool):
+        feed_source["awaiting_input"] = turn["awaiting_input"]
+    for key in ("pending_interaction", "pending_decision"):
+        value = turn.get(key)
+        if isinstance(value, dict):
+            feed_source[key] = dict(value)
+    return feed_source

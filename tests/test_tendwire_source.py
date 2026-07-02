@@ -553,6 +553,94 @@ class TendwireModeTests(unittest.TestCase):
         cached_pane_turn.assert_not_called()
         pane_feed_output.assert_not_called()
 
+    def test_source_read_clean_feed_delivers_tendwire_pending_decision_without_direct_herdr(self) -> None:
+        state, key = _source_state()
+        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        entry = state["panes"][key]
+        entry["prompt_collapse_chars"] = 0
+        counters = {"sends": 0, "feed_sends": 0}
+        sent_items: list[dict] = []
+        turns_payload = {
+            "schema_version": 1,
+            "turns": [
+                {
+                    "id": "turn-public-decision",
+                    "worker_id": "worker-1",
+                    "worker_fingerprint": "fp-1",
+                    "user_text": "Choose an implementation path.",
+                    "assistant_final_text": "",
+                    "assistant_stream_text": "",
+                    "complete": False,
+                    "has_open_turn": True,
+                    "awaiting_input": True,
+                    "pending_decision": {
+                        "decision_id": "decision-public-1",
+                        "prompt": "Which path should I take?",
+                        "options": [
+                            {"id": "fast", "label": "Patch minimal path", "send_text": "1"},
+                            {"id": "full", "label": "Build full path", "send_text": "2"},
+                        ],
+                    },
+                }
+            ],
+        }
+
+        def fake_send_feed_item(chat_id: str, item: dict, **kwargs) -> dict:
+            sent_items.append({"item": item, "kwargs": kwargs})
+            return {"ok": True, "message_id": "601"}
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "TURN_FEED_ENABLED", True), \
+                patch.object(herdres, "tendwire_turns", return_value=turns_payload), \
+                patch.object(herdres, "extract_turn_feed_item") as extract_turn_feed_item, \
+                patch.object(herdres, "cached_pane_turn") as cached_pane_turn, \
+                patch.object(herdres, "pane_turn") as pane_turn, \
+                patch.object(herdres, "prefetch_pane_turns") as prefetch_pane_turns, \
+                patch.object(herdres, "pane_feed_output") as pane_feed_output, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "send_pending_prompt_message", return_value={"changed": False}), \
+                patch.object(herdres, "send_feed_item", side_effect=fake_send_feed_item), \
+                patch.object(herdres, "fold_superseded_turns", return_value=False), \
+                patch.object(herdres, "flush_pending_plan_doc", return_value=False), \
+                patch.object(herdres, "flush_pending_speech_reply", return_value=False):
+            result = herdres._sync_pane_clean_feed(
+                state,
+                "-100",
+                {},
+                pane,
+                entry,
+                counters,
+                pane_api_token=None,
+                turn_only=False,
+                new_entry=False,
+                max_sends=10,
+                max_feed_sends=10,
+                stable_obj_hash="status-hash",
+                changed=False,
+            )
+
+        self.assertIsNone(result["early_return"])
+        self.assertTrue(result["feed_delivered"])
+        self.assertEqual(counters["sends"], 1)
+        self.assertEqual(counters["feed_sends"], 1)
+        sent_item = sent_items[0]["item"]
+        self.assertEqual(sent_item["kind"], "decision")
+        self.assertEqual(sent_item["choice_source"], "pending_decision")
+        self.assertEqual(sent_item["decision_id"], "decision-public-1")
+        self.assertEqual(entry["active_prompt"]["decision_id"], "decision-public-1")
+        self.assertEqual(entry["active_prompt"]["message_id"], "601")
+        reply_markup = sent_items[0]["kwargs"]["reply_markup"]
+        self.assertEqual(
+            reply_markup["inline_keyboard"][1][0]["callback_data"],
+            f"herdr:c:{sent_item['prompt_id']}:full",
+        )
+        extract_turn_feed_item.assert_not_called()
+        cached_pane_turn.assert_not_called()
+        pane_turn.assert_not_called()
+        prefetch_pane_turns.assert_not_called()
+        pane_feed_output.assert_not_called()
+        send_to_pane.assert_not_called()
+
     def test_source_read_clean_feed_global_ledger_suppresses_rebuilt_entry_replay(self) -> None:
         state, key = _source_state()
         pane = herdres.tendwire_source_read_panes(_snapshot())[0]
