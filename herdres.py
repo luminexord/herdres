@@ -7872,13 +7872,13 @@ def active_prompt_message_rejection(prompt: dict[str, Any], callback_message_id:
 
 
 def current_visible_choice_item_for_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
-    if not VISIBLE_CHOICE_BUTTONS_ENABLED:
-        return None
-    if tendwire_source_inventory_enabled() or entry_is_tendwire_source(entry):
+    preflight = herdres_tendwire.visible_choice_refresh_preflight_for_entry(
+        entry,
+        visible_choice_buttons_enabled=VISIBLE_CHOICE_BUTTONS_ENABLED,
+    )
+    if preflight != "ok":
         return None
     pane_id = str(entry.get("pane_id") or "")
-    if not pane_id:
-        return None
     pane = pane_by_id(pane_id) or {"pane_id": pane_id}
     return extract_visible_choice_feed_item(pane)
 

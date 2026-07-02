@@ -735,6 +735,58 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             "ok",
         )
 
+    def test_visible_choice_refresh_preflight_blocks_source_mode_direct_refresh(self) -> None:
+        legacy_entry = _entry(source="herdr", pane_id="pane-1")
+        source_entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            tendwire_worker_id="worker-1",
+            tendwire_fingerprint="fp-1",
+        )
+        missing_pane = _entry(source="herdr", pane_id="")
+
+        self.assertEqual(
+            herdres_tendwire.visible_choice_refresh_preflight_for_entry(
+                legacy_entry,
+                visible_choice_buttons_enabled=False,
+                env={"HERDRES_TENDWIRE_MODE": "off"},
+            ),
+            "disabled",
+        )
+        self.assertEqual(
+            herdres_tendwire.visible_choice_refresh_preflight_for_entry(
+                legacy_entry,
+                visible_choice_buttons_enabled=True,
+                env={"HERDRES_TENDWIRE_MODE": "source"},
+            ),
+            "source_mode_block",
+        )
+        self.assertEqual(
+            herdres_tendwire.visible_choice_refresh_preflight_for_entry(
+                source_entry,
+                visible_choice_buttons_enabled=True,
+                env={"HERDRES_TENDWIRE_MODE": "commands"},
+            ),
+            "source_entry_block",
+        )
+        self.assertEqual(
+            herdres_tendwire.visible_choice_refresh_preflight_for_entry(
+                missing_pane,
+                visible_choice_buttons_enabled=True,
+                env={"HERDRES_TENDWIRE_MODE": "off"},
+            ),
+            "missing_pane",
+        )
+        self.assertEqual(
+            herdres_tendwire.visible_choice_refresh_preflight_for_entry(
+                legacy_entry,
+                visible_choice_buttons_enabled=True,
+                env={"HERDRES_TENDWIRE_MODE": "off"},
+            ),
+            "ok",
+        )
+
 
 class TendwireCommandRoutingTests(unittest.TestCase):
     @contextmanager
@@ -1536,6 +1588,16 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         send_to_pane.assert_not_called()
         run_cmd.assert_called_once()
         save_state.assert_called_once_with(state)
+
+    def test_source_mode_visible_choice_item_does_not_query_herdr(self) -> None:
+        entry = _entry(source="herdr", pane_id="pane-1")
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "VISIBLE_CHOICE_BUTTONS_ENABLED", True), \
+                patch.object(herdres, "pane_by_id") as pane_by_id:
+            item = herdres.current_visible_choice_item_for_entry(entry)
+
+        self.assertIsNone(item)
+        pane_by_id.assert_not_called()
 
     def test_source_read_callback_detail_choice_uses_tendwire_followup(self) -> None:
         entry = _entry(

@@ -1506,6 +1506,43 @@ def plugin_event_preflight_for_env(
     return {"action": "direct", "mode": mode, "message": ""}
 
 
+def visible_choice_refresh_preflight_policy(
+    *,
+    visible_choice_buttons_enabled: bool,
+    source_inventory_enabled: bool,
+    source_entry: bool,
+    pane_id: str,
+) -> str:
+    """Classify visible-choice refresh before any direct Herdr pane lookup."""
+    if not visible_choice_buttons_enabled:
+        return "disabled"
+    if source_inventory_enabled:
+        return "source_mode_block"
+    if source_entry:
+        return "source_entry_block"
+    if not str(pane_id or "").strip():
+        return "missing_pane"
+    return "ok"
+
+
+def visible_choice_refresh_preflight_for_entry(
+    entry: dict[str, Any] | None,
+    *,
+    visible_choice_buttons_enabled: bool,
+    env: Any | None = None,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> str:
+    mode = parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
+    entry_data = entry if isinstance(entry, dict) else {}
+    return visible_choice_refresh_preflight_policy(
+        visible_choice_buttons_enabled=bool(visible_choice_buttons_enabled),
+        source_inventory_enabled=mode_enables_source_inventory(mode),
+        source_entry=is_source_entry(entry),
+        pane_id=str(entry_data.get("pane_id") or ""),
+    )
+
+
 def same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
     if response_status(response) != "stale_target":
         return None
