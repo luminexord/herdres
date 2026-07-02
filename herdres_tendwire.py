@@ -405,7 +405,10 @@ def connector_call(
     return parsed
 
 
-def snapshot_payload(
+def _json_command_payload(
+    command: str,
+    source: str,
+    failure_message: str,
     *,
     runner: Runner,
     sanitize: Sanitizer = _default_sanitize,
@@ -413,19 +416,37 @@ def snapshot_payload(
     default_herdr_bin: str = DEFAULT_HERDR_BIN,
 ) -> dict[str, Any]:
     proc = runner(
-        [*command_base(env), "snapshot", "--json"],
+        [*command_base(env), command, "--json"],
         timeout=timeout_seconds(env),
         env=child_env(env, default_herdr_bin=default_herdr_bin),
     )
     if proc.returncode != 0:
-        raise TendwireCallError(sanitize(proc.stderr or proc.stdout or "tendwire snapshot failed", 500))
+        raise TendwireCallError(sanitize(proc.stderr or proc.stdout or failure_message, 500))
     try:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        raise TendwireCallError("tendwire snapshot returned non-JSON") from exc
+        raise TendwireCallError(f"{source} returned non-JSON") from exc
     if not isinstance(data, dict):
-        raise TendwireCallError("tendwire snapshot returned non-object JSON")
+        raise TendwireCallError(f"{source} returned non-object JSON")
     return data
+
+
+def snapshot_payload(
+    *,
+    runner: Runner,
+    sanitize: Sanitizer = _default_sanitize,
+    env: Any | None = None,
+    default_herdr_bin: str = DEFAULT_HERDR_BIN,
+) -> dict[str, Any]:
+    return _json_command_payload(
+        "snapshot",
+        "tendwire snapshot",
+        "tendwire snapshot failed",
+        runner=runner,
+        sanitize=sanitize,
+        env=env,
+        default_herdr_bin=default_herdr_bin,
+    )
 
 
 def turns_payload(
@@ -435,20 +456,15 @@ def turns_payload(
     env: Any | None = None,
     default_herdr_bin: str = DEFAULT_HERDR_BIN,
 ) -> dict[str, Any]:
-    proc = runner(
-        [*command_base(env), "turns", "--json"],
-        timeout=timeout_seconds(env),
-        env=child_env(env, default_herdr_bin=default_herdr_bin),
+    return _json_command_payload(
+        "turns",
+        "tendwire turns",
+        "tendwire turns failed",
+        runner=runner,
+        sanitize=sanitize,
+        env=env,
+        default_herdr_bin=default_herdr_bin,
     )
-    if proc.returncode != 0:
-        raise TendwireCallError(sanitize(proc.stderr or proc.stdout or "tendwire turns failed", 500))
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise TendwireCallError("tendwire turns returned non-JSON") from exc
-    if not isinstance(data, dict):
-        raise TendwireCallError("tendwire turns returned non-object JSON")
-    return data
 
 
 COMMAND_SUCCESS_STATUSES = {"accepted", "queued", "sent", "submitted", "ok", "success"}

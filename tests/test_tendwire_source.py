@@ -792,6 +792,41 @@ class TendwireConfigTests(unittest.TestCase):
         self.assertEqual(child_env["TENDWIRE_HERDR_BIN"], "/opt/herdr-real")
         self.assertEqual(child_env["TENDWIRE_HERDR_TIMEOUT_SECONDS"], "1.5")
 
+    def test_tendwire_json_payload_helpers_reject_bad_stdout(self) -> None:
+        cases = (
+            (
+                "snapshot",
+                herdres_tendwire.snapshot_payload,
+                subprocess.CompletedProcess(["tendwire"], 0, stdout="not-json", stderr=""),
+                "tendwire snapshot returned non-JSON",
+            ),
+            (
+                "turns",
+                herdres_tendwire.turns_payload,
+                subprocess.CompletedProcess(["tendwire"], 0, stdout='"not-object"', stderr=""),
+                "tendwire turns returned non-object JSON",
+            ),
+            (
+                "snapshot-nonzero",
+                herdres_tendwire.snapshot_payload,
+                subprocess.CompletedProcess(["tendwire"], 1, stdout="", stderr="socket down"),
+                "socket down",
+            ),
+        )
+        for name, call, proc, expected in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(herdres_tendwire.TendwireCallError, expected):
+                call(runner=Mock(return_value=proc))
+
+    def test_tendwire_turns_payload_uses_turns_command(self) -> None:
+        proc = subprocess.CompletedProcess(["tendwire", "turns", "--json"], 0, stdout='{"turns":[]}', stderr="")
+        runner = Mock(return_value=proc)
+
+        data = herdres_tendwire.turns_payload(runner=runner, env={"HERDRES_TENDWIRE_TIMEOUT_SECONDS": "2"})
+
+        self.assertEqual(data, {"turns": []})
+        self.assertEqual(runner.call_args.args[0], ["tendwire", "turns", "--json"])
+        self.assertEqual(runner.call_args.kwargs["timeout"], 2)
+
     def test_diagnostic_config_json_is_valid_and_sanitized(self) -> None:
         env = {
             "HOME": "/tmp/herdres-home",
