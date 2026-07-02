@@ -11958,8 +11958,13 @@ def observed_agent_panes(state: dict[str, Any] | None = None) -> list[dict[str, 
             if isinstance(state, dict):
                 preserved = tendwire_source_state_panes(state)
                 if preserved:
-                    state["tendwire_source_inventory_last_error"] = sanitize_text(str(exc), 500)
-                    state["tendwire_source_inventory_preserved_at"] = utc_now()
+                    herdres_tendwire.note_source_inventory_snapshot_failure(
+                        state,
+                        exc,
+                        preserved,
+                        now=utc_now(),
+                        sanitize=sanitize_text,
+                    )
                     return preserved
             raise
         preserved = tendwire_source_state_panes(state) if isinstance(state, dict) else []
@@ -11971,16 +11976,7 @@ def observed_agent_panes(state: dict[str, Any] | None = None) -> list[dict[str, 
             raw_space_id_predicate=_looks_like_raw_herdr_space_id,
         )
         panes = list(inventory.get("panes") or [])
-        if isinstance(state, dict):
-            state.pop("tendwire_source_inventory_last_error", None)
-            state.pop("tendwire_source_inventory_preserved_at", None)
-        if isinstance(state, dict) and bool(inventory.get("degraded")):
-            state["tendwire_source_inventory_degraded_at"] = utc_now()
-            state["tendwire_source_inventory_preserved"] = int(inventory.get("preserved_count") or 0)
-        else:
-            if isinstance(state, dict):
-                state.pop("tendwire_source_inventory_degraded_at", None)
-                state.pop("tendwire_source_inventory_preserved", None)
+        herdres_tendwire.note_source_inventory_result(state, inventory, now=utc_now())
         return panes
     all_panes = pane_list()
     include_shells = parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "")

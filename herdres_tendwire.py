@@ -1302,6 +1302,64 @@ def source_inventory_panes(
     }
 
 
+def _state_set(state: dict[str, Any], key: str, value: Any) -> bool:
+    if state.get(key) == value:
+        return False
+    state[key] = value
+    return True
+
+
+def _state_pop(state: dict[str, Any], key: str) -> bool:
+    if key not in state:
+        return False
+    state.pop(key, None)
+    return True
+
+
+def note_source_inventory_snapshot_failure(
+    state: dict[str, Any] | None,
+    error: Any,
+    preserved_panes: list[dict[str, Any]],
+    *,
+    now: str,
+    sanitize: Sanitizer = _default_sanitize,
+) -> bool:
+    """Record that source inventory fell back to preserved panes."""
+    if not isinstance(state, dict) or not preserved_panes:
+        return False
+    changed = _state_set(
+        state,
+        "tendwire_source_inventory_last_error",
+        sanitize(str(error), 500),
+    )
+    changed = _state_set(state, "tendwire_source_inventory_preserved_at", str(now or "")) or changed
+    return changed
+
+
+def note_source_inventory_result(
+    state: dict[str, Any] | None,
+    inventory: dict[str, Any],
+    *,
+    now: str,
+) -> bool:
+    """Update source inventory health bookkeeping after a snapshot result."""
+    if not isinstance(state, dict):
+        return False
+    changed = _state_pop(state, "tendwire_source_inventory_last_error")
+    changed = _state_pop(state, "tendwire_source_inventory_preserved_at") or changed
+    if bool(inventory.get("degraded")):
+        changed = _state_set(state, "tendwire_source_inventory_degraded_at", str(now or "")) or changed
+        changed = _state_set(
+            state,
+            "tendwire_source_inventory_preserved",
+            int(inventory.get("preserved_count") or 0),
+        ) or changed
+    else:
+        changed = _state_pop(state, "tendwire_source_inventory_degraded_at") or changed
+        changed = _state_pop(state, "tendwire_source_inventory_preserved") or changed
+    return changed
+
+
 def is_source_read_pane(pane: dict[str, Any] | None) -> bool:
     return isinstance(pane, dict) and bool(pane.get("_tendwire_source_read"))
 

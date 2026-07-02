@@ -855,6 +855,44 @@ class TendwireModeTests(unittest.TestCase):
             ["worker-1", "worker-preserved"],
         )
 
+    def test_tendwire_helper_updates_source_inventory_state_fields(self) -> None:
+        state: dict = {}
+        preserved = [{"worker_id": "worker-1"}]
+
+        changed = herdres_tendwire.note_source_inventory_snapshot_failure(
+            state,
+            RuntimeError("socket down with private-ish detail"),
+            preserved,
+            now="2026-07-02T00:00:00+00:00",
+            sanitize=herdres.sanitize_text,
+        )
+
+        self.assertTrue(changed)
+        self.assertIn("socket down", state["tendwire_source_inventory_last_error"])
+        self.assertEqual(state["tendwire_source_inventory_preserved_at"], "2026-07-02T00:00:00+00:00")
+
+        degraded = herdres_tendwire.note_source_inventory_result(
+            state,
+            {"degraded": True, "preserved_count": 2},
+            now="2026-07-02T00:01:00+00:00",
+        )
+
+        self.assertTrue(degraded)
+        self.assertNotIn("tendwire_source_inventory_last_error", state)
+        self.assertNotIn("tendwire_source_inventory_preserved_at", state)
+        self.assertEqual(state["tendwire_source_inventory_degraded_at"], "2026-07-02T00:01:00+00:00")
+        self.assertEqual(state["tendwire_source_inventory_preserved"], 2)
+
+        healthy = herdres_tendwire.note_source_inventory_result(
+            state,
+            {"degraded": False, "preserved_count": 0},
+            now="2026-07-02T00:02:00+00:00",
+        )
+
+        self.assertTrue(healthy)
+        self.assertNotIn("tendwire_source_inventory_degraded_at", state)
+        self.assertNotIn("tendwire_source_inventory_preserved", state)
+
 
 class TendwireConfigTests(unittest.TestCase):
     def test_child_env_preserves_parent_and_overrides_only_tendwire_keys(self) -> None:
