@@ -14133,15 +14133,16 @@ def event_once() -> dict[str, Any]:
     # so this path can never cross-wire topics against a stale grouping mode. A
     # reset mutates (and we persist) state, so it counts toward `changed`.
     grouping_reset = reconcile_topic_grouping(state)
-    if tendwire_source_inventory_enabled():
-        mode = tendwire_mode()
+    plugin_event_policy = herdres_tendwire.plugin_event_preflight_for_env()
+    if plugin_event_policy.get("action") == "skip_source":
+        mode = str(plugin_event_policy.get("mode") or "")
         state["last_tendwire_source_plugin_event_skipped_at"] = utc_now()
         state["last_tendwire_source_plugin_event_mode"] = mode
         save_state(state)
         return {
             "ok": True,
             "changed": grouping_reset,
-            "message": "plugin event skipped in Tendwire source mode",
+            "message": str(plugin_event_policy.get("message") or "plugin event skipped in Tendwire source mode"),
             "tendwire_mode": mode,
         }
     context = parse_plugin_json_env("HERDR_PLUGIN_CONTEXT_JSON")

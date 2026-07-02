@@ -1489,6 +1489,23 @@ def interrupt_preflight_for_entry(
     )
 
 
+def plugin_event_preflight_for_env(
+    env: Any | None = None,
+    *,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> dict[str, str]:
+    """Classify Herdr plugin-event handling before parsing direct Herdr payloads."""
+    mode = parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
+    if mode_enables_source_inventory(mode):
+        return {
+            "action": "skip_source",
+            "mode": mode,
+            "message": "plugin event skipped in Tendwire source mode",
+        }
+    return {"action": "direct", "mode": mode, "message": ""}
+
+
 def same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
     if response_status(response) != "stale_target":
         return None

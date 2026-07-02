@@ -162,6 +162,20 @@ class TendwireModeTests(unittest.TestCase):
             )
         )
 
+    def test_plugin_event_preflight_skips_direct_herdr_events_in_source_modes(self) -> None:
+        for mode in ("source-read", "source"):
+            with self.subTest(mode=mode):
+                result = herdres_tendwire.plugin_event_preflight_for_env({"HERDRES_TENDWIRE_MODE": mode})
+                self.assertEqual(result["action"], "skip_source")
+                self.assertEqual(result["mode"], mode)
+                self.assertEqual(result["message"], "plugin event skipped in Tendwire source mode")
+
+        for mode in ("off", "commands"):
+            with self.subTest(mode=mode):
+                result = herdres_tendwire.plugin_event_preflight_for_env({"HERDRES_TENDWIRE_MODE": mode})
+                self.assertEqual(result["action"], "direct")
+                self.assertEqual(result["mode"], mode)
+
     def test_tendwire_helper_reports_missing_source_services(self) -> None:
         def runner(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
             action = cmd[2]
