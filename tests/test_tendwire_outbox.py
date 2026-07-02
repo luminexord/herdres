@@ -63,6 +63,29 @@ class TendwireOutboxTests(unittest.TestCase):
         self.assertEqual(herdres.tendwire_outbox_item_identity(item), herdres_tendwire.outbox_item_identity(item))
         self.assertEqual(herdres_tendwire.outbox_item_identity(item), herdres_tendwire.outbox_item_identity(dict(item)))
 
+    def test_tendwire_outbox_audit_state_helpers_live_in_tendwire_module(self) -> None:
+        state = _state()
+        herdres_tendwire.note_outbox_audit(
+            state,
+            {"identity": "abc123", "status": "delivered"},
+            checked_at="2026-07-02T00:00:00+00:00",
+        )
+        herdres_tendwire.note_outbox_audit(
+            state,
+            {"identity": "abc123", "status": "delivered"},
+            checked_at="2026-07-02T00:01:00+00:00",
+        )
+        herdres_tendwire.note_outbox_audit(
+            state,
+            {"identity": "retrying", "status": "failed"},
+            checked_at="2026-07-02T00:02:00+00:00",
+        )
+
+        self.assertEqual(state["tendwire_outbox"]["last_checked_at"], "2026-07-02T00:02:00+00:00")
+        self.assertEqual(state["tendwire_outbox"]["delivered_identities"], ["abc123"])
+        self.assertEqual(herdres_tendwire.outbox_delivered_identities(state), {"abc123"})
+        self.assertEqual(herdres.tendwire_outbox_delivered_identities(state), {"abc123"})
+
     def test_drain_posts_attention_and_acks_public_response(self) -> None:
         calls: list[list[str]] = []
         ack_responses: list[dict] = []

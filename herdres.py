@@ -2169,25 +2169,11 @@ def tendwire_outbox_item_identity(item: dict[str, Any]) -> str:
 
 
 def tendwire_outbox_delivered_identities(state: dict[str, Any]) -> set[str]:
-    audit = state.get("tendwire_outbox") if isinstance(state.get("tendwire_outbox"), dict) else {}
-    identities = audit.get("delivered_identities") if isinstance(audit.get("delivered_identities"), list) else []
-    return {str(value) for value in identities if str(value)}
+    return herdres_tendwire.outbox_delivered_identities(state)
 
 
 def tendwire_outbox_audit(state: dict[str, Any], event: dict[str, Any]) -> None:
-    audit = state.setdefault("tendwire_outbox", {})
-    if not isinstance(audit, dict):
-        audit = {}
-        state["tendwire_outbox"] = audit
-    audit["last_checked_at"] = utc_now()
-    deliveries = audit.get("recent") if isinstance(audit.get("recent"), list) else []
-    deliveries.append(event)
-    audit["recent"] = deliveries[-50:]
-    identity = str(event.get("identity") or "")
-    if identity and str(event.get("status") or "") == "delivered":
-        identities = audit.get("delivered_identities") if isinstance(audit.get("delivered_identities"), list) else []
-        identities.append(identity)
-        audit["delivered_identities"] = list(dict.fromkeys(str(value) for value in identities if str(value)))[-200:]
+    herdres_tendwire.note_outbox_audit(state, event, checked_at=utc_now())
 
 
 def deliver_tendwire_outbox_item(

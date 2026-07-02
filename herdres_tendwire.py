@@ -151,6 +151,37 @@ def outbox_item_identity(item: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
 
 
+def outbox_delivered_identities(state: dict[str, Any]) -> set[str]:
+    audit = state.get("tendwire_outbox") if isinstance(state.get("tendwire_outbox"), dict) else {}
+    identities = audit.get("delivered_identities") if isinstance(audit.get("delivered_identities"), list) else []
+    return {str(value) for value in identities if str(value)}
+
+
+def note_outbox_audit(
+    state: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    checked_at: str,
+    recent_limit: int = 50,
+    delivered_limit: int = 200,
+) -> None:
+    audit = state.setdefault("tendwire_outbox", {})
+    if not isinstance(audit, dict):
+        audit = {}
+        state["tendwire_outbox"] = audit
+    audit["last_checked_at"] = str(checked_at or "")
+    deliveries = audit.get("recent") if isinstance(audit.get("recent"), list) else []
+    deliveries.append(dict(event))
+    audit["recent"] = deliveries[-max(1, int(recent_limit)):]
+    identity = str(event.get("identity") or "")
+    if identity and str(event.get("status") or "") == "delivered":
+        identities = audit.get("delivered_identities") if isinstance(audit.get("delivered_identities"), list) else []
+        identities.append(identity)
+        audit["delivered_identities"] = list(
+            dict.fromkeys(str(value) for value in identities if str(value))
+        )[-max(1, int(delivered_limit)):]
+
+
 def _env_source(env: Any | None = None) -> Any:
     return os.environ if env is None else env
 
