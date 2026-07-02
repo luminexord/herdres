@@ -12417,7 +12417,7 @@ def drop_tendwire_source_pane_records(state: dict[str, Any]) -> int:
     panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
     removed: list[dict[str, Any]] = []
     for key, entry in list(panes.items()):
-        if not entry_is_tendwire_source(entry):
+        if not herdres_tendwire.should_delete_source_record(entry):
             continue
         remove_pane_from_space_memberships(state, str(key))
         panes.pop(key, None)
@@ -12441,6 +12441,8 @@ def archive_legacy_direct_pane_records_for_source(
     removed: list[dict[str, Any]] = []
     for key, entry in list(panes.items()):
         if not isinstance(entry, dict):
+            continue
+        if not herdres_tendwire.should_archive_legacy_direct_record(entry):
             continue
         pane_key_value = str(key)
         audit = herdres_tendwire.legacy_direct_archive_record(
@@ -12489,9 +12491,7 @@ def prune_closed_tendwire_source_records(
     for key, entry in list(panes.items()):
         if not isinstance(entry, dict):
             continue
-        if not entry_is_tendwire_source(entry):
-            continue
-        if str(entry.get("last_known_status") or "").strip().lower() != "closed":
+        if not herdres_tendwire.should_prune_closed_source_record(entry):
             continue
         remove_pane_from_space_memberships(state, str(key))
         panes.pop(key, None)

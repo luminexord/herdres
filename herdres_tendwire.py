@@ -1174,6 +1174,20 @@ def retry_request_id(base_request_id: str, candidate: dict[str, str]) -> str:
     return f"{base}:retry:{digest}"
 
 
+def should_delete_source_record(entry: dict[str, Any] | None) -> bool:
+    return is_source_entry(entry)
+
+
+def should_archive_legacy_direct_record(entry: dict[str, Any] | None) -> bool:
+    return isinstance(entry, dict) and not is_source_entry(entry)
+
+
+def should_prune_closed_source_record(entry: dict[str, Any] | None) -> bool:
+    if not is_source_entry(entry):
+        return False
+    return str((entry or {}).get("last_known_status") or "").strip().lower() == "closed"
+
+
 def legacy_direct_archive_record(
     pane_key_value: str,
     entry: dict[str, Any],

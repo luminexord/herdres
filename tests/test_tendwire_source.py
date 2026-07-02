@@ -1262,6 +1262,37 @@ class TendwireModeTests(unittest.TestCase):
         self.assertNotIn("tendwire_source_inventory_preserved", state)
 
     def test_tendwire_helper_builds_bounded_source_cleanup_audits(self) -> None:
+        self.assertTrue(
+            herdres_tendwire.should_delete_source_record(
+                {"source": "tendwire", "entry_type": "worker", "worker_id": "worker-1"}
+            )
+        )
+        self.assertFalse(
+            herdres_tendwire.should_delete_source_record(
+                {"source": "herdr", "pane_id": "private-pane-id"}
+            )
+        )
+        self.assertTrue(
+            herdres_tendwire.should_archive_legacy_direct_record(
+                {"source": "herdr", "pane_id": "private-pane-id"}
+            )
+        )
+        self.assertFalse(
+            herdres_tendwire.should_archive_legacy_direct_record(
+                {"source": "tendwire", "entry_type": "worker", "worker_id": "worker-1"}
+            )
+        )
+        self.assertTrue(
+            herdres_tendwire.should_prune_closed_source_record(
+                {"source": "tendwire", "entry_type": "worker", "worker_id": "worker-1", "last_known_status": "closed"}
+            )
+        )
+        self.assertFalse(
+            herdres_tendwire.should_prune_closed_source_record(
+                {"source": "tendwire", "entry_type": "worker", "worker_id": "worker-1", "last_known_status": "working"}
+            )
+        )
+
         legacy = herdres_tendwire.legacy_direct_archive_record(
             "legacy-key",
             {
