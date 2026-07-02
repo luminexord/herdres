@@ -1884,14 +1884,6 @@ def tendwire_commands_enabled() -> bool:
     return tendwire_mode_at_least("commands")
 
 
-def tendwire_fallback_to_herdr_enabled() -> bool:
-    return parse_bool_env("HERDRES_TENDWIRE_FALLBACK_HERDR", "1")
-
-
-def tendwire_direct_fallback_enabled() -> bool:
-    return parse_bool_env("HERDRES_TENDWIRE_DIRECT_FALLBACK", "0")
-
-
 def tendwire_config_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
     load_dotenv()
     return {"ok": True, "config": herdres_tendwire.config_status(default_herdr_bin=DEFAULT_HERDR_BIN)}
@@ -8773,7 +8765,7 @@ def send_to_tendwire_worker_response(
         if ledger_changed and persist and state is not None:
             save_state(state)
         return {"handled": True, "reply": str(result.get("reply") or "")}
-    if tendwire_direct_fallback_enabled() and not entry_is_tendwire_source(entry):
+    if herdres_tendwire.direct_fallback_enabled() and not entry_is_tendwire_source(entry):
         return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
     if ledger_changed and persist and state is not None:
         save_state(state)
@@ -11622,7 +11614,7 @@ def observed_agent_panes(state: dict[str, Any] | None = None) -> list[dict[str, 
         load_snapshot=tendwire_snapshot,
         load_real_panes=pane_list,
         include_shells=parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", ""),
-        fallback_to_herdr=tendwire_fallback_to_herdr_enabled(),
+        fallback_to_herdr=herdres_tendwire.fallback_to_herdr_enabled(),
         warn=warn_tendwire_inventory_error,
         pane_key=pane_key,
         is_source_entry=entry_is_tendwire_source,

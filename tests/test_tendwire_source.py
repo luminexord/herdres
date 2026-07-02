@@ -153,6 +153,14 @@ class TendwireModeTests(unittest.TestCase):
         self.assertTrue(herdres_tendwire.source_inventory_enabled_for_env({"HERDRES_TENDWIRE_MODE": "source-read"}))
         self.assertTrue(herdres_tendwire.source_inventory_enabled_for_env({"HERDRES_TENDWIRE_MODE": "source"}))
 
+    def test_tendwire_helper_owns_fallback_env_checks(self) -> None:
+        self.assertTrue(herdres_tendwire.fallback_to_herdr_enabled({}))
+        self.assertFalse(herdres_tendwire.fallback_to_herdr_enabled({"HERDRES_TENDWIRE_FALLBACK_HERDR": "0"}))
+        self.assertTrue(herdres_tendwire.fallback_to_herdr_enabled({"HERDRES_TENDWIRE_FALLBACK_HERDR": "yes"}))
+        self.assertFalse(herdres_tendwire.direct_fallback_enabled({}))
+        self.assertFalse(herdres_tendwire.direct_fallback_enabled({"HERDRES_TENDWIRE_DIRECT_FALLBACK": "0"}))
+        self.assertTrue(herdres_tendwire.direct_fallback_enabled({"HERDRES_TENDWIRE_DIRECT_FALLBACK": "true"}))
+
     def test_source_mode_enables_connector_outbox_by_default(self) -> None:
         self.assertFalse(herdres_tendwire.connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "source-read"}))
         self.assertFalse(herdres_tendwire.connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "commands"}))

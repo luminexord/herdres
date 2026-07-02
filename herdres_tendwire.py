@@ -133,6 +133,21 @@ def connector_outbox_enabled(env: Any | None = None) -> bool:
     return parse_mode(source) == "source"
 
 
+def fallback_to_herdr_enabled(env: Any | None = None) -> bool:
+    source = os.environ if env is None else env
+    return str(source.get("HERDRES_TENDWIRE_FALLBACK_HERDR", "1")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def direct_fallback_enabled(env: Any | None = None) -> bool:
+    source = os.environ if env is None else env
+    return bool_env(source, "HERDRES_TENDWIRE_DIRECT_FALLBACK")
+
+
 def bounded_int_env(
     key: str,
     default: int,
@@ -1262,14 +1277,13 @@ def entry_send_text_policy(
         source_read_enabled=source_inventory,
         commands_enabled=commands,
     )
-    source = os.environ if env is None else env
     return send_text_policy(
         source_inventory_enabled=source_inventory,
         source_entry=source_entry,
         source_entry_commands_allowed=commands_allowed,
         commands_enabled=commands,
         metadata_state=metadata,
-        direct_fallback_enabled=bool_env(source, "HERDRES_TENDWIRE_DIRECT_FALLBACK"),
+        direct_fallback_enabled=direct_fallback_enabled(env),
     )
 
 
