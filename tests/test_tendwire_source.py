@@ -1521,6 +1521,43 @@ class TendwireHybridTests(unittest.TestCase):
         self.assertTrue(source["complete"])
         self.assertFalse(source["has_open_turn"])
 
+    def test_source_turn_feed_item_tracks_stream_and_closed_completion_fallback(self) -> None:
+        calls: list[dict] = []
+
+        def make_feed_item(source: dict) -> dict | None:
+            calls.append(dict(source))
+            if source.get("has_open_turn") is True:
+                return None
+            return {"kind": "turn", "turn_id": str(source.get("turn_id") or "")}
+
+        entry = {"prompt_collapse_chars": 4}
+
+        item = herdres_tendwire.source_turn_feed_item(
+            {
+                "id": "turn-1",
+                "user_text": "prompt",
+                "assistant_final_text": "final",
+                "assistant_stream_text": "stream text",
+                "complete": True,
+                "has_open_turn": True,
+            },
+            entry,
+            make_feed_item=make_feed_item,
+            text_hash=lambda text: f"hash:{text}",
+            sanitize=lambda value, limit: str(value or "")[:limit],
+            final_reply_max_chars=100,
+            user_prompt_max_chars=100,
+            max_reply_chars=100,
+        )
+
+        self.assertEqual(item, {"kind": "turn", "turn_id": "turn-1", "prompt_collapse_chars": 4})
+        self.assertTrue(entry["last_turn_available"])
+        self.assertEqual(entry["pending_stream_turn_id"], "turn-1")
+        self.assertEqual(entry["pending_stream_text"], "stream text")
+        self.assertEqual(entry["pending_stream_revision"], "hash:stream text")
+        self.assertEqual([call["has_open_turn"] for call in calls], [True, False])
+        self.assertEqual(calls[1]["assistant_stream_text"], "")
+
     def test_tendwire_enriches_real_pane_without_replacing_id(self) -> None:
         panes = herdres.tendwire_enrich_panes([_pane()], _snapshot())
 

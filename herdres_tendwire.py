@@ -36,6 +36,8 @@ RawSpacePredicate = Callable[[Any], bool]
 SourceEntryPredicate = Callable[[dict[str, Any] | None], bool]
 PaneKey = Callable[[dict[str, Any]], str]
 Runner = Callable[..., Any]
+FeedItemFactory = Callable[[dict[str, Any]], dict[str, Any] | None]
+TextHash = Callable[[str], str]
 
 
 class TendwireCallError(RuntimeError):
@@ -2012,3 +2014,49 @@ def source_turn_feed_source(
         if isinstance(value, dict):
             feed_source[key] = dict(value)
     return feed_source
+
+
+def note_source_turn_unavailable(
+    entry: dict[str, Any],
+    reason: str,
+    *,
+    sanitize: Sanitizer = _default_sanitize,
+) -> None:
+    entry["last_turn_available"] = False
+    entry["last_turn_reason"] = sanitize(str(reason or "no_tendwire_turn"), 300) or "no_tendwire_turn"
+
+
+def source_turn_feed_item(
+    turn: dict[str, Any] | None,
+    entry: dict[str, Any],
+    *,
+    make_feed_item: FeedItemFactory,
+    text_hash: TextHash,
+    sanitize: Sanitizer = _default_sanitize,
+    final_reply_max_chars: int,
+    user_prompt_max_chars: int,
+    max_reply_chars: int,
+) -> dict[str, Any] | None:
+    if not isinstance(turn, dict):
+        note_source_turn_unavailable(entry, "no_tendwire_turn", sanitize=sanitize)
+        return None
+    entry["last_turn_available"] = True
+    entry.pop("last_turn_reason", None)
+    feed_source = source_turn_feed_source(
+        turn,
+        sanitize=sanitize,
+        final_reply_max_chars=final_reply_max_chars,
+        user_prompt_max_chars=user_prompt_max_chars,
+    )
+    stream_text = sanitize(str(feed_source.get("assistant_stream_text") or ""), max_reply_chars).strip()
+    stream_turn_id = sanitize(str(feed_source.get("turn_id") or ""), 300).strip()
+    if stream_text and stream_turn_id and feed_source.get("has_open_turn") is True:
+        entry["pending_stream_turn_id"] = stream_turn_id
+        entry["pending_stream_text"] = stream_text
+        entry["pending_stream_revision"] = text_hash(stream_text)
+    item = make_feed_item(feed_source)
+    if not item and feed_source.get("complete") is True and feed_source.get("has_open_turn") is True:
+        item = make_feed_item({**feed_source, "has_open_turn": False, "assistant_stream_text": ""})
+    if isinstance(item, dict):
+        item["prompt_collapse_chars"] = int(entry.get("prompt_collapse_chars") or 0)
+    return item

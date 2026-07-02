@@ -2467,28 +2467,18 @@ def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) 
     try:
         turn = tendwire_source_turn_for_pane(pane)
     except BridgeError as exc:
-        entry["last_turn_available"] = False
-        entry["last_turn_reason"] = sanitize_text(str(exc), 300)
+        herdres_tendwire.note_source_turn_unavailable(entry, str(exc), sanitize=sanitize_text)
         return None
-    if not isinstance(turn, dict):
-        entry["last_turn_available"] = False
-        entry["last_turn_reason"] = "no_tendwire_turn"
-        return None
-    entry["last_turn_available"] = True
-    entry.pop("last_turn_reason", None)
-    feed_source = tendwire_source_turn_feed_source(turn)
-    stream_text = sanitize_text(str(feed_source.get("assistant_stream_text") or ""), MAX_REPLY_CHARS).strip()
-    stream_turn_id = sanitize_text(str(feed_source.get("turn_id") or ""), 300).strip()
-    if stream_text and stream_turn_id and feed_source.get("has_open_turn") is True:
-        entry["pending_stream_turn_id"] = stream_turn_id
-        entry["pending_stream_text"] = stream_text
-        entry["pending_stream_revision"] = stream_text_hash(stream_text)
-    item = make_turn_feed_item(feed_source)
-    if not item and feed_source.get("complete") is True and feed_source.get("has_open_turn") is True:
-        item = make_turn_feed_item({**feed_source, "has_open_turn": False, "assistant_stream_text": ""})
-    if isinstance(item, dict):
-        item["prompt_collapse_chars"] = int(entry.get("prompt_collapse_chars") or 0)
-    return item
+    return herdres_tendwire.source_turn_feed_item(
+        turn,
+        entry,
+        make_feed_item=make_turn_feed_item,
+        text_hash=stream_text_hash,
+        sanitize=sanitize_text,
+        final_reply_max_chars=FINAL_REPLY_MAX_CHARS,
+        user_prompt_max_chars=USER_PROMPT_MAX_CHARS,
+        max_reply_chars=MAX_REPLY_CHARS,
+    )
 
 
 def pane_by_id(pane_id: str, deadline: float | None = None) -> dict[str, Any] | None:
