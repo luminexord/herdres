@@ -465,6 +465,50 @@ class TendwireModeTests(unittest.TestCase):
         audit_text = json.dumps(state.get("archived_legacy_direct_panes", []))
         self.assertNotIn("private-pane-id", audit_text)
 
+    def test_sync_once_source_archives_legacy_direct_records_without_closed_notice(self) -> None:
+        state = {
+            "enabled": True,
+            "telegram": {"chat_id": "-100", "general_thread_id": "1"},
+            "spaces": {
+                "workspace:old": {
+                    "space_key": "workspace:old",
+                    "topic_id": "99",
+                    "pane_keys": ["legacy-pane"],
+                    "message_routes": {"10": "legacy-pane"},
+                }
+            },
+            "panes": {
+                "legacy-pane": {
+                    "pane_key": "legacy-pane",
+                    "source": "herdr",
+                    "pane_id": "private-pane-id",
+                    "space_key": "workspace:old",
+                    "topic_id": "99",
+                    "last_known_status": "working",
+                }
+            },
+        }
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "save_state"), \
+                patch.object(herdres, "observed_agent_panes", return_value=[]), \
+                patch.object(herdres, "drain_tendwire_connector_outbox", return_value={"changed": False}), \
+                patch.object(herdres, "reconcile_known_gone_spaces", return_value=0), \
+                patch.object(herdres, "prune_orphan_spaces", return_value=0), \
+                patch.object(herdres, "reconcile_pinned_status_views", return_value={"changed": False, "updated": 0}), \
+                patch.object(herdres, "send_notice") as send_notice:
+            result = herdres.sync_once()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["legacy_direct_pruned"], 1)
+        self.assertEqual(result["sent"], 0)
+        self.assertNotIn("legacy-pane", state["panes"])
+        self.assertNotIn("workspace:old", state["spaces"])
+        self.assertIn("archived_legacy_direct_panes", state)
+        send_notice.assert_not_called()
+
     def test_source_mode_does_not_resolve_single_closed_direct_topic(self) -> None:
         state = {
             "enabled": True,
@@ -893,6 +937,9 @@ class TendwireModeTests(unittest.TestCase):
             pane_list = stack.enter_context(patch.object(herdres, "pane_list"))
             pane_turn = stack.enter_context(patch.object(herdres, "pane_turn"))
             prefetch = stack.enter_context(patch.object(herdres, "prefetch_pane_turns"))
+            extract_turn_feed_item = stack.enter_context(patch.object(herdres, "extract_turn_feed_item"))
+            cached_pane_turn = stack.enter_context(patch.object(herdres, "cached_pane_turn"))
+            pane_feed_output = stack.enter_context(patch.object(herdres, "pane_feed_output"))
             send_to_pane = stack.enter_context(patch.object(herdres, "send_to_pane"))
             labels = stack.enter_context(patch.object(herdres, "workspace_label_map"))
             stack.enter_context(patch.object(herdres, "reconcile_known_gone_spaces", return_value=0))
@@ -929,6 +976,9 @@ class TendwireModeTests(unittest.TestCase):
         pane_list.assert_not_called()
         pane_turn.assert_not_called()
         prefetch.assert_not_called()
+        extract_turn_feed_item.assert_not_called()
+        cached_pane_turn.assert_not_called()
+        pane_feed_output.assert_not_called()
         send_to_pane.assert_not_called()
         labels.assert_not_called()
         create_topic.assert_not_called()
