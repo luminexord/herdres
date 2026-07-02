@@ -653,7 +653,7 @@ HERDRES_TENDWIRE_BIN=tendwire
 HERDRES_TENDWIRE_TIMEOUT_SECONDS=5
 HERDRES_TENDWIRE_HERDR_TIMEOUT_SECONDS=1.0
 # HERDRES_TENDWIRE_DATA_DIR=~/.local/share/tendwire
-# HERDRES_TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.sqlite3
+# HERDRES_TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.db
 # HERDRES_TENDWIRE_HOST_ID=
 HERDRES_TENDWIRE_FALLBACK_HERDR=1
 HERDRES_TENDWIRE_DIRECT_FALLBACK=0
@@ -790,8 +790,8 @@ delivery bookkeeping.
    [Service]
    Type=simple
    Environment=TENDWIRE_HERDR_BACKEND=socket
-   Environment=TENDWIRE_DB_PATH=%h/.local/share/tendwire/tendwire.sqlite3
-   ExecStart=%h/.local/bin/tendwire daemon --db-path %h/.local/share/tendwire/tendwire.sqlite3
+   Environment=TENDWIRE_DB_PATH=%h/.local/share/tendwire/tendwire.db
+   ExecStart=%h/.local/bin/tendwire daemon --db-path %h/.local/share/tendwire/tendwire.db
    Restart=always
    RestartSec=5s
 
@@ -808,15 +808,15 @@ delivery bookkeeping.
 
    ```bash
    TENDWIRE_HERDR_BACKEND=socket \
-     tendwire daemon --db-path ~/.local/share/tendwire/tendwire.sqlite3
+     tendwire daemon --db-path ~/.local/share/tendwire/tendwire.db
    ```
 
 2. Verify Tendwire before moving Telegram traffic:
 
    ```bash
    tendwire doctor --json
-   tendwire snapshot --json --store --db-path ~/.local/share/tendwire/tendwire.sqlite3
-   tendwire store status --db-path ~/.local/share/tendwire/tendwire.sqlite3
+   tendwire snapshot --json --store --db-path ~/.local/share/tendwire/tendwire.db
+   tendwire store status --db-path ~/.local/share/tendwire/tendwire.db
    ```
 
    Healthy snapshots can be empty during startup, but degraded/unavailable backend
@@ -836,10 +836,24 @@ delivery bookkeeping.
    Do not run another long-poll consumer for the same bot token while
    `herdres-gateway.service` is active.
 
+   In source/source-read/commands modes, the old direct-Herdr topic refresher
+   must be off so it cannot write to the same Telegram state:
+
+   ```bash
+   systemctl --user disable --now herdr-telegram-topics.timer 2>/dev/null || true
+   herdres doctor --fix
+   systemctl --user is-active tendwired.service herdres.timer herdres-gateway.service
+   systemctl --user is-active herdr-telegram-topics.timer || true
+   ```
+
+   `herdres doctor` reports this guard without touching Telegram messages. With
+   `--fix`, it disables an active `herdr-telegram-topics.timer` only when the
+   current Tendwire mode conflicts with the legacy refresher.
+
 4. Roll out modes one step at a time in `~/.config/herdres/herdres.env`:
 
    ```bash
-   HERDRES_TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.sqlite3
+   HERDRES_TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.db
    HERDRES_TENDWIRE_MODE=enrich
    ```
 
@@ -858,6 +872,7 @@ delivery bookkeeping.
    ```bash
    HERDR_TELEGRAM_TOPICS_DRY_RUN=1 herdres sync
    herdres tendwire config
+   herdres doctor
    systemctl --user restart herdres.timer herdres-gateway.service
    ```
 
@@ -872,10 +887,12 @@ delivery bookkeeping.
    systemctl --user restart herdres.timer herdres-gateway.service
    ```
 
-   `off` is the only supported legacy direct mode. Do not keep source/source-read
-   enabled while expecting Herdres to call `pane_list`, `pane_turn`,
-   `send_to_pane`, `herdr pane send-keys`, or `herdr pane read` for normal
-   Telegram behavior.
+   `off` is the only supported legacy direct mode. Re-enable
+   `herdr-telegram-topics.timer` only for a deliberate legacy rollback where
+   `HERDRES_TENDWIRE_MODE=off` and `herdres-gateway.service` is not using the
+   same bot lease. Do not keep source/source-read enabled while expecting
+   Herdres to call `pane_list`, `pane_turn`, `send_to_pane`,
+   `herdr pane send-keys`, or `herdr pane read` for normal Telegram behavior.
 
 6. Before leaving source mode on, run a restart/event-storm smoke. A 24-hour soak
    is best; if that is not practical, run this checklist and keep the command
@@ -884,15 +901,15 @@ delivery bookkeeping.
    ```bash
    # 1. Herdr restart: use your Herdr supervisor, then verify Tendwire still
    #    observes workers through its own source path.
-   tendwire snapshot --json --store --db-path ~/.local/share/tendwire/tendwire.sqlite3
+   tendwire snapshot --json --store --db-path ~/.local/share/tendwire/tendwire.db
 
    # 2. Tendwire restart.
    systemctl --user restart tendwired.service
    tendwire doctor --json
-   tendwire store status --db-path ~/.local/share/tendwire/tendwire.sqlite3
+   tendwire store status --db-path ~/.local/share/tendwire/tendwire.db
 
    # 3. SQLite integrity.
-   sqlite3 ~/.local/share/tendwire/tendwire.sqlite3 'PRAGMA integrity_check;'
+   sqlite3 ~/.local/share/tendwire/tendwire.db 'PRAGMA integrity_check;'
 
    # 4. Herdres source-mode dry run with direct Herdr intentionally disabled
    #    for Herdres itself. This copies state to a temp file, sets
@@ -904,13 +921,14 @@ delivery bookkeeping.
    # 5. Herdres restart and one real sync.
    systemctl --user restart herdres.timer herdres-gateway.service
    HERDRES_TENDWIRE_MODE=source herdres sync
+   herdres doctor
 
    # 6. Connector duplicate-delivery check. Run twice; the second pass must not
    #    post the same Tendwire item again. Confirm the Telegram General topic
    #    has no duplicate notice and Tendwire outbox counts are stable or lower.
    herdres tendwire outbox --limit 3
    herdres tendwire outbox --limit 3
-   tendwire store status --db-path ~/.local/share/tendwire/tendwire.sqlite3
+   tendwire store status --db-path ~/.local/share/tendwire/tendwire.db
    ```
 
    If step 4 reports `direct_herdr_calls` greater than `0`, source mode is still
