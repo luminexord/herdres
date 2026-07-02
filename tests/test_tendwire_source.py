@@ -1215,6 +1215,42 @@ class TendwireModeTests(unittest.TestCase):
         self.assertNotIn("tendwire_source_inventory_degraded_at", state)
         self.assertNotIn("tendwire_source_inventory_preserved", state)
 
+    def test_tendwire_helper_builds_bounded_source_cleanup_audits(self) -> None:
+        legacy = herdres_tendwire.legacy_direct_archive_record(
+            "legacy-key",
+            {
+                "source": "herdr",
+                "pane_id": "private-pane-id",
+                "topic_id": "private-topic-id",
+                "space_key": "workspace:old",
+                "last_known_status": "closed",
+            },
+            now="2026-07-02T00:00:00+00:00",
+            is_source_entry=herdres.entry_is_tendwire_source,
+        )
+        self.assertIsNotNone(legacy)
+        self.assertNotIn("private-pane-id", json.dumps(legacy))
+        self.assertNotIn("private-topic-id", json.dumps(legacy))
+
+        delete = herdres_tendwire.source_pane_delete_record(
+            "source-key",
+            {"pane_id": "tendwire:worker-1", "worker_id": "worker-1", "topic_id": "77"},
+            now="2026-07-02T00:01:00+00:00",
+        )
+        self.assertEqual(delete["pane_key"], "source-key")
+        self.assertEqual(delete["worker_id"], "worker-1")
+
+        state = {"audit": [{"old": "1"}]}
+        changed = herdres_tendwire.append_bounded_audit(
+            state,
+            "audit",
+            [{"new": "2"}, {"new": "3"}],
+            limit=2,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(state["audit"], [{"new": "2"}, {"new": "3"}])
+
     def test_tendwire_helper_tracks_source_turn_delivery_ledger(self) -> None:
         state, key = _source_state()
         entry = state["panes"][key]

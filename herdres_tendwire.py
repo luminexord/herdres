@@ -995,6 +995,44 @@ def legacy_direct_archive_record(
     }
 
 
+def source_pane_delete_record(pane_key_value: str, entry: dict[str, Any], *, now: str) -> dict[str, Any]:
+    return {
+        "pane_key": str(pane_key_value),
+        "pane_id": str(entry.get("pane_id") or ""),
+        "entry_type": str(entry.get("entry_type") or ""),
+        "worker_id": str(entry.get("worker_id") or entry.get("tendwire_worker_id") or ""),
+        "space_key": str(entry.get("space_key") or ""),
+        "topic_id": str(entry.get("topic_id") or ""),
+        "removed_at": now,
+    }
+
+
+def closed_source_prune_record(pane_key_value: str, entry: dict[str, Any], *, now: str) -> dict[str, Any]:
+    return {
+        "pane_key": str(pane_key_value),
+        "entry_type": str(entry.get("entry_type") or ""),
+        "worker_id": str(entry.get("worker_id") or entry.get("tendwire_worker_id") or ""),
+        "space_key": str(entry.get("space_key") or ""),
+        "topic_id": str(entry.get("topic_id") or ""),
+        "removed_at": now,
+    }
+
+
+def append_bounded_audit(
+    state: dict[str, Any],
+    key: str,
+    records: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> bool:
+    if not isinstance(state, dict) or not records:
+        return False
+    prior = state.get(key)
+    existing = prior if isinstance(prior, list) else []
+    state[key] = (existing + records)[-max(1, int(limit)):]
+    return True
+
+
 def request_component(
     value: Any,
     limit: int = 48,

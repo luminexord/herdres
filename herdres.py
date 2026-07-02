@@ -12440,19 +12440,13 @@ def drop_tendwire_source_pane_records(state: dict[str, Any]) -> int:
             continue
         remove_pane_from_space_memberships(state, str(key))
         panes.pop(key, None)
-        removed.append({
-            "pane_key": str(key),
-            "pane_id": str(entry.get("pane_id") or ""),
-            "entry_type": str(entry.get("entry_type") or ""),
-            "worker_id": str(entry.get("worker_id") or entry.get("tendwire_worker_id") or ""),
-            "space_key": str(entry.get("space_key") or ""),
-            "topic_id": str(entry.get("topic_id") or ""),
-            "removed_at": utc_now(),
-        })
-    if removed:
-        audit = state.get("deleted_tendwire_source_panes")
-        prior = audit if isinstance(audit, list) else []
-        state["deleted_tendwire_source_panes"] = (prior + removed)[-100:]
+        removed.append(herdres_tendwire.source_pane_delete_record(str(key), entry, now=utc_now()))
+    herdres_tendwire.append_bounded_audit(
+        state,
+        "deleted_tendwire_source_panes",
+        removed,
+        limit=100,
+    )
     return len(removed)
 
 
@@ -12493,9 +12487,12 @@ def archive_legacy_direct_pane_records_for_source(
             space["pane_keys"] = []
         else:
             spaces.pop(key, None)
-    audit = state.get("archived_legacy_direct_panes")
-    prior = audit if isinstance(audit, list) else []
-    state["archived_legacy_direct_panes"] = (prior + removed)[-200:]
+    herdres_tendwire.append_bounded_audit(
+        state,
+        "archived_legacy_direct_panes",
+        removed,
+        limit=200,
+    )
     state["last_legacy_direct_archive_at"] = utc_now()
     return len(removed)
 
@@ -12517,16 +12514,7 @@ def prune_closed_tendwire_source_records(
             continue
         remove_pane_from_space_memberships(state, str(key))
         panes.pop(key, None)
-        removed.append(
-            {
-                "pane_key": str(key),
-                "entry_type": str(entry.get("entry_type") or ""),
-                "worker_id": str(entry.get("worker_id") or entry.get("tendwire_worker_id") or ""),
-                "space_key": str(entry.get("space_key") or ""),
-                "topic_id": str(entry.get("topic_id") or ""),
-                "removed_at": utc_now(),
-            }
-        )
+        removed.append(herdres_tendwire.closed_source_prune_record(str(key), entry, now=utc_now()))
     if not removed:
         return 0
     spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
@@ -12541,9 +12529,12 @@ def prune_closed_tendwire_source_records(
             space["pane_keys"] = []
         else:
             spaces.pop(key, None)
-    audit = state.get("pruned_tendwire_source_panes")
-    prior = audit if isinstance(audit, list) else []
-    state["pruned_tendwire_source_panes"] = (prior + removed)[-200:]
+    herdres_tendwire.append_bounded_audit(
+        state,
+        "pruned_tendwire_source_panes",
+        removed,
+        limit=200,
+    )
     state["last_tendwire_source_prune_at"] = utc_now()
     return len(removed)
 
