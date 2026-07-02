@@ -409,6 +409,9 @@ class GatewayManagedBotTests(unittest.TestCase):
         reassembly_patch = patch.object(managed_gateway, "REASSEMBLY_PATH", Path(self.tmp.name) / "gateway_reassembly.json")
         reassembly_patch.start()
         self.addCleanup(reassembly_patch.stop)
+        trace_patch = patch.object(managed_gateway, "TRACE_PATH", Path(self.tmp.name) / "gateway.trace.log")
+        trace_patch.start()
+        self.addCleanup(trace_patch.stop)
         managed_gateway.PROCESSED_MESSAGE_KEYS = None
         managed_gateway.PROCESSED_MESSAGE_ORDER = []
         if hasattr(managed_gateway, "QUARANTINED_KEYS"):
