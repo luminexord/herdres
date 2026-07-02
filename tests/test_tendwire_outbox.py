@@ -60,8 +60,8 @@ class TendwireOutboxTests(unittest.TestCase):
         self.assertEqual(herdres_tendwire.outbox_event_type(payload), "attention_created")
         self.assertEqual(herdres_tendwire.outbox_event_type({}), "attention")
         self.assertEqual(herdres_tendwire.outbox_item_payload({"payload": "not-public-json"}), {})
-        self.assertEqual(herdres.tendwire_outbox_item_identity(item), herdres_tendwire.outbox_item_identity(item))
         self.assertEqual(herdres_tendwire.outbox_item_identity(item), herdres_tendwire.outbox_item_identity(dict(item)))
+        self.assertFalse(hasattr(herdres, "tendwire_outbox_item_identity"))
 
     def test_tendwire_outbox_worker_route_resolution_lives_in_tendwire_module(self) -> None:
         item = _item()
@@ -109,7 +109,7 @@ class TendwireOutboxTests(unittest.TestCase):
         self.assertEqual(state["tendwire_outbox"]["last_checked_at"], "2026-07-02T00:02:00+00:00")
         self.assertEqual(state["tendwire_outbox"]["delivered_identities"], ["abc123"])
         self.assertEqual(herdres_tendwire.outbox_delivered_identities(state), {"abc123"})
-        self.assertEqual(herdres.tendwire_outbox_delivered_identities(state), {"abc123"})
+        self.assertFalse(hasattr(herdres, "tendwire_outbox_delivered_identities"))
 
     def test_tendwire_outbox_connector_params_live_in_tendwire_module(self) -> None:
         item = _item()
@@ -395,7 +395,7 @@ class TendwireOutboxTests(unittest.TestCase):
 
     def test_drain_deduplicates_previously_delivered_item_before_ack(self) -> None:
         item = _item()
-        identity = herdres.tendwire_outbox_item_identity(item)
+        identity = herdres_tendwire.outbox_item_identity(item)
         state = _state()
         state["tendwire_outbox"] = {"delivered_identities": [identity]}
         ack_responses: list[dict] = []

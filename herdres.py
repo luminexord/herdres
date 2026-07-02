@@ -2139,17 +2139,9 @@ def tendwire_connector_call(action: str, params: dict[str, Any] | None = None) -
     )
 
 
-def _tendwire_attention_payload(item: dict[str, Any]) -> dict[str, Any]:
-    return herdres_tendwire.outbox_item_payload(item)
-
-
-def _tendwire_attention_event_type(payload: dict[str, Any]) -> str:
-    return herdres_tendwire.outbox_event_type(payload, sanitize=sanitize_text)
-
-
 def tendwire_attention_notice_text(payload: dict[str, Any]) -> str:
     attention = payload.get("attention") if isinstance(payload.get("attention"), dict) else {}
-    event_type = _tendwire_attention_event_type(payload)
+    event_type = herdres_tendwire.outbox_event_type(payload, sanitize=sanitize_text)
     title = "Tendwire attention escalated" if event_type == "attention_escalated" else "Tendwire attention"
     lines = [title]
     for label, key, limit in (
@@ -2186,25 +2178,13 @@ def tendwire_attention_notice_html(payload: dict[str, Any]) -> str:
     return "".join(blocks)
 
 
-def tendwire_outbox_item_identity(item: dict[str, Any]) -> str:
-    return herdres_tendwire.outbox_item_identity(item)
-
-
-def tendwire_outbox_delivered_identities(state: dict[str, Any]) -> set[str]:
-    return herdres_tendwire.outbox_delivered_identities(state)
-
-
-def tendwire_outbox_audit(state: dict[str, Any], event: dict[str, Any]) -> None:
-    herdres_tendwire.note_outbox_audit(state, event, checked_at=utc_now())
-
-
 def deliver_tendwire_outbox_item(
     state: dict[str, Any],
     chat_id: str,
     telegram: dict[str, Any],
     item: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = _tendwire_attention_payload(item)
+    payload = herdres_tendwire.outbox_item_payload(item)
     html_text = tendwire_attention_notice_html(payload)
     fallback_text = tendwire_attention_notice_text(payload)
     route_entry = herdres_tendwire.outbox_worker_route_entry(state, payload, sanitize=sanitize_text)
@@ -2227,14 +2207,15 @@ def deliver_tendwire_outbox_item(
         api_token=api_token,
     )
     if result.get("ok"):
-        tendwire_outbox_audit(
+        herdres_tendwire.note_outbox_audit(
             state,
             {
-                "event_type": _tendwire_attention_event_type(payload),
+                "event_type": herdres_tendwire.outbox_event_type(payload, sanitize=sanitize_text),
                 "attempt": int(item.get("attempt") or 0),
                 "status": "delivered",
                 "delivered_at": utc_now(),
             },
+            checked_at=utc_now(),
         )
     return result
 
@@ -2277,7 +2258,11 @@ def drain_tendwire_connector_outbox(
         sanitize=sanitize_text,
     )
     if audit_event is not None:
-        tendwire_outbox_audit(state, {"status": audit_event.get("status"), "checked_at": utc_now()})
+        herdres_tendwire.note_outbox_audit(
+            state,
+            {"status": audit_event.get("status"), "checked_at": utc_now()},
+            checked_at=utc_now(),
+        )
         return result
 
     def execute_outbox_connector_plan(plan: dict[str, Any]) -> None:
@@ -2286,7 +2271,7 @@ def drain_tendwire_connector_outbox(
         herdres_tendwire.outbox_record_connector_response(result, plan, response)
 
     for item in items:
-        action = herdres_tendwire.outbox_item_action(item, tendwire_outbox_delivered_identities(state))
+        action = herdres_tendwire.outbox_item_action(item, herdres_tendwire.outbox_delivered_identities(state))
         ref = str(action.get("ref") or "")
         if not ref:
             continue
@@ -2312,7 +2297,11 @@ def drain_tendwire_connector_outbox(
         if sent.get("ok"):
             counters["sends"] = counters.get("sends", 0) + 1
             herdres_tendwire.outbox_record_delivery_success(result)
-            tendwire_outbox_audit(state, {"identity": identity, "status": "delivered", "recorded_at": utc_now()})
+            herdres_tendwire.note_outbox_audit(
+                state,
+                {"identity": identity, "status": "delivered", "recorded_at": utc_now()},
+                checked_at=utc_now(),
+            )
             plan = herdres_tendwire.outbox_connector_plan(item, action, "delivered", sanitize=sanitize_text)
             execute_outbox_connector_plan(plan)
             continue
