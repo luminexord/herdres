@@ -300,6 +300,30 @@ class DoctorTests(UpdateTestBase):
         self.assertFalse(result["services"]["tendwired.service"]["conflict"])
         self.assertFalse(result["services"]["herdres.timer"]["conflict"])
 
+    def test_doctor_includes_tendwire_backend_and_sqlite_checks(self):
+        for unit in ("tendwired.service", "herdres.timer", "herdres-gateway.service"):
+            self.router.active_units[unit] = "active"
+            self.router.enabled_units[unit] = "enabled"
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(
+                    herdres.herdres_tendwire,
+                    "backend_health_doctor",
+                    return_value={"ok": True, "status": "healthy"},
+                ) as backend, \
+                patch.object(
+                    herdres.herdres_tendwire,
+                    "sqlite_integrity_doctor",
+                    return_value={"ok": True, "status": "ok", "integrity": "ok"},
+                ) as sqlite:
+            result = herdres.doctor_once(_args(fix=False))
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("tendwire_backend", result["checks"])
+        self.assertIn("sqlite_integrity", result["checks"])
+        backend.assert_called_once()
+        sqlite.assert_called_once()
+
 
 class SourceResolutionTests(UpdateTestBase):
     def test_repo_flag_wins(self):

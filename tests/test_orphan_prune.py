@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +60,40 @@ def pane_for(*, workspace_id: str = "wabcdef123456", pane_id: str = "pane-1", te
 
 
 class OrphanPruneLifecycleTests(unittest.TestCase):
+    def test_topic_cleanup_report_is_dry_run_and_uses_topic_refs(self) -> None:
+        state = orphan_state(topic_id="77")
+        state["panes"]["pseudo"] = {
+            "pane_key": "pseudo",
+            "source": "tendwire",
+            "pane_id": "tendwire:worker-1",
+            "topic_id": "88",
+            "last_known_status": "working",
+        }
+        state["spaces"]["workspace:empty"] = {
+            "space_key": "workspace:empty",
+            "topic_id": "99",
+            "pane_keys": [],
+        }
+        delete_topic = Mock(return_value=True)
+
+        with patch.object(herdres, "load_dotenv"), \
+                patch.object(herdres, "load_state", return_value=state), \
+                patch.object(herdres, "delete_topic", delete_topic), \
+                patch.object(herdres, "save_state") as save_state:
+            report = herdres.topic_cleanup_report_once()
+
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["dry_run"])
+        self.assertFalse(report["changed"])
+        self.assertEqual(report["counts"]["pseudo_panes"], 1)
+        self.assertGreaterEqual(report["counts"]["orphan_spaces"], 1)
+        encoded = json.dumps(report, sort_keys=True)
+        self.assertNotIn('"77"', encoded)
+        self.assertNotIn('"88"', encoded)
+        self.assertNotIn('"99"', encoded)
+        delete_topic.assert_not_called()
+        save_state.assert_not_called()
+
     def test_prune_ended_space_deletes_topic_removes_state_and_audits(self) -> None:
         state = orphan_state()
         delete_topic = Mock(return_value=True)

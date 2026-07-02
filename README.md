@@ -894,6 +894,7 @@ delivery bookkeeping.
    HERDR_TELEGRAM_TOPICS_DRY_RUN=1 herdres sync
    herdres tendwire config
    herdres doctor
+   herdres topic-cleanup-report
    systemctl --user restart herdres.timer herdres-gateway.service
    ```
 

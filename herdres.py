@@ -14014,6 +14014,102 @@ def cleanup_duplicates_once(*, delete: bool = False) -> dict[str, Any]:
     }
 
 
+def _topic_ref(topic_id: Any) -> str:
+    value = str(topic_id or "").strip()
+    if not value:
+        return ""
+    return "topic:" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _cleanup_report_entry(key: str, entry: dict[str, Any], reason: str) -> dict[str, Any]:
+    return {
+        "pane_key": sanitize_text(str(key), 160),
+        "reason": reason,
+        "source": sanitize_text(str(entry.get("source") or ""), 80),
+        "entry_type": sanitize_text(str(entry.get("entry_type") or ""), 80),
+        "worker_id": sanitize_text(str(entry.get("worker_id") or entry.get("tendwire_worker_id") or ""), 160),
+        "topic_ref": _topic_ref(entry.get("topic_id")),
+    }
+
+
+def topic_cleanup_report_once() -> dict[str, Any]:
+    """Read-only cleanup report for stale source/topic state.
+
+    This deliberately does not call Telegram, does not delete topics, and does
+    not persist state. Topic IDs are represented by short stable refs so the
+    report can be shared without leaking raw Telegram routing IDs.
+    """
+    load_dotenv()
+    state = load_state()
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    protected = _protected_topic_ids(state)
+    pseudo_panes: list[dict[str, Any]] = []
+    closed_source: list[dict[str, Any]] = []
+    legacy_direct: list[dict[str, Any]] = []
+    for key, entry in panes.items():
+        if not isinstance(entry, dict):
+            continue
+        pane_id = str(entry.get("pane_id") or "")
+        if pane_id.startswith("tendwire:"):
+            pseudo_panes.append(_cleanup_report_entry(str(key), entry, "pseudo_tendwire_pane_id"))
+        if herdres_tendwire.should_prune_closed_source_record(entry):
+            closed_source.append(_cleanup_report_entry(str(key), entry, "closed_source_record"))
+        if herdres_tendwire.should_archive_legacy_direct_record(entry):
+            legacy_direct.append(_cleanup_report_entry(str(key), entry, "legacy_direct_record"))
+
+    orphan_spaces: list[dict[str, Any]] = []
+    for key, space in spaces.items():
+        if not isinstance(space, dict):
+            continue
+        topic_id = str(space.get("topic_id") or "")
+        if topic_id in protected:
+            continue
+        pane_keys = [str(value) for value in space.get("pane_keys") or [] if str(value or "")]
+        existing = [value for value in pane_keys if value in panes]
+        if pane_keys and existing:
+            continue
+        if not pane_keys and not topic_id:
+            continue
+        orphan_spaces.append(
+            {
+                "space_key": sanitize_text(str(key), 160),
+                "reason": "space_without_live_pane_records",
+                "topic_ref": _topic_ref(topic_id),
+                "pane_key_count": len(pane_keys),
+            }
+        )
+
+    duplicates = [
+        {
+            "closed_key": sanitize_text(str(record.get("closed_key") or ""), 160),
+            "active_key": sanitize_text(str(record.get("active_key") or ""), 160),
+            "topic_ref": _topic_ref(record.get("topic_id")),
+            "active_topic_ref": _topic_ref(record.get("active_topic_id")),
+        }
+        for record in duplicate_topic_records(state)
+    ]
+    report = {
+        "ok": True,
+        "dry_run": True,
+        "changed": False,
+        "counts": {
+            "pseudo_panes": len(pseudo_panes),
+            "closed_source_records": len(closed_source),
+            "legacy_direct_records": len(legacy_direct),
+            "orphan_spaces": len(orphan_spaces),
+            "duplicate_topics": len(duplicates),
+        },
+        "pseudo_panes": pseudo_panes,
+        "closed_source_records": closed_source,
+        "legacy_direct_records": legacy_direct,
+        "orphan_spaces": orphan_spaces,
+        "duplicate_topics": duplicates,
+    }
+    report["would_change"] = any(report["counts"].values())
+    return report
+
+
 def parse_plugin_json_env(name: str) -> dict[str, Any]:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -17123,11 +17219,30 @@ def doctor_once(args: Any) -> dict[str, Any]:
     fix = bool(getattr(args, "fix", False))
     legacy_timer = legacy_topic_timer_doctor(fix=fix)
     source_services = source_services_doctor(fix=fix)
+    tendwire_backend = herdres_tendwire.backend_health_doctor(
+        env=os.environ,
+        runner=run_cmd,
+        sanitize=sanitize_text,
+        default_herdr_bin=DEFAULT_HERDR_BIN,
+        warn_invalid=_warn_invalid_tendwire_mode,
+    )
+    sqlite_integrity = herdres_tendwire.sqlite_integrity_doctor(
+        env=os.environ,
+        sanitize=sanitize_text,
+        warn_invalid=_warn_invalid_tendwire_mode,
+    )
     return {
-        "ok": bool(legacy_timer.get("ok")) and bool(source_services.get("ok")),
+        "ok": (
+            bool(legacy_timer.get("ok"))
+            and bool(source_services.get("ok"))
+            and bool(tendwire_backend.get("ok"))
+            and bool(sqlite_integrity.get("ok"))
+        ),
         "checks": {
             "legacy_topic_timer": legacy_timer,
             "source_services": source_services,
+            "tendwire_backend": tendwire_backend,
+            "sqlite_integrity": sqlite_integrity,
         },
     }
 
@@ -17860,6 +17975,7 @@ def main() -> int:
     sub.add_parser("plugin-disable")
     cleanup = sub.add_parser("cleanup-duplicates")
     cleanup.add_argument("--delete", action="store_true")
+    sub.add_parser("topic-cleanup-report")
     sub.add_parser("command")
     sub.add_parser("callback")
     sub.add_parser("managed-bot")
@@ -17921,6 +18037,8 @@ def main() -> int:
             result = with_lock(lambda: plugin_enable_once(False), blocking=True)
         elif args.cmd == "cleanup-duplicates":
             result = with_lock(lambda: cleanup_duplicates_once(delete=args.delete), blocking=True)
+        elif args.cmd == "topic-cleanup-report":
+            result = with_lock(topic_cleanup_report_once, blocking=True)
         elif args.cmd == "command":
             payload = json.loads(sys.stdin.read() or "{}")
             # Issue #4 perf: transcribe a voice note OFF the global lock (the download + STT can take

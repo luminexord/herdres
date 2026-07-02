@@ -286,6 +286,126 @@ class TendwireModeTests(unittest.TestCase):
         self.assertFalse(result["legacy_timer"]["active"])
         self.assertFalse(result["legacy_timer"]["conflict"])
 
+    def test_tendwire_helper_reports_backend_health_from_snapshot(self) -> None:
+        def runner(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            self.assertEqual(cmd[-2:], ["snapshot", "--json"])
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    {
+                        "schema_version": 2,
+                        "backend_health": [
+                            {
+                                "name": "herdr",
+                                "status": "healthy",
+                                "outcome": "healthy_non_empty",
+                                "message": "Herdr observation is healthy",
+                            }
+                        ],
+                    }
+                ),
+                stderr="",
+            )
+
+        result = herdres_tendwire.backend_health_doctor(
+            env={"HERDRES_TENDWIRE_MODE": "source"},
+            runner=runner,
+            sanitize=herdres.sanitize_text,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "healthy")
+        self.assertEqual(result["backend_health"][0]["status"], "healthy")
+
+    def test_tendwire_helper_fails_backend_health_when_snapshot_is_degraded(self) -> None:
+        def runner(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    {
+                        "schema_version": 2,
+                        "backend_health": [
+                            {
+                                "name": "herdr",
+                                "status": "unavailable",
+                                "outcome": "launch_error",
+                                "message": "Herdr backend is unavailable",
+                            }
+                        ],
+                    }
+                ),
+                stderr="",
+            )
+
+        result = herdres_tendwire.backend_health_doctor(
+            env={"HERDRES_TENDWIRE_MODE": "source"},
+            runner=runner,
+            sanitize=herdres.sanitize_text,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "unhealthy")
+
+    def test_tendwire_helper_reports_sqlite_integrity(self) -> None:
+        class Conn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql: str):
+                self.sql = sql
+                return self
+
+            def fetchone(self):
+                return ("ok",)
+
+        seen: list[str] = []
+
+        def connect(path: str):
+            seen.append(path)
+            return Conn()
+
+        result = herdres_tendwire.sqlite_integrity_doctor(
+            env={
+                "HERDRES_TENDWIRE_MODE": "source",
+                "HERDRES_TENDWIRE_DB_PATH": "/tmp/tendwire-test.db",
+            },
+            connect=connect,
+            sanitize=herdres.sanitize_text,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["integrity"], "ok")
+        self.assertEqual(seen, ["/tmp/tendwire-test.db"])
+
+    def test_tendwire_helper_reports_sqlite_integrity_failure(self) -> None:
+        class Conn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql: str):
+                return self
+
+            def fetchone(self):
+                return ("database disk image is malformed",)
+
+        result = herdres_tendwire.sqlite_integrity_doctor(
+            env={"HERDRES_TENDWIRE_MODE": "source"},
+            connect=lambda _path: Conn(),
+            sanitize=herdres.sanitize_text,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed")
+
     def test_legacy_aliases_normalize_to_enrich_when_mode_unset(self) -> None:
         self.assertEqual(herdres_tendwire.parse_mode({"HERDRES_TENDWIRE_HYBRID": "1"}), "enrich")
         self.assertEqual(herdres_tendwire.parse_mode({"HERDRES_TENDWIRE_SNAPSHOT": "1"}), "enrich")

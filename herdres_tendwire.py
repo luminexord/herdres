@@ -14,6 +14,7 @@ import shlex
 import hashlib
 import json
 import subprocess
+import sqlite3
 import sys
 import threading
 from typing import Any, Callable
@@ -24,6 +25,7 @@ LEGACY_TIMER_CONFLICT_MODES = {"commands", "source-read", "source"}
 SOURCE_ROUTE_BLOCK_MODES = LEGACY_TIMER_CONFLICT_MODES
 LEGACY_HERDR_TOPIC_TIMER = "herdr-telegram-topics.timer"
 SOURCE_REQUIRED_SYSTEMD_UNITS = ("tendwired.service", "herdres.timer", "herdres-gateway.service")
+DEFAULT_TENDWIRE_DB_PATH = "~/.local/share/tendwire/tendwire.db"
 OPTIONAL_ENV_KEYS = {
     "HERDRES_TENDWIRE_DATA_DIR": "TENDWIRE_DATA_DIR",
     "HERDRES_TENDWIRE_DB_PATH": "TENDWIRE_DB_PATH",
@@ -677,6 +679,17 @@ def config_status(env: Any | None = None, *, default_herdr_bin: str = DEFAULT_HE
     }
 
 
+def db_path(env: Any | None = None) -> str:
+    source = _env_source(env)
+    configured = optional_config_value("HERDRES_TENDWIRE_DB_PATH", source)
+    if configured:
+        return configured
+    raw_tendwire = _env_get_str(source, "TENDWIRE_DB_PATH").strip()
+    if raw_tendwire:
+        return _expand_config_path(raw_tendwire, source)
+    return _expand_config_path(DEFAULT_TENDWIRE_DB_PATH, source)
+
+
 def _systemd_unit_is_active(unit: str, *, runner: Runner = subprocess.run) -> tuple[bool, str, int]:
     proc = runner(
         ["systemctl", "--user", "is-active", unit],
@@ -854,6 +867,107 @@ def legacy_topic_timer_doctor(
             500,
         )
     result["ok"] = getattr(proc, "returncode", 1) == 0 and not active_after
+    return result
+
+
+def backend_health_doctor(
+    *,
+    env: Any | None = None,
+    runner: Runner,
+    sanitize: Sanitizer = _default_sanitize,
+    default_herdr_bin: str = DEFAULT_HERDR_BIN,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> dict[str, Any]:
+    mode = parse_mode(
+        os.environ if env is None else env,
+        diagnose_invalid=True,
+        warn_invalid=warn_invalid,
+    )
+    required = mode in LEGACY_TIMER_CONFLICT_MODES
+    result: dict[str, Any] = {
+        "ok": True,
+        "mode": mode,
+        "required": bool(required),
+        "status": "skipped",
+        "backend_health": [],
+    }
+    if not required:
+        return result
+    try:
+        snapshot = snapshot_payload(
+            runner=runner,
+            sanitize=sanitize,
+            env=os.environ if env is None else env,
+            default_herdr_bin=default_herdr_bin,
+        )
+    except TendwireCallError as exc:
+        result.update({"ok": False, "status": "snapshot_failed", "error": sanitize(str(exc), 500)})
+        return result
+    except subprocess.TimeoutExpired:
+        result.update({"ok": False, "status": "timeout", "error": "tendwire snapshot timed out"})
+        return result
+    except Exception as exc:
+        result.update({"ok": False, "status": "error", "error": sanitize(str(exc), 500)})
+        return result
+    health_items = snapshot.get("backend_health") if isinstance(snapshot.get("backend_health"), list) else []
+    public_health: list[dict[str, Any]] = []
+    healthy = False
+    for item in health_items:
+        if not isinstance(item, dict):
+            continue
+        status = sanitize(str(item.get("status") or ""), 80).strip().lower()
+        outcome = sanitize(str(item.get("outcome") or ""), 120).strip()
+        public_health.append(
+            {
+                "name": sanitize(str(item.get("name") or ""), 80).strip(),
+                "status": status,
+                "outcome": outcome,
+                "message": sanitize(str(item.get("message") or ""), 300).strip(),
+            }
+        )
+        if status == "healthy":
+            healthy = True
+    result["backend_health"] = public_health
+    result["status"] = "healthy" if healthy else "unhealthy"
+    result["ok"] = healthy
+    if not public_health:
+        result["status"] = "missing_backend_health"
+        result["ok"] = False
+    return result
+
+
+def sqlite_integrity_doctor(
+    *,
+    env: Any | None = None,
+    connect: Callable[..., Any] = sqlite3.connect,
+    sanitize: Sanitizer = _default_sanitize,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> dict[str, Any]:
+    mode = parse_mode(
+        os.environ if env is None else env,
+        diagnose_invalid=True,
+        warn_invalid=warn_invalid,
+    )
+    required = mode in LEGACY_TIMER_CONFLICT_MODES
+    result: dict[str, Any] = {
+        "ok": True,
+        "mode": mode,
+        "required": bool(required),
+        "status": "skipped",
+        "path_configured": bool(optional_config_value("HERDRES_TENDWIRE_DB_PATH", os.environ if env is None else env)),
+    }
+    if not required:
+        return result
+    try:
+        with connect(db_path(os.environ if env is None else env)) as conn:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+    except Exception as exc:
+        result.update({"ok": False, "status": "error", "error": sanitize(str(exc), 300)})
+        return result
+    value = str(row[0] if row else "").strip()
+    result["integrity"] = sanitize(value, 120)
+    result["status"] = "ok" if value == "ok" else "failed"
+    result["ok"] = value == "ok"
     return result
 
 
