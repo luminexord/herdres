@@ -1884,14 +1884,6 @@ def tendwire_commands_enabled() -> bool:
     return tendwire_mode_at_least("commands")
 
 
-def tendwire_source_read_enabled() -> bool:
-    return tendwire_mode() in {"source-read", "source"}
-
-
-def tendwire_source_inventory_enabled() -> bool:
-    return tendwire_source_read_enabled()
-
-
 def tendwire_fallback_to_herdr_enabled() -> bool:
     return parse_bool_env("HERDRES_TENDWIRE_FALLBACK_HERDR", "1")
 
@@ -11657,7 +11649,16 @@ def sync_closed_pane_records(
     *,
     sends: int,
     max_sends: int,
+    source_read_enabled: bool | None = None,
 ) -> dict[str, Any]:
+    source_read = (
+        herdres_tendwire.source_inventory_enabled_for_env(
+            diagnose_invalid=True,
+            warn_invalid=_warn_invalid_tendwire_mode,
+        )
+        if source_read_enabled is None
+        else bool(source_read_enabled)
+    )
     live_keys = {pane_key(pane) for pane in panes}
     state_panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
     changed = False
@@ -11681,7 +11682,7 @@ def sync_closed_pane_records(
             entry["closed_topic_finalized"] = True
             entry["closed_topic_preserved_at"] = utc_now()
             changed = True
-        if entry_is_tendwire_source(entry) and tendwire_source_read_enabled():
+        if entry_is_tendwire_source(entry) and source_read:
             if newly_closed:
                 entry["closed_notice_suppressed_at"] = utc_now()
                 changed = True
@@ -13745,7 +13746,10 @@ def sync_once() -> dict[str, Any]:
     # changes, forget all existing topic mappings so fresh topics are created.
     if reconcile_topic_grouping(state):
         changed = True
-    source_read = tendwire_source_read_enabled()
+    source_read = herdres_tendwire.source_inventory_enabled_for_env(
+        diagnose_invalid=True,
+        warn_invalid=_warn_invalid_tendwire_mode,
+    )
     if source_read and seed_source_turn_delivery_ledger_from_entries(state):
         changed = True
     stale_tendwire_pruned = 0 if source_read else drop_tendwire_source_pane_records(state)
@@ -13768,6 +13772,7 @@ def sync_once() -> dict[str, Any]:
         panes,
         sends=0,
         max_sends=MAX_SENDS_PER_RUN,
+        source_read_enabled=source_read,
     )
     if closed_result.get("changed"):
         changed = True

@@ -2275,8 +2275,6 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
             save_state=save_state or Mock(),
             send_to_pane=send_to_pane or Mock(return_value=(True, "")),
             pane_turn=pane_turn or Mock(return_value={"available": True, "turn_id": "turn-before"}),
-            tendwire_source_inventory_enabled=Mock(return_value=False),
-            tendwire_source_read_enabled=Mock(return_value=False),
             tendwire_commands_enabled=Mock(return_value=False),
         )
 

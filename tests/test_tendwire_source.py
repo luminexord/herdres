@@ -147,6 +147,12 @@ class TendwireModeTests(unittest.TestCase):
                 self.assertTrue(herdres.tendwire_snapshot_enabled())
                 self.assertTrue(herdres.tendwire_commands_enabled())
 
+    def test_tendwire_helper_owns_source_inventory_mode_check(self) -> None:
+        self.assertFalse(herdres_tendwire.source_inventory_enabled_for_env({"HERDRES_TENDWIRE_MODE": "off"}))
+        self.assertFalse(herdres_tendwire.source_inventory_enabled_for_env({"HERDRES_TENDWIRE_MODE": "commands"}))
+        self.assertTrue(herdres_tendwire.source_inventory_enabled_for_env({"HERDRES_TENDWIRE_MODE": "source-read"}))
+        self.assertTrue(herdres_tendwire.source_inventory_enabled_for_env({"HERDRES_TENDWIRE_MODE": "source"}))
+
     def test_source_mode_enables_connector_outbox_by_default(self) -> None:
         self.assertFalse(herdres_tendwire.connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "source-read"}))
         self.assertFalse(herdres_tendwire.connector_outbox_enabled({"HERDRES_TENDWIRE_MODE": "commands"}))

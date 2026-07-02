@@ -111,6 +111,17 @@ def mode_enables_source_inventory(mode: str) -> bool:
     return str(mode or "").strip().lower() in {"source-read", "source"}
 
 
+def source_inventory_enabled_for_env(
+    env: Any | None = None,
+    *,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> bool:
+    return mode_enables_source_inventory(
+        parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
+    )
+
+
 def source_mode_blocks_closed_direct_routes(env: Any | None = None) -> bool:
     return parse_mode(env) in SOURCE_ROUTE_BLOCK_MODES
 
