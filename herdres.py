@@ -2352,24 +2352,8 @@ TENDWIRE_COMMAND_SUCCESS_STATUSES = herdres_tendwire.COMMAND_SUCCESS_STATUSES
 TENDWIRE_COMMAND_FAILURE_STATUSES = herdres_tendwire.COMMAND_FAILURE_STATUSES
 
 
-def _tendwire_response_status(response: dict[str, Any]) -> str:
-    return herdres_tendwire.response_status(response)
-
-
-def _tendwire_duplicate_payload_matches(response: dict[str, Any]) -> bool:
-    return herdres_tendwire.duplicate_payload_matches(response)
-
-
 def tendwire_command_succeeded(response: dict[str, Any]) -> bool:
     return herdres_tendwire.command_succeeded(response)
-
-
-def _same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
-    return herdres_tendwire.same_worker_stale_target_candidate(response, worker_id)
-
-
-def _retry_tendwire_request_id(base_request_id: str, candidate: dict[str, str]) -> str:
-    return herdres_tendwire.retry_request_id(base_request_id, candidate)
 
 
 def tendwire_success_reply(response: dict[str, Any]) -> str:
@@ -9017,22 +9001,12 @@ def send_to_tendwire_worker_response(
     outbound = str(text or "")
     pane_id = str(entry.get("pane_id") or "").strip()
     after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
-    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
-    submission_identity = _tendwire_command_submission_identity(
+    attempt = herdres_tendwire.submit_send_instruction_attempt(
         entry,
         outbound,
-        origin=origin,
-        chat_id=chat_id,
-        topic_id=topic_id,
-        message_id=message_id,
-        reply_to_message_id=reply_to_message_id,
-        callback_message_id=callback_message_id,
-    )
-    if tendwire_command_submission_seen(state, submission_identity):
-        return {"handled": True, "reply": ""}
-    request = build_tendwire_send_instruction_request(
-        entry,
-        outbound,
+        state=state,
+        command_call=tendwire_command,
+        now=utc_now,
         origin=origin,
         chat_id=chat_id,
         topic_id=topic_id,
@@ -9040,54 +9014,12 @@ def send_to_tendwire_worker_response(
         reply_to_message_id=reply_to_message_id,
         callback_message_id=callback_message_id,
         request_id=request_id,
+        sanitize=sanitize_text,
     )
-    ledger_changed = note_tendwire_command_submission(
-        state,
-        submission_identity,
-        request_id=str(request.get("request_id") or request_id),
-        worker_id=worker_id,
-        origin=origin,
-        text=outbound,
-        status="attempted",
-    )
-    response = tendwire_command(request)
-    if _tendwire_response_status(response) == "stale_target":
-        retry = build_tendwire_retry_send_instruction_request(
-            entry,
-            outbound,
-            response,
-            origin=origin,
-            chat_id=chat_id,
-            topic_id=topic_id,
-            message_id=message_id,
-            reply_to_message_id=reply_to_message_id,
-            callback_message_id=callback_message_id,
-            base_request_id=str(request.get("request_id") or request_id),
-        )
-        if retry is not None:
-            retry_entry, retry_request = retry
-            response = tendwire_command(retry_request)
-            ledger_changed = note_tendwire_command_submission(
-                state,
-                submission_identity,
-                request_id=str(retry_request.get("request_id") or request.get("request_id") or request_id),
-                worker_id=worker_id,
-                origin=origin,
-                text=outbound,
-                status=_tendwire_response_status(response) or "attempted",
-            ) or ledger_changed
-            if tendwire_command_succeeded(response):
-                entry["tendwire_fingerprint"] = str(retry_entry.get("tendwire_fingerprint") or "")
-    else:
-        ledger_changed = note_tendwire_command_submission(
-            state,
-            submission_identity,
-            request_id=str(request.get("request_id") or request_id),
-            worker_id=worker_id,
-            origin=origin,
-            text=outbound,
-            status=_tendwire_response_status(response) or "attempted",
-        ) or ledger_changed
+    if attempt.get("duplicate"):
+        return {"handled": True, "reply": ""}
+    response = attempt["response"] if isinstance(attempt.get("response"), dict) else {}
+    ledger_changed = bool(attempt.get("ledger_changed"))
     if tendwire_command_succeeded(response):
         if mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin=origin, pane_id=pane_id):
             ledger_changed = True
@@ -12495,60 +12427,6 @@ def tendwire_instruction_submission_identity(
     )
 
 
-def _tendwire_command_submission_identity(
-    entry: dict[str, Any],
-    text: str,
-    *,
-    origin: str = "send",
-    chat_id: str = "",
-    topic_id: str = "",
-    message_id: str = "",
-    reply_to_message_id: str = "",
-    callback_message_id: str = "",
-) -> str:
-    return herdres_tendwire.command_submission_identity_for_entry(
-        entry,
-        text,
-        chat_id=chat_id,
-        topic_id=topic_id,
-        message_id=message_id,
-        reply_to_message_id=reply_to_message_id,
-        callback_message_id=callback_message_id,
-        origin=origin,
-    )
-
-
-def _tendwire_command_submission_ledger(state: dict[str, Any]) -> dict[str, Any]:
-    return herdres_tendwire.command_submission_ledger(state)
-
-
-def tendwire_command_submission_seen(state: dict[str, Any] | None, identity: str) -> bool:
-    return herdres_tendwire.command_submission_seen(state, identity)
-
-
-def note_tendwire_command_submission(
-    state: dict[str, Any] | None,
-    identity: str,
-    *,
-    request_id: str = "",
-    worker_id: str = "",
-    origin: str = "",
-    text: str = "",
-    status: str = "",
-) -> bool:
-    return herdres_tendwire.note_command_submission(
-        state,
-        identity,
-        request_id=request_id,
-        worker_id=worker_id,
-        origin=origin,
-        text=text,
-        status=status,
-        now=utc_now(),
-        sanitize=sanitize_text,
-    )
-
-
 def build_tendwire_send_instruction_request(
     entry: dict[str, Any],
     text: str,
@@ -12571,34 +12449,6 @@ def build_tendwire_send_instruction_request(
         reply_to_message_id=reply_to_message_id,
         callback_message_id=callback_message_id,
         request_id=request_id,
-        sanitize=sanitize_text,
-    )
-
-
-def build_tendwire_retry_send_instruction_request(
-    entry: dict[str, Any],
-    text: str,
-    response: dict[str, Any],
-    *,
-    origin: str = "send",
-    chat_id: str = "",
-    topic_id: str = "",
-    message_id: str = "",
-    reply_to_message_id: str = "",
-    callback_message_id: str = "",
-    base_request_id: str = "",
-) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    return herdres_tendwire.retry_send_instruction_request(
-        entry,
-        text,
-        response,
-        origin=origin,
-        chat_id=chat_id,
-        topic_id=topic_id,
-        message_id=message_id,
-        reply_to_message_id=reply_to_message_id,
-        callback_message_id=callback_message_id,
-        base_request_id=base_request_id,
         sanitize=sanitize_text,
     )
 

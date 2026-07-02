@@ -779,6 +779,49 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         stale["result"]["candidates"] = [{"worker_id": "worker-2", "worker_fingerprint": "other-fp"}]
         self.assertIsNone(herdres_tendwire.retry_send_instruction_request(entry, "continue", stale))
 
+    def test_tendwire_helper_submits_retry_and_updates_public_ledger(self) -> None:
+        entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", tendwire_fingerprint="old-fp")
+        state = _state(entry)
+        stale = {
+            "status": "stale_target",
+            "result": {"candidates": [{"worker_id": "worker-1", "worker_fingerprint": "new-fp"}]},
+        }
+        accepted = {"status": "accepted", "ok": True}
+        calls: list[dict] = []
+
+        def command_call(request: dict) -> dict:
+            calls.append(request)
+            return stale if len(calls) == 1 else accepted
+
+        result = herdres_tendwire.submit_send_instruction_attempt(
+            entry,
+            "continue",
+            state=state,
+            command_call=command_call,
+            now=lambda: "2026-01-01T00:00:00+00:00",
+            origin="plain",
+            chat_id="-1001",
+            topic_id="77",
+            message_id="5000",
+        )
+
+        self.assertFalse(result["duplicate"])
+        self.assertTrue(result["ledger_changed"])
+        self.assertEqual(result["response"], accepted)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["target"]["worker_fingerprint"], "old-fp")
+        self.assertEqual(calls[1]["target"]["worker_fingerprint"], "new-fp")
+        self.assertIn(":retry:", calls[1]["request_id"])
+        self.assertEqual(entry["tendwire_fingerprint"], "new-fp")
+        ledger = state["tendwire_command_submissions"]
+        self.assertEqual(len(ledger), 1)
+        record = next(iter(ledger.values()))
+        self.assertEqual(record["status"], "accepted")
+        self.assertEqual(record["worker_id"], "worker-1")
+        self.assertNotIn("chat_id", record)
+        self.assertNotIn("topic_id", record)
+        self.assertNotIn("message_id", record)
+
     def test_tendwire_helper_success_reply(self) -> None:
         self.assertEqual(herdres_tendwire.success_reply({"status": "queued"}), "Queued for Tendwire worker.")
         self.assertEqual(

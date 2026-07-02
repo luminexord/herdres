@@ -1165,6 +1165,122 @@ def retry_send_instruction_request(
     return retry_entry, retry_request
 
 
+def submit_send_instruction_attempt(
+    entry: dict[str, Any],
+    text: str,
+    *,
+    state: dict[str, Any] | None = None,
+    command_call: Callable[[dict[str, Any]], dict[str, Any]],
+    now: Callable[[], str],
+    origin: str = "send",
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+    request_id: str = "",
+    sanitize: Sanitizer = _default_sanitize,
+) -> dict[str, Any]:
+    """Submit one Tendwire send_instruction command and handle public-safe retry/ledger state."""
+    outbound = str(text or "")
+    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
+    submission_identity = command_submission_identity_for_entry(
+        entry,
+        outbound,
+        origin=origin,
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+    )
+    if command_submission_seen(state, submission_identity):
+        return {
+            "duplicate": True,
+            "ledger_changed": False,
+            "response": {},
+            "request_id": "",
+            "submission_identity": submission_identity,
+            "outbound": outbound,
+        }
+    request = build_send_instruction_request(
+        entry,
+        outbound,
+        origin=origin,
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+        request_id=request_id,
+        sanitize=sanitize,
+    )
+    current_request_id = str(request.get("request_id") or request_id)
+    ledger_changed = note_command_submission(
+        state,
+        submission_identity,
+        request_id=current_request_id,
+        worker_id=worker_id,
+        origin=origin,
+        text=outbound,
+        status="attempted",
+        now=now(),
+        sanitize=sanitize,
+    )
+    response = command_call(request)
+    if response_status(response) == "stale_target":
+        retry = retry_send_instruction_request(
+            entry,
+            outbound,
+            response,
+            origin=origin,
+            chat_id=chat_id,
+            topic_id=topic_id,
+            message_id=message_id,
+            reply_to_message_id=reply_to_message_id,
+            callback_message_id=callback_message_id,
+            base_request_id=current_request_id,
+            sanitize=sanitize,
+        )
+        if retry is not None:
+            retry_entry, retry_request = retry
+            response = command_call(retry_request)
+            current_request_id = str(retry_request.get("request_id") or current_request_id)
+            ledger_changed = note_command_submission(
+                state,
+                submission_identity,
+                request_id=current_request_id,
+                worker_id=worker_id,
+                origin=origin,
+                text=outbound,
+                status=response_status(response) or "attempted",
+                now=now(),
+                sanitize=sanitize,
+            ) or ledger_changed
+            if command_succeeded(response):
+                entry["tendwire_fingerprint"] = str(retry_entry.get("tendwire_fingerprint") or "")
+    else:
+        ledger_changed = note_command_submission(
+            state,
+            submission_identity,
+            request_id=current_request_id,
+            worker_id=worker_id,
+            origin=origin,
+            text=outbound,
+            status=response_status(response) or "attempted",
+            now=now(),
+            sanitize=sanitize,
+        ) or ledger_changed
+    return {
+        "duplicate": False,
+        "ledger_changed": ledger_changed,
+        "response": response,
+        "request_id": current_request_id,
+        "submission_identity": submission_identity,
+        "outbound": outbound,
+    }
+
+
 def worker_status_for_herdres(status: str) -> str:
     value = str(status or "unknown").strip().lower().replace("-", "_")
     if value in {"active", "running", "working", "busy"}:
