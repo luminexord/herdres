@@ -479,6 +479,35 @@ def child_env(env: Any | None = None, *, default_herdr_bin: str = DEFAULT_HERDR_
     return child
 
 
+def source_smoke_child_env(
+    env: Any,
+    *,
+    smoke_state: str,
+    smoke_lock: str,
+    direct_bin: str,
+    direct_log: str,
+    with_outbox: bool = False,
+    default_herdr_bin: str = DEFAULT_HERDR_BIN,
+) -> dict[str, str]:
+    """Build the child environment for source-smoke without inheriting direct Herdr access."""
+    child = {str(key): str(value) for key, value in dict(env).items()}
+    if not str(child.get("HERDR_REAL_BIN") or "").strip():
+        child["HERDR_REAL_BIN"] = str(child.get("HERDR_BIN") or default_herdr_bin)
+    child.update(
+        {
+            "HERDR_TELEGRAM_TOPICS_STATE": str(smoke_state),
+            "HERDR_TELEGRAM_TOPICS_LOCK": str(smoke_lock),
+            "HERDR_TELEGRAM_TOPICS_DRY_RUN": "1",
+            "HERDRES_TENDWIRE_MODE": "source",
+            "HERDR_BIN": str(direct_bin),
+            "HERDRES_SOURCE_SMOKE_DIRECT_HERDR_LOG": str(direct_log),
+        }
+    )
+    if not with_outbox:
+        child["HERDRES_TENDWIRE_CONNECTOR_OUTBOX"] = "0"
+    return child
+
+
 def config_status(env: Any | None = None, *, default_herdr_bin: str = DEFAULT_HERDR_BIN) -> dict[str, Any]:
     source = _env_source(env)
     outer_timeout = timeout_seconds(source)

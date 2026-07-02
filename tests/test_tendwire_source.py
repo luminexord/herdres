@@ -1401,6 +1401,46 @@ class TendwireConfigTests(unittest.TestCase):
             ["/tmp/herdres-home/bin/tendwire", "--profile", "local", "--json-log"],
         )
 
+    def test_source_smoke_child_env_blocks_direct_herdr_and_preserves_real_bin(self) -> None:
+        env = {
+            "PATH": "/bin",
+            "HERDR_BIN": "/usr/bin/herdr",
+            "HERDR_REAL_BIN": "",
+            "HERDRES_TENDWIRE_MODE": "off",
+            "HERDRES_TENDWIRE_CONNECTOR_OUTBOX": "1",
+        }
+
+        child = herdres_tendwire.source_smoke_child_env(
+            env,
+            smoke_state="/tmp/smoke-state.json",
+            smoke_lock="/tmp/smoke.lock",
+            direct_bin="/tmp/direct-forbidden",
+            direct_log="/tmp/direct.log",
+            with_outbox=False,
+            default_herdr_bin="herdr",
+        )
+
+        self.assertEqual(child["PATH"], "/bin")
+        self.assertEqual(child["HERDR_REAL_BIN"], "/usr/bin/herdr")
+        self.assertEqual(child["HERDR_BIN"], "/tmp/direct-forbidden")
+        self.assertEqual(child["HERDRES_TENDWIRE_MODE"], "source")
+        self.assertEqual(child["HERDR_TELEGRAM_TOPICS_DRY_RUN"], "1")
+        self.assertEqual(child["HERDR_TELEGRAM_TOPICS_STATE"], "/tmp/smoke-state.json")
+        self.assertEqual(child["HERDR_TELEGRAM_TOPICS_LOCK"], "/tmp/smoke.lock")
+        self.assertEqual(child["HERDRES_SOURCE_SMOKE_DIRECT_HERDR_LOG"], "/tmp/direct.log")
+        self.assertEqual(child["HERDRES_TENDWIRE_CONNECTOR_OUTBOX"], "0")
+
+        outbox_child = herdres_tendwire.source_smoke_child_env(
+            env,
+            smoke_state="/tmp/smoke-state.json",
+            smoke_lock="/tmp/smoke.lock",
+            direct_bin="/tmp/direct-forbidden",
+            direct_log="/tmp/direct.log",
+            with_outbox=True,
+            default_herdr_bin="herdr",
+        )
+        self.assertEqual(outbox_child["HERDRES_TENDWIRE_CONNECTOR_OUTBOX"], "1")
+
     def test_tendwire_snapshot_passes_explicit_child_env(self) -> None:
         proc = subprocess.CompletedProcess(["tendwire", "snapshot", "--json"], 0, stdout=json.dumps(_snapshot()), stderr="")
         env = {

@@ -2046,21 +2046,15 @@ def tendwire_source_smoke_once(args: Any) -> dict[str, Any]:
             encoding="utf-8",
         )
         direct_bin.chmod(0o700)
-        child_env = {str(key): str(value) for key, value in os.environ.items()}
-        if not str(child_env.get("HERDR_REAL_BIN") or "").strip():
-            child_env["HERDR_REAL_BIN"] = str(child_env.get("HERDR_BIN") or DEFAULT_HERDR_BIN)
-        child_env.update(
-            {
-                "HERDR_TELEGRAM_TOPICS_STATE": str(smoke_state),
-                "HERDR_TELEGRAM_TOPICS_LOCK": str(smoke_lock),
-                "HERDR_TELEGRAM_TOPICS_DRY_RUN": "1",
-                "HERDRES_TENDWIRE_MODE": "source",
-                "HERDR_BIN": str(direct_bin),
-                "HERDRES_SOURCE_SMOKE_DIRECT_HERDR_LOG": str(direct_log),
-            }
+        child_env = herdres_tendwire.source_smoke_child_env(
+            os.environ,
+            smoke_state=str(smoke_state),
+            smoke_lock=str(smoke_lock),
+            direct_bin=str(direct_bin),
+            direct_log=str(direct_log),
+            with_outbox=bool(getattr(args, "with_outbox", False)),
+            default_herdr_bin=DEFAULT_HERDR_BIN,
         )
-        if not bool(getattr(args, "with_outbox", False)):
-            child_env["HERDRES_TENDWIRE_CONNECTOR_OUTBOX"] = "0"
         proc = run_cmd(
             [sys.executable, str(Path(__file__).resolve()), "sync"],
             timeout=timeout,
