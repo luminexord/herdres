@@ -3696,6 +3696,50 @@ class StreamingIntegrationTests(unittest.TestCase):
         for call in edit_feed_item.call_args_list:
             self.assertEqual(call.args[1], "3001", "worklog must only edit the turn's own message")
 
+    def test_noisy_stored_clean_text_same_turn_hash_does_not_edit_loop(self) -> None:
+        state, pane, _key, entry = self._state()
+        counters, caps = self._caps()
+        turn = {
+            "available": True,
+            "complete": True,
+            "turn_id": "turn-1",
+            "user_text": "Run tests",
+            "assistant_final_text": "Tests passed.",
+        }
+        item = herdres.make_turn_feed_item(turn)
+        assert item is not None
+        entry.update({
+            "last_clean_item": item,
+            "last_clean_text": herdres.item_plain_text(item) + "\nRunning in the background",
+            "last_clean_semantic_hash": herdres.clean_feed_hash(item, include_render_version=False),
+            "last_clean_hash": herdres.clean_feed_hash(item),
+            "last_clean_render_hash": herdres.clean_feed_hash(item),
+            "last_clean_message_id": "3001",
+            "last_turn_id": "turn-1",
+        })
+        self.assertTrue(herdres.feed_text_has_ui_noise(str(entry["last_clean_text"])))
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "3002"})
+        edit_feed_item = Mock(return_value={"ok": True})
+        with patch.multiple(
+            herdres,
+            pane_turn=Mock(return_value=turn),
+            send_feed_item=send_feed_item,
+            edit_feed_item=edit_feed_item,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        send_feed_item.assert_not_called()
+        edit_feed_item.assert_not_called()
+        self.assertEqual(counters["feed_sends"], 0)
+        self.assertEqual(entry["last_clean_message_id"], "3001")
+
     def test_worklog_label_elapsed_tick_does_not_change_hash(self) -> None:
         """worklog_label embeds a wall-clock elapsed time ("Worklog (1h 11m)"), so it must
         stay OUT of the render hash. Otherwise a long-idle pane whose turn still carries a

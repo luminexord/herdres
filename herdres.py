@@ -13198,7 +13198,7 @@ def _sync_pane_clean_feed(
         same_semantic = same_delivered_content(entry, item, item_semantic_hash)
         render_changed = item_render_hash != previous_render_hash
         content_changed = not same_semantic
-        should_deliver = old_clean_has_noise or content_changed or render_changed
+        should_deliver = content_changed or render_changed
         desired_bot_kind = desired_message_bot_kind(telegram, entry)
         message_id = str(entry.get("last_clean_message_id") or "")
         if same_semantic and render_changed and not content_changed and not old_clean_has_noise and not message_id:
@@ -13270,7 +13270,7 @@ def _sync_pane_clean_feed(
                     ))
                 else:
                     result = {**result, "edit_failed": True}
-            elif same_semantic and (render_changed or old_clean_has_noise) and message_id:
+            elif same_semantic and render_changed and message_id:
                 result = clean_feed_delivery_call(lambda: edit_feed_item(
                     chat_id,
                     message_id,
