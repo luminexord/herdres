@@ -157,6 +157,52 @@ class TendwireRequestBuilderTests(unittest.TestCase):
         self.assertNotIn("5000", encoded)
         self.assertNotIn("1001", encoded)
 
+    def test_send_text_policy_keeps_source_mode_fail_closed(self) -> None:
+        self.assertEqual(
+            herdres_tendwire.send_text_policy(
+                source_inventory_enabled=True,
+                source_entry=False,
+                source_entry_commands_allowed=False,
+                commands_enabled=True,
+                metadata_state="valid",
+                direct_fallback_enabled=True,
+            ),
+            "legacy_source_block",
+        )
+        self.assertEqual(
+            herdres_tendwire.send_text_policy(
+                source_inventory_enabled=True,
+                source_entry=True,
+                source_entry_commands_allowed=True,
+                commands_enabled=True,
+                metadata_state="valid",
+                direct_fallback_enabled=True,
+            ),
+            "tendwire",
+        )
+        self.assertEqual(
+            herdres_tendwire.send_text_policy(
+                source_inventory_enabled=True,
+                source_entry=True,
+                source_entry_commands_allowed=True,
+                commands_enabled=True,
+                metadata_state="partial",
+                direct_fallback_enabled=True,
+            ),
+            "safe_failure",
+        )
+        self.assertEqual(
+            herdres_tendwire.send_text_policy(
+                source_inventory_enabled=False,
+                source_entry=False,
+                source_entry_commands_allowed=False,
+                commands_enabled=True,
+                metadata_state="partial",
+                direct_fallback_enabled=True,
+            ),
+            "direct",
+        )
+
 
 class TendwireCommandRoutingTests(unittest.TestCase):
     @contextmanager

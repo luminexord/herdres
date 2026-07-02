@@ -14612,38 +14612,41 @@ def forward_text_to_pane_response(
     if not outbound:
         return {"handled": True, "reply": usage}
     source_entry = entry_is_tendwire_source(entry)
-    if tendwire_source_inventory_enabled() and not source_entry:
+    source_entry_commands_allowed = tendwire_source_entry_commands_allowed(entry)
+    commands_enabled = tendwire_commands_enabled()
+    metadata_state = tendwire_entry_metadata_state(entry)
+    policy = herdres_tendwire.send_text_policy(
+        source_inventory_enabled=tendwire_source_inventory_enabled(),
+        source_entry=source_entry,
+        source_entry_commands_allowed=source_entry_commands_allowed,
+        commands_enabled=commands_enabled,
+        metadata_state=metadata_state,
+        direct_fallback_enabled=tendwire_direct_fallback_enabled(),
+    )
+    if policy == "legacy_source_block":
         return {
             "handled": True,
             "reply": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending.",
         }
-    if source_entry and not tendwire_source_entry_commands_allowed(entry):
+    if policy == "source_commands_disabled":
         return {
             "handled": True,
             "reply": "This is a Tendwire status entry. Sending commands through Tendwire is not enabled in Herdres yet.",
         }
-    if tendwire_commands_enabled():
-        metadata_state = tendwire_entry_metadata_state(entry)
-        if metadata_state == "valid" and isinstance(entry, dict):
-            return send_to_tendwire_worker_response(
-                entry,
-                raw_outbound,
-                state=state,
-                origin=origin,
-                chat_id=chat_id,
-                topic_id=topic_id,
-                message_id=message_id,
-                reply_to_message_id=reply_to_message_id,
-                callback_message_id=callback_message_id,
-                request_id=request_id,
-            )
-        if metadata_state == "partial":
-            if not source_entry and tendwire_direct_fallback_enabled():
-                return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
-            return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
-        if tendwire_source_inventory_enabled():
-            return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
-    if source_entry:
+    if policy == "tendwire" and isinstance(entry, dict):
+        return send_to_tendwire_worker_response(
+            entry,
+            raw_outbound,
+            state=state,
+            origin=origin,
+            chat_id=chat_id,
+            topic_id=topic_id,
+            message_id=message_id,
+            reply_to_message_id=reply_to_message_id,
+            callback_message_id=callback_message_id,
+            request_id=request_id,
+        )
+    if policy == "safe_failure" or source_entry:
         return {"handled": True, "reply": TENDWIRE_SAFE_SEND_FAILURE_REPLY}
     return send_direct_text_to_pane_response(pane_id, outbound, state=state, entry=entry, origin=origin)
 

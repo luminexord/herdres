@@ -538,6 +538,35 @@ def success_reply(
     return ""
 
 
+def send_text_policy(
+    *,
+    source_inventory_enabled: bool,
+    source_entry: bool,
+    source_entry_commands_allowed: bool,
+    commands_enabled: bool,
+    metadata_state: str,
+    direct_fallback_enabled: bool,
+) -> str:
+    """Classify a pane text send without touching Herdr, Tendwire, or Telegram state."""
+    normalized_metadata = str(metadata_state or "none").strip().lower()
+    if source_inventory_enabled and not source_entry:
+        return "legacy_source_block"
+    if source_entry and not source_entry_commands_allowed:
+        return "source_commands_disabled"
+    if commands_enabled:
+        if normalized_metadata == "valid":
+            return "tendwire"
+        if normalized_metadata == "partial":
+            if direct_fallback_enabled and not source_entry:
+                return "direct"
+            return "safe_failure"
+        if source_inventory_enabled:
+            return "safe_failure"
+    if source_entry:
+        return "safe_failure"
+    return "direct"
+
+
 def same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
     if response_status(response) != "stale_target":
         return None
