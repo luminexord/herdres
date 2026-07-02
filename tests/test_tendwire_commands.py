@@ -622,6 +622,10 @@ class TendwireCommandRoutingTests(unittest.TestCase):
     def test_tendwire_helper_success_reply(self) -> None:
         self.assertEqual(herdres_tendwire.success_reply({"status": "queued"}), "Queued for Tendwire worker.")
         self.assertEqual(
+            herdres_tendwire.success_reply({"status": "accepted", "result": {"delivery_state": "queued"}}),
+            "Queued for Tendwire worker.",
+        )
+        self.assertEqual(
             herdres_tendwire.success_reply(
                 {"status": "accepted", "result": {"message": "Accepted for delivery"}},
                 sanitize=lambda text, limit=300: text[:limit].lower(),

@@ -578,9 +578,12 @@ def success_reply(
     limit: int = 300,
 ) -> str:
     status = response_status(response)
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    if str(result.get("delivery_state") or "").strip().lower() == "queued":
+        return "Queued for Tendwire worker."
     if status == "queued":
         return "Queued for Tendwire worker."
-    for container in (response, response.get("result") if isinstance(response.get("result"), dict) else {}):
+    for container in (response, result):
         message = str(container.get("reply") or container.get("message") or "").strip()
         if message:
             return sanitize(message, limit)
