@@ -2280,11 +2280,12 @@ def drain_tendwire_connector_outbox(
         tendwire_outbox_audit(state, {"status": audit_event.get("status"), "checked_at": utc_now()})
         return result
     for item in items:
-        ref = str(item.get("ref") or "").strip()
+        action = herdres_tendwire.outbox_item_action(item, tendwire_outbox_delivered_identities(state))
+        ref = str(action.get("ref") or "")
         if not ref:
             continue
-        identity = tendwire_outbox_item_identity(item)
-        if identity in tendwire_outbox_delivered_identities(state):
+        identity = str(action.get("identity") or "")
+        if action.get("action") == "ack_duplicate":
             ack = tendwire_connector_call(
                 "ack",
                 herdres_tendwire.outbox_ack_params(

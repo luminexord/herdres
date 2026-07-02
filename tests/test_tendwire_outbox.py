@@ -197,6 +197,33 @@ class TendwireOutboxTests(unittest.TestCase):
             9,
         )
 
+    def test_tendwire_outbox_item_action_classifies_delivery_without_state_refs(self) -> None:
+        item = _item()
+        identity = herdres_tendwire.outbox_item_identity(item)
+
+        self.assertEqual(
+            herdres_tendwire.outbox_item_action({"payload": {}}, set()),
+            {"action": "skip", "reason": "missing_ref", "ref": "", "identity": ""},
+        )
+        self.assertEqual(
+            herdres_tendwire.outbox_item_action(item, {identity}),
+            {
+                "action": "ack_duplicate",
+                "reason": "already_delivered",
+                "ref": "twref1.safeopaque",
+                "identity": identity,
+            },
+        )
+        self.assertEqual(
+            herdres_tendwire.outbox_item_action(item, set()),
+            {
+                "action": "deliver",
+                "reason": "due",
+                "ref": "twref1.safeopaque",
+                "identity": identity,
+            },
+        )
+
     def test_drain_posts_attention_and_acks_public_response(self) -> None:
         calls: list[list[str]] = []
         ack_responses: list[dict] = []

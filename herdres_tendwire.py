@@ -313,6 +313,17 @@ def outbox_apply_poll_response(
     return items, None
 
 
+def outbox_item_action(item: dict[str, Any], delivered_identities: set[str]) -> dict[str, Any]:
+    """Classify one leased outbox item without exposing its opaque ref in state."""
+    ref = str(item.get("ref") or "").strip()
+    if not ref:
+        return {"action": "skip", "reason": "missing_ref", "ref": "", "identity": ""}
+    identity = outbox_item_identity(item)
+    if identity in {str(value) for value in delivered_identities}:
+        return {"action": "ack_duplicate", "reason": "already_delivered", "ref": ref, "identity": identity}
+    return {"action": "deliver", "reason": "due", "ref": ref, "identity": identity}
+
+
 def outbox_poll_params(
     *,
     remaining_sends: int,
