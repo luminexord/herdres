@@ -634,6 +634,55 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(panes[0]["worker_id"], "worker-legacy")
         self.assertEqual(panes[0]["pane_id"], "")
 
+    def test_tendwire_helper_reconstructs_open_source_state_panes(self) -> None:
+        state, key = _source_state()
+        state["panes"]["closed"] = {
+            **state["panes"][key],
+            "pane_key": "closed",
+            "worker_id": "worker-closed",
+            "tendwire_worker_id": "worker-closed",
+            "last_known_status": "closed",
+        }
+        state["panes"]["direct"] = {
+            "pane_key": "direct",
+            "pane_id": "pane-direct",
+            "last_known_status": "working",
+        }
+
+        panes = herdres_tendwire.source_state_panes(
+            state,
+            is_source_entry=herdres.entry_is_tendwire_source,
+        )
+
+        self.assertEqual([pane["worker_id"] for pane in panes], ["worker-1"])
+        self.assertTrue(panes[0]["_tendwire_preserved_from_state"])
+        self.assertEqual(panes[0]["pane_id"], "")
+
+    def test_tendwire_helper_merges_preserved_source_panes_without_duplicates(self) -> None:
+        state, key = _source_state()
+        state["panes"]["worker:preserved"] = {
+            **state["panes"][key],
+            "pane_key": "worker:preserved",
+            "worker_id": "worker-preserved",
+            "tendwire_worker_id": "worker-preserved",
+            "worker_fingerprint": "fp-preserved",
+            "tendwire_fingerprint": "fp-preserved",
+        }
+        live = herdres.tendwire_source_read_panes(_snapshot())
+        preserved = herdres_tendwire.source_state_panes(
+            state,
+            is_source_entry=herdres.entry_is_tendwire_source,
+        )
+
+        merged, preserved_count = herdres_tendwire.merge_preserved_source_panes(
+            live,
+            preserved,
+            pane_key=herdres.pane_key,
+        )
+
+        self.assertEqual([pane["worker_id"] for pane in merged], ["worker-1", "worker-preserved"])
+        self.assertEqual(preserved_count, 1)
+
 
 class TendwireConfigTests(unittest.TestCase):
     def test_child_env_preserves_parent_and_overrides_only_tendwire_keys(self) -> None:

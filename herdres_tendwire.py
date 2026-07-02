@@ -33,6 +33,7 @@ _CONFIG_ENV_VAR_RE = re.compile(r"\$(\w+)|\$\{([^}]+)\}")
 Sanitizer = Callable[[str, int], str]
 RawSpacePredicate = Callable[[Any], bool]
 SourceEntryPredicate = Callable[[dict[str, Any] | None], bool]
+PaneKey = Callable[[dict[str, Any]], str]
 Runner = Callable[..., Any]
 
 
@@ -937,6 +938,47 @@ def source_entry_as_pane(
         "_tendwire_last_seen_at": str(entry.get("tendwire_last_seen_at") or ""),
         "_tendwire_preserved_from_state": True,
     }
+
+
+def source_state_panes(
+    state: dict[str, Any],
+    *,
+    is_source_entry: SourceEntryPredicate,
+) -> list[dict[str, Any]]:
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    preserved: list[dict[str, Any]] = []
+    for key, entry in panes.items():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("last_known_status") or "").strip().lower() == "closed":
+            continue
+        pane = source_entry_as_pane(
+            str(key),
+            entry,
+            is_source_entry=is_source_entry,
+        )
+        if pane is not None:
+            preserved.append(pane)
+    return preserved
+
+
+def merge_preserved_source_panes(
+    panes: list[dict[str, Any]],
+    preserved_panes: list[dict[str, Any]],
+    *,
+    pane_key: PaneKey,
+) -> tuple[list[dict[str, Any]], int]:
+    merged = list(panes)
+    live_keys = {pane_key(pane) for pane in merged}
+    preserved_count = 0
+    for pane in preserved_panes:
+        key = pane_key(pane)
+        if key in live_keys:
+            continue
+        merged.append(pane)
+        live_keys.add(key)
+        preserved_count += 1
+    return merged, preserved_count
 
 
 def is_source_read_pane(pane: dict[str, Any] | None) -> bool:

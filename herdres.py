@@ -2427,34 +2427,21 @@ def tendwire_source_entry_as_pane(pane_key_value: str, entry: dict[str, Any]) ->
 
 
 def tendwire_source_state_panes(state: dict[str, Any]) -> list[dict[str, Any]]:
-    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
-    preserved: list[dict[str, Any]] = []
-    for key, entry in panes.items():
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("last_known_status") or "").strip().lower() == "closed":
-            continue
-        pane = tendwire_source_entry_as_pane(str(key), entry)
-        if pane is not None:
-            preserved.append(pane)
-    return preserved
+    return herdres_tendwire.source_state_panes(
+        state,
+        is_source_entry=entry_is_tendwire_source,
+    )
 
 
 def merge_preserved_source_panes(
     state: dict[str, Any],
     panes: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
-    merged = list(panes)
-    live_keys = {pane_key(pane) for pane in merged}
-    preserved_count = 0
-    for pane in tendwire_source_state_panes(state):
-        key = pane_key(pane)
-        if key in live_keys:
-            continue
-        merged.append(pane)
-        live_keys.add(key)
-        preserved_count += 1
-    return merged, preserved_count
+    return herdres_tendwire.merge_preserved_source_panes(
+        panes,
+        tendwire_source_state_panes(state),
+        pane_key=pane_key,
+    )
 
 
 def pane_is_tendwire_source_read(pane: dict[str, Any] | None) -> bool:
