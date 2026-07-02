@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import herdres
+import herdres_tendwire
 
 
 def _pane(**extra) -> dict:
@@ -788,6 +789,61 @@ class TendwireConfigTests(unittest.TestCase):
 
 
 class TendwireHybridTests(unittest.TestCase):
+    def test_source_turn_for_pane_prefers_matching_worker_fingerprint(self) -> None:
+        pane = {
+            "worker_id": "worker-1",
+            "worker_fingerprint": "fp-current",
+        }
+        payload = {
+            "turns": [
+                {"id": "old", "worker_id": "worker-1", "worker_fingerprint": "fp-old"},
+                {"id": "current", "worker_id": "worker-1", "worker_fingerprint": "fp-current"},
+                {"id": "other", "worker_id": "worker-2", "worker_fingerprint": "fp-current"},
+            ],
+        }
+
+        turn = herdres_tendwire.source_turn_for_pane(pane, payload)
+
+        self.assertIsNotNone(turn)
+        self.assertEqual(turn["id"], "current")
+
+    def test_source_turn_for_pane_falls_back_to_worker_match_without_fingerprint(self) -> None:
+        pane = {"_tendwire_worker_id": "worker-1", "_tendwire_fingerprint": "missing"}
+        payload = {
+            "turns": [
+                {"id": "fallback", "worker_id": "worker-1", "worker_fingerprint": "fp-old"},
+                {"id": "other", "worker_id": "worker-2", "worker_fingerprint": "missing"},
+            ],
+        }
+
+        turn = herdres_tendwire.source_turn_for_pane(pane, payload)
+
+        self.assertIsNotNone(turn)
+        self.assertEqual(turn["id"], "fallback")
+
+    def test_source_turn_feed_source_sanitizes_and_defaults_public_turn_fields(self) -> None:
+        def sanitizer(value: str, limit: int) -> str:
+            return value.replace("secret", "[redacted]")[:limit]
+
+        source = herdres_tendwire.source_turn_feed_source(
+            {
+                "fingerprint": "turn-fp",
+                "user_text": "user secret prompt",
+                "assistant_final_text": "assistant secret final",
+                "assistant_stream_text": "stream secret text",
+            },
+            sanitize=sanitizer,
+            final_reply_max_chars=18,
+            user_prompt_max_chars=16,
+        )
+
+        self.assertEqual(source["turn_id"], "turn-fp")
+        self.assertEqual(source["user_text"], "user [redacted]")
+        self.assertEqual(source["assistant_final_text"], "assistant [redacte")
+        self.assertEqual(source["assistant_stream_text"], "stream [redacted]")
+        self.assertTrue(source["complete"])
+        self.assertFalse(source["has_open_turn"])
+
     def test_tendwire_enriches_real_pane_without_replacing_id(self) -> None:
         panes = herdres.tendwire_enrich_panes([_pane()], _snapshot())
 

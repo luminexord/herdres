@@ -2469,44 +2469,21 @@ def merge_preserved_source_panes(
 
 
 def pane_is_tendwire_source_read(pane: dict[str, Any] | None) -> bool:
-    return isinstance(pane, dict) and bool(pane.get("_tendwire_source_read"))
+    return herdres_tendwire.is_source_read_pane(pane)
 
 
 def tendwire_source_turn_for_pane(pane: dict[str, Any]) -> dict[str, Any] | None:
-    worker_id = str(pane.get("worker_id") or pane.get("_tendwire_worker_id") or "").strip()
-    if not worker_id:
-        return None
-    fingerprint = str(pane.get("worker_fingerprint") or pane.get("_tendwire_fingerprint") or "").strip()
     payload = tendwire_turns()
-    turns = payload.get("turns") if isinstance(payload.get("turns"), list) else []
-    fallback: dict[str, Any] | None = None
-    for turn in turns:
-        if not isinstance(turn, dict):
-            continue
-        if str(turn.get("worker_id") or "").strip() != worker_id:
-            continue
-        if fingerprint and str(turn.get("worker_fingerprint") or "").strip() == fingerprint:
-            return turn
-        if fallback is None:
-            fallback = turn
-    return fallback
+    return herdres_tendwire.source_turn_for_pane(pane, payload)
 
 
 def tendwire_source_turn_feed_source(turn: dict[str, Any]) -> dict[str, Any]:
-    assistant_final = sanitize_text(str(turn.get("assistant_final_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
-    assistant_stream = sanitize_text(str(turn.get("assistant_stream_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
-    user_text = sanitize_text(str(turn.get("user_text") or ""), USER_PROMPT_MAX_CHARS).strip()
-    complete = turn.get("complete") if isinstance(turn.get("complete"), bool) else bool(assistant_final)
-    has_open_turn = turn.get("has_open_turn") if isinstance(turn.get("has_open_turn"), bool) else False
-    return {
-        "available": True,
-        "turn_id": str(turn.get("id") or turn.get("turn_id") or turn.get("fingerprint") or ""),
-        "user_text": user_text,
-        "assistant_final_text": assistant_final,
-        "assistant_stream_text": assistant_stream,
-        "complete": complete,
-        "has_open_turn": has_open_turn,
-    }
+    return herdres_tendwire.source_turn_feed_source(
+        turn,
+        sanitize=sanitize_text,
+        final_reply_max_chars=FINAL_REPLY_MAX_CHARS,
+        user_prompt_max_chars=USER_PROMPT_MAX_CHARS,
+    )
 
 
 def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:

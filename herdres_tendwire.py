@@ -872,3 +872,52 @@ def source_entry_as_pane(
         "_tendwire_last_seen_at": str(entry.get("tendwire_last_seen_at") or ""),
         "_tendwire_preserved_from_state": True,
     }
+
+
+def is_source_read_pane(pane: dict[str, Any] | None) -> bool:
+    return isinstance(pane, dict) and bool(pane.get("_tendwire_source_read"))
+
+
+def source_turn_for_pane(
+    pane: dict[str, Any],
+    turns_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    worker_id = str(pane.get("worker_id") or pane.get("_tendwire_worker_id") or "").strip()
+    if not worker_id:
+        return None
+    fingerprint = str(pane.get("worker_fingerprint") or pane.get("_tendwire_fingerprint") or "").strip()
+    turns = turns_payload.get("turns") if isinstance(turns_payload.get("turns"), list) else []
+    fallback: dict[str, Any] | None = None
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        if str(turn.get("worker_id") or "").strip() != worker_id:
+            continue
+        if fingerprint and str(turn.get("worker_fingerprint") or "").strip() == fingerprint:
+            return turn
+        if fallback is None:
+            fallback = turn
+    return fallback
+
+
+def source_turn_feed_source(
+    turn: dict[str, Any],
+    *,
+    sanitize: Sanitizer = _default_sanitize,
+    final_reply_max_chars: int,
+    user_prompt_max_chars: int,
+) -> dict[str, Any]:
+    assistant_final = sanitize(str(turn.get("assistant_final_text") or ""), final_reply_max_chars).strip()
+    assistant_stream = sanitize(str(turn.get("assistant_stream_text") or ""), final_reply_max_chars).strip()
+    user_text = sanitize(str(turn.get("user_text") or ""), user_prompt_max_chars).strip()
+    complete = turn.get("complete") if isinstance(turn.get("complete"), bool) else bool(assistant_final)
+    has_open_turn = turn.get("has_open_turn") if isinstance(turn.get("has_open_turn"), bool) else False
+    return {
+        "available": True,
+        "turn_id": str(turn.get("id") or turn.get("turn_id") or turn.get("fingerprint") or ""),
+        "user_text": user_text,
+        "assistant_final_text": assistant_final,
+        "assistant_stream_text": assistant_stream,
+        "complete": complete,
+        "has_open_turn": has_open_turn,
+    }
