@@ -12404,6 +12404,55 @@ def drop_tendwire_source_pane_records(state: dict[str, Any]) -> int:
     return len(removed)
 
 
+def archive_legacy_direct_pane_records_for_source(
+    state: dict[str, Any],
+    *,
+    active_space_keys: set[str] | None = None,
+) -> int:
+    """Remove old direct-Herdr pane records while Tendwire source mode owns routing."""
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    removed: list[dict[str, Any]] = []
+    for key, entry in list(panes.items()):
+        if not isinstance(entry, dict):
+            continue
+        if entry_is_tendwire_source(entry):
+            continue
+        pane_key_value = str(key)
+        remove_pane_from_space_memberships(state, pane_key_value)
+        panes.pop(key, None)
+        removed.append(
+            {
+                "pane_key_hash": hashlib.sha256(pane_key_value.encode("utf-8")).hexdigest()[:16],
+                "source": str(entry.get("source") or "herdr"),
+                "entry_type": str(entry.get("entry_type") or ""),
+                "status": str(entry.get("last_known_status") or ""),
+                "space_key": str(entry.get("space_key") or ""),
+                "had_topic": bool(str(entry.get("topic_id") or "")),
+                "had_private_pane": bool(str(entry.get("pane_id") or "")),
+                "removed_at": utc_now(),
+            }
+        )
+    if not removed:
+        return 0
+    spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
+    active_keys = active_space_keys or set()
+    for key, space in list(spaces.items()):
+        if not isinstance(space, dict):
+            continue
+        pane_keys = [str(value) for value in space.get("pane_keys") or [] if str(value) in panes]
+        if pane_keys:
+            space["pane_keys"] = pane_keys
+        elif str(key) in active_keys:
+            space["pane_keys"] = []
+        else:
+            spaces.pop(key, None)
+    audit = state.get("archived_legacy_direct_panes")
+    prior = audit if isinstance(audit, list) else []
+    state["archived_legacy_direct_panes"] = (prior + removed)[-200:]
+    state["last_legacy_direct_archive_at"] = utc_now()
+    return len(removed)
+
+
 def prune_closed_tendwire_source_records(
     state: dict[str, Any],
     *,
@@ -12917,10 +12966,15 @@ def remove_pane_from_space_memberships(state: dict[str, Any], pane_key_value: st
         if not isinstance(space, dict):
             continue
         pane_keys = space.get("pane_keys")
-        if not isinstance(pane_keys, list) or pane_key_value not in pane_keys:
-            continue
-        space["pane_keys"] = [str(key) for key in pane_keys if str(key) != pane_key_value]
-        changed = True
+        if isinstance(pane_keys, list) and pane_key_value in pane_keys:
+            space["pane_keys"] = [str(key) for key in pane_keys if str(key) != pane_key_value]
+            changed = True
+        routes = space.get("message_routes")
+        if isinstance(routes, dict):
+            kept_routes = {str(msg): value for msg, value in routes.items() if str(value) != pane_key_value}
+            if len(kept_routes) != len(routes):
+                space["message_routes"] = kept_routes
+                changed = True
     return changed
 
 
@@ -13972,6 +14026,14 @@ def sync_once() -> dict[str, Any]:
         changed = True
 
     panes = observed_agent_panes(state=state)
+    active_source_space_keys = {space_key(pane) for pane in panes} if source_read else set()
+    legacy_direct_pruned = (
+        archive_legacy_direct_pane_records_for_source(state, active_space_keys=active_source_space_keys)
+        if source_read
+        else 0
+    )
+    if legacy_direct_pruned:
+        changed = True
     closed_result = sync_closed_pane_records(
         state,
         chat_id,
@@ -13982,7 +14044,6 @@ def sync_once() -> dict[str, Any]:
     )
     if closed_result.get("changed"):
         changed = True
-    active_source_space_keys = {space_key(pane) for pane in panes} if source_read else set()
     closed_source_pruned = (
         prune_closed_tendwire_source_records(state, active_space_keys=active_source_space_keys)
         if source_read
@@ -14043,6 +14104,7 @@ def sync_once() -> dict[str, Any]:
             "tendwire_outbox": tendwire_outbox_result,
             "tier0_pruned": tier0_pruned,
             "stale_tendwire_pruned": stale_tendwire_pruned,
+            "legacy_direct_pruned": legacy_direct_pruned,
             "closed_source_pruned": closed_source_pruned,
             "orphan_pruned": orphan_pruned,
             "orphan_abandoned": int(prune_stats.get("abandoned") or 0),
@@ -14142,6 +14204,7 @@ def sync_once() -> dict[str, Any]:
         "devin_glm_started": devin_glm_started,
         "tier0_pruned": tier0_pruned,
         "stale_tendwire_pruned": stale_tendwire_pruned,
+        "legacy_direct_pruned": legacy_direct_pruned,
         "closed_source_pruned": closed_source_pruned,
         "orphan_pruned": orphan_pruned,
         "orphan_abandoned": int(prune_stats.get("abandoned") or 0),
@@ -14490,6 +14553,10 @@ def entry_is_live_route_target(entry: dict[str, Any] | None) -> bool:
     return str(entry.get("last_known_status") or "").strip().lower() != "closed"
 
 
+def source_mode_blocks_closed_direct_routes() -> bool:
+    return tendwire_mode() in {"commands", "source-read", "source"}
+
+
 def preferred_active_route_entry(
     entries: list[tuple[str, dict[str, Any]]],
 ) -> tuple[str, dict[str, Any]] | None:
@@ -14555,7 +14622,11 @@ def resolve_topic_entry(
                     closed_entries.append((pane_key_value, entry))
     if len(matching_entries) == 1:
         return matching_entries[0]
-    if not matching_entries and len(closed_entries) == 1:
+    if (
+        not matching_entries
+        and len(closed_entries) == 1
+        and not source_mode_blocks_closed_direct_routes()
+    ):
         return closed_entries[0]
     return None
 

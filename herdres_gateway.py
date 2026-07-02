@@ -72,6 +72,7 @@ MANAGED_BOT_ALIASES = {
 }
 MANAGED_BOT_KEY_RE = re.compile(r"^managed-([a-z0-9_]+)-")
 MANAGED_BOT_MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,64})")
+TENDWIRE_SOURCE_ROUTE_MODES = {"commands", "source-read", "source"}
 
 LONG_POLL_SECONDS = int(os.getenv("HERDRES_GATEWAY_LONG_POLL_SECONDS", "50"))
 CHILD_POLL_SECONDS = int(os.getenv("HERDRES_GATEWAY_CHILD_POLL_SECONDS", "0"))
@@ -774,6 +775,10 @@ def entry_is_live_route_target(entry: dict | None) -> bool:
     return str(entry.get("last_known_status") or "").strip().lower() != "closed"
 
 
+def tendwire_source_mode_blocks_closed_routes() -> bool:
+    return os.getenv("HERDRES_TENDWIRE_MODE", "off").strip().lower() in TENDWIRE_SOURCE_ROUTE_MODES
+
+
 def route_message_entry(state: dict, chat_id: str, thread_id: str | None, message_id: str | int | None) -> tuple[str, dict] | None:
     message_key = str(message_id or "").strip()
     if not message_key:
@@ -828,7 +833,11 @@ def resolve_mapped_entry(
                 closed_entries.append(item)
     if len(matching_entries) == 1:
         return matching_entries[0]
-    if not matching_entries and len(closed_entries) == 1:
+    if (
+        not matching_entries
+        and len(closed_entries) == 1
+        and not tendwire_source_mode_blocks_closed_routes()
+    ):
         return closed_entries[0]
     return None
 

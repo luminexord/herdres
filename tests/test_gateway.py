@@ -466,6 +466,18 @@ class GatewayManagedBotTests(unittest.TestCase):
         self.assertTrue(tokens[0][0].startswith("managed-codex-"))
         self.assertEqual(tokens[0][1], "CODEX_TOKEN")
 
+    def test_source_mode_does_not_route_single_closed_legacy_topic(self) -> None:
+        state = managed_multi_pane_space_state()
+        state["spaces"] = {}
+        state["panes"] = {"pane-1": state["panes"]["pane-1"]}
+        state["panes"]["pane-1"]["last_known_status"] = "closed"
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}):
+            self.assertIsNone(managed_gateway.resolve_mapped_entry(state, "-1001", "77"))
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "off"}):
+            self.assertIsNotNone(managed_gateway.resolve_mapped_entry(state, "-1001", "77"))
+
     def test_handle_update_dispatches_managed_bot_created_message(self) -> None:
         handler = Mock()
         update = {
@@ -2194,6 +2206,9 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
             save_state=save_state or Mock(),
             send_to_pane=send_to_pane or Mock(return_value=(True, "")),
             pane_turn=pane_turn or Mock(return_value={"available": True, "turn_id": "turn-before"}),
+            tendwire_source_inventory_enabled=Mock(return_value=False),
+            tendwire_source_read_enabled=Mock(return_value=False),
+            tendwire_commands_enabled=Mock(return_value=False),
         )
 
     def test_command_reply_successful_direct_owner_send_sets_marker(self) -> None:

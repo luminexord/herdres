@@ -434,6 +434,59 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(state["spaces"]["agent:worker:worker-1"]["topic_id"], "77")
         self.assertEqual(state["spaces"]["agent:worker:worker-1"]["pane_keys"], [])
 
+    def test_archive_legacy_direct_pane_records_for_source_removes_routes(self) -> None:
+        state, source_key = _source_state()
+        state["panes"]["legacy-pane"] = {
+            "pane_key": "legacy-pane",
+            "source": "herdr",
+            "pane_id": "private-pane-id",
+            "space_key": "workspace:old",
+            "topic_id": "99",
+            "last_known_status": "closed",
+        }
+        state["spaces"]["workspace:old"] = {
+            "space_key": "workspace:old",
+            "topic_id": "99",
+            "pane_keys": ["legacy-pane"],
+            "message_routes": {"10": "legacy-pane"},
+        }
+        state["spaces"]["agent:worker:worker-1"]["message_routes"] = {"11": source_key, "12": "legacy-pane"}
+
+        removed = herdres.archive_legacy_direct_pane_records_for_source(
+            state,
+            active_space_keys={"agent:worker:worker-1"},
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertNotIn("legacy-pane", state["panes"])
+        self.assertNotIn("workspace:old", state["spaces"])
+        self.assertEqual(state["spaces"]["agent:worker:worker-1"]["message_routes"], {"11": source_key})
+        self.assertIn(source_key, state["panes"])
+        audit_text = json.dumps(state.get("archived_legacy_direct_panes", []))
+        self.assertNotIn("private-pane-id", audit_text)
+
+    def test_source_mode_does_not_resolve_single_closed_direct_topic(self) -> None:
+        state = {
+            "enabled": True,
+            "telegram": {"chat_id": "-100", "general_thread_id": "1"},
+            "spaces": {},
+            "panes": {
+                "legacy-pane": {
+                    "pane_key": "legacy-pane",
+                    "source": "herdr",
+                    "pane_id": "private-pane-id",
+                    "topic_id": "99",
+                    "last_known_status": "closed",
+                }
+            },
+        }
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True):
+            self.assertIsNone(herdres.resolve_topic_entry(state, "-100", "99"))
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "off"}, clear=True):
+            self.assertIsNotNone(herdres.resolve_topic_entry(state, "-100", "99"))
+
     def test_source_read_clean_feed_delivers_tendwire_turn_without_direct_herdr(self) -> None:
         state, key = _source_state()
         pane = herdres.tendwire_source_read_panes(_snapshot())[0]
