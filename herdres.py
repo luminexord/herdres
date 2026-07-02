@@ -12357,9 +12357,6 @@ def tendwire_instruction_request_id(
     )
 
 
-TENDWIRE_COMMAND_SUBMISSION_LEDGER_LIMIT = 500
-
-
 def tendwire_instruction_submission_identity(
     *,
     chat_id: str = "",
@@ -12394,36 +12391,24 @@ def _tendwire_command_submission_identity(
     reply_to_message_id: str = "",
     callback_message_id: str = "",
 ) -> str:
-    if not (str(message_id or "").strip() or str(callback_message_id or "").strip()):
-        return ""
-    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
-    if not worker_id:
-        return ""
-    return tendwire_instruction_submission_identity(
+    return herdres_tendwire.command_submission_identity_for_entry(
+        entry,
+        text,
         chat_id=chat_id,
         topic_id=topic_id,
         message_id=message_id,
         reply_to_message_id=reply_to_message_id,
         callback_message_id=callback_message_id,
-        worker_id=worker_id,
         origin=origin,
-        text=text,
     )
 
 
 def _tendwire_command_submission_ledger(state: dict[str, Any]) -> dict[str, Any]:
-    ledger = state.get("tendwire_command_submissions")
-    if not isinstance(ledger, dict):
-        ledger = {}
-        state["tendwire_command_submissions"] = ledger
-    return ledger
+    return herdres_tendwire.command_submission_ledger(state)
 
 
 def tendwire_command_submission_seen(state: dict[str, Any] | None, identity: str) -> bool:
-    if not isinstance(state, dict) or not identity:
-        return False
-    ledger = state.get("tendwire_command_submissions")
-    return isinstance(ledger, dict) and identity in ledger
+    return herdres_tendwire.command_submission_seen(state, identity)
 
 
 def note_tendwire_command_submission(
@@ -12436,36 +12421,17 @@ def note_tendwire_command_submission(
     text: str = "",
     status: str = "",
 ) -> bool:
-    if not isinstance(state, dict) or not identity:
-        return False
-    ledger = _tendwire_command_submission_ledger(state)
-    record = ledger.get(identity)
-    if not isinstance(record, dict):
-        record = {"submitted_at": utc_now()}
-        ledger[identity] = record
-        changed = True
-    else:
-        changed = False
-    values = {
-        "request_id": sanitize_text(str(request_id or ""), 200).strip(),
-        "worker_id": sanitize_text(str(worker_id or ""), 120).strip(),
-        "origin": sanitize_text(str(origin or ""), 40).strip(),
-        "text_hash": tendwire_instruction_text_hash(text),
-        "status": sanitize_text(str(status or "attempted"), 80).strip() or "attempted",
-        "updated_at": utc_now(),
-    }
-    for key, value in values.items():
-        if record.get(key) != value:
-            record[key] = value
-            changed = True
-    while len(ledger) > TENDWIRE_COMMAND_SUBMISSION_LEDGER_LIMIT:
-        oldest_key = min(
-            ledger,
-            key=lambda item: str((ledger.get(item) if isinstance(ledger.get(item), dict) else {}).get("updated_at") or ""),
-        )
-        ledger.pop(oldest_key, None)
-        changed = True
-    return changed
+    return herdres_tendwire.note_command_submission(
+        state,
+        identity,
+        request_id=request_id,
+        worker_id=worker_id,
+        origin=origin,
+        text=text,
+        status=status,
+        now=utc_now(),
+        sanitize=sanitize_text,
+    )
 
 
 def build_tendwire_send_instruction_request(

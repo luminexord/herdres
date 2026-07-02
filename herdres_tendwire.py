@@ -526,6 +526,7 @@ ENTRY_METADATA_KEYS = (
     "tendwire_status_line",
     "tendwire_last_seen_at",
 )
+COMMAND_SUBMISSION_LEDGER_LIMIT = 500
 
 
 def is_source_entry(entry: dict[str, Any] | None) -> bool:
@@ -803,6 +804,95 @@ def instruction_submission_identity(
         "text_hash": instruction_text_hash(text),
     }
     return hashlib.sha256(json.dumps(context, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+
+
+def command_submission_identity_for_entry(
+    entry: dict[str, Any],
+    text: str,
+    *,
+    origin: str = "send",
+    chat_id: str = "",
+    topic_id: str = "",
+    message_id: str = "",
+    reply_to_message_id: str = "",
+    callback_message_id: str = "",
+) -> str:
+    if not (str(message_id or "").strip() or str(callback_message_id or "").strip()):
+        return ""
+    worker_id = str(entry.get("tendwire_worker_id") or "").strip()
+    if not worker_id:
+        return ""
+    return instruction_submission_identity(
+        chat_id=chat_id,
+        topic_id=topic_id,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        callback_message_id=callback_message_id,
+        worker_id=worker_id,
+        origin=origin,
+        text=text,
+    )
+
+
+def command_submission_ledger(state: dict[str, Any]) -> dict[str, Any]:
+    ledger = state.get("tendwire_command_submissions")
+    if not isinstance(ledger, dict):
+        ledger = {}
+        state["tendwire_command_submissions"] = ledger
+    return ledger
+
+
+def command_submission_seen(state: dict[str, Any] | None, identity: str) -> bool:
+    if not isinstance(state, dict) or not identity:
+        return False
+    ledger = state.get("tendwire_command_submissions")
+    return isinstance(ledger, dict) and identity in ledger
+
+
+def note_command_submission(
+    state: dict[str, Any] | None,
+    identity: str,
+    *,
+    request_id: str = "",
+    worker_id: str = "",
+    origin: str = "",
+    text: str = "",
+    status: str = "",
+    now: str,
+    sanitize: Sanitizer = _default_sanitize,
+    limit: int = COMMAND_SUBMISSION_LEDGER_LIMIT,
+) -> bool:
+    if not isinstance(state, dict) or not identity:
+        return False
+    ledger = command_submission_ledger(state)
+    record = ledger.get(identity)
+    if not isinstance(record, dict):
+        record = {"submitted_at": str(now or "")}
+        ledger[identity] = record
+        changed = True
+    else:
+        changed = False
+    values = {
+        "request_id": sanitize(str(request_id or ""), 200).strip(),
+        "worker_id": sanitize(str(worker_id or ""), 120).strip(),
+        "origin": sanitize(str(origin or ""), 40).strip(),
+        "text_hash": instruction_text_hash(text),
+        "status": sanitize(str(status or "attempted"), 80).strip() or "attempted",
+        "updated_at": str(now or ""),
+    }
+    for key, value in values.items():
+        if record.get(key) != value:
+            record[key] = value
+            changed = True
+    max_records = max(1, int(limit))
+    while len(ledger) > max_records:
+        oldest_key = min(
+            ledger,
+            key=lambda item: str((ledger.get(item) if isinstance(ledger.get(item), dict) else {}).get("updated_at") or ""),
+        )
+        ledger.pop(oldest_key, None)
+        changed = True
+    return changed
 
 
 def build_send_instruction_request(

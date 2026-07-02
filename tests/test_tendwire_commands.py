@@ -157,6 +157,88 @@ class TendwireRequestBuilderTests(unittest.TestCase):
         self.assertNotIn("5000", encoded)
         self.assertNotIn("1001", encoded)
 
+    def test_submission_identity_wrapper_matches_tendwire_helper(self) -> None:
+        direct = herdres_tendwire.instruction_submission_identity(
+            chat_id="-1001",
+            topic_id="77",
+            message_id="5000",
+            worker_id="worker-1",
+            origin="plain",
+            text="hello",
+        )
+        wrapped = herdres.tendwire_instruction_submission_identity(
+            chat_id="-1001",
+            topic_id="77",
+            message_id="5000",
+            worker_id="worker-1",
+            origin="plain",
+            text="hello",
+        )
+
+        self.assertEqual(wrapped, direct)
+
+    def test_submission_ledger_helpers_are_public_safe_and_bounded(self) -> None:
+        entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", worker_fingerprint="fp-1")
+        state: dict = {}
+        first_identity = herdres_tendwire.command_submission_identity_for_entry(
+            entry,
+            "hello",
+            origin="plain",
+            chat_id="-1001",
+            topic_id="77",
+            message_id="5000",
+            reply_to_message_id="1001",
+        )
+        second_identity = herdres_tendwire.command_submission_identity_for_entry(
+            entry,
+            "again",
+            origin="plain",
+            chat_id="-1001",
+            topic_id="77",
+            message_id="5001",
+        )
+
+        self.assertTrue(first_identity)
+        self.assertTrue(
+            herdres_tendwire.note_command_submission(
+                state,
+                first_identity,
+                request_id="request-1",
+                worker_id="worker-1",
+                origin="plain",
+                text="hello",
+                status="accepted",
+                now="2026-07-02T00:00:00+00:00",
+                limit=1,
+            )
+        )
+        self.assertTrue(herdres_tendwire.command_submission_seen(state, first_identity))
+        self.assertTrue(
+            herdres_tendwire.note_command_submission(
+                state,
+                second_identity,
+                request_id="request-2",
+                worker_id="worker-1",
+                origin="plain",
+                text="again",
+                status="accepted",
+                now="2026-07-02T00:01:00+00:00",
+                limit=1,
+            )
+        )
+
+        ledger = state["tendwire_command_submissions"]
+        self.assertEqual(set(ledger), {second_identity})
+        record = ledger[second_identity]
+        self.assertEqual(record["worker_id"], "worker-1")
+        self.assertEqual(record["origin"], "plain")
+        self.assertEqual(record["status"], "accepted")
+        encoded = json.dumps(state, sort_keys=True)
+        self.assertNotIn("-1001", encoded)
+        self.assertNotIn('"77"', encoded)
+        self.assertNotIn("5000", encoded)
+        self.assertNotIn("5001", encoded)
+
     def test_entry_metadata_classification_lives_in_tendwire_helper(self) -> None:
         legacy = _entry(source="herdr")
         source_entry = _entry(
