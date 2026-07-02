@@ -695,6 +695,46 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             "ok",
         )
 
+    def test_interrupt_preflight_for_entry_blocks_source_and_command_mode_direct_paths(self) -> None:
+        legacy_entry = _entry(source="herdr", pane_id="pane-1")
+        source_entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            tendwire_worker_id="worker-1",
+            tendwire_fingerprint="fp-1",
+        )
+        enriched_entry = _entry(source="herdr", pane_id="pane-1")
+
+        self.assertEqual(
+            herdres_tendwire.interrupt_preflight_for_entry(
+                legacy_entry,
+                {"HERDRES_TENDWIRE_MODE": "source"},
+            ),
+            "source_interrupt_unsupported",
+        )
+        self.assertEqual(
+            herdres_tendwire.interrupt_preflight_for_entry(
+                source_entry,
+                {"HERDRES_TENDWIRE_MODE": "commands"},
+            ),
+            "source_entry_interrupt_unsupported",
+        )
+        self.assertEqual(
+            herdres_tendwire.interrupt_preflight_for_entry(
+                enriched_entry,
+                {"HERDRES_TENDWIRE_MODE": "commands"},
+            ),
+            "commands_interrupt_unsupported",
+        )
+        self.assertEqual(
+            herdres_tendwire.interrupt_preflight_for_entry(
+                legacy_entry,
+                {"HERDRES_TENDWIRE_MODE": "off"},
+            ),
+            "ok",
+        )
+
 
 class TendwireCommandRoutingTests(unittest.TestCase):
     @contextmanager
@@ -1698,6 +1738,15 @@ class TendwireCommandRoutingTests(unittest.TestCase):
     def test_send_force_fails_closed_for_command_mode_enriched_entry(self) -> None:
         entry = _entry()
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "commands"}, clear=True), \
+                patch.object(herdres, "interrupt_and_send_to_pane") as interrupt_and_send:
+            result = herdres.interrupt_and_send_response("pane-1", "stop now", state={"panes": {}}, entry=entry)
+
+        self.assertIn("cannot safely interrupt", result["reply"])
+        interrupt_and_send.assert_not_called()
+
+    def test_send_force_fails_closed_for_legacy_entry_in_source_mode(self) -> None:
+        entry = _entry(source="herdr", pane_id="pane-1")
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
                 patch.object(herdres, "interrupt_and_send_to_pane") as interrupt_and_send:
             result = herdres.interrupt_and_send_response("pane-1", "stop now", state={"panes": {}}, entry=entry)
 

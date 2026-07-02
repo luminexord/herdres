@@ -8798,17 +8798,18 @@ def interrupt_and_send_response(
     outbound = str(text or "").strip()
     if not outbound:
         return {"handled": True, "reply": "Usage: /send! <instruction> — interrupts the current turn and sends now"}
-    if tendwire_source_inventory_enabled():
+    interrupt_policy = herdres_tendwire.interrupt_preflight_for_entry(entry)
+    if interrupt_policy == "source_interrupt_unsupported":
         return {
             "handled": True,
             "reply": "Tendwire source mode cannot safely interrupt workers from Telegram; use /send.",
         }
-    if entry_is_tendwire_source(entry):
+    if interrupt_policy == "source_entry_interrupt_unsupported":
         return {
             "handled": True,
             "reply": "Tendwire command mode cannot safely interrupt this worker yet; use /send.",
         }
-    if tendwire_commands_enabled() and herdres_tendwire.entry_metadata_state_for_env(entry) in {"valid", "partial"}:
+    if interrupt_policy == "commands_interrupt_unsupported":
         return {
             "handled": True,
             "reply": "Tendwire command mode cannot safely interrupt this worker yet; use /send or interrupt in Herdr.",

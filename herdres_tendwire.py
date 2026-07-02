@@ -1450,6 +1450,45 @@ def raw_keys_preflight_for_entry(
     )
 
 
+def interrupt_preflight_policy(
+    *,
+    source_inventory_enabled: bool,
+    source_entry: bool,
+    commands_enabled: bool,
+    metadata_state: str,
+) -> str:
+    """Classify send-force/interrupt before any direct Herdr interrupt path."""
+    if source_inventory_enabled:
+        return "source_interrupt_unsupported"
+    if source_entry:
+        return "source_entry_interrupt_unsupported"
+    if commands_enabled and str(metadata_state or "").strip().lower() in {"valid", "partial"}:
+        return "commands_interrupt_unsupported"
+    return "ok"
+
+
+def interrupt_preflight_for_entry(
+    entry: dict[str, Any] | None,
+    env: Any | None = None,
+    *,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> str:
+    mode = parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
+    source_inventory = mode_enables_source_inventory(mode)
+    commands = mode_enables_commands(mode)
+    return interrupt_preflight_policy(
+        source_inventory_enabled=source_inventory,
+        source_entry=is_source_entry(entry),
+        commands_enabled=commands,
+        metadata_state=entry_metadata_state(
+            entry,
+            source_read_enabled=source_inventory,
+            commands_enabled=commands,
+        ),
+    )
+
+
 def same_worker_stale_target_candidate(response: dict[str, Any], worker_id: str) -> dict[str, str] | None:
     if response_status(response) != "stale_target":
         return None
