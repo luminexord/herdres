@@ -2325,14 +2325,6 @@ TENDWIRE_COMMAND_SUCCESS_STATUSES = herdres_tendwire.COMMAND_SUCCESS_STATUSES
 TENDWIRE_COMMAND_FAILURE_STATUSES = herdres_tendwire.COMMAND_FAILURE_STATUSES
 
 
-def tendwire_command_succeeded(response: dict[str, Any]) -> bool:
-    return herdres_tendwire.command_succeeded(response)
-
-
-def tendwire_success_reply(response: dict[str, Any]) -> str:
-    return herdres_tendwire.success_reply(response, sanitize=sanitize_text)
-
-
 def tendwire_worker_status_for_herdres(status: str) -> str:
     return herdres_tendwire.worker_status_for_herdres(status)
 
@@ -12311,87 +12303,6 @@ def tendwire_entry_metadata_state(entry: dict[str, Any] | None) -> str:
         entry,
         source_read_enabled=tendwire_source_read_enabled(),
         commands_enabled=tendwire_commands_enabled(),
-    )
-
-
-def tendwire_request_component(value: Any, limit: int = 48) -> str:
-    return herdres_tendwire.request_component(value, limit, sanitize=sanitize_text)
-
-
-def tendwire_instruction_text_hash(text: str) -> str:
-    return herdres_tendwire.instruction_text_hash(text)
-
-
-def tendwire_instruction_request_id(
-    *,
-    chat_id: str = "",
-    topic_id: str = "",
-    message_id: str = "",
-    reply_to_message_id: str = "",
-    callback_message_id: str = "",
-    worker_id: str = "",
-    origin: str = "send",
-    text: str = "",
-) -> str:
-    return herdres_tendwire.instruction_request_id(
-        chat_id=chat_id,
-        topic_id=topic_id,
-        message_id=message_id,
-        reply_to_message_id=reply_to_message_id,
-        callback_message_id=callback_message_id,
-        worker_id=worker_id,
-        origin=origin,
-        text=text,
-        sanitize=sanitize_text,
-    )
-
-
-def tendwire_instruction_submission_identity(
-    *,
-    chat_id: str = "",
-    topic_id: str = "",
-    message_id: str = "",
-    reply_to_message_id: str = "",
-    callback_message_id: str = "",
-    worker_id: str = "",
-    origin: str = "send",
-    text: str = "",
-) -> str:
-    return herdres_tendwire.instruction_submission_identity(
-        chat_id=chat_id,
-        topic_id=topic_id,
-        message_id=message_id,
-        reply_to_message_id=reply_to_message_id,
-        callback_message_id=callback_message_id,
-        worker_id=worker_id,
-        origin=origin,
-        text=text,
-    )
-
-
-def build_tendwire_send_instruction_request(
-    entry: dict[str, Any],
-    text: str,
-    *,
-    origin: str = "send",
-    chat_id: str = "",
-    topic_id: str = "",
-    message_id: str = "",
-    reply_to_message_id: str = "",
-    callback_message_id: str = "",
-    request_id: str = "",
-) -> dict[str, Any]:
-    return herdres_tendwire.build_send_instruction_request(
-        entry,
-        text,
-        origin=origin,
-        chat_id=chat_id,
-        topic_id=topic_id,
-        message_id=message_id,
-        reply_to_message_id=reply_to_message_id,
-        callback_message_id=callback_message_id,
-        request_id=request_id,
-        sanitize=sanitize_text,
     )
 
 

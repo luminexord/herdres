@@ -113,7 +113,7 @@ class TendwireRequestBuilderTests(unittest.TestCase):
     def test_request_shape_stable_id_and_exact_multiline_text(self) -> None:
         entry = _entry()
         text = "first line\n\nsecond line"
-        request = herdres.build_tendwire_send_instruction_request(
+        request = herdres_tendwire.build_send_instruction_request(
             entry,
             text,
             origin="plain",
@@ -122,7 +122,7 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             message_id="5000",
             reply_to_message_id="1001",
         )
-        again = herdres.build_tendwire_send_instruction_request(
+        again = herdres_tendwire.build_send_instruction_request(
             entry,
             text,
             origin="plain",
@@ -131,7 +131,7 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             message_id="5000",
             reply_to_message_id="1001",
         )
-        changed = herdres.build_tendwire_send_instruction_request(
+        changed = herdres_tendwire.build_send_instruction_request(
             entry,
             text + "!",
             origin="plain",
@@ -157,8 +157,8 @@ class TendwireRequestBuilderTests(unittest.TestCase):
         self.assertNotIn("5000", encoded)
         self.assertNotIn("1001", encoded)
 
-    def test_submission_identity_wrapper_matches_tendwire_helper(self) -> None:
-        direct = herdres_tendwire.instruction_submission_identity(
+    def test_submission_identity_is_stable_and_private_id_free(self) -> None:
+        first = herdres_tendwire.instruction_submission_identity(
             chat_id="-1001",
             topic_id="77",
             message_id="5000",
@@ -166,7 +166,7 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             origin="plain",
             text="hello",
         )
-        wrapped = herdres.tendwire_instruction_submission_identity(
+        again = herdres_tendwire.instruction_submission_identity(
             chat_id="-1001",
             topic_id="77",
             message_id="5000",
@@ -175,7 +175,19 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             text="hello",
         )
 
-        self.assertEqual(wrapped, direct)
+        changed = herdres_tendwire.instruction_submission_identity(
+            chat_id="-1001",
+            topic_id="77",
+            message_id="5000",
+            worker_id="worker-1",
+            origin="plain",
+            text="hello!",
+        )
+
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, changed)
+        self.assertNotIn("-1001", first)
+        self.assertNotIn("5000", first)
 
     def test_submission_ledger_helpers_are_public_safe_and_bounded(self) -> None:
         entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", worker_fingerprint="fp-1")
