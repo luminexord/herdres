@@ -1025,6 +1025,35 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(panes[0]["worker_id"], "worker-legacy")
         self.assertEqual(panes[0]["pane_id"], "")
 
+    def test_source_worker_uses_matching_managed_bot_voice(self) -> None:
+        state, key = _source_state()
+        entry = state["panes"][key]
+        state["telegram"]["managed_bots"] = {
+            "codex": {"token": "CODEX_TOKEN", "enabled": True},
+        }
+        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_SOURCE_MANAGED_VOICE": "1"}, clear=False):
+            herdres.refresh_entry_managed_voice(state, entry, pane)
+
+        self.assertTrue(entry["managed_voice_active"])
+        self.assertEqual(herdres.managed_bot_token_for_entry(state["telegram"], entry, pane), "CODEX_TOKEN")
+        self.assertEqual(herdres.desired_message_bot_kind(state["telegram"], entry, pane), "codex")
+
+    def test_source_worker_space_migrates_to_per_agent_voice_when_child_bot_exists(self) -> None:
+        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        state = {
+            "telegram": {"managed_bots": {"codex": {"token": "CODEX_TOKEN", "enabled": True}}},
+            "spaces": {},
+            "panes": {},
+        }
+
+        with patch.dict(os.environ, {"HERDR_TELEGRAM_TOPICS_SOURCE_MANAGED_VOICE": "1"}, clear=False):
+            _key, space, changed = herdres.ensure_space_entry(state, pane)
+
+        self.assertTrue(changed)
+        self.assertEqual(space["voice_mode"], "per_agent")
+
     def test_tendwire_helper_reconstructs_open_source_state_panes(self) -> None:
         state, key = _source_state()
         state["panes"]["closed"] = {

@@ -807,7 +807,33 @@ def space_voice_mode(state: dict[str, Any], pane_or_entry: dict[str, Any] | None
 
 
 def managed_voice_enabled_for_space(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> bool:
+    if source_managed_voice_enabled_for_entry(state, pane_or_entry):
+        return True
     return space_voice_mode(state, pane_or_entry) == "per_agent"
+
+
+def source_managed_voice_enabled_for_entry(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> bool:
+    """Source-mode workers should speak with their matching child bot when available."""
+    if not parse_bool_env("HERDR_TELEGRAM_TOPICS_SOURCE_MANAGED_VOICE", "1"):
+        return False
+    if not isinstance(pane_or_entry, dict):
+        return False
+    if not (
+        pane_or_entry.get("_tendwire_source_read")
+        or str(pane_or_entry.get("source") or "").strip().lower() == "tendwire"
+        or str(pane_or_entry.get("entry_type") or "").strip().lower() == "worker"
+        and bool(pane_or_entry.get("worker_id"))
+    ):
+        return False
+    kind = managed_bot_kind_for_entry(pane_or_entry, pane_or_entry)
+    if not kind:
+        return False
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    bots = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
+    record = bots.get(kind) if isinstance(bots, dict) else None
+    if not isinstance(record, dict) or record.get("enabled") is False:
+        return False
+    return bool(str(record.get("token") or "").strip())
 
 
 def space_prompt_collapse_chars(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> int:
@@ -3152,9 +3178,17 @@ def ensure_space_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str
     council = is_council_pane(pane)
     if not isinstance(entry, dict):
         preserved = state.get("_preserved_voice_mode") if isinstance(state.get("_preserved_voice_mode"), dict) else {}
-        vm = preserved.pop(key, None) or ("per_agent" if council else "shared")
+        source_voice = source_managed_voice_enabled_for_entry(state, pane)
+        vm = preserved.pop(key, None) or ("per_agent" if council or source_voice else "shared")
         entry = {"space_key": key, "created_at": utc_now(), "pane_keys": [], "voice_mode": vm}
         spaces[key] = entry
+        changed = True
+    elif (
+        source_managed_voice_enabled_for_entry(state, pane)
+        and str(entry.get("voice_mode") or "shared") != "per_agent"
+    ):
+        entry["voice_mode"] = "per_agent"
+        entry["source_managed_voice_migrated_at"] = utc_now()
         changed = True
     if not entry.get("origin"):
         entry["origin"] = "council" if council else "personal"

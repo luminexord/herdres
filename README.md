@@ -527,7 +527,7 @@ When `HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1`, Herdres posts managed-bot setup lin
 
 Telegram still requires each child bot to have access to the forum group. If a child token is registered but Telegram rejects pane messages from it, Herdres posts add-to-group buttons in General and does not send that pane traffic as the manager bot.
 
-Pane output is sent by the matching child bot when configured. Add each child bot to the Telegram forum group so replies to that child bot are delivered to the gateway; if a child bot is not yet allowed to post, Herdres falls back to the manager bot for that send.
+Pane output is sent by the matching child bot when configured. In Tendwire `source` and `source-read` modes, source workers with a matching child bot use that per-agent voice by default (`HERDR_TELEGRAM_TOPICS_SOURCE_MANAGED_VOICE=1`) so Codex/Claude/Kimi/etc. replies appear from the correct bot instead of the shared manager. Add each child bot to the Telegram forum group so replies to that child bot are delivered to the gateway; if a child bot is not yet allowed to post, Herdres falls back to the manager bot for that send.
 
 The standalone gateway runs one long-poll worker for the manager bot and one worker for each registered child bot. Telegram returns a long poll immediately when a message arrives, and each child bot is isolated from other bot-token waits or reconnect backoff:
 
