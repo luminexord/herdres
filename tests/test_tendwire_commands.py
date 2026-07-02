@@ -489,6 +489,79 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             "ok",
         )
 
+    def test_entry_metadata_state_for_env_owns_mode_parsing(self) -> None:
+        source_entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            tendwire_worker_id="worker-1",
+            tendwire_fingerprint="fp-1",
+        )
+        partial_legacy = _entry(tendwire_worker_id="worker-1", tendwire_fingerprint="")
+
+        self.assertEqual(
+            herdres_tendwire.entry_metadata_state_for_env(
+                source_entry,
+                {"HERDRES_TENDWIRE_MODE": "source-read"},
+            ),
+            "valid",
+        )
+        self.assertEqual(
+            herdres_tendwire.entry_metadata_state_for_env(
+                source_entry,
+                {"HERDRES_TENDWIRE_MODE": "commands"},
+            ),
+            "none",
+        )
+        self.assertEqual(
+            herdres_tendwire.entry_metadata_state_for_env(
+                partial_legacy,
+                {"HERDRES_TENDWIRE_MODE": "commands"},
+            ),
+            "partial",
+        )
+
+    def test_callback_choice_preflight_for_entry_reads_mode_and_metadata(self) -> None:
+        legacy_entry = _entry(source="herdr", pane_id="pane-1")
+        source_entry = _entry(
+            source="tendwire",
+            entry_type="worker",
+            pane_id="",
+            tendwire_worker_id="worker-1",
+            tendwire_fingerprint="fp-1",
+        )
+        partial_source = dict(source_entry, tendwire_fingerprint="")
+        closed_source = dict(source_entry, last_known_status="closed")
+
+        self.assertEqual(
+            herdres_tendwire.callback_choice_preflight_for_entry(
+                legacy_entry,
+                {"HERDRES_TENDWIRE_MODE": "source"},
+            ),
+            "legacy_source_block",
+        )
+        self.assertEqual(
+            herdres_tendwire.callback_choice_preflight_for_entry(
+                source_entry,
+                {"HERDRES_TENDWIRE_MODE": "source-read"},
+            ),
+            "ok",
+        )
+        self.assertEqual(
+            herdres_tendwire.callback_choice_preflight_for_entry(
+                partial_source,
+                {"HERDRES_TENDWIRE_MODE": "source-read"},
+            ),
+            "safe_failure",
+        )
+        self.assertEqual(
+            herdres_tendwire.callback_choice_preflight_for_entry(
+                closed_source,
+                {"HERDRES_TENDWIRE_MODE": "source-read"},
+            ),
+            "source_not_live",
+        )
+
     def test_attachment_preflight_policy_keeps_source_mode_out_of_direct_herdr(self) -> None:
         self.assertEqual(
             herdres_tendwire.attachment_send_preflight_policy(

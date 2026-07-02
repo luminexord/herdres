@@ -8808,11 +8808,7 @@ def interrupt_and_send_response(
             "handled": True,
             "reply": "Tendwire command mode cannot safely interrupt this worker yet; use /send.",
         }
-    if tendwire_commands_enabled() and herdres_tendwire.entry_metadata_state(
-        entry,
-        source_read_enabled=tendwire_source_read_enabled(),
-        commands_enabled=tendwire_commands_enabled(),
-    ) in {"valid", "partial"}:
+    if tendwire_commands_enabled() and herdres_tendwire.entry_metadata_state_for_env(entry) in {"valid", "partial"}:
         return {
             "handled": True,
             "reply": "Tendwire command mode cannot safely interrupt this worker yet; use /send or interrupt in Herdr.",
@@ -15486,11 +15482,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             visible_choice = str(awaiting.get("visible_choice") or "").strip()
             direct_origin_detail_text = arg
             if source_entry:
-                if herdres_tendwire.entry_metadata_state(
-                    entry,
-                    source_read_enabled=tendwire_source_read_enabled(),
-                    commands_enabled=tendwire_commands_enabled(),
-                ) != "valid":
+                if herdres_tendwire.entry_metadata_state_for_env(entry) != "valid":
                     entry.pop("awaiting_detail", None)
                     entry.pop("active_prompt", None)
                     save_state(state)
@@ -16242,17 +16234,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if len(parts) != 4 or parts[1] not in {"c", "d"}:
         return {"handled": True, "answer": "Unknown Herdr action."}
     source_entry = entry_is_tendwire_source(entry)
-    preflight = herdres_tendwire.callback_choice_preflight_policy(
-        source_inventory_enabled=tendwire_source_inventory_enabled(),
-        source_entry=source_entry,
-        pane_id=str(entry.get("pane_id") or ""),
-        last_known_status=str(entry.get("last_known_status") or ""),
-        metadata_state=herdres_tendwire.entry_metadata_state(
-            entry,
-            source_read_enabled=tendwire_source_read_enabled(),
-            commands_enabled=tendwire_commands_enabled(),
-        ),
-    )
+    preflight = herdres_tendwire.callback_choice_preflight_for_entry(entry)
     if preflight == "legacy_source_block":
         return {
             "handled": True,

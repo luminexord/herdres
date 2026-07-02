@@ -1128,6 +1128,21 @@ def entry_metadata_state(
     return "valid" if worker_id and fingerprint else "partial"
 
 
+def entry_metadata_state_for_env(
+    entry: dict[str, Any] | None,
+    env: Any | None = None,
+    *,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> str:
+    mode = parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
+    return entry_metadata_state(
+        entry,
+        source_read_enabled=mode_enables_source_inventory(mode),
+        commands_enabled=mode_enables_commands(mode),
+    )
+
+
 def response_status(response: dict[str, Any]) -> str:
     for container in (response, response.get("result") if isinstance(response.get("result"), dict) else {}):
         for key in ("status", "state", "result_status"):
@@ -1308,6 +1323,30 @@ def callback_choice_preflight_policy(
     if source_entry and str(metadata_state or "").strip().lower() != "valid":
         return "safe_failure"
     return "ok"
+
+
+def callback_choice_preflight_for_entry(
+    entry: dict[str, Any] | None,
+    env: Any | None = None,
+    *,
+    diagnose_invalid: bool = False,
+    warn_invalid: Callable[[Any], None] | None = None,
+) -> str:
+    mode = parse_mode(env, diagnose_invalid=diagnose_invalid, warn_invalid=warn_invalid)
+    source_entry = is_source_entry(entry)
+    metadata_state = entry_metadata_state(
+        entry,
+        source_read_enabled=mode_enables_source_inventory(mode),
+        commands_enabled=mode_enables_commands(mode),
+    )
+    entry_data = entry if isinstance(entry, dict) else {}
+    return callback_choice_preflight_policy(
+        source_inventory_enabled=mode_enables_source_inventory(mode),
+        source_entry=source_entry,
+        pane_id=str(entry_data.get("pane_id") or ""),
+        last_known_status=str(entry_data.get("last_known_status") or ""),
+        metadata_state=metadata_state,
+    )
 
 
 def attachment_send_preflight_policy(
