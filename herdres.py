@@ -2100,26 +2100,15 @@ def tendwire_snapshot() -> dict[str, Any]:
         raise BridgeError(str(exc)) from exc
 
 
-_tendwire_turns_cache: dict[str, Any] | None = None
-_tendwire_turns_cache_lock = threading.Lock()
-
-
 def tendwire_turns() -> dict[str, Any]:
-    global _tendwire_turns_cache
-    with _tendwire_turns_cache_lock:
-        if _tendwire_turns_cache is not None:
-            return _tendwire_turns_cache
     try:
-        data = herdres_tendwire.turns_payload(
+        return herdres_tendwire.cached_turns_payload(
             runner=run_cmd,
             sanitize=sanitize_text,
             default_herdr_bin=DEFAULT_HERDR_BIN,
         )
     except herdres_tendwire.TendwireCallError as exc:
         raise BridgeError(str(exc)) from exc
-    with _tendwire_turns_cache_lock:
-        _tendwire_turns_cache = data
-    return data
 
 
 def _json_object_from_stdout(stdout: str, source: str) -> tuple[dict[str, Any] | None, str]:
@@ -2572,14 +2561,13 @@ def fresh_cached_pane_turn(pane_id: str) -> dict[str, Any]:
 
 def clear_sync_caches() -> None:
     """Clear per-sync ephemeral caches. Called at the start of each sync."""
-    global _council_fetch_count, _tendwire_turns_cache
+    global _council_fetch_count
     _council_fetch_count = 0  # Fix E: reset the per-run council fetch budget each sync/event
     with _turn_cache_lock:
         _turn_cache.clear()
     with _pane_read_cache_lock:
         _pane_read_cache.clear()
-    with _tendwire_turns_cache_lock:
-        _tendwire_turns_cache = None
+    herdres_tendwire.clear_turns_payload_cache()
 
 
 def pane_agent_session_id(pane: dict[str, Any]) -> str:

@@ -14,6 +14,7 @@ import shlex
 import hashlib
 import json
 import subprocess
+import threading
 from typing import Any, Callable
 
 
@@ -689,6 +690,38 @@ def turns_payload(
         env=env,
         default_herdr_bin=default_herdr_bin,
     )
+
+
+_TURNS_PAYLOAD_CACHE: dict[str, Any] | None = None
+_TURNS_PAYLOAD_CACHE_LOCK = threading.Lock()
+
+
+def clear_turns_payload_cache() -> None:
+    global _TURNS_PAYLOAD_CACHE
+    with _TURNS_PAYLOAD_CACHE_LOCK:
+        _TURNS_PAYLOAD_CACHE = None
+
+
+def cached_turns_payload(
+    *,
+    runner: Runner,
+    sanitize: Sanitizer = _default_sanitize,
+    env: Any | None = None,
+    default_herdr_bin: str = DEFAULT_HERDR_BIN,
+) -> dict[str, Any]:
+    global _TURNS_PAYLOAD_CACHE
+    with _TURNS_PAYLOAD_CACHE_LOCK:
+        if _TURNS_PAYLOAD_CACHE is not None:
+            return _TURNS_PAYLOAD_CACHE
+    data = turns_payload(
+        runner=runner,
+        sanitize=sanitize,
+        env=env,
+        default_herdr_bin=default_herdr_bin,
+    )
+    with _TURNS_PAYLOAD_CACHE_LOCK:
+        _TURNS_PAYLOAD_CACHE = data
+    return data
 
 
 COMMAND_SUCCESS_STATUSES = {

@@ -1420,6 +1420,23 @@ class TendwireConfigTests(unittest.TestCase):
         self.assertEqual(runner.call_args.args[0], ["tendwire", "turns", "--json"])
         self.assertEqual(runner.call_args.kwargs["timeout"], 2)
 
+    def test_tendwire_cached_turns_payload_clears_between_syncs(self) -> None:
+        first = subprocess.CompletedProcess(["tendwire", "turns", "--json"], 0, stdout='{"turns":[{"id":"one"}]}', stderr="")
+        second = subprocess.CompletedProcess(["tendwire", "turns", "--json"], 0, stdout='{"turns":[{"id":"two"}]}', stderr="")
+        runner = Mock(side_effect=[first, second])
+        herdres_tendwire.clear_turns_payload_cache()
+        try:
+            self.assertEqual(herdres_tendwire.cached_turns_payload(runner=runner)["turns"][0]["id"], "one")
+            self.assertEqual(herdres_tendwire.cached_turns_payload(runner=runner)["turns"][0]["id"], "one")
+            self.assertEqual(runner.call_count, 1)
+
+            herdres_tendwire.clear_turns_payload_cache()
+
+            self.assertEqual(herdres_tendwire.cached_turns_payload(runner=runner)["turns"][0]["id"], "two")
+            self.assertEqual(runner.call_count, 2)
+        finally:
+            herdres_tendwire.clear_turns_payload_cache()
+
     def test_diagnostic_config_json_is_valid_and_sanitized(self) -> None:
         env = {
             "HOME": "/tmp/herdres-home",
