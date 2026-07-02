@@ -105,6 +105,17 @@ class PublicSanitizerTests(unittest.TestCase):
 
         self.assertEqual(herdres.sanitize_text(text, 1000), text)
 
+    def test_sanitize_text_preserves_public_hashes_but_redacts_base64_blobs(self) -> None:
+        public_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        base64_blob = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0123456789+/=="
+        text = f"content_fingerprint={public_hash} semantic_hash={public_hash} blob {base64_blob}"
+
+        sanitized = herdres.sanitize_text(text, 1000)
+
+        self.assertIn(f"content_fingerprint={public_hash}", sanitized)
+        self.assertIn(f"semantic_hash={public_hash}", sanitized)
+        self.assertNotIn(base64_blob, sanitized)
+
 
 class SpaceTopicStateTests(unittest.TestCase):
     def test_space_key_prefers_space_id_then_workspace_then_cwd_default(self) -> None:

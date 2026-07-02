@@ -316,7 +316,7 @@ SECRET_PATTERNS = [
     re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"(?i)bot\d{6,}:[A-Za-z0-9_-]{20,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+    re.compile(r"(?<![\w+/=])(?=[A-Za-z0-9+/=]{40,}(?![\w+/=]))(?=[A-Za-z0-9+/=]*[+/=])[A-Za-z0-9+/]{40,}={0,2}"),
     re.compile(r"(?i)([?&](?:access_token|api[_-]?key|auth[_-]?token|token|signature|sig)=)([^&#\s]+)"),
 ]
 PRIVATE_FIELD_VALUE_RE = re.compile(
