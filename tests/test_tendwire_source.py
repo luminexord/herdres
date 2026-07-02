@@ -893,6 +893,67 @@ class TendwireModeTests(unittest.TestCase):
         self.assertNotIn("tendwire_source_inventory_degraded_at", state)
         self.assertNotIn("tendwire_source_inventory_preserved", state)
 
+    def test_tendwire_helper_tracks_source_turn_delivery_ledger(self) -> None:
+        state, key = _source_state()
+        entry = state["panes"][key]
+        pane = herdres.tendwire_source_read_panes(_snapshot())[0]
+        identity = "turn-semantic-1"
+        entry["delivered_turn_identities"] = [identity]
+
+        seeded = herdres_tendwire.seed_source_turn_delivery_ledger_from_entries(
+            state,
+            is_source_entry=herdres.entry_is_tendwire_source,
+            identities_for_entry=herdres_tendwire.entry_delivered_turn_identities,
+            now="2026-07-02T00:00:00+00:00",
+            sanitize=herdres.sanitize_text,
+            cap=10,
+        )
+
+        self.assertTrue(seeded)
+        self.assertTrue(
+            herdres_tendwire.source_turn_delivery_seen(
+                state,
+                pane,
+                entry,
+                identity,
+                sanitize=herdres.sanitize_text,
+            )
+        )
+
+        reseeded = herdres_tendwire.seed_source_turn_delivery_ledger_from_entries(
+            state,
+            is_source_entry=herdres.entry_is_tendwire_source,
+            identities_for_entry=herdres_tendwire.entry_delivered_turn_identities,
+            now="2026-07-02T00:05:00+00:00",
+            sanitize=herdres.sanitize_text,
+            cap=10,
+        )
+
+        self.assertFalse(reseeded)
+        records = list(state["tendwire_source_delivered_turns"].values())
+        self.assertEqual(records[0]["updated_at"], "2026-07-02T00:00:00+00:00")
+
+        delivered = herdres_tendwire.note_source_turn_delivery_identity(
+            state,
+            pane,
+            entry,
+            identity,
+            turn_id="turn-public-1",
+            semantic_hash="sem-hash",
+            now="2026-07-02T00:10:00+00:00",
+            sanitize=herdres.sanitize_text,
+            cap=10,
+        )
+
+        self.assertTrue(delivered)
+        records = list(state["tendwire_source_delivered_turns"].values())
+        self.assertEqual(records[0]["updated_at"], "2026-07-02T00:10:00+00:00")
+        self.assertEqual(records[0]["turn_id"], "turn-public-1")
+        self.assertFalse(herdres_tendwire.record_entry_delivered_turn_identity(entry, "", cap=10))
+        self.assertFalse(herdres_tendwire.record_entry_delivered_turn_identity(entry, identity, cap=10))
+        self.assertTrue(herdres_tendwire.record_entry_delivered_turn_identity(entry, "turn-semantic-2", cap=10))
+        self.assertEqual(entry["delivered_turn_identities"], [identity, "turn-semantic-2"])
+
 
 class TendwireConfigTests(unittest.TestCase):
     def test_child_env_preserves_parent_and_overrides_only_tendwire_keys(self) -> None:

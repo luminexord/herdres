@@ -1458,6 +1458,216 @@ def is_source_read_pane(pane: dict[str, Any] | None) -> bool:
     return isinstance(pane, dict) and bool(pane.get("_tendwire_source_read"))
 
 
+def entry_delivered_turn_identities(entry: dict[str, Any]) -> set[str]:
+    raw = entry.get("delivered_turn_identities")
+    if not isinstance(raw, list):
+        return set()
+    identities: set[str] = set()
+    for value in raw:
+        clean = str(value or "").strip()
+        if clean:
+            identities.add(clean)
+    return identities
+
+
+def source_turn_delivery_ledger(state: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+    ledger = state.get("tendwire_source_delivered_turns")
+    if not isinstance(ledger, dict):
+        ledger = {}
+        state["tendwire_source_delivered_turns"] = ledger
+    return ledger
+
+
+def source_turn_delivery_key(
+    worker_id: str,
+    identity: str,
+    *,
+    sanitize: Sanitizer = _default_sanitize,
+) -> str:
+    clean_worker = sanitize(str(worker_id or ""), 120).strip()
+    clean_identity = sanitize(str(identity or ""), 300).strip()
+    if not clean_worker or not clean_identity:
+        return ""
+    payload = {"source": "tendwire", "worker_id": clean_worker, "turn_identity": clean_identity}
+    return "source-turn:" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def source_turn_worker_id(
+    pane: dict[str, Any] | None,
+    entry: dict[str, Any] | None,
+    *,
+    sanitize: Sanitizer = _default_sanitize,
+) -> str:
+    for obj in (entry, pane):
+        if not isinstance(obj, dict):
+            continue
+        value = str(obj.get("tendwire_worker_id") or obj.get("worker_id") or obj.get("_tendwire_worker_id") or "").strip()
+        if value:
+            return sanitize(value, 120).strip()
+    return ""
+
+
+def source_turn_delivery_seen(
+    state: dict[str, Any] | None,
+    pane: dict[str, Any] | None,
+    entry: dict[str, Any] | None,
+    identity: str,
+    *,
+    sanitize: Sanitizer = _default_sanitize,
+) -> bool:
+    if not isinstance(state, dict) or not identity:
+        return False
+    key = source_turn_delivery_key(
+        source_turn_worker_id(pane, entry, sanitize=sanitize),
+        identity,
+        sanitize=sanitize,
+    )
+    ledger = state.get("tendwire_source_delivered_turns")
+    return bool(key and isinstance(ledger, dict) and key in ledger)
+
+
+def prune_source_turn_delivery_ledger(ledger: dict[str, Any], *, cap: int) -> None:
+    if len(ledger) <= int(cap):
+        return
+
+    def sort_key(item: tuple[str, Any]) -> str:
+        record = item[1]
+        if isinstance(record, dict):
+            return str(record.get("updated_at") or record.get("delivered_at") or "")
+        return ""
+
+    kept = dict(sorted(ledger.items(), key=sort_key)[-max(1, int(cap)):])
+    ledger.clear()
+    ledger.update(kept)
+
+
+def note_source_turn_delivery_identity(
+    state: dict[str, Any] | None,
+    pane: dict[str, Any] | None,
+    entry: dict[str, Any] | None,
+    identity: str,
+    *,
+    turn_id: str = "",
+    semantic_hash: str = "",
+    now: str,
+    refresh_updated_at: bool = True,
+    sanitize: Sanitizer = _default_sanitize,
+    cap: int,
+) -> bool:
+    worker_id = source_turn_worker_id(pane, entry, sanitize=sanitize)
+    key = source_turn_delivery_key(worker_id, identity, sanitize=sanitize)
+    if not isinstance(state, dict) or not key:
+        return False
+    ledger = source_turn_delivery_ledger(state)
+    record = ledger.get(key)
+    if not isinstance(record, dict):
+        record = {"delivered_at": str(now or "")}
+        ledger[key] = record
+        changed = True
+    else:
+        changed = False
+    values = {
+        "worker_id": worker_id,
+        "turn_identity": sanitize(str(identity or ""), 300).strip(),
+        "turn_id": sanitize(str(turn_id or ""), 200).strip(),
+        "semantic_hash": str(semantic_hash or ""),
+    }
+    if refresh_updated_at or not record.get("updated_at"):
+        values["updated_at"] = str(now or "")
+    for field, value in values.items():
+        if record.get(field) != value:
+            record[field] = value
+            changed = True
+    prune_source_turn_delivery_ledger(ledger, cap=cap)
+    return changed
+
+
+def note_source_turn_delivery(
+    state: dict[str, Any] | None,
+    pane: dict[str, Any] | None,
+    entry: dict[str, Any] | None,
+    item: dict[str, Any] | None,
+    *,
+    identity: str,
+    semantic_hash: str = "",
+    now: str,
+    sanitize: Sanitizer = _default_sanitize,
+    cap: int,
+) -> bool:
+    if not isinstance(item, dict) or str(item.get("kind") or "").lower() != "turn":
+        return False
+    return note_source_turn_delivery_identity(
+        state,
+        pane,
+        entry,
+        identity,
+        turn_id=str(item.get("turn_id") or ""),
+        semantic_hash=semantic_hash,
+        now=now,
+        refresh_updated_at=True,
+        sanitize=sanitize,
+        cap=cap,
+    )
+
+
+def seed_source_turn_delivery_ledger_from_entries(
+    state: dict[str, Any] | None,
+    *,
+    is_source_entry: SourceEntryPredicate,
+    identities_for_entry: Callable[[dict[str, Any]], set[str]],
+    now: str,
+    sanitize: Sanitizer = _default_sanitize,
+    cap: int,
+) -> bool:
+    if not isinstance(state, dict):
+        return False
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    changed = False
+    for entry in panes.values():
+        if not isinstance(entry, dict) or not is_source_entry(entry):
+            continue
+        worker_id = source_turn_worker_id(None, entry, sanitize=sanitize)
+        if not worker_id:
+            continue
+        for identity in identities_for_entry(entry):
+            changed = note_source_turn_delivery_identity(
+                state,
+                None,
+                entry,
+                identity,
+                now=now,
+                refresh_updated_at=False,
+                sanitize=sanitize,
+                cap=cap,
+            ) or changed
+    return changed
+
+
+def record_entry_delivered_turn_identity(
+    entry: dict[str, Any],
+    identity: str,
+    *,
+    cap: int,
+) -> bool:
+    clean_identity = str(identity or "").strip()
+    if not clean_identity:
+        return False
+    raw = entry.get("delivered_turn_identities")
+    identities = [str(value or "").strip() for value in raw] if isinstance(raw, list) else []
+    identities = [value for value in identities if value and value != clean_identity]
+    identities.append(clean_identity)
+    if len(identities) > int(cap):
+        identities = identities[-max(1, int(cap)):]
+    if entry.get("delivered_turn_identities") == identities:
+        return False
+    entry["delivered_turn_identities"] = identities
+    return True
+
+
 def source_turn_for_pane(
     pane: dict[str, Any],
     turns_payload: dict[str, Any],

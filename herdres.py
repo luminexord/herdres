@@ -4861,46 +4861,19 @@ def completed_turn_delivery_identity(item: dict[str, Any]) -> str:
 
 
 def delivered_turn_identities(entry: dict[str, Any]) -> set[str]:
-    raw = entry.get("delivered_turn_identities")
-    if not isinstance(raw, list):
-        return set()
-    identities: set[str] = set()
-    for value in raw:
-        clean = str(value or "").strip()
-        if clean:
-            identities.add(clean)
-    return identities
+    return herdres_tendwire.entry_delivered_turn_identities(entry)
 
 
 def source_turn_delivery_ledger(state: dict[str, Any] | None) -> dict[str, Any]:
-    if not isinstance(state, dict):
-        return {}
-    ledger = state.get("tendwire_source_delivered_turns")
-    if not isinstance(ledger, dict):
-        ledger = {}
-        state["tendwire_source_delivered_turns"] = ledger
-    return ledger
+    return herdres_tendwire.source_turn_delivery_ledger(state)
 
 
 def source_turn_delivery_key(worker_id: str, identity: str) -> str:
-    clean_worker = sanitize_text(str(worker_id or ""), 120).strip()
-    clean_identity = sanitize_text(str(identity or ""), 300).strip()
-    if not clean_worker or not clean_identity:
-        return ""
-    payload = {"source": "tendwire", "worker_id": clean_worker, "turn_identity": clean_identity}
-    return "source-turn:" + hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:24]
+    return herdres_tendwire.source_turn_delivery_key(worker_id, identity, sanitize=sanitize_text)
 
 
 def source_turn_worker_id(pane: dict[str, Any] | None, entry: dict[str, Any] | None) -> str:
-    for obj in (entry, pane):
-        if not isinstance(obj, dict):
-            continue
-        value = str(obj.get("tendwire_worker_id") or obj.get("worker_id") or obj.get("_tendwire_worker_id") or "").strip()
-        if value:
-            return sanitize_text(value, 120).strip()
-    return ""
+    return herdres_tendwire.source_turn_worker_id(pane, entry, sanitize=sanitize_text)
 
 
 def source_turn_delivery_seen(
@@ -4912,24 +4885,20 @@ def source_turn_delivery_seen(
     if not isinstance(state, dict) or not isinstance(item, dict):
         return False
     identity = completed_turn_delivery_identity(item)
-    key = source_turn_delivery_key(source_turn_worker_id(pane, entry), identity)
-    ledger = state.get("tendwire_source_delivered_turns")
-    return bool(key and isinstance(ledger, dict) and key in ledger)
+    return herdres_tendwire.source_turn_delivery_seen(
+        state,
+        pane,
+        entry,
+        identity,
+        sanitize=sanitize_text,
+    )
 
 
 def prune_source_turn_delivery_ledger(ledger: dict[str, Any]) -> None:
-    if len(ledger) <= SOURCE_TURN_DELIVERY_LEDGER_CAP:
-        return
-
-    def sort_key(item: tuple[str, Any]) -> str:
-        record = item[1]
-        if isinstance(record, dict):
-            return str(record.get("updated_at") or record.get("delivered_at") or "")
-        return ""
-
-    kept = dict(sorted(ledger.items(), key=sort_key)[-SOURCE_TURN_DELIVERY_LEDGER_CAP:])
-    ledger.clear()
-    ledger.update(kept)
+    herdres_tendwire.prune_source_turn_delivery_ledger(
+        ledger,
+        cap=SOURCE_TURN_DELIVERY_LEDGER_CAP,
+    )
 
 
 def note_source_turn_delivery_identity(
@@ -4941,33 +4910,19 @@ def note_source_turn_delivery_identity(
     item: dict[str, Any] | None = None,
     delivered_at: str | None = None,
 ) -> bool:
-    worker_id = source_turn_worker_id(pane, entry)
-    key = source_turn_delivery_key(worker_id, identity)
-    if not isinstance(state, dict) or not key:
-        return False
-    ledger = source_turn_delivery_ledger(state)
     now = delivered_at or utc_now()
-    record = ledger.get(key)
-    if not isinstance(record, dict):
-        record = {"delivered_at": now}
-        ledger[key] = record
-        changed = True
-    else:
-        changed = False
-    values = {
-        "worker_id": worker_id,
-        "turn_identity": sanitize_text(str(identity or ""), 300).strip(),
-        "turn_id": sanitize_text(str((item or {}).get("turn_id") or ""), 200).strip(),
-        "semantic_hash": clean_feed_hash(item, include_render_version=False) if isinstance(item, dict) else "",
-    }
-    if item is not None or delivered_at is not None or not record.get("updated_at"):
-        values["updated_at"] = now
-    for field, value in values.items():
-        if record.get(field) != value:
-            record[field] = value
-            changed = True
-    prune_source_turn_delivery_ledger(ledger)
-    return changed
+    return herdres_tendwire.note_source_turn_delivery_identity(
+        state,
+        pane,
+        entry,
+        identity,
+        turn_id=str((item or {}).get("turn_id") or ""),
+        semantic_hash=clean_feed_hash(item, include_render_version=False) if isinstance(item, dict) else "",
+        now=now,
+        refresh_updated_at=item is not None or delivered_at is not None,
+        sanitize=sanitize_text,
+        cap=SOURCE_TURN_DELIVERY_LEDGER_CAP,
+    )
 
 
 def note_source_turn_delivery(
@@ -4981,30 +4936,28 @@ def note_source_turn_delivery(
     if not isinstance(item, dict) or str(item.get("kind") or "").lower() != "turn":
         return False
     identity = completed_turn_delivery_identity(item)
-    return note_source_turn_delivery_identity(
+    return herdres_tendwire.note_source_turn_delivery(
         state,
         pane,
         entry,
-        identity,
-        item=item,
-        delivered_at=delivered_at,
+        item,
+        identity=identity,
+        semantic_hash=clean_feed_hash(item, include_render_version=False),
+        now=delivered_at or utc_now(),
+        sanitize=sanitize_text,
+        cap=SOURCE_TURN_DELIVERY_LEDGER_CAP,
     )
 
 
 def seed_source_turn_delivery_ledger_from_entries(state: dict[str, Any] | None) -> bool:
-    if not isinstance(state, dict):
-        return False
-    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
-    changed = False
-    for entry in panes.values():
-        if not isinstance(entry, dict) or not entry_is_tendwire_source(entry):
-            continue
-        worker_id = source_turn_worker_id(None, entry)
-        if not worker_id:
-            continue
-        for identity in delivered_turn_identities(entry):
-            changed = note_source_turn_delivery_identity(state, None, entry, identity) or changed
-    return changed
+    return herdres_tendwire.seed_source_turn_delivery_ledger_from_entries(
+        state,
+        is_source_entry=entry_is_tendwire_source,
+        identities_for_entry=delivered_turn_identities,
+        now=utc_now(),
+        sanitize=sanitize_text,
+        cap=SOURCE_TURN_DELIVERY_LEDGER_CAP,
+    )
 
 
 def suppress_globally_delivered_source_turn(
@@ -5027,18 +4980,11 @@ def suppress_globally_delivered_source_turn(
 
 def record_delivered_turn_identity(entry: dict[str, Any], item: dict[str, Any]) -> bool:
     identity = completed_turn_delivery_identity(item)
-    if not identity:
-        return False
-    raw = entry.get("delivered_turn_identities")
-    identities = [str(value or "").strip() for value in raw] if isinstance(raw, list) else []
-    identities = [value for value in identities if value and value != identity]
-    identities.append(identity)
-    if len(identities) > DELIVERED_TURN_IDENTITIES_CAP:
-        identities = identities[-DELIVERED_TURN_IDENTITIES_CAP:]
-    if entry.get("delivered_turn_identities") == identities:
-        return False
-    entry["delivered_turn_identities"] = identities
-    return True
+    return herdres_tendwire.record_entry_delivered_turn_identity(
+        entry,
+        identity,
+        cap=DELIVERED_TURN_IDENTITIES_CAP,
+    )
 
 
 def delivered_turn_cursor_id(entry: dict[str, Any]) -> str:
