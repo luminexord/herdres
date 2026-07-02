@@ -8808,7 +8808,11 @@ def interrupt_and_send_response(
             "handled": True,
             "reply": "Tendwire command mode cannot safely interrupt this worker yet; use /send.",
         }
-    if tendwire_commands_enabled() and tendwire_entry_metadata_state(entry) in {"valid", "partial"}:
+    if tendwire_commands_enabled() and herdres_tendwire.entry_metadata_state(
+        entry,
+        source_read_enabled=tendwire_source_read_enabled(),
+        commands_enabled=tendwire_commands_enabled(),
+    ) in {"valid", "partial"}:
         return {
             "handled": True,
             "reply": "Tendwire command mode cannot safely interrupt this worker yet; use /send or interrupt in Herdr.",
@@ -12102,24 +12106,7 @@ def entry_is_tendwire_source(entry: dict[str, Any] | None) -> bool:
     return herdres_tendwire.is_source_entry(entry)
 
 
-def tendwire_source_entry_commands_allowed(entry: dict[str, Any] | None) -> bool:
-    return herdres_tendwire.source_entry_commands_allowed(
-        entry,
-        source_read_enabled=tendwire_source_read_enabled(),
-        commands_enabled=tendwire_commands_enabled(),
-    )
-
-
-TENDWIRE_ENTRY_METADATA_KEYS = herdres_tendwire.ENTRY_METADATA_KEYS
 TENDWIRE_SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the target again."
-
-
-def tendwire_entry_metadata_state(entry: dict[str, Any] | None) -> str:
-    return herdres_tendwire.entry_metadata_state(
-        entry,
-        source_read_enabled=tendwire_source_read_enabled(),
-        commands_enabled=tendwire_commands_enabled(),
-    )
 
 
 def drop_tendwire_source_pane_records(state: dict[str, Any]) -> int:
@@ -15499,7 +15486,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             visible_choice = str(awaiting.get("visible_choice") or "").strip()
             direct_origin_detail_text = arg
             if source_entry:
-                if tendwire_entry_metadata_state(entry) != "valid":
+                if herdres_tendwire.entry_metadata_state(
+                    entry,
+                    source_read_enabled=tendwire_source_read_enabled(),
+                    commands_enabled=tendwire_commands_enabled(),
+                ) != "valid":
                     entry.pop("awaiting_detail", None)
                     entry.pop("active_prompt", None)
                     save_state(state)
@@ -16256,7 +16247,11 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         source_entry=source_entry,
         pane_id=str(entry.get("pane_id") or ""),
         last_known_status=str(entry.get("last_known_status") or ""),
-        metadata_state=tendwire_entry_metadata_state(entry),
+        metadata_state=herdres_tendwire.entry_metadata_state(
+            entry,
+            source_read_enabled=tendwire_source_read_enabled(),
+            commands_enabled=tendwire_commands_enabled(),
+        ),
     )
     if preflight == "legacy_source_block":
         return {

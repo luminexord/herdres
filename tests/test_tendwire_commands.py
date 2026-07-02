@@ -989,7 +989,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
 
     def test_no_metadata_continues_to_use_legacy_direct_send(self) -> None:
         entry = _entry()
-        for key in herdres.TENDWIRE_ENTRY_METADATA_KEYS:
+        for key in herdres_tendwire.ENTRY_METADATA_KEYS:
             entry.pop(key, None)
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "commands"}, clear=True), \
                 patch.object(herdres, "send_to_pane", return_value=(True, "queued")) as send_to_pane, \
@@ -1058,7 +1058,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
 
     def test_source_mode_legacy_entry_does_not_call_herdr_or_tendwire(self) -> None:
         entry = _entry(source="herdr", pane_id="pane-1")
-        for key in herdres.TENDWIRE_ENTRY_METADATA_KEYS:
+        for key in herdres_tendwire.ENTRY_METADATA_KEYS:
             entry.pop(key, None)
         state = _state(entry)
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
@@ -1588,7 +1588,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
 
     def test_source_read_agent_picker_missing_metadata_fails_closed(self) -> None:
         entry = _entry(source="tendwire", entry_type="worker", pane_id="", worker_id="worker-1", worker_fingerprint="fp-1", agent="codex")
-        for key in herdres.TENDWIRE_ENTRY_METADATA_KEYS:
+        for key in herdres_tendwire.ENTRY_METADATA_KEYS:
             entry.pop(key, None)
         pane_key = "pane-1"
         space = {
@@ -1624,7 +1624,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
 
     def test_source_mode_agent_picker_legacy_entry_does_not_call_herdr_or_tendwire(self) -> None:
         entry = _entry(source="herdr", pane_id="pane-1", agent="codex")
-        for key in herdres.TENDWIRE_ENTRY_METADATA_KEYS:
+        for key in herdres_tendwire.ENTRY_METADATA_KEYS:
             entry.pop(key, None)
         pane_key = "pane-1"
         space = {
