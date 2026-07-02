@@ -253,6 +253,51 @@ def outbox_preflight_status(
     return ""
 
 
+def outbox_prepare_drain(
+    *,
+    enabled: bool,
+    max_sends: int,
+    sent_count: int,
+    delivery_configured: bool,
+    limit: int | None = None,
+    env: Any | None = None,
+) -> dict[str, Any]:
+    result = outbox_drain_result(bool(enabled))
+    if not enabled:
+        return {"result": result, "should_poll": False, "remaining_sends": 0, "poll_params": None}
+    remaining = max(0, int(max_sends) - int(sent_count))
+    preflight_status = outbox_preflight_status(
+        delivery_configured=delivery_configured,
+        remaining_sends=remaining,
+    )
+    if preflight_status:
+        result["status"] = preflight_status
+        return {"result": result, "should_poll": False, "remaining_sends": remaining, "poll_params": None}
+    return {
+        "result": result,
+        "should_poll": True,
+        "remaining_sends": remaining,
+        "poll_params": outbox_poll_params(remaining_sends=remaining, limit=limit, env=env),
+    }
+
+
+def outbox_apply_poll_response(
+    result: dict[str, Any],
+    poll: dict[str, Any],
+    *,
+    sanitize: Sanitizer = _default_sanitize,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    if not poll.get("ok"):
+        status = str(poll.get("status") or "poll_failed")
+        result["status"] = status
+        result["error"] = sanitize(str(poll.get("error") or ""), 300)
+        result["changed"] = True
+        return [], {"status": status}
+    items = [item for item in poll.get("items", []) if isinstance(item, dict)]
+    result["polled"] = len(items)
+    return items, None
+
+
 def outbox_poll_params(
     *,
     remaining_sends: int,

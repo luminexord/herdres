@@ -2257,11 +2257,10 @@ def drain_tendwire_connector_outbox(
 ) -> dict[str, Any]:
     if enabled is None:
         enabled = tendwire_connector_outbox_enabled()
-    result: dict[str, Any] = herdres_tendwire.outbox_drain_result(bool(enabled))
-    if not enabled:
-        return result
-    remaining = max(0, int(max_sends) - int(counters.get("sends", 0)))
-    preflight_status = herdres_tendwire.outbox_preflight_status(
+    prepared = herdres_tendwire.outbox_prepare_drain(
+        enabled=bool(enabled),
+        max_sends=max_sends,
+        sent_count=int(counters.get("sends", 0)),
         delivery_configured=bool(
             str(chat_id or "").strip()
             and (
@@ -2269,23 +2268,23 @@ def drain_tendwire_connector_outbox(
                 or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
             )
         ),
-        remaining_sends=remaining,
+        limit=limit,
     )
-    if preflight_status:
-        result["status"] = preflight_status
+    result = prepared["result"] if isinstance(prepared.get("result"), dict) else herdres_tendwire.outbox_drain_result(False)
+    if not prepared.get("should_poll"):
         return result
     poll = tendwire_connector_call(
         "poll",
-        herdres_tendwire.outbox_poll_params(remaining_sends=remaining, limit=limit),
+        prepared.get("poll_params") if isinstance(prepared.get("poll_params"), dict) else {},
     )
-    if not poll.get("ok"):
-        result["status"] = str(poll.get("status") or "poll_failed")
-        result["error"] = sanitize_text(str(poll.get("error") or ""), 300)
-        tendwire_outbox_audit(state, {"status": result["status"], "checked_at": utc_now()})
-        result["changed"] = True
+    items, audit_event = herdres_tendwire.outbox_apply_poll_response(
+        result,
+        poll,
+        sanitize=sanitize_text,
+    )
+    if audit_event is not None:
+        tendwire_outbox_audit(state, {"status": audit_event.get("status"), "checked_at": utc_now()})
         return result
-    items = [item for item in poll.get("items", []) if isinstance(item, dict)]
-    result["polled"] = len(items)
     for item in items:
         ref = str(item.get("ref") or "").strip()
         if not ref:

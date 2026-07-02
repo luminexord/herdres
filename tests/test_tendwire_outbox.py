@@ -128,10 +128,56 @@ class TendwireOutboxTests(unittest.TestCase):
             herdres_tendwire.outbox_preflight_status(delivery_configured=True, remaining_sends=0),
             "send_cap_exhausted",
         )
+        disabled = herdres_tendwire.outbox_prepare_drain(
+            enabled=False,
+            max_sends=8,
+            sent_count=0,
+            delivery_configured=True,
+            env=env,
+        )
+        self.assertFalse(disabled["should_poll"])
+        self.assertFalse(disabled["result"]["enabled"])
+        unconfigured = herdres_tendwire.outbox_prepare_drain(
+            enabled=True,
+            max_sends=8,
+            sent_count=0,
+            delivery_configured=False,
+            env=env,
+        )
+        self.assertFalse(unconfigured["should_poll"])
+        self.assertEqual(unconfigured["result"]["status"], "telegram_unconfigured")
+        prepared = herdres_tendwire.outbox_prepare_drain(
+            enabled=True,
+            max_sends=8,
+            sent_count=6,
+            delivery_configured=True,
+            limit=5,
+            env=env,
+        )
+        self.assertTrue(prepared["should_poll"])
+        self.assertEqual(prepared["remaining_sends"], 2)
+        self.assertEqual(prepared["poll_params"], {"name": "attention.main", "limit": 2, "lease_seconds": 45})
         self.assertEqual(
             herdres_tendwire.outbox_poll_params(remaining_sends=2, limit=5, env=env),
             {"name": "attention.main", "limit": 2, "lease_seconds": 45},
         )
+        result = herdres_tendwire.outbox_drain_result(True)
+        items, audit = herdres_tendwire.outbox_apply_poll_response(
+            result,
+            {"ok": True, "items": [_item(), "not-an-item"]},
+        )
+        self.assertEqual(items, [_item()])
+        self.assertIsNone(audit)
+        self.assertEqual(result["polled"], 1)
+        failed_result = herdres_tendwire.outbox_drain_result(True)
+        items, audit = herdres_tendwire.outbox_apply_poll_response(
+            failed_result,
+            {"ok": False, "status": "backend_unavailable", "error": "private detail"},
+        )
+        self.assertEqual(items, [])
+        self.assertEqual(audit, {"status": "backend_unavailable"})
+        self.assertTrue(failed_result["changed"])
+        self.assertEqual(failed_result["status"], "backend_unavailable")
 
         ack = herdres_tendwire.outbox_ack_params("twref1.safeopaque", item, deduplicated=True, env=env)
         self.assertEqual(ack["name"], "attention.main")
