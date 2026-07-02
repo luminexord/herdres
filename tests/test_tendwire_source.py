@@ -1149,7 +1149,6 @@ class TendwireModeTests(unittest.TestCase):
             preserved_panes=preserved,
             pane_key=herdres.pane_key,
             sanitize=herdres.sanitize_text,
-            raw_space_id_predicate=herdres._looks_like_raw_herdr_space_id,
         )
 
         self.assertTrue(result["degraded"])
@@ -1172,7 +1171,6 @@ class TendwireModeTests(unittest.TestCase):
             is_source_entry=herdres.entry_is_tendwire_source,
             now="2026-07-02T00:00:00+00:00",
             sanitize=herdres.sanitize_text,
-            raw_space_id_predicate=herdres._looks_like_raw_herdr_space_id,
         )
 
         self.assertEqual([pane["worker_id"] for pane in panes], [state["panes"][key]["worker_id"]])

@@ -2410,7 +2410,6 @@ def tendwire_source_read_panes(snapshot: dict[str, Any]) -> list[dict[str, Any]]
     return herdres_tendwire.source_read_panes(
         snapshot,
         sanitize=sanitize_text,
-        raw_space_id_predicate=_looks_like_raw_herdr_space_id,
     )
 
 
@@ -2991,7 +2990,7 @@ def agent_topic_name_for_pane(pane: dict[str, Any]) -> str:
 
 
 def _looks_like_raw_herdr_space_id(value: Any) -> bool:
-    return bool(re.fullmatch(r"w[0-9a-f]{8,}", str(value or "").strip(), flags=re.IGNORECASE))
+    return herdres_tendwire.looks_like_raw_herdr_space_id(value)
 
 
 def space_name_for_pane(pane: dict[str, Any]) -> str:
@@ -11872,7 +11871,6 @@ def observed_agent_panes(state: dict[str, Any] | None = None) -> list[dict[str, 
             is_source_entry=entry_is_tendwire_source,
             now=utc_now(),
             sanitize=sanitize_text,
-            raw_space_id_predicate=_looks_like_raw_herdr_space_id,
         )
     all_panes = pane_list()
     include_shells = parse_bool_env("HERDR_TELEGRAM_TOPICS_INCLUDE_SHELLS", "")

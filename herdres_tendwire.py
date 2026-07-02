@@ -1357,6 +1357,10 @@ def worker_agent(worker: dict[str, Any], *, sanitize: Sanitizer = _default_sanit
     return sanitize(str(meta.get("agent") or worker.get("name") or ""), 80)
 
 
+def looks_like_raw_herdr_space_id(value: Any) -> bool:
+    return bool(re.fullmatch(r"w[0-9a-f]{8,}", str(value or "").strip(), flags=re.IGNORECASE))
+
+
 def worker_match_keys(worker: dict[str, Any], *, sanitize: Sanitizer = _default_sanitize) -> list[tuple[str, str, str, str]]:
     meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
     space_id = str(worker.get("space_id") or "").strip()
@@ -1463,6 +1467,7 @@ def source_read_panes(
     raw_space_id_predicate: RawSpacePredicate | None = None,
 ) -> list[dict[str, Any]]:
     """Build read-only pane-like records from Tendwire's public snapshot."""
+    raw_id_predicate = raw_space_id_predicate or looks_like_raw_herdr_space_id
     spaces = {
         str(space.get("id") or ""): space
         for space in snapshot.get("spaces") or []
@@ -1479,7 +1484,7 @@ def source_read_panes(
         space_id = str(worker.get("space_id") or "").strip()
         space = spaces.get(space_id) or {}
         space_name = sanitize(str(space.get("name") or space.get("label") or ""), 120).strip()
-        if raw_space_id_predicate is not None and raw_space_id_predicate(space_name):
+        if raw_id_predicate(space_name):
             space_name = ""
         agent = worker_agent(worker, sanitize=sanitize) or sanitize(str(worker.get("name") or "worker"), 80)
         status_line = sanitize(str(worker.get("status_line") or worker.get("summary") or ""), 500)
