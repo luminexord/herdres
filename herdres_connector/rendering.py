@@ -9,6 +9,7 @@ from .safe import compact_ws, html_escape, sanitize_text
 
 
 ACTIVE_STATUSES = {"active", "busy", "in_progress", "pending", "running", "waiting", "working"}
+EXPANDABLE_SECTION_CHARS = 700
 
 
 def normalized_status(value: Any) -> str:
@@ -119,6 +120,15 @@ def markdownish_to_html(value: Any, *, limit: int = 12000) -> str:
     return "\n".join(rendered).strip()
 
 
+def section_html(label: str, body_html: str, *, expandable: bool = False) -> str:
+    body = str(body_html or "").strip()
+    if not body:
+        return ""
+    title = html_escape(label, 80)
+    attr = " expandable" if expandable else ""
+    return f"<b>{title}</b>\n<blockquote{attr}>{body}</blockquote>"
+
+
 def render_working_update(item: dict[str, Any], entry: dict[str, Any]) -> str:
     label = html_escape(worker_label(entry), 80)
     body = compact_ws(item.get("assistant_stream_text") or item.get("user_text") or "Work is in progress.", 700)
@@ -132,9 +142,21 @@ def render_final_turn(item: dict[str, Any], entry: dict[str, Any]) -> str:
     user_text = sanitize_text(item.get("user_text"), 3500).strip()
     final_text = sanitize_text(item.get("assistant_final_text") or item.get("assistant_stream_text"), 12000).strip()
     if user_text:
-        parts.append(f"<b>You</b>\n{html_escape(user_text, 3500)}")
+        parts.append(
+            section_html(
+                "You",
+                html_escape(user_text, 3500),
+                expandable=len(user_text) > EXPANDABLE_SECTION_CHARS,
+            )
+        )
     if final_text:
-        parts.append(f"<b>Response</b>\n{markdownish_to_html(final_text, limit=12000)}")
+        parts.append(
+            section_html(
+                "Response",
+                markdownish_to_html(final_text, limit=12000),
+                expandable=len(final_text) > EXPANDABLE_SECTION_CHARS,
+            )
+        )
     return "\n\n".join(parts)
 
 

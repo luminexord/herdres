@@ -64,6 +64,16 @@ class TelegramClient:
             raise TelegramError(sanitize_text(data.get("description") or "Telegram API error", 300))
         return data
 
+    def _html_variants(self, html_text: str) -> list[tuple[str, str]]:
+        html = sanitize_text(html_text, 3900)
+        variants = [("html", html)]
+        if "<blockquote expandable>" in html:
+            variants.append(("html-no-expandable", html.replace("<blockquote expandable>", "<blockquote>")))
+        plain = html_to_plain(html)
+        if plain and plain != html:
+            variants.append(("plain", sanitize_text(plain, 3900)))
+        return variants
+
     def send_message(
         self,
         chat_id: str,
@@ -73,49 +83,48 @@ class TelegramClient:
         reply_to_message_id: str | int | None = None,
         notify: bool = False,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        base_payload: dict[str, Any] = {
             "chat_id": chat_id,
-            "text": sanitize_text(html_text, 3900),
-            "parse_mode": "HTML",
             "disable_web_page_preview": "true",
             "disable_notification": "false" if notify else "true",
         }
         if thread_id:
-            payload["message_thread_id"] = str(thread_id)
+            base_payload["message_thread_id"] = str(thread_id)
         if reply_to_message_id:
-            payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
-        try:
-            result = self.api("sendMessage", payload).get("result") or {}
-            return {"ok": True, "message_id": str(result.get("message_id") or "0")}
-        except TelegramError as exc:
-            fallback = html_to_plain(html_text)
-            if fallback and fallback != html_text:
-                plain_payload = dict(payload)
-                plain_payload.pop("parse_mode", None)
-                plain_payload["text"] = sanitize_text(fallback, 3900)
-                try:
-                    result = self.api("sendMessage", plain_payload).get("result") or {}
-                    return {"ok": True, "message_id": str(result.get("message_id") or "0"), "format": "plain"}
-                except TelegramError:
-                    pass
-            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+            base_payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
+        last_error = ""
+        for fmt, text in self._html_variants(html_text):
+            payload = dict(base_payload)
+            payload["text"] = text
+            if fmt != "plain":
+                payload["parse_mode"] = "HTML"
+            try:
+                result = self.api("sendMessage", payload).get("result") or {}
+                return {"ok": True, "message_id": str(result.get("message_id") or "0"), "format": fmt}
+            except TelegramError as exc:
+                last_error = str(exc)
+        return {"ok": False, "error": sanitize_text(last_error, 300)}
 
     def edit_message(self, chat_id: str, message_id: str | int, html_text: str) -> dict[str, Any]:
-        payload = {
+        base_payload = {
             "chat_id": chat_id,
             "message_id": str(message_id),
-            "text": sanitize_text(html_text, 3900),
-            "parse_mode": "HTML",
             "disable_web_page_preview": "true",
         }
-        try:
-            self.api("editMessageText", payload)
-            return {"ok": True, "message_id": str(message_id), "kind": "edited"}
-        except TelegramError as exc:
-            text = str(exc)
-            if "message is not modified" in text.lower():
-                return {"ok": True, "message_id": str(message_id), "kind": "unchanged"}
-            return {"ok": False, "error": sanitize_text(text, 300)}
+        last_error = ""
+        for fmt, text in self._html_variants(html_text):
+            payload = dict(base_payload)
+            payload["text"] = text
+            if fmt != "plain":
+                payload["parse_mode"] = "HTML"
+            try:
+                self.api("editMessageText", payload)
+                return {"ok": True, "message_id": str(message_id), "kind": "edited", "format": fmt}
+            except TelegramError as exc:
+                last_error = str(exc)
+                if "message is not modified" in last_error.lower():
+                    return {"ok": True, "message_id": str(message_id), "kind": "unchanged", "format": fmt}
+        return {"ok": False, "error": sanitize_text(last_error, 300)}
 
     def create_topic(self, chat_id: str, name: str) -> dict[str, Any]:
         payload = {"chat_id": chat_id, "name": sanitize_text(name, 128)}

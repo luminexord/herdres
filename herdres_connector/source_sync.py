@@ -11,7 +11,7 @@ from .safe import compact_ws, short_hash
 from .telegram_delivery import TelegramClient, drain_outbox, topic_icon_id
 from .tendwire_client import TendwireClient
 
-RENDER_VERSION = "telegram-html-md-v1"
+RENDER_VERSION = "telegram-html-md-v2"
 
 
 @dataclass
