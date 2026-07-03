@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import config, state
-from .rendering import html_to_plain, render_attention_notice
+from .rendering import html_to_plain, render_attention_notice, split_text_chunks
 from .safe import sanitize_text, short_hash
 from .tendwire_client import TendwireClient
 
@@ -23,6 +23,10 @@ class RateLimited(TelegramError):
     def __init__(self, retry_after: int, message: str = "Telegram rate limited") -> None:
         super().__init__(message)
         self.retry_after = max(1, int(retry_after or 1))
+
+
+MESSAGE_TEXT_LIMIT = 3900
+SPLIT_TEXT_LIMIT = 3400
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,27 @@ class TelegramClient:
             base_payload["message_thread_id"] = str(thread_id)
         if reply_to_message_id:
             base_payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
+        plain = html_to_plain(sanitize_text(html_text, 12000))
+        if len(sanitize_text(html_text, 12000)) > MESSAGE_TEXT_LIMIT and plain:
+            chunks = split_text_chunks(plain, limit=SPLIT_TEXT_LIMIT)
+            message_ids: list[str] = []
+            last_error = ""
+            total = len(chunks)
+            for index, chunk in enumerate(chunks, start=1):
+                text = chunk if total == 1 else f"Part {index}/{total}\n{chunk}"
+                payload = dict(base_payload)
+                payload["text"] = sanitize_text(text, MESSAGE_TEXT_LIMIT)
+                if index > 1:
+                    payload.pop("reply_parameters", None)
+                try:
+                    result = self.api("sendMessage", payload).get("result") or {}
+                    message_ids.append(str(result.get("message_id") or "0"))
+                except TelegramError as exc:
+                    last_error = str(exc)
+                    break
+            if len(message_ids) == total:
+                return {"ok": True, "message_id": message_ids[0] if message_ids else "0", "message_ids": message_ids, "format": "plain-split"}
+            return {"ok": False, "error": sanitize_text(last_error, 300)}
         last_error = ""
         for fmt, text in self._html_variants(html_text):
             payload = dict(base_payload)

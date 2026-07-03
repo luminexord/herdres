@@ -10,6 +10,8 @@ from .safe import compact_ws, html_escape, sanitize_text
 
 ACTIVE_STATUSES = {"active", "busy", "in_progress", "pending", "running", "waiting", "working"}
 EXPANDABLE_SECTION_CHARS = 700
+FINAL_CHUNK_SOURCE_CHARS = 2400
+TELEGRAM_SAFE_HTML_CHARS = 3600
 
 
 def normalized_status(value: Any) -> str:
@@ -47,10 +49,10 @@ def worker_label(entry: dict[str, Any] | None, worker: dict[str, Any] | None = N
     )
 
 
-def html_to_plain(value: str) -> str:
+def html_to_plain(value: str, *, limit: int = 12000) -> str:
     text = re.sub(r"<br\s*/?>", "\n", value)
     text = re.sub(r"<[^>]+>", "", text)
-    return sanitize_text(text, 4000)
+    return sanitize_text(text, limit)
 
 
 def _inline_markdown_html(text: str) -> str:
@@ -129,6 +131,39 @@ def section_html(label: str, body_html: str, *, expandable: bool = False) -> str
     return f"<b>{title}</b>\n<blockquote{attr}>{body}</blockquote>"
 
 
+def split_text_chunks(value: Any, *, limit: int = FINAL_CHUNK_SOURCE_CHARS) -> list[str]:
+    text = sanitize_text(value, 12000).strip()
+    if not text:
+        return []
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    def flush() -> None:
+        nonlocal current, current_len
+        body = "\n".join(current).strip()
+        if body:
+            chunks.append(body)
+        current = []
+        current_len = 0
+
+    for line in text.splitlines():
+        if len(line) > limit:
+            flush()
+            start = 0
+            while start < len(line):
+                chunks.append(line[start : start + limit].strip())
+                start += limit
+            continue
+        extra = len(line) + (1 if current else 0)
+        if current and current_len + extra > limit:
+            flush()
+        current.append(line)
+        current_len += extra
+    flush()
+    return chunks
+
+
 def render_working_update(item: dict[str, Any], entry: dict[str, Any]) -> str:
     label = html_escape(worker_label(entry), 80)
     body = compact_ws(item.get("assistant_stream_text") or item.get("user_text") or "Work is in progress.", 700)
@@ -158,6 +193,52 @@ def render_final_turn(item: dict[str, Any], entry: dict[str, Any]) -> str:
             )
         )
     return "\n\n".join(parts)
+
+
+def render_final_turn_chunks(item: dict[str, Any], entry: dict[str, Any], *, max_chars: int = TELEGRAM_SAFE_HTML_CHARS) -> list[str]:
+    full = render_final_turn(item, entry)
+    if len(full) <= max_chars:
+        return [full]
+
+    label = html_escape(worker_label(entry), 80)
+    header = f"<b>{label}</b>"
+    user_text = sanitize_text(item.get("user_text"), 3500).strip()
+    final_text = sanitize_text(item.get("assistant_final_text") or item.get("assistant_stream_text"), 12000).strip()
+    messages: list[str] = []
+
+    if user_text:
+        user_section = section_html(
+            "You",
+            html_escape(user_text, 3200),
+            expandable=len(user_text) > EXPANDABLE_SECTION_CHARS,
+        )
+        user_message = "\n\n".join([header, user_section])
+        if len(user_message) <= max_chars:
+            messages.append(user_message)
+
+    raw_chunks = split_text_chunks(final_text)
+    total = len(raw_chunks)
+    for index, chunk in enumerate(raw_chunks, start=1):
+        response_label = "Response" if total <= 1 else f"Response {index}/{total}"
+        response_section = section_html(
+            response_label,
+            markdownish_to_html(chunk, limit=FINAL_CHUNK_SOURCE_CHARS + 800),
+            expandable=False,
+        )
+        message = "\n\n".join([header, response_section])
+        if len(message) <= max_chars:
+            messages.append(message)
+            continue
+        for smaller in split_text_chunks(chunk, limit=max(800, FINAL_CHUNK_SOURCE_CHARS // 2)):
+            messages.append(
+                "\n\n".join(
+                    [
+                        header,
+                        section_html(response_label, markdownish_to_html(smaller, limit=FINAL_CHUNK_SOURCE_CHARS), expandable=False),
+                    ]
+                )
+            )
+    return messages or [full[:max_chars]]
 
 
 def render_pending(item: dict[str, Any], entry: dict[str, Any]) -> str:
