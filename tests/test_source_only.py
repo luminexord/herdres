@@ -720,6 +720,119 @@ def test_existing_final_message_is_not_reposted_for_render_version_churn(monkeyp
     assert telegram.edited == []
 
 
+def test_completed_turn_content_churn_is_not_reposted(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    first_turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_final_text": "First final",
+                "complete": True,
+            }
+        ]
+    }
+    second_turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_final_text": "First final with formatting changed",
+                "complete": True,
+            }
+        ]
+    }
+
+    first = sync_once(store, SyncRuntime(FakeTendwire(turns=first_turns), telegram, with_outbox=False))
+    sent_before = list(telegram.sent)
+    second = sync_once(store, SyncRuntime(FakeTendwire(turns=second_turns), telegram, with_outbox=False))
+
+    assert first["feed_sent"] == 1
+    assert second["feed_sent"] == 0
+    assert second["turn_updates"] == 1
+    assert telegram.sent == sent_before
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert entry["last_turn_id"] == "turn-1"
+    assert len([key for key in store["tendwire_source_delivered_turns"] if key.startswith("final:turn-1:")]) == 1
+
+
+def test_delivered_final_turn_repairs_stale_entry_without_repost(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    _worker_key, worker, _created = state.upsert_worker_entry(
+        store,
+        {"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"},
+    )
+    worker["last_turn_id"] = "old-turn"
+    worker["last_clean_message_id"] = "old-message"
+    state.bind_message_to_worker(store, "555", worker, topic_id="77", kind="final", turn_id="turn-1", bot_kind="codex")
+    state.mark_delivered(store, "final:turn-1:oldhash", {"worker_id": "worker-1", "turn_id": "turn-1"})
+    telegram = FakeTelegram()
+    turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_final_text": "Current final text",
+                "complete": True,
+            }
+        ]
+    }
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+
+    assert result["feed_sent"] == 0
+    assert result["turn_updates"] == 1
+    assert not any("Current final text" in sent[1] for sent in telegram.sent)
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert entry["last_turn_id"] == "turn-1"
+    assert entry["last_clean_message_id"] == "555"
+    assert entry["last_clean_message_ids"] == ["555"]
+    assert entry["last_clean_bot_kind"] == "codex"
+
+
+def test_historical_same_worker_final_is_suppressed_without_churning_latest(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    turns = {
+        "turns": [
+            {
+                "id": "turn-new",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_final_text": "New final",
+                "complete": True,
+            },
+            {
+                "id": "turn-old",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_final_text": "Old final",
+                "complete": True,
+            },
+        ]
+    }
+
+    first = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+    second = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+
+    assert first["feed_sent"] == 1
+    assert "New final" in "\n".join(sent[1] for sent in telegram.sent)
+    assert "Old final" not in "\n".join(sent[1] for sent in telegram.sent)
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert entry["last_turn_id"] == "turn-new"
+    assert second["feed_sent"] == 0
+    assert second["turn_updates"] == 0
+    assert entry["last_turn_id"] == "turn-new"
+    assert any(key.startswith("final:turn-old:") for key in store["tendwire_source_delivered_turns"])
+
+
 def test_working_update_edits_existing_message(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
@@ -767,7 +880,7 @@ def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path,
         }
     )
 
-    assert result == {"handled": True, "reply": ""}
+    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
     request = fake.commands[0]
     assert request["target"] == {"worker_id": "worker-1", "worker_fingerprint": "fp-1"}
     encoded = json.dumps(request, sort_keys=True)
@@ -813,7 +926,7 @@ def test_command_reply_to_agent_message_targets_original_worker(tmp_path, monkey
         }
     )
 
-    assert result == {"handled": True, "reply": ""}
+    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
     request = fake.commands[0]
     assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
     assert request["instruction"] == {"text": "reply to claude"}
@@ -854,7 +967,7 @@ def test_command_reply_at_alias_targets_worker_in_space(tmp_path, monkeypatch):
         }
     )
 
-    assert result == {"handled": True, "reply": ""}
+    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
     request = fake.commands[0]
     assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
     assert request["instruction"] == {"text": "hello there"}

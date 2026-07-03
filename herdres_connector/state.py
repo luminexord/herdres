@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import fcntl
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,19 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
     tmp = state_file.with_suffix(state_file.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(tmp, state_file)
+
+
+@contextmanager
+def state_lock(path: Path | None = None):
+    state_file = path or config.state_path()
+    lock_file = state_file.with_suffix(state_file.suffix + ".lock")
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with lock_file.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def source_worker_entries(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
