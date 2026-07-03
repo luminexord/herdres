@@ -518,13 +518,17 @@ def test_final_response_renders_common_markdown_as_telegram_html():
 
     assert "##" not in html
     assert "**" not in html
-    assert "<h3>Alpha</h3>" in html
-    assert "<h3>Fix it</h3>" in html
-    assert "<li>keep <b>bold</b></li>" in html
+    assert "<h3>" not in html
+    assert "<p>" not in html
+    assert "<ul>" not in html
+    assert "<ol>" not in html
+    assert "<small><b>Alpha</b></small>" in html
+    assert "<b>Fix it</b>" in html
+    assert "• keep <b>bold</b>" in html
     assert "escape &lt;tags&gt;" in html
     assert "<code>code</code>" in html
-    assert '<details open><summary><b>Response</b></summary>' in html
-    assert "<summary><b>Response</b></summary><blockquote>" not in html
+    assert '<details open><summary><small><b>Response</b></small></summary><small>' in html
+    assert "<summary><small><b>Response</b></small></summary><blockquote>" not in html
 
 
 def test_long_final_response_uses_full_visible_response_section():
@@ -537,12 +541,16 @@ def test_long_final_response_uses_full_visible_response_section():
         }
     )
 
-    assert '<details open><summary><b>Response</b></summary>' in html
-    assert "<summary><b>Response</b></summary><blockquote>" not in html
+    assert '<details open><summary><small><b>Response</b></small></summary><small>' in html
+    assert "<summary><small><b>Response</b></small></summary><blockquote>" not in html
     assert "<blockquote expandable>" not in html
     assert "##" not in html
     assert "**" not in html
-    assert "<li>keep <b>rich</b> sections</li>" in html
+    assert "<h3>" not in html
+    assert "<p>" not in html
+    assert "<ul>" not in html
+    assert "<ol>" not in html
+    assert "• keep <b>rich</b> sections" in html
 
 
 def test_oversize_rich_response_falls_back_without_raw_markdown_or_truncation(monkeypatch):
@@ -555,7 +563,7 @@ def test_oversize_rich_response_falls_back_without_raw_markdown_or_truncation(mo
             {
                 "id": "turn-huge",
                 "worker_id": "worker-1",
-                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 600 + tail,
+                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 450 + tail,
                 "complete": True,
             }
         ]
