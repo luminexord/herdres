@@ -16,6 +16,7 @@ DEFAULT_HERDRES_ENV_PATH = HOME / ".config/herdres/herdres.env"
 DEFAULT_GENERAL_THREAD_ID = "1"
 SOURCE_SERVICES = ("tendwired.service", "herdres-gateway.service", "herdres.timer")
 LEGACY_TIMER = "herdr-telegram-topics.timer"
+TOPIC_MODES = {"space", "worker"}
 
 
 def load_env_file(path: str | Path | None = None) -> None:
@@ -62,6 +63,20 @@ def require_source_mode(env: Any | None = None) -> None:
     current = mode(env)
     if current != "source":
         raise RuntimeError(f"Herdres tendwired branch supports only HERDRES_TENDWIRE_MODE=source, got {current!r}")
+
+
+def source_topic_mode(env: Any | None = None) -> str:
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_SOURCE_TOPIC_MODE", source.get("HERDRES_TOPIC_GRANULARITY", "space")) or "space").strip().lower()
+    if value in {"pane", "panes", "worker", "workers"}:
+        return "worker"
+    return value if value in TOPIC_MODES else "space"
+
+
+def delete_done_council_topics(env: Any | None = None) -> bool:
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_DELETE_DONE_COUNCIL_TOPICS", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def telegram_token(env: Any | None = None) -> str:

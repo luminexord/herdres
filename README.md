@@ -23,6 +23,21 @@ herdres sync
 
 Only `HERDRES_TENDWIRE_MODE=source` is supported.
 
+By default Herdres creates one Telegram topic per Tendwire space:
+
+```sh
+HERDRES_SOURCE_TOPIC_MODE=space
+```
+
+Use worker/pane topics only when explicitly wanted:
+
+```sh
+HERDRES_SOURCE_TOPIC_MODE=worker
+```
+
+Finished council/gitmoot/gm worker topics are deleted automatically when
+`HERDRES_DELETE_DONE_COUNCIL_TOPICS=1`.
+
 ## Install
 
 ```sh

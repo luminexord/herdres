@@ -60,7 +60,7 @@ def source_space_entries(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def source_entries(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return source_space_entries(data)
+    return source_worker_entries(data) if config.source_topic_mode() == "worker" else source_space_entries(data)
 
 
 def find_entry_key_by_worker(data: dict[str, Any], worker_id: str) -> str | None:
@@ -89,7 +89,7 @@ def find_space_entry_by_id(data: dict[str, Any], space_id: str | None) -> tuple[
 def find_entry_by_thread(data: dict[str, Any], thread_id: str | None) -> tuple[str, dict[str, Any]] | tuple[None, None]:
     if not thread_id:
         return None, None
-    for key, entry in source_space_entries(data).items():
+    for key, entry in source_entries(data).items():
         if str(entry.get("topic_id") or "") == str(thread_id):
             return key, entry
     return None, None
@@ -184,6 +184,7 @@ def upsert_worker_entry(data: dict[str, Any], worker: dict[str, Any], *, topic_i
             "tendwire_fingerprint": fingerprint,
             "agent": worker_agent(worker),
             "worker_name": compact_ws(worker.get("name") or worker_id, 80),
+            "tendwire_raw_status": compact_ws(worker.get("status"), 80),
             "tendwire_status_line": compact_ws(worker.get("summary") or worker.get("status"), 240),
             "tendwire_last_seen_at": str(worker.get("last_seen_at") or ""),
             "topic_name": entry.get("topic_name") or topic_name_for_worker(worker),

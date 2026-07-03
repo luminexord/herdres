@@ -44,6 +44,27 @@ def _worker_is_open(worker: dict[str, Any]) -> bool:
     return normalized_status(worker.get("status")) not in {"closed", "failed"}
 
 
+def _worker_status_is_finished(value: Any) -> bool:
+    status = str(value or "").strip().lower().replace("-", "_")
+    return status in {"closed", "complete", "completed", "done", "failed", "failure"}
+
+
+def _entry_status_is_finished(entry: dict[str, Any]) -> bool:
+    return _worker_status_is_finished(entry.get("tendwire_raw_status") or entry.get("status"))
+
+
+def _entry_is_council_topic(entry: dict[str, Any]) -> bool:
+    material = " ".join(
+        str(entry.get(key) or "").lower()
+        for key in ("topic_name", "worker_name", "agent", "space_topic_name")
+    )
+    return any(marker in material for marker in ("council", "gitmoot", "gm-local", "gm_"))
+
+
+def _should_delete_done_council_topic(entry: dict[str, Any]) -> bool:
+    return config.delete_done_council_topics() and _entry_is_council_topic(entry) and _entry_status_is_finished(entry)
+
+
 def _space_is_open(space: dict[str, Any]) -> bool:
     return normalized_status(space.get("status")) not in {"closed", "failed"}
 
@@ -81,6 +102,8 @@ def _entry_for_turn(store: dict[str, Any], item: dict[str, Any]) -> tuple[str | 
     worker_entry = state.source_worker_entries(store).get(key)
     if worker_entry is None:
         return None, None
+    if config.source_topic_mode() == "worker":
+        return key, worker_entry
     _space_key, space_entry = state.find_space_entry_by_id(
         store,
         compact_ws(item.get("space_id") or worker_entry.get("tendwire_space_id") or worker_entry.get("space_id"), 160),
@@ -151,17 +174,22 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
 
 def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, int]:
     counts = {"created": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
+    topic_mode = config.source_topic_mode()
     spaces = {compact_ws(item.get("id"), 160): item for item in _spaces(snapshot) if compact_ws(item.get("id"), 160)}
     workers_by_space: dict[str, list[dict[str, Any]]] = {}
     for worker in _workers(snapshot):
-        if not _worker_is_open(worker):
-            continue
         space_id = compact_ws(worker.get("space_id"), 160)
-        if space_id:
-            workers_by_space.setdefault(space_id, []).append(worker)
         _key, entry, created = state.upsert_worker_entry(store, worker)
         entry["status"] = normalized_status(worker.get("status"))
         counts["created"] += int(created)
+        if not _worker_is_open(worker):
+            continue
+        if space_id:
+            workers_by_space.setdefault(space_id, []).append(worker)
+        if topic_mode == "worker" and not _should_delete_done_council_topic(entry):
+            topic_needed, topic_created = _ensure_topic(store, worker, entry, runtime, chat_id=chat_id)
+            counts["created"] += int(topic_created or topic_needed)
+            counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["panes"] += 1
 
     for space_id, workers in workers_by_space.items():
@@ -169,6 +197,9 @@ def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: Sync
             spaces[space_id] = {"id": space_id, "name": space_id, "status": "unknown"}
 
     seen_space_keys: set[str] = set()
+    if topic_mode == "worker":
+        return counts
+
     for space_id, space in spaces.items():
         if not _space_is_open(space):
             continue
@@ -194,6 +225,46 @@ def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: Sync
         if key not in seen_space_keys:
             spaces_store.pop(key, None)
     return counts
+
+
+def _cleanup_worker_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, Any]:
+    result = {"deleted": 0, "failed": 0, "changed": False}
+    visible_space_topics = {
+        str(entry.get("topic_id"))
+        for entry in state.source_space_entries(store).values()
+        if entry.get("topic_id")
+    }
+    panes = store.get("panes") if isinstance(store.get("panes"), dict) else {}
+    audit = store.setdefault("telegram_deleted_topics", [])
+    for key, entry in list(state.source_worker_entries(store).items()):
+        topic_id = str(entry.get("topic_id") or "")
+        if not topic_id:
+            continue
+        stale_worker_topic = config.source_topic_mode() == "space" and topic_id not in visible_space_topics
+        done_council_topic = _should_delete_done_council_topic(entry)
+        if not stale_worker_topic and not done_council_topic:
+            continue
+        reason = "done_council_topic" if done_council_topic else "stale_worker_topic"
+        if runtime.dry_run:
+            result["deleted"] += 1
+            result["changed"] = True
+            continue
+        deleted = runtime.telegram.delete_topic(chat_id, topic_id)
+        if not deleted.get("ok"):
+            result["failed"] += 1
+            entry["last_topic_delete_error"] = compact_ws(deleted.get("error"), 240)
+            continue
+        result["deleted"] += 1
+        result["changed"] = True
+        audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": reason})
+        if done_council_topic:
+            panes.pop(key, None)
+        else:
+            entry.pop("topic_id", None)
+            entry["deleted_topic_id"] = topic_id
+            entry["deleted_topic_reason"] = reason
+    store["telegram_deleted_topics"] = audit[-200:]
+    return result
 
 
 def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
@@ -402,13 +473,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "pinned_status_updated": 0,
                 "feed_sent": 0,
                 "sent": 0,
+                "topic_cleanup": {"deleted": 0, "failed": 0, "changed": False},
                 "tendwire_outbox": {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False},
             }
     changed = False
     source_counts = _sync_sources(store, snapshot, runtime, chat_id=chat_id)
     bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
     turn_counts = {"feed_sent": 0, "sent": 0} if bootstrapped else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
-    changed = changed or bool(source_counts["created"] or source_counts["icon_updated"] or turn_counts["sent"] or bootstrapped)
+    topic_cleanup = _cleanup_worker_topics(store, runtime, chat_id=chat_id)
+    changed = changed or bool(source_counts["created"] or source_counts["icon_updated"] or turn_counts["sent"] or bootstrapped or topic_cleanup.get("changed"))
     pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
     changed = changed or pinned_changed
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
@@ -427,5 +500,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "feed_sent": turn_counts["feed_sent"],
         "sent": turn_counts["sent"],
         "bootstrap_seen": bootstrapped,
+        "topic_cleanup": topic_cleanup,
         "tendwire_outbox": outbox_result,
     }

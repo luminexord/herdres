@@ -65,13 +65,18 @@ class FakeTelegram:
         self.sent = []
         self.edited = []
         self.topics = []
+        self.deleted_topics = []
         self.pins = []
 
     def create_topic(self, _chat_id, name):
         self.topics.append(name)
-        return {"ok": True, "topic_id": "77"}
+        return {"ok": True, "topic_id": str(76 + len(self.topics))}
 
     def edit_topic_icon(self, *_args, **_kwargs):
+        return {"ok": True}
+
+    def delete_topic(self, _chat_id, thread_id):
+        self.deleted_topics.append(str(thread_id))
         return {"ok": True}
 
     def send_message(self, chat_id, html, **kwargs):
@@ -188,6 +193,33 @@ def test_sync_creates_one_topic_per_space_not_per_worker(monkeypatch):
     assert all(sent[2]["thread_id"] == "77" for sent in telegram.sent if sent[1].startswith("<b>Project"))
 
 
+def test_worker_topic_mode_creates_one_topic_per_worker(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    telegram = FakeTelegram()
+    workers = [
+        {"id": "worker-1", "name": "codex", "status": "working", "space_id": "space-1", "fingerprint": "fp-1"},
+        {"id": "worker-2", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-2"},
+    ]
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=workers,
+                spaces=[{"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"}],
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert result["panes"] == 2
+    assert telegram.topics == ["codex", "claude"]
+    assert len(state.source_entries(store)) == 2
+
+
 def test_space_topic_reuses_existing_same_name_worker_topic(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
@@ -226,6 +258,54 @@ def test_space_without_open_worker_is_not_telegram_visible(monkeypatch):
     assert result["spaces"] == 0
     assert telegram.topics == []
     assert state.source_entries(store) == {}
+
+
+def test_space_mode_deletes_stale_worker_topics(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    _key, stale, _created = state.upsert_worker_entry(
+        store,
+        {"id": "worker-old", "name": "Old worker", "status": "idle", "space_id": "old-space", "fingerprint": "old-fp"},
+        topic_id="88",
+    )
+    stale["topic_name"] = "Old worker"
+    telegram = FakeTelegram()
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(), telegram, with_outbox=False))
+
+    assert result["topic_cleanup"]["deleted"] == 1
+    assert telegram.deleted_topics == ["88"]
+    old = [entry for entry in state.source_worker_entries(store).values() if entry.get("tendwire_worker_id") == "worker-old"][0]
+    assert not old.get("topic_id")
+
+
+def test_finished_council_worker_topic_is_deleted(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "gm-1", "name": "gm-local-as", "status": "done", "space_id": "space-1", "fingerprint": "fp-1"},
+        topic_id="88",
+    )
+    telegram = FakeTelegram()
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=[{"id": "gm-1", "name": "gm-local-as", "status": "done", "space_id": "space-1", "fingerprint": "fp-1"}],
+                spaces=[{"id": "space-1", "name": "Council", "status": "active", "fingerprint": "space-fp"}],
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert result["topic_cleanup"]["deleted"] == 1
+    assert telegram.topics == []
+    assert telegram.deleted_topics == ["88"]
+    assert state.source_worker_entries(store) == {}
 
 
 def test_final_response_renders_common_markdown_as_telegram_html():

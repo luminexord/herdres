@@ -143,6 +143,13 @@ class TelegramClient:
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
+    def delete_topic(self, chat_id: str, thread_id: str) -> dict[str, Any]:
+        try:
+            self.api("deleteForumTopic", {"chat_id": chat_id, "message_thread_id": str(thread_id)})
+            return {"ok": True}
+        except TelegramError as exc:
+            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
     def pin_message(self, chat_id: str, message_id: str | int) -> dict[str, Any]:
         try:
             self.api("pinChatMessage", {"chat_id": chat_id, "message_id": str(message_id), "disable_notification": "true"})
