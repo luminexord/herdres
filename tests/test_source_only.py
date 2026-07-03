@@ -1,0 +1,212 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import herdres
+import herdres_gateway
+from herdres_connector import state
+from herdres_connector.safe import public_prune
+from herdres_connector.source_sync import SyncRuntime, sync_once
+
+
+class FakeTendwire:
+    def __init__(self, *, turns=None, pending=None):
+        self.commands = []
+        self._turns = turns or {"turns": []}
+        self._pending = pending or {"pending_interactions": []}
+
+    def snapshot(self):
+        return {
+            "ok": True,
+            "workers": [
+                {
+                    "id": "worker-1",
+                    "name": "Alpha",
+                    "status": "working",
+                    "fingerprint": "fp-1",
+                    "meta": {"agent": "codex"},
+                }
+            ],
+        }
+
+    def turns(self):
+        return self._turns
+
+    def pending(self):
+        return self._pending
+
+    def connector_poll(self, **_kwargs):
+        return {"ok": True, "items": []}
+
+    def command(self, request):
+        self.commands.append(request)
+        return {"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}
+
+
+class FakeTelegram:
+    token = "fake"
+    dry_run = False
+
+    def __init__(self):
+        self.sent = []
+        self.edited = []
+        self.topics = []
+        self.pins = []
+
+    def create_topic(self, _chat_id, name):
+        self.topics.append(name)
+        return {"ok": True, "topic_id": "77"}
+
+    def edit_topic_icon(self, *_args, **_kwargs):
+        return {"ok": True}
+
+    def send_message(self, chat_id, html, **kwargs):
+        message_id = str(100 + len(self.sent))
+        self.sent.append((chat_id, html, kwargs, message_id))
+        return {"ok": True, "message_id": message_id}
+
+    def edit_message(self, chat_id, message_id, html):
+        self.edited.append((chat_id, str(message_id), html))
+        return {"ok": True, "message_id": str(message_id)}
+
+    def pin_message(self, chat_id, message_id):
+        self.pins.append((chat_id, str(message_id)))
+        return {"ok": True}
+
+
+def _store():
+    return {"enabled": True, "telegram": {"chat_id": "-100", "general_thread_id": "1"}, "panes": {}, "spaces": {}}
+
+
+def test_sync_delivers_final_turn_once(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "user_text": "Question",
+                "assistant_final_text": "Full final answer",
+                "complete": True,
+            }
+        ]
+    }
+    runtime = SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False)
+
+    first = sync_once(store, runtime)
+    second = sync_once(store, runtime)
+
+    assert first["feed_sent"] == 1
+    assert second["feed_sent"] == 0
+    assert any("Full final answer" in sent[1] for sent in telegram.sent)
+    assert len(store["tendwire_source_delivered_turns"]) == 1
+
+
+def test_working_update_edits_existing_message(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    first_turns = {"turns": [{"id": "turn-1", "worker_id": "worker-1", "assistant_stream_text": "first", "complete": False}]}
+    second_turns = {"turns": [{"id": "turn-1", "worker_id": "worker-1", "assistant_stream_text": "second", "complete": False}]}
+
+    sync_once(store, SyncRuntime(FakeTendwire(turns=first_turns), telegram, with_outbox=False))
+    sync_once(store, SyncRuntime(FakeTendwire(turns=second_turns), telegram, with_outbox=False))
+
+    assert len(telegram.sent) >= 1
+    assert telegram.edited
+    assert "second" in telegram.edited[-1][2]
+
+
+def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    store = _store()
+    key, entry, _created = state.upsert_worker_entry(
+        store,
+        {"id": "worker-1", "name": "Alpha", "status": "idle", "fingerprint": "fp-1"},
+        topic_id="77",
+    )
+    store["panes"][key] = entry
+    state.save_state(store)
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    result = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "12345",
+            "reply_to_message_id": "12344",
+            "text": "/send hello",
+        }
+    )
+
+    assert result == {"handled": True, "reply": ""}
+    request = fake.commands[0]
+    assert request["target"] == {"worker_id": "worker-1", "worker_fingerprint": "fp-1"}
+    encoded = json.dumps(request, sort_keys=True)
+    assert "12345" not in encoded
+    assert "-100" not in encoded
+    assert "topic_id" not in encoded
+
+
+def test_gateway_maps_only_source_topic(monkeypatch):
+    store = _store()
+    key, entry, _created = state.upsert_worker_entry(
+        store,
+        {"id": "worker-1", "name": "Alpha", "status": "idle", "fingerprint": "fp-1"},
+        topic_id="77",
+    )
+    store["panes"][key] = entry
+    payload = herdres_gateway._payload_for_message(
+        {
+            "chat": {"id": "-100", "is_forum": True},
+            "message_thread_id": 77,
+            "message_id": 10,
+            "from": {"id": "1", "is_bot": False},
+            "text": "hello",
+        },
+        store,
+    )
+    assert payload is not None
+    assert payload["topic_id"] == "77"
+    assert herdres_gateway._payload_for_message({"chat": {"id": "-100"}, "message_thread_id": 78}, store) is None
+
+
+def test_runtime_has_no_direct_herdr_pane_api_names():
+    forbidden = [
+        "pane_list",
+        "pane_by_id",
+        "pane_turn",
+        "prefetch_pane_turns",
+        "send_to_pane",
+        "pane send-keys",
+        "pane read",
+    ]
+    runtime_files = [Path("herdres.py"), Path("herdres_gateway.py"), *Path("herdres_connector").glob("*.py")]
+    text = "\n".join(path.read_text(encoding="utf-8") for path in runtime_files)
+    for needle in forbidden:
+        assert needle not in text
+
+
+def test_public_prune_removes_private_fields():
+    payload = {
+        "ok": True,
+        "chat_id": "-100",
+        "topic_id": "77",
+        "message_id": "10",
+        "token": "secret",
+        "target": {"worker_id": "w", "backend_target": "raw"},
+    }
+    clean = public_prune(payload)
+    encoded = json.dumps(clean)
+    assert "-100" not in encoded
+    assert "secret" not in encoded
+    assert "backend_target" not in encoded
