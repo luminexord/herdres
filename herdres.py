@@ -12949,6 +12949,7 @@ def _sync_pane_clean_feed(
             changed = True
             did_edit = False
             lifecycle_message_id = ""
+            source_same_turn_clean_anchor = False
             if str(item.get("kind") or "").lower() == "turn":
                 lifecycle_message_id = turn_visible_anchor_message_id(entry, str(item.get("turn_id") or ""))
                 if not source_read_pane and not lifecycle_message_id and entry.get("last_stream_message_id"):
@@ -12965,6 +12966,15 @@ def _sync_pane_clean_feed(
                         # newly-added Devin pane's messages had since buried). Drop the anchor
                         # so the turn is sent as a fresh message at the bottom of the topic.
                         lifecycle_message_id = ""
+                if (
+                    source_read_pane
+                    and not lifecycle_message_id
+                    and str(item.get("turn_id") or "")
+                    and str(item.get("turn_id") or "") == str(entry.get("last_turn_id") or "")
+                    and str(entry.get("last_clean_message_id") or "")
+                ):
+                    lifecycle_message_id = str(entry.get("last_clean_message_id") or "")
+                    source_same_turn_clean_anchor = True
             if lifecycle_message_id and not entry.get("last_clean_bot_kind"):
                 if lifecycle_message_id == str(entry.get("last_stream_message_id") or "") and entry.get("last_stream_bot_kind"):
                     entry["last_clean_bot_kind"] = str(entry.get("last_stream_bot_kind") or "")
@@ -12972,7 +12982,10 @@ def _sync_pane_clean_feed(
                     entry["last_clean_bot_kind"] = str(entry.get("last_prompt_bot_kind") or "")
             if (
                 lifecycle_message_id
-                and not message_bot_reissue_due(entry, "last_clean_bot_kind", desired_bot_kind)
+                and (
+                    source_same_turn_clean_anchor
+                    or not message_bot_reissue_due(entry, "last_clean_bot_kind", desired_bot_kind)
+                )
             ):
                 result = clean_feed_delivery_call(lambda: edit_feed_item(
                     chat_id,
@@ -12986,16 +12999,20 @@ def _sync_pane_clean_feed(
                     did_edit = True
                     message_id = lifecycle_message_id
                 elif result.get("not_found"):
-                    result = clean_feed_delivery_call(lambda: send_feed_item(
-                        chat_id,
-                        item,
-                        telegram=telegram,
-                        thread_id=entry["topic_id"],
-                        notify=bool(item.get("notify")),
-                        reply_markup=reply_markup,
-                        reply_to_message_id=pane_root_reply_target(entry),
-                        api_token=pane_api_token,
-                    ))
+                    if source_same_turn_clean_anchor:
+                        entry["last_clean_message_missing_at"] = utc_now()
+                        result = {"ok": False, "kind": "not_found", "skipped_stale_repost": True}
+                    else:
+                        result = clean_feed_delivery_call(lambda: send_feed_item(
+                            chat_id,
+                            item,
+                            telegram=telegram,
+                            thread_id=entry["topic_id"],
+                            notify=bool(item.get("notify")),
+                            reply_markup=reply_markup,
+                            reply_to_message_id=pane_root_reply_target(entry),
+                            api_token=pane_api_token,
+                        ))
                 else:
                     result = {**result, "edit_failed": True}
             elif same_semantic and render_changed and message_id:

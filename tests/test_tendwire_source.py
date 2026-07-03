@@ -1203,6 +1203,80 @@ class TendwireModeTests(unittest.TestCase):
         pane_feed_output.assert_not_called()
         send_to_pane.assert_not_called()
 
+    def test_source_read_same_public_turn_edits_existing_clean_message_without_ledger(self) -> None:
+        state, key = _source_state()
+        pane = _source_read_panes(_snapshot())[0]
+        entry = state["panes"][key]
+        entry.update(
+            {
+                "last_turn_id": "turn-public-1",
+                "last_clean_message_id": "501",
+                "last_clean_bot_kind": "codex",
+                "last_clean_text": "User:\nold\n\nResponse\nold response",
+                "last_clean_semantic_hash": "old-semantic",
+                "last_clean_render_hash": "old-render",
+                "last_clean_hash": "old-render",
+                "last_clean_item": {
+                    "kind": "turn",
+                    "turn_id": "turn-public-1",
+                    "user_text": "old",
+                    "assistant_final_text": "old response",
+                },
+            }
+        )
+        state.pop("tendwire_source_delivered_turns", None)
+        turns_payload = {
+            "schema_version": 1,
+            "turns": [
+                {
+                    "id": "turn-public-1",
+                    "worker_id": "worker-1",
+                    "worker_fingerprint": "fp-1",
+                    "user_text": "old",
+                    "assistant_final_text": "new response for the same public turn",
+                    "assistant_stream_text": "",
+                    "complete": True,
+                    "has_open_turn": False,
+                }
+            ],
+        }
+        counters = {"sends": 0, "feed_sends": 0}
+        edit_feed_item = Mock(return_value={"ok": True, "message_id": "501"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "new-message"})
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "TURN_FEED_ENABLED", True), \
+                patch.object(herdres, "tendwire_turns", return_value=turns_payload), \
+                patch.object(herdres, "send_pending_prompt_message", return_value={"changed": False}), \
+                patch.object(herdres, "edit_feed_item", edit_feed_item), \
+                patch.object(herdres, "send_feed_item", send_feed_item), \
+                patch.object(herdres, "fold_superseded_turns", return_value=False), \
+                patch.object(herdres, "flush_pending_plan_doc", return_value=False), \
+                patch.object(herdres, "flush_pending_speech_reply", return_value=False):
+            result = herdres._sync_pane_clean_feed(
+                state,
+                "-100",
+                {},
+                pane,
+                entry,
+                counters,
+                pane_api_token=None,
+                turn_only=False,
+                new_entry=False,
+                max_sends=10,
+                max_feed_sends=10,
+                stable_obj_hash="status-hash",
+                changed=False,
+            )
+
+        self.assertTrue(result["feed_delivered"])
+        edit_feed_item.assert_called_once()
+        self.assertEqual(edit_feed_item.call_args.args[1], "501")
+        send_feed_item.assert_not_called()
+        self.assertEqual(entry["last_clean_message_id"], "501")
+        self.assertEqual(entry["last_turn_id"], "turn-public-1")
+        self.assertEqual(len(state.get("tendwire_source_delivered_turns") or {}), 1)
+
     def test_sync_once_source_delivers_completed_tendwire_turn_without_direct_herdr(self) -> None:
         state = {
             "enabled": True,
