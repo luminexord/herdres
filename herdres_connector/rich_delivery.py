@@ -28,7 +28,10 @@ PROMPT_PREVIEW_CHARS = 80
 USER_PROMPT_LABEL = "You"
 RESPONSE_LABEL = "Response"
 WORKING_LABEL = "Working"
-RICH_RENDER_VERSION = 25
+YOU_ICON = "💬"
+WORKING_ICON = "⚙️"
+RESPONSE_ICON = "✅"
+RICH_RENDER_VERSION = 26
 RICH_BAD_REQUEST_LIMIT = 3
 
 FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
@@ -64,17 +67,6 @@ def _rich_paragraph(value: Any) -> str:
     return f"<p>{clean}</p>" if clean else ""
 
 
-def _has_block_html(value: str) -> bool:
-    return bool(re.search(r"<\s*(?:h[1-6]|p|ul|ol|pre|blockquote|details|table)\b", str(value or ""), re.IGNORECASE))
-
-
-def _small_body_html(value: str) -> str:
-    body = str(value or "").strip()
-    if not body:
-        return ""
-    return body if _has_block_html(body) else f"<small>{body}</small>"
-
-
 def _prompt_preview(value: Any) -> str:
     for line in str(value or "").splitlines():
         clean = line.strip()
@@ -96,12 +88,18 @@ def _rich_details_quote_html(
     summary: str,
     body_html: str,
     *,
+    icon: str = "",
     summary_max_chars: int = 80,
     open_by_default: bool = True,
-    quote: bool = True,
+    quote: bool = False,
     preview: str = "",
-    body_small: bool = True,
+    de_emphasize: bool = False,
 ) -> str:
+    # Telegram rich messages do not support <small> (it is silently dropped) and
+    # every block element carries a fixed native margin. So secondary sections
+    # (prompt, worklog) are de-emphasized with <footer> instead of a <blockquote>
+    # (which would stack a second margin and add a heavy left bar). A colored
+    # emoji icon marks the section in the summary.
     body = str(body_html or "").strip()
     if not body:
         return ""
@@ -109,10 +107,15 @@ def _rich_details_quote_html(
     open_attr = " open" if open_by_default else ""
     preview_text = str(preview or "").strip()
     preview_html = f" {_html_text(preview_text, PROMPT_PREVIEW_CHARS + 6)}" if preview_text else ""
-    summary_html = f"<small><b>{label}</b>{preview_html}</small>"
-    body_content = _small_body_html(body) if body_small else body
-    inner = f"<blockquote>{body_content}</blockquote>" if quote else body_content
-    return f"<details{open_attr}><summary>{summary_html}</summary>{inner}</details>"
+    icon_html = f"{icon} " if icon else ""
+    summary_html = f"{icon_html}<b>{label}</b>{preview_html}"
+    if de_emphasize:
+        body_content = f"<footer>{body}</footer>"
+    elif quote:
+        body_content = f"<blockquote>{body}</blockquote>"
+    else:
+        body_content = body
+    return f"<details{open_attr}><summary>{summary_html}</summary>{body_content}</details>"
 
 
 def render_user_prompt_quote_html(user_text: str, collapse_chars: int = 0) -> str:
@@ -124,9 +127,11 @@ def render_user_prompt_quote_html(user_text: str, collapse_chars: int = 0) -> st
     return _rich_details_quote_html(
         USER_PROMPT_LABEL,
         body,
+        icon=YOU_ICON,
         summary_max_chars=20,
         open_by_default=not collapse,
         preview=_prompt_preview(user_text) if collapse else "",
+        de_emphasize=True,
     )
 
 
@@ -223,7 +228,11 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             continue
         if _is_heading(line, first_block=not seen_heading, previous_blank=previous_blank):
             title = _heading_title(line)
-            parts.append(f"<h3>{_html_text(title, 100)}</h3>")
+            # First section heading is prominent (<h3>); later ones drop to <h4>
+            # so a multi-section response stays compact -- every <h3> adds a big
+            # native margin in Telegram's rich renderer.
+            tag = "h3" if not seen_heading else "h4"
+            parts.append(f"<{tag}>{_html_text(title, 100)}</{tag}>")
             seen_heading = True
             previous_blank = False
             idx += 1
@@ -289,57 +298,54 @@ def render_final_reply_html(value: str) -> str:
     return _render_final_reply_blocks(clean.splitlines())
 
 
-def render_assistant_response_quote_html(
-    assistant_final: str,
-    *,
-    open_by_default: bool = True,
-    preview: str = "",
-) -> str:
+def render_assistant_response_html(assistant_final: str) -> str:
+    # The Response is the answer the reader came for, so it renders as the open
+    # top-level body (not buried in a <details> card): a colored bold marker, one
+    # breath, then the rich blocks. The de-emphasized prompt sits below it.
     clean = str(assistant_final or "").strip()
     if not clean:
         return ""
     body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
-    return _rich_details_quote_html(
-        RESPONSE_LABEL,
-        body_html,
-        quote=False,
-        open_by_default=open_by_default,
-        preview=preview,
-    )
+    marker = f"<b>{RESPONSE_ICON} {RESPONSE_LABEL}</b>"
+    return f"{marker}<br>{body_html}"
 
 
 def render_source_v2_working_update_html(worklog_text: str, *, label: str = WORKING_LABEL) -> str:
     clean = str(worklog_text or "").strip()
     if not clean:
         return ""
-    label_html = _html_text(label or WORKING_LABEL, 100)
-    preview = _prompt_preview(clean)
-    preview_html = f" {_html_text(preview, PROMPT_PREVIEW_CHARS + 6)}" if preview else ""
     body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
-    return f"<details><summary><small><b>{label_html}</b>{preview_html}</small></summary><blockquote>{body_html}</blockquote></details>"
+    return _rich_details_quote_html(
+        label or WORKING_LABEL,
+        body_html,
+        icon=WORKING_ICON,
+        open_by_default=False,
+        preview=_prompt_preview(clean),
+        de_emphasize=True,
+    )
 
 
 def render_turn_item_html(item: dict[str, Any]) -> str:
-    title = str(item.get("title") or "").strip()
+    # Layout (source mode): the Response is the open, prominent top-level body;
+    # the user prompt (and any in-progress worklog) are de-emphasized collapsible
+    # sections below it. No redundant top worker title -- the Telegram topic
+    # already names the worker, and an extra <h3> only added a margin-bearing
+    # block above the first section.
     user_text = str(item.get("user_text") or "").strip()
     worklog_text = str(item.get("worklog_text") or item.get("assistant_stream_text") or "").strip()
     worklog_label = str(item.get("worklog_label") or WORKING_LABEL).strip() or WORKING_LABEL
     assistant_final = str(item.get("assistant_final_text") or "").strip()
-    response_open = not bool(item.get("collapse_response"))
-    response_preview = "" if response_open else _prompt_preview(assistant_final)
     parts: list[str] = []
-    if title:
-        parts.append(f"<h3>{_html_text(title, 100)}</h3>")
+    response_html = render_assistant_response_html(assistant_final)
+    if response_html:
+        parts.append(response_html)
     if user_text:
         parts.append(render_user_prompt_quote_html(user_text, int(item.get("prompt_collapse_chars") or 0)))
     if worklog_text and not assistant_final:
         parts.append(render_source_v2_working_update_html(worklog_text, label=worklog_label))
     elif worklog_text:
         body_html = render_final_reply_html(worklog_text) or _rich_paragraph(worklog_text)
-        parts.append(_rich_details_quote_html(worklog_label, body_html, open_by_default=False, preview=_prompt_preview(worklog_text)))
-    response_html = render_assistant_response_quote_html(assistant_final, open_by_default=response_open, preview=response_preview)
-    if response_html:
-        parts.append(response_html)
+        parts.append(_rich_details_quote_html(worklog_label, body_html, icon=WORKING_ICON, open_by_default=False, preview=_prompt_preview(worklog_text), de_emphasize=True))
     return _join_blocks(parts).strip()
 
 
