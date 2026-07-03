@@ -1018,11 +1018,11 @@ def command_submit(
         return {"ok": False, "status": "timeout", "error": "tendwire command timed out"}
     except Exception as exc:
         return {"ok": False, "status": "subprocess_failed", "error": sanitize(str(exc), 300)}
-    if proc.returncode != 0:
-        detail = sanitize(proc.stderr or proc.stdout or "tendwire command failed", 500)
-        return {"ok": False, "status": "nonzero_exit", "error": detail}
     data, error = json_object_from_stdout(proc.stdout, "tendwire command")
     if error:
+        if proc.returncode != 0:
+            detail = sanitize(proc.stderr or proc.stdout or "tendwire command failed", 500)
+            return {"ok": False, "status": "nonzero_exit", "error": detail}
         return {"ok": False, "status": _json_error_status(error), "error": error}
     return data
 

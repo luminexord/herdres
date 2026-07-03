@@ -93,7 +93,7 @@ class TendwireCommandSubprocessTests(unittest.TestCase):
             ("malformed", _completed("{"), "malformed_json"),
             ("non_object", _completed('["ok"]'), "non_object_json"),
             ("extra_json", _completed('{"ok":true}\n{"ok":true}'), "non_json_stdout"),
-            ("nonzero", _completed({"status": "accepted"}, returncode=2, stderr="boom"), "nonzero_exit"),
+            ("nonzero", _completed("", returncode=2, stderr="boom"), "nonzero_exit"),
         )
         for name, proc, status in cases:
             with self.subTest(name=name), patch.object(herdres, "run_cmd", return_value=proc):
@@ -101,6 +101,32 @@ class TendwireCommandSubprocessTests(unittest.TestCase):
 
             self.assertFalse(response["ok"])
             self.assertEqual(response["status"], status)
+
+    def test_tendwire_command_preserves_structured_nonzero_response(self) -> None:
+        proc = _completed(
+            {
+                "ok": False,
+                "status": "stale_target",
+                "request_id": "request-1",
+                "result": {
+                    "candidates": [
+                        {
+                            "worker_id": "worker-1",
+                            "worker_fingerprint": "new-fp",
+                        }
+                    ]
+                },
+            },
+            returncode=2,
+            stderr="stale target",
+        )
+        with patch.object(herdres, "run_cmd", return_value=proc):
+            response = herdres.tendwire_command({"schema_version": 1})
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["status"], "stale_target")
+        self.assertEqual(response["request_id"], "request-1")
+        self.assertEqual(response["result"]["candidates"][0]["worker_fingerprint"], "new-fp")
 
     def test_tendwire_command_timeout_and_subprocess_failure(self) -> None:
         with patch.object(herdres, "run_cmd", side_effect=subprocess.TimeoutExpired(["tendwire"], 5)):
