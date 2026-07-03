@@ -15,9 +15,9 @@ from herdres_connector.telegram_delivery import TelegramClient
 class FakeTendwire:
     def __init__(self, *, turns=None, pending=None, workers=None, spaces=None):
         self.commands = []
-        self._turns = turns or {"turns": []}
-        self._pending = pending or {"pending_interactions": []}
-        self._workers = workers or [
+        self._turns = turns if turns is not None else {"turns": []}
+        self._pending = pending if pending is not None else {"pending_interactions": []}
+        self._workers = workers if workers is not None else [
             {
                 "id": "worker-1",
                 "name": "Alpha",
@@ -27,7 +27,7 @@ class FakeTendwire:
                 "meta": {"agent": "codex"},
             }
         ]
-        self._spaces = spaces or [
+        self._spaces = spaces if spaces is not None else [
             {
                 "id": "space-1",
                 "name": "Project",
@@ -202,8 +202,30 @@ def test_space_topic_reuses_existing_same_name_worker_topic(monkeypatch):
     sync_once(store, SyncRuntime(FakeTendwire(), telegram, with_outbox=False))
 
     assert telegram.topics == []
-    entry = next(iter(state.source_worker_entries(store).values()))
+    entry = next(iter(state.source_entries(store).values()))
     assert entry["topic_id"] == "123"
+
+
+def test_space_without_open_worker_is_not_telegram_visible(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=[],
+                spaces=[{"id": "empty-space", "name": "Empty", "status": "active", "fingerprint": "space-fp"}],
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert result["spaces"] == 0
+    assert telegram.topics == []
+    assert state.source_entries(store) == {}
 
 
 def test_final_response_renders_common_markdown_as_telegram_html():

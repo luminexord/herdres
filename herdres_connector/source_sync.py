@@ -168,12 +168,16 @@ def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: Sync
         if space_id not in spaces:
             spaces[space_id] = {"id": space_id, "name": space_id, "status": "unknown"}
 
+    seen_space_keys: set[str] = set()
     for space_id, space in spaces.items():
         if not _space_is_open(space):
             continue
-        _key, entry, created = state.upsert_space_entry(store, space)
         selectable = [worker for worker in workers_by_space.get(space_id, []) if _worker_is_open(worker)]
+        if not selectable:
+            continue
+        _key, entry, created = state.upsert_space_entry(store, space)
         selected = _select_space_worker(selectable)
+        seen_space_keys.add(_key)
         entry["status"] = normalized_status(selected.get("status") or space.get("status"))
         entry["worker_count"] = len(selectable)
         if selected:
@@ -185,6 +189,10 @@ def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: Sync
         counts["created"] += int(created or topic_created or topic_needed)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["spaces"] += 1
+    spaces_store = store.get("spaces") if isinstance(store.get("spaces"), dict) else {}
+    for key in list(state.source_space_entries(store)):
+        if key not in seen_space_keys:
+            spaces_store.pop(key, None)
     return counts
 
 
