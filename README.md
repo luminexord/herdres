@@ -38,6 +38,20 @@ HERDRES_SOURCE_TOPIC_MODE=worker
 Finished council/gitmoot/gm worker topics are deleted automatically when
 `HERDRES_DELETE_DONE_COUNCIL_TOPICS=1`.
 
+Rich Telegram messages are enabled by default. Final responses render as open
+rich content; working updates render as compact editable updates.
+
+Optional per-agent bot voices are configured with generic private tokens:
+
+```sh
+HERDR_TELEGRAM_TOPICS_MANAGED_BOTS=1
+HERDRES_MANAGED_BOT_CODEX_TOKEN=...
+HERDRES_MANAGED_BOT_CLAUDE_TOKEN=...
+```
+
+Unconfigured agent kinds fall back to the manager bot. Do not commit real bot
+tokens or local bot names.
+
 ## Install
 
 ```sh

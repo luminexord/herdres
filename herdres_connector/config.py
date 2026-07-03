@@ -17,6 +17,7 @@ DEFAULT_GENERAL_THREAD_ID = "1"
 SOURCE_SERVICES = ("tendwired.service", "herdres-gateway.service", "herdres.timer")
 LEGACY_TIMER = "herdr-telegram-topics.timer"
 TOPIC_MODES = {"space", "worker"}
+MANAGED_BOT_KINDS = {"codex", "claude", "glm", "kimi", "omp", "devin"}
 
 
 def load_env_file(path: str | Path | None = None) -> None:
@@ -76,6 +77,33 @@ def source_topic_mode(env: Any | None = None) -> str:
 def delete_done_council_topics(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDRES_DELETE_DONE_COUNCIL_TOPICS", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def managed_bots_enabled(env: Any | None = None) -> bool:
+    source = os.environ if env is None else env
+    value = str(source.get("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "0") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def managed_bot_token(kind: str, env: Any | None = None) -> str:
+    source = os.environ if env is None else env
+    normalized = "".join(char for char in str(kind or "").upper() if char.isalnum())
+    if not normalized:
+        return ""
+    for key in (
+        f"HERDRES_MANAGED_BOT_{normalized}_TOKEN",
+        f"HERDR_TELEGRAM_TOPICS_MANAGED_BOT_{normalized}_TOKEN",
+    ):
+        value = str(source.get(key, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def rich_messages_enabled(env: Any | None = None) -> bool:
+    source = os.environ if env is None else env
+    value = str(source.get("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1") or "").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
 

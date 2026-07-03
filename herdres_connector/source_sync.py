@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import config, state
-from .rendering import normalized_status, render_final_turn, render_final_turn_chunks, render_pending, render_status_overview, render_working_update, status_emoji
+from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token_for_entry
+from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
+from .rich_delivery import edit_feed_item, send_feed_item, split_legacy_message_ids, turn_item_from_source
 from .safe import compact_ws, short_hash
 from .telegram_delivery import TelegramClient, drain_outbox, topic_icon_id
 from .tendwire_client import TendwireClient
 
-RENDER_VERSION = "telegram-html-md-v4"
+RENDER_VERSION = "telegram-rich-v21"
 
 
 @dataclass
@@ -96,7 +98,38 @@ def _delivery_entry(space_entry: dict[str, Any], worker_entry: dict[str, Any] | 
     entry["space_topic_name"] = space_name
     entry["tendwire_worker_id"] = worker_entry.get("tendwire_worker_id") or space_entry.get("active_worker_id")
     entry["tendwire_fingerprint"] = worker_entry.get("tendwire_fingerprint") or space_entry.get("active_worker_fingerprint")
+    entry["agent"] = worker_entry.get("agent") or entry.get("agent")
+    entry["managed_bot_kind"] = worker_entry.get("managed_bot_kind") or managed_bot_kind_for_entry(worker_entry)
     return entry
+
+
+def _telegram_state(store: dict[str, Any]) -> dict[str, Any]:
+    telegram = store.get("telegram")
+    if not isinstance(telegram, dict):
+        telegram = {}
+        store["telegram"] = telegram
+    return telegram
+
+
+def _delivery_bot(store: dict[str, Any], entry: dict[str, Any]) -> tuple[str | None, str]:
+    telegram = _telegram_state(store)
+    token = managed_bot_token_for_entry(telegram, entry)
+    return token, desired_message_bot_kind(telegram, entry)
+
+
+def _record_delivery_error(entry: dict[str, Any], result: dict[str, Any], bot_kind: str) -> None:
+    error = compact_ws(result.get("error") or result.get("kind") or "Telegram delivery failed", 240)
+    entry["last_delivery_error"] = error
+    if bot_kind != MANAGER_BOT_KIND:
+        entry["last_managed_bot_kind"] = bot_kind
+        entry["last_managed_bot_error"] = error
+
+
+def _record_delivery_success(entry: dict[str, Any], bot_kind: str) -> None:
+    entry.pop("last_delivery_error", None)
+    if bot_kind != MANAGER_BOT_KIND:
+        entry["last_managed_bot_kind"] = bot_kind
+        entry.pop("last_managed_bot_error", None)
 
 
 def _entry_for_turn(store: dict[str, Any], item: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
@@ -340,12 +373,28 @@ def _backfill_message_bindings(store: dict[str, Any]) -> int:
             continue
         stream_id = str(entry.get("last_stream_message_id") or "")
         if stream_id:
-            state.bind_message_to_worker(store, stream_id, entry, topic_id=topic_id, kind="working", turn_id=str(entry.get("last_stream_turn_id") or ""))
+            state.bind_message_to_worker(
+                store,
+                stream_id,
+                entry,
+                topic_id=topic_id,
+                kind="working",
+                turn_id=str(entry.get("last_stream_turn_id") or ""),
+                bot_kind=str(entry.get("last_stream_bot_kind") or ""),
+            )
         final_ids = entry.get("last_clean_message_ids")
         if not isinstance(final_ids, list) or not final_ids:
             final_ids = [entry.get("last_clean_message_id")]
         for message_id in final_ids:
-            state.bind_message_to_worker(store, message_id, entry, topic_id=topic_id, kind="final", turn_id=str(entry.get("last_turn_id") or ""))
+            state.bind_message_to_worker(
+                store,
+                message_id,
+                entry,
+                topic_id=topic_id,
+                kind="final",
+                turn_id=str(entry.get("last_turn_id") or ""),
+                bot_kind=str(entry.get("last_clean_bot_kind") or ""),
+            )
     return len(set(state.message_bindings(store)) - before)
 
 
@@ -355,7 +404,7 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
         return False
     turn_id = _turn_id(item)
     content_hash = _turn_content_hash(item, "working")
-    html = render_working_update(item, entry)
+    feed_item = turn_item_from_source(item, entry)
     if entry.get("last_stream_turn_id") == turn_id and entry.get("last_stream_hash") == content_hash:
         return False
     if runtime.dry_run:
@@ -363,17 +412,39 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
         entry["last_stream_hash"] = content_hash
         entry.setdefault("last_stream_message_id", "0")
         return True
-    if entry.get("last_stream_message_id") and entry.get("last_stream_turn_id") == turn_id:
-        sent = runtime.telegram.edit_message(chat_id, str(entry["last_stream_message_id"]), html)
+    telegram = _telegram_state(store)
+    api_token, bot_kind = _delivery_bot(store, entry)
+    stored_bot_kind = str(entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND)
+    if entry.get("last_stream_message_id") and entry.get("last_stream_turn_id") == turn_id and stored_bot_kind == bot_kind:
+        sent = edit_feed_item(
+            runtime.telegram,
+            chat_id,
+            str(entry["last_stream_message_id"]),
+            feed_item,
+            telegram=telegram,
+            live=True,
+            api_token=api_token,
+        )
     else:
-        sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
+        sent = send_feed_item(
+            runtime.telegram,
+            chat_id,
+            feed_item,
+            telegram=telegram,
+            thread_id=thread_id,
+            notify=False,
+            live=True,
+            api_token=api_token,
+        )
     if sent.get("ok"):
         entry["last_stream_turn_id"] = turn_id
         entry["last_stream_hash"] = content_hash
         entry["last_stream_message_id"] = str(sent.get("message_id") or entry.get("last_stream_message_id") or "")
-        state.bind_message_to_worker(store, entry.get("last_stream_message_id"), entry, topic_id=thread_id, kind="working", turn_id=turn_id)
+        entry["last_stream_bot_kind"] = bot_kind
+        _record_delivery_success(entry, bot_kind)
+        state.bind_message_to_worker(store, entry.get("last_stream_message_id"), entry, topic_id=thread_id, kind="working", turn_id=turn_id, bot_kind=bot_kind)
         return True
-    entry["last_delivery_error"] = compact_ws(sent.get("error"), 240)
+    _record_delivery_error(entry, sent, bot_kind)
     return False
 
 
@@ -385,50 +456,40 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
     content_hash = _turn_content_hash(item, "final")
     identity = f"final:{turn_id}:{content_hash}"
     if identity in state.delivered_turns(store):
-        if (
-            entry.get("last_clean_message_id")
-            and entry.get("last_render_version") != RENDER_VERSION
-            and not runtime.dry_run
-        ):
-            chunks = render_final_turn_chunks(item, entry)
-            edited = runtime.telegram.edit_message(chat_id, str(entry["last_clean_message_id"]), chunks[0])
-            if edited.get("ok"):
-                message_ids = [str(entry["last_clean_message_id"])]
-                state.bind_message_to_worker(store, entry["last_clean_message_id"], entry, topic_id=thread_id, kind="final", turn_id=turn_id)
-                for html in chunks[1:]:
-                    sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
-                    if not sent.get("ok"):
-                        entry["last_delivery_error"] = compact_ws(sent.get("error"), 240)
-                        return False
-                    message_id = str(sent.get("message_id") or "")
-                    message_ids.append(message_id)
-                    state.bind_message_to_worker(store, message_id, entry, topic_id=thread_id, kind="final", turn_id=turn_id)
-                entry["last_clean_message_ids"] = [item for item in message_ids if item]
-                entry["last_render_version"] = RENDER_VERSION
-                return True
         return False
-    html_chunks = render_final_turn_chunks(item, entry)
+    feed_item = turn_item_from_source(item, entry)
     if runtime.dry_run:
         state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
         entry["last_turn_id"] = turn_id
         entry["last_clean_hash"] = content_hash
         entry["last_render_version"] = RENDER_VERSION
         entry.setdefault("last_clean_message_id", "0")
-        entry["last_clean_message_ids"] = ["0"] * len(html_chunks)
+        entry["last_clean_message_ids"] = ["0"]
         return True
+    telegram = _telegram_state(store)
+    api_token, bot_kind = _delivery_bot(store, entry)
+    sent = send_feed_item(
+        runtime.telegram,
+        chat_id,
+        feed_item,
+        telegram=telegram,
+        thread_id=thread_id,
+        notify=False,
+        api_token=api_token,
+    )
+    if not sent.get("ok"):
+        _record_delivery_error(entry, sent, bot_kind)
+        return False
     message_ids: list[str] = []
-    for html in html_chunks:
-        sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
-        if not sent.get("ok"):
-            entry["last_delivery_error"] = compact_ws(sent.get("error"), 240)
-            return False
-        message_id = str(sent.get("message_id") or "")
+    for message_id in split_legacy_message_ids(sent):
         message_ids.append(message_id)
-        state.bind_message_to_worker(store, message_id, entry, topic_id=thread_id, kind="final", turn_id=turn_id)
+        state.bind_message_to_worker(store, message_id, entry, topic_id=thread_id, kind="final", turn_id=turn_id, bot_kind=bot_kind)
     state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
     entry["last_turn_id"] = turn_id
     entry["last_clean_hash"] = content_hash
     entry["last_render_version"] = RENDER_VERSION
+    entry["last_clean_bot_kind"] = bot_kind
+    _record_delivery_success(entry, bot_kind)
     entry["last_clean_message_id"] = message_ids[0] if message_ids else ""
     entry["last_clean_message_ids"] = [item for item in message_ids if item]
     return True
@@ -449,10 +510,15 @@ def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncR
     html = render_pending(item, entry)
     if runtime.dry_run:
         return state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id})
-    sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=True)
+    api_token, bot_kind = _delivery_bot(store, entry)
+    client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
+    sent = client.send_message(chat_id, html, thread_id=thread_id, notify=True)
     if sent.get("ok"):
-        state.bind_message_to_worker(store, sent.get("message_id"), entry, topic_id=thread_id, kind="pending", turn_id=pending_id)
+        entry["last_prompt_bot_kind"] = bot_kind
+        _record_delivery_success(entry, bot_kind)
+        state.bind_message_to_worker(store, sent.get("message_id"), entry, topic_id=thread_id, kind="pending", turn_id=pending_id, bot_kind=bot_kind)
         return state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id})
+    _record_delivery_error(entry, sent, bot_kind)
     return False
 
 

@@ -209,6 +209,7 @@ def upsert_worker_entry(data: dict[str, Any], worker: dict[str, Any], *, topic_i
     worker_id = compact_ws(worker.get("id"), 160)
     fingerprint = compact_ws(worker.get("fingerprint"), 160)
     space_id = compact_ws(worker.get("space_id"), 160)
+    agent = worker_agent(worker)
     key = find_entry_key_by_worker(data, worker_id)
     created = False
     if key is None:
@@ -225,7 +226,8 @@ def upsert_worker_entry(data: dict[str, Any], worker: dict[str, Any], *, topic_i
             "tendwire_space_id": space_id,
             "space_id": space_id,
             "tendwire_fingerprint": fingerprint,
-            "agent": worker_agent(worker),
+            "agent": agent,
+            "managed_bot_kind": agent if agent in config.MANAGED_BOT_KINDS else "",
             "worker_name": compact_ws(worker.get("name") or worker_id, 80),
             "tendwire_raw_status": compact_ws(worker.get("status"), 80),
             "tendwire_status_line": compact_ws(worker.get("summary") or worker.get("status"), 240),
@@ -274,6 +276,7 @@ def bind_message_to_worker(
     topic_id: str | int | None = None,
     kind: str = "",
     turn_id: str = "",
+    bot_kind: str = "",
 ) -> None:
     message = str(message_id or "").strip()
     if not message or message == "0":
@@ -286,6 +289,7 @@ def bind_message_to_worker(
         "space_id": str(entry.get("tendwire_space_id") or entry.get("space_id") or ""),
         "kind": str(kind or ""),
         "turn_id": str(turn_id or ""),
+        "bot_kind": str(bot_kind or ""),
     }
     if len(bindings) > 2000:
         for key in list(bindings)[: len(bindings) - 2000]:
