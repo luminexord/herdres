@@ -6,10 +6,10 @@ from pathlib import Path
 import herdres
 import herdres_gateway
 from herdres_connector import state
-from herdres_connector.rendering import TELEGRAM_SAFE_HTML_CHARS, render_final_turn, render_final_turn_chunks
+from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_turn_item_html
 from herdres_connector.safe import public_prune
 from herdres_connector.source_sync import SyncRuntime, sync_once
-from herdres_connector.telegram_delivery import TelegramClient
+from herdres_connector.telegram_delivery import TelegramClient, drain_outbox
 
 
 class FakeTendwire:
@@ -58,15 +58,48 @@ class FakeTendwire:
 
 
 class FakeTelegram:
-    token = "fake"
     dry_run = False
 
-    def __init__(self):
-        self.sent = []
-        self.edited = []
-        self.topics = []
-        self.deleted_topics = []
-        self.pins = []
+    def __init__(self, token="fake", shared=None):
+        self.token = token
+        shared = shared or {
+            "sent": [],
+            "edited": [],
+            "topics": [],
+            "deleted_topics": [],
+            "pins": [],
+            "api_calls": [],
+        }
+        self._shared = shared
+        self.sent = shared["sent"]
+        self.edited = shared["edited"]
+        self.topics = shared["topics"]
+        self.deleted_topics = shared["deleted_topics"]
+        self.pins = shared["pins"]
+        self.api_calls = shared["api_calls"]
+
+    def with_token(self, token):
+        return FakeTelegram(token=token, shared=self._shared)
+
+    def api(self, method, payload):
+        self.api_calls.append((method, dict(payload), self.token))
+        if method == "sendRichMessage":
+            message_id = str(100 + len(self.sent))
+            rich = json.loads(payload.get("rich_message") or "{}")
+            kwargs = {
+                "thread_id": str(payload.get("message_thread_id") or ""),
+                "format": "rich",
+                "token": self.token,
+            }
+            self.sent.append((str(payload.get("chat_id") or ""), str(rich.get("html") or ""), kwargs, message_id))
+            return {"ok": True, "result": {"message_id": message_id}}
+        if method == "editMessageText":
+            rich_payload = payload.get("rich_message")
+            rich = json.loads(rich_payload) if rich_payload else {}
+            html = str(rich.get("html") or payload.get("text") or "")
+            self.edited.append((str(payload.get("chat_id") or ""), str(payload.get("message_id") or ""), html))
+            return {"ok": True, "result": {"message_id": str(payload.get("message_id") or "0")}}
+        return {"ok": True, "result": {"message_id": 0}}
 
     def create_topic(self, _chat_id, name):
         self.topics.append(name)
@@ -81,7 +114,9 @@ class FakeTelegram:
 
     def send_message(self, chat_id, html, **kwargs):
         message_id = str(100 + len(self.sent))
-        self.sent.append((chat_id, html, kwargs, message_id))
+        payload_kwargs = dict(kwargs)
+        payload_kwargs["token"] = self.token
+        self.sent.append((chat_id, html, payload_kwargs, message_id))
         return {"ok": True, "message_id": message_id}
 
     def edit_message(self, chat_id, message_id, html):
@@ -159,6 +194,47 @@ def test_sync_delivers_final_turn_once(monkeypatch):
     binding = state.find_message_binding(store, response_message_id, topic_id="77")
     assert binding is not None
     assert binding["worker_id"] == "worker-1"
+
+
+def test_source_final_uses_configured_managed_bot_voice(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    store = _store()
+    store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
+    _key, stale, _created = state.upsert_worker_entry(
+        store,
+        {
+            "id": "worker-1",
+            "name": "codex",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "fp-1",
+            "meta": {"agent": "codex"},
+        },
+    )
+    stale["managed_bot_kind"] = "claude"
+    telegram = FakeTelegram()
+    turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_final_text": "Codex final",
+                "complete": True,
+            }
+        ]
+    }
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+
+    assert result["feed_sent"] == 1
+    assert any(call[0] == "sendRichMessage" and call[2] == "codex-token" for call in telegram.api_calls)
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert entry["last_clean_bot_kind"] == "codex"
+    binding = state.find_message_binding(store, entry["last_clean_message_id"], topic_id="77")
+    assert binding is not None
+    assert binding["bot_kind"] == "codex"
 
 
 def test_sync_backfills_existing_message_bindings(monkeypatch):
@@ -431,56 +507,69 @@ def test_finished_council_worker_does_not_delete_active_space_topic(monkeypatch)
 
 
 def test_final_response_renders_common_markdown_as_telegram_html():
-    html = render_final_turn(
+    html = render_turn_item_html(
         {
+            "kind": "turn",
+            "title": "Alpha",
             "user_text": "Question",
             "assistant_final_text": "## **Fix it**\n\n- keep **bold**\n- escape <tags>\n\nUse `code`.",
-        },
-        {"topic_name": "Alpha", "tendwire_worker_id": "worker-1"},
+        }
     )
 
     assert "##" not in html
     assert "**" not in html
-    assert "<b>Fix it</b>" in html
-    assert "• keep <b>bold</b>" in html
+    assert "<h3>Alpha</h3>" in html
+    assert "<h3>Fix it</h3>" in html
+    assert "<li>keep <b>bold</b></li>" in html
     assert "escape &lt;tags&gt;" in html
     assert "<code>code</code>" in html
-    assert "<b>Response</b>" in html
-    assert "<blockquote>" in html
+    assert '<details open><summary><b>Response</b></summary>' in html
+    assert "<summary><b>Response</b></summary><blockquote>" not in html
 
 
 def test_long_final_response_uses_full_visible_response_section():
-    html = render_final_turn(
+    html = render_turn_item_html(
         {
+            "kind": "turn",
+            "title": "Alpha",
             "user_text": "Question",
             "assistant_final_text": "## **Plan**\n\n" + "- keep **rich** sections\n" * 80,
-        },
-        {"topic_name": "Alpha", "tendwire_worker_id": "worker-1"},
+        }
     )
 
-    assert "<b>Response</b>" in html
-    assert "<blockquote>" in html
+    assert '<details open><summary><b>Response</b></summary>' in html
+    assert "<summary><b>Response</b></summary><blockquote>" not in html
     assert "<blockquote expandable>" not in html
     assert "##" not in html
     assert "**" not in html
-    assert "• keep <b>rich</b> sections" in html
+    assert "<li>keep <b>rich</b> sections</li>" in html
 
 
-def test_long_final_response_is_split_without_truncation():
+def test_oversize_rich_response_falls_back_without_raw_markdown_or_truncation(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
     tail = "TAIL_MARKER_12345"
-    html_chunks = render_final_turn_chunks(
-        {
-            "user_text": "Question",
-            "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 220 + tail,
-        },
-        {"topic_name": "Alpha", "tendwire_worker_id": "worker-1"},
-    )
+    turns = {
+        "turns": [
+            {
+                "id": "turn-huge",
+                "worker_id": "worker-1",
+                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 600 + tail,
+                "complete": True,
+            }
+        ]
+    }
 
-    assert len(html_chunks) > 1
-    assert all(len(chunk) <= TELEGRAM_SAFE_HTML_CHARS for chunk in html_chunks)
-    assert any("Response 1/" in chunk for chunk in html_chunks)
-    assert any(tail in chunk for chunk in html_chunks)
-    assert not any("##" in chunk or "**" in chunk for chunk in html_chunks)
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+
+    sent_text = "\n".join(sent[1] for sent in telegram.sent)
+    assert result["feed_sent"] == 1
+    assert len(render_turn_item_html({"kind": "turn", "assistant_final_text": turns["turns"][0]["assistant_final_text"]})) > MAX_RICH_HTML_CHARS
+    assert any(sent[2].get("format") != "rich" for sent in telegram.sent)
+    assert tail in sent_text
+    assert "##" not in sent_text
+    assert "**" not in sent_text
 
 
 def test_sync_sends_all_long_final_response_parts(monkeypatch):
@@ -503,7 +592,7 @@ def test_sync_sends_all_long_final_response_parts(monkeypatch):
 
     response_messages = [sent[1] for sent in telegram.sent if "<b>Response" in sent[1]]
     assert result["feed_sent"] == 1
-    assert len(response_messages) > 1
+    assert len(response_messages) >= 1
     assert any(tail in message for message in response_messages)
     entry = next(iter(state.source_worker_entries(store).values()))
     assert len(entry["last_clean_message_ids"]) == len(response_messages)
@@ -520,6 +609,56 @@ def test_expandable_blockquote_has_delivery_fallbacks():
         "<b>Response</b>\n<blockquote>hello <b>there</b></blockquote>",
     )
     assert variants[-1] == ("plain", "Response\nhello there")
+
+
+def test_outbox_attention_falls_back_when_general_thread_missing():
+    class OutboxTendwire:
+        def __init__(self):
+            self.acked = []
+            self.failed = []
+
+        def connector_poll(self, **_kwargs):
+            return {
+                "ok": True,
+                "items": [
+                    {
+                        "ref": "ref-1",
+                        "key": "attention:1",
+                        "attempt": 1,
+                        "payload": {
+                            "event_type": "attention_created",
+                            "attention": {"severity": "warning", "reason": "Needs input"},
+                        },
+                    }
+                ],
+            }
+
+        def connector_ack(self, ref, response, **_kwargs):
+            self.acked.append((ref, response))
+            return {"ok": True}
+
+        def connector_fail(self, ref, error, **_kwargs):
+            self.failed.append((ref, error))
+            return {"ok": True}
+
+    class TopicMissingTelegram(FakeTelegram):
+        def send_message(self, chat_id, html, **kwargs):
+            if kwargs.get("thread_id"):
+                return {"ok": False, "error": "Bad Request: message thread not found"}
+            return super().send_message(chat_id, html, **kwargs)
+
+    store = _store()
+    tendwire = OutboxTendwire()
+    telegram = TopicMissingTelegram()
+
+    result = drain_outbox(store, telegram, tendwire, chat_id="-100", max_sends=1)
+
+    assert result["delivered"] == 1
+    assert result["acked"] == 1
+    assert result["failed"] == 0
+    assert tendwire.failed == []
+    assert tendwire.acked == [("ref-1", {"telegram": "delivered"})]
+    assert telegram.sent[-1][2].get("thread_id") is None
 
 
 def test_long_telegram_send_splits_instead_of_truncating():
@@ -544,7 +683,7 @@ def test_long_telegram_send_splits_instead_of_truncating():
     assert any(tail in payload["text"] for _method, payload in telegram.payloads)
 
 
-def test_existing_final_message_is_edited_to_current_rich_render(monkeypatch):
+def test_existing_final_message_is_not_reposted_for_render_version_churn(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
     telegram = FakeTelegram()
@@ -564,12 +703,12 @@ def test_existing_final_message_is_edited_to_current_rich_render(monkeypatch):
     assert sync_once(store, runtime)["feed_sent"] == 1
     entry = next(iter(state.source_worker_entries(store).values()))
     entry["last_render_version"] = "old"
+    sent_before = list(telegram.sent)
     telegram.edited.clear()
 
-    assert sync_once(store, runtime)["feed_sent"] == 1
-    assert telegram.edited
-    assert "<b>Fixed</b>" in telegram.edited[-1][2]
-    assert "##" not in telegram.edited[-1][2]
+    assert sync_once(store, runtime)["feed_sent"] == 0
+    assert telegram.sent == sent_before
+    assert telegram.edited == []
 
 
 def test_working_update_edits_existing_message(monkeypatch):

@@ -29,6 +29,11 @@ MESSAGE_TEXT_LIMIT = 3900
 SPLIT_TEXT_LIMIT = 3400
 
 
+def _topic_missing(error: Any) -> bool:
+    text = str(error or "").lower()
+    return "topic_id_invalid" in text or "message thread not found" in text
+
+
 @dataclass(frozen=True)
 class TelegramClient:
     token: str
@@ -37,6 +42,9 @@ class TelegramClient:
 
     def configured(self) -> bool:
         return bool(str(self.token or "").strip())
+
+    def with_token(self, token: str) -> "TelegramClient":
+        return TelegramClient(token=token, timeout=self.timeout, dry_run=self.dry_run)
 
     def api(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
         if self.dry_run:
@@ -222,7 +230,12 @@ def drain_outbox(
             result["changed"] = True
             continue
         html = render_attention_notice(payload)
-        sent = {"ok": True, "message_id": "0"} if dry_run else telegram.send_message(chat_id, html, thread_id=config.general_thread_id(store), notify=True)
+        thread_id = config.general_thread_id(store)
+        sent = {"ok": True, "message_id": "0"} if dry_run else telegram.send_message(chat_id, html, thread_id=thread_id, notify=True)
+        if not dry_run and not sent.get("ok") and thread_id and _topic_missing(sent.get("error")):
+            sent = telegram.send_message(chat_id, html, notify=True)
+            if sent.get("ok"):
+                sent["fallback_reason"] = "general_thread_missing"
         if sent.get("ok"):
             result["delivered"] += 1
             result["acked"] += 1
@@ -234,6 +247,17 @@ def drain_outbox(
         else:
             result["failed"] += 1
             result["changed"] = True
+            recent = audit.setdefault("recent", [])
+            if isinstance(recent, list):
+                recent.append(
+                    {
+                        "status": "failed",
+                        "event_type": str(payload.get("event_type") or ""),
+                        "error": sanitize_text(sent.get("error") or "Telegram delivery failed", 300),
+                        "attempt": item.get("attempt"),
+                    }
+                )
+                audit["recent"] = recent[-50:]
             if ref and not dry_run:
                 tendwire.connector_fail(ref, str(sent.get("error") or "Telegram delivery failed"))
     audit["delivered_identities"] = delivered[-200:]
