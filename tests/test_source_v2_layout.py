@@ -122,8 +122,89 @@ class SourceV2TelegramLayoutTests(unittest.TestCase):
         self.assertTrue(changed)
         update_live_card.assert_called_once()
         key = herdres.pane_key(pane)
-        self.assertEqual(state["panes"][key]["card_status_hash"], herdres.clean_feed_hash(herdres.live_status_item(pane)))
+        with self.source_v2_env():
+            expected_hash = herdres.clean_feed_hash(herdres.live_status_item(pane))
+        self.assertEqual(state["panes"][key]["card_status_hash"], expected_hash)
         self.assertEqual(state["panes"][key]["last_pane_message_id"], "601")
+
+    def test_source_v2_live_status_card_avoids_latest_placeholder_copy(self) -> None:
+        bad_phrases = (
+            "Latest Done",
+            "Latest Idle",
+            "Latest Working",
+            "Latest work appears complete",
+            "No active change",
+            "Work is in progress",
+        )
+
+        with self.source_v2_env():
+            cards = [
+                herdres.render_feed_item_html(herdres.live_status_item(make_pane("Codex", status, agent="codex")), live=True)
+                for status in ("done", "idle", "working")
+            ]
+            plain = [
+                herdres.item_plain_text(herdres.live_status_item(make_pane("Codex", status, agent="codex")))
+                for status in ("done", "idle", "working")
+            ]
+
+        for text in cards + plain:
+            for phrase in bad_phrases:
+                self.assertNotIn(phrase, text)
+        self.assertIn("<blockquote><small><b>Codex</b> · ✅ Done</small></blockquote>", cards[0])
+        self.assertIn("<blockquote><small><b>Codex</b> · 🟢 Idle</small></blockquote>", cards[1])
+        self.assertIn("<blockquote><small><b>Codex</b> · 🟡 Working</small></blockquote>", cards[2])
+
+    def test_source_v2_live_status_card_fallback_avoids_placeholder_copy(self) -> None:
+        pane = make_pane("Codex", "done", agent="codex")
+        send_rich = Mock(return_value={"ok": True, "format": "rich", "message_id": "701"})
+
+        with self.source_v2_env(), patch.object(herdres, "send_rich_message", send_rich):
+            result = herdres.update_live_card(
+                "-1001",
+                {"topic_id": "77", "agent": "codex"},
+                herdres.live_status_item(pane),
+                telegram={"rich_messages": {"supported": "yes"}},
+            )
+
+        self.assertTrue(result["ok"])
+        html = send_rich.call_args.args[1]
+        fallback = send_rich.call_args.kwargs["fallback_text"]
+        for text in (html, fallback):
+            self.assertNotIn("Latest", text)
+            self.assertNotIn("Latest work appears complete", text)
+            self.assertNotIn("No active change", text)
+            self.assertNotIn("Work is in progress", text)
+        self.assertIn("<blockquote><small><b>Codex</b> · ✅ Done</small></blockquote>", html)
+        self.assertEqual(fallback, "Codex · ✅ Done")
+
+    def test_source_v2_live_status_normalizes_aliases(self) -> None:
+        cases = {
+            "running": "working",
+            "in-progress": "working",
+            "completed": "done",
+            "success": "done",
+            "waiting": "blocked",
+            "failure": "error",
+            "surprising": "unknown",
+        }
+
+        with self.source_v2_env():
+            for raw, expected in cases.items():
+                self.assertEqual(
+                    herdres.live_status_item(make_pane("Codex", raw, agent="codex"))["live_status_key"],
+                    expected,
+                    raw,
+                )
+
+    def test_source_v2_live_status_hash_ignores_label_only_changes(self) -> None:
+        pane_a = {"agent_status": "working", "label": "Brewed for 1m"}
+        pane_b = {"agent_status": "working", "label": "Brewed for 5m"}
+
+        with self.source_v2_env():
+            self.assertEqual(
+                herdres.clean_feed_hash(herdres.live_status_item(pane_a)),
+                herdres.clean_feed_hash(herdres.live_status_item(pane_b)),
+            )
 
     def test_working_update_is_compact_and_expandable(self) -> None:
         item = {

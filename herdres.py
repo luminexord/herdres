@@ -231,6 +231,29 @@ RICH_RENDER_VERSION = 21
 TELEGRAM_LAYOUT_SOURCE_V1 = "source_v1"
 TELEGRAM_LAYOUT_SOURCE_V2 = "source_v2"
 TELEGRAM_LAYOUT_VALUES = {TELEGRAM_LAYOUT_SOURCE_V1, TELEGRAM_LAYOUT_SOURCE_V2}
+SOURCE_V2_LIVE_STATUS_LABELS = {
+    "blocked": "🟠 Waiting",
+    "error": "🔴 Error",
+    "done": "✅ Done",
+    "idle": "🟢 Idle",
+    "unknown": "⚪ Status",
+    "working": "🟡 Working",
+}
+SOURCE_V2_LIVE_STATUS_ALIASES = {
+    "active": "working",
+    "busy": "working",
+    "in_progress": "working",
+    "pending": "working",
+    "running": "working",
+    "complete": "done",
+    "completed": "done",
+    "success": "done",
+    "succeeded": "done",
+    "waiting": "blocked",
+    "failed": "error",
+    "failure": "error",
+    "errored": "error",
+}
 USER_PROMPT_LABEL = "User:"
 WORKLOG_LABEL = "Worklog"
 # Issue #3: while a turn is still open/streaming, the worklog header reads "Working…" instead of
@@ -6662,8 +6685,23 @@ def render_working_header_html(label: str) -> str:
     return f"<blockquote><small><b>{text}</b></small></blockquote>" if text else ""
 
 
+def render_source_v2_live_status_html(item: dict[str, Any]) -> str:
+    actor = _html_text(str(item.get("live_actor") or "Worker").strip() or "Worker", 80)
+    status_key = str(item.get("live_status_key") or "unknown").strip().lower()
+    status_label = SOURCE_V2_LIVE_STATUS_LABELS.get(status_key, SOURCE_V2_LIVE_STATUS_LABELS["working"])
+    detail = str(item.get("summary") or item.get("detail") or "").strip()
+    if detail:
+        return (
+            f"<blockquote><small><b>{actor}</b> · {_html_text(status_label, 80)}"
+            f"<br>{_rich_inline(detail, 500)}</small></blockquote>"
+        )
+    return f"<blockquote><small><b>{actor}</b> · {_html_text(status_label, 80)}</small></blockquote>"
+
+
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
+    if live and source_v2_layout_enabled() and kind == "status" and item.get("live_status"):
+        return render_source_v2_live_status_html(item)
     if kind == "prompt":
         prompt = str(item.get("user_text") or item.get("summary") or "").strip()
         html_out = render_user_prompt_quote_html(prompt, _item_prompt_collapse_chars(item))
@@ -7946,6 +7984,16 @@ def revalidate_pending_decision_prompt(
 
 def live_status_item(pane: dict[str, Any]) -> dict[str, Any]:
     status = str(pane.get("agent_status") or "unknown").lower()
+    if source_v2_layout_enabled():
+        status_key = source_v2_live_status_key(status)
+        actor = live_status_actor_label(pane)
+        body = source_v2_live_status_detail(pane, status_key)
+        title = f"{actor} · {SOURCE_V2_LIVE_STATUS_LABELS[status_key]}"
+        item = make_feed_item("status", title, body, notify=False)
+        item["live_status"] = True
+        item["live_status_key"] = status_key
+        item["live_actor"] = actor
+        return item
     if status in {"blocked"}:
         return make_feed_item("status", "Waiting", "This pane is waiting for input or is blocked.", notify=False)
     if status in {"error"}:
@@ -7957,6 +8005,39 @@ def live_status_item(pane: dict[str, Any]) -> dict[str, Any]:
     if status in {"unknown"}:
         return make_feed_item("status", "Status", "Current pane state is unclear.", notify=False)
     return make_feed_item("status", "Working", "Work is in progress.", notify=False)
+
+
+def source_v2_live_status_key(status: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", str(status or "").strip().lower()).strip("_")
+    key = SOURCE_V2_LIVE_STATUS_ALIASES.get(key, key)
+    return key if key in SOURCE_V2_LIVE_STATUS_LABELS else "unknown"
+
+
+def live_status_actor_label(pane: dict[str, Any]) -> str:
+    council_label = council_display_label_for_entry_like(pane, pane)
+    if council_label:
+        return council_label
+    kind = managed_bot_kind_for_entry(pane, pane)
+    spec = managed_bot_specs().get(kind) if kind else None
+    if spec:
+        return sanitize_text(str(spec.get("label") or kind.title()), 80)
+    agent = clean_label_topic_title(str(pane.get("agent") or ""), fallback="")
+    if agent:
+        return sanitize_text(agent, 80)
+    return "Worker"
+
+
+def source_v2_live_status_detail(pane: dict[str, Any], status_key: str) -> str:
+    workflows = workflow_summary(pane)
+    if workflows:
+        return workflows
+    if status_key == "blocked":
+        return "Needs input."
+    if status_key == "error":
+        return "Error reported."
+    if status_key == "unknown":
+        return "Status unclear."
+    return ""
 
 
 def workflow_summary(pane: dict[str, Any]) -> str:
