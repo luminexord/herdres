@@ -1358,7 +1358,7 @@ def success_reply(
     ):
         return "Submitted to busy Tendwire worker."
     if str(result.get("delivery_state") or "").strip().lower() == "duplicate_suppressed":
-        return ""
+        return "Already sent to Tendwire worker."
     if status == "queued":
         return "Queued for Tendwire worker."
     for container in (response, result):

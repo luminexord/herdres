@@ -278,7 +278,7 @@ class TendwireRequestBuilderTests(unittest.TestCase):
         self.assertNotIn("5000", encoded)
         self.assertNotIn("5001", encoded)
 
-    def test_duplicate_instruction_status_is_successful_noop(self) -> None:
+    def test_duplicate_instruction_status_is_successful_noop_with_visible_ack(self) -> None:
         response = {
             "ok": True,
             "status": "duplicate_instruction",
@@ -289,7 +289,7 @@ class TendwireRequestBuilderTests(unittest.TestCase):
         }
 
         self.assertTrue(herdres_tendwire.command_succeeded(response))
-        self.assertEqual(herdres_tendwire.success_reply(response), "")
+        self.assertEqual(herdres_tendwire.success_reply(response), "Already sent to Tendwire worker.")
 
     def test_entry_metadata_classification_lives_in_tendwire_helper(self) -> None:
         legacy = _entry(source="herdr")
