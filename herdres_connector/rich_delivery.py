@@ -28,7 +28,7 @@ PROMPT_PREVIEW_CHARS = 80
 USER_PROMPT_LABEL = "You"
 RESPONSE_LABEL = "Response"
 WORKING_LABEL = "Working"
-RICH_RENDER_VERSION = 24
+RICH_RENDER_VERSION = 25
 RICH_BAD_REQUEST_LIMIT = 3
 
 FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
@@ -61,7 +61,18 @@ def _rich_inline(value: Any, max_chars: int = 900) -> str:
 
 def _rich_paragraph(value: Any) -> str:
     clean = _rich_inline(value, 1600).strip()
-    return clean
+    return f"<p>{clean}</p>" if clean else ""
+
+
+def _has_block_html(value: str) -> bool:
+    return bool(re.search(r"<\s*(?:h[1-6]|p|ul|ol|pre|blockquote|details|table)\b", str(value or ""), re.IGNORECASE))
+
+
+def _small_body_html(value: str) -> str:
+    body = str(value or "").strip()
+    if not body:
+        return ""
+    return body if _has_block_html(body) else f"<small>{body}</small>"
 
 
 def _prompt_preview(value: Any) -> str:
@@ -99,7 +110,7 @@ def _rich_details_quote_html(
     preview_text = str(preview or "").strip()
     preview_html = f" {_html_text(preview_text, PROMPT_PREVIEW_CHARS + 6)}" if preview_text else ""
     summary_html = f"<small><b>{label}</b>{preview_html}</small>"
-    body_content = f"<small>{body}</small>" if body_small else body
+    body_content = _small_body_html(body) if body_small else body
     inner = f"<blockquote>{body_content}</blockquote>" if quote else body_content
     return f"<details{open_attr}><summary>{summary_html}</summary>{inner}</details>"
 
@@ -119,14 +130,27 @@ def render_user_prompt_quote_html(user_text: str, collapse_chars: int = 0) -> st
     )
 
 
+_RICH_SPACIOUS_BLOCK_TAG_RE = r"pre|h[1-6]|ul|ol|blockquote|details|table"
+_SPACIOUS_END = re.compile(rf"</(?:{_RICH_SPACIOUS_BLOCK_TAG_RE})>$")
+_SPACIOUS_START = re.compile(rf"^<(?:{_RICH_SPACIOUS_BLOCK_TAG_RE})\b")
+
+
 def _join_blocks(parts: list[str]) -> str:
     kept = [part for part in parts if str(part or "").strip()]
-    return "<br>".join(kept)
-
-
-def _join_sections(parts: list[str]) -> str:
-    kept = [part for part in parts if str(part or "").strip()]
-    return "<br>".join(kept)
+    if not kept:
+        return ""
+    result = kept[0]
+    for part in kept[1:]:
+        prev = result.rstrip()
+        nxt = part.lstrip()
+        if _SPACIOUS_END.search(prev) or _SPACIOUS_START.match(nxt):
+            sep = ""
+        elif prev.endswith(">"):
+            sep = "<br>"
+        else:
+            sep = "<br><br>"
+        result += sep + part
+    return result
 
 
 def _bullet_text(line: str) -> str | None:
@@ -199,7 +223,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             continue
         if _is_heading(line, first_block=not seen_heading, previous_blank=previous_blank):
             title = _heading_title(line)
-            parts.append(f"<b>{_html_text(title, 100)}</b>")
+            parts.append(f"<h3>{_html_text(title, 100)}</h3>")
             seen_heading = True
             previous_blank = False
             idx += 1
@@ -213,7 +237,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                     break
                 items.append(parsed)
                 idx += 1
-            parts.append("<br>".join(f"• {_rich_inline(item, 900)}" for item in items))
+            parts.append("<ul>\n" + "\n".join(f"<li>{_rich_inline(item, 900)}</li>" for item in items) + "\n</ul>")
             previous_blank = False
             continue
         numbered = _numbered_text(line)
@@ -226,7 +250,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                 _number, text = parsed_numbered
                 items.append(text)
                 idx += 1
-            parts.append("<br>".join(f"{number}. {_rich_inline(item, 900)}" for number, item in enumerate(items, start=1)))
+            parts.append("<ol>\n" + "\n".join(f"<li>{_rich_inline(item, 900)}</li>" for item in items) + "\n</ol>")
             previous_blank = False
             continue
         if stripped.startswith(">"):
@@ -292,7 +316,7 @@ def render_source_v2_working_update_html(worklog_text: str, *, label: str = WORK
     preview = _prompt_preview(clean)
     preview_html = f" {_html_text(preview, PROMPT_PREVIEW_CHARS + 6)}" if preview else ""
     body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
-    return f"<details><summary><small><b>{label_html}</b>{preview_html}</small></summary><blockquote><small>{body_html}</small></blockquote></details>"
+    return f"<details><summary><small><b>{label_html}</b>{preview_html}</small></summary><blockquote>{body_html}</blockquote></details>"
 
 
 def render_turn_item_html(item: dict[str, Any]) -> str:
@@ -305,7 +329,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     response_preview = "" if response_open else _prompt_preview(assistant_final)
     parts: list[str] = []
     if title:
-        parts.append(f"<small><b>{_html_text(title, 100)}</b></small>")
+        parts.append(f"<h3>{_html_text(title, 100)}</h3>")
     if user_text:
         parts.append(render_user_prompt_quote_html(user_text, int(item.get("prompt_collapse_chars") or 0)))
     if worklog_text and not assistant_final:
@@ -316,7 +340,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     response_html = render_assistant_response_quote_html(assistant_final, open_by_default=response_open, preview=response_preview)
     if response_html:
         parts.append(response_html)
-    return _join_sections(parts).strip()
+    return _join_blocks(parts).strip()
 
 
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
@@ -327,10 +351,10 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     summary = str(item.get("summary") or item.get("text") or "").strip()
     if live:
         title = f"Latest {title}"
-    parts = [f"<small><b>{_html_text(title, 100)}</b></small>"]
+    parts = [f"<h3>{_html_text(title, 100)}</h3>"]
     if summary:
         parts.append(render_final_reply_html(summary) or _rich_paragraph(summary))
-    return _join_sections(parts)
+    return _join_blocks(parts)
 
 
 def item_plain_text(item: dict[str, Any]) -> str:
