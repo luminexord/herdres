@@ -833,6 +833,44 @@ def test_historical_same_worker_final_is_suppressed_without_churning_latest(monk
     assert any(key.startswith("final:turn-old:") for key in store["tendwire_source_delivered_turns"])
 
 
+def test_only_latest_working_turn_per_worker_is_delivered(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    turns = {
+        "turns": [
+            {
+                "id": "turn-old-open",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_stream_text": "old working text",
+                "complete": False,
+            },
+            {
+                "id": "turn-new-open",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_stream_text": "new working text",
+                "complete": False,
+                "updated_at": "2026-07-03T16:24:15+00:00",
+            },
+        ]
+    }
+
+    first = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+    sent_text = "\n".join(sent[1] for sent in telegram.sent)
+    sent_before = list(telegram.sent)
+    second = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+
+    assert first["feed_sent"] == 1
+    assert "new working text" in sent_text
+    assert "old working text" not in sent_text
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert entry["last_stream_turn_id"] == "turn-new-open"
+    assert second["feed_sent"] == 0
+    assert telegram.sent == sent_before
+
+
 def test_working_update_edits_existing_message(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()

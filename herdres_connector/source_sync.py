@@ -642,22 +642,50 @@ def _bootstrap_existing_turns(store: dict[str, Any], turns_payload: dict[str, An
 
 def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_payload: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, int]:
     counts = {"feed_sent": 0, "sent": 0, "updated": 0}
+    turns = _turns(turns_payload)
+    latest_content_turn_by_worker: dict[str, str] = {}
+    latest_content_rank_by_worker: dict[str, tuple[bool, str, int]] = {}
+    for index, item in enumerate(turns):
+        _key, entry = _entry_for_turn(store, item)
+        if entry is None:
+            continue
+        worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
+        if not worker_key:
+            continue
+        complete = bool(item.get("complete")) or bool(item.get("assistant_final_text"))
+        has_content = bool(item.get("assistant_stream_text")) or (complete and bool(item.get("assistant_final_text")))
+        if not has_content:
+            continue
+        updated_at = str(item.get("updated_at") or "")
+        rank = (bool(updated_at), updated_at, -index)
+        if rank > latest_content_rank_by_worker.get(worker_key, (False, "", -10**9)):
+            latest_content_rank_by_worker[worker_key] = rank
+            latest_content_turn_by_worker[worker_key] = _turn_id(item)
     seen_final_workers: set[str] = set()
-    for item in _turns(turns_payload):
+    seen_working_workers: set[str] = set()
+    for item in turns:
         _key, entry = _entry_for_turn(store, item)
         if entry is None:
             continue
         before = dict(entry)
+        worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
+        latest_turn_id = latest_content_turn_by_worker.get(worker_key)
         complete = bool(item.get("complete")) or bool(item.get("assistant_final_text"))
         if complete and (item.get("assistant_final_text") or item.get("assistant_stream_text")):
-            worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
-            if worker_key in seen_final_workers:
+            if latest_turn_id and _turn_id(item) != latest_turn_id:
                 delivered = False
                 counts["updated"] += int(_suppress_historical_final(store, item, _turn_content_hash(item, "final")))
+                continue
+            if worker_key in seen_final_workers:
                 continue
             seen_final_workers.add(worker_key)
             delivered = _deliver_final(store, item, entry, runtime, chat_id=chat_id)
         elif item.get("assistant_stream_text"):
+            if latest_turn_id and _turn_id(item) != latest_turn_id:
+                continue
+            if worker_key in seen_working_workers:
+                continue
+            seen_working_workers.add(worker_key)
             delivered = _deliver_working(store, item, entry, runtime, chat_id=chat_id)
         else:
             delivered = False
