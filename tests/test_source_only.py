@@ -155,6 +155,33 @@ def test_sync_delivers_final_turn_once(monkeypatch):
     assert any("Full final answer" in sent[1] for sent in telegram.sent)
     assert any(sent[2]["thread_id"] == "77" for sent in telegram.sent if "Full final answer" in sent[1])
     assert len(store["tendwire_source_delivered_turns"]) == 1
+    response_message_id = [sent[3] for sent in telegram.sent if "Full final answer" in sent[1]][0]
+    binding = state.find_message_binding(store, response_message_id, topic_id="77")
+    assert binding is not None
+    assert binding["worker_id"] == "worker-1"
+
+
+def test_sync_backfills_existing_message_bindings(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    _worker_key, worker, _created = state.upsert_worker_entry(
+        store,
+        {"id": "worker-1", "name": "Alpha", "status": "working", "space_id": "space-1", "fingerprint": "fp-1"},
+    )
+    worker["last_clean_message_id"] = "555"
+    worker["last_turn_id"] = "turn-1"
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(), FakeTelegram(), with_outbox=False))
+
+    assert result["message_bindings"] == 1
+    binding = state.find_message_binding(store, "555", topic_id="77")
+    assert binding is not None
+    assert binding["worker_id"] == "worker-1"
 
 
 def test_sync_creates_one_topic_per_space_not_per_worker(monkeypatch):
@@ -599,6 +626,126 @@ def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path,
     assert "12345" not in encoded
     assert "-100" not in encoded
     assert "topic_id" not in encoded
+
+
+def test_command_reply_to_agent_message_targets_original_worker(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
+    )
+    _worker_key, claude, _created = state.upsert_worker_entry(
+        store,
+        {"id": "worker-claude", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-claude"},
+    )
+    _space_key, entry, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    entry["active_worker_id"] = "worker-codex"
+    entry["active_worker_fingerprint"] = "fp-codex"
+    state.bind_message_to_worker(store, "555", claude, topic_id="77", kind="final", turn_id="turn-claude")
+    state.save_state(store)
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    result = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "999",
+            "reply_to_message_id": "555",
+            "text": "/send reply to claude",
+        }
+    )
+
+    assert result == {"handled": True, "reply": ""}
+    request = fake.commands[0]
+    assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
+    assert request["instruction"] == {"text": "reply to claude"}
+
+
+def test_command_reply_at_alias_targets_worker_in_space(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
+    )
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-claude", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-claude"},
+    )
+    _space_key, entry, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    entry["active_worker_id"] = "worker-codex"
+    entry["active_worker_fingerprint"] = "fp-codex"
+    state.save_state(store)
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    result = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "999",
+            "text": "/send @claude hello there",
+        }
+    )
+
+    assert result == {"handled": True, "reply": ""}
+    request = fake.commands[0]
+    assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
+    assert request["instruction"] == {"text": "hello there"}
+
+
+def test_command_reply_unknown_at_alias_fails_safely(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
+    )
+    _space_key, entry, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    entry["active_worker_id"] = "worker-codex"
+    entry["active_worker_fingerprint"] = "fp-codex"
+    state.save_state(store)
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    result = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "999",
+            "text": "/send @missing hello",
+        }
+    )
+
+    assert result["handled"] is True
+    assert result["status"] == "unknown_target_alias"
+    assert fake.commands == []
 
 
 def test_gateway_maps_only_source_topic(monkeypatch):
