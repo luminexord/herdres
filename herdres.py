@@ -40,6 +40,11 @@ except Exception:  # pragma: no cover - speech is strictly additive
     herdres_speech = None  # type: ignore
 
 import herdres_tendwire
+from herdres_connector import doctor as connector_doctor
+from herdres_connector import formatter as connector_formatter
+from herdres_connector import source_state as connector_source_state
+from herdres_connector import telegram_delivery as connector_telegram_delivery
+from herdres_connector.tendwire_client import TendwireClient
 
 
 HERDRES_VERSION = "0.4.0"
@@ -1852,6 +1857,35 @@ def _warn_invalid_tendwire_mode(raw: Any) -> None:
     print(f"herdres tendwire warning: invalid HERDRES_TENDWIRE_MODE {value!r}; allowed values: {allowed}; using off", file=sys.stderr)
 
 
+def _tendwire_client() -> TendwireClient:
+    return TendwireClient(
+        runner=run_cmd,
+        sanitize=sanitize_text,
+        default_herdr_bin=DEFAULT_HERDR_BIN,
+    )
+
+
+def _tendwire_delivery_runtime() -> connector_telegram_delivery.TelegramDeliveryRuntime:
+    return connector_telegram_delivery.TelegramDeliveryRuntime(
+        sanitize=sanitize_text,
+        now=utc_now,
+        send_rich_message=send_rich_message,
+        pane_root_reply_target=pane_root_reply_target,
+        managed_bot_token_for_entry=managed_bot_token_for_entry,
+        connector_call=tendwire_connector_call,
+        rate_limited_exceptions=(RateLimited,),
+    )
+
+
+def _source_turn_runtime() -> connector_source_state.SourceTurnRuntime:
+    return connector_source_state.SourceTurnRuntime(
+        delivery_seen=source_turn_delivery_seen,
+        record_suppressed=record_suppressed_clean_item,
+        record_identity=record_delivered_turn_identity,
+        note_delivery=note_source_turn_delivery,
+    )
+
+
 def tendwire_config_once(args: Any) -> dict[str, Any]:  # noqa: ARG001 - uniform handler signature
     load_dotenv()
     return {"ok": True, "config": herdres_tendwire.config_status(default_herdr_bin=DEFAULT_HERDR_BIN)}
@@ -1948,82 +1982,32 @@ def tendwire_source_smoke_once(args: Any) -> dict[str, Any]:
 
 def tendwire_snapshot() -> dict[str, Any]:
     try:
-        return herdres_tendwire.snapshot_payload(
-            runner=run_cmd,
-            sanitize=sanitize_text,
-            default_herdr_bin=DEFAULT_HERDR_BIN,
-        )
+        return _tendwire_client().snapshot()
     except herdres_tendwire.TendwireCallError as exc:
         raise BridgeError(str(exc)) from exc
 
 
 def tendwire_turns() -> dict[str, Any]:
     try:
-        return herdres_tendwire.cached_turns_payload(
-            runner=run_cmd,
-            sanitize=sanitize_text,
-            default_herdr_bin=DEFAULT_HERDR_BIN,
-        )
+        return _tendwire_client().turns()
     except herdres_tendwire.TendwireCallError as exc:
         raise BridgeError(str(exc)) from exc
 
 
 def tendwire_command(request: dict[str, Any]) -> dict[str, Any]:
-    return herdres_tendwire.command_submit(
-        request,
-        runner=run_cmd,
-        sanitize=sanitize_text,
-        default_herdr_bin=DEFAULT_HERDR_BIN,
-    )
+    return _tendwire_client().command(request)
 
 
 def tendwire_connector_call(action: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    return herdres_tendwire.connector_call(
-        action,
-        params,
-        runner=run_cmd,
-        sanitize=sanitize_text,
-        default_herdr_bin=DEFAULT_HERDR_BIN,
-    )
+    return _tendwire_client().connector_call(action, params)
 
 
 def tendwire_attention_notice_text(payload: dict[str, Any]) -> str:
-    attention = payload.get("attention") if isinstance(payload.get("attention"), dict) else {}
-    event_type = herdres_tendwire.outbox_event_type(payload, sanitize=sanitize_text)
-    title = "Tendwire attention escalated" if event_type == "attention_escalated" else "Tendwire attention"
-    lines = [title]
-    for label, key, limit in (
-        ("Severity", "severity", 80),
-        ("Status", "status", 80),
-        ("Kind", "kind", 120),
-        ("Reason", "reason", 500),
-        ("Updated", "last_changed_at", 80),
-        ("Signals", "signal_count", 40),
-    ):
-        value = attention.get(key) if isinstance(attention, dict) else None
-        text = sanitize_text(str(value or ""), limit).strip()
-        if text:
-            lines.append(f"{label}: {text}")
-    transition_at = sanitize_text(str(payload.get("transition_at") or ""), 80).strip()
-    if transition_at:
-        lines.append(f"Observed: {transition_at}")
-    return "\n".join(lines)
+    return connector_formatter.attention_notice_text(payload, sanitize=sanitize_text)
 
 
 def tendwire_attention_notice_html(payload: dict[str, Any]) -> str:
-    plain = tendwire_attention_notice_text(payload)
-    lines = plain.splitlines()
-    if not lines:
-        return "<b>Tendwire attention</b>"
-    head, rest = lines[0], lines[1:]
-    blocks = [f"<h3>{html.escape(head)}</h3>"]
-    for line in rest:
-        label, sep, value = line.partition(":")
-        if sep:
-            blocks.append(f"<p><b>{html.escape(label.strip())}</b>: {html.escape(value.strip())}</p>")
-        else:
-            blocks.append(f"<p>{html.escape(line)}</p>")
-    return "".join(blocks)
+    return connector_formatter.attention_notice_html(payload, sanitize=sanitize_text)
 
 
 def deliver_tendwire_outbox_item(
@@ -2032,40 +2016,14 @@ def deliver_tendwire_outbox_item(
     telegram: dict[str, Any],
     item: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = herdres_tendwire.outbox_item_payload(item)
-    html_text = tendwire_attention_notice_html(payload)
-    fallback_text = tendwire_attention_notice_text(payload)
-    route_entry = herdres_tendwire.outbox_worker_route_entry(state, payload, sanitize=sanitize_text)
-    if route_entry is not None:
-        thread_id = route_entry.get("topic_id") or telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID)
-        reply_to_message_id = pane_root_reply_target(route_entry)
-        api_token = managed_bot_token_for_entry(telegram, route_entry, route_entry)
-    else:
-        thread_id = telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID)
-        reply_to_message_id = None
-        api_token = None
-    result = send_rich_message(
+    return connector_telegram_delivery.deliver_outbox_item(
+        state,
         chat_id,
-        html_text,
-        telegram=telegram,
-        fallback_text=fallback_text,
-        thread_id=thread_id,
-        notify=True,
-        reply_to_message_id=reply_to_message_id,
-        api_token=api_token,
+        telegram,
+        item,
+        runtime=_tendwire_delivery_runtime(),
+        default_general_thread_id=DEFAULT_GENERAL_THREAD_ID,
     )
-    if result.get("ok"):
-        herdres_tendwire.note_outbox_audit(
-            state,
-            {
-                "event_type": herdres_tendwire.outbox_event_type(payload, sanitize=sanitize_text),
-                "attempt": int(item.get("attempt") or 0),
-                "status": "delivered",
-                "delivered_at": utc_now(),
-            },
-            checked_at=utc_now(),
-        )
-    return result
 
 
 def drain_tendwire_connector_outbox(
@@ -2078,84 +2036,18 @@ def drain_tendwire_connector_outbox(
     enabled: bool | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    if enabled is None:
-        enabled = herdres_tendwire.connector_outbox_enabled()
-    prepared = herdres_tendwire.outbox_prepare_drain(
-        enabled=bool(enabled),
+    return connector_telegram_delivery.drain_connector_outbox(
+        state,
+        chat_id,
+        telegram,
+        counters,
+        runtime=_tendwire_delivery_runtime(),
         max_sends=max_sends,
-        sent_count=int(counters.get("sends", 0)),
-        delivery_configured=bool(
-            str(chat_id or "").strip()
-            and (
-                os.getenv("HERDRES_OUTBOUND_BOT_TOKEN", "").strip()
-                or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-            )
-        ),
+        default_general_thread_id=DEFAULT_GENERAL_THREAD_ID,
+        enabled=enabled,
         limit=limit,
+        delivery_configured=connector_telegram_delivery.outbound_delivery_configured(chat_id),
     )
-    result = prepared["result"] if isinstance(prepared.get("result"), dict) else herdres_tendwire.outbox_drain_result(False)
-    if not prepared.get("should_poll"):
-        return result
-    poll = tendwire_connector_call(
-        "poll",
-        prepared.get("poll_params") if isinstance(prepared.get("poll_params"), dict) else {},
-    )
-    items, audit_event = herdres_tendwire.outbox_apply_poll_response(
-        result,
-        poll,
-        sanitize=sanitize_text,
-    )
-    if audit_event is not None:
-        herdres_tendwire.note_outbox_audit(
-            state,
-            {"status": audit_event.get("status"), "checked_at": utc_now()},
-            checked_at=utc_now(),
-        )
-        return result
-
-    def execute_outbox_connector_plan(plan: dict[str, Any]) -> None:
-        params = plan.get("params") if isinstance(plan.get("params"), dict) else {}
-        response = tendwire_connector_call(str(plan.get("action") or ""), params)
-        herdres_tendwire.outbox_record_connector_response(result, plan, response)
-
-    for item in items:
-        action = herdres_tendwire.outbox_item_action(item, herdres_tendwire.outbox_delivered_identities(state))
-        ref = str(action.get("ref") or "")
-        if not ref:
-            continue
-        identity = str(action.get("identity") or "")
-        if action.get("action") == "ack_duplicate":
-            plan = herdres_tendwire.outbox_connector_plan(item, action, "duplicate", sanitize=sanitize_text)
-            execute_outbox_connector_plan(plan)
-            continue
-        try:
-            sent = deliver_tendwire_outbox_item(state, chat_id, telegram, item)
-        except RateLimited as exc:
-            plan = herdres_tendwire.outbox_connector_plan(
-                item,
-                action,
-                "rate_limited",
-                retry_after=max(1, int(exc.retry_after)),
-                sanitize=sanitize_text,
-            )
-            execute_outbox_connector_plan(plan)
-            continue
-        except Exception as exc:
-            sent = {"ok": False, "error": sanitize_text(str(exc), 300)}
-        if sent.get("ok"):
-            counters["sends"] = counters.get("sends", 0) + 1
-            herdres_tendwire.outbox_record_delivery_success(result)
-            herdres_tendwire.note_outbox_audit(
-                state,
-                {"identity": identity, "status": "delivered", "recorded_at": utc_now()},
-                checked_at=utc_now(),
-            )
-            plan = herdres_tendwire.outbox_connector_plan(item, action, "delivered", sanitize=sanitize_text)
-            execute_outbox_connector_plan(plan)
-            continue
-        plan = herdres_tendwire.outbox_connector_plan(item, action, "failed", sanitize=sanitize_text)
-        execute_outbox_connector_plan(plan)
-    return result
 
 
 def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
@@ -4620,18 +4512,7 @@ def source_turn_delivery_seen(
 
 
 def source_turn_already_clean_delivered(entry: dict[str, Any], item: dict[str, Any] | None) -> bool:
-    if not isinstance(item, dict) or str(item.get("kind") or "").lower() != "turn":
-        return False
-    turn_id = str(item.get("turn_id") or "").strip()
-    if not turn_id:
-        return False
-    if turn_id != str(entry.get("last_turn_id") or "").strip():
-        return False
-    if not str(entry.get("last_clean_message_id") or "").strip():
-        return False
-    last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
-    last_kind = str(entry.get("last_clean_kind") or last_item.get("kind") or "turn").lower()
-    return last_kind == "turn"
+    return connector_source_state.already_clean_delivered(entry, item)
 
 
 def prune_source_turn_delivery_ledger(ledger: dict[str, Any]) -> None:
@@ -4706,21 +4587,13 @@ def suppress_globally_delivered_source_turn(
     entry: dict[str, Any],
     item: dict[str, Any] | None,
 ) -> bool:
-    if not isinstance(item, dict) or str(item.get("kind") or "").lower() != "turn":
-        return False
-    if source_turn_delivery_seen(state, pane, entry, item):
-        record_suppressed_clean_item(entry, item, "source_turn_global_delivered")
-        record_delivered_turn_identity(entry, item)
-        if item.get("turn_id"):
-            entry["last_turn_id"] = str(item.get("turn_id") or "")
-        note_source_turn_delivery(state, pane, entry, item)
-        return True
-    if source_turn_already_clean_delivered(entry, item):
-        record_suppressed_clean_item(entry, item, "source_turn_already_delivered")
-        record_delivered_turn_identity(entry, item)
-        note_source_turn_delivery(state, pane, entry, item)
-        return True
-    return False
+    return connector_source_state.suppress_globally_delivered_turn(
+        state,
+        pane,
+        entry,
+        item,
+        runtime=_source_turn_runtime(),
+    )
 
 
 def record_delivered_turn_identity(entry: dict[str, Any], item: dict[str, Any]) -> bool:
@@ -17024,6 +16897,12 @@ def _update_files_plan() -> list[dict[str, Any]]:
         {"src": "herdres_gateway.py", "dest": INSTALL_BIN_DIR / "herdres-gateway", "mode": 0o755},
         {"src": "herdres_routing.py", "dest": INSTALL_BIN_DIR / "herdres_routing.py", "mode": 0o644},
         {"src": "herdres_tendwire.py", "dest": INSTALL_BIN_DIR / "herdres_tendwire.py", "mode": 0o644},
+        {"src": "herdres_connector/__init__.py", "dest": INSTALL_BIN_DIR / "herdres_connector" / "__init__.py", "mode": 0o644},
+        {"src": "herdres_connector/doctor.py", "dest": INSTALL_BIN_DIR / "herdres_connector" / "doctor.py", "mode": 0o644},
+        {"src": "herdres_connector/formatter.py", "dest": INSTALL_BIN_DIR / "herdres_connector" / "formatter.py", "mode": 0o644},
+        {"src": "herdres_connector/source_state.py", "dest": INSTALL_BIN_DIR / "herdres_connector" / "source_state.py", "mode": 0o644},
+        {"src": "herdres_connector/telegram_delivery.py", "dest": INSTALL_BIN_DIR / "herdres_connector" / "telegram_delivery.py", "mode": 0o644},
+        {"src": "herdres_connector/tendwire_client.py", "dest": INSTALL_BIN_DIR / "herdres_connector" / "tendwire_client.py", "mode": 0o644},
         # Local speech engine + warm sidecar (issue #4). herdres imports herdres_speech best-effort;
         # the sidecar is opt-in (its unit is shipped but not enabled). Heavy deps/models are not here.
         {"src": "herdres_speech.py", "dest": INSTALL_BIN_DIR / "herdres_speech.py", "mode": 0o644},
@@ -17233,9 +17112,9 @@ def _gateway_is_active() -> bool:
 
 
 def source_services_doctor(*, fix: bool = False, env: Any | None = None) -> dict[str, Any]:
-    return herdres_tendwire.source_services_doctor(
+    return connector_doctor.source_services_doctor(
         fix=fix,
-        env=os.environ if env is None else env,
+        env=env,
         is_macos=_platform_is_macos,
         runner=subprocess.run,
         sanitize=sanitize_text,
@@ -17244,9 +17123,9 @@ def source_services_doctor(*, fix: bool = False, env: Any | None = None) -> dict
 
 
 def legacy_topic_timer_doctor(*, fix: bool = False, env: Any | None = None) -> dict[str, Any]:
-    return herdres_tendwire.legacy_topic_timer_doctor(
+    return connector_doctor.legacy_topic_timer_doctor(
         fix=fix,
-        env=os.environ if env is None else env,
+        env=env,
         is_macos=_platform_is_macos,
         runner=subprocess.run,
         sanitize=sanitize_text,
@@ -17271,20 +17150,12 @@ def doctor_once(args: Any) -> dict[str, Any]:
         sanitize=sanitize_text,
         warn_invalid=_warn_invalid_tendwire_mode,
     )
-    return {
-        "ok": (
-            bool(legacy_timer.get("ok"))
-            and bool(source_services.get("ok"))
-            and bool(tendwire_backend.get("ok"))
-            and bool(sqlite_integrity.get("ok"))
-        ),
-        "checks": {
-            "legacy_topic_timer": legacy_timer,
-            "source_services": source_services,
-            "tendwire_backend": tendwire_backend,
-            "sqlite_integrity": sqlite_integrity,
-        },
-    }
+    return connector_doctor.doctor_report(
+        legacy_timer=legacy_timer,
+        source_services=source_services,
+        tendwire_backend=tendwire_backend,
+        sqlite_integrity=sqlite_integrity,
+    )
 
 
 def _restart_services() -> list[str]:

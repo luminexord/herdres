@@ -42,8 +42,14 @@ install_pinned herdres.py            herdres
 install_pinned herdr_turn_adapter.py herdr_turn_adapter.py
 install_pinned herdres_gateway.py    herdres-gateway
 # herdres_gateway.py imports routing helpers from herdres_routing.py, so it
-# must sit next to the installed gateway binary on the import path.
+# must sit next to the installed gateway binary on the import path. Source mode
+# also imports Tendwire connector helpers from the same installed bin directory.
 install -m 644 "$HERE/herdres_routing.py" "$BIN/herdres_routing.py"
+install -m 644 "$HERE/herdres_tendwire.py" "$BIN/herdres_tendwire.py"
+mkdir -p "$BIN/herdres_connector"
+for f in "$HERE"/herdres_connector/*.py; do
+    install -m 644 "$f" "$BIN/herdres_connector/$(basename "$f")"
+done
 # Claude Code hook (issue #36): mirrors a pending AskUserQuestion/ExitPlanMode to Telegram as
 # tappable buttons; register it in ~/.claude/settings.json (idempotent, no-op without Claude Code).
 install_pinned herdres_decision_hook.py herdres-decision-hook

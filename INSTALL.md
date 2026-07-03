@@ -13,6 +13,10 @@ the existing installer:
 ./install-user.sh
 ```
 
+The installer copies `herdres.py`, `herdres_tendwire.py`, and the
+`herdres_connector/` package together so the installed CLI keeps the same source
+mode boundary as the checkout.
+
 Create a local environment file from `.env.example`:
 
 ```bash

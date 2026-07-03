@@ -2,9 +2,11 @@
 
 # Herdres
 
-Rich Telegram forum-topic visibility and control for Herdr spaces and panes.
+Telegram connector for Tendwire source-mode Herdr workers.
 
-Herdres is a small stdlib-only Python bridge that maps each Herdr space to a Telegram forum topic. It posts actual pane traffic into that space topic, records the Telegram messages it sends as pane routing anchors, and can optionally create pane-root cards when that older thread-style UI is explicitly enabled. It can post explicit rich-message reports/questions/choices today, stream partial assistant output with Telegram draft methods when available, and switch to structured turn delivery when Herdr exposes a safe last-turn endpoint.
+Herdres is a small stdlib-only Python Telegram connector. In the normal release-candidate setup, Tendwire owns Herdr observation, worker identity, commands, receipts, health, and the connector outbox while Herdres owns Telegram topic/message mapping, formatting, replies/buttons, rate limits, delivery state, retry state, doctor checks, and cleanup. Legacy direct Herdr modes remain available only for explicit rollback/debug use.
+
+Herdres maps each Tendwire/Herdr space to a Telegram forum topic. It posts source-mode worker turns into that space topic, records the Telegram messages it sends as routing anchors, and can optionally create pane-root cards when the older thread-style UI is explicitly enabled. It can post explicit rich-message reports/questions/choices today and stream partial assistant output with Telegram draft methods when available.
 
 It does not patch Hermes or Herdr core files and routine sync uses no LLM calls.
 
@@ -69,7 +71,7 @@ Codex (or any skills-compatible agent that reads `.codex-plugin/`): add the same
 ## Quick Start
 
 ```bash
-git clone https://github.com/gaijinjoe/herdres.git
+git clone https://github.com/luminexord/herdres.git
 cd herdres
 
 install -Dm755 herdres.py ~/.local/bin/herdres
@@ -727,11 +729,11 @@ Tendwire modes:
 
 | `HERDRES_TENDWIRE_MODE` | Behavior |
 | --- | --- |
-| `off` | Default. Disables Tendwire calls and enrichment. |
-| `enrich` | Enables the current safe enrichment path. Herdres still reads real Herdr panes directly with `pane_list()`, preserves real `pane_id` values, and Tendwire only adds metadata/status to unambiguous real-pane matches. |
+| `off` | Legacy rollback. Disables Tendwire calls and enrichment. |
+| `enrich` | Legacy/debug enrichment path. Herdres still reads real Herdr panes directly with `pane_list()`, preserves real `pane_id` values, and Tendwire only adds metadata/status to unambiguous real-pane matches. |
 | `commands` | Keeps real-pane enrichment, then routes normal Telegram text for Tendwire-enriched entries through `tendwire command --json` using the worker id and fingerprint. Entries without Tendwire metadata still use the legacy direct Herdr send path. |
 | `source-read` | Uses the Tendwire public snapshot as the pane inventory instead of `pane_list()`, creates read-only worker entries (`entry_type=worker`, `worker_id`, `worker_fingerprint`) without inventing `tendwire:<worker>` pane ids, skips Herdr pane read/feed/turn inventory helpers for those entries, and routes text only through `tendwire command --json` when worker id/fingerprint metadata is present. Attachments, raw reads, picker callbacks, stale choices, `/new`, `/send!`, `/keys`, and direct Herdr fallback for source entries fail closed. |
-| `source` | Full source mode. Uses the same Tendwire snapshot inventory and worker entries as `source-read`, routes normal Telegram text/buttons through Tendwire, drains the Tendwire connector outbox by default, and does not use direct Herdr calls for normal Telegram behavior. Legacy direct mode remains available only by switching `HERDRES_TENDWIRE_MODE=off`. |
+| `source` | Normal release-candidate path. Uses the same Tendwire snapshot inventory and worker entries as `source-read`, routes normal Telegram text/buttons through Tendwire, drains the Tendwire connector outbox by default, and does not use direct Herdr calls for normal Telegram behavior. Legacy direct mode remains available only by switching `HERDRES_TENDWIRE_MODE=off`. |
 
 Invalid mode values warn and fall back to `off`; they never enable Tendwire behavior. When `HERDRES_TENDWIRE_MODE` is unset, legacy `HERDRES_TENDWIRE_HYBRID=1` or `HERDRES_TENDWIRE_SNAPSHOT=1` aliases to `enrich`. Those legacy names remain compatibility aliases, not the public Tendwire mental model.
 
@@ -744,9 +746,9 @@ again.
 
 In `source-read` and `source` modes, the same emergency fallback does not apply to Tendwire worker entries. Source entries are not real Herdr pane ids; missing worker metadata, failed Tendwire sends, attachments, `/raw`, `/read`, stale choices, and picker callbacks that cannot be routed through Tendwire all fail closed instead of calling Herdr directly. Existing legacy `tendwire:<worker>` pseudo-pane records are pruned when source inventory mode is not active.
 
-The Tendwire mode helpers live in `herdres_tendwire.py`; keep it installed next
-to `herdres` and `herdres-gateway` when deploying from source or release
-tarballs.
+The Tendwire mode compatibility helpers live in `herdres_tendwire.py`; the small
+connector boundary lives in `herdres_connector/`. Keep both installed next to
+`herdres` and `herdres-gateway` when deploying from source or release tarballs.
 
 When Tendwire reports degraded or unavailable backend health, or when the
 snapshot command fails while source entries already exist, Herdres preserves the
