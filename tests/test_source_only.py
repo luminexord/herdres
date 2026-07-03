@@ -308,6 +308,34 @@ def test_finished_council_worker_topic_is_deleted(monkeypatch):
     assert state.source_worker_entries(store) == {}
 
 
+def test_finished_council_space_topic_is_deleted(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "gitmoot · local-as", "status": "active", "fingerprint": "space-fp"},
+        topic_id="88",
+    )
+    telegram = FakeTelegram()
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=[],
+                spaces=[{"id": "space-1", "name": "gitmoot · local-as", "status": "active", "fingerprint": "space-fp"}],
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert result["topic_cleanup"]["deleted"] == 1
+    assert result["topic_cleanup"]["pruned"] == 1
+    assert telegram.deleted_topics == ["88"]
+    assert state.source_entries(store) == {}
+
+
 def test_final_response_renders_common_markdown_as_telegram_html():
     html = render_final_turn(
         {
