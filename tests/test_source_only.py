@@ -6,6 +6,7 @@ from pathlib import Path
 import herdres
 import herdres_gateway
 from herdres_connector import state
+from herdres_connector.rendering import render_final_turn
 from herdres_connector.safe import public_prune
 from herdres_connector.source_sync import SyncRuntime, sync_once
 
@@ -136,6 +137,51 @@ def test_sync_delivers_final_turn_once(monkeypatch):
     assert second["feed_sent"] == 0
     assert any("Full final answer" in sent[1] for sent in telegram.sent)
     assert len(store["tendwire_source_delivered_turns"]) == 1
+
+
+def test_final_response_renders_common_markdown_as_telegram_html():
+    html = render_final_turn(
+        {
+            "user_text": "Question",
+            "assistant_final_text": "## **Fix it**\n\n- keep **bold**\n- escape <tags>\n\nUse `code`.",
+        },
+        {"topic_name": "Alpha", "tendwire_worker_id": "worker-1"},
+    )
+
+    assert "##" not in html
+    assert "**" not in html
+    assert "<b>Fix it</b>" in html
+    assert "• keep <b>bold</b>" in html
+    assert "escape &lt;tags&gt;" in html
+    assert "<code>code</code>" in html
+
+
+def test_existing_final_message_is_edited_to_current_rich_render(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_final_text": "## **Fixed**\n\n- now rich",
+                "complete": True,
+            }
+        ]
+    }
+    runtime = SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False)
+
+    assert sync_once(store, runtime)["feed_sent"] == 1
+    entry = next(iter(state.source_entries(store).values()))
+    entry["last_render_version"] = "old"
+    telegram.edited.clear()
+
+    assert sync_once(store, runtime)["feed_sent"] == 1
+    assert telegram.edited
+    assert "<b>Fixed</b>" in telegram.edited[-1][2]
+    assert "##" not in telegram.edited[-1][2]
 
 
 def test_working_update_edits_existing_message(monkeypatch):
