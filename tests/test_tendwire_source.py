@@ -1203,7 +1203,7 @@ class TendwireModeTests(unittest.TestCase):
         pane_feed_output.assert_not_called()
         send_to_pane.assert_not_called()
 
-    def test_source_read_same_public_turn_edits_existing_clean_message_without_ledger(self) -> None:
+    def test_source_read_same_public_turn_suppresses_existing_clean_message_without_ledger(self) -> None:
         state, key = _source_state()
         pane = _source_read_panes(_snapshot())[0]
         entry = state["panes"][key]
@@ -1269,12 +1269,12 @@ class TendwireModeTests(unittest.TestCase):
                 changed=False,
             )
 
-        self.assertTrue(result["feed_delivered"])
-        edit_feed_item.assert_called_once()
-        self.assertEqual(edit_feed_item.call_args.args[1], "501")
+        self.assertFalse(result["feed_delivered"])
+        edit_feed_item.assert_not_called()
         send_feed_item.assert_not_called()
         self.assertEqual(entry["last_clean_message_id"], "501")
         self.assertEqual(entry["last_turn_id"], "turn-public-1")
+        self.assertEqual(entry["last_clean_suppressed_reason"], "source_turn_already_delivered")
         self.assertEqual(len(state.get("tendwire_source_delivered_turns") or {}), 1)
 
     def test_sync_once_source_delivers_completed_tendwire_turn_without_direct_herdr(self) -> None:

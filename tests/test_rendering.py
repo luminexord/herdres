@@ -12579,6 +12579,17 @@ class SelfHealingFoldTests(unittest.TestCase):
         self.assertFalse(mutated)
         ef.assert_not_called()
 
+    def test_source_entry_clears_fold_buffer_without_editing(self) -> None:
+        entry = self._entry(source="tendwire", entry_type="worker", last_clean_message_id="m2", last_turn_id="t2", unfolded_turns=[
+            {"message_id": "m1", "turn_id": "t1", "item": self._item("t1")},
+        ])
+        ef = Mock(return_value={"ok": True})
+        with patch.multiple(herdres, edit_feed_item=ef, managed_bot_token_for_entry=Mock(return_value="tok")):
+            mutated = herdres.fold_superseded_turns(self._state(enabled=True), entry, {}, "-1001")
+        self.assertTrue(mutated)
+        self.assertNotIn("unfolded_turns", entry)
+        ef.assert_not_called()
+
     # --- record_delivered_feed_item seeding ---
     def test_record_seeds_prior_then_appends_new_turn(self) -> None:
         entry = self._entry(last_clean_item=self._item("t1"), last_clean_message_id="m1", last_turn_id="t1")
@@ -12586,6 +12597,19 @@ class SelfHealingFoldTests(unittest.TestCase):
             entry, self._item("t2"), {"ok": True, "message_id": "m2"},
             pending_active_prompt=None, clear_active_prompt=False)
         self.assertEqual([e["message_id"] for e in entry["unfolded_turns"]], ["m1", "m2"])
+
+    def test_record_does_not_seed_source_turn_for_fold(self) -> None:
+        entry = self._entry(
+            source="tendwire",
+            entry_type="worker",
+            last_clean_item=self._item("t1"),
+            last_clean_message_id="m1",
+            last_turn_id="t1",
+        )
+        herdres.record_delivered_feed_item(
+            entry, self._item("t2"), {"ok": True, "message_id": "m2"},
+            pending_active_prompt=None, clear_active_prompt=False)
+        self.assertNotIn("unfolded_turns", entry)
 
 
 class PlanAttachmentTests(unittest.TestCase):

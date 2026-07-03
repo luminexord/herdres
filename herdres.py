@@ -962,6 +962,11 @@ def fold_superseded_turns(
     folded (only post-deploy turns and the one seeded from last_clean_item are captured).
 
     Returns True if the buffer mutated (caller persists state)."""
+    if entry_is_tendwire_source(entry):
+        if entry.get("unfolded_turns"):
+            entry.pop("unfolded_turns", None)
+            return True
+        return False
     if not space_collapse_previous_responses(state, entry):
         return False
     buf = entry.get("unfolded_turns")
@@ -4614,6 +4619,21 @@ def source_turn_delivery_seen(
     )
 
 
+def source_turn_already_clean_delivered(entry: dict[str, Any], item: dict[str, Any] | None) -> bool:
+    if not isinstance(item, dict) or str(item.get("kind") or "").lower() != "turn":
+        return False
+    turn_id = str(item.get("turn_id") or "").strip()
+    if not turn_id:
+        return False
+    if turn_id != str(entry.get("last_turn_id") or "").strip():
+        return False
+    if not str(entry.get("last_clean_message_id") or "").strip():
+        return False
+    last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
+    last_kind = str(entry.get("last_clean_kind") or last_item.get("kind") or "turn").lower()
+    return last_kind == "turn"
+
+
 def prune_source_turn_delivery_ledger(ledger: dict[str, Any]) -> None:
     herdres_tendwire.prune_source_turn_delivery_ledger(
         ledger,
@@ -4688,14 +4708,19 @@ def suppress_globally_delivered_source_turn(
 ) -> bool:
     if not isinstance(item, dict) or str(item.get("kind") or "").lower() != "turn":
         return False
-    if not source_turn_delivery_seen(state, pane, entry, item):
-        return False
-    record_suppressed_clean_item(entry, item, "source_turn_global_delivered")
-    record_delivered_turn_identity(entry, item)
-    if item.get("turn_id"):
-        entry["last_turn_id"] = str(item.get("turn_id") or "")
-    note_source_turn_delivery(state, pane, entry, item)
-    return True
+    if source_turn_delivery_seen(state, pane, entry, item):
+        record_suppressed_clean_item(entry, item, "source_turn_global_delivered")
+        record_delivered_turn_identity(entry, item)
+        if item.get("turn_id"):
+            entry["last_turn_id"] = str(item.get("turn_id") or "")
+        note_source_turn_delivery(state, pane, entry, item)
+        return True
+    if source_turn_already_clean_delivered(entry, item):
+        record_suppressed_clean_item(entry, item, "source_turn_already_delivered")
+        record_delivered_turn_identity(entry, item)
+        note_source_turn_delivery(state, pane, entry, item)
+        return True
+    return False
 
 
 def record_delivered_turn_identity(entry: dict[str, Any], item: dict[str, Any]) -> bool:
@@ -7793,6 +7818,9 @@ def record_delivered_feed_item(
         if stream_turn_id and stream_turn_id != item_turn_id:
             retire_direct_origin_marker(entry, stream_turn_id)
         invalidate_cached_pane_turn(str(entry.get("pane_id") or ""))
+        if entry_is_tendwire_source(entry):
+            entry.pop("unfolded_turns", None)
+            return
         new_mid = str(result.get("message_id") or fallback_message_id or "")
         if (
             not entry.get("unfolded_turns")
