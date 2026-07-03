@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import Mock
 
 from herdres_connector import formatter, source_state, telegram_delivery
@@ -32,6 +33,12 @@ def _outbox_item() -> dict:
 
 
 class HerdresConnectorExtractionTests(unittest.TestCase):
+    def test_connector_package_does_not_import_runtime_wrapper(self) -> None:
+        for path in Path("herdres_connector").glob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("import herdres\n", text, path)
+            self.assertNotIn("from herdres import", text, path)
+
     def test_attention_formatter_keeps_existing_notice_shape(self) -> None:
         payload = _outbox_item()["payload"]
 
@@ -116,4 +123,3 @@ class HerdresConnectorExtractionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
