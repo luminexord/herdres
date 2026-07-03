@@ -876,12 +876,42 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(counters["sends"], 1)
         self.assertEqual(counters["feed_sends"], 1)
         self.assertEqual(sent_items[0]["turn_id"], "turn-public-1")
+        self.assertTrue(sent_items[0].get("collapse_response"))
+        self.assertIn("<details><summary><b>Response</b>", herdres.render_turn_item_html(sent_items[0]))
         self.assertIn("Herdres was skipping Tendwire turn text", sent_items[0]["assistant_final_text"])
         self.assertEqual(entry["last_clean_message_id"], "501")
         self.assertEqual(len(state.get("tendwire_source_delivered_turns") or {}), 1)
         extract_turn_feed_item.assert_not_called()
         cached_pane_turn.assert_not_called()
         pane_feed_output.assert_not_called()
+
+    def test_source_read_clean_feed_can_leave_latest_response_expanded(self) -> None:
+        state, key = _source_state()
+        pane = _source_read_panes(_snapshot())[0]
+        entry = state["panes"][key]
+        turns_payload = {
+            "schema_version": 1,
+            "turns": [
+                {
+                    "id": "turn-public-1",
+                    "worker_id": "worker-1",
+                    "worker_fingerprint": "fp-1",
+                    "user_text": "Why does Telegram show compact source text?",
+                    "assistant_final_text": "Because source compact responses are enabled by default.",
+                    "complete": True,
+                    "has_open_turn": False,
+                }
+            ],
+        }
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_SOURCE_COMPACT_RESPONSES": "0"}, clear=True), \
+                patch.object(herdres, "tendwire_turns", return_value=turns_payload):
+            item = herdres.tendwire_source_turn_feed_item(pane, entry)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertNotIn("collapse_response", item)
+        self.assertIn("<details open><summary><b>Response</b>", herdres.render_turn_item_html(item))
 
     def test_source_read_clean_feed_delivers_tendwire_pending_decision_without_direct_herdr(self) -> None:
         state, key = _source_state()

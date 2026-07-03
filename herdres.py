@@ -870,6 +870,11 @@ def response_collapse_previous_default() -> bool:
     return parse_bool_env("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "")
 
 
+def source_compact_responses_enabled() -> bool:
+    """Source-mode turns default to compact expandable responses to keep Telegram topics scannable."""
+    return parse_bool_env("HERDRES_TENDWIRE_SOURCE_COMPACT_RESPONSES", "1")
+
+
 def space_collapse_previous_responses(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> bool:
     """Per-space: when a new turn arrives, fold the PREVIOUS turn's Response in place
     (the latest turn always stays expanded). Defaults to
@@ -2154,7 +2159,7 @@ def drain_tendwire_connector_outbox(
 
 
 def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
-    return herdres_tendwire.source_turn_feed_item_from_loader(
+    item = herdres_tendwire.source_turn_feed_item_from_loader(
         pane,
         entry,
         load_turns=tendwire_turns,
@@ -2165,6 +2170,14 @@ def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) 
         user_prompt_max_chars=USER_PROMPT_MAX_CHARS,
         max_reply_chars=MAX_REPLY_CHARS,
     )
+    if (
+        source_compact_responses_enabled()
+        and isinstance(item, dict)
+        and str(item.get("kind") or "").lower() == "turn"
+        and str(item.get("assistant_final_text") or "").strip()
+    ):
+        item["collapse_response"] = True
+    return item
 
 
 def pane_by_id(pane_id: str, deadline: float | None = None) -> dict[str, Any] | None:
@@ -7138,6 +7151,7 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
     # forever — a live re-delivery loop. The label is pure render data; keep it out.
     if include_render_version:
         payload["render_version"] = RICH_RENDER_VERSION
+        payload["collapse_response"] = bool(item.get("collapse_response"))
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 

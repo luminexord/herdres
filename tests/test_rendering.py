@@ -3831,6 +3831,19 @@ class StreamingIntegrationTests(unittest.TestCase):
         # the response body is preserved either way (collapse is a fold, not a drop)
         self.assertIn("the answer body", collapsed)
 
+    def test_collapse_response_changes_render_hash_not_semantic_hash(self) -> None:
+        item = herdres.make_turn_feed_item(
+            {"available": True, "complete": True, "turn_id": "t1", "user_text": "q", "assistant_final_text": "done"}
+        )
+        assert item is not None
+        collapsed = dict(item, collapse_response=True)
+
+        self.assertNotEqual(herdres.clean_feed_hash(item), herdres.clean_feed_hash(collapsed))
+        self.assertEqual(
+            herdres.clean_feed_hash(item, include_render_version=False),
+            herdres.clean_feed_hash(collapsed, include_render_version=False),
+        )
+
     def test_new_turn_folds_previous_turn_response_when_enabled(self) -> None:
         state, pane, _key, entry = self._state()
         counters, caps = self._caps()

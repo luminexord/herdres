@@ -770,6 +770,7 @@ Tendwire config:
 - `TENDWIRE_HERDR_BIN` is set for Tendwire from `HERDR_REAL_BIN` when present, otherwise `HERDR_BIN`, otherwise `herdr`.
 - `HERDRES_TENDWIRE_DATA_DIR`, `HERDRES_TENDWIRE_DB_PATH`, and `HERDRES_TENDWIRE_HOST_ID` are optional Herdres-controlled overrides for `TENDWIRE_DATA_DIR`, `TENDWIRE_DB_PATH`, and `TENDWIRE_HOST_ID`. Path values expand `~` and environment variables. Leave them unset to let Tendwire use its own defaults.
 - `HERDRES_TENDWIRE_DIRECT_FALLBACK=1` explicitly permits direct Herdr fallback after Tendwire command routing fails or metadata is partial. Leave it at `0` for normal fail-closed command ownership.
+- `HERDRES_TENDWIRE_SOURCE_COMPACT_RESPONSES=1` keeps source-mode turn updates compact by folding the latest Response body behind an expandable header. Set `0` to leave the latest source response open.
 
 Tendwire connector outbox:
 

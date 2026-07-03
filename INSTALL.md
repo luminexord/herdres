@@ -24,7 +24,8 @@ chmod 600 ~/.config/herdres/herdres.env
 Fill in `TELEGRAM_BOT_TOKEN`, `HERDR_TELEGRAM_TOPICS_CHAT_ID`, and
 `TELEGRAM_ALLOWED_USERS`. Keep `HERDRES_TENDWIRE_MODE=source` for normal daily
 source-mode use and keep `HERDRES_TENDWIRE_DB_PATH` aligned with the Tendwire
-daemon store.
+daemon store. `HERDRES_TENDWIRE_SOURCE_COMPACT_RESPONSES=1` keeps source-mode
+turn updates short in Telegram while preserving the full expandable response.
 
 ## Services
 
