@@ -220,15 +220,14 @@ def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: Sync
         counts["created"] += int(created or topic_created or topic_needed)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["spaces"] += 1
-    spaces_store = store.get("spaces") if isinstance(store.get("spaces"), dict) else {}
     for key in list(state.source_space_entries(store)):
         if key not in seen_space_keys:
-            spaces_store.pop(key, None)
+            state.source_space_entries(store)[key]["stale_space_topic"] = True
     return counts
 
 
-def _cleanup_worker_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, Any]:
-    result = {"deleted": 0, "failed": 0, "changed": False}
+def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, Any]:
+    result = {"deleted": 0, "failed": 0, "pruned": 0, "changed": False}
     visible_space_topics = {
         str(entry.get("topic_id"))
         for entry in state.source_space_entries(store).values()
@@ -263,6 +262,28 @@ def _cleanup_worker_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_
             entry.pop("topic_id", None)
             entry["deleted_topic_id"] = topic_id
             entry["deleted_topic_reason"] = reason
+    spaces = store.get("spaces") if isinstance(store.get("spaces"), dict) else {}
+    for key, entry in list(state.source_space_entries(store).items()):
+        if not entry.get("stale_space_topic"):
+            continue
+        topic_id = str(entry.get("topic_id") or "")
+        should_delete = config.delete_done_council_topics() and _entry_is_council_topic(entry) and bool(topic_id)
+        if should_delete:
+            if runtime.dry_run:
+                result["deleted"] += 1
+                result["changed"] = True
+                continue
+            deleted = runtime.telegram.delete_topic(chat_id, topic_id)
+            if not deleted.get("ok"):
+                result["failed"] += 1
+                entry["last_topic_delete_error"] = compact_ws(deleted.get("error"), 240)
+                continue
+            result["deleted"] += 1
+            audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": "done_council_space_topic"})
+        if not runtime.dry_run:
+            spaces.pop(key, None)
+            result["pruned"] += 1
+        result["changed"] = True
     store["telegram_deleted_topics"] = audit[-200:]
     return result
 
@@ -473,14 +494,14 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "pinned_status_updated": 0,
                 "feed_sent": 0,
                 "sent": 0,
-                "topic_cleanup": {"deleted": 0, "failed": 0, "changed": False},
+                "topic_cleanup": {"deleted": 0, "failed": 0, "pruned": 0, "changed": False},
                 "tendwire_outbox": {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False},
             }
     changed = False
     source_counts = _sync_sources(store, snapshot, runtime, chat_id=chat_id)
     bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
     turn_counts = {"feed_sent": 0, "sent": 0} if bootstrapped else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
-    topic_cleanup = _cleanup_worker_topics(store, runtime, chat_id=chat_id)
+    topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id)
     changed = changed or bool(source_counts["created"] or source_counts["icon_updated"] or turn_counts["sent"] or bootstrapped or topic_cleanup.get("changed"))
     pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
     changed = changed or pinned_changed
