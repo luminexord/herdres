@@ -518,18 +518,17 @@ def test_final_response_renders_common_markdown_as_telegram_html():
 
     assert "##" not in html
     assert "**" not in html
-    assert "<h3>" not in html
-    assert "<p>" not in html
-    assert "<ul>" not in html
-    assert "<ol>" not in html
-    assert "<small><b>Alpha</b></small><br><details" in html
-    assert "<b>Fix it</b>" in html
-    assert "• keep <b>bold</b>" in html
+    assert "<h3>Alpha</h3><details" in html
+    assert "<h3>Fix it</h3>" in html
+    assert "<ul>" in html
+    assert "<li>keep <b>bold</b></li>" in html
     assert "escape &lt;tags&gt;" in html
     assert "<code>code</code>" in html
-    assert "Use <code>code</code>." in html
+    assert "<p>Use <code>code</code>.</p>" in html
     assert '<details open><summary><small><b>Response</b></small></summary>' in html
     assert "<summary><small><b>Response</b></small></summary><blockquote>" not in html
+    assert "</details><details open>" in html
+    assert "</details><br><details" not in html
 
 
 def test_long_final_response_uses_full_visible_response_section():
@@ -547,12 +546,10 @@ def test_long_final_response_uses_full_visible_response_section():
     assert "<blockquote expandable>" not in html
     assert "##" not in html
     assert "**" not in html
-    assert "<h3>" not in html
-    assert "<p>" not in html
-    assert "<ul>" not in html
-    assert "<ol>" not in html
-    assert "<b>Plan</b>" in html
-    assert "• keep <b>rich</b> sections" in html
+    assert "<h3>Plan</h3>" in html
+    assert "<ul>" in html
+    assert "<li>keep <b>rich</b> sections</li>" in html
+    assert "</details><br><details" not in html
 
 
 def test_oversize_rich_response_falls_back_without_raw_markdown_or_truncation(monkeypatch):
