@@ -72,6 +72,16 @@ def _topic_missing(error: Any) -> bool:
     return "topic_id_invalid" in text or "message thread not found" in text
 
 
+def _topic_not_modified(error: Any) -> bool:
+    text = str(error or "").lower()
+    return "topic_not_modified" in text or "not modified" in text
+
+
+def _message_missing(error: Any) -> bool:
+    text = str(error or "").lower()
+    return "message to edit not found" in text or "message not found" in text
+
+
 def _space_is_open(space: dict[str, Any]) -> bool:
     return normalized_status(space.get("status")) not in {"closed", "failed"}
 
@@ -254,20 +264,29 @@ def _ensure_topic(
 
 
 def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
+    if not config.topic_status_icons_enabled():
+        return False
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
         return False
     emoji = status_emoji(entry.get("status") or entry.get("tendwire_status_line"))
-    emoji_id = topic_icon_id(store, emoji)
-    if not emoji_id or entry.get("last_topic_icon") == emoji:
+    emoji_id = topic_icon_id(store, emoji, runtime.telegram)
+    if not emoji_id:
+        entry["last_topic_icon_missing"] = emoji
+        return False
+    if entry.get("last_topic_icon") == emoji:
         return False
     if runtime.dry_run:
         entry["last_topic_icon"] = emoji
+        entry.pop("last_topic_icon_missing", None)
         return True
     result = runtime.telegram.edit_topic_icon(chat_id, thread_id, emoji_id)
-    if result.get("ok"):
+    if result.get("ok") or _topic_not_modified(result.get("error")):
         entry["last_topic_icon"] = emoji
+        entry.pop("last_topic_icon_missing", None)
+        entry.pop("last_topic_icon_error", None)
         return True
+    entry["last_topic_icon_error"] = compact_ws(result.get("error"), 240)
     return False
 
 
@@ -644,8 +663,7 @@ def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_pa
     counts = {"feed_sent": 0, "sent": 0, "updated": 0}
     turns = _turns(turns_payload)
     latest_content_turn_by_worker: dict[str, str] = {}
-    latest_content_rank_by_worker: dict[str, tuple[bool, str, int]] = {}
-    for index, item in enumerate(turns):
+    for item in turns:
         _key, entry = _entry_for_turn(store, item)
         if entry is None:
             continue
@@ -656,11 +674,10 @@ def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_pa
         has_content = bool(item.get("assistant_stream_text")) or (complete and bool(item.get("assistant_final_text")))
         if not has_content:
             continue
-        updated_at = str(item.get("updated_at") or "")
-        rank = (bool(updated_at), updated_at, -index)
-        if rank > latest_content_rank_by_worker.get(worker_key, (False, "", -10**9)):
-            latest_content_rank_by_worker[worker_key] = rank
-            latest_content_turn_by_worker[worker_key] = _turn_id(item)
+        # Tendwire store output is already ordered by per-worker observed recency.
+        # Payload updated_at can be absent on current worker-derived turns, so do
+        # not let an older command row with updated_at suppress the live turn.
+        latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
     seen_final_workers: set[str] = set()
     seen_working_workers: set[str] = set()
     for item in turns:
@@ -715,14 +732,23 @@ def _sync_pinned(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -
         return True
     if message_id:
         sent = runtime.telegram.edit_message(chat_id, message_id, html)
+        if not sent.get("ok") and _message_missing(sent.get("error")):
+            sent = runtime.telegram.send_message(chat_id, html, thread_id=config.general_thread_id(store), notify=False)
+            if not sent.get("ok") and _topic_missing(sent.get("error")):
+                sent = runtime.telegram.send_message(chat_id, html, notify=False)
+            if sent.get("ok") and sent.get("message_id"):
+                runtime.telegram.pin_message(chat_id, str(sent["message_id"]))
     else:
         sent = runtime.telegram.send_message(chat_id, html, thread_id=config.general_thread_id(store), notify=False)
+        if not sent.get("ok") and _topic_missing(sent.get("error")):
+            sent = runtime.telegram.send_message(chat_id, html, notify=False)
         if sent.get("ok") and sent.get("message_id"):
             runtime.telegram.pin_message(chat_id, str(sent["message_id"]))
     if sent.get("ok"):
         telegram["pinned_status_hash"] = content_hash
         if sent.get("message_id"):
             telegram["pinned_status_message_id"] = str(sent["message_id"])
+        telegram.pop("pinned_status_last_error", None)
         return True
     telegram["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
     return False

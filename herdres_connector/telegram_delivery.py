@@ -7,6 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from . import config, state
@@ -27,6 +28,18 @@ class RateLimited(TelegramError):
 
 MESSAGE_TEXT_LIMIT = 3900
 SPLIT_TEXT_LIMIT = 3400
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _cache_fresh(value: str, ttl_seconds: int) -> bool:
+    try:
+        then = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    return (datetime.now(timezone.utc) - then).total_seconds() <= ttl_seconds
 
 
 def _topic_missing(error: Any) -> bool:
@@ -191,11 +204,39 @@ class TelegramClient:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
 
-def topic_icon_id(store: dict[str, Any], emoji: str) -> str:
+def topic_icon_id(store: dict[str, Any], emoji: str, telegram_client: TelegramClient | None = None) -> str:
     telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
-    icons = telegram.get("forum_topic_icons") if isinstance(telegram.get("forum_topic_icons"), dict) else {}
+    icons = telegram.setdefault("forum_topic_icons", {}) if isinstance(telegram, dict) else {}
+    if not isinstance(icons, dict):
+        icons = {}
+        telegram["forum_topic_icons"] = icons
     by_emoji = icons.get("by_emoji") if isinstance(icons.get("by_emoji"), dict) else {}
-    return str(by_emoji.get(emoji) or "")
+    cached = str(by_emoji.get(emoji) or "")
+    if cached:
+        return cached
+    if telegram_client is None or getattr(telegram_client, "dry_run", False):
+        return ""
+    if by_emoji and _cache_fresh(str(icons.get("fetched_at") or ""), config.topic_icon_cache_ttl_seconds()):
+        return ""
+    try:
+        response = telegram_client.api("getForumTopicIconStickers", {})
+    except Exception as exc:  # noqa: BLE001
+        icons["last_error"] = sanitize_text(str(exc), 300)
+        icons["last_error_at"] = _utc_now()
+        return ""
+    fresh: dict[str, str] = {}
+    for sticker in response.get("result") or []:
+        if not isinstance(sticker, dict):
+            continue
+        sticker_emoji = str(sticker.get("emoji") or "").strip()
+        custom_emoji_id = str(sticker.get("custom_emoji_id") or "").strip()
+        if sticker_emoji and custom_emoji_id and sticker_emoji not in fresh:
+            fresh[sticker_emoji] = custom_emoji_id
+    icons["by_emoji"] = fresh
+    icons["fetched_at"] = _utc_now()
+    icons.pop("last_error", None)
+    icons.pop("last_error_at", None)
+    return str(fresh.get(emoji) or "")
 
 
 def drain_outbox(

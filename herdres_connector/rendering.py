@@ -32,7 +32,7 @@ def status_emoji(status: str) -> str:
         "attention": "❓",
         "failed": "‼️",
         "idle": "✅",
-        "working": "🔵",
+        "working": "⚡️",
     }.get(normalized_status(status), "☕️")
 
 

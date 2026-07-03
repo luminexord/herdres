@@ -69,6 +69,7 @@ class FakeTelegram:
             "deleted_topics": [],
             "pins": [],
             "api_calls": [],
+            "icon_edits": [],
         }
         self._shared = shared
         self.sent = shared["sent"]
@@ -77,6 +78,7 @@ class FakeTelegram:
         self.deleted_topics = shared["deleted_topics"]
         self.pins = shared["pins"]
         self.api_calls = shared["api_calls"]
+        self.icon_edits = shared["icon_edits"]
 
     def with_token(self, token):
         return FakeTelegram(token=token, shared=self._shared)
@@ -99,13 +101,24 @@ class FakeTelegram:
             html = str(rich.get("html") or payload.get("text") or "")
             self.edited.append((str(payload.get("chat_id") or ""), str(payload.get("message_id") or ""), html))
             return {"ok": True, "result": {"message_id": str(payload.get("message_id") or "0")}}
+        if method == "getForumTopicIconStickers":
+            return {
+                "ok": True,
+                "result": [
+                    {"emoji": "⚡️", "custom_emoji_id": "icon-working"},
+                    {"emoji": "✅", "custom_emoji_id": "icon-idle"},
+                    {"emoji": "❓", "custom_emoji_id": "icon-attention"},
+                    {"emoji": "‼️", "custom_emoji_id": "icon-failed"},
+                ],
+            }
         return {"ok": True, "result": {"message_id": 0}}
 
     def create_topic(self, _chat_id, name):
         self.topics.append(name)
         return {"ok": True, "topic_id": str(76 + len(self.topics))}
 
-    def edit_topic_icon(self, *_args, **_kwargs):
+    def edit_topic_icon(self, chat_id, thread_id, emoji_id):
+        self.icon_edits.append((str(chat_id), str(thread_id), str(emoji_id)))
         return {"ok": True}
 
     def delete_topic(self, _chat_id, thread_id):
@@ -840,19 +853,19 @@ def test_only_latest_working_turn_per_worker_is_delivered(monkeypatch):
     turns = {
         "turns": [
             {
-                "id": "turn-old-open",
-                "worker_id": "worker-1",
-                "worker_fingerprint": "fp-1",
-                "assistant_stream_text": "old working text",
-                "complete": False,
-            },
-            {
                 "id": "turn-new-open",
                 "worker_id": "worker-1",
                 "worker_fingerprint": "fp-1",
                 "assistant_stream_text": "new working text",
                 "complete": False,
                 "updated_at": "2026-07-03T16:24:15+00:00",
+            },
+            {
+                "id": "turn-old-open",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_stream_text": "old working text",
+                "complete": False,
             },
         ]
     }
@@ -869,6 +882,111 @@ def test_only_latest_working_turn_per_worker_is_delivered(monkeypatch):
     assert entry["last_stream_turn_id"] == "turn-new-open"
     assert second["feed_sent"] == 0
     assert telegram.sent == sent_before
+
+
+def test_current_worker_final_without_updated_at_beats_older_command_turn(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    turns = {
+        "turns": [
+            {
+                "id": "turn-current-worker",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "source": "worker:worker-1",
+                "assistant_final_text": "fresh current worker final",
+                "complete": True,
+            },
+            {
+                "id": "turn-old-command",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "source": "command",
+                "assistant_final_text": "stale command final",
+                "complete": True,
+                "updated_at": "2026-07-03T16:21:55+00:00",
+            },
+        ]
+    }
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+    sent_text = "\n".join(sent[1] for sent in telegram.sent)
+
+    assert result["feed_sent"] == 1
+    assert "fresh current worker final" in sent_text
+    assert "stale command final" not in sent_text
+
+
+def test_topic_icon_cache_is_fetched_and_working_icon_updates(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=[
+                    {
+                        "id": "worker-1",
+                        "name": "Alpha",
+                        "status": "working",
+                        "space_id": "space-1",
+                        "fingerprint": "fp-1",
+                    }
+                ],
+                turns={"turns": []},
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert result["icon_updated"] == 1
+    assert telegram.icon_edits == [("-100", "77", "icon-working")]
+    assert store["telegram"]["forum_topic_icons"]["by_emoji"]["⚡️"] == "icon-working"
+    entry = next(iter(state.source_space_entries(store).values()))
+    assert entry["last_topic_icon"] == "⚡️"
+
+
+def test_topic_icon_not_modified_repairs_local_icon_state(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+
+    class NotModifiedTelegram(FakeTelegram):
+        def edit_topic_icon(self, chat_id, thread_id, emoji_id):
+            self.icon_edits.append((str(chat_id), str(thread_id), str(emoji_id)))
+            return {"ok": False, "error": "Bad Request: TOPIC_NOT_MODIFIED"}
+
+    store = _store()
+    telegram = NotModifiedTelegram()
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns={"turns": []}), telegram, with_outbox=False))
+
+    assert result["icon_updated"] == 1
+    entry = next(iter(state.source_space_entries(store).values()))
+    assert entry["last_topic_icon"] == "⚡️"
+    assert "last_topic_icon_error" not in entry
+
+
+def test_pinned_status_falls_back_when_general_thread_is_missing(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+
+    class MissingGeneralThreadTelegram(FakeTelegram):
+        def send_message(self, chat_id, html, **kwargs):
+            if str(kwargs.get("thread_id") or "") == "1":
+                return {"ok": False, "error": "Bad Request: message thread not found"}
+            return super().send_message(chat_id, html, **kwargs)
+
+    store = _store()
+    telegram = MissingGeneralThreadTelegram()
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns={"turns": []}), telegram, with_outbox=False))
+
+    assert result["pinned_status_updated"] == 1
+    assert telegram.pins
+    assert store["telegram"]["pinned_status_message_id"]
+    assert "pinned_status_last_error" not in store["telegram"]
 
 
 def test_working_update_edits_existing_message(monkeypatch):
