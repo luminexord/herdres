@@ -228,6 +228,9 @@ STRUCTURED_INTERACTIONS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STRUCTUR
 STATUS_MARKER_DELETE_OLD = parse_bool_env("HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD", "1")
 ALLOW_UNBOUNDED_REPORTS = parse_bool_env("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "0")
 RICH_RENDER_VERSION = 21
+TELEGRAM_LAYOUT_SOURCE_V1 = "source_v1"
+TELEGRAM_LAYOUT_SOURCE_V2 = "source_v2"
+TELEGRAM_LAYOUT_VALUES = {TELEGRAM_LAYOUT_SOURCE_V1, TELEGRAM_LAYOUT_SOURCE_V2}
 USER_PROMPT_LABEL = "User:"
 WORKLOG_LABEL = "Worklog"
 # Issue #3: while a turn is still open/streaming, the worklog header reads "Working…" instead of
@@ -1874,6 +1877,7 @@ def _tendwire_delivery_runtime() -> connector_telegram_delivery.TelegramDelivery
         managed_bot_token_for_entry=managed_bot_token_for_entry,
         connector_call=tendwire_connector_call,
         rate_limited_exceptions=(RateLimited,),
+        layout=telegram_layout(),
     )
 
 
@@ -2003,11 +2007,11 @@ def tendwire_connector_call(action: str, params: dict[str, Any] | None = None) -
 
 
 def tendwire_attention_notice_text(payload: dict[str, Any]) -> str:
-    return connector_formatter.attention_notice_text(payload, sanitize=sanitize_text)
+    return connector_formatter.attention_notice_text(payload, sanitize=sanitize_text, layout=telegram_layout())
 
 
 def tendwire_attention_notice_html(payload: dict[str, Any]) -> str:
-    return connector_formatter.attention_notice_html(payload, sanitize=sanitize_text)
+    return connector_formatter.attention_notice_html(payload, sanitize=sanitize_text, layout=telegram_layout())
 
 
 def deliver_tendwire_outbox_item(
@@ -6475,6 +6479,20 @@ def render_worklog_quote_html(
     )
 
 
+def render_source_v2_working_update_html(worklog_text: str, *, label: str = WORKING_LABEL) -> str:
+    clean = str(worklog_text or "").strip()
+    if not clean:
+        return ""
+    label_html = _html_text(label or WORKING_LABEL, 80)
+    preview = _prompt_preview(clean)
+    preview_html = (" " + _html_text(preview, PROMPT_PREVIEW_CHARS + 6)) if preview else ""
+    body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
+    return (
+        f"<details><summary><small><b>{label_html}</b>{preview_html}</small></summary>"
+        f"<blockquote>{body_html}</blockquote></details>"
+    )
+
+
 def render_turn_item_html(item: dict[str, Any]) -> str:
     user_text = str(item.get("user_text") or "").strip()
     worklog_text = str(item.get("worklog_text") or item.get("assistant_stream_text") or "").strip()
@@ -6488,13 +6506,16 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     if user_text:
         parts.append(render_user_prompt_quote_html(user_text, collapse_chars))
     active_worklog = bool(worklog_text and not assistant_final and worklog_label.startswith(WORKING_LABEL))
-    worklog_html = render_worklog_quote_html(
-        worklog_text,
-        response_available=bool(assistant_final),
-        label=worklog_label,
-        open_by_default=False if active_worklog else None,
-        preview=_prompt_preview(worklog_text) if active_worklog else "",
-    )
+    if source_v2_layout_enabled() and active_worklog:
+        worklog_html = render_source_v2_working_update_html(worklog_text, label=worklog_label)
+    else:
+        worklog_html = render_worklog_quote_html(
+            worklog_text,
+            response_available=bool(assistant_final),
+            label=worklog_label,
+            open_by_default=False if active_worklog else None,
+            preview=_prompt_preview(worklog_text) if active_worklog else "",
+        )
     if worklog_html:
         parts.append(worklog_html)
     response_html = render_assistant_response_quote_html(
@@ -6567,7 +6588,8 @@ def render_decision_item_html(item: dict[str, Any]) -> str:
         context_html = render_assistant_response_quote_html(assistant_context)
         if context_html:
             parts.append(context_html)
-    parts.append("<h3>Decision needed</h3>")
+    title = "⚠️ Decision needed" if source_v2_layout_enabled() else "Decision needed"
+    parts.append(f"<h3>{title}</h3>")
     if prompt:
         parts.append(_rich_paragraph(prompt))
     if options:
@@ -6594,7 +6616,8 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
         context_html = render_assistant_response_quote_html(assistant_context)
         if context_html:
             parts.append(context_html)
-    parts.append("<h3>Input needed</h3>")
+    title = "⚠️ Input needed" if source_v2_layout_enabled() else "Input needed"
+    parts.append(f"<h3>{title}</h3>")
     if prompt:
         parts.append(_rich_paragraph(prompt))
     parts.append(
@@ -8109,6 +8132,23 @@ def pinned_status_enabled() -> bool:
     return os.getenv("HERDR_TELEGRAM_TOPICS_PINNED_STATUS", "0").strip() == "1"
 
 
+def telegram_layout() -> str:
+    raw = os.getenv("HERDRES_TELEGRAM_LAYOUT", TELEGRAM_LAYOUT_SOURCE_V1).strip().lower()
+    return raw if raw in TELEGRAM_LAYOUT_VALUES else TELEGRAM_LAYOUT_SOURCE_V1
+
+
+def source_v2_layout_enabled() -> bool:
+    return telegram_layout() == TELEGRAM_LAYOUT_SOURCE_V2
+
+
+def space_pinned_status_enabled() -> bool:
+    return bool(PINNED_STATUS_ENABLED) or pinned_status_enabled() or source_v2_layout_enabled()
+
+
+def live_card_enabled() -> bool:
+    return bool(LIVE_CARD_ENABLED) or source_v2_layout_enabled()
+
+
 def working_badge_enabled() -> bool:
     # Read at runtime, not as a module constant: the Herdr plugin runs `herdres event` and
     # load_dotenv() executes inside the handler (the import-time flag gotcha).
@@ -8215,7 +8255,8 @@ def render_pinned_status(
     if not rows:
         return "No active panes."
     rows.sort(key=lambda r: (-r[0], r[1]))
-    return sanitize_text(" | ".join(r[2] for r in rows), MAX_REPLY_CHARS)
+    separator = "\n" if source_v2_layout_enabled() else " | "
+    return sanitize_text(separator.join(r[2] for r in rows), MAX_REPLY_CHARS)
 
 
 def status_icon_explicit_id(key: str) -> str:
@@ -11371,7 +11412,7 @@ def ensure_space_pinned_status(
     max_sends: int,
 ) -> dict[str, Any]:
     topic_id = str(space_entry.get("topic_id") or "")
-    if not PINNED_STATUS_ENABLED or not topic_id:
+    if not space_pinned_status_enabled() or not topic_id:
         return {"changed": False, "updated": False, "skipped": True}
     text = render_pinned_status(state, panes)
     if not text:
@@ -11443,7 +11484,7 @@ def sync_space_pinned_statuses(
     counters: dict[str, int],
     max_sends: int,
 ) -> dict[str, Any]:
-    if not PINNED_STATUS_ENABLED:
+    if not space_pinned_status_enabled():
         return {"changed": False, "updated": 0}
     spaces = state.get("spaces") if isinstance(state.get("spaces"), dict) else {}
     grouped = open_panes_by_space(panes)
@@ -13219,7 +13260,7 @@ def sync_pane_once(
     stable_obj_hash = status_hash(stable_status_object(pane))
     live_item = live_status_item(pane)
     live_card_hash = clean_feed_hash(live_item)
-    if LIVE_CARD_ENABLED and not STATUS_MARKER_ENABLED and counters.get("sends", 0) < max_sends and (
+    if live_card_enabled() and not STATUS_MARKER_ENABLED and counters.get("sends", 0) < max_sends and (
         not entry.get("card_message_id") or entry.get("card_status_hash") != live_card_hash
     ):
         card_result = update_live_card(chat_id, entry, live_item, telegram=telegram)

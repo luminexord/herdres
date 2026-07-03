@@ -21,6 +21,7 @@ class TelegramDeliveryRuntime:
     managed_bot_token_for_entry: Callable[..., str | None]
     connector_call: Callable[[str, dict[str, Any] | None], dict[str, Any]]
     rate_limited_exceptions: tuple[type[BaseException], ...] = ()
+    layout: str = "source_v1"
 
 
 def outbound_delivery_configured(chat_id: str, *, env: Any | None = None) -> bool:
@@ -45,8 +46,8 @@ def deliver_outbox_item(
     default_general_thread_id: str,
 ) -> dict[str, Any]:
     payload = herdres_tendwire.outbox_item_payload(item)
-    html_text = attention_notice_html(payload, sanitize=runtime.sanitize)
-    fallback_text = attention_notice_text(payload, sanitize=runtime.sanitize)
+    html_text = attention_notice_html(payload, sanitize=runtime.sanitize, layout=runtime.layout)
+    fallback_text = attention_notice_text(payload, sanitize=runtime.sanitize, layout=runtime.layout)
     route_entry = herdres_tendwire.outbox_worker_route_entry(state, payload, sanitize=runtime.sanitize)
     if route_entry is not None:
         thread_id = route_entry.get("topic_id") or telegram.get("general_thread_id", default_general_thread_id)
@@ -174,4 +175,3 @@ def drain_connector_outbox(
         plan = herdres_tendwire.outbox_connector_plan(item, action, "failed", sanitize=runtime.sanitize)
         execute_outbox_connector_plan(plan)
     return result
-

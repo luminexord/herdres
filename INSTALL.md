@@ -31,6 +31,18 @@ source-mode use and keep `HERDRES_TENDWIRE_DB_PATH` aligned with the Tendwire
 daemon store. Final source responses stay expanded; in-progress `Working…`
 updates stay compact and expandable.
 
+For the guarded multi-project Telegram layout, set:
+
+```bash
+HERDRES_TELEGRAM_LAYOUT=source_v2
+```
+
+`source_v1` is the rollback layout. `source_v2` keeps one topic per Tendwire
+Space/project, one edited status board per Space, one edited live card per
+active Worker, compact working updates, expanded final responses, highlighted
+attention/pending notices, and report-only topic cleanup until an explicit
+confirmation path is used.
+
 ## Services
 
 Install and enable the Herdres timer and gateway:

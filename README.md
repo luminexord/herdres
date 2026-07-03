@@ -774,6 +774,15 @@ Tendwire config:
 - `HERDRES_TENDWIRE_DIRECT_FALLBACK=1` explicitly permits direct Herdr fallback after Tendwire command routing fails or metadata is partial. Leave it at `0` for normal fail-closed command ownership.
 - Source-mode final `Response` blocks stay expanded. In-progress `Working…`/`Worklog` updates render as a short expandable preview and are edited in place when Telegram supports it.
 
+Telegram source layout:
+
+- `HERDRES_TELEGRAM_LAYOUT=source_v1` keeps the current source-mode Telegram rendering and remains the rollback layout.
+- `HERDRES_TELEGRAM_LAYOUT=source_v2` enables the multi-project source-mode layout. It keeps one Telegram forum topic per Tendwire Space/project, one pinned and edited status board per Space, and one edited live card per active Worker. It does not change Tendwire command routing or public JSON.
+- Source v2 keeps in-progress `Working…` updates compact and collapsed by default. The same worker/turn live card is edited instead of reposted whenever Telegram allows it.
+- Source v2 keeps completed final `Response` content expanded. If the same `turn_id` is seen again, Herdres edits or reuses the existing message instead of reposting the completed turn.
+- Attention and pending-interaction items are rendered as highlighted connector notices with an explicit heading and compact metadata; they stay public-safe and do not expose Telegram IDs or raw Herdr targets.
+- Topic cleanup stays report-first. `herdres topic-cleanup-report` is dry-run only and uses stable topic refs; no topic deletion is performed without a separate explicit confirmation path.
+
 Tendwire connector outbox:
 
 - `HERDRES_TENDWIRE_CONNECTOR_OUTBOX` controls the neutral connector drain during `herdres sync`. When unset, it defaults on only in `HERDRES_TENDWIRE_MODE=source` and remains off in earlier modes. Set `0` to disable it explicitly or `1` to enable it in `source-read` during staged testing.

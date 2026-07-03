@@ -9,10 +9,16 @@ import html
 import herdres_tendwire
 
 
-def attention_notice_text(payload: dict[str, Any], *, sanitize: Callable[[str, int], str]) -> str:
+def _source_v2_layout(layout: str) -> bool:
+    return str(layout or "").strip().lower() == "source_v2"
+
+
+def attention_notice_text(payload: dict[str, Any], *, sanitize: Callable[[str, int], str], layout: str = "source_v1") -> str:
     attention = payload.get("attention") if isinstance(payload.get("attention"), dict) else {}
     event_type = herdres_tendwire.outbox_event_type(payload, sanitize=sanitize)
     title = "Tendwire attention escalated" if event_type == "attention_escalated" else "Tendwire attention"
+    if _source_v2_layout(layout):
+        title = f"⚠️ {title}"
     lines = [title]
     for label, key, limit in (
         ("Severity", "severity", 80),
@@ -32,8 +38,8 @@ def attention_notice_text(payload: dict[str, Any], *, sanitize: Callable[[str, i
     return "\n".join(lines)
 
 
-def attention_notice_html(payload: dict[str, Any], *, sanitize: Callable[[str, int], str]) -> str:
-    plain = attention_notice_text(payload, sanitize=sanitize)
+def attention_notice_html(payload: dict[str, Any], *, sanitize: Callable[[str, int], str], layout: str = "source_v1") -> str:
+    plain = attention_notice_text(payload, sanitize=sanitize, layout=layout)
     lines = plain.splitlines()
     if not lines:
         return "<b>Tendwire attention</b>"
@@ -46,4 +52,3 @@ def attention_notice_html(payload: dict[str, Any], *, sanitize: Callable[[str, i
         else:
             blocks.append(f"<p>{html.escape(line)}</p>")
     return "".join(blocks)
-
