@@ -28,7 +28,7 @@ PROMPT_PREVIEW_CHARS = 80
 USER_PROMPT_LABEL = "You"
 RESPONSE_LABEL = "Response"
 WORKING_LABEL = "Working"
-RICH_RENDER_VERSION = 23
+RICH_RENDER_VERSION = 24
 RICH_BAD_REQUEST_LIMIT = 3
 
 FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
@@ -61,18 +61,7 @@ def _rich_inline(value: Any, max_chars: int = 900) -> str:
 
 def _rich_paragraph(value: Any) -> str:
     clean = _rich_inline(value, 1600).strip()
-    return f"<p><small>{clean}</small></p>" if clean else ""
-
-
-def _has_block_html(value: str) -> bool:
-    return bool(re.search(r"<\s*(?:h3|p|ul|ol|pre|blockquote|details)\b", str(value or ""), re.IGNORECASE))
-
-
-def _small_body_html(value: str) -> str:
-    body = str(value or "").strip()
-    if not body:
-        return ""
-    return body if _has_block_html(body) else f"<small>{body}</small>"
+    return clean
 
 
 def _prompt_preview(value: Any) -> str:
@@ -110,7 +99,7 @@ def _rich_details_quote_html(
     preview_text = str(preview or "").strip()
     preview_html = f" {_html_text(preview_text, PROMPT_PREVIEW_CHARS + 6)}" if preview_text else ""
     summary_html = f"<small><b>{label}</b>{preview_html}</small>"
-    body_content = _small_body_html(body) if body_small else body
+    body_content = f"<small>{body}</small>" if body_small else body
     inner = f"<blockquote>{body_content}</blockquote>" if quote else body_content
     return f"<details{open_attr}><summary>{summary_html}</summary>{inner}</details>"
 
@@ -137,7 +126,7 @@ def _join_blocks(parts: list[str]) -> str:
 
 def _join_sections(parts: list[str]) -> str:
     kept = [part for part in parts if str(part or "").strip()]
-    return "\n".join(kept)
+    return "<br>".join(kept)
 
 
 def _bullet_text(line: str) -> str | None:
@@ -210,7 +199,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             continue
         if _is_heading(line, first_block=not seen_heading, previous_blank=previous_blank):
             title = _heading_title(line)
-            parts.append(f"<h3><small>{_html_text(title, 100)}</small></h3>")
+            parts.append(f"<b>{_html_text(title, 100)}</b>")
             seen_heading = True
             previous_blank = False
             idx += 1
@@ -224,7 +213,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                     break
                 items.append(parsed)
                 idx += 1
-            parts.append("<ul>" + "".join(f"<li><small>{_rich_inline(item, 900)}</small></li>" for item in items) + "</ul>")
+            parts.append("<br>".join(f"• {_rich_inline(item, 900)}" for item in items))
             previous_blank = False
             continue
         numbered = _numbered_text(line)
@@ -237,7 +226,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                 _number, text = parsed_numbered
                 items.append(text)
                 idx += 1
-            parts.append("<ol>" + "".join(f"<li><small>{_rich_inline(item, 900)}</small></li>" for item in items) + "</ol>")
+            parts.append("<br>".join(f"{number}. {_rich_inline(item, 900)}" for number, item in enumerate(items, start=1)))
             previous_blank = False
             continue
         if stripped.startswith(">"):
@@ -303,7 +292,7 @@ def render_source_v2_working_update_html(worklog_text: str, *, label: str = WORK
     preview = _prompt_preview(clean)
     preview_html = f" {_html_text(preview, PROMPT_PREVIEW_CHARS + 6)}" if preview else ""
     body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
-    return f"<details><summary><small><b>{label_html}</b>{preview_html}</small></summary><blockquote>{_small_body_html(body_html)}</blockquote></details>"
+    return f"<details><summary><small><b>{label_html}</b>{preview_html}</small></summary><blockquote><small>{body_html}</small></blockquote></details>"
 
 
 def render_turn_item_html(item: dict[str, Any]) -> str:
@@ -316,7 +305,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     response_preview = "" if response_open else _prompt_preview(assistant_final)
     parts: list[str] = []
     if title:
-        parts.append(f"<h3><small>{_html_text(title, 100)}</small></h3>")
+        parts.append(f"<small><b>{_html_text(title, 100)}</b></small>")
     if user_text:
         parts.append(render_user_prompt_quote_html(user_text, int(item.get("prompt_collapse_chars") or 0)))
     if worklog_text and not assistant_final:
@@ -338,7 +327,7 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     summary = str(item.get("summary") or item.get("text") or "").strip()
     if live:
         title = f"Latest {title}"
-    parts = [f"<h3><small>{_html_text(title, 100)}</small></h3>"]
+    parts = [f"<small><b>{_html_text(title, 100)}</b></small>"]
     if summary:
         parts.append(render_final_reply_html(summary) or _rich_paragraph(summary))
     return _join_sections(parts)
