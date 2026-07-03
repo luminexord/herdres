@@ -2078,9 +2078,9 @@ class TelegramDraftTests(unittest.TestCase):
         self.assertTrue(first["ok"])
         self.assertTrue(second["skipped"])
         self.assertEqual(api.call_count, 1)
-        self.assertEqual(entry["last_stream_hash"], herdres.stream_text_hash("Partial answer"))
+        self.assertEqual(entry["last_stream_hash"], herdres.stream_render_hash("Partial answer"))
 
-    def test_stream_draft_renders_partial_text_as_open_worklog(self) -> None:
+    def test_stream_draft_renders_partial_text_as_compact_worklog(self) -> None:
         telegram = {"rich_messages": {"supported": "yes"}}
         entry = {
             "pane_key": "pane-1",
@@ -2109,7 +2109,7 @@ class TelegramDraftTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         rich_message = json.loads(calls[0][1]["rich_message"])
-        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", rich_message["html"])
+        self.assertIn("<details><summary><b>Working…</b> Partial answer</summary><blockquote>", rich_message["html"])
         self.assertNotIn("<b>Response</b>", rich_message["html"])
 
     def test_request_elapsed_label_formats_minutes_and_hours(self) -> None:
@@ -2160,7 +2160,7 @@ class TelegramDraftTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         rich_message = json.loads(calls[0][1]["rich_message"])
-        self.assertIn("<details open><summary><b>Working… (2m)</b></summary><blockquote>", rich_message["html"])
+        self.assertIn("<details><summary><b>Working… (2m)</b> Partial answer</summary><blockquote>", rich_message["html"])
 
     def test_stream_draft_throttle_enforces_min_interval_between_updates(self) -> None:
         telegram = {"rich_messages": {"supported": "yes"}}
@@ -2273,12 +2273,12 @@ class TelegramDraftTests(unittest.TestCase):
         self.assertTrue(first["sent_message"])
         self.assertEqual(entry["last_stream_message_id"], "5001")
         send_rich.assert_called_once()
-        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", send_rich.call_args.args[1])
+        self.assertIn("<details><summary><b>Working…</b> Partial answer</summary><blockquote>", send_rich.call_args.args[1])
         self.assertNotIn("<b>Response</b>", send_rich.call_args.args[1])
         self.assertEqual(send_rich.call_args.kwargs["thread_id"], "77")
         self.assertIsNone(send_rich.call_args.kwargs["reply_to_message_id"])
         edit_rich.assert_called_once()
-        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", edit_rich.call_args.args[2])
+        self.assertIn("<details><summary><b>Working…</b> Partial answer", edit_rich.call_args.args[2])
         self.assertTrue(second["ok"])
         self.assertFalse(second.get("sent_message", False))
 
@@ -2486,7 +2486,7 @@ class ManagedBotTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(calls[0][2], "CLAUDE_TOKEN")
 
-    def test_stream_update_renders_user_block_with_open_worklog(self) -> None:
+    def test_stream_update_renders_user_block_with_compact_worklog(self) -> None:
         telegram = {"rich_messages": {"supported": "yes"}, "streaming_drafts": {"supported": "yes"}}
         entry = {
             "pane_key": "pane-1",
@@ -2518,7 +2518,7 @@ class ManagedBotTests(unittest.TestCase):
         rich_message = json.loads(calls[0][1]["rich_message"])
         self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", rich_message["html"])
         self.assertIn("Run the profile.", rich_message["html"])
-        self.assertIn("<details open><summary><b>Working…</b></summary><blockquote>", rich_message["html"])
+        self.assertIn("<details><summary><b>Working…</b> The CPU profile is still running.</summary><blockquote>", rich_message["html"])
         self.assertNotIn("<b>Response</b>", rich_message["html"])
 
     def test_stream_update_reissues_same_worklog_when_user_block_is_added(self) -> None:
@@ -2529,7 +2529,7 @@ class ManagedBotTests(unittest.TestCase):
             "topic_id": "77",
             "pane_root_message_id": "1001",
             "last_stream_turn_id": "turn-1",
-            "last_stream_hash": herdres.stream_text_hash("The CPU profile is still running."),
+            "last_stream_hash": herdres.stream_render_hash("The CPU profile is still running."),
         }
         calls: list[tuple[str, dict, str | None]] = []
 
@@ -3085,7 +3085,10 @@ class StreamingIntegrationTests(unittest.TestCase):
             working_html = json.loads(edit_calls[0][1]["rich_message"])["html"]
             self.assertIn("<details open><summary><b>User:</b></summary><blockquote>", working_html)
             self.assertIn(user_text, working_html)
-            self.assertIn("<details open><summary><b>Working… (1m)</b></summary><blockquote>", working_html)
+            self.assertIn(
+                "<details><summary><b>Working… (1m)</b> The CPU profile is still running.</summary><blockquote>",
+                working_html,
+            )
             self.assertIn(worklog_text, working_html)
             self.assertNotIn("<b>Response</b>", working_html)
 

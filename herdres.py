@@ -222,7 +222,7 @@ LEGACY_CHOICES_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES", 
 STRUCTURED_INTERACTIONS_ENABLED = parse_bool_env("HERDR_TELEGRAM_TOPICS_STRUCTURED_INTERACTIONS", "1")
 STATUS_MARKER_DELETE_OLD = parse_bool_env("HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD", "1")
 ALLOW_UNBOUNDED_REPORTS = parse_bool_env("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "0")
-RICH_RENDER_VERSION = 20
+RICH_RENDER_VERSION = 21
 USER_PROMPT_LABEL = "User:"
 WORKLOG_LABEL = "Worklog"
 # Issue #3: while a turn is still open/streaming, the worklog header reads "Working…" instead of
@@ -868,11 +868,6 @@ def response_collapse_previous_default() -> bool:
     Entry points call load_dotenv() first, so this honors herdres.env on every path.
     Mirrors per_agent_topics_enabled()."""
     return parse_bool_env("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "")
-
-
-def source_compact_responses_enabled() -> bool:
-    """Source-mode turns default to compact expandable responses to keep Telegram topics scannable."""
-    return parse_bool_env("HERDRES_TENDWIRE_SOURCE_COMPACT_RESPONSES", "1")
 
 
 def space_collapse_previous_responses(state: dict[str, Any], pane_or_entry: dict[str, Any] | None) -> bool:
@@ -2159,7 +2154,7 @@ def drain_tendwire_connector_outbox(
 
 
 def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
-    item = herdres_tendwire.source_turn_feed_item_from_loader(
+    return herdres_tendwire.source_turn_feed_item_from_loader(
         pane,
         entry,
         load_turns=tendwire_turns,
@@ -2170,14 +2165,6 @@ def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) 
         user_prompt_max_chars=USER_PROMPT_MAX_CHARS,
         max_reply_chars=MAX_REPLY_CHARS,
     )
-    if (
-        source_compact_responses_enabled()
-        and isinstance(item, dict)
-        and str(item.get("kind") or "").lower() == "turn"
-        and str(item.get("assistant_final_text") or "").strip()
-    ):
-        item["collapse_response"] = True
-    return item
 
 
 def pane_by_id(pane_id: str, deadline: float | None = None) -> dict[str, Any] | None:
@@ -4622,6 +4609,7 @@ def source_turn_delivery_seen(
         pane,
         entry,
         identity,
+        turn_id=str(item.get("turn_id") or ""),
         sanitize=sanitize_text,
     )
 
@@ -6572,12 +6560,21 @@ def render_worklog_quote_html(
     *,
     response_available: bool,
     label: str = WORKLOG_LABEL,
+    open_by_default: bool | None = None,
+    preview: str = "",
 ) -> str:
     clean = str(worklog_text or "").strip()
     if not clean:
         return ""
     body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
-    return _rich_details_quote_html(label or WORKLOG_LABEL, body_html, open_by_default=not response_available)
+    if open_by_default is None:
+        open_by_default = not response_available
+    return _rich_details_quote_html(
+        label or WORKLOG_LABEL,
+        body_html,
+        open_by_default=open_by_default,
+        preview=preview,
+    )
 
 
 def render_turn_item_html(item: dict[str, Any]) -> str:
@@ -6592,7 +6589,14 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     parts: list[str] = []
     if user_text:
         parts.append(render_user_prompt_quote_html(user_text, collapse_chars))
-    worklog_html = render_worklog_quote_html(worklog_text, response_available=bool(assistant_final), label=worklog_label)
+    active_worklog = bool(worklog_text and not assistant_final and worklog_label.startswith(WORKING_LABEL))
+    worklog_html = render_worklog_quote_html(
+        worklog_text,
+        response_available=bool(assistant_final),
+        label=worklog_label,
+        open_by_default=False if active_worklog else None,
+        preview=_prompt_preview(worklog_text) if active_worklog else "",
+    )
     if worklog_html:
         parts.append(worklog_html)
     response_html = render_assistant_response_quote_html(
@@ -6644,7 +6648,13 @@ def render_stream_turn_html(user_text: str, worklog_text: str, *, worklog_label:
                 "prompt_collapse_chars": collapse_chars,
             }
         )
-    return render_worklog_quote_html(clean_worklog, response_available=False, label=worklog_label)
+    return render_worklog_quote_html(
+        clean_worklog,
+        response_available=False,
+        label=worklog_label,
+        open_by_default=False,
+        preview=_prompt_preview(clean_worklog),
+    )
 
 
 def render_decision_item_html(item: dict[str, Any]) -> str:
@@ -6724,11 +6734,11 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
 
 def render_working_header_html(label: str) -> str:
     # Issue #3: a static "Working…" indicator on the open prompt message during the reasoning
-    # window (no streamed output yet). A plain bold line — NOT a body-less <details>, which
-    # Telegram's server-side sendRichMessage parser may drop — so it always renders. The label is
-    # bare (no ticking elapsed) so it never churns the prompt message's hash.
+    # window (no streamed output yet). Keep it visually small and blockquoted so it reads as a
+    # status badge, not as a full agent response. The label is bare (no ticking elapsed) so it
+    # never churns the prompt message's hash.
     text = _html_text(label, 80).strip()
-    return f"<b>{text}</b>" if text else ""
+    return f"<blockquote><small><b>{text}</b></small></blockquote>" if text else ""
 
 
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
@@ -10082,8 +10092,8 @@ def stream_render_hash(text: str, user_text: str = "") -> str:
     clean_user = sanitize_text(str(user_text or ""), USER_PROMPT_MAX_CHARS).strip()
     clean_text = sanitize_text(str(text or ""), MAX_REPLY_CHARS).strip()
     if clean_user:
-        return stream_text_hash(f"{clean_user}\n\n{clean_text}")
-    return stream_text_hash(clean_text)
+        return stream_text_hash(f"v{RICH_RENDER_VERSION}\n{clean_user}\n\n{clean_text}")
+    return stream_text_hash(f"v{RICH_RENDER_VERSION}\n{clean_text}")
 
 
 def stream_draft_id(chat_id: str, space_key_value: str, pane_key_value: str, turn_id: str) -> int:

@@ -876,8 +876,8 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(counters["sends"], 1)
         self.assertEqual(counters["feed_sends"], 1)
         self.assertEqual(sent_items[0]["turn_id"], "turn-public-1")
-        self.assertTrue(sent_items[0].get("collapse_response"))
-        self.assertIn("<details><summary><b>Response</b>", herdres.render_turn_item_html(sent_items[0]))
+        self.assertNotIn("collapse_response", sent_items[0])
+        self.assertIn("<details open><summary><b>Response</b>", herdres.render_turn_item_html(sent_items[0]))
         self.assertIn("Herdres was skipping Tendwire turn text", sent_items[0]["assistant_final_text"])
         self.assertEqual(entry["last_clean_message_id"], "501")
         self.assertEqual(len(state.get("tendwire_source_delivered_turns") or {}), 1)
@@ -885,7 +885,7 @@ class TendwireModeTests(unittest.TestCase):
         cached_pane_turn.assert_not_called()
         pane_feed_output.assert_not_called()
 
-    def test_source_read_clean_feed_can_leave_latest_response_expanded(self) -> None:
+    def test_source_read_clean_feed_keeps_latest_response_expanded(self) -> None:
         state, key = _source_state()
         pane = _source_read_panes(_snapshot())[0]
         entry = state["panes"][key]
@@ -896,16 +896,15 @@ class TendwireModeTests(unittest.TestCase):
                     "id": "turn-public-1",
                     "worker_id": "worker-1",
                     "worker_fingerprint": "fp-1",
-                    "user_text": "Why does Telegram show compact source text?",
-                    "assistant_final_text": "Because source compact responses are enabled by default.",
+                    "user_text": "Why does Telegram show full source responses?",
+                    "assistant_final_text": "Because final source responses stay expanded by default.",
                     "complete": True,
                     "has_open_turn": False,
                 }
             ],
         }
 
-        with patch.dict(os.environ, {"HERDRES_TENDWIRE_SOURCE_COMPACT_RESPONSES": "0"}, clear=True), \
-                patch.object(herdres, "tendwire_turns", return_value=turns_payload):
+        with patch.object(herdres, "tendwire_turns", return_value=turns_payload):
             item = herdres.tendwire_source_turn_feed_item(pane, entry)
 
         self.assertIsNotNone(item)
@@ -1063,6 +1062,9 @@ class TendwireModeTests(unittest.TestCase):
                 "last_turn_id",
             ):
                 entry.pop(field, None)
+            turns_payload["turns"][0]["assistant_final_text"] = (
+                "Because Tendwire later enriched the same public turn with more detail."
+            )
             counters = {"sends": 0, "feed_sends": 0}
             second = herdres._sync_pane_clean_feed(
                 state,
@@ -1088,6 +1090,7 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(entry["last_clean_suppressed_reason"], "source_turn_global_delivered")
         self.assertEqual(entry["last_turn_id"], "turn-public-1")
         self.assertTrue(entry.get("delivered_turn_identities"))
+        self.assertEqual(len(state.get("tendwire_source_delivered_turns") or {}), 1)
 
     def test_source_read_global_ledger_still_delivers_open_stream_update(self) -> None:
         state, key = _source_state()
@@ -1701,6 +1704,35 @@ class TendwireModeTests(unittest.TestCase):
         records = list(state["tendwire_source_delivered_turns"].values())
         self.assertEqual(records[0]["updated_at"], "2026-07-02T00:10:00+00:00")
         self.assertEqual(records[0]["turn_id"], "turn-public-1")
+        rebuilt_identity = "turn-semantic-1-rebuilt"
+        self.assertTrue(
+            herdres_tendwire.source_turn_delivery_seen(
+                state,
+                pane,
+                entry,
+                rebuilt_identity,
+                turn_id="turn-public-1",
+                sanitize=herdres.sanitize_text,
+            )
+        )
+        redelivered = herdres_tendwire.note_source_turn_delivery_identity(
+            state,
+            pane,
+            entry,
+            rebuilt_identity,
+            turn_id="turn-public-1",
+            semantic_hash="sem-hash-rebuilt",
+            now="2026-07-02T00:11:00+00:00",
+            sanitize=herdres.sanitize_text,
+            cap=10,
+        )
+        self.assertTrue(redelivered)
+        records = list(state["tendwire_source_delivered_turns"].values())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["turn_identity"], rebuilt_identity)
+        self.assertEqual(records[0]["semantic_hash"], "sem-hash-rebuilt")
+        self.assertEqual(records[0]["delivered_at"], "2026-07-02T00:00:00+00:00")
+        self.assertEqual(records[0]["updated_at"], "2026-07-02T00:11:00+00:00")
         self.assertFalse(herdres_tendwire.record_entry_delivered_turn_identity(entry, "", cap=10))
         self.assertFalse(herdres_tendwire.record_entry_delivered_turn_identity(entry, identity, cap=10))
         self.assertTrue(herdres_tendwire.record_entry_delivered_turn_identity(entry, "turn-semantic-2", cap=10))

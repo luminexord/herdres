@@ -2756,17 +2756,29 @@ def source_turn_delivery_seen(
     entry: dict[str, Any] | None,
     identity: str,
     *,
+    turn_id: str = "",
     sanitize: Sanitizer = _default_sanitize,
 ) -> bool:
     if not isinstance(state, dict) or not identity:
         return False
+    worker_id = source_turn_worker_id(pane, entry, sanitize=sanitize)
     key = source_turn_delivery_key(
-        source_turn_worker_id(pane, entry, sanitize=sanitize),
+        worker_id,
         identity,
         sanitize=sanitize,
     )
     ledger = state.get("tendwire_source_delivered_turns")
-    return bool(key and isinstance(ledger, dict) and key in ledger)
+    if key and isinstance(ledger, dict) and key in ledger:
+        return True
+    clean_turn_id = sanitize(str(turn_id or ""), 200).strip()
+    if not clean_turn_id or not isinstance(ledger, dict):
+        return False
+    for record in ledger.values():
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("worker_id") or "") == worker_id and str(record.get("turn_id") or "") == clean_turn_id:
+            return True
+    return False
 
 
 def prune_source_turn_delivery_ledger(ledger: dict[str, Any], *, cap: int) -> None:
@@ -2803,8 +2815,22 @@ def note_source_turn_delivery_identity(
         return False
     ledger = source_turn_delivery_ledger(state)
     record = ledger.get(key)
+    clean_turn_id = sanitize(str(turn_id or ""), 200).strip()
+    old_key = ""
+    if not isinstance(record, dict) and clean_turn_id:
+        for existing_key, existing in ledger.items():
+            if not isinstance(existing, dict):
+                continue
+            if str(existing.get("worker_id") or "") == worker_id and str(existing.get("turn_id") or "") == clean_turn_id:
+                record = existing
+                old_key = str(existing_key or "")
+                break
     if not isinstance(record, dict):
         record = {"delivered_at": str(now or "")}
+        ledger[key] = record
+        changed = True
+    elif old_key and old_key != key:
+        ledger.pop(old_key, None)
         ledger[key] = record
         changed = True
     else:
@@ -2812,7 +2838,7 @@ def note_source_turn_delivery_identity(
     values = {
         "worker_id": worker_id,
         "turn_identity": sanitize(str(identity or ""), 300).strip(),
-        "turn_id": sanitize(str(turn_id or ""), 200).strip(),
+        "turn_id": clean_turn_id,
         "semantic_hash": str(semantic_hash or ""),
     }
     if refresh_updated_at or not record.get("updated_at"):
