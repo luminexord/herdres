@@ -9,6 +9,7 @@ from herdres_connector import state
 from herdres_connector.rendering import render_final_turn
 from herdres_connector.safe import public_prune
 from herdres_connector.source_sync import SyncRuntime, sync_once
+from herdres_connector.telegram_delivery import TelegramClient
 
 
 class FakeTendwire:
@@ -154,6 +155,37 @@ def test_final_response_renders_common_markdown_as_telegram_html():
     assert "• keep <b>bold</b>" in html
     assert "escape &lt;tags&gt;" in html
     assert "<code>code</code>" in html
+    assert "<b>Response</b>" in html
+    assert "<blockquote>" in html
+
+
+def test_long_final_response_uses_expandable_response_section():
+    html = render_final_turn(
+        {
+            "user_text": "Question",
+            "assistant_final_text": "## **Plan**\n\n" + "- keep **rich** sections\n" * 80,
+        },
+        {"topic_name": "Alpha", "tendwire_worker_id": "worker-1"},
+    )
+
+    assert "<b>Response</b>" in html
+    assert "<blockquote expandable>" in html
+    assert "##" not in html
+    assert "**" not in html
+    assert "• keep <b>rich</b> sections" in html
+
+
+def test_expandable_blockquote_has_delivery_fallbacks():
+    variants = TelegramClient(token="fake", dry_run=True)._html_variants(
+        "<b>Response</b>\n<blockquote expandable>hello <b>there</b></blockquote>"
+    )
+
+    assert variants[0][0] == "html"
+    assert variants[1] == (
+        "html-no-expandable",
+        "<b>Response</b>\n<blockquote>hello <b>there</b></blockquote>",
+    )
+    assert variants[-1] == ("plain", "Response\nhello there")
 
 
 def test_existing_final_message_is_edited_to_current_rich_render(monkeypatch):
