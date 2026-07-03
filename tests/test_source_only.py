@@ -159,7 +159,7 @@ def test_final_response_renders_common_markdown_as_telegram_html():
     assert "<blockquote>" in html
 
 
-def test_long_final_response_uses_expandable_response_section():
+def test_long_final_response_uses_full_visible_response_section():
     html = render_final_turn(
         {
             "user_text": "Question",
@@ -169,7 +169,8 @@ def test_long_final_response_uses_expandable_response_section():
     )
 
     assert "<b>Response</b>" in html
-    assert "<blockquote expandable>" in html
+    assert "<blockquote>" in html
+    assert "<blockquote expandable>" not in html
     assert "##" not in html
     assert "**" not in html
     assert "• keep <b>rich</b> sections" in html

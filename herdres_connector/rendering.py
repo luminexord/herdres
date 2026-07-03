@@ -154,7 +154,7 @@ def render_final_turn(item: dict[str, Any], entry: dict[str, Any]) -> str:
             section_html(
                 "Response",
                 markdownish_to_html(final_text, limit=12000),
-                expandable=len(final_text) > EXPANDABLE_SECTION_CHARS,
+                expandable=False,
             )
         )
     return "\n\n".join(parts)
