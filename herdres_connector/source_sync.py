@@ -11,6 +11,8 @@ from .safe import compact_ws, short_hash
 from .telegram_delivery import TelegramClient, drain_outbox, topic_icon_id
 from .tendwire_client import TendwireClient
 
+RENDER_VERSION = "telegram-html-md-v1"
+
 
 @dataclass
 class SyncRuntime:
@@ -151,12 +153,22 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
     content_hash = _turn_content_hash(item, "final")
     identity = f"final:{turn_id}:{content_hash}"
     if identity in state.delivered_turns(store):
+        if (
+            entry.get("last_clean_message_id")
+            and entry.get("last_render_version") != RENDER_VERSION
+            and not runtime.dry_run
+        ):
+            edited = runtime.telegram.edit_message(chat_id, str(entry["last_clean_message_id"]), render_final_turn(item, entry))
+            if edited.get("ok"):
+                entry["last_render_version"] = RENDER_VERSION
+                return True
         return False
     html = render_final_turn(item, entry)
     if runtime.dry_run:
         state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
         entry["last_turn_id"] = turn_id
         entry["last_clean_hash"] = content_hash
+        entry["last_render_version"] = RENDER_VERSION
         entry.setdefault("last_clean_message_id", "0")
         return True
     sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
@@ -164,6 +176,7 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
         state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
         entry["last_turn_id"] = turn_id
         entry["last_clean_hash"] = content_hash
+        entry["last_render_version"] = RENDER_VERSION
         entry["last_clean_message_id"] = str(sent.get("message_id") or "")
         return True
     entry["last_delivery_error"] = compact_ws(sent.get("error"), 240)
