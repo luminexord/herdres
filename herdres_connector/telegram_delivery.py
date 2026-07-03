@@ -1,177 +1,199 @@
-"""Telegram delivery helpers for Tendwire connector outbox items."""
+"""Telegram API and connector-outbox delivery for source-only Herdres."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from typing import Any
-import os
 
-import herdres_tendwire
+from . import config, state
+from .rendering import html_to_plain, render_attention_notice
+from .safe import sanitize_text, short_hash
+from .tendwire_client import TendwireClient
 
-from .formatter import attention_notice_html, attention_notice_text
+
+class TelegramError(RuntimeError):
+    pass
+
+
+class RateLimited(TelegramError):
+    def __init__(self, retry_after: int, message: str = "Telegram rate limited") -> None:
+        super().__init__(message)
+        self.retry_after = max(1, int(retry_after or 1))
 
 
 @dataclass(frozen=True)
-class TelegramDeliveryRuntime:
-    sanitize: Callable[[str, int], str]
-    now: Callable[[], str]
-    send_rich_message: Callable[..., dict[str, Any]]
-    pane_root_reply_target: Callable[[dict[str, Any]], str | None]
-    managed_bot_token_for_entry: Callable[..., str | None]
-    connector_call: Callable[[str, dict[str, Any] | None], dict[str, Any]]
-    rate_limited_exceptions: tuple[type[BaseException], ...] = ()
-    layout: str = "source_v1"
+class TelegramClient:
+    token: str
+    timeout: float = 20.0
+    dry_run: bool = False
 
+    def configured(self) -> bool:
+        return bool(str(self.token or "").strip())
 
-def outbound_delivery_configured(chat_id: str, *, env: Any | None = None) -> bool:
-    source = os.environ if env is None else env
-    get = source.get if hasattr(source, "get") else os.environ.get
-    return bool(
-        str(chat_id or "").strip()
-        and (
-            str(get("HERDRES_OUTBOUND_BOT_TOKEN", "") or "").strip()
-            or str(get("TELEGRAM_BOT_TOKEN", "") or "").strip()
-        )
-    )
-
-
-def deliver_outbox_item(
-    state: dict[str, Any],
-    chat_id: str,
-    telegram: dict[str, Any],
-    item: dict[str, Any],
-    *,
-    runtime: TelegramDeliveryRuntime,
-    default_general_thread_id: str,
-) -> dict[str, Any]:
-    payload = herdres_tendwire.outbox_item_payload(item)
-    html_text = attention_notice_html(payload, sanitize=runtime.sanitize, layout=runtime.layout)
-    fallback_text = attention_notice_text(payload, sanitize=runtime.sanitize, layout=runtime.layout)
-    route_entry = herdres_tendwire.outbox_worker_route_entry(state, payload, sanitize=runtime.sanitize)
-    if route_entry is not None:
-        thread_id = route_entry.get("topic_id") or telegram.get("general_thread_id", default_general_thread_id)
-        reply_to_message_id = runtime.pane_root_reply_target(route_entry)
-        api_token = runtime.managed_bot_token_for_entry(telegram, route_entry, route_entry)
-    else:
-        thread_id = telegram.get("general_thread_id", default_general_thread_id)
-        reply_to_message_id = None
-        api_token = None
-    result = runtime.send_rich_message(
-        chat_id,
-        html_text,
-        telegram=telegram,
-        fallback_text=fallback_text,
-        thread_id=thread_id,
-        notify=True,
-        reply_to_message_id=reply_to_message_id,
-        api_token=api_token,
-    )
-    if result.get("ok"):
-        herdres_tendwire.note_outbox_audit(
-            state,
-            {
-                "event_type": herdres_tendwire.outbox_event_type(payload, sanitize=runtime.sanitize),
-                "attempt": int(item.get("attempt") or 0),
-                "status": "delivered",
-                "delivered_at": runtime.now(),
-            },
-            checked_at=runtime.now(),
-        )
-    return result
-
-
-def drain_connector_outbox(
-    state: dict[str, Any],
-    chat_id: str,
-    telegram: dict[str, Any],
-    counters: dict[str, int],
-    *,
-    runtime: TelegramDeliveryRuntime,
-    max_sends: int,
-    default_general_thread_id: str,
-    enabled: bool | None = None,
-    limit: int | None = None,
-    delivery_configured: bool | None = None,
-) -> dict[str, Any]:
-    if enabled is None:
-        enabled = herdres_tendwire.connector_outbox_enabled()
-    if delivery_configured is None:
-        delivery_configured = outbound_delivery_configured(chat_id)
-    prepared = herdres_tendwire.outbox_prepare_drain(
-        enabled=bool(enabled),
-        max_sends=max_sends,
-        sent_count=int(counters.get("sends", 0)),
-        delivery_configured=bool(delivery_configured),
-        limit=limit,
-    )
-    result = prepared["result"] if isinstance(prepared.get("result"), dict) else herdres_tendwire.outbox_drain_result(False)
-    if not prepared.get("should_poll"):
-        return result
-    poll = runtime.connector_call(
-        "poll",
-        prepared.get("poll_params") if isinstance(prepared.get("poll_params"), dict) else {},
-    )
-    items, audit_event = herdres_tendwire.outbox_apply_poll_response(
-        result,
-        poll,
-        sanitize=runtime.sanitize,
-    )
-    if audit_event is not None:
-        herdres_tendwire.note_outbox_audit(
-            state,
-            {"status": audit_event.get("status"), "checked_at": runtime.now()},
-            checked_at=runtime.now(),
-        )
-        return result
-
-    def execute_outbox_connector_plan(plan: dict[str, Any]) -> None:
-        params = plan.get("params") if isinstance(plan.get("params"), dict) else {}
-        response = runtime.connector_call(str(plan.get("action") or ""), params)
-        herdres_tendwire.outbox_record_connector_response(result, plan, response)
-
-    for item in items:
-        action = herdres_tendwire.outbox_item_action(item, herdres_tendwire.outbox_delivered_identities(state))
-        ref = str(action.get("ref") or "")
-        if not ref:
-            continue
-        identity = str(action.get("identity") or "")
-        if action.get("action") == "ack_duplicate":
-            plan = herdres_tendwire.outbox_connector_plan(item, action, "duplicate", sanitize=runtime.sanitize)
-            execute_outbox_connector_plan(plan)
-            continue
+    def api(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.dry_run:
+            return {"ok": True, "result": {"message_id": 0, "message_thread_id": payload.get("message_thread_id", 0)}}
+        if not self.configured():
+            raise TelegramError("Telegram bot token is not configured")
+        data = urllib.parse.urlencode({key: str(value) for key, value in payload.items() if value is not None}).encode()
+        url = f"https://api.telegram.org/bot{self.token}/{method}"
         try:
-            sent = deliver_outbox_item(
-                state,
-                chat_id,
-                telegram,
-                item,
-                runtime=runtime,
-                default_general_thread_id=default_general_thread_id,
-            )
-        except runtime.rate_limited_exceptions as exc:
-            plan = herdres_tendwire.outbox_connector_plan(
-                item,
-                action,
-                "rate_limited",
-                retry_after=max(1, int(getattr(exc, "retry_after", 1) or 1)),
-                sanitize=runtime.sanitize,
-            )
-            execute_outbox_connector_plan(plan)
+            with urllib.request.urlopen(url, data=data, timeout=self.timeout) as response:
+                body = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                data = json.loads(detail)
+            except json.JSONDecodeError:
+                data = {}
+            params = data.get("parameters") if isinstance(data.get("parameters"), dict) else {}
+            if exc.code == 429:
+                raise RateLimited(int(params.get("retry_after") or 1), sanitize_text(data.get("description") or detail, 300)) from exc
+            raise TelegramError(sanitize_text(data.get("description") or detail or str(exc), 300)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise TelegramError(sanitize_text(str(exc), 300)) from exc
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise TelegramError("Telegram returned non-json response") from exc
+        if not data.get("ok"):
+            raise TelegramError(sanitize_text(data.get("description") or "Telegram API error", 300))
+        return data
+
+    def send_message(
+        self,
+        chat_id: str,
+        html_text: str,
+        *,
+        thread_id: str | int | None = None,
+        reply_to_message_id: str | int | None = None,
+        notify: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": sanitize_text(html_text, 3900),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+            "disable_notification": "false" if notify else "true",
+        }
+        if thread_id:
+            payload["message_thread_id"] = str(thread_id)
+        if reply_to_message_id:
+            payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
+        try:
+            result = self.api("sendMessage", payload).get("result") or {}
+            return {"ok": True, "message_id": str(result.get("message_id") or "0")}
+        except TelegramError as exc:
+            fallback = html_to_plain(html_text)
+            if fallback and fallback != html_text:
+                plain_payload = dict(payload)
+                plain_payload.pop("parse_mode", None)
+                plain_payload["text"] = sanitize_text(fallback, 3900)
+                try:
+                    result = self.api("sendMessage", plain_payload).get("result") or {}
+                    return {"ok": True, "message_id": str(result.get("message_id") or "0"), "format": "plain"}
+                except TelegramError:
+                    pass
+            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
+    def edit_message(self, chat_id: str, message_id: str | int, html_text: str) -> dict[str, Any]:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": str(message_id),
+            "text": sanitize_text(html_text, 3900),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
+        try:
+            self.api("editMessageText", payload)
+            return {"ok": True, "message_id": str(message_id), "kind": "edited"}
+        except TelegramError as exc:
+            text = str(exc)
+            if "message is not modified" in text.lower():
+                return {"ok": True, "message_id": str(message_id), "kind": "unchanged"}
+            return {"ok": False, "error": sanitize_text(text, 300)}
+
+    def create_topic(self, chat_id: str, name: str) -> dict[str, Any]:
+        payload = {"chat_id": chat_id, "name": sanitize_text(name, 128)}
+        try:
+            result = self.api("createForumTopic", payload).get("result") or {}
+            return {"ok": True, "topic_id": str(result.get("message_thread_id") or "")}
+        except TelegramError as exc:
+            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
+    def edit_topic_icon(self, chat_id: str, thread_id: str, emoji_id: str) -> dict[str, Any]:
+        if not emoji_id:
+            return {"ok": False, "skipped": True}
+        try:
+            self.api("editForumTopic", {"chat_id": chat_id, "message_thread_id": str(thread_id), "icon_custom_emoji_id": emoji_id})
+            return {"ok": True}
+        except TelegramError as exc:
+            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
+    def pin_message(self, chat_id: str, message_id: str | int) -> dict[str, Any]:
+        try:
+            self.api("pinChatMessage", {"chat_id": chat_id, "message_id": str(message_id), "disable_notification": "true"})
+            return {"ok": True}
+        except TelegramError as exc:
+            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
+
+def topic_icon_id(store: dict[str, Any], emoji: str) -> str:
+    telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
+    icons = telegram.get("forum_topic_icons") if isinstance(telegram.get("forum_topic_icons"), dict) else {}
+    by_emoji = icons.get("by_emoji") if isinstance(icons.get("by_emoji"), dict) else {}
+    return str(by_emoji.get(emoji) or "")
+
+
+def drain_outbox(
+    store: dict[str, Any],
+    telegram: TelegramClient,
+    tendwire: TendwireClient,
+    *,
+    chat_id: str,
+    max_sends: int,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    result = {"enabled": True, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
+    if max_sends <= 0:
+        return result
+    poll = tendwire.connector_poll(limit=max_sends)
+    if not poll.get("ok"):
+        result.update({"changed": True, "status": poll.get("status") or "poll_failed"})
+        return result
+    items = [item for item in poll.get("items", []) if isinstance(item, dict)]
+    result["polled"] = len(items)
+    audit = store.setdefault("tendwire_outbox", {})
+    delivered = audit.setdefault("delivered_identities", [])
+    delivered_set = {str(item) for item in delivered}
+    for item in items[:max_sends]:
+        ref = str(item.get("ref") or "")
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        identity = short_hash({"key": item.get("key"), "payload": payload}, 24)
+        if identity in delivered_set:
+            if ref and not dry_run:
+                tendwire.connector_ack(ref, {"duplicate": True})
+            result["acked"] += 1
+            result["changed"] = True
             continue
-        except Exception as exc:  # noqa: BLE001 - connector failures are converted to Tendwire fail plans
-            sent = {"ok": False, "error": runtime.sanitize(str(exc), 300)}
+        html = render_attention_notice(payload)
+        sent = {"ok": True, "message_id": "0"} if dry_run else telegram.send_message(chat_id, html, thread_id=config.general_thread_id(store), notify=True)
         if sent.get("ok"):
-            counters["sends"] = counters.get("sends", 0) + 1
-            herdres_tendwire.outbox_record_delivery_success(result)
-            herdres_tendwire.note_outbox_audit(
-                state,
-                {"identity": identity, "status": "delivered", "recorded_at": runtime.now()},
-                checked_at=runtime.now(),
-            )
-            plan = herdres_tendwire.outbox_connector_plan(item, action, "delivered", sanitize=runtime.sanitize)
-            execute_outbox_connector_plan(plan)
-            continue
-        plan = herdres_tendwire.outbox_connector_plan(item, action, "failed", sanitize=runtime.sanitize)
-        execute_outbox_connector_plan(plan)
+            result["delivered"] += 1
+            result["acked"] += 1
+            result["changed"] = True
+            delivered.append(identity)
+            delivered_set.add(identity)
+            if ref and not dry_run:
+                tendwire.connector_ack(ref, {"telegram": "delivered"})
+        else:
+            result["failed"] += 1
+            result["changed"] = True
+            if ref and not dry_run:
+                tendwire.connector_fail(ref, str(sent.get("error") or "Telegram delivery failed"))
+    audit["delivered_identities"] = delivered[-200:]
     return result

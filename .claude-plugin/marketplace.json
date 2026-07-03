@@ -1,9 +1,0 @@
-{
-  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "herdres",
-  "description": "Operate the Herdr-to-Telegram bridge from a skills-compatible agent.",
-  "owner": { "name": "luminexord", "url": "https://github.com/luminexord" },
-  "plugins": [
-    { "name": "herdres", "description": "Herdres operator skill.", "source": "./", "category": "productivity" }
-  ]
-}
