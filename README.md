@@ -777,8 +777,9 @@ Tendwire config:
 Telegram source layout:
 
 - `HERDRES_TELEGRAM_LAYOUT=source_v1` keeps the current source-mode Telegram rendering and remains the rollback layout.
-- `HERDRES_TELEGRAM_LAYOUT=source_v2` enables the multi-project source-mode layout. It keeps one Telegram forum topic per Tendwire Space/project, one pinned and edited status board per Space, and one edited live card per active Worker. It does not change Tendwire command routing or public JSON.
-- Source v2 keeps in-progress `Working…` updates compact and collapsed by default. The same worker/turn live card is edited instead of reposted whenever Telegram allows it.
+- `HERDRES_TELEGRAM_LAYOUT=source_v2` enables the multi-project source-mode layout. It keeps one Telegram forum topic per Tendwire Space/project and one pinned and edited status board per Space. It does not change Tendwire command routing or public JSON.
+- Source v2 treats idle/working/done as pinned-board and topic-icon state, not extra status messages. `HERDR_TELEGRAM_TOPICS_LIVE_CARD=1` remains an explicit opt-in if an operator wants separate edited status cards.
+- Source v2 keeps in-progress `Working…` updates compact and collapsed by default. The same worker/turn message is edited instead of reposted whenever Telegram allows it.
 - Source v2 keeps completed final `Response` content expanded. If the same `turn_id` is seen again, Herdres edits or reuses the existing message instead of reposting the completed turn.
 - Attention and pending-interaction items are rendered as highlighted connector notices with an explicit heading and compact metadata; they stay public-safe and do not expose Telegram IDs or raw Herdr targets.
 - Topic cleanup stays report-first. `herdres topic-cleanup-report` is dry-run only and uses stable topic refs; no topic deletion is performed without a separate explicit confirmation path.

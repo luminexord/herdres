@@ -38,10 +38,12 @@ HERDRES_TELEGRAM_LAYOUT=source_v2
 ```
 
 `source_v1` is the rollback layout. `source_v2` keeps one topic per Tendwire
-Space/project, one edited status board per Space, one edited live card per
-active Worker, compact working updates, expanded final responses, highlighted
-attention/pending notices, and report-only topic cleanup until an explicit
-confirmation path is used.
+Space/project, one edited status board per Space, compact working updates,
+expanded final responses, highlighted attention/pending notices, and
+report-only topic cleanup until an explicit confirmation path is used.
+Idle/working/done state is shown on the pinned board and topic emoji; separate
+live status cards stay off unless `HERDR_TELEGRAM_TOPICS_LIVE_CARD=1` is set
+explicitly.
 
 ## Services
 

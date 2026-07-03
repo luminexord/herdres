@@ -8227,7 +8227,7 @@ def space_pinned_status_enabled() -> bool:
 
 
 def live_card_enabled() -> bool:
-    return bool(LIVE_CARD_ENABLED) or source_v2_layout_enabled()
+    return bool(LIVE_CARD_ENABLED)
 
 
 def working_badge_enabled() -> bool:

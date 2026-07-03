@@ -90,7 +90,7 @@ class SourceV2TelegramLayoutTests(unittest.TestCase):
         self.assertEqual(send_status.call_args.kwargs["thread_id"], "77")
         pin_status.assert_called_once_with("-1001", "501")
 
-    def test_source_v2_enables_edited_live_card_per_worker(self) -> None:
+    def test_source_v2_does_not_create_status_live_card_by_default(self) -> None:
         pane = make_pane("Codex", "working", agent="codex", workspace_id="alpha", tab_id="tab-alpha")
         state = {"version": 1, "telegram": {"chat_id": "-1001"}, "spaces": {}, "panes": {}}
         counters = {"creates": 0, "sends": 0, "feed_sends": 0, "marker_sends": 0, "verifies": 0, "renames": 0}
@@ -100,6 +100,41 @@ class SourceV2TelegramLayoutTests(unittest.TestCase):
         with self.source_v2_env(), patch.multiple(
             herdres,
             LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+            TURN_FEED_ENABLED=False,
+            CLEAN_FEED_ENABLED=False,
+            STATUS_ICON_ENABLED=False,
+            create_topic=Mock(return_value="77"),
+            update_live_card=update_live_card,
+            save_state=Mock(),
+            apply_api_error_warning=Mock(return_value={"topic_missing": False, "changed": False}),
+        ):
+            changed = herdres.sync_pane_once(
+                state,
+                "-1001",
+                state["telegram"],
+                pane,
+                counters,
+                caps,
+                turn_only=True,
+            )
+
+        self.assertTrue(changed)
+        update_live_card.assert_not_called()
+        key = herdres.pane_key(pane)
+        self.assertNotIn("card_status_hash", state["panes"][key])
+        self.assertNotIn("last_pane_message_id", state["panes"][key])
+
+    def test_source_v2_allows_status_live_card_only_when_explicitly_enabled(self) -> None:
+        pane = make_pane("Codex", "working", agent="codex", workspace_id="alpha", tab_id="tab-alpha")
+        state = {"version": 1, "telegram": {"chat_id": "-1001"}, "spaces": {}, "panes": {}}
+        counters = {"creates": 0, "sends": 0, "feed_sends": 0, "marker_sends": 0, "verifies": 0, "renames": 0}
+        caps = {"max_creates": 5, "max_sends": 8, "max_feed_sends": 0, "max_marker_sends": 0, "max_verifies": 0}
+        update_live_card = Mock(return_value={"ok": True, "attempted": True, "message_id": "601"})
+
+        with self.source_v2_env(), patch.multiple(
+            herdres,
+            LIVE_CARD_ENABLED=True,
             STATUS_MARKER_ENABLED=False,
             TURN_FEED_ENABLED=False,
             CLEAN_FEED_ENABLED=False,
