@@ -518,16 +518,18 @@ def test_final_response_renders_common_markdown_as_telegram_html():
 
     assert "##" not in html
     assert "**" not in html
-    assert "<h3>Alpha</h3><details" in html
+    # No redundant top worker title; the Response is the open top-level section.
+    assert "<h3>Alpha</h3>" not in html
+    assert html.startswith("<b>✅ Response</b>")
     assert "<h3>Fix it</h3>" in html
     assert "<ul>" in html
     assert "<li>keep <b>bold</b></li>" in html
     assert "escape &lt;tags&gt;" in html
     assert "<code>code</code>" in html
     assert "<p>Use <code>code</code>.</p>" in html
-    assert '<details open><summary><small><b>Response</b></small></summary>' in html
-    assert "<summary><small><b>Response</b></small></summary><blockquote>" not in html
-    assert "</details><details open>" in html
+    # Prompt is a de-emphasized (<footer>) collapsible section; no quote bars.
+    assert "<details open><summary>💬 <b>You</b></summary><footer>Question</footer></details>" in html
+    assert "<blockquote>" not in html
     assert "</details><br><details" not in html
 
 
@@ -541,8 +543,8 @@ def test_long_final_response_uses_full_visible_response_section():
         }
     )
 
-    assert '<details open><summary><small><b>Response</b></small></summary>' in html
-    assert "<summary><small><b>Response</b></small></summary><blockquote>" not in html
+    assert html.startswith("<b>✅ Response</b>")
+    assert "<blockquote>" not in html
     assert "<blockquote expandable>" not in html
     assert "##" not in html
     assert "**" not in html
@@ -597,7 +599,7 @@ def test_sync_sends_all_long_final_response_parts(monkeypatch):
 
     result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
 
-    response_messages = [sent[1] for sent in telegram.sent if "<b>Response" in sent[1]]
+    response_messages = [sent[1] for sent in telegram.sent if "<b>✅ Response" in sent[1]]
     assert result["feed_sent"] == 1
     assert len(response_messages) >= 1
     assert any(tail in message for message in response_messages)

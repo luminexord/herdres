@@ -13,7 +13,7 @@ from .safe import compact_ws, short_hash
 from .telegram_delivery import TelegramClient, drain_outbox, topic_icon_id
 from .tendwire_client import TendwireClient
 
-RENDER_VERSION = "telegram-rich-v25-old-spacing"
+RENDER_VERSION = "telegram-rich-v26-clean"
 
 
 @dataclass
