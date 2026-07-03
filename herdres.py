@@ -12992,6 +12992,7 @@ def _sync_pane_clean_feed(
                 if (
                     source_read_pane
                     and not lifecycle_message_id
+                    and same_semantic
                     and str(item.get("turn_id") or "")
                     and str(item.get("turn_id") or "") == str(entry.get("last_turn_id") or "")
                     and str(entry.get("last_clean_message_id") or "")

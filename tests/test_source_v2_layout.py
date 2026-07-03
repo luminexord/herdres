@@ -320,6 +320,12 @@ class SourceV2TelegramLayoutTests(unittest.TestCase):
             "last_turn_id": "turn-3",
             "last_clean_message_id": "700",
             "last_clean_kind": "turn",
+            "last_clean_text": "Final text",
+            "last_clean_item": {
+                "kind": "turn",
+                "turn_id": "turn-3",
+                "assistant_final_text": "Final text",
+            },
         }
         item = {"kind": "turn", "turn_id": "turn-3", "assistant_final_text": "Final text"}
 

@@ -2776,14 +2776,6 @@ def source_turn_delivery_seen(
     ledger = state.get("tendwire_source_delivered_turns")
     if key and isinstance(ledger, dict) and key in ledger:
         return True
-    clean_turn_id = sanitize(str(turn_id or ""), 200).strip()
-    if not clean_turn_id or not isinstance(ledger, dict):
-        return False
-    for record in ledger.values():
-        if not isinstance(record, dict):
-            continue
-        if str(record.get("worker_id") or "") == worker_id and str(record.get("turn_id") or "") == clean_turn_id:
-            return True
     return False
 
 
@@ -2793,10 +2785,10 @@ def prune_source_turn_delivery_ledger(ledger: dict[str, Any], *, cap: int) -> No
         if not isinstance(record, dict):
             continue
         worker_id = str(record.get("worker_id") or "")
-        turn_id = str(record.get("turn_id") or "")
-        if not worker_id or not turn_id:
+        identity = str(record.get("turn_identity") or "")
+        if not worker_id or not identity:
             continue
-        groups.setdefault(f"{worker_id}\0{turn_id}", []).append((str(key), record))
+        groups.setdefault(f"{worker_id}\0{identity}", []).append((str(key), record))
 
     for records in groups.values():
         if len(records) <= 1:
@@ -2855,21 +2847,8 @@ def note_source_turn_delivery_identity(
     ledger = source_turn_delivery_ledger(state)
     record = ledger.get(key)
     clean_turn_id = sanitize(str(turn_id or ""), 200).strip()
-    old_key = ""
-    if not isinstance(record, dict) and clean_turn_id:
-        for existing_key, existing in ledger.items():
-            if not isinstance(existing, dict):
-                continue
-            if str(existing.get("worker_id") or "") == worker_id and str(existing.get("turn_id") or "") == clean_turn_id:
-                record = existing
-                old_key = str(existing_key or "")
-                break
     if not isinstance(record, dict):
         record = {"delivered_at": str(now or "")}
-        ledger[key] = record
-        changed = True
-    elif old_key and old_key != key:
-        ledger.pop(old_key, None)
         ledger[key] = record
         changed = True
     else:
@@ -3042,17 +3021,48 @@ def source_turn_for_pane(
         return None
     fingerprint = str(pane.get("worker_fingerprint") or pane.get("_tendwire_fingerprint") or "").strip()
     turns = turns_payload.get("turns") if isinstance(turns_payload.get("turns"), list) else []
-    fallback: dict[str, Any] | None = None
+    candidates: list[dict[str, Any]] = []
     for turn in turns:
         if not isinstance(turn, dict):
             continue
         if str(turn.get("worker_id") or "").strip() != worker_id:
             continue
-        if fingerprint and str(turn.get("worker_fingerprint") or "").strip() == fingerprint:
-            return turn
-        if fallback is None:
-            fallback = turn
-    return fallback
+        candidates.append(turn)
+    if not candidates:
+        return None
+
+    def rank(turn: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, str, str]:
+        exact_fingerprint = int(
+            bool(fingerprint) and str(turn.get("worker_fingerprint") or "").strip() == fingerprint
+        )
+        has_user = int(bool(str(turn.get("user_text") or "").strip()))
+        has_final = int(bool(str(turn.get("assistant_final_text") or "").strip()))
+        has_stream = int(bool(str(turn.get("assistant_stream_text") or "").strip()))
+        has_content = int(
+            bool(
+                has_user
+                or has_final
+                or has_stream
+            )
+        )
+        command_origin = int(bool(str(turn.get("origin_command_id") or "").strip()))
+        open_turn = int(turn.get("has_open_turn") is True or turn.get("complete") is False)
+        command_prompt = int(bool(command_origin and open_turn and has_user))
+        updated_at = str(turn.get("updated_at") or turn.get("observed_at") or "")
+        turn_id = str(turn.get("id") or turn.get("turn_id") or "")
+        return (
+            exact_fingerprint,
+            command_origin,
+            command_prompt,
+            open_turn,
+            has_content,
+            has_final,
+            has_stream,
+            updated_at,
+            turn_id,
+        )
+
+    return max(candidates, key=rank)
 
 
 def source_turn_feed_source(
@@ -3070,6 +3080,7 @@ def source_turn_feed_source(
     feed_source = {
         "available": True,
         "turn_id": str(turn.get("id") or turn.get("turn_id") or turn.get("fingerprint") or ""),
+        "status": str(turn.get("status") or ""),
         "user_text": user_text,
         "assistant_final_text": assistant_final,
         "assistant_stream_text": assistant_stream,
@@ -3119,7 +3130,22 @@ def source_turn_feed_item(
     )
     stream_text = sanitize(str(feed_source.get("assistant_stream_text") or ""), max_reply_chars).strip()
     stream_turn_id = sanitize(str(feed_source.get("turn_id") or ""), 300).strip()
+    user_text = sanitize(str(feed_source.get("user_text") or ""), user_prompt_max_chars).strip()
+    open_or_incomplete = feed_source.get("has_open_turn") is True or feed_source.get("complete") is not True
+    prompt_hash = text_hash(user_text) if stream_turn_id and user_text else ""
+    prompt_already_sent = str(entry.get("last_prompt_turn_id") or "") == stream_turn_id and (
+        not str(entry.get("last_prompt_hash") or "") or str(entry.get("last_prompt_hash") or "") == prompt_hash
+    )
+    if open_or_incomplete and stream_turn_id and user_text and not prompt_already_sent:
+        entry["pending_prompt_turn_id"] = stream_turn_id
+        entry["pending_prompt_text"] = user_text
+        entry["pending_prompt_hash"] = prompt_hash
+    elif stream_turn_id:
+        entry.pop("pending_prompt_turn_id", None)
+        entry.pop("pending_prompt_text", None)
+        entry.pop("pending_prompt_hash", None)
     if stream_text and stream_turn_id and feed_source.get("has_open_turn") is True:
+        entry["prompt_working"] = False
         entry["pending_stream_turn_id"] = stream_turn_id
         entry["pending_stream_text"] = stream_text
         entry["pending_stream_revision"] = text_hash(stream_text)
@@ -3128,6 +3154,15 @@ def source_turn_feed_item(
         item = make_feed_item({**feed_source, "has_open_turn": False, "assistant_stream_text": ""})
     if isinstance(item, dict):
         item["prompt_collapse_chars"] = int(entry.get("prompt_collapse_chars") or 0)
+    entry["prompt_working"] = bool(
+        open_or_incomplete
+        and stream_turn_id
+        and user_text
+        and not stream_text
+        and str(feed_source.get("status") or "").strip().lower()
+        in {"active", "busy", "in_progress", "pending", "running", "waiting", "working"}
+        and not prompt_already_sent
+    )
     return item
 
 

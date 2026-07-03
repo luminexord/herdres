@@ -1000,7 +1000,7 @@ class TendwireModeTests(unittest.TestCase):
         pane_feed_output.assert_not_called()
         send_to_pane.assert_not_called()
 
-    def test_source_read_clean_feed_global_ledger_suppresses_rebuilt_entry_replay(self) -> None:
+    def test_source_read_clean_feed_global_ledger_allows_same_public_turn_new_content(self) -> None:
         state, key = _source_state()
         pane = _source_read_panes(_snapshot())[0]
         entry = state["panes"][key]
@@ -1083,14 +1083,19 @@ class TendwireModeTests(unittest.TestCase):
             )
 
         self.assertTrue(first["feed_delivered"])
-        self.assertEqual(len(sent_items), 1)
-        self.assertFalse(second["feed_delivered"])
-        self.assertEqual(counters["sends"], 0)
-        self.assertEqual(counters["feed_sends"], 0)
-        self.assertEqual(entry["last_clean_suppressed_reason"], "source_turn_global_delivered")
+        self.assertEqual(len(sent_items), 2)
+        self.assertTrue(second["feed_delivered"])
+        self.assertEqual(counters["sends"], 1)
+        self.assertEqual(counters["feed_sends"], 1)
+        self.assertNotEqual(sent_items[0]["assistant_final_text"], sent_items[1]["assistant_final_text"])
+        self.assertNotEqual(sent_items[0]["text"], sent_items[1]["text"])
+        self.assertNotEqual(
+            herdres.completed_turn_delivery_identity(sent_items[0]),
+            herdres.completed_turn_delivery_identity(sent_items[1]),
+        )
         self.assertEqual(entry["last_turn_id"], "turn-public-1")
         self.assertTrue(entry.get("delivered_turn_identities"))
-        self.assertEqual(len(state.get("tendwire_source_delivered_turns") or {}), 1)
+        self.assertEqual(len(state.get("tendwire_source_delivered_turns") or {}), 2)
 
     def test_source_read_global_ledger_still_delivers_open_stream_update(self) -> None:
         state, key = _source_state()
@@ -1203,7 +1208,7 @@ class TendwireModeTests(unittest.TestCase):
         pane_feed_output.assert_not_called()
         send_to_pane.assert_not_called()
 
-    def test_source_read_same_public_turn_suppresses_existing_clean_message_without_ledger(self) -> None:
+    def test_source_read_same_public_turn_new_content_sends_fresh_message_without_ledger(self) -> None:
         state, key = _source_state()
         pane = _source_read_panes(_snapshot())[0]
         entry = state["panes"][key]
@@ -1269,13 +1274,87 @@ class TendwireModeTests(unittest.TestCase):
                 changed=False,
             )
 
-        self.assertFalse(result["feed_delivered"])
+        self.assertTrue(result["feed_delivered"])
         edit_feed_item.assert_not_called()
-        send_feed_item.assert_not_called()
-        self.assertEqual(entry["last_clean_message_id"], "501")
+        send_feed_item.assert_called_once()
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["assistant_final_text"], "new response for the same public turn")
+        self.assertEqual(entry["last_clean_message_id"], "new-message")
         self.assertEqual(entry["last_turn_id"], "turn-public-1")
-        self.assertEqual(entry["last_clean_suppressed_reason"], "source_turn_already_delivered")
+        self.assertNotEqual(entry.get("last_clean_suppressed_reason"), "source_turn_already_delivered")
+        self.assertEqual(counters["sends"], 1)
+        self.assertEqual(counters["feed_sends"], 1)
         self.assertEqual(len(state.get("tendwire_source_delivered_turns") or {}), 1)
+
+    def test_source_read_open_turn_stages_prompt_echo_without_direct_herdr(self) -> None:
+        state, key = _source_state()
+        pane = _source_read_panes(_snapshot())[0]
+        entry = state["panes"][key]
+        entry["prompt_collapse_chars"] = 0
+        turns_payload = {
+            "schema_version": 1,
+            "turns": [
+                {
+                    "id": "turn-public-1",
+                    "worker_id": "worker-1",
+                    "worker_fingerprint": "fp-1",
+                    "status": "active",
+                    "user_text": "Please check the source-mode feed.",
+                    "assistant_final_text": "",
+                    "assistant_stream_text": "",
+                    "complete": False,
+                    "has_open_turn": True,
+                }
+            ],
+        }
+        counters = {"sends": 0, "feed_sends": 0}
+        sent_prompts: list[dict] = []
+
+        def fake_send_pending_prompt_message(*args, **kwargs) -> dict:
+            sent_prompts.append(dict(entry))
+            return {"changed": True, "message_id": "601"}
+
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
+                patch.object(herdres, "TURN_FEED_ENABLED", True), \
+                patch.object(herdres, "tendwire_turns", return_value=turns_payload), \
+                patch.object(herdres, "send_pending_prompt_message", side_effect=fake_send_pending_prompt_message), \
+                patch.object(herdres, "extract_turn_feed_item") as extract_turn_feed_item, \
+                patch.object(herdres, "cached_pane_turn") as cached_pane_turn, \
+                patch.object(herdres, "pane_turn") as pane_turn, \
+                patch.object(herdres, "prefetch_pane_turns") as prefetch_pane_turns, \
+                patch.object(herdres, "pane_feed_output") as pane_feed_output, \
+                patch.object(herdres, "send_to_pane") as send_to_pane, \
+                patch.object(herdres, "fold_superseded_turns", return_value=False), \
+                patch.object(herdres, "flush_pending_plan_doc", return_value=False), \
+                patch.object(herdres, "flush_pending_speech_reply", return_value=False):
+            result = herdres._sync_pane_clean_feed(
+                state,
+                "-100",
+                {},
+                pane,
+                entry,
+                counters,
+                pane_api_token=None,
+                turn_only=False,
+                new_entry=False,
+                max_sends=10,
+                max_feed_sends=10,
+                stable_obj_hash="status-hash",
+                changed=False,
+            )
+
+        self.assertIsNone(result["early_return"])
+        self.assertFalse(result["feed_delivered"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(sent_prompts[0]["pending_prompt_turn_id"], "turn-public-1")
+        self.assertEqual(sent_prompts[0]["pending_prompt_text"], "Please check the source-mode feed.")
+        self.assertTrue(sent_prompts[0]["prompt_working"])
+        extract_turn_feed_item.assert_not_called()
+        cached_pane_turn.assert_not_called()
+        pane_turn.assert_not_called()
+        prefetch_pane_turns.assert_not_called()
+        pane_feed_output.assert_not_called()
+        send_to_pane.assert_not_called()
 
     def test_sync_once_source_delivers_completed_tendwire_turn_without_direct_herdr(self) -> None:
         state = {
@@ -1783,7 +1862,7 @@ class TendwireModeTests(unittest.TestCase):
         self.assertEqual(records[0]["updated_at"], "2026-07-02T00:10:00+00:00")
         self.assertEqual(records[0]["turn_id"], "turn-public-1")
         rebuilt_identity = "turn-semantic-1-rebuilt"
-        self.assertTrue(
+        self.assertFalse(
             herdres_tendwire.source_turn_delivery_seen(
                 state,
                 pane,
@@ -1806,22 +1885,23 @@ class TendwireModeTests(unittest.TestCase):
         )
         self.assertTrue(redelivered)
         records = list(state["tendwire_source_delivered_turns"].values())
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["turn_identity"], rebuilt_identity)
-        self.assertEqual(records[0]["semantic_hash"], "sem-hash-rebuilt")
-        self.assertEqual(records[0]["delivered_at"], "2026-07-02T00:00:00+00:00")
-        self.assertEqual(records[0]["updated_at"], "2026-07-02T00:11:00+00:00")
+        by_identity = {record["turn_identity"]: record for record in records}
+        self.assertEqual(set(by_identity), {identity, rebuilt_identity})
+        self.assertEqual(by_identity[identity]["semantic_hash"], "sem-hash")
+        self.assertEqual(by_identity[rebuilt_identity]["semantic_hash"], "sem-hash-rebuilt")
+        self.assertEqual(by_identity[rebuilt_identity]["delivered_at"], "2026-07-02T00:11:00+00:00")
+        self.assertEqual(by_identity[rebuilt_identity]["updated_at"], "2026-07-02T00:11:00+00:00")
         self.assertFalse(herdres_tendwire.record_entry_delivered_turn_identity(entry, "", cap=10))
         self.assertFalse(herdres_tendwire.record_entry_delivered_turn_identity(entry, identity, cap=10))
         self.assertTrue(herdres_tendwire.record_entry_delivered_turn_identity(entry, "turn-semantic-2", cap=10))
         self.assertEqual(entry["delivered_turn_identities"], [identity, "turn-semantic-2"])
 
-    def test_tendwire_helper_dedupes_source_turn_delivery_ledger_by_public_turn(self) -> None:
+    def test_tendwire_helper_dedupes_source_turn_delivery_ledger_by_identity(self) -> None:
         ledger = {
             "source-turn:old": {
                 "worker_id": "worker-1",
                 "turn_id": "turn-public-1",
-                "turn_identity": "old-identity",
+                "turn_identity": "same-identity",
                 "semantic_hash": "old-semantic",
                 "delivered_at": "2026-07-02T00:00:00+00:00",
                 "updated_at": "2026-07-02T00:05:00+00:00",
@@ -1829,10 +1909,18 @@ class TendwireModeTests(unittest.TestCase):
             "source-turn:new": {
                 "worker_id": "worker-1",
                 "turn_id": "turn-public-1",
-                "turn_identity": "new-identity",
+                "turn_identity": "same-identity",
                 "semantic_hash": "new-semantic",
                 "delivered_at": "2026-07-02T00:10:00+00:00",
                 "updated_at": "2026-07-02T00:15:00+00:00",
+            },
+            "source-turn:distinct": {
+                "worker_id": "worker-1",
+                "turn_id": "turn-public-1",
+                "turn_identity": "distinct-identity",
+                "semantic_hash": "distinct-semantic",
+                "delivered_at": "2026-07-02T00:12:00+00:00",
+                "updated_at": "2026-07-02T00:13:00+00:00",
             },
             "source-turn:other": {
                 "worker_id": "worker-2",
@@ -1846,8 +1934,8 @@ class TendwireModeTests(unittest.TestCase):
 
         herdres_tendwire.prune_source_turn_delivery_ledger(ledger, cap=10)
 
-        self.assertEqual(sorted(ledger), ["source-turn:new", "source-turn:other"])
-        self.assertEqual(ledger["source-turn:new"]["turn_identity"], "new-identity")
+        self.assertEqual(sorted(ledger), ["source-turn:distinct", "source-turn:new", "source-turn:other"])
+        self.assertEqual(ledger["source-turn:new"]["turn_identity"], "same-identity")
         self.assertEqual(ledger["source-turn:new"]["delivered_at"], "2026-07-02T00:00:00+00:00")
         self.assertEqual(ledger["source-turn:new"]["updated_at"], "2026-07-02T00:15:00+00:00")
 
@@ -2141,6 +2229,37 @@ class TendwireHybridTests(unittest.TestCase):
 
         self.assertIsNotNone(turn)
         self.assertEqual(turn["id"], "fallback")
+
+    def test_source_turn_for_pane_prefers_command_origin_open_prompt(self) -> None:
+        pane = {"_tendwire_worker_id": "worker-1", "_tendwire_fingerprint": "fp-1"}
+        payload = {
+            "turns": [
+                {
+                    "id": "old-content",
+                    "worker_id": "worker-1",
+                    "worker_fingerprint": "fp-1",
+                    "assistant_final_text": "Previously delivered response",
+                    "complete": True,
+                    "has_open_turn": False,
+                    "updated_at": "2026-07-03T08:00:00+00:00",
+                },
+                {
+                    "id": "command-prompt",
+                    "worker_id": "worker-1",
+                    "worker_fingerprint": "fp-1",
+                    "origin_command_id": "req-1",
+                    "user_text": "Fresh Telegram prompt",
+                    "complete": False,
+                    "has_open_turn": True,
+                    "updated_at": "2026-07-03T08:01:00+00:00",
+                },
+            ],
+        }
+
+        turn = herdres_tendwire.source_turn_for_pane(pane, payload)
+
+        self.assertIsNotNone(turn)
+        self.assertEqual(turn["id"], "command-prompt")
 
     def test_source_turn_feed_source_sanitizes_and_defaults_public_turn_fields(self) -> None:
         def sanitizer(value: str, limit: int) -> str:

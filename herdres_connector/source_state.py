@@ -15,6 +15,17 @@ class SourceTurnRuntime:
     note_delivery: Callable[[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None], bool]
 
 
+def _turn_plain_text(item: dict[str, Any]) -> str:
+    user_text = str(item.get("user_text") or "").strip()
+    assistant_final = str(item.get("assistant_final_text") or "").strip()
+    parts: list[str] = []
+    if user_text:
+        parts.extend(["User:", user_text, ""])
+    if assistant_final:
+        parts.append(assistant_final)
+    return "\n".join(parts).strip()
+
+
 def already_clean_delivered(entry: dict[str, Any], item: dict[str, Any] | None) -> bool:
     if not isinstance(item, dict) or str(item.get("kind") or "").lower() != "turn":
         return False
@@ -27,7 +38,13 @@ def already_clean_delivered(entry: dict[str, Any], item: dict[str, Any] | None) 
         return False
     last_item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
     last_kind = str(entry.get("last_clean_kind") or last_item.get("kind") or "turn").lower()
-    return last_kind == "turn"
+    if last_kind != "turn":
+        return False
+    current_text = _turn_plain_text(item)
+    previous_text = str(entry.get("last_clean_text") or "").strip()
+    if not previous_text and last_item:
+        previous_text = _turn_plain_text(last_item)
+    return bool(current_text and previous_text and current_text == previous_text)
 
 
 def suppress_globally_delivered_turn(
@@ -53,4 +70,3 @@ def suppress_globally_delivered_turn(
         runtime.note_delivery(state, pane, entry, item)
         return True
     return False
-

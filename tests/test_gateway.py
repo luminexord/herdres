@@ -10,6 +10,7 @@ import time
 import types
 import unittest
 import urllib.error
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
@@ -2335,6 +2336,7 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
         for key in self.DIRECT_ORIGIN_FIELDS:
             self.assertNotIn(key, entry)
 
+    @contextmanager
     def _command_patches(
         self,
         state: dict,
@@ -2343,14 +2345,15 @@ class DirectOriginCommandMarkerTests(unittest.TestCase):
         pane_turn: Mock | None = None,
         save_state: Mock | None = None,
     ):
-        return patch.multiple(
+        with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "off"}, clear=False), patch.multiple(
             herdres,
             load_dotenv=Mock(),
             load_state=Mock(return_value=state),
             save_state=save_state or Mock(),
             send_to_pane=send_to_pane or Mock(return_value=(True, "")),
             pane_turn=pane_turn or Mock(return_value={"available": True, "turn_id": "turn-before"}),
-        )
+        ):
+            yield
 
     def test_command_reply_successful_direct_owner_send_sets_marker(self) -> None:
         state = self._state()

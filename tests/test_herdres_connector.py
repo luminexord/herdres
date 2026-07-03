@@ -55,6 +55,7 @@ class HerdresConnectorExtractionTests(unittest.TestCase):
             "last_turn_id": "turn-1",
             "last_clean_message_id": "501",
             "last_clean_kind": "turn",
+            "last_clean_text": "done",
         }
         item = {"kind": "turn", "turn_id": "turn-1", "assistant_final_text": "done"}
         reasons: list[str] = []
