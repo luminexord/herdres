@@ -128,7 +128,7 @@ def _success_reply(response: dict[str, Any]) -> str:
     ):
         return "Submitted to busy Tendwire worker."
     if status in {"accepted", "submitted", "sent", "ok", "success"}:
-        return ""
+        return "Sent to Tendwire worker."
     return ""
 
 
@@ -140,38 +140,39 @@ def _command_succeeded(response: dict[str, Any]) -> bool:
 
 
 def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
-    store = state.load_state()
-    _key, entry = state.find_entry_by_thread(store, str(payload.get("topic_id") or ""))
-    if entry is None:
-        return {"handled": False}
-    text = _send_text_from_payload(payload)
-    alias, clean_text = _split_target_alias(text)
-    if alias:
-        _alias_key, alias_entry = _worker_entry_from_alias(store, alias, entry)
-        if alias_entry is not None:
-            entry = alias_entry
-            text = clean_text
+    with state.state_lock():
+        store = state.load_state()
+        _key, entry = state.find_entry_by_thread(store, str(payload.get("topic_id") or ""))
+        if entry is None:
+            return {"handled": False}
+        text = _send_text_from_payload(payload)
+        alias, clean_text = _split_target_alias(text)
+        if alias:
+            _alias_key, alias_entry = _worker_entry_from_alias(store, alias, entry)
+            if alias_entry is not None:
+                entry = alias_entry
+                text = clean_text
+            else:
+                return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "unknown_target_alias"}
         else:
-            return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "unknown_target_alias"}
-    else:
-        _reply_key, reply_entry = _worker_entry_from_reply(store, payload)
-        if reply_entry is not None:
-            entry = reply_entry
-    if not text:
-        return {"handled": True, "reply": "Send a message in this topic or use /send <instruction>."}
-    request = _command_request(entry, payload, text)
-    response = TendwireClient().command(request)
-    ledger = store.setdefault("tendwire_command_submissions", {})
-    identity = short_hash({"request": request["request_id"], "worker": entry.get("tendwire_worker_id")}, 20)
-    ledger[identity] = {
-        "worker_id": entry.get("active_worker_id") or entry.get("tendwire_worker_id"),
-        "space_id": entry.get("tendwire_space_id") or entry.get("space_id"),
-        "status": response.get("status") or "unknown",
-    }
-    state.save_state(store)
-    if _command_succeeded(response):
-        return {"handled": True, "reply": _success_reply(response)}
-    return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": response.get("status") or "failed"}
+            _reply_key, reply_entry = _worker_entry_from_reply(store, payload)
+            if reply_entry is not None:
+                entry = reply_entry
+        if not text:
+            return {"handled": True, "reply": "Send a message in this topic or use /send <instruction>."}
+        request = _command_request(entry, payload, text)
+        response = TendwireClient().command(request)
+        ledger = store.setdefault("tendwire_command_submissions", {})
+        identity = short_hash({"request": request["request_id"], "worker": entry.get("tendwire_worker_id")}, 20)
+        ledger[identity] = {
+            "worker_id": entry.get("active_worker_id") or entry.get("tendwire_worker_id"),
+            "space_id": entry.get("tendwire_space_id") or entry.get("space_id"),
+            "status": response.get("status") or "unknown",
+        }
+        state.save_state(store)
+        if _command_succeeded(response):
+            return {"handled": True, "reply": _success_reply(response)}
+        return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": response.get("status") or "failed"}
 
 
 def callback_reply(_payload: dict[str, Any]) -> dict[str, Any]:
@@ -181,10 +182,11 @@ def callback_reply(_payload: dict[str, Any]) -> dict[str, Any]:
 def cmd_sync(_args: argparse.Namespace) -> int:
     config.load_env_file()
     config.require_source_mode()
-    store = state.load_state()
-    result = sync_once(store, _runtime(dry_run=False, with_outbox=True))
-    if result.get("changed"):
-        state.save_state(store)
+    with state.state_lock():
+        store = state.load_state()
+        result = sync_once(store, _runtime(dry_run=False, with_outbox=True))
+        if result.get("changed"):
+            state.save_state(store)
     return _json(result)
 
 
@@ -214,7 +216,8 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 def cmd_source_smoke(args: argparse.Namespace) -> int:
     config.load_env_file()
     config.require_source_mode()
-    store = copy.deepcopy(state.load_state())
+    with state.state_lock():
+        store = copy.deepcopy(state.load_state())
     result = sync_once(store, _runtime(dry_run=True, with_outbox=bool(args.with_outbox)))
     payload = {
         "ok": bool(result.get("ok")),
@@ -234,14 +237,15 @@ def cmd_source_smoke(args: argparse.Namespace) -> int:
 
 def cmd_outbox(args: argparse.Namespace) -> int:
     config.load_env_file()
-    store = state.load_state()
-    runtime = _runtime(dry_run=bool(args.dry_run), with_outbox=True)
-    chat_id = config.telegram_chat_id(store)
-    from herdres_connector.telegram_delivery import drain_outbox
+    with state.state_lock():
+        store = state.load_state()
+        runtime = _runtime(dry_run=bool(args.dry_run), with_outbox=True)
+        chat_id = config.telegram_chat_id(store)
+        from herdres_connector.telegram_delivery import drain_outbox
 
-    result = drain_outbox(store, runtime.telegram, runtime.tendwire, chat_id=chat_id, max_sends=int(args.limit), dry_run=bool(args.dry_run))
-    if result.get("changed") and not args.dry_run:
-        state.save_state(store)
+        result = drain_outbox(store, runtime.telegram, runtime.tendwire, chat_id=chat_id, max_sends=int(args.limit), dry_run=bool(args.dry_run))
+        if result.get("changed") and not args.dry_run:
+            state.save_state(store)
     return _json({"ok": True, **result})
 
 

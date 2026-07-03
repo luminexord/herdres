@@ -168,6 +168,67 @@ def _turn_content_hash(item: dict[str, Any], kind: str) -> str:
     )
 
 
+def _final_delivery_bindings(store: dict[str, Any], turn_id: str) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (message_id, binding)
+        for message_id, binding in state.message_bindings(store).items()
+        if isinstance(binding, dict) and str(binding.get("kind") or "") == "final" and str(binding.get("turn_id") or "") == turn_id
+    ]
+
+
+def _final_turn_delivered(store: dict[str, Any], turn_id: str) -> bool:
+    if not turn_id:
+        return False
+    prefix = f"final:{turn_id}:"
+    for identity, record in state.delivered_turns(store).items():
+        if str(identity).startswith(prefix):
+            return True
+        if isinstance(record, dict) and str(record.get("turn_id") or "") == turn_id:
+            return True
+    return False
+
+
+def _repair_delivered_final_entry(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], content_hash: str) -> bool:
+    turn_id = _turn_id(item)
+    changed = False
+    if entry.get("last_turn_id") != turn_id:
+        entry["last_turn_id"] = turn_id
+        changed = True
+    if entry.get("last_clean_hash") != content_hash:
+        entry["last_clean_hash"] = content_hash
+        changed = True
+    final_bindings = _final_delivery_bindings(store, turn_id)
+    if final_bindings:
+        message_ids = [message_id for message_id, _binding in final_bindings if message_id]
+        if entry.get("last_clean_message_ids") != message_ids:
+            entry["last_clean_message_ids"] = message_ids
+            changed = True
+        first_id = message_ids[0] if message_ids else ""
+        if first_id and entry.get("last_clean_message_id") != first_id:
+            entry["last_clean_message_id"] = first_id
+            changed = True
+        bot_kind = str(final_bindings[-1][1].get("bot_kind") or "")
+        if bot_kind and entry.get("last_clean_bot_kind") != bot_kind:
+            entry["last_clean_bot_kind"] = bot_kind
+            changed = True
+    return changed
+
+
+def _suppress_historical_final(store: dict[str, Any], item: dict[str, Any], content_hash: str) -> bool:
+    turn_id = _turn_id(item)
+    if not turn_id or _final_turn_delivered(store, turn_id):
+        return False
+    return state.mark_delivered(
+        store,
+        f"final:{turn_id}:{content_hash}",
+        {
+            "worker_id": compact_ws(item.get("worker_id"), 160),
+            "turn_id": turn_id,
+            "suppressed": "historical_same_worker_turn",
+        },
+    )
+
+
 def _ensure_topic(
     store: dict[str, Any],
     source: dict[str, Any],
@@ -211,15 +272,18 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
 
 
 def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, int]:
-    counts = {"created": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
+    counts = {"created": 0, "updated": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
     topic_mode = config.source_topic_mode()
     spaces = {compact_ws(item.get("id"), 160): item for item in _spaces(snapshot) if compact_ws(item.get("id"), 160)}
     workers_by_space: dict[str, list[dict[str, Any]]] = {}
     for worker in _workers(snapshot):
         space_id = compact_ws(worker.get("space_id"), 160)
+        existing_key = state.find_entry_key_by_worker(store, compact_ws(worker.get("id"), 160))
+        before = dict(state.source_worker_entries(store).get(existing_key) or {}) if existing_key is not None else {}
         _key, entry, created = state.upsert_worker_entry(store, worker)
         entry["status"] = normalized_status(worker.get("status"))
         counts["created"] += int(created)
+        counts["updated"] += int(not created and before != entry)
         if not _worker_is_open(worker):
             continue
         if space_id:
@@ -244,6 +308,8 @@ def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: Sync
         selectable = [worker for worker in workers_by_space.get(space_id, []) if _worker_is_open(worker)]
         if not selectable:
             continue
+        existing_key = state.find_entry_key_by_space(store, space_id)
+        before = dict(state.source_space_entries(store).get(existing_key) or {}) if existing_key is not None else {}
         _key, entry, created = state.upsert_space_entry(store, space)
         selected = _select_space_worker(selectable)
         seen_space_keys.add(_key)
@@ -256,6 +322,7 @@ def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: Sync
             entry["active_worker_status"] = normalized_status(selected.get("status"))
         topic_needed, topic_created = _ensure_topic(store, space, entry, runtime, chat_id=chat_id)
         counts["created"] += int(created or topic_created or topic_needed)
+        counts["updated"] += int(not created and before != entry)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["spaces"] += 1
     for key in list(state.source_space_entries(store)):
@@ -455,7 +522,8 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
     turn_id = _turn_id(item)
     content_hash = _turn_content_hash(item, "final")
     identity = f"final:{turn_id}:{content_hash}"
-    if identity in state.delivered_turns(store):
+    if identity in state.delivered_turns(store) or _final_turn_delivered(store, turn_id):
+        _repair_delivered_final_entry(store, item, entry, content_hash)
         return False
     feed_item = turn_item_from_source(item, entry)
     if runtime.dry_run:
@@ -573,13 +641,21 @@ def _bootstrap_existing_turns(store: dict[str, Any], turns_payload: dict[str, An
 
 
 def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_payload: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, int]:
-    counts = {"feed_sent": 0, "sent": 0}
+    counts = {"feed_sent": 0, "sent": 0, "updated": 0}
+    seen_final_workers: set[str] = set()
     for item in _turns(turns_payload):
         _key, entry = _entry_for_turn(store, item)
         if entry is None:
             continue
+        before = dict(entry)
         complete = bool(item.get("complete")) or bool(item.get("assistant_final_text"))
         if complete and (item.get("assistant_final_text") or item.get("assistant_stream_text")):
+            worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
+            if worker_key in seen_final_workers:
+                delivered = False
+                counts["updated"] += int(_suppress_historical_final(store, item, _turn_content_hash(item, "final")))
+                continue
+            seen_final_workers.add(worker_key)
             delivered = _deliver_final(store, item, entry, runtime, chat_id=chat_id)
         elif item.get("assistant_stream_text"):
             delivered = _deliver_working(store, item, entry, runtime, chat_id=chat_id)
@@ -587,6 +663,7 @@ def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_pa
             delivered = False
         counts["feed_sent"] += int(delivered)
         counts["sent"] += int(delivered)
+        counts["updated"] += int(not delivered and before != entry)
     for item in _pending(pending_payload):
         delivered = _deliver_pending(store, item, runtime, chat_id=chat_id)
         counts["feed_sent"] += int(delivered)
@@ -636,6 +713,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "status": f"tendwire_{name}_failed",
                 "changed": False,
                 "created": 0,
+                "updated": 0,
                 "panes": 0,
                 "spaces": 0,
                 "icon_updated": 0,
@@ -643,6 +721,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "feed_sent": 0,
                 "sent": 0,
                 "message_bindings": 0,
+                "turn_updates": 0,
                 "topic_cleanup": {"deleted": 0, "failed": 0, "pruned": 0, "changed": False},
                 "tendwire_outbox": {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False},
             }
@@ -650,9 +729,18 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     source_counts = _sync_sources(store, snapshot, runtime, chat_id=chat_id)
     message_bindings = _backfill_message_bindings(store)
     bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
-    turn_counts = {"feed_sent": 0, "sent": 0} if bootstrapped else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
+    turn_counts = {"feed_sent": 0, "sent": 0, "updated": 0} if bootstrapped else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
     topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id)
-    changed = changed or bool(source_counts["created"] or source_counts["icon_updated"] or turn_counts["sent"] or bootstrapped or topic_cleanup.get("changed") or message_bindings)
+    changed = changed or bool(
+        source_counts["created"]
+        or source_counts["updated"]
+        or source_counts["icon_updated"]
+        or turn_counts["sent"]
+        or turn_counts["updated"]
+        or bootstrapped
+        or topic_cleanup.get("changed")
+        or message_bindings
+    )
     pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
     changed = changed or pinned_changed
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
@@ -664,12 +752,14 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "ok": True,
         "changed": changed,
         "created": source_counts["created"],
+        "updated": source_counts["updated"],
         "panes": source_counts["panes"],
         "spaces": source_counts["spaces"],
         "icon_updated": source_counts["icon_updated"],
         "pinned_status_updated": int(pinned_changed),
         "feed_sent": turn_counts["feed_sent"],
         "sent": turn_counts["sent"],
+        "turn_updates": turn_counts["updated"],
         "bootstrap_seen": bootstrapped,
         "message_bindings": message_bindings,
         "topic_cleanup": topic_cleanup,
