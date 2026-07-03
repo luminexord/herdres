@@ -191,6 +191,56 @@ def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncR
     return False
 
 
+def _bootstrap_existing_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_payload: dict[str, Any]) -> int:
+    """Record current Tendwire rows as seen on first deployment.
+
+    The pre-slim source ledger used different identities. Without this bootstrap,
+    the first source-only sync can repost historical rows. This migration is
+    intentionally one-way and Telegram-silent.
+    """
+    if store.get("tendwired_bootstrap_complete"):
+        return 0
+    skipped = 0
+    for item in _turns(turns_payload):
+        _key, entry = _entry_for_turn(store, item)
+        if entry is None:
+            continue
+        turn_id = _turn_id(item)
+        if not turn_id:
+            continue
+        if bool(item.get("complete")) or item.get("assistant_final_text"):
+            content_hash = _turn_content_hash(item, "final")
+            identity = f"final:{turn_id}:{content_hash}"
+            state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
+            entry["last_turn_id"] = turn_id
+            entry["last_clean_hash"] = content_hash
+            entry.setdefault("last_clean_message_id", "0")
+            skipped += 1
+            continue
+        if item.get("assistant_stream_text"):
+            entry["last_stream_turn_id"] = turn_id
+            entry["last_stream_hash"] = _turn_content_hash(item, "working")
+            entry.setdefault("last_stream_message_id", "0")
+            skipped += 1
+    for item in _pending(pending_payload):
+        _key, entry = _entry_for_turn(store, item)
+        if entry is None:
+            continue
+        pending_id = compact_ws(item.get("id") or item.get("pending_id") or item.get("turn_id"), 200)
+        if not pending_id:
+            continue
+        content_hash = short_hash({"pending": pending_id, "text": item.get("prompt_text") or item.get("text")}, 20)
+        state.mark_delivered(
+            store,
+            f"pending:{pending_id}:{content_hash}",
+            {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id},
+        )
+        skipped += 1
+    store["tendwired_bootstrap_complete"] = True
+    store["tendwired_bootstrap_seen"] = skipped
+    return skipped
+
+
 def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_payload: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, int]:
     counts = {"feed_sent": 0, "sent": 0}
     for item in _turns(turns_payload):
@@ -200,7 +250,7 @@ def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_pa
         complete = bool(item.get("complete")) or bool(item.get("assistant_final_text"))
         if complete and (item.get("assistant_final_text") or item.get("assistant_stream_text")):
             delivered = _deliver_final(store, item, entry, runtime, chat_id=chat_id)
-        elif item.get("assistant_stream_text") or item.get("user_text"):
+        elif item.get("assistant_stream_text"):
             delivered = _deliver_working(store, item, entry, runtime, chat_id=chat_id)
         else:
             delivered = False
@@ -264,8 +314,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             }
     changed = False
     worker_counts = _sync_workers(store, snapshot, runtime, chat_id=chat_id)
-    turn_counts = _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
-    changed = changed or bool(worker_counts["created"] or worker_counts["icon_updated"] or turn_counts["sent"])
+    bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
+    turn_counts = {"feed_sent": 0, "sent": 0} if bootstrapped else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
+    changed = changed or bool(worker_counts["created"] or worker_counts["icon_updated"] or turn_counts["sent"] or bootstrapped)
     pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
     changed = changed or pinned_changed
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
@@ -282,5 +333,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "pinned_status_updated": int(pinned_changed),
         "feed_sent": turn_counts["feed_sent"],
         "sent": turn_counts["sent"],
+        "bootstrap_seen": bootstrapped,
         "tendwire_outbox": outbox_result,
     }

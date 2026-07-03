@@ -76,7 +76,39 @@ class FakeTelegram:
 
 
 def _store():
-    return {"enabled": True, "telegram": {"chat_id": "-100", "general_thread_id": "1"}, "panes": {}, "spaces": {}}
+    return {
+        "enabled": True,
+        "telegram": {"chat_id": "-100", "general_thread_id": "1"},
+        "panes": {},
+        "spaces": {},
+        "tendwired_bootstrap_complete": True,
+    }
+
+
+def test_first_sync_bootstraps_current_turns_without_telegram_posts(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    store.pop("tendwired_bootstrap_complete", None)
+    telegram = FakeTelegram()
+    turns = {
+        "turns": [
+            {
+                "id": "turn-0",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "user_text": "Old prompt",
+                "assistant_final_text": "Old final",
+                "complete": True,
+            }
+        ]
+    }
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+
+    assert result["bootstrap_seen"] == 1
+    assert result["feed_sent"] == 0
+    assert not any("Old final" in sent[1] for sent in telegram.sent)
+    assert store["tendwired_bootstrap_complete"] is True
 
 
 def test_sync_delivers_final_turn_once(monkeypatch):
