@@ -2782,6 +2782,39 @@ def source_turn_delivery_seen(
 
 
 def prune_source_turn_delivery_ledger(ledger: dict[str, Any], *, cap: int) -> None:
+    groups: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for key, record in list(ledger.items()):
+        if not isinstance(record, dict):
+            continue
+        worker_id = str(record.get("worker_id") or "")
+        turn_id = str(record.get("turn_id") or "")
+        if not worker_id or not turn_id:
+            continue
+        groups.setdefault(f"{worker_id}\0{turn_id}", []).append((str(key), record))
+
+    for records in groups.values():
+        if len(records) <= 1:
+            continue
+        keeper_key, keeper = max(
+            records,
+            key=lambda item: str(item[1].get("updated_at") or item[1].get("delivered_at") or ""),
+        )
+        delivered_values = sorted(
+            str(record.get("delivered_at") or "") for _key, record in records if str(record.get("delivered_at") or "")
+        )
+        updated_values = sorted(
+            str(record.get("updated_at") or record.get("delivered_at") or "")
+            for _key, record in records
+            if str(record.get("updated_at") or record.get("delivered_at") or "")
+        )
+        if delivered_values:
+            keeper["delivered_at"] = delivered_values[0]
+        if updated_values:
+            keeper["updated_at"] = updated_values[-1]
+        for key, _record in records:
+            if key != keeper_key:
+                ledger.pop(key, None)
+
     if len(ledger) <= int(cap):
         return
 

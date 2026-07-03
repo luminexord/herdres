@@ -1738,6 +1738,41 @@ class TendwireModeTests(unittest.TestCase):
         self.assertTrue(herdres_tendwire.record_entry_delivered_turn_identity(entry, "turn-semantic-2", cap=10))
         self.assertEqual(entry["delivered_turn_identities"], [identity, "turn-semantic-2"])
 
+    def test_tendwire_helper_dedupes_source_turn_delivery_ledger_by_public_turn(self) -> None:
+        ledger = {
+            "source-turn:old": {
+                "worker_id": "worker-1",
+                "turn_id": "turn-public-1",
+                "turn_identity": "old-identity",
+                "semantic_hash": "old-semantic",
+                "delivered_at": "2026-07-02T00:00:00+00:00",
+                "updated_at": "2026-07-02T00:05:00+00:00",
+            },
+            "source-turn:new": {
+                "worker_id": "worker-1",
+                "turn_id": "turn-public-1",
+                "turn_identity": "new-identity",
+                "semantic_hash": "new-semantic",
+                "delivered_at": "2026-07-02T00:10:00+00:00",
+                "updated_at": "2026-07-02T00:15:00+00:00",
+            },
+            "source-turn:other": {
+                "worker_id": "worker-2",
+                "turn_id": "turn-public-1",
+                "turn_identity": "other-identity",
+                "semantic_hash": "other-semantic",
+                "delivered_at": "2026-07-02T00:20:00+00:00",
+                "updated_at": "2026-07-02T00:21:00+00:00",
+            },
+        }
+
+        herdres_tendwire.prune_source_turn_delivery_ledger(ledger, cap=10)
+
+        self.assertEqual(sorted(ledger), ["source-turn:new", "source-turn:other"])
+        self.assertEqual(ledger["source-turn:new"]["turn_identity"], "new-identity")
+        self.assertEqual(ledger["source-turn:new"]["delivered_at"], "2026-07-02T00:00:00+00:00")
+        self.assertEqual(ledger["source-turn:new"]["updated_at"], "2026-07-02T00:15:00+00:00")
+
 
 class TendwireConfigTests(unittest.TestCase):
     def test_child_env_preserves_parent_and_overrides_only_tendwire_keys(self) -> None:
