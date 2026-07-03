@@ -93,7 +93,8 @@ class TendwireCommandSubprocessTests(unittest.TestCase):
             ("malformed", _completed("{"), "malformed_json"),
             ("non_object", _completed('["ok"]'), "non_object_json"),
             ("extra_json", _completed('{"ok":true}\n{"ok":true}'), "non_json_stdout"),
-            ("nonzero", _completed("", returncode=2, stderr="boom"), "nonzero_exit"),
+            ("nonzero_empty", _completed("", returncode=2, stderr="boom"), "nonzero_exit"),
+            ("nonzero_success", _completed({"status": "accepted"}, returncode=2, stderr="boom"), "nonzero_exit"),
         )
         for name, proc, status in cases:
             with self.subTest(name=name), patch.object(herdres, "run_cmd", return_value=proc):

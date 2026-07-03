@@ -1024,6 +1024,11 @@ def command_submit(
             detail = sanitize(proc.stderr or proc.stdout or "tendwire command failed", 500)
             return {"ok": False, "status": "nonzero_exit", "error": detail}
         return {"ok": False, "status": _json_error_status(error), "error": error}
+    if proc.returncode != 0:
+        status = response_status(data)
+        if not status or status in COMMAND_SUCCESS_STATUSES:
+            detail = sanitize(proc.stderr or "tendwire command failed", 500)
+            return {"ok": False, "status": "nonzero_exit", "error": detail}
     return data
 
 
