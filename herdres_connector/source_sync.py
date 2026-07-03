@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import config, state
-from .rendering import normalized_status, render_final_turn, render_pending, render_status_overview, render_working_update, status_emoji
+from .rendering import normalized_status, render_final_turn, render_final_turn_chunks, render_pending, render_status_overview, render_working_update, status_emoji
 from .safe import compact_ws, short_hash
 from .telegram_delivery import TelegramClient, drain_outbox, topic_icon_id
 from .tendwire_client import TendwireClient
 
-RENDER_VERSION = "telegram-html-md-v3"
+RENDER_VERSION = "telegram-html-md-v4"
 
 
 @dataclass
@@ -63,6 +63,11 @@ def _entry_is_council_topic(entry: dict[str, Any]) -> bool:
 
 def _should_delete_done_council_topic(entry: dict[str, Any]) -> bool:
     return config.delete_done_council_topics() and _entry_is_council_topic(entry) and _entry_status_is_finished(entry)
+
+
+def _topic_missing(error: Any) -> bool:
+    text = str(error or "").lower()
+    return "topic_id_invalid" in text or "message thread not found" in text
 
 
 def _space_is_open(space: dict[str, Any]) -> bool:
@@ -235,25 +240,51 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
     }
     panes = store.get("panes") if isinstance(store.get("panes"), dict) else {}
     audit = store.setdefault("telegram_deleted_topics", [])
+    deleted_topic_ids: set[str] = set()
+
+    def clear_worker_topic_refs(topic_id: str, reason: str) -> None:
+        for worker_key, worker_entry in list(state.source_worker_entries(store).items()):
+            if str(worker_entry.get("topic_id") or "") != topic_id:
+                continue
+            if _should_delete_done_council_topic(worker_entry):
+                panes.pop(worker_key, None)
+                continue
+            worker_entry.pop("topic_id", None)
+            worker_entry["deleted_topic_id"] = topic_id
+            worker_entry["deleted_topic_reason"] = reason
     for key, entry in list(state.source_worker_entries(store).items()):
         topic_id = str(entry.get("topic_id") or "")
         if not topic_id:
             continue
         stale_worker_topic = config.source_topic_mode() == "space" and topic_id not in visible_space_topics
-        done_council_topic = _should_delete_done_council_topic(entry)
+        done_council_topic = _should_delete_done_council_topic(entry) and (
+            config.source_topic_mode() == "worker" or topic_id not in visible_space_topics
+        )
         if not stale_worker_topic and not done_council_topic:
             continue
         reason = "done_council_topic" if done_council_topic else "stale_worker_topic"
         if runtime.dry_run:
-            result["deleted"] += 1
+            if topic_id not in deleted_topic_ids:
+                result["deleted"] += 1
+                deleted_topic_ids.add(topic_id)
             result["changed"] = True
             continue
         deleted = runtime.telegram.delete_topic(chat_id, topic_id)
         if not deleted.get("ok"):
+            if _topic_missing(deleted.get("error")):
+                result["changed"] = True
+                if done_council_topic:
+                    panes.pop(key, None)
+                else:
+                    entry.pop("topic_id", None)
+                    entry["deleted_topic_id"] = topic_id
+                    entry["deleted_topic_reason"] = reason
+                continue
             result["failed"] += 1
             entry["last_topic_delete_error"] = compact_ws(deleted.get("error"), 240)
             continue
         result["deleted"] += 1
+        deleted_topic_ids.add(topic_id)
         result["changed"] = True
         audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": reason})
         if done_council_topic:
@@ -268,19 +299,29 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
             continue
         topic_id = str(entry.get("topic_id") or "")
         should_delete = config.delete_done_council_topics() and _entry_is_council_topic(entry) and bool(topic_id)
-        if should_delete:
+        if should_delete and topic_id not in deleted_topic_ids:
             if runtime.dry_run:
                 result["deleted"] += 1
+                deleted_topic_ids.add(topic_id)
                 result["changed"] = True
                 continue
             deleted = runtime.telegram.delete_topic(chat_id, topic_id)
             if not deleted.get("ok"):
+                if _topic_missing(deleted.get("error")):
+                    clear_worker_topic_refs(topic_id, "done_council_space_topic")
+                    spaces.pop(key, None)
+                    result["pruned"] += 1
+                    result["changed"] = True
+                    continue
                 result["failed"] += 1
                 entry["last_topic_delete_error"] = compact_ws(deleted.get("error"), 240)
                 continue
             result["deleted"] += 1
+            deleted_topic_ids.add(topic_id)
             audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": "done_council_space_topic"})
         if not runtime.dry_run:
+            if should_delete:
+                clear_worker_topic_refs(topic_id, "done_council_space_topic")
             spaces.pop(key, None)
             result["pruned"] += 1
         result["changed"] = True
@@ -328,29 +369,43 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
             and entry.get("last_render_version") != RENDER_VERSION
             and not runtime.dry_run
         ):
-            edited = runtime.telegram.edit_message(chat_id, str(entry["last_clean_message_id"]), render_final_turn(item, entry))
+            chunks = render_final_turn_chunks(item, entry)
+            edited = runtime.telegram.edit_message(chat_id, str(entry["last_clean_message_id"]), chunks[0])
             if edited.get("ok"):
+                message_ids = [str(entry["last_clean_message_id"])]
+                for html in chunks[1:]:
+                    sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
+                    if not sent.get("ok"):
+                        entry["last_delivery_error"] = compact_ws(sent.get("error"), 240)
+                        return False
+                    message_ids.append(str(sent.get("message_id") or ""))
+                entry["last_clean_message_ids"] = [item for item in message_ids if item]
                 entry["last_render_version"] = RENDER_VERSION
                 return True
         return False
-    html = render_final_turn(item, entry)
+    html_chunks = render_final_turn_chunks(item, entry)
     if runtime.dry_run:
         state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
         entry["last_turn_id"] = turn_id
         entry["last_clean_hash"] = content_hash
         entry["last_render_version"] = RENDER_VERSION
         entry.setdefault("last_clean_message_id", "0")
+        entry["last_clean_message_ids"] = ["0"] * len(html_chunks)
         return True
-    sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
-    if sent.get("ok"):
-        state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
-        entry["last_turn_id"] = turn_id
-        entry["last_clean_hash"] = content_hash
-        entry["last_render_version"] = RENDER_VERSION
-        entry["last_clean_message_id"] = str(sent.get("message_id") or "")
-        return True
-    entry["last_delivery_error"] = compact_ws(sent.get("error"), 240)
-    return False
+    message_ids: list[str] = []
+    for html in html_chunks:
+        sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
+        if not sent.get("ok"):
+            entry["last_delivery_error"] = compact_ws(sent.get("error"), 240)
+            return False
+        message_ids.append(str(sent.get("message_id") or ""))
+    state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
+    entry["last_turn_id"] = turn_id
+    entry["last_clean_hash"] = content_hash
+    entry["last_render_version"] = RENDER_VERSION
+    entry["last_clean_message_id"] = message_ids[0] if message_ids else ""
+    entry["last_clean_message_ids"] = [item for item in message_ids if item]
+    return True
 
 
 def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:

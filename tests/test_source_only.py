@@ -6,7 +6,7 @@ from pathlib import Path
 import herdres
 import herdres_gateway
 from herdres_connector import state
-from herdres_connector.rendering import render_final_turn
+from herdres_connector.rendering import TELEGRAM_SAFE_HTML_CHARS, render_final_turn, render_final_turn_chunks
 from herdres_connector.safe import public_prune
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient
@@ -336,6 +336,73 @@ def test_finished_council_space_topic_is_deleted(monkeypatch):
     assert state.source_entries(store) == {}
 
 
+def test_finished_council_worker_and_space_topic_delete_once(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "gm-1", "name": "gm-local-as", "status": "closed", "space_id": "space-1", "fingerprint": "fp-1"},
+        topic_id="88",
+    )
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "gitmoot · local-as", "status": "active", "fingerprint": "space-fp"},
+        topic_id="88",
+    )
+    telegram = FakeTelegram()
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=[],
+                spaces=[{"id": "space-1", "name": "gitmoot · local-as", "status": "active", "fingerprint": "space-fp"}],
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert result["topic_cleanup"]["deleted"] == 1
+    assert telegram.deleted_topics == ["88"]
+    assert state.source_entries(store) == {}
+    assert state.source_worker_entries(store) == {}
+
+
+def test_finished_council_worker_does_not_delete_active_space_topic(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "gm-old", "name": "gm-local-as", "status": "done", "space_id": "space-1", "fingerprint": "fp-old"},
+        topic_id="88",
+    )
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "gitmoot · local-as", "status": "active", "fingerprint": "space-fp"},
+        topic_id="88",
+    )
+    telegram = FakeTelegram()
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=[
+                    {"id": "gm-new", "name": "gm-local-as", "status": "working", "space_id": "space-1", "fingerprint": "fp-new"}
+                ],
+                spaces=[{"id": "space-1", "name": "gitmoot · local-as", "status": "active", "fingerprint": "space-fp"}],
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert result["topic_cleanup"]["deleted"] == 0
+    assert telegram.deleted_topics == []
+    assert next(iter(state.source_entries(store).values()))["topic_id"] == "88"
+
+
 def test_final_response_renders_common_markdown_as_telegram_html():
     html = render_final_turn(
         {
@@ -372,6 +439,49 @@ def test_long_final_response_uses_full_visible_response_section():
     assert "• keep <b>rich</b> sections" in html
 
 
+def test_long_final_response_is_split_without_truncation():
+    tail = "TAIL_MARKER_12345"
+    html_chunks = render_final_turn_chunks(
+        {
+            "user_text": "Question",
+            "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 220 + tail,
+        },
+        {"topic_name": "Alpha", "tendwire_worker_id": "worker-1"},
+    )
+
+    assert len(html_chunks) > 1
+    assert all(len(chunk) <= TELEGRAM_SAFE_HTML_CHARS for chunk in html_chunks)
+    assert any("Response 1/" in chunk for chunk in html_chunks)
+    assert any(tail in chunk for chunk in html_chunks)
+    assert not any("##" in chunk or "**" in chunk for chunk in html_chunks)
+
+
+def test_sync_sends_all_long_final_response_parts(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    tail = "TAIL_MARKER_67890"
+    turns = {
+        "turns": [
+            {
+                "id": "turn-long",
+                "worker_id": "worker-1",
+                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 220 + tail,
+                "complete": True,
+            }
+        ]
+    }
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+
+    response_messages = [sent[1] for sent in telegram.sent if "<b>Response" in sent[1]]
+    assert result["feed_sent"] == 1
+    assert len(response_messages) > 1
+    assert any(tail in message for message in response_messages)
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert len(entry["last_clean_message_ids"]) == len(response_messages)
+
+
 def test_expandable_blockquote_has_delivery_fallbacks():
     variants = TelegramClient(token="fake", dry_run=True)._html_variants(
         "<b>Response</b>\n<blockquote expandable>hello <b>there</b></blockquote>"
@@ -383,6 +493,28 @@ def test_expandable_blockquote_has_delivery_fallbacks():
         "<b>Response</b>\n<blockquote>hello <b>there</b></blockquote>",
     )
     assert variants[-1] == ("plain", "Response\nhello there")
+
+
+def test_long_telegram_send_splits_instead_of_truncating():
+    class CapturingTelegram(TelegramClient):
+        def __init__(self):
+            super().__init__(token="fake")
+            object.__setattr__(self, "payloads", [])
+
+        def api(self, method, payload):
+            self.payloads.append((method, payload))
+            return {"ok": True, "result": {"message_id": len(self.payloads)}}
+
+    telegram = CapturingTelegram()
+    tail = "TAIL_MARKER_TELEGRAM_SPLIT"
+    result = telegram.send_message("-100", "<b>Long</b>\n" + ("word " * 1200) + tail, thread_id="77")
+
+    assert result["ok"] is True
+    assert result["format"] == "plain-split"
+    assert len(result["message_ids"]) > 1
+    assert all(len(payload["text"]) <= 3900 for _method, payload in telegram.payloads)
+    assert all("parse_mode" not in payload for _method, payload in telegram.payloads)
+    assert any(tail in payload["text"] for _method, payload in telegram.payloads)
 
 
 def test_existing_final_message_is_edited_to_current_rich_render(monkeypatch):
