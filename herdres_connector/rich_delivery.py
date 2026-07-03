@@ -24,6 +24,7 @@ MAX_REPLY_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "
 MAX_RICH_HTML_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS", "14000"))
 RICH_SAFE_CHARS = 12000
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
+WORKLOG_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_WORKLOG_MAX_CHARS", "1200"))
 PROMPT_PREVIEW_CHARS = 80
 USER_PROMPT_LABEL = "You"
 RESPONSE_LABEL = "Response"
@@ -307,17 +308,27 @@ def render_assistant_response_html(assistant_final: str) -> str:
         return ""
     body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
     marker = f"<b>{RESPONSE_ICON} {RESPONSE_LABEL}</b>"
-    return f"{marker}<br>{body_html}"
+    # Blank line below the title so the body isn't glued to it (a single <br>
+    # only moves to the next line in Telegram rich rendering — no visible gap).
+    return f"{marker}<br><br>{body_html}"
 
 
 def render_source_v2_working_update_html(worklog_text: str, *, label: str = WORKING_LABEL) -> str:
     clean = str(worklog_text or "").strip()
     if not clean:
         return ""
-    body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
+    # Match the "You" section styling exactly: flat inline lines joined by a
+    # single <br>. Rendering the worklog as rich <p>/<ul> blocks would give each
+    # line a native block margin, and _join_blocks adds a <br> between <p>s,
+    # stacking into the big gaps between paragraphs. Flat-inline keeps the
+    # worklog as small and gap-free as the prompt.
+    body = "<br>".join(_rich_inline(line, 900) for line in sanitize_text(clean, WORKLOG_MAX_CHARS).splitlines())
+    body = body.strip()
+    if not body:
+        return ""
     return _rich_details_quote_html(
         label or WORKING_LABEL,
-        body_html,
+        body,
         icon=WORKING_ICON,
         open_by_default=False,
         preview=_prompt_preview(clean),
@@ -341,11 +352,8 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
         parts.append(response_html)
     if user_text:
         parts.append(render_user_prompt_quote_html(user_text, int(item.get("prompt_collapse_chars") or 0)))
-    if worklog_text and not assistant_final:
+    if worklog_text:
         parts.append(render_source_v2_working_update_html(worklog_text, label=worklog_label))
-    elif worklog_text:
-        body_html = render_final_reply_html(worklog_text) or _rich_paragraph(worklog_text)
-        parts.append(_rich_details_quote_html(worklog_label, body_html, icon=WORKING_ICON, open_by_default=False, preview=_prompt_preview(worklog_text), de_emphasize=True))
     return _join_blocks(parts).strip()
 
 
