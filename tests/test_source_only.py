@@ -13,23 +13,34 @@ from herdres_connector.telegram_delivery import TelegramClient
 
 
 class FakeTendwire:
-    def __init__(self, *, turns=None, pending=None):
+    def __init__(self, *, turns=None, pending=None, workers=None, spaces=None):
         self.commands = []
         self._turns = turns or {"turns": []}
         self._pending = pending or {"pending_interactions": []}
+        self._workers = workers or [
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "working",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+                "meta": {"agent": "codex"},
+            }
+        ]
+        self._spaces = spaces or [
+            {
+                "id": "space-1",
+                "name": "Project",
+                "status": "active",
+                "fingerprint": "space-fp-1",
+            }
+        ]
 
     def snapshot(self):
         return {
             "ok": True,
-            "workers": [
-                {
-                    "id": "worker-1",
-                    "name": "Alpha",
-                    "status": "working",
-                    "fingerprint": "fp-1",
-                    "meta": {"agent": "codex"},
-                }
-            ],
+            "spaces": self._spaces,
+            "workers": self._workers,
         }
 
     def turns(self):
@@ -137,7 +148,62 @@ def test_sync_delivers_final_turn_once(monkeypatch):
     assert first["feed_sent"] == 1
     assert second["feed_sent"] == 0
     assert any("Full final answer" in sent[1] for sent in telegram.sent)
+    assert any(sent[2]["thread_id"] == "77" for sent in telegram.sent if "Full final answer" in sent[1])
     assert len(store["tendwire_source_delivered_turns"]) == 1
+
+
+def test_sync_creates_one_topic_per_space_not_per_worker(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    workers = [
+        {"id": "worker-1", "name": "codex", "status": "working", "space_id": "space-1", "fingerprint": "fp-1"},
+        {"id": "worker-2", "name": "claude", "status": "done", "space_id": "space-1", "fingerprint": "fp-2"},
+    ]
+    turns = {
+        "turns": [
+            {"id": "turn-1", "worker_id": "worker-1", "assistant_final_text": "one", "complete": True},
+            {"id": "turn-2", "worker_id": "worker-2", "assistant_final_text": "two", "complete": True},
+        ]
+    }
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                turns=turns,
+                workers=workers,
+                spaces=[{"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"}],
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert result["spaces"] == 1
+    assert result["panes"] == 2
+    assert telegram.topics == ["Project"]
+    assert len(state.source_entries(store)) == 1
+    assert len(state.source_worker_entries(store)) == 2
+    assert all(sent[2]["thread_id"] == "77" for sent in telegram.sent if sent[1].startswith("<b>Project"))
+
+
+def test_space_topic_reuses_existing_same_name_worker_topic(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    _key, legacy, _created = state.upsert_worker_entry(
+        store,
+        {"id": "worker-old", "name": "Project", "status": "idle", "space_id": "old-space", "fingerprint": "old-fp"},
+        topic_id="123",
+    )
+    legacy["topic_name"] = "Project"
+    telegram = FakeTelegram()
+
+    sync_once(store, SyncRuntime(FakeTendwire(), telegram, with_outbox=False))
+
+    assert telegram.topics == []
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert entry["topic_id"] == "123"
 
 
 def test_final_response_renders_common_markdown_as_telegram_html():
@@ -207,7 +273,7 @@ def test_existing_final_message_is_edited_to_current_rich_render(monkeypatch):
     runtime = SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False)
 
     assert sync_once(store, runtime)["feed_sent"] == 1
-    entry = next(iter(state.source_entries(store).values()))
+    entry = next(iter(state.source_worker_entries(store).values()))
     entry["last_render_version"] = "old"
     telegram.edited.clear()
 
@@ -235,12 +301,17 @@ def test_working_update_edits_existing_message(monkeypatch):
 def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
-    key, entry, _created = state.upsert_worker_entry(
+    state.upsert_worker_entry(
         store,
-        {"id": "worker-1", "name": "Alpha", "status": "idle", "fingerprint": "fp-1"},
+        {"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"},
+    )
+    _space_key, entry, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
         topic_id="77",
     )
-    store["panes"][key] = entry
+    entry["active_worker_id"] = "worker-1"
+    entry["active_worker_fingerprint"] = "fp-1"
     state.save_state(store)
     fake = FakeTendwire()
 
@@ -270,12 +341,16 @@ def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path,
 
 def test_gateway_maps_only_source_topic(monkeypatch):
     store = _store()
-    key, entry, _created = state.upsert_worker_entry(
+    state.upsert_worker_entry(
         store,
-        {"id": "worker-1", "name": "Alpha", "status": "idle", "fingerprint": "fp-1"},
+        {"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"},
+        topic_id="78",
+    )
+    _space_key, entry, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
         topic_id="77",
     )
-    store["panes"][key] = entry
     payload = herdres_gateway._payload_for_message(
         {
             "chat": {"id": "-100", "is_forum": True},

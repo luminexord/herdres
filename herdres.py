@@ -53,9 +53,23 @@ def _request_id(entry: dict[str, Any], payload: dict[str, Any], text: str) -> st
         "message": payload.get("message_id"),
         "reply": payload.get("reply_to_message_id"),
         "text": text,
-        "worker": entry.get("tendwire_worker_id"),
+        "worker": entry.get("active_worker_id") or entry.get("tendwire_worker_id"),
+        "space": entry.get("tendwire_space_id") or entry.get("space_id"),
     }
-    return f"herdres:{entry.get('tendwire_worker_id')}:{short_hash(material, 20)}"
+    target = entry.get("active_worker_id") or entry.get("tendwire_worker_id") or entry.get("tendwire_space_id") or "space"
+    return f"herdres:{target}:{short_hash(material, 20)}"
+
+
+def _target_for_entry(entry: dict[str, Any]) -> dict[str, str]:
+    worker_id = str(entry.get("active_worker_id") or entry.get("tendwire_worker_id") or "").strip()
+    fingerprint = str(entry.get("active_worker_fingerprint") or entry.get("tendwire_fingerprint") or "").strip()
+    if worker_id:
+        target = {"worker_id": worker_id}
+        if fingerprint:
+            target["worker_fingerprint"] = fingerprint
+        return target
+    space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "").strip()
+    return {"space_id": space_id} if space_id else {}
 
 
 def _command_request(entry: dict[str, Any], payload: dict[str, Any], text: str) -> dict[str, Any]:
@@ -64,10 +78,7 @@ def _command_request(entry: dict[str, Any], payload: dict[str, Any], text: str) 
         "action": "send_instruction",
         "request_id": _request_id(entry, payload, text),
         "dry_run": False,
-        "target": {
-            "worker_id": str(entry.get("tendwire_worker_id") or ""),
-            "worker_fingerprint": str(entry.get("tendwire_fingerprint") or ""),
-        },
+        "target": _target_for_entry(entry),
         "instruction": {"text": text},
         "params": {"origin": "telegram", "telegram_origin": "topic"},
     }
@@ -111,7 +122,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     ledger = store.setdefault("tendwire_command_submissions", {})
     identity = short_hash({"request": request["request_id"], "worker": entry.get("tendwire_worker_id")}, 20)
     ledger[identity] = {
-        "worker_id": entry.get("tendwire_worker_id"),
+        "worker_id": entry.get("active_worker_id") or entry.get("tendwire_worker_id"),
+        "space_id": entry.get("tendwire_space_id") or entry.get("space_id"),
         "status": response.get("status") or "unknown",
     }
     state.save_state(store)

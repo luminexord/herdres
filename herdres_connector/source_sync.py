@@ -27,6 +27,10 @@ def _workers(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in snapshot.get("workers", []) if isinstance(item, dict)]
 
 
+def _spaces(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item for item in snapshot.get("spaces", []) if isinstance(item, dict)]
+
+
 def _turns(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in payload.get("turns", []) if isinstance(item, dict)]
 
@@ -40,13 +44,50 @@ def _worker_is_open(worker: dict[str, Any]) -> bool:
     return normalized_status(worker.get("status")) not in {"closed", "failed"}
 
 
+def _space_is_open(space: dict[str, Any]) -> bool:
+    return normalized_status(space.get("status")) not in {"closed", "failed"}
+
+
+def _select_space_worker(workers: list[dict[str, Any]]) -> dict[str, Any]:
+    for wanted in ("working", "attention", "idle"):
+        matches = [worker for worker in workers if normalized_status(worker.get("status")) == wanted]
+        if matches:
+            return max(matches, key=lambda worker: str(worker.get("last_seen_at") or ""))
+    return max(workers, key=lambda worker: str(worker.get("last_seen_at") or "")) if workers else {}
+
+
+def _delivery_entry(space_entry: dict[str, Any], worker_entry: dict[str, Any] | None = None) -> dict[str, Any]:
+    worker_entry = worker_entry or {}
+    entry = worker_entry
+    worker_name = compact_ws(worker_entry.get("worker_name") or worker_entry.get("agent"), 80)
+    space_name = compact_ws(space_entry.get("topic_name"), 80)
+    if worker_name and space_name:
+        entry["topic_name"] = f"{space_name} · {worker_name}"
+    elif space_name:
+        entry["topic_name"] = space_name
+    entry["topic_id"] = str(space_entry.get("topic_id") or "")
+    entry["tendwire_space_id"] = space_entry.get("tendwire_space_id") or worker_entry.get("tendwire_space_id")
+    entry["space_topic_name"] = space_name
+    entry["tendwire_worker_id"] = worker_entry.get("tendwire_worker_id") or space_entry.get("active_worker_id")
+    entry["tendwire_fingerprint"] = worker_entry.get("tendwire_fingerprint") or space_entry.get("active_worker_fingerprint")
+    return entry
+
+
 def _entry_for_turn(store: dict[str, Any], item: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
     worker_id = compact_ws(item.get("worker_id"), 160)
     key = state.find_entry_key_by_worker(store, worker_id)
     if key is None:
         return None, None
-    entries = state.source_entries(store)
-    return key, entries.get(key)
+    worker_entry = state.source_worker_entries(store).get(key)
+    if worker_entry is None:
+        return None, None
+    _space_key, space_entry = state.find_space_entry_by_id(
+        store,
+        compact_ws(item.get("space_id") or worker_entry.get("tendwire_space_id") or worker_entry.get("space_id"), 160),
+    )
+    if space_entry is None:
+        return None, None
+    return key, _delivery_entry(space_entry, worker_entry)
 
 
 def _turn_id(item: dict[str, Any]) -> str:
@@ -68,7 +109,7 @@ def _turn_content_hash(item: dict[str, Any], kind: str) -> str:
 
 def _ensure_topic(
     store: dict[str, Any],
-    worker: dict[str, Any],
+    source: dict[str, Any],
     entry: dict[str, Any],
     runtime: SyncRuntime,
     *,
@@ -76,9 +117,13 @@ def _ensure_topic(
 ) -> tuple[bool, bool]:
     if entry.get("topic_id"):
         return False, False
+    reused = state.find_legacy_topic_id_by_name(store, entry.get("topic_name") or "")
+    if reused:
+        entry["topic_id"] = reused
+        return False, False
     if runtime.dry_run:
         return True, False
-    created = runtime.telegram.create_topic(chat_id, entry.get("topic_name") or state.topic_name_for_worker(worker))
+    created = runtime.telegram.create_topic(chat_id, entry.get("topic_name") or state.topic_name_for_space(source))
     if created.get("ok") and created.get("topic_id"):
         entry["topic_id"] = str(created["topic_id"])
         return True, True
@@ -104,17 +149,42 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
     return False
 
 
-def _sync_workers(store: dict[str, Any], snapshot: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, int]:
-    counts = {"created": 0, "panes": 0, "icon_updated": 0}
+def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, int]:
+    counts = {"created": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
+    spaces = {compact_ws(item.get("id"), 160): item for item in _spaces(snapshot) if compact_ws(item.get("id"), 160)}
+    workers_by_space: dict[str, list[dict[str, Any]]] = {}
     for worker in _workers(snapshot):
         if not _worker_is_open(worker):
             continue
+        space_id = compact_ws(worker.get("space_id"), 160)
+        if space_id:
+            workers_by_space.setdefault(space_id, []).append(worker)
         _key, entry, created = state.upsert_worker_entry(store, worker)
         entry["status"] = normalized_status(worker.get("status"))
-        topic_needed, topic_created = _ensure_topic(store, worker, entry, runtime, chat_id=chat_id)
+        counts["created"] += int(created)
+        counts["panes"] += 1
+
+    for space_id, workers in workers_by_space.items():
+        if space_id not in spaces:
+            spaces[space_id] = {"id": space_id, "name": space_id, "status": "unknown"}
+
+    for space_id, space in spaces.items():
+        if not _space_is_open(space):
+            continue
+        _key, entry, created = state.upsert_space_entry(store, space)
+        selectable = [worker for worker in workers_by_space.get(space_id, []) if _worker_is_open(worker)]
+        selected = _select_space_worker(selectable)
+        entry["status"] = normalized_status(selected.get("status") or space.get("status"))
+        entry["worker_count"] = len(selectable)
+        if selected:
+            entry["active_worker_id"] = compact_ws(selected.get("id"), 160)
+            entry["active_worker_fingerprint"] = compact_ws(selected.get("fingerprint"), 160)
+            entry["active_worker_name"] = compact_ws(selected.get("name"), 80)
+            entry["active_worker_status"] = normalized_status(selected.get("status"))
+        topic_needed, topic_created = _ensure_topic(store, space, entry, runtime, chat_id=chat_id)
         counts["created"] += int(created or topic_created or topic_needed)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
-        counts["panes"] += 1
+        counts["spaces"] += 1
     return counts
 
 
@@ -319,6 +389,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "changed": False,
                 "created": 0,
                 "panes": 0,
+                "spaces": 0,
                 "icon_updated": 0,
                 "pinned_status_updated": 0,
                 "feed_sent": 0,
@@ -326,10 +397,10 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "tendwire_outbox": {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False},
             }
     changed = False
-    worker_counts = _sync_workers(store, snapshot, runtime, chat_id=chat_id)
+    source_counts = _sync_sources(store, snapshot, runtime, chat_id=chat_id)
     bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
     turn_counts = {"feed_sent": 0, "sent": 0} if bootstrapped else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
-    changed = changed or bool(worker_counts["created"] or worker_counts["icon_updated"] or turn_counts["sent"] or bootstrapped)
+    changed = changed or bool(source_counts["created"] or source_counts["icon_updated"] or turn_counts["sent"] or bootstrapped)
     pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
     changed = changed or pinned_changed
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
@@ -340,9 +411,10 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     return {
         "ok": True,
         "changed": changed,
-        "created": worker_counts["created"],
-        "panes": worker_counts["panes"],
-        "icon_updated": worker_counts["icon_updated"],
+        "created": source_counts["created"],
+        "panes": source_counts["panes"],
+        "spaces": source_counts["spaces"],
+        "icon_updated": source_counts["icon_updated"],
         "pinned_status_updated": int(pinned_changed),
         "feed_sent": turn_counts["feed_sent"],
         "sent": turn_counts["sent"],
