@@ -1841,10 +1841,6 @@ TENDWIRE_OPTIONAL_PATH_KEYS = herdres_tendwire.OPTIONAL_PATH_KEYS
 TENDWIRE_HERDR_TIMEOUT_DEFAULT = herdres_tendwire.HERDR_TIMEOUT_DEFAULT
 
 
-def _tendwire_bool_env(env: Any, key: str) -> bool:
-    return herdres_tendwire.bool_env(env, key)
-
-
 def _warn_invalid_tendwire_mode(raw: Any) -> None:
     value = sanitize_text(str(raw), 120)
     allowed = ", ".join(TENDWIRE_MODE_VALUES)
@@ -1873,23 +1869,6 @@ def tendwire_outbox_once(args: Any) -> dict[str, Any]:
     if result.get("changed"):
         save_state(state)
     return {"ok": True, "tendwire_outbox": result, "sent": counters["sends"]}
-
-
-def _last_json_line(stdout: str) -> tuple[dict[str, Any] | None, int]:
-    parsed: dict[str, Any] | None = None
-    count = 0
-    for raw in str(stdout or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            count += 1
-            parsed = obj
-    return parsed, count
 
 
 def tendwire_source_smoke_once(args: Any) -> dict[str, Any]:
@@ -1928,7 +1907,7 @@ def tendwire_source_smoke_once(args: Any) -> dict[str, Any]:
             timeout=timeout,
             env=child_env,
         )
-        sync_result, json_lines = _last_json_line(proc.stdout)
+        sync_result, json_lines = herdres_tendwire.last_json_object_from_lines(proc.stdout)
         direct_calls = 0
         if direct_log.exists():
             direct_calls = len([line for line in direct_log.read_text(encoding="utf-8").splitlines() if line.strip()])
@@ -1982,10 +1961,6 @@ def tendwire_turns() -> dict[str, Any]:
         )
     except herdres_tendwire.TendwireCallError as exc:
         raise BridgeError(str(exc)) from exc
-
-
-def _json_object_from_stdout(stdout: str, source: str) -> tuple[dict[str, Any] | None, str]:
-    return herdres_tendwire.json_object_from_stdout(stdout, source)
 
 
 def tendwire_command(request: dict[str, Any]) -> dict[str, Any]:
@@ -2176,10 +2151,6 @@ def drain_tendwire_connector_outbox(
         plan = herdres_tendwire.outbox_connector_plan(item, action, "failed", sanitize=sanitize_text)
         execute_outbox_connector_plan(plan)
     return result
-
-
-TENDWIRE_COMMAND_SUCCESS_STATUSES = herdres_tendwire.COMMAND_SUCCESS_STATUSES
-TENDWIRE_COMMAND_FAILURE_STATUSES = herdres_tendwire.COMMAND_FAILURE_STATUSES
 
 
 def tendwire_source_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:

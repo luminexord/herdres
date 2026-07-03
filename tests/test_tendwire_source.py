@@ -1805,6 +1805,18 @@ class TendwireConfigTests(unittest.TestCase):
         )
         self.assertEqual(outbox_child["HERDRES_TENDWIRE_CONNECTOR_OUTBOX"], "1")
 
+    def test_last_json_object_from_lines_returns_last_object_and_count(self) -> None:
+        payload, count = herdres_tendwire.last_json_object_from_lines(
+            "noise\n"
+            '{"ok": false}\n'
+            '["ignored"]\n'
+            "{malformed}\n"
+            '{"ok": true, "panes": 2}\n'
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(payload, {"ok": True, "panes": 2})
+
     def test_tendwire_snapshot_passes_explicit_child_env(self) -> None:
         proc = subprocess.CompletedProcess(["tendwire", "snapshot", "--json"], 0, stdout=json.dumps(_snapshot()), stderr="")
         env = {

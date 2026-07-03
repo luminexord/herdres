@@ -990,6 +990,23 @@ def json_object_from_stdout(stdout: str, source: str) -> tuple[dict[str, Any] | 
     return value, ""
 
 
+def last_json_object_from_lines(stdout: str) -> tuple[dict[str, Any] | None, int]:
+    parsed: dict[str, Any] | None = None
+    count = 0
+    for raw in str(stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            count += 1
+            parsed = obj
+    return parsed, count
+
+
 def _json_error_status(error: str) -> str:
     if "malformed JSON" in error:
         return "malformed_json"
