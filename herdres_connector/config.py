@@ -80,6 +80,20 @@ def delete_done_council_topics(env: Any | None = None) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def topic_status_icons_enabled(env: Any | None = None) -> bool:
+    source = os.environ if env is None else env
+    value = str(source.get("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def topic_icon_cache_ttl_seconds(env: Any | None = None) -> int:
+    source = os.environ if env is None else env
+    try:
+        return max(60, int(str(source.get("HERDR_TELEGRAM_TOPICS_STATUS_ICON_CACHE_TTL", "86400") or "86400")))
+    except ValueError:
+        return 86400
+
+
 def managed_bots_enabled(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "0") or "").strip().lower()
