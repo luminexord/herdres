@@ -48,6 +48,36 @@ def _send_text_from_payload(payload: dict[str, Any]) -> str:
     return text
 
 
+def _split_target_alias(text: str) -> tuple[str, str]:
+    parts = str(text or "").strip().split(maxsplit=1)
+    if not parts or not parts[0].startswith("@"):
+        return "", str(text or "").strip()
+    alias = parts[0].strip("@:,. ")
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if rest.startswith("/send"):
+        rest = rest[5:].strip()
+    return alias, rest
+
+
+def _worker_entry_from_reply(store: dict[str, Any], payload: dict[str, Any]) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    binding = state.find_message_binding(
+        store,
+        payload.get("reply_to_message_id"),
+        topic_id=payload.get("topic_id"),
+    )
+    if not binding:
+        return None, None
+    return state.find_worker_entry_by_id(store, str(binding.get("worker_id") or ""))
+
+
+def _worker_entry_from_alias(store: dict[str, Any], alias: str, entry: dict[str, Any]) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    return state.find_worker_entry_by_alias(
+        store,
+        alias,
+        space_id=str(entry.get("tendwire_space_id") or entry.get("space_id") or ""),
+    )
+
+
 def _request_id(entry: dict[str, Any], payload: dict[str, Any], text: str) -> str:
     material = {
         "message": payload.get("message_id"),
@@ -115,6 +145,18 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if entry is None:
         return {"handled": False}
     text = _send_text_from_payload(payload)
+    alias, clean_text = _split_target_alias(text)
+    if alias:
+        _alias_key, alias_entry = _worker_entry_from_alias(store, alias, entry)
+        if alias_entry is not None:
+            entry = alias_entry
+            text = clean_text
+        else:
+            return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "unknown_target_alias"}
+    else:
+        _reply_key, reply_entry = _worker_entry_from_reply(store, payload)
+        if reply_entry is not None:
+            entry = reply_entry
     if not text:
         return {"handled": True, "reply": "Send a message in this topic or use /send <instruction>."}
     request = _command_request(entry, payload, text)

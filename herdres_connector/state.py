@@ -70,6 +70,49 @@ def find_entry_key_by_worker(data: dict[str, Any], worker_id: str) -> str | None
     return None
 
 
+def find_worker_entry_by_id(data: dict[str, Any], worker_id: str) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    key = find_entry_key_by_worker(data, worker_id)
+    if key is None:
+        return None, None
+    return key, source_worker_entries(data).get(key)
+
+
+def _alias_token(value: Any) -> str:
+    text = str(value or "").strip().lower().lstrip("@")
+    return "".join(char for char in text if char.isalnum())
+
+
+def find_worker_entry_by_alias(
+    data: dict[str, Any],
+    alias: str,
+    *,
+    space_id: str | None = None,
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    wanted = _alias_token(alias)
+    if not wanted:
+        return None, None
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for key, entry in source_worker_entries(data).items():
+        if space_id and str(entry.get("tendwire_space_id") or entry.get("space_id") or "") != str(space_id):
+            continue
+        values = (
+            entry.get("worker_name"),
+            entry.get("agent"),
+            entry.get("topic_name"),
+            entry.get("tendwire_worker_id"),
+            entry.get("worker_id"),
+        )
+        aliases = {_alias_token(value) for value in values if value}
+        if wanted in aliases:
+            candidates.append((key, entry))
+    if not candidates:
+        return None, None
+    order = {"working": 0, "attention": 1, "idle": 2}
+    candidates.sort(key=lambda item: str(item[1].get("tendwire_last_seen_at") or ""), reverse=True)
+    candidates.sort(key=lambda item: order.get(str(item[1].get("status") or "").lower(), 3))
+    return candidates[0]
+
+
 def find_entry_key_by_space(data: dict[str, Any], space_id: str) -> str | None:
     for key, entry in source_space_entries(data).items():
         if str(entry.get("tendwire_space_id") or entry.get("space_id") or "") == space_id:
@@ -213,3 +256,49 @@ def mark_delivered(data: dict[str, Any], identity: str, record: dict[str, Any]) 
         for key in list(ledger)[: len(ledger) - 1000]:
             ledger.pop(key, None)
     return True
+
+
+def message_bindings(data: dict[str, Any]) -> dict[str, Any]:
+    bindings = data.get("telegram_message_bindings")
+    if not isinstance(bindings, dict):
+        bindings = {}
+        data["telegram_message_bindings"] = bindings
+    return bindings
+
+
+def bind_message_to_worker(
+    data: dict[str, Any],
+    message_id: str | int | None,
+    entry: dict[str, Any],
+    *,
+    topic_id: str | int | None = None,
+    kind: str = "",
+    turn_id: str = "",
+) -> None:
+    message = str(message_id or "").strip()
+    if not message or message == "0":
+        return
+    bindings = message_bindings(data)
+    bindings[message] = {
+        "topic_id": str(topic_id or entry.get("topic_id") or ""),
+        "worker_id": str(entry.get("tendwire_worker_id") or entry.get("active_worker_id") or ""),
+        "worker_fingerprint": str(entry.get("tendwire_fingerprint") or entry.get("active_worker_fingerprint") or ""),
+        "space_id": str(entry.get("tendwire_space_id") or entry.get("space_id") or ""),
+        "kind": str(kind or ""),
+        "turn_id": str(turn_id or ""),
+    }
+    if len(bindings) > 2000:
+        for key in list(bindings)[: len(bindings) - 2000]:
+            bindings.pop(key, None)
+
+
+def find_message_binding(data: dict[str, Any], message_id: str | int | None, *, topic_id: str | int | None = None) -> dict[str, Any] | None:
+    message = str(message_id or "").strip()
+    if not message:
+        return None
+    binding = message_bindings(data).get(message)
+    if not isinstance(binding, dict):
+        return None
+    if topic_id and str(binding.get("topic_id") or "") and str(binding.get("topic_id")) != str(topic_id):
+        return None
+    return binding

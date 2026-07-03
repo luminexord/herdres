@@ -329,6 +329,26 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
     return result
 
 
+def _backfill_message_bindings(store: dict[str, Any]) -> int:
+    before = set(state.message_bindings(store))
+    for entry in state.source_worker_entries(store).values():
+        topic_id = str(entry.get("topic_id") or "")
+        if not topic_id:
+            _space_key, space_entry = state.find_space_entry_by_id(store, str(entry.get("tendwire_space_id") or entry.get("space_id") or ""))
+            topic_id = str((space_entry or {}).get("topic_id") or "")
+        if not topic_id:
+            continue
+        stream_id = str(entry.get("last_stream_message_id") or "")
+        if stream_id:
+            state.bind_message_to_worker(store, stream_id, entry, topic_id=topic_id, kind="working", turn_id=str(entry.get("last_stream_turn_id") or ""))
+        final_ids = entry.get("last_clean_message_ids")
+        if not isinstance(final_ids, list) or not final_ids:
+            final_ids = [entry.get("last_clean_message_id")]
+        for message_id in final_ids:
+            state.bind_message_to_worker(store, message_id, entry, topic_id=topic_id, kind="final", turn_id=str(entry.get("last_turn_id") or ""))
+    return len(set(state.message_bindings(store)) - before)
+
+
 def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
@@ -351,6 +371,7 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
         entry["last_stream_turn_id"] = turn_id
         entry["last_stream_hash"] = content_hash
         entry["last_stream_message_id"] = str(sent.get("message_id") or entry.get("last_stream_message_id") or "")
+        state.bind_message_to_worker(store, entry.get("last_stream_message_id"), entry, topic_id=thread_id, kind="working", turn_id=turn_id)
         return True
     entry["last_delivery_error"] = compact_ws(sent.get("error"), 240)
     return False
@@ -373,12 +394,15 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
             edited = runtime.telegram.edit_message(chat_id, str(entry["last_clean_message_id"]), chunks[0])
             if edited.get("ok"):
                 message_ids = [str(entry["last_clean_message_id"])]
+                state.bind_message_to_worker(store, entry["last_clean_message_id"], entry, topic_id=thread_id, kind="final", turn_id=turn_id)
                 for html in chunks[1:]:
                     sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
                     if not sent.get("ok"):
                         entry["last_delivery_error"] = compact_ws(sent.get("error"), 240)
                         return False
-                    message_ids.append(str(sent.get("message_id") or ""))
+                    message_id = str(sent.get("message_id") or "")
+                    message_ids.append(message_id)
+                    state.bind_message_to_worker(store, message_id, entry, topic_id=thread_id, kind="final", turn_id=turn_id)
                 entry["last_clean_message_ids"] = [item for item in message_ids if item]
                 entry["last_render_version"] = RENDER_VERSION
                 return True
@@ -398,7 +422,9 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
         if not sent.get("ok"):
             entry["last_delivery_error"] = compact_ws(sent.get("error"), 240)
             return False
-        message_ids.append(str(sent.get("message_id") or ""))
+        message_id = str(sent.get("message_id") or "")
+        message_ids.append(message_id)
+        state.bind_message_to_worker(store, message_id, entry, topic_id=thread_id, kind="final", turn_id=turn_id)
     state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
     entry["last_turn_id"] = turn_id
     entry["last_clean_hash"] = content_hash
@@ -425,6 +451,7 @@ def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncR
         return state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id})
     sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=True)
     if sent.get("ok"):
+        state.bind_message_to_worker(store, sent.get("message_id"), entry, topic_id=thread_id, kind="pending", turn_id=pending_id)
         return state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id})
     return False
 
@@ -549,15 +576,17 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "pinned_status_updated": 0,
                 "feed_sent": 0,
                 "sent": 0,
+                "message_bindings": 0,
                 "topic_cleanup": {"deleted": 0, "failed": 0, "pruned": 0, "changed": False},
                 "tendwire_outbox": {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False},
             }
     changed = False
     source_counts = _sync_sources(store, snapshot, runtime, chat_id=chat_id)
+    message_bindings = _backfill_message_bindings(store)
     bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
     turn_counts = {"feed_sent": 0, "sent": 0} if bootstrapped else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
     topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id)
-    changed = changed or bool(source_counts["created"] or source_counts["icon_updated"] or turn_counts["sent"] or bootstrapped or topic_cleanup.get("changed"))
+    changed = changed or bool(source_counts["created"] or source_counts["icon_updated"] or turn_counts["sent"] or bootstrapped or topic_cleanup.get("changed") or message_bindings)
     pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
     changed = changed or pinned_changed
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
@@ -576,6 +605,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "feed_sent": turn_counts["feed_sent"],
         "sent": turn_counts["sent"],
         "bootstrap_seen": bootstrapped,
+        "message_bindings": message_bindings,
         "topic_cleanup": topic_cleanup,
         "tendwire_outbox": outbox_result,
     }
