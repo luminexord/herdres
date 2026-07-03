@@ -1351,6 +1351,12 @@ def success_reply(
     result = response.get("result") if isinstance(response.get("result"), dict) else {}
     if str(result.get("delivery_state") or "").strip().lower() == "queued":
         return "Queued for Tendwire worker."
+    if (
+        str(result.get("transport_state") or "").strip().lower() == "submitted"
+        and str(result.get("target_state_at_send") or "").strip().lower()
+        in {"active", "busy", "in_progress", "pending", "running", "waiting", "working"}
+    ):
+        return "Submitted to busy Tendwire worker."
     if str(result.get("delivery_state") or "").strip().lower() == "duplicate_suppressed":
         return ""
     if status == "queued":

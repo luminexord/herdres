@@ -1208,6 +1208,19 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         )
         self.assertEqual(
             herdres_tendwire.success_reply(
+                {
+                    "status": "accepted",
+                    "result": {
+                        "delivery_state": "submitted",
+                        "transport_state": "submitted",
+                        "target_state_at_send": "working",
+                    },
+                }
+            ),
+            "Submitted to busy Tendwire worker.",
+        )
+        self.assertEqual(
+            herdres_tendwire.success_reply(
                 {"status": "accepted", "result": {"message": "Accepted for delivery"}},
                 sanitize=lambda text, limit=300: text[:limit].lower(),
             ),
@@ -1232,6 +1245,25 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         self.assertTrue(queued["succeeded"])
         self.assertTrue(queued["ledger_changed"])
         self.assertEqual(queued["reply"], "Queued for Tendwire worker.")
+
+        submitted_busy = herdres_tendwire.send_instruction_attempt_result(
+            {
+                "response": {
+                    "status": "accepted",
+                    "result": {
+                        "delivery_state": "submitted",
+                        "transport_state": "submitted",
+                        "target_state_at_send": "working",
+                    },
+                },
+                "ledger_changed": True,
+            },
+            safe_failure_reply=herdres.TENDWIRE_SAFE_SEND_FAILURE_REPLY,
+        )
+        self.assertFalse(submitted_busy["duplicate"])
+        self.assertTrue(submitted_busy["succeeded"])
+        self.assertTrue(submitted_busy["ledger_changed"])
+        self.assertEqual(submitted_busy["reply"], "Submitted to busy Tendwire worker.")
 
         failed = herdres_tendwire.send_instruction_attempt_result(
             {"response": {"status": "backend_unavailable"}, "ledger_changed": True},
