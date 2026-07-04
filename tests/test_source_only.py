@@ -1358,6 +1358,73 @@ def test_open_turn_in_space_keeps_topic_icon_working_when_worker_id_shifted(monk
     assert telegram.icon_edits == [("-100", "77", "icon-working")]
 
 
+def test_public_raw_status_working_overrides_done_source_status(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire(
+        turns={"turns": []},
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "claude",
+                "status": "done",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+                "meta": {"agent": "claude", "raw_status": "working"},
+            }
+        ],
+        spaces=[{"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"}],
+    )
+
+    result = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+    entry = next(iter(state.source_space_entries(store).values()))
+
+    assert result["icon_updated"] == 1
+    assert result["feed_sent"] == 0
+    assert entry["status"] == "working"
+    assert entry["active_worker_status"] == "working"
+    assert entry["last_topic_icon"] == "⚡️"
+
+
+def test_empty_current_turn_for_working_worker_sends_compact_working_update(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire(
+        turns={
+            "turns": [
+                {
+                    "id": "turn-current",
+                    "worker_id": "worker-1",
+                    "space_id": "space-1",
+                    "status": "done",
+                }
+            ]
+        },
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "claude",
+                "status": "done",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+                "meta": {"agent": "claude", "raw_status": "working"},
+            }
+        ],
+        spaces=[{"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"}],
+    )
+
+    first = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+    second = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+    entry = next(iter(state.source_worker_entries(store).values()))
+
+    assert first["feed_sent"] == 1
+    assert second["feed_sent"] == 0
+    assert entry["last_stream_turn_id"] == "turn-current"
+    assert any("Work is in progress." in sent[1] for sent in telegram.sent)
+
+
 def test_space_topic_pin_renders_worker_board_not_space_summary(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
