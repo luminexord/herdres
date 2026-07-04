@@ -10,7 +10,6 @@ from herdres_connector.managed_bots import managed_bot_kind_for_key, managed_bot
 from herdres_connector.rendering import render_status_overview
 from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_turn_item_html, turn_item_from_source
 from herdres_connector.safe import public_prune
-from herdres_connector import speech
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient, drain_outbox
 
@@ -1870,7 +1869,7 @@ def test_gateway_maps_only_source_topic(monkeypatch):
 def test_gateway_child_bot_payload_targets_child_kind(monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
     store = _store()
-    store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
+    store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token", "username": "codex_bot"}}
     state.upsert_worker_entry(
         store,
         {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
@@ -1888,7 +1887,7 @@ def test_gateway_child_bot_payload_targets_child_kind(monkeypatch):
             "message_thread_id": 77,
             "message_id": 10,
             "from": {"id": "1", "is_bot": False},
-            "text": "hello",
+            "text": "@codex_bot hello",
         },
         store,
         bot_key=key,
@@ -1898,10 +1897,52 @@ def test_gateway_child_bot_payload_targets_child_kind(monkeypatch):
     assert payload["target_bot_kind"] == "codex"
 
 
+def test_gateway_child_bot_does_not_claim_unaddressed_topic_message(monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    store = _store()
+    store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
+    )
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    key = managed_bot_tokens(store["telegram"])[0][0]
+
+    child_payload = herdres_gateway._payload_for_message(
+        {
+            "chat": {"id": "-100", "is_forum": True},
+            "message_thread_id": 77,
+            "message_id": 10,
+            "from": {"id": "1", "is_bot": False},
+            "text": "hello",
+        },
+        store,
+        bot_key=key,
+    )
+    manager_payload = herdres_gateway._payload_for_message(
+        {
+            "chat": {"id": "-100", "is_forum": True},
+            "message_thread_id": 77,
+            "message_id": 10,
+            "from": {"id": "1", "is_bot": False},
+            "text": "hello",
+        },
+        store,
+    )
+
+    assert child_payload is None
+    assert manager_payload is not None
+    assert "target_bot_kind" not in manager_payload
+
+
 def test_gateway_voice_payload_includes_attachment(monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
     store = _store()
-    store["telegram"]["managed_bots"] = {"kimi": {"enabled": True, "token": "kimi-token"}}
+    store["telegram"]["managed_bots"] = {"kimi": {"enabled": True, "token": "kimi-token", "username": "kimi_bot"}}
     state.upsert_worker_entry(
         store,
         {"id": "worker-kimi", "name": "kimi", "status": "idle", "space_id": "space-1", "fingerprint": "fp-kimi"},
@@ -1926,6 +1967,7 @@ def test_gateway_voice_payload_includes_attachment(monkeypatch):
                 "file_size": 4200,
                 "duration": 3,
             },
+            "caption": "@kimi_bot",
         },
         store,
         bot_key=key,
@@ -1949,6 +1991,7 @@ def test_gateway_pretranscribes_voice_before_command(monkeypatch, tmp_path):
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
         topic_id="77",
     )
+    store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
     state.save_state(store)
     seen = {}
 
