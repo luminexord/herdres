@@ -70,11 +70,24 @@ def _stamp_managed_voice(entry: dict[str, Any], voice_mode: str) -> None:
     entry["managed_voice_active"] = mode == "per_agent"
 
 
+def _meta_raw_status(worker: dict[str, Any]) -> str:
+    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+    return compact_ws(meta.get("raw_status"), 80)
+
+
 def _source_status(value: Any) -> str:
     raw = str(value or "").strip().lower().replace("-", "_")
     if raw == "active":
         return "idle"
     return normalized_status(value)
+
+
+def _dominant_status(*values: Any) -> str:
+    statuses = [normalized_status(value) for value in values if str(value or "").strip()]
+    for wanted in ("failed", "attention", "working"):
+        if wanted in statuses:
+            return wanted
+    return statuses[0] if statuses else ""
 
 
 def _turn_activity_status(item: dict[str, Any]) -> str:
@@ -103,8 +116,11 @@ def _turn_activity_statuses(payload: dict[str, Any]) -> tuple[dict[str, str], di
 
 def _effective_worker_status(worker: dict[str, Any], turn_status_by_worker: dict[str, str]) -> str:
     raw_status = normalized_status(worker.get("status"))
-    if raw_status in {"closed", "failed"}:
+    if raw_status in {"closed", "failed", "attention"}:
         return raw_status
+    public_raw_status = normalized_status(_meta_raw_status(worker))
+    if public_raw_status in {"failed", "attention", "working"}:
+        return public_raw_status
     worker_id = compact_ws(worker.get("id"), 160)
     if worker_id and turn_status_by_worker.get(worker_id):
         return turn_status_by_worker[worker_id]
@@ -249,6 +265,24 @@ def _turn_content_hash(item: dict[str, Any], kind: str) -> str:
         },
         20,
     )
+
+
+def _working_delivery_item(item: dict[str, Any]) -> dict[str, Any]:
+    if item.get("assistant_stream_text") or item.get("assistant_final_text"):
+        return item
+    updated = dict(item)
+    updated["assistant_stream_text"] = "Work is in progress."
+    return updated
+
+
+def _turn_is_working_placeholder(item: dict[str, Any], entry: dict[str, Any]) -> bool:
+    if item.get("assistant_stream_text") or item.get("assistant_final_text"):
+        return False
+    if bool(item.get("complete")):
+        return False
+    if not _turn_id(item):
+        return False
+    return normalized_status(entry.get("status")) == "working"
 
 
 def _final_delivery_bindings(store: dict[str, Any], turn_id: str) -> list[tuple[str, dict[str, Any]]]:
@@ -638,14 +672,16 @@ def _sync_sources(
         _stamp_managed_voice(entry, _entry_voice_mode(entry))
         selected = _select_space_worker(selectable, turn_status_by_worker)
         seen_space_keys.add(_key)
-        entry["status"] = turn_status_by_space.get(space_id) or _effective_worker_status(selected, turn_status_by_worker) or _source_status(space.get("status"))
+        selected_status = _effective_worker_status(selected, turn_status_by_worker) if selected else ""
+        space_turn_status = turn_status_by_space.get(space_id) or ""
+        entry["status"] = _dominant_status(space_turn_status, selected_status, _source_status(space.get("status")))
         entry["worker_count"] = len(selectable)
         entry["worker_ids"] = [compact_ws(worker.get("id"), 160) for worker in selectable if compact_ws(worker.get("id"), 160)]
         if selected:
             entry["active_worker_id"] = compact_ws(selected.get("id"), 160)
             entry["active_worker_fingerprint"] = compact_ws(selected.get("fingerprint"), 160)
             entry["active_worker_name"] = compact_ws(selected.get("name"), 80)
-            entry["active_worker_status"] = turn_status_by_space.get(space_id) or _effective_worker_status(selected, turn_status_by_worker)
+            entry["active_worker_status"] = _dominant_status(space_turn_status, selected_status)
         topic_needed, topic_created = _ensure_topic(store, space, entry, runtime, chat_id=chat_id)
         counts["created"] += int(created or topic_created or topic_needed)
         counts["updated"] += int(not created and before != entry)
@@ -795,9 +831,10 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
         return False
+    delivery_item = _working_delivery_item(item)
     turn_id = _turn_id(item)
-    content_hash = _turn_content_hash(item, "working")
-    feed_item = turn_item_from_source(item, entry)
+    content_hash = _turn_content_hash(delivery_item, "working")
+    feed_item = turn_item_from_source(delivery_item, entry)
     if entry.get("last_stream_turn_id") == turn_id and entry.get("last_stream_hash") == content_hash:
         return False
     if runtime.dry_run:
@@ -990,7 +1027,11 @@ def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_pa
         if not worker_key:
             continue
         complete = bool(item.get("complete")) or bool(item.get("assistant_final_text"))
-        has_content = bool(item.get("assistant_stream_text")) or (complete and bool(item.get("assistant_final_text")))
+        has_content = (
+            bool(item.get("assistant_stream_text"))
+            or (complete and bool(item.get("assistant_final_text")))
+            or _turn_is_working_placeholder(item, entry)
+        )
         if not has_content:
             continue
         # Tendwire store output is already ordered by per-worker observed recency.
@@ -1017,7 +1058,7 @@ def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_pa
                 continue
             seen_final_workers.add(worker_key)
             delivered = _deliver_final(store, item, entry, runtime, chat_id=chat_id)
-        elif item.get("assistant_stream_text"):
+        elif item.get("assistant_stream_text") or _turn_is_working_placeholder(item, entry):
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 continue
             if worker_key in seen_working_workers:
