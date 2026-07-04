@@ -86,6 +86,12 @@ def topic_status_icons_enabled(env: Any | None = None) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def delete_topic_icon_service_messages(env: Any | None = None) -> bool:
+    source = os.environ if env is None else env
+    value = str(source.get("HERDR_TELEGRAM_TOPICS_DELETE_ICON_MESSAGES", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def topic_icon_cache_ttl_seconds(env: Any | None = None) -> int:
     source = os.environ if env is None else env
     try:

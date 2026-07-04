@@ -202,6 +202,41 @@ def _delivery_entry(space_entry: dict[str, Any], worker_entry: dict[str, Any] | 
     return entry
 
 
+def _entry_worker_id(entry: dict[str, Any]) -> str:
+    return compact_ws(entry.get("tendwire_worker_id") or entry.get("worker_id") or entry.get("active_worker_id"), 160)
+
+
+def _entry_space_id(entry: dict[str, Any]) -> str:
+    return compact_ws(entry.get("tendwire_space_id") or entry.get("space_id"), 160)
+
+
+def _source_space_topic_ids(store: dict[str, Any]) -> dict[str, str]:
+    topic_ids: dict[str, str] = {}
+    for entry in state.source_space_entries(store).values():
+        space_id = _entry_space_id(entry)
+        topic_id = compact_ws(entry.get("topic_id"), 80)
+        if space_id and topic_id:
+            topic_ids[space_id] = topic_id
+    return topic_ids
+
+
+def _worker_entry_for_turn(store: dict[str, Any], worker_id: str, space_id: str) -> tuple[str | None, dict[str, Any] | None]:
+    candidates = [
+        (key, entry)
+        for key, entry in state.source_worker_entries(store).items()
+        if _entry_worker_id(entry) == worker_id
+    ]
+    if not candidates:
+        return None, None
+    if space_id:
+        matches = [(key, entry) for key, entry in candidates if _entry_space_id(entry) == space_id]
+        if matches:
+            return matches[0]
+        if any(_entry_space_id(entry) for _key, entry in candidates):
+            return None, None
+    return candidates[0]
+
+
 def _telegram_state(store: dict[str, Any]) -> dict[str, Any]:
     telegram = store.get("telegram")
     if not isinstance(telegram, dict):
@@ -233,17 +268,17 @@ def _record_delivery_success(entry: dict[str, Any], bot_kind: str) -> None:
 
 def _entry_for_turn(store: dict[str, Any], item: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
     worker_id = compact_ws(item.get("worker_id"), 160)
-    key = state.find_entry_key_by_worker(store, worker_id)
+    space_id = compact_ws(item.get("space_id"), 160)
+    key, worker_entry = _worker_entry_for_turn(store, worker_id, space_id)
     if key is None:
         return None, None
-    worker_entry = state.source_worker_entries(store).get(key)
     if worker_entry is None:
         return None, None
     if config.source_topic_mode() == "worker":
         return key, worker_entry
     _space_key, space_entry = state.find_space_entry_by_id(
         store,
-        compact_ws(item.get("space_id") or worker_entry.get("tendwire_space_id") or worker_entry.get("space_id"), 160),
+        compact_ws(space_id or worker_entry.get("tendwire_space_id") or worker_entry.get("space_id"), 160),
     )
     if space_entry is None:
         return None, None
@@ -265,6 +300,21 @@ def _turn_content_hash(item: dict[str, Any], kind: str) -> str:
         },
         20,
     )
+
+
+def _turn_user_hash(item: dict[str, Any]) -> str:
+    text = compact_ws(item.get("user_text"), 2000)
+    return short_hash({"user": text}, 16) if text else ""
+
+
+def _changed_final_should_send_new_message(item: dict[str, Any], entry: dict[str, Any]) -> bool:
+    user_hash = _turn_user_hash(item)
+    if not user_hash:
+        return False
+    if entry.get("last_turn_id") != _turn_id(item):
+        return False
+    previous = str(entry.get("last_clean_user_hash") or "")
+    return bool(previous and previous != user_hash)
 
 
 def _working_delivery_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -337,6 +387,7 @@ def _clear_open_turn_final_delivery_state(store: dict[str, Any], entry: dict[str
             "last_clean_message_id",
             "last_clean_message_ids",
             "last_clean_bot_kind",
+            "last_clean_user_hash",
             "last_render_version",
         ):
             if key in entry:
@@ -353,6 +404,13 @@ def _repair_delivered_final_entry(store: dict[str, Any], item: dict[str, Any], e
         changed = True
     if entry.get("last_clean_hash") != content_hash:
         entry["last_clean_hash"] = content_hash
+        changed = True
+    user_hash = _turn_user_hash(item)
+    if user_hash and entry.get("last_clean_user_hash") != user_hash:
+        entry["last_clean_user_hash"] = user_hash
+        changed = True
+    if not user_hash and "last_clean_user_hash" in entry:
+        entry.pop("last_clean_user_hash", None)
         changed = True
     final_bindings = _final_delivery_bindings(store, turn_id)
     if final_bindings:
@@ -397,6 +455,11 @@ def _record_final_delivery_success(
     entry["last_clean_hash"] = content_hash
     entry["last_render_version"] = RENDER_VERSION
     entry["last_clean_bot_kind"] = bot_kind
+    user_hash = _turn_user_hash(item)
+    if user_hash:
+        entry["last_clean_user_hash"] = user_hash
+    else:
+        entry.pop("last_clean_user_hash", None)
     _record_delivery_success(entry, bot_kind)
     entry["last_clean_message_id"] = message_ids[0] if message_ids else ""
     entry["last_clean_message_ids"] = [message_id for message_id in message_ids if message_id]
@@ -839,6 +902,62 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
     return result
 
 
+def _clear_entry_message_reference(entry: dict[str, Any], message_id: str, kind: str) -> bool:
+    changed = False
+    if kind == "working" and str(entry.get("last_stream_message_id") or "") == message_id:
+        for key in ("last_stream_message_id", "last_stream_turn_id", "last_stream_hash", "last_stream_bot_kind"):
+            if key in entry:
+                entry.pop(key, None)
+                changed = True
+    if kind == "final":
+        message_ids = entry.get("last_clean_message_ids")
+        if isinstance(message_ids, list) and message_id in {str(item) for item in message_ids}:
+            kept = [str(item) for item in message_ids if str(item) != message_id]
+            if kept:
+                entry["last_clean_message_ids"] = kept
+                entry["last_clean_message_id"] = kept[0]
+            else:
+                for key in ("last_clean_message_ids", "last_clean_message_id", "last_clean_hash", "last_turn_id", "last_clean_bot_kind"):
+                    entry.pop(key, None)
+            changed = True
+        elif str(entry.get("last_clean_message_id") or "") == message_id:
+            for key in ("last_clean_message_id", "last_clean_hash", "last_turn_id", "last_clean_bot_kind"):
+                entry.pop(key, None)
+                changed = True
+    return changed
+
+
+def _repair_space_mode_routing_state(store: dict[str, Any]) -> int:
+    if config.source_topic_mode() != "space":
+        return 0
+    repaired = 0
+    topic_by_space = _source_space_topic_ids(store)
+    for entry in state.source_worker_entries(store).values():
+        space_id = _entry_space_id(entry)
+        expected_topic = topic_by_space.get(space_id)
+        actual_topic = compact_ws(entry.get("topic_id"), 80)
+        if expected_topic and actual_topic and actual_topic != expected_topic:
+            entry.pop("topic_id", None)
+            repaired += 1
+    bindings = state.message_bindings(store)
+    for message_id, binding in list(bindings.items()):
+        if not isinstance(binding, dict):
+            continue
+        space_id = compact_ws(binding.get("space_id"), 160)
+        expected_topic = topic_by_space.get(space_id)
+        actual_topic = compact_ws(binding.get("topic_id"), 80)
+        if not expected_topic or not actual_topic or actual_topic == expected_topic:
+            continue
+        worker_id = compact_ws(binding.get("worker_id"), 160)
+        kind = str(binding.get("kind") or "")
+        for entry in state.source_worker_entries(store).values():
+            if _entry_worker_id(entry) == worker_id and _entry_space_id(entry) == space_id:
+                repaired += int(_clear_entry_message_reference(entry, str(message_id), kind))
+        bindings.pop(str(message_id), None)
+        repaired += 1
+    return repaired
+
+
 def _backfill_message_bindings(store: dict[str, Any]) -> int:
     before = set(state.message_bindings(store))
     for entry in state.source_worker_entries(store).values():
@@ -941,12 +1060,18 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
         state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
         entry["last_turn_id"] = turn_id
         entry["last_clean_hash"] = content_hash
+        user_hash = _turn_user_hash(item)
+        if user_hash:
+            entry["last_clean_user_hash"] = user_hash
+        else:
+            entry.pop("last_clean_user_hash", None)
         entry["last_render_version"] = RENDER_VERSION
         entry.setdefault("last_clean_message_id", "0")
         entry["last_clean_message_ids"] = ["0"]
         return True
+    send_changed_as_new = _changed_final_should_send_new_message(item, entry)
     if _final_turn_delivered(store, turn_id):
-        if entry.get("last_clean_hash") == content_hash and _replace_changed_final(
+        if not send_changed_as_new and entry.get("last_clean_hash") == content_hash and _replace_changed_final(
             store,
             item,
             entry,
@@ -957,9 +1082,10 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
             identity=identity,
         ):
             return True
-        _repair_delivered_final_entry(store, item, entry, content_hash)
-        return False
-    if _replace_changed_final(
+        if not send_changed_as_new:
+            _repair_delivered_final_entry(store, item, entry, content_hash)
+            return False
+    if not send_changed_as_new and _replace_changed_final(
         store,
         item,
         entry,
@@ -1238,6 +1364,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "pinned_status_updated": 0,
                 "feed_sent": 0,
                 "sent": 0,
+                "routing_repaired": 0,
                 "message_bindings": 0,
                 "turn_updates": 0,
                 "topic_cleanup": {"deleted": 0, "failed": 0, "pruned": 0, "changed": False},
@@ -1245,14 +1372,17 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             }
     changed = False
     source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
+    routing_repaired = _repair_space_mode_routing_state(store)
     message_bindings = _backfill_message_bindings(store)
     bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
     turn_counts = {"feed_sent": 0, "sent": 0, "updated": 0} if bootstrapped else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
+    routing_repaired += _repair_space_mode_routing_state(store)
     topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id)
     changed = changed or bool(
         source_counts["created"]
         or source_counts["updated"]
         or source_counts["icon_updated"]
+        or routing_repaired
         or turn_counts["sent"]
         or turn_counts["updated"]
         or bootstrapped
@@ -1278,6 +1408,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "pinned_status_updated": int(pinned_changed) + topic_pinned_updated,
         "feed_sent": turn_counts["feed_sent"],
         "sent": turn_counts["sent"],
+        "routing_repaired": routing_repaired,
         "turn_updates": turn_counts["updated"],
         "bootstrap_seen": bootstrapped,
         "message_bindings": message_bindings,

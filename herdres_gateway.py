@@ -215,6 +215,26 @@ def _payload_for_message(message: dict[str, Any], store: dict[str, Any], *, bot_
     return payload
 
 
+def _delete_topic_icon_service_message(message: dict[str, Any], store: dict[str, Any], token: str) -> bool:
+    if not config.delete_topic_icon_service_messages():
+        return False
+    edited = message.get("forum_topic_edited")
+    if not isinstance(edited, dict) or "icon_custom_emoji_id" not in edited:
+        return False
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    chat_id = str(chat.get("id") or "")
+    configured_chat = config.telegram_chat_id(store)
+    if configured_chat and chat_id != configured_chat:
+        return False
+    message_id = str(message.get("message_id") or "")
+    if not chat_id or not message_id:
+        return False
+    result = TelegramClient(token=token).delete_message(chat_id, message_id)
+    if not result.get("ok"):
+        log(f"topic icon service cleanup failed: {sanitize_text(result.get('error'), 160)}")
+    return True
+
+
 def _script_path() -> str:
     return os.getenv("HERDR_TELEGRAM_TOPICS_SCRIPT", str(Path.home() / ".local/bin/herdres"))
 
@@ -241,6 +261,8 @@ def run_herdres_command(payload: dict[str, Any]) -> dict[str, Any]:
 
 def handle_message(message: dict[str, Any], token: str, *, bot_key: str | None = None) -> None:
     store = state.load_state()
+    if _delete_topic_icon_service_message(message, store, token):
+        return
     payload = _payload_for_message(message, store, bot_key=bot_key)
     if payload is None:
         return

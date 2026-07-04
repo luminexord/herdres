@@ -174,6 +174,13 @@ class TelegramClient:
                     return {"ok": True, "message_id": str(message_id), "kind": "unchanged", "format": fmt}
         return {"ok": False, "error": sanitize_text(last_error, 300)}
 
+    def delete_message(self, chat_id: str, message_id: str | int) -> dict[str, Any]:
+        try:
+            self.api("deleteMessage", {"chat_id": chat_id, "message_id": str(message_id)})
+            return {"ok": True}
+        except TelegramError as exc:
+            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
     def create_topic(self, chat_id: str, name: str) -> dict[str, Any]:
         payload = {"chat_id": chat_id, "name": sanitize_text(name, 128)}
         try:
