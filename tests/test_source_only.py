@@ -700,8 +700,8 @@ def test_final_response_renders_common_markdown_as_telegram_html():
     assert "**" not in html
     # No redundant top worker title; the Response is the open top-level section.
     assert "<h3>Alpha</h3>" not in html
-    assert html.startswith("<b>✅ Response</b>")
-    assert "<h3>Fix it</h3>" in html
+    assert html.startswith("<b>✅ Response</b><br><br>")
+    assert "<h4>Fix it</h4>" in html
     assert "<ul>" in html
     assert "<li>keep <b>bold</b></li>" in html
     assert "escape &lt;tags&gt;" in html
@@ -723,12 +723,12 @@ def test_long_final_response_uses_full_visible_response_section():
         }
     )
 
-    assert html.startswith("<b>✅ Response</b>")
+    assert html.startswith("<b>✅ Response</b><br><br>")
     assert "<blockquote>" not in html
     assert "<blockquote expandable>" not in html
     assert "##" not in html
     assert "**" not in html
-    assert "<h3>Plan</h3>" in html
+    assert "<h4>Plan</h4>" in html
     assert "<ul>" in html
     assert "<li>keep <b>rich</b> sections</li>" in html
     assert "</details><br><details" not in html
@@ -1266,6 +1266,85 @@ def test_working_update_edits_existing_message(monkeypatch):
     assert "second" in telegram.edited[-1][2]
 
 
+def test_completed_turn_promotes_working_message_to_final(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    first_turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "user_text": "Question",
+                "assistant_stream_text": "still thinking",
+                "complete": False,
+            }
+        ]
+    }
+    final_turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "user_text": "Question",
+                "assistant_final_text": "Final answer",
+                "complete": True,
+            }
+        ]
+    }
+
+    first = sync_once(store, SyncRuntime(FakeTendwire(turns=first_turns), telegram, with_outbox=False))
+    entry = next(iter(state.source_worker_entries(store).values()))
+    working_message_id = entry["last_stream_message_id"]
+    second = sync_once(store, SyncRuntime(FakeTendwire(turns=final_turns), telegram, with_outbox=False))
+    binding = state.find_message_binding(store, working_message_id, topic_id="77")
+
+    assert first["feed_sent"] == 1
+    assert second["feed_sent"] == 1
+    assert any(edit[1] == working_message_id and "Final answer" in edit[2] for edit in telegram.edited)
+    assert not any("Final answer" in sent[1] for sent in telegram.sent)
+    assert binding is not None
+    assert binding["kind"] == "final"
+    assert entry["last_clean_message_id"] == working_message_id
+    assert entry["last_clean_message_ids"] == [working_message_id]
+    assert "last_stream_message_id" not in entry
+
+
+def test_completed_turn_sends_new_final_when_working_bot_kind_differs(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    store = _store()
+    store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
+    telegram = FakeTelegram()
+    first_turns = {"turns": [{"id": "turn-1", "worker_id": "worker-1", "assistant_stream_text": "working", "complete": False}]}
+    final_turns = {"turns": [{"id": "turn-1", "worker_id": "worker-1", "assistant_final_text": "Bot-specific final", "complete": True}]}
+
+    sync_once(store, SyncRuntime(FakeTendwire(turns=first_turns), telegram, with_outbox=False))
+    entry = next(iter(state.source_worker_entries(store).values()))
+    entry["last_stream_bot_kind"] = "claude"
+    sync_once(store, SyncRuntime(FakeTendwire(turns=final_turns), telegram, with_outbox=False))
+
+    assert not any("Bot-specific final" in edit[2] for edit in telegram.edited)
+    assert any("Bot-specific final" in sent[1] for sent in telegram.sent)
+    assert entry["last_clean_message_id"] != entry.get("last_stream_message_id")
+
+
+def test_completed_long_turn_sends_final_without_cutting_content(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    tail = "TAIL_PROMOTION_FALLBACK_67890"
+    long_final = "## Long\n\n" + "- keep the complete response\n" * 260 + tail
+    first_turns = {"turns": [{"id": "turn-1", "worker_id": "worker-1", "assistant_stream_text": "working", "complete": False}]}
+    final_turns = {"turns": [{"id": "turn-1", "worker_id": "worker-1", "assistant_final_text": long_final, "complete": True}]}
+
+    sync_once(store, SyncRuntime(FakeTendwire(turns=first_turns), telegram, with_outbox=False))
+    sync_once(store, SyncRuntime(FakeTendwire(turns=final_turns), telegram, with_outbox=False))
+
+    assert not any(tail in edit[2] for edit in telegram.edited)
+    assert any(tail in sent[1] for sent in telegram.sent)
+
+
 def test_open_working_turn_repairs_stale_final_markers_then_finalizes(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
@@ -1311,7 +1390,7 @@ def test_open_working_turn_repairs_stale_final_markers_then_finalizes(monkeypatc
     )
 
     assert second["feed_sent"] == 1
-    assert any("real final" in sent[1] for sent in telegram.sent)
+    assert any("real final" in sent[1] for sent in telegram.sent) or any("real final" in edit[2] for edit in telegram.edited)
     assert any(key.startswith("final:turn-1:") for key in store["tendwire_source_delivered_turns"])
 
 
