@@ -453,6 +453,54 @@ def _promote_working_to_final(
     return True
 
 
+def _replace_changed_final(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    thread_id: str,
+    content_hash: str,
+    identity: str,
+) -> bool:
+    bindings = _final_delivery_bindings(store, _turn_id(item))
+    message_ids = [message_id for message_id, _binding in bindings if message_id]
+    if len(message_ids) != 1:
+        return False
+    telegram = _telegram_state(store)
+    api_token, bot_kind = _delivery_bot(store, entry)
+    stored_bot_kind = str(bindings[-1][1].get("bot_kind") or entry.get("last_clean_bot_kind") or MANAGER_BOT_KIND)
+    if stored_bot_kind != bot_kind:
+        return False
+    feed_item = turn_item_from_source(item, entry)
+    if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(feed_item):
+        return False
+    sent = edit_feed_item(
+        runtime.telegram,
+        chat_id,
+        message_ids[0],
+        feed_item,
+        telegram=telegram,
+        api_token=api_token,
+    )
+    if not sent.get("ok"):
+        return False
+    edited_message_id = str(sent.get("message_id") or "").strip()
+    message_id = edited_message_id if edited_message_id and edited_message_id != "0" else message_ids[0]
+    _record_final_delivery_success(
+        store,
+        item,
+        entry,
+        thread_id=thread_id,
+        message_ids=[message_id],
+        content_hash=content_hash,
+        identity=identity,
+        bot_kind=bot_kind,
+    )
+    return True
+
+
 def _suppress_historical_final(store: dict[str, Any], item: dict[str, Any], content_hash: str) -> bool:
     turn_id = _turn_id(item)
     if not turn_id or _final_turn_delivered(store, turn_id):
@@ -885,7 +933,7 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
     turn_id = _turn_id(item)
     content_hash = _turn_content_hash(item, "final")
     identity = f"final:{turn_id}:{content_hash}"
-    if identity in state.delivered_turns(store) or _final_turn_delivered(store, turn_id):
+    if identity in state.delivered_turns(store):
         _repair_delivered_final_entry(store, item, entry, content_hash)
         return False
     feed_item = turn_item_from_source(item, entry)
@@ -896,6 +944,31 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
         entry["last_render_version"] = RENDER_VERSION
         entry.setdefault("last_clean_message_id", "0")
         entry["last_clean_message_ids"] = ["0"]
+        return True
+    if _final_turn_delivered(store, turn_id):
+        if entry.get("last_clean_hash") == content_hash and _replace_changed_final(
+            store,
+            item,
+            entry,
+            runtime,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            content_hash=content_hash,
+            identity=identity,
+        ):
+            return True
+        _repair_delivered_final_entry(store, item, entry, content_hash)
+        return False
+    if _replace_changed_final(
+        store,
+        item,
+        entry,
+        runtime,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        content_hash=content_hash,
+        identity=identity,
+    ):
         return True
     if _promote_working_to_final(
         store,
