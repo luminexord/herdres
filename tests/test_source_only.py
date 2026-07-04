@@ -176,6 +176,17 @@ def test_status_overview_uses_old_pane_board_shape():
     assert "no active pane" not in html.lower()
 
 
+def test_status_overview_disambiguates_duplicate_agent_labels():
+    html = render_status_overview(
+        [
+            {"agent": "codex", "worker_name": "codex", "tendwire_worker_id": "codex", "status": "idle"},
+            {"agent": "codex", "worker_name": "codex", "tendwire_worker_id": "codex-1-2", "status": "idle"},
+        ]
+    )
+
+    assert html.splitlines() == ["Codex 🟢", "Codex 1-2 🟢"]
+
+
 def test_first_sync_bootstraps_current_turns_without_telegram_posts(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
