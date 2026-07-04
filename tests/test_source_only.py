@@ -2302,3 +2302,70 @@ def test_public_prune_removes_private_fields():
     assert "-100" not in encoded
     assert "secret" not in encoded
     assert "backend_target" not in encoded
+
+
+def test_placeholder_turn_never_outranks_real_turn_for_same_worker(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire(
+        turns={
+            "turns": [
+                {
+                    "id": "turn-empty-placeholder",
+                    "worker_id": "worker-1",
+                    "space_id": "space-1",
+                    "complete": False,
+                    "has_open_turn": True,
+                },
+                {
+                    "id": "turn-real",
+                    "worker_id": "worker-1",
+                    "space_id": "space-1",
+                    "user_text": "please do the thing",
+                    "assistant_stream_text": "thinking about the thing",
+                    "complete": False,
+                    "has_open_turn": True,
+                },
+            ]
+        },
+        workers=[
+            {"id": "worker-1", "name": "claude", "status": "working", "space_id": "space-1", "fingerprint": "fp-1"}
+        ],
+        spaces=[{"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"}],
+    )
+
+    sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+
+    working_cards = [html for _chat, html, _kw, _mid in telegram.sent if "Working" in html or "Work is in progress" in html]
+    assert len(working_cards) == 1
+    assert "thinking about the thing" in working_cards[0]
+    assert "Work is in progress." not in working_cards[0]
+
+
+def test_retired_worker_turns_are_not_delivered(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire(
+        turns={
+            "turns": [
+                {
+                    "id": "turn-retired",
+                    "worker_id": "worker-retired",
+                    "space_id": "space-1",
+                    "user_text": "old prompt",
+                    "assistant_final_text": "stale final from a retired worker id",
+                    "complete": True,
+                }
+            ]
+        },
+        workers=[
+            {"id": "worker-live", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-live"}
+        ],
+        spaces=[{"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"}],
+    )
+
+    sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+
+    assert all("stale final" not in html for _chat, html, _kw, _mid in telegram.sent)

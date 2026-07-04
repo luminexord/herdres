@@ -1288,10 +1288,31 @@ def _bootstrap_existing_turns(store: dict[str, Any], turns_payload: dict[str, An
     return skipped
 
 
-def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_payload: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, int]:
+def _sync_turns(
+    store: dict[str, Any],
+    turns_payload: dict[str, Any],
+    pending_payload: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    live_worker_ids: set[str] | None = None,
+) -> dict[str, int]:
     counts = {"feed_sent": 0, "sent": 0, "updated": 0}
     turns = _turns(turns_payload)
+    if live_worker_ids is not None:
+        # Retired-worker turns must not be delivered (same rule already applied
+        # to status aggregation): a stale row can otherwise emit a duplicate
+        # working card or a misattributed final.
+        turns = [
+            item
+            for item in turns
+            if compact_ws(item.get("worker_id"), 160) in live_worker_ids
+        ]
     latest_content_turn_by_worker: dict[str, str] = {}
+    # Pass 1: real content only (user prompt, stream, or a completed final).
+    # Tendwire store output is already ordered by per-worker observed recency.
+    # Payload updated_at can be absent on current worker-derived turns, so do
+    # not let an older command row with updated_at suppress the live turn.
     for item in turns:
         _key, entry = _entry_for_turn(store, item)
         if entry is None:
@@ -1300,17 +1321,25 @@ def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_pa
         if not worker_key:
             continue
         complete = bool(item.get("complete")) or bool(item.get("assistant_final_text"))
-        has_content = (
+        has_real_content = (
             bool(item.get("assistant_stream_text"))
+            or bool(item.get("user_text"))
             or (complete and bool(item.get("assistant_final_text")))
-            or _turn_is_working_placeholder(item, entry)
         )
-        if not has_content:
+        if not has_real_content:
             continue
-        # Tendwire store output is already ordered by per-worker observed recency.
-        # Payload updated_at can be absent on current worker-derived turns, so do
-        # not let an older command row with updated_at suppress the live turn.
         latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
+    # Pass 2: synthetic "Work is in progress." placeholders only fill workers
+    # with no real turn at all — a placeholder must never outrank a real turn.
+    for item in turns:
+        _key, entry = _entry_for_turn(store, item)
+        if entry is None:
+            continue
+        worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
+        if not worker_key or worker_key in latest_content_turn_by_worker:
+            continue
+        if _turn_is_working_placeholder(item, entry):
+            latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
     seen_final_workers: set[str] = set()
     seen_working_workers: set[str] = set()
     for item in turns:
@@ -1449,7 +1478,13 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     routing_repaired = _repair_space_mode_routing_state(store)
     message_bindings = _backfill_message_bindings(store)
     bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
-    turn_counts = {"feed_sent": 0, "sent": 0, "updated": 0} if bootstrapped else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
+    live_worker_ids = {compact_ws(worker.get("id"), 160) for worker in _workers(snapshot)}
+    live_worker_ids.discard("")
+    turn_counts = (
+        {"feed_sent": 0, "sent": 0, "updated": 0}
+        if bootstrapped
+        else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id, live_worker_ids=live_worker_ids)
+    )
     routing_repaired += _repair_space_mode_routing_state(store)
     topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id)
     changed = changed or bool(
