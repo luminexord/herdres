@@ -7888,6 +7888,18 @@ def format_debug(pane: dict[str, Any] | None, entry: dict[str, Any]) -> str:
         f"status_marker_hash: {entry.get('status_marker_hash') or ''}",
         f"last_seen_at: {entry.get('last_seen_at') or ''}",
     ]
+    if herdres_tendwire.is_source_entry(entry):
+        # In source mode there is no local pane; surface the Tendwire worker binding so operators can
+        # diagnose routing/fingerprint validity from Telegram.
+        lines.extend([
+            "-- Tendwire source --",
+            f"tendwire_worker_id: {entry.get('tendwire_worker_id') or ''}",
+            f"tendwire_fingerprint: {entry.get('tendwire_fingerprint') or ''}",
+            f"tendwire_status_line: {entry.get('tendwire_status_line') or ''}",
+            f"tendwire_last_seen_at: {entry.get('tendwire_last_seen_at') or ''}",
+            f"source: {entry.get('source') or ''}",
+            f"entry_type: {entry.get('entry_type') or ''}",
+        ])
     if pane:
         lines.extend([
             f"agent: {pane.get('agent') or ''}",
@@ -15559,7 +15571,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if attachment_policy == "source_attachment_unsupported":
         return {
             "handled": True,
-            "reply": "Attachments and voice notes are not available in Tendwire source-read mode yet; send text with /send.",
+            "reply": "Photo/document attachments are not available in Tendwire source mode yet; send text or a voice note.",
         }
     if isinstance(attachment, dict) and attachment.get("kind") in {"document", "photo"} and attachment.get("file_id"):
         caption = str(payload.get("caption") or "")
@@ -15594,13 +15606,17 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 # Speech off/unavailable: still deliver a caption if the owner attached one, rather than
                 # silently dropping it (parity with the document/photo arm); otherwise explain how to enable.
                 if caption:
-                    after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
-                    sent_ok, sent_detail = send_to_pane(pane_id, caption)
-                    if not sent_ok:
-                        return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
-                    if mark_direct_origin_send(entry, caption, after_turn_id=after_turn_id, origin="voice", pane_id=pane_id):
-                        save_state(state)
-                    return {"handled": True, "reply": "Speech is off, so I sent your caption to this pane."}
+                    return forward_text_to_pane_response(
+                        pane_id,
+                        caption,
+                        state=state,
+                        entry=entry,
+                        origin="voice",
+                        chat_id=chat_id,
+                        topic_id=topic_id,
+                        message_id=str(payload.get("message_id") or ""),
+                        reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
+                    )
                 return {"handled": True, "reply": (
                     "Voice transcription is off. Enable it with `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1` "
                     "and `herdres speech install`, or send text.")}
@@ -15623,13 +15639,20 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             pass
         outbound = f"{transcript}\n\n{caption}" if caption else transcript
-        after_turn_id = _direct_origin_after_turn_id(entry, pane_id)
-        sent_ok, sent_detail = send_to_pane(pane_id, outbound)
-        if not sent_ok:
-            return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
-        if mark_direct_origin_send(entry, outbound, after_turn_id=after_turn_id, origin="voice", pane_id=pane_id):
-            save_state(state)
-        return {"handled": True, "reply": "Sent your voice message to this pane."}
+        # Route through the source-aware seam: a Tendwire source entry sends the transcript to the
+        # worker via send_instruction; a direct pane entry keeps the original send-to-pane path. The
+        # "🎙️ Heard: …" echo above already confirms receipt, so a silent/queued reply here is fine.
+        return forward_text_to_pane_response(
+            pane_id,
+            outbound,
+            state=state,
+            entry=entry,
+            origin="voice",
+            chat_id=chat_id,
+            topic_id=topic_id,
+            message_id=str(payload.get("message_id") or ""),
+            reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
+        )
 
     if command == "plain":
         implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))

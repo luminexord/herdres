@@ -1522,10 +1522,14 @@ def attachment_send_preflight_policy(
     source_entry: bool,
     attachment_kind: str,
 ) -> str:
-    """Classify attachment/voice sends before any direct Herdr delivery path."""
+    """Classify attachment/voice sends before any direct Herdr delivery path.
+
+    Voice notes ARE supported for source entries: they are transcribed and the transcript is routed to
+    the worker as a text instruction (via send_instruction), so voice is not in the blocked set. Raw
+    photo/document delivery has no Tendwire transport yet and stays blocked."""
     if source_inventory_enabled and not source_entry:
         return "legacy_source_block"
-    if source_entry and str(attachment_kind or "").strip().lower() in {"document", "photo", "voice"}:
+    if source_entry and str(attachment_kind or "").strip().lower() in {"document", "photo"}:
         return "source_attachment_unsupported"
     return "ok"
 

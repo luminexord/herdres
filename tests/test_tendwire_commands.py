@@ -598,14 +598,25 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             ),
             "legacy_source_block",
         )
+        # Voice IS supported for source entries (transcribed → routed as a text instruction).
         self.assertEqual(
             herdres_tendwire.attachment_send_preflight_policy(
                 source_inventory_enabled=True,
                 source_entry=True,
                 attachment_kind="voice",
             ),
-            "source_attachment_unsupported",
+            "ok",
         )
+        # Raw photo/document delivery has no Tendwire transport yet and stays blocked.
+        for blocked_kind in ("photo", "document"):
+            self.assertEqual(
+                herdres_tendwire.attachment_send_preflight_policy(
+                    source_inventory_enabled=True,
+                    source_entry=True,
+                    attachment_kind=blocked_kind,
+                ),
+                "source_attachment_unsupported",
+            )
         self.assertEqual(
             herdres_tendwire.attachment_send_preflight_policy(
                 source_inventory_enabled=False,
@@ -633,10 +644,20 @@ class TendwireRequestBuilderTests(unittest.TestCase):
             ),
             "legacy_source_block",
         )
+        # Voice IS supported for source entries (transcribed → routed as a text instruction).
         self.assertEqual(
             herdres_tendwire.attachment_send_preflight_for_entry(
                 source_entry,
                 "voice",
+                {"HERDRES_TENDWIRE_MODE": "source-read"},
+            ),
+            "ok",
+        )
+        # Photo/document have no Tendwire transport yet and stay blocked for source entries.
+        self.assertEqual(
+            herdres_tendwire.attachment_send_preflight_for_entry(
+                source_entry,
+                "document",
                 {"HERDRES_TENDWIRE_MODE": "source-read"},
             ),
             "source_attachment_unsupported",
@@ -1372,7 +1393,7 @@ class TendwireCommandRoutingTests(unittest.TestCase):
                 _payload(text="", attachment={"kind": "document", "file_id": "file-1"})
             )
 
-        self.assertIn("Attachments and voice notes are not available", result["reply"])
+        self.assertIn("Photo/document attachments are not available", result["reply"])
         deliver_attachment.assert_not_called()
         patched["send_to_pane"].assert_not_called()
         patched["run_cmd"].assert_not_called()
@@ -1459,7 +1480,10 @@ class TendwireCommandRoutingTests(unittest.TestCase):
         patched["send_to_pane"].assert_not_called()
         patched["run_cmd"].assert_not_called()
 
-    def test_source_mode_voice_attachment_fails_before_direct_herdr_delivery(self) -> None:
+    def test_source_mode_voice_is_transcribed_and_routed_via_the_seam(self) -> None:
+        # Voice IS supported in source mode: it is transcribed and the transcript is delivered through
+        # forward_text_to_pane_response (which routes source entries to the Tendwire worker), never via
+        # direct-Herdr deliver_attachment / send_to_pane / run_cmd.
         source_entry = _entry(
             source="tendwire",
             entry_type="worker",
@@ -1468,19 +1492,22 @@ class TendwireCommandRoutingTests(unittest.TestCase):
             worker_fingerprint="fp-1",
         )
         state = _state(source_entry)
-        payload = _payload(
-            text="",
-            attachment={"kind": "voice", "file_id": "voice-file"},
-        )
+        payload = _payload(text="", attachment={"kind": "voice", "file_id": "voice-file"})
+        payload["_speech_pretranscribed"] = True
+        payload["_speech_transcript"] = "run the migration"
+        fwd = Mock(return_value={"handled": True, "reply": ""})
         with patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True), \
                 self._command_patches(state) as patched, \
+                patch.object(herdres, "forward_text_to_pane_response", fwd), \
                 patch.object(herdres, "deliver_attachment") as deliver_attachment:
-            result = herdres.command_reply(payload)
+            herdres.command_reply(payload)
 
-        self.assertIn("not available in Tendwire source-read mode", result["reply"])
-        deliver_attachment.assert_not_called()
-        patched["send_to_pane"].assert_not_called()
-        patched["run_cmd"].assert_not_called()
+        fwd.assert_called_once()
+        self.assertIn("run the migration", fwd.call_args.args[1])
+        self.assertEqual(fwd.call_args.kwargs.get("origin"), "voice")
+        deliver_attachment.assert_not_called()          # pretranscribed, no re-download
+        patched["send_to_pane"].assert_not_called()     # no direct pane send
+        patched["run_cmd"].assert_not_called()          # no direct Herdr
 
     def test_source_read_callback_choice_uses_tendwire_command_not_herdr(self) -> None:
         entry = _entry(

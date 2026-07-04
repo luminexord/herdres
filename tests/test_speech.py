@@ -92,7 +92,7 @@ class VoiceCommandReplyTests(unittest.TestCase):
         self.assertEqual(send_to_pane.call_args.args[1], "deploy the staging branch please")
         # echo went to the topic
         self.assertTrue(any("Heard" in str(a) for a in send_message.call_args.args))
-        self.assertIn("Sent your voice message", result["reply"])
+        self.assertEqual(result["reply"], "")  # silent on success (routed via the send seam like /send); the 🎙️ echo confirms receipt
 
     def test_caption_appended(self) -> None:
         speech = Mock()
@@ -124,7 +124,7 @@ class VoiceCommandReplyTests(unittest.TestCase):
         send_to_pane.assert_called_once()
         self.assertEqual(send_to_pane.call_args.args[1], "ship it")
         deliver.assert_not_called()  # no need to download audio we won't transcribe
-        self.assertIn("sent your caption", result["reply"])
+        self.assertEqual(result["reply"], "")  # caption routed via the send seam (silent on success)
 
     def test_echo_failure_does_not_abort_delivery(self) -> None:
         # The cosmetic "Heard:" echo raising must NOT prevent the transcript reaching the pane.
@@ -143,7 +143,7 @@ class VoiceCommandReplyTests(unittest.TestCase):
             result = herdres.command_reply(_voice_payload())
         send_to_pane.assert_called_once()
         self.assertEqual(send_to_pane.call_args.args[1], "do the thing")
-        self.assertIn("Sent your voice message", result["reply"])
+        self.assertEqual(result["reply"], "")  # silent on success (routed via the send seam like /send); the 🎙️ echo confirms receipt
 
     def test_empty_transcript_is_graceful(self) -> None:
         speech = Mock()
@@ -197,7 +197,7 @@ class VoiceCommandReplyTests(unittest.TestCase):
         send_to_pane.assert_called_once()
         self.assertEqual(send_to_pane.call_args.args[1], "already heard off the lock")
         self.assertTrue(any("Heard" in str(a) for a in send_message.call_args.args))
-        self.assertIn("Sent your voice message", result["reply"])
+        self.assertEqual(result["reply"], "")  # silent on success (routed via the send seam like /send); the 🎙️ echo confirms receipt
 
     def test_pretranscribed_empty_is_graceful(self) -> None:
         speech = Mock()

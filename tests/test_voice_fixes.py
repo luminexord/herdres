@@ -11,10 +11,71 @@ from unittest.mock import Mock, patch
 
 import herdres
 import herdres_speech
+import herdres_tendwire
 
 
 TELEGRAM = {"managed_bots": {"claude": {"token": "CLAUDE_TOK", "enabled": True},
                              "codex": {"token": "CODEX_TOK", "enabled": True}}}
+
+
+class SourceModeVoiceTests(unittest.TestCase):
+    """Tendwire source mode: a voice note is transcribed and the transcript is routed to the worker
+    as a text instruction (send_instruction), instead of the direct send-to-pane path."""
+
+    def _state(self, entry):
+        key = entry["pane_key"]
+        return {
+            "version": 1, "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "spaces": {entry["space_key"]: {"space_key": entry["space_key"], "topic_id": "77", "pane_keys": [key]}},
+            "panes": {key: entry},
+        }
+
+    def _voice_payload(self, transcript="do the thing"):
+        return {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "message_id": "8", "text": "",
+                "reply_to_message_id": "",
+                "attachment": {"kind": "voice", "file_id": "VID"},
+                "_speech_pretranscribed": True, "_speech_transcript": transcript}
+
+    def test_voice_arm_routes_transcript_through_the_seam(self) -> None:
+        # The voice arm must deliver via forward_text_to_pane_response (source-aware), not send_to_pane.
+        entry = {"pane_key": "pane-1", "pane_id": "pane-1", "space_key": "workspace:one", "topic_id": "77",
+                 "pane_root_message_id": "1001", "last_known_status": "idle"}
+        state = self._state(entry)
+        fwd = Mock(return_value={"handled": True, "reply": ""})
+        with patch.multiple(herdres, load_state=Mock(return_value=state), save_state=Mock(),
+                            load_dotenv=Mock(), send_message=Mock(),
+                            forward_text_to_pane_response=fwd):
+            herdres.command_reply(self._voice_payload("do the thing"))
+        fwd.assert_called_once()
+        args, kwargs = fwd.call_args
+        self.assertIn("do the thing", args[1])            # the transcript is the delivered text
+        self.assertEqual(kwargs.get("origin"), "voice")
+
+    def test_seam_sends_source_voice_to_tendwire_not_pane(self) -> None:
+        # A source entry must route the transcript to the Tendwire worker, never to a (nonexistent) pane.
+        entry = {"pane_key": "w:p1:x", "pane_id": "", "space_key": "agent:w:p1", "topic_id": "77",
+                 "source": "tendwire", "entry_type": "worker",
+                 "tendwire_worker_id": "worker-1", "tendwire_fingerprint": "fp-1"}
+        to_tendwire = Mock(return_value={"handled": True, "reply": "Sent to Tendwire worker."})
+        to_pane = Mock(return_value={"handled": True, "reply": ""})
+        with patch.object(herdres_tendwire, "entry_send_text_decision", return_value={"action": "tendwire"}), \
+                patch.object(herdres, "send_to_tendwire_worker_response", to_tendwire), \
+                patch.object(herdres, "send_direct_text_to_pane_response", to_pane):
+            out = herdres.forward_text_to_pane_response(
+                "", "transcribed instruction", state={}, entry=entry, origin="voice")
+        to_tendwire.assert_called_once()
+        to_pane.assert_not_called()
+        self.assertEqual(out["reply"], "Sent to Tendwire worker.")
+
+    def test_debug_surfaces_tendwire_worker_metadata_for_source(self) -> None:
+        entry = {"pane_id": "", "topic_id": "77", "source": "tendwire", "entry_type": "worker",
+                 "tendwire_worker_id": "worker-1", "tendwire_fingerprint": "fp-1",
+                 "tendwire_status_line": "Working on tests"}
+        out = herdres.format_debug(None, entry)
+        self.assertIn("Tendwire source", out)
+        self.assertIn("worker-1", out)
+        self.assertIn("fp-1", out)
 
 
 class DownloadTokenTests(unittest.TestCase):
