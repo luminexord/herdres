@@ -1,8 +1,13 @@
 [Unit]
-Description=Herdres Tendwire source Telegram sync
+Description=Herdres Tendwire source Telegram sync loop
 
 [Service]
-Type=oneshot
+Type=simple
 EnvironmentFile=%h/.config/herdres/herdres.env
 Environment=HERDRES_TENDWIRE_MODE=source
-ExecStart=%h/.local/bin/herdres sync
+ExecStart=%h/.local/bin/herdres sync --loop 5
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

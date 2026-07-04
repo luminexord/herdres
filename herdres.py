@@ -292,15 +292,30 @@ def callback_reply(_payload: dict[str, Any]) -> dict[str, Any]:
     return {"handled": True, "reply": "This source-only Herdres branch does not use Telegram callbacks."}
 
 
-def cmd_sync(_args: argparse.Namespace) -> int:
-    config.load_env_file()
-    config.require_source_mode()
+def _sync_pass() -> dict[str, Any]:
     with state.state_lock():
         store = state.load_state()
         result = sync_once(store, _runtime(dry_run=False, with_outbox=True))
         if result.get("changed"):
             state.save_state(store)
-    return _json(result)
+    return result
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    config.load_env_file()
+    config.require_source_mode()
+    interval = float(getattr(args, "loop", 0) or 0)
+    if interval <= 0:
+        return _json(_sync_pass())
+    import time as _time
+
+    while True:
+        started = _time.monotonic()
+        try:
+            _sync_pass()
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive across transient failures
+            print(json.dumps({"ok": False, "status": "sync_pass_failed", "error": sanitize_text(str(exc), 300)}), flush=True)
+        _time.sleep(max(0.5, interval - (_time.monotonic() - started)))
 
 
 def cmd_command(_args: argparse.Namespace) -> int:
@@ -387,7 +402,9 @@ def cmd_outbox(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="herdres")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("sync").set_defaults(func=cmd_sync)
+    sync_parser = sub.add_parser("sync")
+    sync_parser.add_argument("--loop", type=float, default=0.0, help="run continuously, one pass every N seconds")
+    sync_parser.set_defaults(func=cmd_sync)
     sub.add_parser("command").set_defaults(func=cmd_command)
     sub.add_parser("callback").set_defaults(func=cmd_callback)
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
