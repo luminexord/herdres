@@ -8,7 +8,7 @@ import herdres_gateway
 from herdres_connector import state
 from herdres_connector.managed_bots import managed_bot_kind_for_key, managed_bot_tokens
 from herdres_connector.rendering import render_status_overview
-from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, RICH_SINGLE_MESSAGE_CHARS, render_feed_item_delivery_html_parts, render_turn_item_html, turn_item_from_source
+from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_feed_item_delivery_html_parts, render_turn_item_html, turn_item_from_source
 from herdres_connector.safe import public_prune
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient, drain_outbox
@@ -818,7 +818,7 @@ def test_sync_sends_all_long_final_response_parts(monkeypatch):
             {
                 "id": "turn-long",
                 "worker_id": "worker-1",
-                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 220 + tail,
+                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 700 + tail,
                 "complete": True,
             }
         ]
@@ -859,19 +859,22 @@ Pushed:
 - branch: `tendwired`"""
 
 
-def test_medium_final_response_splits_before_rich_display_cutoff():
+def test_medium_final_response_renders_as_single_message():
+    # A medium response (~1350 chars rendered) fits one rich message, so it is
+    # delivered as a SINGLE part with a plain "Response" marker -- no "1/N" split.
     parts = render_feed_item_delivery_html_parts(
         {"kind": "turn", "assistant_final_text": _recent_cutoff_response_text()}
     )
 
-    combined_plain = "\n".join(parts)
-    assert len(parts) > 1
-    assert all(len(part) <= RICH_SINGLE_MESSAGE_CHARS for part in parts)
-    assert "4557d20 Prevent child bot target races" in combined_plain
-    assert "branch: <code>tendwired</code>" in combined_plain
+    assert len(parts) == 1
+    assert parts[0].startswith("<b>✅ Response</b><br><br>")
+    assert "4557d20 Prevent child bot target races" in parts[0]
+    assert "branch: <code>tendwired</code>" in parts[0]
 
 
-def test_promoted_working_final_uses_split_send_not_cutting_rich_tail(monkeypatch):
+def test_promoted_working_final_edits_in_place_as_single_message(monkeypatch):
+    # A medium final (under the legacy edit cap) now promotes the working stream
+    # message to the final Response via an in-place EDIT -- one message, no split.
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
     telegram = FakeTelegram()
@@ -899,12 +902,76 @@ def test_promoted_working_final_uses_split_send_not_cutting_rich_tail(monkeypatc
     sync_once(store, SyncRuntime(FakeTendwire(turns=working_turns), telegram, with_outbox=False))
     result = sync_once(store, SyncRuntime(FakeTendwire(turns=final_turns), telegram, with_outbox=False))
 
-    response_messages = [sent[1] for sent in telegram.sent if "✅ Response" in sent[1]]
+    edited_html = "\n".join(edit[2] for edit in telegram.edited)
     assert result["feed_sent"] == 1
-    assert len(response_messages) > 1
-    assert not any("4557d20 Prevent chi" in edit[2] for edit in telegram.edited)
-    assert "4557d20 Prevent child bot target races" in "\n".join(response_messages)
-    assert "branch: <code>tendwired</code>" in "\n".join(response_messages)
+    # The final Response was edited into the existing working message.
+    assert "4557d20 Prevent child bot target races" in edited_html
+    assert "branch: <code>tendwired</code>" in edited_html
+    # Single message -- no "Response i/N" split labels anywhere.
+    assert "✅ Response 1/" not in edited_html
+    assert "✅ Response 1/" not in "\n".join(sent[1] for sent in telegram.sent)
+
+
+def test_oversize_response_splits_losslessly_into_labeled_parts():
+    # A response too large for one rich message still splits, losslessly, into
+    # labeled "Response i/N" parts -- each under the per-message cap.
+    tail = "TAIL_MARKER_LOSSLESS"
+    text = "## **Long**\n\n" + ("- keep **rich** sections\n" * 700) + tail
+    parts = render_feed_item_delivery_html_parts({"kind": "turn", "assistant_final_text": text})
+
+    assert len(render_turn_item_html({"kind": "turn", "assistant_final_text": text})) > MAX_RICH_HTML_CHARS
+    assert len(parts) > 1
+    total = len(parts)
+    for index, part in enumerate(parts, start=1):
+        assert part.startswith(f"<b>✅ Response {index}/{total}</b><br><br>")
+        assert len(part) <= MAX_RICH_HTML_CHARS
+    combined = "\n".join(parts)
+    assert tail in combined                       # nothing cut
+    assert combined.count("<b>✅ Response ") == total  # one marker per part
+
+
+def test_promote_to_final_uses_send_when_over_edit_cap_but_under_rich_cap(monkeypatch):
+    # A final whose rendered HTML is above the legacy edit cap (3900) but below
+    # the rich cap (14000) cannot be edited in place, so it is freshly sent --
+    # as ONE message (no split), since it still fits a single rich message.
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    tail = "TAIL_MARKER_SENDSINGLE"
+    body = "## **Long**\n\n" + ("- keep **rich** sections\n" * 180) + tail
+    working_turns = {
+        "turns": [
+            {
+                "id": "turn-midlong",
+                "worker_id": "worker-1",
+                "assistant_stream_text": "Working on it.",
+                "complete": False,
+            }
+        ]
+    }
+    final_turns = {
+        "turns": [
+            {
+                "id": "turn-midlong",
+                "worker_id": "worker-1",
+                "assistant_final_text": body,
+                "complete": True,
+            }
+        ]
+    }
+
+    sync_once(store, SyncRuntime(FakeTendwire(turns=working_turns), telegram, with_outbox=False))
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns=final_turns), telegram, with_outbox=False))
+
+    full_html_len = len(render_turn_item_html({"kind": "turn", "assistant_final_text": body}))
+    assert full_html_len > 3900            # above legacy edit cap -> cannot edit
+    assert full_html_len <= MAX_RICH_HTML_CHARS  # below rich cap -> one message
+
+    response_messages = [sent[1] for sent in telegram.sent if "<b>✅ Response" in sent[1]]
+    assert result["feed_sent"] == 1
+    assert len(response_messages) == 1     # exactly one fresh send
+    assert "✅ Response 1/" not in response_messages[0]
+    assert tail in response_messages[0]
 
 
 def test_expandable_blockquote_has_delivery_fallbacks():
