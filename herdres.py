@@ -14,7 +14,7 @@ import json
 import sys
 from typing import Any
 
-from herdres_connector import config, doctor, state
+from herdres_connector import config, doctor, speech, state
 from herdres_connector.managed_bots import managed_bot_kind_for_username
 from herdres_connector.safe import compact_ws, public_prune, sanitize_text, short_hash
 from herdres_connector.source_sync import SyncRuntime, sync_once
@@ -62,6 +62,44 @@ def _split_target_alias(text: str) -> tuple[str, str]:
     if rest.startswith("/send"):
         rest = rest[5:].strip()
     return alias, rest
+
+
+def _clean_voice_caption(caption: Any) -> str:
+    text = str(caption or "").strip()
+    if text.startswith("/send"):
+        text = text[5:].strip()
+    if text.startswith("/"):
+        return ""
+    alias, rest = _split_target_alias(text)
+    return rest if alias else text
+
+
+def _voice_transcript_from_payload(payload: dict[str, Any]) -> str:
+    if not speech.is_voice_payload(payload) or not payload.get("_speech_pretranscribed"):
+        return ""
+    return sanitize_text(payload.get("_speech_transcript"), 12000).strip()
+
+
+def _voice_submission_text(payload: dict[str, Any], alias_body: str = "") -> str:
+    transcript = _voice_transcript_from_payload(payload)
+    if not transcript:
+        return ""
+    caption = _clean_voice_caption(alias_body or payload.get("caption") or payload.get("text") or "")
+    if caption and caption != transcript:
+        return f"{transcript}\n\n{caption}"
+    return transcript
+
+
+def _voice_unavailable_reply(payload: dict[str, Any]) -> str:
+    if payload.get("_speech_pretranscribed"):
+        return "Got your voice note, but speech-to-text is unavailable on this host. Send text, or run `herdres speech check`."
+    try:
+        enabled = speech.speech_input_enabled()
+    except Exception:
+        enabled = False
+    if not enabled:
+        return "Voice transcription is off. Enable `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1` and run `herdres speech install`, or send text."
+    return "Got your voice note, but it could not be transcribed. Send text, or run `herdres speech check`."
 
 
 def _worker_entry_from_reply(store: dict[str, Any], payload: dict[str, Any]) -> tuple[str, dict[str, Any]] | tuple[None, None]:
@@ -200,7 +238,9 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             state.save_state(store)
             return voice_reply
         text = _send_text_from_payload(payload)
-        alias, clean_text = _split_target_alias(text)
+        voice_payload = speech.is_voice_payload(payload)
+        alias_source = text if text else _clean_voice_caption(payload.get("caption") or payload.get("text") or "")
+        alias, clean_text = _split_target_alias(alias_source)
         if alias:
             _alias_key, alias_entry = _worker_entry_from_alias(store, alias, entry)
             if alias_entry is not None:
@@ -226,7 +266,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                         entry = kind_entry
                     else:
                         return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "unknown_target_bot"}
+        voice_text = _voice_submission_text(payload, clean_text if alias else "")
+        if voice_text:
+            text = voice_text
         if not text:
+            if voice_payload:
+                return {"handled": True, "reply": _voice_unavailable_reply(payload)}
             return {"handled": True, "reply": "Send a message in this topic or use /send <instruction>."}
         request = _command_request(entry, payload, text)
         response = TendwireClient().command(request)
@@ -281,6 +326,28 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     return _json(doctor.run_doctor())
 
 
+def cmd_speech(args: argparse.Namespace) -> int:
+    config.load_env_file()
+    action = str(args.action or "check")
+    if action == "check":
+        return _json({"ok": True, "speech": speech.check()})
+    if action == "install":
+        logs: list[str] = []
+        ok, detail = speech.install_stt_model(force=bool(args.force), log=lambda msg: logs.append(str(msg)))
+        result = {
+            "ok": bool(ok),
+            "status": "ok" if ok else "failed",
+            "stt_model": detail,
+            "speech": speech.check(),
+        }
+        if logs:
+            result["log"] = logs[-3:]
+        if not speech.sherpa_available():
+            result["next_step"] = "Install the sherpa-onnx Python package, then enable HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1."
+        return _json(result)
+    return _json({"ok": False, "status": "failed", "error": f"unknown speech action: {action}"})
+
+
 def cmd_source_smoke(args: argparse.Namespace) -> int:
     config.load_env_file()
     config.require_source_mode()
@@ -325,6 +392,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("callback").set_defaults(func=cmd_callback)
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
     sub.add_parser("version").set_defaults(func=lambda _args: (print(VERSION), 0)[1])
+    speech_parser = sub.add_parser("speech")
+    speech_parser.add_argument("action", nargs="?", default="check", choices=["check", "install"])
+    speech_parser.add_argument("--force", action="store_true")
+    speech_parser.set_defaults(func=cmd_speech)
     tendwire = sub.add_parser("tendwire")
     tendwire_sub = tendwire.add_subparsers(dest="tendwire_cmd", required=True)
     smoke = tendwire_sub.add_parser("source-smoke")

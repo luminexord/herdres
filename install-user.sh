@@ -9,7 +9,6 @@ done
 rm -f \
     "$HOME/.local/bin/herdres_tendwire.py" \
     "$HOME/.local/bin/herdres_routing.py" \
-    "$HOME/.local/bin/herdres_speech.py" \
     "$HOME/.local/bin/herdres_gateway.py" \
     "$HOME/.local/bin/herdres-decision-hook" \
     "$HOME/.local/bin/herdres-speech" \

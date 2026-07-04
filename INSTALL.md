@@ -32,3 +32,12 @@ systemctl --user enable --now herdres.timer herdres-gateway.service
 ```
 
 `herdr-server.service` is not managed by Herdres.
+
+Optional inbound voice-note transcription is disabled by default. To enable it:
+
+```sh
+pip install sherpa-onnx
+herdres speech install
+HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1
+systemctl --user restart herdres-gateway.service
+```
