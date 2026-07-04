@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from herdres_connector import config, state
+from herdres_connector import config, speech, state
 from herdres_connector.managed_bots import MANAGER_BOT_KIND, managed_bot_kind_for_key, managed_bot_kind_for_username, managed_bot_tokens
 from herdres_connector.safe import sanitize_text, short_hash
 from herdres_connector.telegram_delivery import TelegramClient
@@ -192,6 +192,9 @@ def _payload_for_message(message: dict[str, Any], store: dict[str, Any], *, bot_
     reply_to = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
     text = str(message.get("text") or "")
     caption = str(message.get("caption") or "")
+    attachment = speech.voice_attachment_from_message(message)
+    if not text and not caption and not attachment:
+        return None
     target_bot_kind = _target_bot_kind_for_message(store, message, text or caption, bot_key, thread_id)
     current_bot_kind = managed_bot_kind_for_key(bot_key) or MANAGER_BOT_KIND
     if current_bot_kind == MANAGER_BOT_KIND and target_bot_kind in _managed_bot_token_kinds(store):
@@ -206,6 +209,8 @@ def _payload_for_message(message: dict[str, Any], store: dict[str, Any], *, bot_
         "text": text,
         "caption": caption,
     }
+    if attachment:
+        payload["attachment"] = attachment
     if target_bot_kind:
         payload["target_bot_kind"] = target_bot_kind
     return payload
@@ -243,6 +248,7 @@ def handle_message(message: dict[str, Any], token: str, *, bot_key: str | None =
     key = short_hash({"message": payload.get("message_id"), "topic": payload.get("topic_id"), "text": payload.get("text") or payload.get("caption")}, 24)
     if not _reserve_processed(key):
         return
+    payload = speech.pretranscribe_voice_payload(payload, bot_token=token)
     result = run_herdres_command(payload)
     reply = sanitize_text(result.get("reply"), 3500).strip()
     if reply:

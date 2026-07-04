@@ -10,6 +10,7 @@ from herdres_connector.managed_bots import managed_bot_kind_for_key, managed_bot
 from herdres_connector.rendering import render_status_overview
 from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_turn_item_html, turn_item_from_source
 from herdres_connector.safe import public_prune
+from herdres_connector import speech
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient, drain_outbox
 
@@ -1685,6 +1686,91 @@ def test_command_reply_target_bot_kind_targets_worker_in_space(tmp_path, monkeyp
     assert request["instruction"] == {"text": "hello from child bot"}
 
 
+def test_command_reply_voice_transcript_targets_worker_in_space(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
+    )
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-kimi", "name": "kimi", "status": "idle", "space_id": "space-1", "fingerprint": "fp-kimi"},
+    )
+    _space_key, entry, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    entry["active_worker_id"] = "worker-codex"
+    entry["active_worker_fingerprint"] = "fp-codex"
+    state.save_state(store)
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    result = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "999",
+            "target_bot_kind": "kimi",
+            "text": "",
+            "caption": "",
+            "attachment": {"kind": "voice", "file_id": "voice-file", "file_size": 42},
+            "_speech_pretranscribed": True,
+            "_speech_transcript": "check the worker status",
+        }
+    )
+
+    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
+    request = fake.commands[0]
+    assert request["target"] == {"worker_id": "worker-kimi", "worker_fingerprint": "fp-kimi"}
+    assert request["instruction"] == {"text": "check the worker status"}
+    assert "voice-file" not in json.dumps(request, sort_keys=True)
+
+
+def test_command_reply_voice_without_transcript_has_voice_specific_reply(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    monkeypatch.delenv("HERDR_TELEGRAM_TOPICS_SPEECH_INPUT", raising=False)
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"},
+    )
+    _space_key, entry, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    entry["active_worker_id"] = "worker-1"
+    entry["active_worker_fingerprint"] = "fp-1"
+    state.save_state(store)
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    result = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "999",
+            "text": "",
+            "attachment": {"kind": "voice", "file_id": "voice-file", "file_size": 42},
+        }
+    )
+
+    assert result["handled"] is True
+    assert "Voice transcription is off" in result["reply"]
+    assert fake.commands == []
+
+
 def test_voice_command_sets_space_voice_mode(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
@@ -1810,6 +1896,90 @@ def test_gateway_child_bot_payload_targets_child_kind(monkeypatch):
 
     assert payload is not None
     assert payload["target_bot_kind"] == "codex"
+
+
+def test_gateway_voice_payload_includes_attachment(monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    store = _store()
+    store["telegram"]["managed_bots"] = {"kimi": {"enabled": True, "token": "kimi-token"}}
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-kimi", "name": "kimi", "status": "idle", "space_id": "space-1", "fingerprint": "fp-kimi"},
+    )
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    key = managed_bot_tokens(store["telegram"])[0][0]
+
+    payload = herdres_gateway._payload_for_message(
+        {
+            "chat": {"id": "-100", "is_forum": True},
+            "message_thread_id": 77,
+            "message_id": 10,
+            "from": {"id": "1", "is_bot": False},
+            "voice": {
+                "file_id": "voice-file",
+                "file_unique_id": "voice-unique",
+                "mime_type": "audio/ogg",
+                "file_size": 4200,
+                "duration": 3,
+            },
+        },
+        store,
+        bot_key=key,
+    )
+
+    assert payload is not None
+    assert payload["target_bot_kind"] == "kimi"
+    assert payload["attachment"]["kind"] == "voice"
+    assert payload["attachment"]["file_id"] == "voice-file"
+
+
+def test_gateway_pretranscribes_voice_before_command(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"},
+    )
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    state.save_state(store)
+    seen = {}
+
+    def fake_pretranscribe(payload, *, bot_token):
+        assert bot_token == "receiver-token"
+        out = dict(payload)
+        out["_speech_pretranscribed"] = True
+        out["_speech_transcript"] = "from voice"
+        return out
+
+    def fake_command(payload):
+        seen.update(payload)
+        return {"handled": True, "reply": ""}
+
+    monkeypatch.setattr(herdres_gateway.speech, "pretranscribe_voice_payload", fake_pretranscribe)
+    monkeypatch.setattr(herdres_gateway, "run_herdres_command", fake_command)
+    monkeypatch.setattr(herdres_gateway, "_reserve_processed", lambda _key: True)
+
+    herdres_gateway.handle_message(
+        {
+            "chat": {"id": "-100", "is_forum": True},
+            "message_thread_id": 77,
+            "message_id": 10,
+            "from": {"id": "1", "is_bot": False},
+            "voice": {"file_id": "voice-file", "file_size": 42},
+        },
+        "receiver-token",
+    )
+
+    assert seen["_speech_pretranscribed"] is True
+    assert seen["_speech_transcript"] == "from voice"
 
 
 def test_gateway_manager_skips_reply_owned_by_child_bot(monkeypatch):
