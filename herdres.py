@@ -8966,15 +8966,61 @@ def submit_staged_pane_input_if_needed(
     return True, ""
 
 
-def telegram_get_file(file_id: str) -> dict[str, Any]:
-    response = telegram_api("getFile", {"file_id": str(file_id)})
+def telegram_get_file(file_id: str, *, api_token: str | None = None) -> dict[str, Any]:
+    response = telegram_api("getFile", {"file_id": str(file_id)}, token=api_token)
     result = response.get("result") if isinstance(response, dict) else None
     if not isinstance(result, dict) or not str(result.get("file_path") or ""):
         raise BridgeError("Telegram getFile returned no file_path")
     return result
 
 
-def download_telegram_file(file_path: str, dest_path: Path, *, max_bytes: int = ATTACHMENT_MAX_BYTES) -> int:
+def download_bot_token_candidates(telegram: dict[str, Any] | None, target_bot_kind: str) -> list[str | None]:
+    """Ordered bot tokens to fetch a file_id with. A Telegram file_id is only valid for the token of
+    the bot that RECEIVED the message; when a managed pane bot (claude/codex) wins the getUpdates race
+    for its topic, the manager token cannot fetch the file. Try the receiving managed bot first (from
+    the gateway-stamped target_bot_kind), then the manager (None → default), then any other managed
+    bot (covers a mis-attributed kind). None means "use the default manager token"."""
+    bots = telegram.get("managed_bots") if isinstance(telegram, dict) else None
+    bots = bots if isinstance(bots, dict) else {}
+
+    def token_for(kind: str) -> str | None:
+        rec = bots.get(kind)
+        if isinstance(rec, dict) and rec.get("enabled") is not False:
+            tok = str(rec.get("token") or "").strip()
+            return tok or None
+        return None
+
+    ordered: list[str | None] = []
+    seen: set[str] = set()
+
+    def add(tok: str | None) -> None:
+        key = tok or "__manager__"
+        if key not in seen:
+            seen.add(key)
+            ordered.append(tok)
+
+    kind = str(target_bot_kind or "").strip().lower()
+    if kind:
+        add(token_for(kind))
+    add(None)  # manager / default token
+    for other in bots:
+        add(token_for(str(other)))
+    return ordered
+
+
+def telegram_get_file_any(file_id: str, tokens: list[str | None]) -> tuple[dict[str, Any], str | None]:
+    """getFile trying each candidate token in order; return (result, working_token) on the first that
+    succeeds. A file_id belongs to exactly one bot token, so at most one candidate works."""
+    last_exc: Exception | None = None
+    for tok in (tokens or [None]):
+        try:
+            return telegram_get_file(file_id, api_token=tok), tok
+        except (BridgeError, OSError) as exc:
+            last_exc = exc
+    raise last_exc or BridgeError("Telegram getFile returned no file_path")
+
+
+def download_telegram_file(file_path: str, dest_path: Path, *, api_token: str | None = None, max_bytes: int = ATTACHMENT_MAX_BYTES) -> int:
     # Stream to a sibling <name>.part then atomically rename to the final name on
     # success, so a SIGKILL (the bridge kills the subprocess at ~25s) can only
     # leave a .part that is never handed to the agent. O_EXCL|O_NOFOLLOW refuses
@@ -8992,7 +9038,7 @@ def download_telegram_file(file_path: str, dest_path: Path, *, max_bytes: int = 
                 out.write(placeholder)
                 written = len(placeholder)
             else:
-                token = telegram_token()
+                token = api_token or telegram_token()
                 url = f"{ATTACHMENT_FILE_HOST}/file/bot{token}/{urllib.parse.quote(str(file_path), safe='/')}"
                 deadline = time.monotonic() + ATTACHMENT_DOWNLOAD_TIMEOUT
                 try:
@@ -9122,18 +9168,20 @@ def pane_attachment_instruction(path: Path, attachment: dict[str, Any], caption:
     return head + "Read that file and treat its contents as the owner's instruction; then respond to the owner."
 
 
-def deliver_attachment(pane_id: str, attachment: dict[str, Any]) -> tuple[bool, str, Path | None]:
+def deliver_attachment(pane_id: str, attachment: dict[str, Any], *, api_tokens: list[str | None] | None = None) -> tuple[bool, str, Path | None]:
     cap_mb = ATTACHMENT_MAX_BYTES // (1024 * 1024)
     declared = int(attachment.get("file_size") or 0)
     if declared > ATTACHMENT_MAX_BYTES:
         return (False, f"too large ({declared // (1024 * 1024)} MB); Telegram bots can only fetch files up to {cap_mb} MB.", None)
     try:
-        result = telegram_get_file(str(attachment.get("file_id") or ""))
+        # A file_id is scoped to the bot token that received it; try the receiving managed bot first,
+        # then the manager, then other managed bots. The getFile winner's token also fetches the bytes.
+        result, file_token = telegram_get_file_any(str(attachment.get("file_id") or ""), api_tokens or [None])
         confirmed = int(result.get("file_size") or 0)
         if confirmed > ATTACHMENT_MAX_BYTES:
             return (False, f"too large ({confirmed // (1024 * 1024)} MB); Telegram bots can only fetch files up to {cap_mb} MB.", None)
         dest = attachment_dest_path(pane_id, attachment)
-        written = download_telegram_file(str(result.get("file_path") or ""), dest)
+        written = download_telegram_file(str(result.get("file_path") or ""), dest, api_token=file_token)
         if confirmed > 0 and written != confirmed and not dry_run_enabled():
             _unlink_quietly(dest)
             return (False, "the download was incomplete (size mismatch); please resend.", None)
@@ -9739,6 +9787,39 @@ def _abandon_speech_reply(entry: dict[str, Any], turn_id: str, path: Path) -> No
     entry.pop("pending_speech_reply", None)
 
 
+VOICE_REPLY_ID_HISTORY = 30
+
+
+def speech_reply_on_voice_reply_enabled() -> bool:
+    """Default-on: when the owner replies (Telegram reply) to one of the agent's voice notes, speak
+    the agent's next reply — no trigger phrase needed. Disable with
+    HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_ON_VOICE_REPLY=0."""
+    return str(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_ON_VOICE_REPLY", "1") or "1").strip().lower() \
+        not in {"0", "false", "no", "off"}
+
+
+def record_voice_reply_message_id(entry: dict[str, Any], message_id: str | int) -> None:
+    """Remember the message-ids of the voice notes we send for a pane (bounded ring) so a Telegram
+    reply TO one of them can be recognized and auto-enable 'reply by voice' for the next turn."""
+    mid = str(message_id or "").strip()
+    if not mid or not isinstance(entry, dict):
+        return
+    ids = [str(x) for x in entry.get("voice_reply_message_ids")] if isinstance(entry.get("voice_reply_message_ids"), list) else []
+    if mid in ids:
+        ids.remove(mid)
+    ids.append(mid)
+    entry["voice_reply_message_ids"] = ids[-VOICE_REPLY_ID_HISTORY:]
+
+
+def message_is_voice_reply(entry: dict[str, Any], reply_to_message_id: str | int | None) -> bool:
+    """True when reply_to_message_id points at one of this pane's own voice notes."""
+    rt = str(reply_to_message_id or "").strip()
+    if not rt or not isinstance(entry, dict):
+        return False
+    ids = entry.get("voice_reply_message_ids")
+    return isinstance(ids, list) and rt in {str(x) for x in ids}
+
+
 def flush_pending_speech_reply(
     state: dict[str, Any], entry: dict[str, Any], telegram: dict[str, Any], chat_id: str, *, api_token: str | None = None
 ) -> bool:
@@ -9787,6 +9868,8 @@ def flush_pending_speech_reply(
             record_pane_message_route(
                 state, str(entry.get("space_key") or ""), str(entry.get("pane_key") or ""), voice_message_id
             )
+            # Remember it so a reply to this voice note auto-speaks the next turn (issue #4 v2).
+            record_voice_reply_message_id(entry, voice_message_id)
         _unlink_quietly(path)
         entry["last_speech_reply_turn_id"] = turn_id
         entry.pop("pending_speech_reply", None)
@@ -13136,11 +13219,14 @@ def _sync_pane_clean_feed(
                         )
                     # Issue #4 v2: queue a spoken version of the reply (flushed below, like plan_doc).
                     # Speak this turn when the owner's prompt contained the trigger phrase ("reply by
-                    # voice"), or when SPEECH_REPLIES force-speaks every reply. Keyword path needs no
-                    # global flag — per-message opt-in, default text.
+                    # voice"), when the owner replied to one of the pane's voice notes (speak_next_reply,
+                    # one-shot — consumed here whether or not we can speak, so it never leaks to a later
+                    # turn), or when SPEECH_REPLIES force-speaks every reply.
                     try:
+                        want_voice_reply = bool(entry.pop("speak_next_reply", None))
                         if herdres_speech is not None and (
-                            herdres_speech.speech_reply_triggered(item.get("user_text"))
+                            want_voice_reply
+                            or herdres_speech.speech_reply_triggered(item.get("user_text"))
                             or herdres_speech.speech_replies_enabled()
                         ):
                             queue_speech_reply(
@@ -15253,8 +15339,9 @@ def enumerate_pane_skills(agent_kind: str, cwd: str | None = None, *,
 def pretranscribe_voice_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Issue #4 perf: download + transcribe an owner's voice note BEFORE the command takes the global
     sync lock, so the slow part (network download + STT, 0.5-13s) never pins the lock and stalls the
-    timer sync / other inbound messages. Runs in the same subprocess as command_reply, so the token
-    resolution (telegram_token, from the subprocess env) is identical to the in-lock path.
+    timer sync / other inbound messages. Runs in the same subprocess as command_reply. The file_id is
+    scoped to the bot that received it, so we fetch with the receiving-bot token candidates (resolved
+    from the gateway-stamped target_bot_kind), not just the manager token.
 
     Strictly fail-open: on anything unexpected (speech off/unavailable, oversized, download/STT error)
     we return the payload UNCHANGED and command_reply's existing in-lock arm handles it exactly as
@@ -15269,14 +15356,19 @@ def pretranscribe_voice_payload(payload: dict[str, Any]) -> dict[str, Any]:
             return payload  # disabled/unavailable — let the in-lock arm produce the right reply
         if int(attachment.get("file_size") or 0) > ATTACHMENT_MAX_BYTES:
             return payload  # oversized — let the in-lock arm produce the size-error reply
+        try:
+            telegram = load_state().get("telegram")
+        except Exception:
+            telegram = None
+        tokens = download_bot_token_candidates(telegram, str(payload.get("target_bot_kind") or ""))
         dest_fd, dest_name = tempfile.mkstemp(prefix="herdres-stt-", suffix=".ogg")
         os.close(dest_fd)
         dest = Path(dest_name)
         try:
-            result = telegram_get_file(str(attachment.get("file_id") or ""))
+            result, file_token = telegram_get_file_any(str(attachment.get("file_id") or ""), tokens)
             if int(result.get("file_size") or 0) > ATTACHMENT_MAX_BYTES:
                 return payload
-            download_telegram_file(str(result.get("file_path") or ""), dest)
+            download_telegram_file(str(result.get("file_path") or ""), dest, api_token=file_token)
             transcript = str(herdres_speech.speech_request("stt", {"path": str(dest)}).get("text") or "").strip()
         finally:
             _unlink_quietly(dest)
@@ -15364,6 +15456,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         reply_to_message_id=str(payload.get("reply_to_message_id") or ""),
         target_bot_kind=target_bot_kind,
     )
+    # "Reply by voice" auto-mode: replying to one of this pane's voice notes speaks the next turn
+    # (one-shot), no trigger phrase needed. Consumed at turn render in _sync_pane_clean_feed.
+    if isinstance(entry, dict) and speech_reply_on_voice_reply_enabled() \
+            and message_is_voice_reply(entry, payload.get("reply_to_message_id")):
+        entry["speak_next_reply"] = True
     if not entry:
         mapped_space = topic_space_entry(state, chat_id, topic_id)
         if mapped_space:
@@ -15449,6 +15546,9 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             "handled": True,
             "reply": "This topic was created by legacy Herdr mode. Refresh Tendwire source status before sending.",
         }
+    # Downloads (getFile + file fetch) must use the token of the bot that RECEIVED the message, which
+    # can differ from the pane's outbound token — resolve candidates from the gateway-stamped kind.
+    download_tokens = download_bot_token_candidates(telegram, str(payload.get("target_bot_kind") or ""))
     if command == "agents":
         label = str((managed_bot_specs().get(managed_bot_kind_for_entry(entry)) or {}).get("label")
                     or entry.get("agent") or entry.get("pane_id") or "pane")
@@ -15461,7 +15561,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         }
     if isinstance(attachment, dict) and attachment.get("kind") in {"document", "photo"} and attachment.get("file_id"):
         caption = str(payload.get("caption") or "")
-        ok, detail, dest = deliver_attachment(pane_id, attachment)
+        ok, detail, dest = deliver_attachment(pane_id, attachment, api_tokens=download_tokens)
         if not ok or dest is None:
             return {"handled": True, "reply": f"Could not deliver that attachment: {detail}"}
         instruction = pane_attachment_instruction(dest, attachment, caption or text)
@@ -15502,7 +15602,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 return {"handled": True, "reply": (
                     "Voice transcription is off. Enable it with `HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1` "
                     "and `herdres speech install`, or send text.")}
-            ok, detail, dest = deliver_attachment(pane_id, attachment)
+            ok, detail, dest = deliver_attachment(pane_id, attachment, api_tokens=download_tokens)
             if not ok or dest is None:
                 return {"handled": True, "reply": f"Could not fetch that voice note: {detail}"}
             try:

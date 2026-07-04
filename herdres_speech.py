@@ -186,28 +186,73 @@ def _max_decode_seconds() -> int:
         return 600
 
 
+def _stt_normalize_filter() -> str:
+    """ffmpeg audio filter applied before STT. Telegram voice notes are often recorded very quietly
+    (mean loudness well below -40 dB), which parakeet transcribes to nothing; loudnorm brings the
+    signal up to a consistent level. Set HERDR_TELEGRAM_TOPICS_SPEECH_NORMALIZE=0 to disable."""
+    raw = str(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_NORMALIZE", "1") or "1").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return ""
+    return str(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_NORMALIZE_FILTER", "loudnorm=I=-16:TP=-1.5:LRA=11")
+               or "").strip()
+
+
 def _decode_to_pcm(path: Path) -> bytes | None:
-    """Decode any audio (Telegram voice = OGG/Opus) to 16 kHz mono float32 PCM via ffmpeg."""
+    """Decode any audio (Telegram voice = OGG/Opus) to 16 kHz mono float32 PCM via ffmpeg, with an
+    optional loudness-normalization filter (rescues very quiet recordings)."""
     ff = _ffmpeg()
     if not ff:
         return None
+    # -t caps decoded duration so a tiny-but-long Opus note can't expand to GBs of PCM in RAM.
+    cmd = [ff, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-ar", str(STT_SAMPLE_RATE), "-ac", "1", "-t", str(_max_decode_seconds())]
+    norm = _stt_normalize_filter()
+    if norm:
+        cmd += ["-af", norm]
+    cmd += ["-f", "f32le", "-"]
     try:
-        proc = subprocess.run(
-            # -t caps decoded duration so a tiny-but-long Opus note can't expand to GBs of PCM in RAM.
-            [ff, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path),
-             "-ar", str(STT_SAMPLE_RATE), "-ac", "1", "-t", str(_max_decode_seconds()), "-f", "f32le", "-"],
-            capture_output=True, timeout=45,  # safety bound on a pathological ffmpeg hang
-        )
+        proc = subprocess.run(cmd, capture_output=True, timeout=45)  # safety bound on a pathological ffmpeg hang
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0 or not proc.stdout:
-        return None
+        # Normalization can fail on odd inputs; retry once without the filter before giving up.
+        if norm:
+            try:
+                bare = [ff, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path),
+                        "-ar", str(STT_SAMPLE_RATE), "-ac", "1", "-t", str(_max_decode_seconds()), "-f", "f32le", "-"]
+                proc = subprocess.run(bare, capture_output=True, timeout=45)
+            except (OSError, subprocess.SubprocessError):
+                return None
+        if proc.returncode != 0 or not proc.stdout:
+            return None
     return proc.stdout
+
+
+def _stt_chunk_samples() -> int:
+    """Window length (in samples) for long-audio chunking. parakeet-tdt returns an EMPTY result once
+    a single decode pass exceeds ~15s, so anything longer must be windowed. Default 14s; override with
+    HERDR_TELEGRAM_TOPICS_SPEECH_CHUNK_SECONDS."""
+    try:
+        secs = max(1, int(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_CHUNK_SECONDS", "14") or "14"))
+    except ValueError:
+        secs = 14
+    return secs * STT_SAMPLE_RATE
+
+
+def _decode_samples(rec, samples) -> str:
+    stream = rec.create_stream()
+    stream.accept_waveform(STT_SAMPLE_RATE, samples)
+    rec.decode_stream(stream)
+    return str(getattr(stream.result, "text", "") or "").strip()
 
 
 def transcribe(path: str | Path) -> str:
     """Transcribe an audio file to text. Returns "" on ANY failure (engine/model/ffmpeg absent or
-    error) — the caller degrades to "speech unavailable" and keeps the text path working."""
+    error) — the caller degrades to "speech unavailable" and keeps the text path working.
+
+    Long clips are windowed: parakeet-tdt returns an empty string once one decode pass runs past
+    ~15s, so a 30s/60s voice note would otherwise transcribe to nothing. We split into overlapping
+    windows, decode each, and join the non-empty parts."""
     rec = _load_stt()
     if rec is None:
         return ""
@@ -225,10 +270,23 @@ def transcribe(path: str | Path) -> str:
             import array
             samples = array.array("f")
             samples.frombytes(pcm)
-        stream = rec.create_stream()
-        stream.accept_waveform(STT_SAMPLE_RATE, samples)
-        rec.decode_stream(stream)
-        return str(getattr(stream.result, "text", "") or "").strip()
+        n = len(samples)
+        chunk = _stt_chunk_samples()
+        # Short clip: single pass (parakeet handles it, and one pass avoids boundary artifacts).
+        if n <= chunk:
+            return _decode_samples(rec, samples)
+        # Long clip: window it. A ~1s overlap keeps a word from being clipped exactly on a boundary;
+        # duplicate boundary words are far less bad than a silently-empty transcript.
+        overlap = STT_SAMPLE_RATE
+        step = max(1, chunk - overlap)
+        parts: list[str] = []
+        i = 0
+        while i < n:
+            piece = _decode_samples(rec, samples[i:i + chunk])
+            if piece:
+                parts.append(piece)
+            i += step
+        return " ".join(parts).strip()
     except Exception:
         return ""
 
