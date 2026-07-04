@@ -174,6 +174,12 @@ def _explicit_target_bot_kind_for_message(store: dict[str, Any], message: dict[s
     )
 
 
+def _drop(message: dict[str, Any], reason: str, detail: str = "") -> None:
+    message_id = str(message.get("message_id") or "")
+    suffix = f" ({detail})" if detail else ""
+    log(f"drop message {message_id}: {reason}{suffix}")
+
+
 def _payload_for_message(message: dict[str, Any], store: dict[str, Any], *, bot_key: str | None = None) -> dict[str, Any] | None:
     chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
     configured_chat = config.telegram_chat_id(store)
@@ -182,9 +188,11 @@ def _payload_for_message(message: dict[str, Any], store: dict[str, Any], *, bot_
     thread_id = _message_thread_id(message, store)
     _key, entry = state.find_entry_by_thread(store, thread_id)
     if entry is None:
+        _drop(message, "no_topic_entry", f"thread {thread_id}")
         return None
     user = message.get("from") if isinstance(message.get("from"), dict) else {}
     if not _owner_allowed(store, str(user.get("id") or ""), bool(user.get("is_bot"))):
+        _drop(message, "sender_not_allowed")
         return None
     reply_to = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
     text = str(message.get("text") or "")
@@ -195,6 +203,7 @@ def _payload_for_message(message: dict[str, Any], store: dict[str, Any], *, bot_
     target_bot_kind = _explicit_target_bot_kind_for_message(store, message, text or caption, thread_id)
     current_bot_kind = managed_bot_kind_for_key(bot_key) or MANAGER_BOT_KIND
     if current_bot_kind == MANAGER_BOT_KIND and target_bot_kind in _managed_bot_token_kinds(store):
+        # Deferred to the targeted managed bot poller; only that poller may handle it.
         return None
     if current_bot_kind != MANAGER_BOT_KIND and target_bot_kind != current_bot_kind:
         return None
@@ -309,7 +318,10 @@ def _poll_once(key: str, token: str, *, timeout_seconds: int) -> None:
             return
     for update in get_updates(token, offset, timeout_seconds=timeout_seconds):
         update_id = int(update.get("update_id") or 0)
-        handle_update(update, token, bot_key=key)
+        try:
+            handle_update(update, token, bot_key=key)
+        except Exception as exc:  # noqa: BLE001 - skip poison updates instead of re-fetching them forever
+            log(f"update {update_id} failed for {key}: {type(exc).__name__}: {sanitize_text(str(exc), 200)}")
         if offset is None or update_id >= offset:
             offset = update_id + 1
             _save_offset(offset, key)
@@ -319,8 +331,8 @@ def _poll_worker(key: str, token: str, timeout_seconds: int, stop_event: threadi
     while not stop_event.is_set():
         try:
             _poll_once(key, token, timeout_seconds=timeout_seconds)
-        except (urllib.error.URLError, TimeoutError, RuntimeError) as exc:
-            log(f"poll error for {key}: {sanitize_text(str(exc), 200)}")
+        except Exception as exc:  # noqa: BLE001 - a dead poll thread silently drops inbound messages
+            log(f"poll error for {key}: {type(exc).__name__}: {sanitize_text(str(exc), 200)}")
             time.sleep(ERROR_BACKOFF)
 
 
