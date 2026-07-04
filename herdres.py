@@ -274,7 +274,19 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 return {"handled": True, "reply": _voice_unavailable_reply(payload)}
             return {"handled": True, "reply": "Send a message in this topic or use /send <instruction>."}
         request = _command_request(entry, payload, text)
-        response = TendwireClient().command(request)
+        client = TendwireClient()
+        response = client.command(request)
+        if (
+            str(response.get("status") or "") == "stale_target"
+            and isinstance(request.get("target"), dict)
+            and request["target"].get("worker_fingerprint")
+        ):
+            # Worker fingerprints churn with status/summary, so a cached
+            # fingerprint can be seconds stale. Retry once pinned by id only.
+            retry = json.loads(json.dumps(request))
+            retry["target"].pop("worker_fingerprint", None)
+            retry["request_id"] = f"{request['request_id']}-r2"
+            response = client.command(retry)
         ledger = store.setdefault("tendwire_command_submissions", {})
         identity = short_hash({"request": request["request_id"], "worker": entry.get("tendwire_worker_id")}, 20)
         ledger[identity] = {

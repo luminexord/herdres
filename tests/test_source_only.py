@@ -1386,7 +1386,7 @@ def test_active_source_status_with_completed_turn_uses_idle_topic_icon(monkeypat
     assert telegram.icon_edits == [("-100", "77", "icon-idle")]
 
 
-def test_open_turn_in_space_keeps_topic_icon_working_when_worker_id_shifted(monkeypatch):
+def test_open_turn_from_retired_worker_id_does_not_pin_topic_icon(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
     telegram = FakeTelegram()
@@ -1418,11 +1418,13 @@ def test_open_turn_in_space_keeps_topic_icon_working_when_worker_id_shifted(monk
     result = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
     entry = next(iter(state.source_space_entries(store).values()))
 
+    # Worker ids are stable now; a lingering open turn from a retired worker id
+    # must not pin the live space to "working" forever.
     assert result["icon_updated"] == 1
-    assert entry["status"] == "working"
-    assert entry["active_worker_status"] == "working"
-    assert entry["last_topic_icon"] == "⚡️"
-    assert telegram.icon_edits == [("-100", "77", "icon-working")]
+    assert entry["status"] == "idle"
+    assert entry["active_worker_status"] == "idle"
+    assert entry["last_topic_icon"] == "✅"
+    assert telegram.icon_edits == [("-100", "77", "icon-idle")]
 
 
 def test_public_raw_status_working_overrides_done_source_status(monkeypatch):

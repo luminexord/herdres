@@ -98,7 +98,7 @@ def _turn_activity_status(item: dict[str, Any]) -> str:
     return ""
 
 
-def _turn_activity_statuses(payload: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+def _turn_activity_statuses(payload: dict[str, Any], live_worker_ids: set[str] | None = None) -> tuple[dict[str, str], dict[str, str]]:
     by_worker: dict[str, str] = {}
     by_space: dict[str, str] = {}
     for item in _turns(payload):
@@ -107,6 +107,11 @@ def _turn_activity_statuses(payload: dict[str, Any]) -> tuple[dict[str, str], di
             continue
         worker_id = compact_ws(item.get("worker_id"), 160)
         space_id = compact_ws(item.get("space_id"), 160)
+        if live_worker_ids is not None and worker_id and worker_id not in live_worker_ids:
+            # Stale turn rows from retired worker ids must not pin a live
+            # space/worker status (e.g. an abandoned open turn reading as
+            # "working" forever).
+            continue
         if worker_id and worker_id not in by_worker:
             by_worker[worker_id] = status
         if space_id and space_id not in by_space:
@@ -817,7 +822,9 @@ def _sync_sources(
 ) -> dict[str, int]:
     counts = {"created": 0, "updated": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
     topic_mode = config.source_topic_mode()
-    turn_status_by_worker, turn_status_by_space = _turn_activity_statuses(turns_payload)
+    live_worker_ids = {compact_ws(worker.get("id"), 160) for worker in _workers(snapshot)}
+    live_worker_ids.discard("")
+    turn_status_by_worker, turn_status_by_space = _turn_activity_statuses(turns_payload, live_worker_ids)
     spaces = {compact_ws(item.get("id"), 160): item for item in _spaces(snapshot) if compact_ws(item.get("id"), 160)}
     workers_by_space: dict[str, list[dict[str, Any]]] = {}
     for worker in _workers(snapshot):
