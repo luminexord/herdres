@@ -74,10 +74,49 @@ Tendwire.
 ./install-user.sh
 $EDITOR ~/.config/herdres/herdres.env
 systemctl --user daemon-reload
-systemctl --user enable --now herdres.timer herdres-gateway.service
+systemctl --user enable --now herdres.service herdres-gateway.service
 ```
 
 Do not run the legacy `herdr-telegram-topics.timer` with this branch.
+
+### Services
+
+This branch runs two user services (plus the Tendwire daemon):
+
+- `herdres.service` — the source sync loop (`herdres sync --loop`). It reads
+  Tendwire snapshots/turns/pending and drives Telegram topics, messages, and
+  pinned status. This replaces the old `herdres.timer`; there is no timer unit
+  on this branch.
+- `herdres-gateway.service` — inbound Telegram polling; forwards topic input to
+  `herdres command` → `tendwire command`.
+- `tendwired.service` — the Tendwire daemon (installed from the Tendwire repo);
+  Herdres depends on it but does not manage it.
+
+## Send transport
+
+Herdres submits every outbound instruction through Tendwire's public command
+path (`command.submit`, invoked as `tendwire command --json`). Herdres never
+sees or handles `pane_id`, `terminal_id`, or `send_keys` — those never appear in
+public or source-mode state. Tendwire owns the private send target and may, for
+delivery reliability, drive a private Herdr pane transport internally; that is a
+Tendwire implementation detail behind the public command contract. Planned
+follow-up: switch Tendwire's internal send to the semantic `agent.send` API once
+it is stable, with no change to the public command path Herdres depends on.
+
+## Rollback
+
+This branch is source-only: `HERDRES_TENDWIRE_MODE` must be `source`
+(`require_source_mode` rejects any other value — there is no
+`HERDRES_TENDWIRE_MODE=off`). To roll back, switch the checkout to a legacy
+(non-tendwired) Herdres branch or release tag and reinstall from there:
+
+```sh
+systemctl --user disable --now herdres.service herdres-gateway.service
+git checkout <legacy-herdres-tag>
+./install-user.sh   # or the legacy branch's installer
+```
+
+Rolling back is a code/branch switch, not an environment-variable toggle.
 
 ## Checks
 
