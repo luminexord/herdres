@@ -822,7 +822,11 @@ def _sync_sources(
 ) -> dict[str, int]:
     counts = {"created": 0, "updated": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
     topic_mode = config.source_topic_mode()
-    live_worker_ids = {compact_ws(worker.get("id"), 160) for worker in _workers(snapshot)}
+    live_worker_ids = {
+        compact_ws(worker.get("id"), 160)
+        for worker in _workers(snapshot)
+        if _worker_is_open(worker)
+    }
     live_worker_ids.discard("")
     turn_status_by_worker, turn_status_by_space = _turn_activity_statuses(turns_payload, live_worker_ids)
     spaces = {compact_ws(item.get("id"), 160): item for item in _spaces(snapshot) if compact_ws(item.get("id"), 160)}
@@ -1478,7 +1482,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     routing_repaired = _repair_space_mode_routing_state(store)
     message_bindings = _backfill_message_bindings(store)
     bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
-    live_worker_ids = {compact_ws(worker.get("id"), 160) for worker in _workers(snapshot)}
+    live_worker_ids = {
+        compact_ws(worker.get("id"), 160)
+        for worker in _workers(snapshot)
+        if _worker_is_open(worker)
+    }
     live_worker_ids.discard("")
     turn_counts = (
         {"feed_sent": 0, "sent": 0, "updated": 0}
