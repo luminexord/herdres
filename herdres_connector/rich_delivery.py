@@ -22,8 +22,15 @@ from .telegram_delivery import RateLimited, TelegramClient, TelegramError
 
 MAX_REPLY_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "64000"))
 MAX_RICH_HTML_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS", "14000"))
-RICH_SINGLE_MESSAGE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SINGLE_MESSAGE_CHARS", "1000"))
-RICH_SAFE_CHARS = 12000
+# A turn is sent as ONE rich message when its full rendered HTML fits this; it is
+# only split into "Response i/N" parts when it cannot fit a single message.
+# Default = MAX_RICH_HTML_CHARS so a response splits iff Telegram would reject it
+# as too large -- not before. (The split itself stays lossless.)
+RICH_SINGLE_MESSAGE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SINGLE_MESSAGE_CHARS", str(MAX_RICH_HTML_CHARS)))
+# Source-text chunk size used when a response DOES need splitting. Bigger chunks
+# => fewer parts; kept well under the per-message cap so each rendered part
+# (plus the You/Working sections on part 1) stays rich rather than falling back.
+RICH_SPLIT_CHUNK_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SPLIT_CHUNK_CHARS", "4000"))
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 WORKLOG_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_WORKLOG_MAX_CHARS", "1200"))
 PROMPT_PREVIEW_CHARS = 80
@@ -387,9 +394,9 @@ def _turn_item_delivery_parts(item: dict[str, Any], *, live: bool = False) -> li
     final_text = _turn_response_text(item)
     if not final_text:
         return [item]
-    if len(render_turn_item_html(item)) <= RICH_SINGLE_MESSAGE_CHARS:
+    if len(render_turn_item_html(item)) <= min(RICH_SINGLE_MESSAGE_CHARS, MAX_RICH_HTML_CHARS):
         return [item]
-    chunks = split_text_chunks(final_text, limit=700)
+    chunks = split_text_chunks(final_text, limit=RICH_SPLIT_CHUNK_CHARS)
     if len(chunks) <= 1:
         return [item]
     total = len(chunks)
