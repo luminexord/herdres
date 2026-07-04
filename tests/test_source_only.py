@@ -6,6 +6,7 @@ from pathlib import Path
 import herdres
 import herdres_gateway
 from herdres_connector import state
+from herdres_connector.rendering import render_status_overview
 from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_turn_item_html
 from herdres_connector.safe import public_prune
 from herdres_connector.source_sync import SyncRuntime, sync_once
@@ -149,6 +150,26 @@ def _store():
         "spaces": {},
         "tendwired_bootstrap_complete": True,
     }
+
+
+def test_status_overview_shows_active_pane_for_space_topic():
+    html = render_status_overview(
+        [
+            {
+                "topic_name": "Workers",
+                "status": "working",
+                "active_worker_name": "claude",
+                "active_worker_status": "working",
+                "worker_count": 2,
+            }
+        ]
+    )
+
+    assert "<b>Workers</b>" in html
+    assert "active: claude" in html
+    assert "working" in html
+    assert "2 panes" in html
+    assert "no active pane" not in html.lower()
 
 
 def test_first_sync_bootstraps_current_turns_without_telegram_posts(monkeypatch):

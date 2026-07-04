@@ -247,11 +247,50 @@ def render_pending(item: dict[str, Any], entry: dict[str, Any]) -> str:
     return f"<b>Input Needed</b> · {label}\n\n{prompt}"
 
 
+def _pane_count_label(value: Any) -> str:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if count <= 0:
+        return ""
+    return "1 pane" if count == 1 else f"{count} panes"
+
+
+def _active_worker_label(entry: dict[str, Any]) -> str:
+    return compact_ws(
+        entry.get("active_worker_name")
+        or entry.get("active_worker_id")
+        or entry.get("worker_name")
+        or entry.get("tendwire_worker_id"),
+        80,
+    )
+
+
+def render_status_entry(entry: dict[str, Any]) -> str:
+    status = normalized_status(
+        entry.get("active_worker_status")
+        or entry.get("tendwire_status_line")
+        or entry.get("status")
+    )
+    topic = html_escape(worker_label(entry), 80)
+    details: list[str] = []
+    active_worker = _active_worker_label(entry)
+    if active_worker:
+        details.append(f"active: {html_escape(active_worker, 80)}")
+        details.append(status)
+    else:
+        details.append("no active pane")
+    pane_count = _pane_count_label(entry.get("worker_count"))
+    if pane_count:
+        details.append(pane_count)
+    return f"{status_emoji(status)} <b>{topic}</b> · {' · '.join(details)}"
+
+
 def render_status_overview(entries: list[dict[str, Any]]) -> str:
     rows = ["<b>Herdres</b> · Tendwire source mode"]
     for entry in sorted(entries, key=lambda item: str(item.get("topic_name") or item.get("tendwire_worker_id"))):
-        status = normalized_status(entry.get("tendwire_status_line") or entry.get("status"))
-        rows.append(f"{status_emoji(status)} {html_escape(worker_label(entry), 80)}")
+        rows.append(render_status_entry(entry))
     return "\n".join(rows)
 
 
