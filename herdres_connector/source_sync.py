@@ -198,6 +198,46 @@ def _final_turn_delivered(store: dict[str, Any], turn_id: str) -> bool:
     return False
 
 
+def _clear_open_turn_final_delivery_state(store: dict[str, Any], entry: dict[str, Any], turn_id: str) -> bool:
+    """Remove stale final-delivery markers for a turn Tendwire still reports open.
+
+    Older source syncs could accidentally render stream-only progress as a final
+    Response. If those markers remain, the real completed response for the same
+    turn_id is suppressed later by the duplicate guard.
+    """
+    if not turn_id:
+        return False
+    changed = False
+    delivered = state.delivered_turns(store)
+    for identity, record in list(delivered.items()):
+        same_turn_record = isinstance(record, dict) and str(record.get("turn_id") or "") == turn_id
+        if str(identity).startswith(f"final:{turn_id}:") or same_turn_record:
+            delivered.pop(identity, None)
+            changed = True
+    bindings = state.message_bindings(store)
+    for message_id, binding in list(bindings.items()):
+        if (
+            isinstance(binding, dict)
+            and str(binding.get("kind") or "") == "final"
+            and str(binding.get("turn_id") or "") == turn_id
+        ):
+            bindings.pop(message_id, None)
+            changed = True
+    if entry.get("last_turn_id") == turn_id:
+        for key in (
+            "last_turn_id",
+            "last_clean_hash",
+            "last_clean_message_id",
+            "last_clean_message_ids",
+            "last_clean_bot_kind",
+            "last_render_version",
+        ):
+            if key in entry:
+                entry.pop(key, None)
+                changed = True
+    return changed
+
+
 def _repair_delivered_final_entry(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], content_hash: str) -> bool:
     turn_id = _turn_id(item)
     changed = False
@@ -785,6 +825,7 @@ def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_pa
         if entry is None:
             continue
         before = dict(entry)
+        repaired_open_final = False
         worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
         latest_turn_id = latest_content_turn_by_worker.get(worker_key)
         complete = bool(item.get("complete")) or bool(item.get("assistant_final_text"))
@@ -803,12 +844,13 @@ def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_pa
             if worker_key in seen_working_workers:
                 continue
             seen_working_workers.add(worker_key)
+            repaired_open_final = _clear_open_turn_final_delivery_state(store, entry, _turn_id(item))
             delivered = _deliver_working(store, item, entry, runtime, chat_id=chat_id)
         else:
             delivered = False
         counts["feed_sent"] += int(delivered)
         counts["sent"] += int(delivered)
-        counts["updated"] += int(not delivered and before != entry)
+        counts["updated"] += int((not delivered and before != entry) or (repaired_open_final and not delivered))
     for item in _pending(pending_payload):
         delivered = _deliver_pending(store, item, runtime, chat_id=chat_id)
         counts["feed_sent"] += int(delivered)

@@ -1266,6 +1266,55 @@ def test_working_update_edits_existing_message(monkeypatch):
     assert "second" in telegram.edited[-1][2]
 
 
+def test_open_working_turn_repairs_stale_final_markers_then_finalizes(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    _worker_key, worker, _created = state.upsert_worker_entry(
+        store,
+        {"id": "worker-1", "name": "Alpha", "status": "working", "space_id": "space-1", "fingerprint": "fp-1"},
+    )
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    state.mark_delivered(store, "final:turn-1:oldstream", {"worker_id": "worker-1", "turn_id": "turn-1"})
+    state.bind_message_to_worker(store, "555", worker, topic_id="77", kind="final", turn_id="turn-1", bot_kind="codex")
+    worker["last_turn_id"] = "turn-1"
+    worker["last_clean_hash"] = "oldstream"
+    worker["last_clean_message_id"] = "555"
+    worker["last_clean_message_ids"] = ["555"]
+    telegram = FakeTelegram()
+
+    first = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns={"turns": [{"id": "turn-1", "worker_id": "worker-1", "assistant_stream_text": "still working", "complete": False}]}),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+    entry = next(iter(state.source_worker_entries(store).values()))
+
+    assert first["feed_sent"] == 1
+    assert not any(key.startswith("final:turn-1:") for key in store["tendwire_source_delivered_turns"])
+    assert state.find_message_binding(store, "555", topic_id="77") is None
+    assert "last_clean_message_id" not in entry
+
+    second = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns={"turns": [{"id": "turn-1", "worker_id": "worker-1", "assistant_final_text": "real final", "complete": True}]}),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert second["feed_sent"] == 1
+    assert any("real final" in sent[1] for sent in telegram.sent)
+    assert any(key.startswith("final:turn-1:") for key in store["tendwire_source_delivered_turns"])
+
+
 def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
