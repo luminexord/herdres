@@ -329,6 +329,23 @@ def _pinned_model_suffix(entry: dict[str, Any], label: str) -> str:
     return f" · {pretty}"
 
 
+def _duplicate_worker_suffix(entry: dict[str, Any], label: str) -> str:
+    worker_id = compact_ws(entry.get("tendwire_worker_id") or entry.get("worker_id") or entry.get("active_worker_id"), 40)
+    if not worker_id:
+        return ""
+    label_key = re.sub(r"[^a-z0-9]+", "", label.lower())
+    worker_key = re.sub(r"[^a-z0-9]+", "", worker_id.lower())
+    if worker_key == label_key:
+        return ""
+    suffix = worker_id
+    lowered = worker_id.lower()
+    for prefix in (label.lower() + "-", label.lower() + "_", label.lower()):
+        if lowered.startswith(prefix):
+            suffix = worker_id[len(prefix) :].strip("-_ ")
+            break
+    return f" {suffix}" if suffix else ""
+
+
 def pinned_status_entry_label(entry: dict[str, Any]) -> str:
     return (
         _title_label(entry.get("agent"))
@@ -339,25 +356,49 @@ def pinned_status_entry_label(entry: dict[str, Any]) -> str:
     )
 
 
-def render_status_entry(entry: dict[str, Any]) -> str:
+def _render_status_entry_display(entry: dict[str, Any], display: str) -> str:
     status = normalized_status(
         entry.get("active_worker_status")
         or entry.get("tendwire_status_line")
         or entry.get("status")
     )
-    label = pinned_status_entry_label(entry)
-    display = f"{label}{_pinned_model_suffix(entry, label)}"
     return f"{html_escape(display, 120)} {_pinned_status_dot(status)}"
 
 
+def render_status_entry(entry: dict[str, Any]) -> str:
+    label = pinned_status_entry_label(entry)
+    display = f"{label}{_pinned_model_suffix(entry, label)}"
+    return _render_status_entry_display(entry, display)
+
+
 def render_status_overview(entries: list[dict[str, Any]]) -> str:
-    rows: list[tuple[int, str, str]] = []
+    records: list[dict[str, Any]] = []
     for entry in entries:
         status = normalized_status(entry.get("active_worker_status") or entry.get("tendwire_status_line") or entry.get("status"))
         label = pinned_status_entry_label(entry)
-        rows.append((_pinned_status_severity(status), label.casefold(), render_status_entry(entry)))
-    if not rows:
+        model_suffix = _pinned_model_suffix(entry, label)
+        display = f"{label}{model_suffix}"
+        records.append({"entry": entry, "status": status, "label": label, "model_suffix": model_suffix, "display": display})
+    if not records:
         return "No active panes."
+    display_counts: dict[str, int] = {}
+    for record in records:
+        key = str(record["display"]).casefold()
+        display_counts[key] = display_counts.get(key, 0) + 1
+    rows: list[tuple[int, str, str]] = []
+    for record in records:
+        entry = record["entry"]
+        label = str(record["label"])
+        display = str(record["display"])
+        if display_counts.get(display.casefold(), 0) > 1:
+            display = f"{label}{_duplicate_worker_suffix(entry, label)}{record['model_suffix']}"
+        rows.append(
+            (
+                _pinned_status_severity(str(record["status"])),
+                display.casefold(),
+                _render_status_entry_display(entry, display),
+            )
+        )
     rows.sort(key=lambda row: (-row[0], row[1]))
     return "\n".join(row[2] for row in rows)
 
