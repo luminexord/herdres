@@ -975,6 +975,12 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertTrue(turn["has_open_turn"])
         self.assertEqual(turn["open_turn_id"], "user-2")
         self.assertEqual(turn["open_user_text"], "This newer turn is still open.")
+        # The completed turn exposes its stable prompt id as source_turn_id so a
+        # working card (keyed by open_turn_id) can edit into the final once this
+        # same prompt id completes, instead of duplicating.
+        self.assertEqual(turn["source_turn_id"], "user-1")
+        self.assertEqual(turn["recent_turns"][-1]["source_turn_id"], "user-1")
+        self.assertNotIn("_prompt_uuid", turn["recent_turns"][-1])
 
     def test_claude_open_turn_exposes_stream_text_without_completing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

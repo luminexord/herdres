@@ -1789,13 +1789,17 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                 }
                 if completed:
                     result["recent_turns"] = [
-                        {k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]
+                        {("source_turn_id" if k == "_prompt_uuid" else k): v for k, v in t.items()}
+                        for t in completed[-RECENT_TURNS:]
                     ]
                 if current_model:
                     result["model"] = current_model
                 return result
     if completed:
-        recent = [{k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]]
+        recent = [
+            {("source_turn_id" if k == "_prompt_uuid" else k): v for k, v in t.items()}
+            for t in completed[-RECENT_TURNS:]
+        ]
         latest = dict(recent[-1])
         if incomplete_user:
             latest["has_open_turn"] = True
