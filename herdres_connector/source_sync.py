@@ -307,6 +307,116 @@ def _turn_user_hash(item: dict[str, Any]) -> str:
     return short_hash({"user": text}, 16) if text else ""
 
 
+# --- Delivery-state single writers ------------------------------------------
+# These keys describe the last delivered final/stream message for an entry.
+# Every write goes through the helpers below so the group stays consistent;
+# never assign the keys directly.
+
+_FINAL_DELIVERY_KEYS = (
+    "last_turn_id",
+    "last_clean_hash",
+    "last_clean_user_hash",
+    "last_clean_message_id",
+    "last_clean_message_ids",
+    "last_clean_bot_kind",
+    "last_render_version",
+)
+_STREAM_DELIVERY_KEYS = (
+    "last_stream_turn_id",
+    "last_stream_hash",
+    "last_stream_message_id",
+    "last_stream_bot_kind",
+)
+
+
+def _pop_keys(entry: dict[str, Any], keys: tuple[str, ...]) -> bool:
+    changed = False
+    for key in keys:
+        if key in entry:
+            entry.pop(key, None)
+            changed = True
+    return changed
+
+
+def _clear_final_delivery_keys(entry: dict[str, Any]) -> bool:
+    return _pop_keys(entry, _FINAL_DELIVERY_KEYS)
+
+
+def _clear_stream_delivery_keys(entry: dict[str, Any]) -> bool:
+    return _pop_keys(entry, _STREAM_DELIVERY_KEYS)
+
+
+def _entry_put(entry: dict[str, Any], key: str, value: Any) -> bool:
+    if entry.get(key) == value:
+        return False
+    entry[key] = value
+    return True
+
+
+def _set_final_delivery(
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    content_hash: str,
+    user_hash: str | None = None,
+    message_ids: list[str] | None = None,
+    bot_kind: str | None = None,
+    render_version: int | None = None,
+    placeholder: bool = False,
+) -> bool:
+    """Single writer for the final-delivery key group.
+
+    ``user_hash``/``message_ids``/``bot_kind``/``render_version`` are left
+    untouched when None. ``placeholder`` records the "0" sentinel used by
+    dry-run and bootstrap paths without clobbering a real message id.
+    """
+    changed = _entry_put(entry, "last_turn_id", turn_id)
+    changed = _entry_put(entry, "last_clean_hash", content_hash) or changed
+    if user_hash is not None:
+        if user_hash:
+            changed = _entry_put(entry, "last_clean_user_hash", user_hash) or changed
+        elif "last_clean_user_hash" in entry:
+            entry.pop("last_clean_user_hash", None)
+            changed = True
+    if render_version is not None:
+        changed = _entry_put(entry, "last_render_version", render_version) or changed
+    if bot_kind:
+        changed = _entry_put(entry, "last_clean_bot_kind", bot_kind) or changed
+    if placeholder:
+        if not entry.get("last_clean_message_id"):
+            entry["last_clean_message_id"] = "0"
+            changed = True
+        changed = _entry_put(entry, "last_clean_message_ids", ["0"]) or changed
+    elif message_ids is not None:
+        kept = [message_id for message_id in message_ids if message_id]
+        changed = _entry_put(entry, "last_clean_message_ids", kept) or changed
+        changed = _entry_put(entry, "last_clean_message_id", kept[0] if kept else "") or changed
+    return changed
+
+
+def _set_stream_delivery(
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    content_hash: str,
+    message_id: str | None = None,
+    bot_kind: str | None = None,
+    placeholder: bool = False,
+) -> bool:
+    """Single writer for the stream-delivery key group."""
+    changed = _entry_put(entry, "last_stream_turn_id", turn_id)
+    changed = _entry_put(entry, "last_stream_hash", content_hash) or changed
+    if placeholder:
+        if not entry.get("last_stream_message_id"):
+            entry["last_stream_message_id"] = "0"
+            changed = True
+    elif message_id is not None:
+        changed = _entry_put(entry, "last_stream_message_id", message_id) or changed
+    if bot_kind:
+        changed = _entry_put(entry, "last_stream_bot_kind", bot_kind) or changed
+    return changed
+
+
 def _changed_final_should_send_new_message(item: dict[str, Any], entry: dict[str, Any]) -> bool:
     user_hash = _turn_user_hash(item)
     if not user_hash:
@@ -381,59 +491,29 @@ def _clear_open_turn_final_delivery_state(store: dict[str, Any], entry: dict[str
             bindings.pop(message_id, None)
             changed = True
     if entry.get("last_turn_id") == turn_id:
-        for key in (
-            "last_turn_id",
-            "last_clean_hash",
-            "last_clean_message_id",
-            "last_clean_message_ids",
-            "last_clean_bot_kind",
-            "last_clean_user_hash",
-            "last_render_version",
-        ):
-            if key in entry:
-                entry.pop(key, None)
-                changed = True
+        changed = _clear_final_delivery_keys(entry) or changed
     return changed
 
 
 def _repair_delivered_final_entry(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], content_hash: str) -> bool:
     turn_id = _turn_id(item)
-    changed = False
-    if entry.get("last_turn_id") != turn_id:
-        entry["last_turn_id"] = turn_id
-        changed = True
-    if entry.get("last_clean_hash") != content_hash:
-        entry["last_clean_hash"] = content_hash
-        changed = True
-    user_hash = _turn_user_hash(item)
-    if user_hash and entry.get("last_clean_user_hash") != user_hash:
-        entry["last_clean_user_hash"] = user_hash
-        changed = True
-    if not user_hash and "last_clean_user_hash" in entry:
-        entry.pop("last_clean_user_hash", None)
-        changed = True
     final_bindings = _final_delivery_bindings(store, turn_id)
-    if final_bindings:
-        message_ids = [message_id for message_id, _binding in final_bindings if message_id]
-        if entry.get("last_clean_message_ids") != message_ids:
-            entry["last_clean_message_ids"] = message_ids
-            changed = True
-        first_id = message_ids[0] if message_ids else ""
-        if first_id and entry.get("last_clean_message_id") != first_id:
-            entry["last_clean_message_id"] = first_id
-            changed = True
-        bot_kind = str(final_bindings[-1][1].get("bot_kind") or "")
-        if bot_kind and entry.get("last_clean_bot_kind") != bot_kind:
-            entry["last_clean_bot_kind"] = bot_kind
-            changed = True
-    return changed
+    message_ids = [message_id for message_id, _binding in final_bindings if message_id] if final_bindings else None
+    bot_kind = str(final_bindings[-1][1].get("bot_kind") or "") if final_bindings else ""
+    return _set_final_delivery(
+        entry,
+        turn_id=turn_id,
+        content_hash=content_hash,
+        user_hash=_turn_user_hash(item),
+        message_ids=message_ids,
+        bot_kind=bot_kind or None,
+    )
 
 
 def _clear_stream_delivery_state(entry: dict[str, Any], turn_id: str) -> None:
     if entry.get("last_stream_turn_id") != turn_id:
         return
-    for key in ("last_stream_turn_id", "last_stream_hash", "last_stream_message_id", "last_stream_bot_kind"):
-        entry.pop(key, None)
+    _clear_stream_delivery_keys(entry)
 
 
 def _record_final_delivery_success(
@@ -451,18 +531,16 @@ def _record_final_delivery_success(
     for message_id in message_ids:
         state.bind_message_to_worker(store, message_id, entry, topic_id=thread_id, kind="final", turn_id=turn_id, bot_kind=bot_kind)
     state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
-    entry["last_turn_id"] = turn_id
-    entry["last_clean_hash"] = content_hash
-    entry["last_render_version"] = RENDER_VERSION
-    entry["last_clean_bot_kind"] = bot_kind
-    user_hash = _turn_user_hash(item)
-    if user_hash:
-        entry["last_clean_user_hash"] = user_hash
-    else:
-        entry.pop("last_clean_user_hash", None)
+    _set_final_delivery(
+        entry,
+        turn_id=turn_id,
+        content_hash=content_hash,
+        user_hash=_turn_user_hash(item),
+        message_ids=message_ids,
+        bot_kind=bot_kind,
+        render_version=RENDER_VERSION,
+    )
     _record_delivery_success(entry, bot_kind)
-    entry["last_clean_message_id"] = message_ids[0] if message_ids else ""
-    entry["last_clean_message_ids"] = [message_id for message_id in message_ids if message_id]
     _clear_stream_delivery_state(entry, turn_id)
 
 
@@ -905,10 +983,7 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
 def _clear_entry_message_reference(entry: dict[str, Any], message_id: str, kind: str) -> bool:
     changed = False
     if kind == "working" and str(entry.get("last_stream_message_id") or "") == message_id:
-        for key in ("last_stream_message_id", "last_stream_turn_id", "last_stream_hash", "last_stream_bot_kind"):
-            if key in entry:
-                entry.pop(key, None)
-                changed = True
+        changed = _clear_stream_delivery_keys(entry)
     if kind == "final":
         message_ids = entry.get("last_clean_message_ids")
         if isinstance(message_ids, list) and message_id in {str(item) for item in message_ids}:
@@ -917,13 +992,10 @@ def _clear_entry_message_reference(entry: dict[str, Any], message_id: str, kind:
                 entry["last_clean_message_ids"] = kept
                 entry["last_clean_message_id"] = kept[0]
             else:
-                for key in ("last_clean_message_ids", "last_clean_message_id", "last_clean_hash", "last_turn_id", "last_clean_bot_kind"):
-                    entry.pop(key, None)
+                _clear_final_delivery_keys(entry)
             changed = True
         elif str(entry.get("last_clean_message_id") or "") == message_id:
-            for key in ("last_clean_message_id", "last_clean_hash", "last_turn_id", "last_clean_bot_kind"):
-                entry.pop(key, None)
-                changed = True
+            changed = _clear_final_delivery_keys(entry) or changed
     return changed
 
 
@@ -1005,9 +1077,7 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
     if entry.get("last_stream_turn_id") == turn_id and entry.get("last_stream_hash") == content_hash:
         return False
     if runtime.dry_run:
-        entry["last_stream_turn_id"] = turn_id
-        entry["last_stream_hash"] = content_hash
-        entry.setdefault("last_stream_message_id", "0")
+        _set_stream_delivery(entry, turn_id=turn_id, content_hash=content_hash, placeholder=True)
         return True
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
@@ -1034,10 +1104,13 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
             api_token=api_token,
         )
     if sent.get("ok"):
-        entry["last_stream_turn_id"] = turn_id
-        entry["last_stream_hash"] = content_hash
-        entry["last_stream_message_id"] = str(sent.get("message_id") or entry.get("last_stream_message_id") or "")
-        entry["last_stream_bot_kind"] = bot_kind
+        _set_stream_delivery(
+            entry,
+            turn_id=turn_id,
+            content_hash=content_hash,
+            message_id=str(sent.get("message_id") or entry.get("last_stream_message_id") or ""),
+            bot_kind=bot_kind,
+        )
         _record_delivery_success(entry, bot_kind)
         state.bind_message_to_worker(store, entry.get("last_stream_message_id"), entry, topic_id=thread_id, kind="working", turn_id=turn_id, bot_kind=bot_kind)
         return True
@@ -1058,16 +1131,14 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
     feed_item = turn_item_from_source(item, entry)
     if runtime.dry_run:
         state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
-        entry["last_turn_id"] = turn_id
-        entry["last_clean_hash"] = content_hash
-        user_hash = _turn_user_hash(item)
-        if user_hash:
-            entry["last_clean_user_hash"] = user_hash
-        else:
-            entry.pop("last_clean_user_hash", None)
-        entry["last_render_version"] = RENDER_VERSION
-        entry.setdefault("last_clean_message_id", "0")
-        entry["last_clean_message_ids"] = ["0"]
+        _set_final_delivery(
+            entry,
+            turn_id=turn_id,
+            content_hash=content_hash,
+            user_hash=_turn_user_hash(item),
+            render_version=RENDER_VERSION,
+            placeholder=True,
+        )
         return True
     send_changed_as_new = _changed_final_should_send_new_message(item, entry)
     if _final_turn_delivered(store, turn_id):
@@ -1185,15 +1256,11 @@ def _bootstrap_existing_turns(store: dict[str, Any], turns_payload: dict[str, An
             content_hash = _turn_content_hash(item, "final")
             identity = f"final:{turn_id}:{content_hash}"
             state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
-            entry["last_turn_id"] = turn_id
-            entry["last_clean_hash"] = content_hash
-            entry.setdefault("last_clean_message_id", "0")
+            _set_final_delivery(entry, turn_id=turn_id, content_hash=content_hash, placeholder=True)
             skipped += 1
             continue
         if item.get("assistant_stream_text"):
-            entry["last_stream_turn_id"] = turn_id
-            entry["last_stream_hash"] = _turn_content_hash(item, "working")
-            entry.setdefault("last_stream_message_id", "0")
+            _set_stream_delivery(entry, turn_id=turn_id, content_hash=_turn_content_hash(item, "working"), placeholder=True)
             skipped += 1
     for item in _pending(pending_payload):
         _key, entry = _entry_for_turn(store, item)
