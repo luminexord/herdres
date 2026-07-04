@@ -165,10 +165,7 @@ def _reply_bot_kind_from_binding(store: dict[str, Any], reply_to: dict[str, Any]
     return kind if kind and kind != MANAGER_BOT_KIND else ""
 
 
-def _target_bot_kind_for_message(store: dict[str, Any], message: dict[str, Any], text: str, bot_key: str | None, thread_id: str) -> str:
-    key_kind = managed_bot_kind_for_key(bot_key)
-    if key_kind:
-        return key_kind
+def _explicit_target_bot_kind_for_message(store: dict[str, Any], message: dict[str, Any], text: str, thread_id: str) -> str:
     reply_to = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
     return (
         _reply_bot_kind_from_binding(store, reply_to, thread_id)
@@ -195,9 +192,11 @@ def _payload_for_message(message: dict[str, Any], store: dict[str, Any], *, bot_
     attachment = speech.voice_attachment_from_message(message)
     if not text and not caption and not attachment:
         return None
-    target_bot_kind = _target_bot_kind_for_message(store, message, text or caption, bot_key, thread_id)
+    target_bot_kind = _explicit_target_bot_kind_for_message(store, message, text or caption, thread_id)
     current_bot_kind = managed_bot_kind_for_key(bot_key) or MANAGER_BOT_KIND
     if current_bot_kind == MANAGER_BOT_KIND and target_bot_kind in _managed_bot_token_kinds(store):
+        return None
+    if current_bot_kind != MANAGER_BOT_KIND and target_bot_kind != current_bot_kind:
         return None
     payload = {
         "chat_id": str(chat.get("id") or ""),

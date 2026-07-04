@@ -36,8 +36,9 @@ systemctl --user enable --now herdres.timer herdres-gateway.service
 Optional inbound voice-note transcription is disabled by default. To enable it:
 
 ```sh
-pip install sherpa-onnx
-herdres speech install
+python3 -m venv ~/.local/share/herdres/speech-venv
+uv pip install --python ~/.local/share/herdres/speech-venv/bin/python sherpa-onnx numpy
+~/.local/share/herdres/speech-venv/bin/python ~/.local/bin/herdres speech install
 HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1
 systemctl --user restart herdres-gateway.service
 ```

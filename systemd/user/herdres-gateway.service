@@ -6,7 +6,7 @@ After=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/herdres/herdres.env
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/share/herdres/speech-venv/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HERDRES_TENDWIRE_MODE=source
 Environment=HERDR_TELEGRAM_TOPICS_STATE=%h/.local/share/herdres/state.json
 Environment=HERDR_TELEGRAM_TOPICS_SCRIPT=%h/.local/bin/herdres
