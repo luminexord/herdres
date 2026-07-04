@@ -152,23 +152,27 @@ def _store():
     }
 
 
-def test_status_overview_shows_active_pane_for_space_topic():
+def test_status_overview_uses_old_pane_board_shape():
     html = render_status_overview(
         [
             {
-                "topic_name": "Workers",
+                "agent": "claude",
+                "worker_name": "claude",
+                "model": "claude-opus-4-8",
+                "status": "idle",
+            },
+            {
+                "agent": "codex",
+                "worker_name": "codex",
+                "model": "gpt-5-codex",
                 "status": "working",
-                "active_worker_name": "claude",
-                "active_worker_status": "working",
-                "worker_count": 2,
             }
         ]
     )
 
-    assert "<b>Workers</b>" in html
-    assert "active: claude" in html
-    assert "working" in html
-    assert "2 panes" in html
+    assert html.splitlines() == ["Codex · GPT-5 Codex 🟡", "Claude · Opus 4.8 🟢"]
+    assert "Herdres · Tendwire source mode" not in html
+    assert "active:" not in html
     assert "no active pane" not in html.lower()
 
 
@@ -1013,6 +1017,55 @@ def test_topic_icon_not_modified_repairs_local_icon_state(monkeypatch):
     assert entry["last_topic_icon"] == "⚡️"
     assert entry["last_topic_icon_id"] == "icon-working"
     assert "last_topic_icon_error" not in entry
+
+
+def test_space_topic_pin_renders_worker_board_not_space_summary(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {
+            "id": "worker-stale-claude",
+            "name": "claude",
+            "status": "idle",
+            "space_id": "space-1",
+            "fingerprint": "fp-stale",
+            "meta": {"agent": "claude"},
+        },
+    )
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire(
+        turns={"turns": []},
+        workers=[
+            {
+                "id": "worker-claude",
+                "name": "claude",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-claude",
+                "meta": {"agent": "claude", "model": "claude-opus-4-8"},
+            },
+            {
+                "id": "worker-codex",
+                "name": "codex",
+                "status": "working",
+                "space_id": "space-1",
+                "fingerprint": "fp-codex",
+                "model": "gpt-5-codex",
+                "meta": {"agent": "codex"},
+            },
+        ],
+    )
+
+    result = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+    topic_status_html = "\n".join(sent[1] for sent in telegram.sent if sent[2].get("thread_id") == "77")
+
+    assert result["pinned_status_updated"] >= 1
+    assert "Codex · GPT-5 Codex 🟡" in topic_status_html
+    assert "Claude · Opus 4.8 🟢" in topic_status_html
+    assert topic_status_html.count("Claude") == 1
+    assert "active:" not in topic_status_html
+    assert "Project" not in topic_status_html
 
 
 def test_topic_pinned_status_reuses_legacy_topic_pin(monkeypatch):

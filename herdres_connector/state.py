@@ -225,6 +225,8 @@ def upsert_worker_entry(data: dict[str, Any], worker: dict[str, Any], *, topic_i
     fingerprint = compact_ws(worker.get("fingerprint"), 160)
     space_id = compact_ws(worker.get("space_id"), 160)
     agent = worker_agent(worker)
+    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+    model = compact_ws(worker.get("model") or meta.get("model"), 80)
     key = find_entry_key_by_worker(data, worker_id)
     created = False
     if key is None:
@@ -252,6 +254,8 @@ def upsert_worker_entry(data: dict[str, Any], worker: dict[str, Any], *, topic_i
     )
     if topic_id:
         entry["topic_id"] = str(topic_id)
+    if model:
+        entry["model"] = model
     panes[key] = entry
     return key, entry, created
 

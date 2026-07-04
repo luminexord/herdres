@@ -12,6 +12,20 @@ ACTIVE_STATUSES = {"active", "busy", "in_progress", "pending", "running", "waiti
 EXPANDABLE_SECTION_CHARS = 700
 FINAL_CHUNK_SOURCE_CHARS = 2400
 TELEGRAM_SAFE_HTML_CHARS = 3600
+PINNED_STATUS_DOTS = {
+    "attention": "🔴",
+    "failed": "🔴",
+    "idle": "🟢",
+    "unknown": "⬜",
+    "working": "🟡",
+}
+PINNED_STATUS_SEVERITY = {
+    "failed": 8,
+    "attention": 7,
+    "working": 5,
+    "idle": 3,
+    "unknown": 1,
+}
 
 
 def normalized_status(value: Any) -> str:
@@ -247,14 +261,43 @@ def render_pending(item: dict[str, Any], entry: dict[str, Any]) -> str:
     return f"<b>Input Needed</b> · {label}\n\n{prompt}"
 
 
-def _pane_count_label(value: Any) -> str:
-    try:
-        count = int(value)
-    except (TypeError, ValueError):
+def pretty_model_label(raw: Any) -> str:
+    clean = re.sub(r"\[[^\]]*\]", "", str(raw or "")).strip()
+    if not clean:
         return ""
-    if count <= 0:
+    low = clean.lower()
+    match = re.match(r"^claude-(opus|sonnet|haiku|fable)-(\d+)(?:[-.](\d+))?", low)
+    if match:
+        version = match.group(2) + ("." + match.group(3) if match.group(3) else "")
+        return f"Claude {match.group(1).capitalize()} {version}"
+    match = re.match(r"^gpt-([\d.]+o?)(?:-(codex|mini|turbo|pro|nano))?", low)
+    if match:
+        suffix = (" " + match.group(2).capitalize()) if match.group(2) else ""
+        return f"GPT-{match.group(1)}{suffix}"
+    match = re.match(r"^(glm|kimi|gemini|deepseek|grok|qwen)[-.]?(.*)$", low)
+    if match:
+        family = {
+            "deepseek": "DeepSeek",
+            "gemini": "Gemini",
+            "glm": "GLM",
+            "grok": "Grok",
+            "kimi": "Kimi",
+            "qwen": "Qwen",
+        }[match.group(1)]
+        rest = " ".join(part.capitalize() if part.isalpha() else part for part in re.split(r"[-_]+", match.group(2)) if part)
+        return f"{family} {rest}".strip()
+    return clean.replace("_", " ").strip()
+
+
+def _title_label(value: Any) -> str:
+    text = compact_ws(value, 80)
+    if not text:
         return ""
-    return "1 pane" if count == 1 else f"{count} panes"
+    upper = {"glm": "GLM", "gpt": "GPT", "omp": "OMP"}
+    lowered = text.lower()
+    if lowered in upper:
+        return upper[lowered]
+    return " ".join(word.upper() if word.lower() in upper else word.capitalize() for word in text.split())
 
 
 def _active_worker_label(entry: dict[str, Any]) -> str:
@@ -267,31 +310,56 @@ def _active_worker_label(entry: dict[str, Any]) -> str:
     )
 
 
+def _pinned_status_dot(status: str) -> str:
+    return PINNED_STATUS_DOTS.get(normalized_status(status), "⬜")
+
+
+def _pinned_status_severity(status: str) -> int:
+    return PINNED_STATUS_SEVERITY.get(normalized_status(status), PINNED_STATUS_SEVERITY["unknown"])
+
+
+def _pinned_model_suffix(entry: dict[str, Any], label: str) -> str:
+    pretty = pretty_model_label(entry.get("model") or entry.get("active_worker_model"))
+    if not pretty:
+        return ""
+    words = pretty.split()
+    first_label_word = label.strip().split()[0].lower() if label.strip() else ""
+    if words and first_label_word and words[0].lower() == first_label_word:
+        pretty = " ".join(words[1:]).strip() or pretty
+    return f" · {pretty}"
+
+
+def pinned_status_entry_label(entry: dict[str, Any]) -> str:
+    return (
+        _title_label(entry.get("agent"))
+        or _title_label(entry.get("worker_name"))
+        or _title_label(_active_worker_label(entry))
+        or _title_label(worker_label(entry))
+        or "Pane"
+    )
+
+
 def render_status_entry(entry: dict[str, Any]) -> str:
     status = normalized_status(
         entry.get("active_worker_status")
         or entry.get("tendwire_status_line")
         or entry.get("status")
     )
-    topic = html_escape(worker_label(entry), 80)
-    details: list[str] = []
-    active_worker = _active_worker_label(entry)
-    if active_worker:
-        details.append(f"active: {html_escape(active_worker, 80)}")
-        details.append(status)
-    else:
-        details.append("no active pane")
-    pane_count = _pane_count_label(entry.get("worker_count"))
-    if pane_count:
-        details.append(pane_count)
-    return f"{status_emoji(status)} <b>{topic}</b> · {' · '.join(details)}"
+    label = pinned_status_entry_label(entry)
+    display = f"{label}{_pinned_model_suffix(entry, label)}"
+    return f"{html_escape(display, 120)} {_pinned_status_dot(status)}"
 
 
 def render_status_overview(entries: list[dict[str, Any]]) -> str:
-    rows = ["<b>Herdres</b> · Tendwire source mode"]
-    for entry in sorted(entries, key=lambda item: str(item.get("topic_name") or item.get("tendwire_worker_id"))):
-        rows.append(render_status_entry(entry))
-    return "\n".join(rows)
+    rows: list[tuple[int, str, str]] = []
+    for entry in entries:
+        status = normalized_status(entry.get("active_worker_status") or entry.get("tendwire_status_line") or entry.get("status"))
+        label = pinned_status_entry_label(entry)
+        rows.append((_pinned_status_severity(status), label.casefold(), render_status_entry(entry)))
+    if not rows:
+        return "No active panes."
+    rows.sort(key=lambda row: (-row[0], row[1]))
+    return "\n".join(row[2] for row in rows)
 
 
 def render_attention_notice(payload: dict[str, Any]) -> str:

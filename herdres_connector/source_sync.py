@@ -315,11 +315,40 @@ def _record_topic_pinned_status(entry: dict[str, Any], *, message_id: str, conte
     entry.pop("pinned_status_last_error", None)
 
 
+def _entry_open_for_pin(entry: dict[str, Any]) -> bool:
+    raw_status = str(entry.get("status") or entry.get("tendwire_raw_status") or entry.get("tendwire_status_line") or "").strip().lower().replace("-", "_")
+    if raw_status in {"closed", "exited"}:
+        return False
+    status = normalized_status(raw_status)
+    if status in {"closed", "failed"}:
+        return False
+    return not (entry.get("closed") or entry.get("exited") or entry.get("process_exited"))
+
+
+def _status_entries_for_topic_pin(store: dict[str, Any], entry: dict[str, Any]) -> list[dict[str, Any]]:
+    if str(entry.get("entry_type") or "") != "space":
+        return [entry] if _entry_open_for_pin(entry) else []
+    space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+    worker_ids = entry.get("worker_ids")
+    current_worker_ids = {str(worker_id) for worker_id in worker_ids if worker_id} if isinstance(worker_ids, list) else set()
+    workers = [
+        worker_entry
+        for worker_entry in state.source_worker_entries(store).values()
+        if _entry_open_for_pin(worker_entry)
+        and str(worker_entry.get("tendwire_space_id") or worker_entry.get("space_id") or "") == space_id
+        and (
+            not current_worker_ids
+            or str(worker_entry.get("tendwire_worker_id") or worker_entry.get("worker_id") or "") in current_worker_ids
+        )
+    ]
+    return workers or ([entry] if _entry_open_for_pin(entry) else [])
+
+
 def _sync_topic_pinned(store: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
         return False
-    html = render_status_overview([entry])
+    html = render_status_overview(_status_entries_for_topic_pin(store, entry))
     content_hash = short_hash(html, 20)
     message_id = str(entry.get("pinned_status_message_id") or "") or _legacy_pinned_message_id_for_topic(store, thread_id)
     if message_id and entry.get("pinned_status_hash") == content_hash and entry.get("pinned_status_pinned"):
@@ -404,6 +433,7 @@ def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: Sync
         seen_space_keys.add(_key)
         entry["status"] = normalized_status(selected.get("status") or space.get("status"))
         entry["worker_count"] = len(selectable)
+        entry["worker_ids"] = [compact_ws(worker.get("id"), 160) for worker in selectable if compact_ws(worker.get("id"), 160)]
         if selected:
             entry["active_worker_id"] = compact_ws(selected.get("id"), 160)
             entry["active_worker_fingerprint"] = compact_ws(selected.get("fingerprint"), 160)
@@ -787,7 +817,29 @@ def _sync_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_pa
 
 
 def _sync_pinned(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
-    entries = list(state.source_entries(store).values())
+    current_worker_ids: set[str] = set()
+    current_space_ids = {
+        str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+        for entry in state.source_space_entries(store).values()
+        if _entry_open_for_pin(entry) and not entry.get("stale_space_topic")
+    }
+    for entry in state.source_space_entries(store).values():
+        worker_ids = entry.get("worker_ids")
+        if isinstance(worker_ids, list):
+            current_worker_ids.update(str(worker_id) for worker_id in worker_ids if worker_id)
+    entries = []
+    for entry in state.source_worker_entries(store).values():
+        if not _entry_open_for_pin(entry):
+            continue
+        worker_id = str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "")
+        space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+        if current_worker_ids and worker_id not in current_worker_ids:
+            continue
+        if not current_worker_ids and current_space_ids and space_id not in current_space_ids:
+            continue
+        entries.append(entry)
+    if not entries:
+        entries = [entry for entry in state.source_entries(store).values() if _entry_open_for_pin(entry)]
     if not entries:
         return False
     html = render_status_overview(entries)
