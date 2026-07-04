@@ -11,6 +11,7 @@ from .safe import compact_ws, html_escape, sanitize_text
 ACTIVE_STATUSES = {"active", "busy", "in_progress", "pending", "running", "waiting", "working"}
 EXPANDABLE_SECTION_CHARS = 700
 FINAL_CHUNK_SOURCE_CHARS = 2400
+SPLIT_SOURCE_MAX_CHARS = 64000
 TELEGRAM_SAFE_HTML_CHARS = 3600
 PINNED_STATUS_DOTS = {
     "attention": "🔴",
@@ -146,7 +147,7 @@ def section_html(label: str, body_html: str, *, expandable: bool = False) -> str
 
 
 def split_text_chunks(value: Any, *, limit: int = FINAL_CHUNK_SOURCE_CHARS) -> list[str]:
-    text = sanitize_text(value, 12000).strip()
+    text = sanitize_text(value, SPLIT_SOURCE_MAX_CHARS).strip()
     if not text:
         return []
     chunks: list[str] = []

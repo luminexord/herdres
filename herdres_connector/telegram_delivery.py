@@ -28,6 +28,7 @@ class RateLimited(TelegramError):
 
 MESSAGE_TEXT_LIMIT = 3900
 SPLIT_TEXT_LIMIT = 3400
+MESSAGE_SOURCE_LIMIT = 64000
 
 
 def _utc_now() -> str:
@@ -117,8 +118,9 @@ class TelegramClient:
             base_payload["message_thread_id"] = str(thread_id)
         if reply_to_message_id:
             base_payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
-        plain = html_to_plain(sanitize_text(html_text, 12000))
-        if len(sanitize_text(html_text, 12000)) > MESSAGE_TEXT_LIMIT and plain:
+        source = sanitize_text(html_text, MESSAGE_SOURCE_LIMIT)
+        plain = html_to_plain(source, limit=MESSAGE_SOURCE_LIMIT)
+        if len(source) > MESSAGE_TEXT_LIMIT and plain:
             chunks = split_text_chunks(plain, limit=SPLIT_TEXT_LIMIT)
             message_ids: list[str] = []
             last_error = ""
