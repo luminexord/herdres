@@ -9015,6 +9015,8 @@ def telegram_get_file_any(file_id: str, tokens: list[str | None]) -> tuple[dict[
     for tok in (tokens or [None]):
         try:
             return telegram_get_file(file_id, api_token=tok), tok
+        except RateLimited:
+            raise  # a 429 must propagate so backoff honors retry_after — never fall through to another token
         except (BridgeError, OSError) as exc:
             last_exc = exc
     raise last_exc or BridgeError("Telegram getFile returned no file_path")
