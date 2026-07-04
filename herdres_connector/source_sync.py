@@ -8,9 +8,9 @@ from typing import Any
 from . import config, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
-from .rich_delivery import edit_feed_item, send_feed_item, split_legacy_message_ids, turn_item_from_source
+from .rich_delivery import edit_feed_item, render_feed_item_html, send_feed_item, split_legacy_message_ids, turn_item_from_source
 from .safe import compact_ws, short_hash
-from .telegram_delivery import TelegramClient, drain_outbox, topic_icon_id
+from .telegram_delivery import MESSAGE_TEXT_LIMIT, TelegramClient, drain_outbox, topic_icon_id
 from .tendwire_client import TendwireClient
 
 RENDER_VERSION = "telegram-rich-v26-clean"
@@ -262,6 +262,88 @@ def _repair_delivered_final_entry(store: dict[str, Any], item: dict[str, Any], e
             entry["last_clean_bot_kind"] = bot_kind
             changed = True
     return changed
+
+
+def _clear_stream_delivery_state(entry: dict[str, Any], turn_id: str) -> None:
+    if entry.get("last_stream_turn_id") != turn_id:
+        return
+    for key in ("last_stream_turn_id", "last_stream_hash", "last_stream_message_id", "last_stream_bot_kind"):
+        entry.pop(key, None)
+
+
+def _record_final_delivery_success(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    thread_id: str,
+    message_ids: list[str],
+    content_hash: str,
+    identity: str,
+    bot_kind: str,
+) -> None:
+    turn_id = _turn_id(item)
+    for message_id in message_ids:
+        state.bind_message_to_worker(store, message_id, entry, topic_id=thread_id, kind="final", turn_id=turn_id, bot_kind=bot_kind)
+    state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
+    entry["last_turn_id"] = turn_id
+    entry["last_clean_hash"] = content_hash
+    entry["last_render_version"] = RENDER_VERSION
+    entry["last_clean_bot_kind"] = bot_kind
+    _record_delivery_success(entry, bot_kind)
+    entry["last_clean_message_id"] = message_ids[0] if message_ids else ""
+    entry["last_clean_message_ids"] = [message_id for message_id in message_ids if message_id]
+    _clear_stream_delivery_state(entry, turn_id)
+
+
+def _promote_working_to_final(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    thread_id: str,
+    content_hash: str,
+    identity: str,
+) -> bool:
+    turn_id = _turn_id(item)
+    stream_message_id = str(entry.get("last_stream_message_id") or "")
+    if not stream_message_id or entry.get("last_stream_turn_id") != turn_id:
+        return False
+    telegram = _telegram_state(store)
+    api_token, bot_kind = _delivery_bot(store, entry)
+    stored_bot_kind = str(entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND)
+    if stored_bot_kind != bot_kind:
+        return False
+    feed_item = turn_item_from_source(item, entry)
+    # Telegram legacy edits cannot split. If the final view is too large for a
+    # single safe edit, use the send path instead so long responses are split.
+    if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT:
+        return False
+    sent = edit_feed_item(
+        runtime.telegram,
+        chat_id,
+        stream_message_id,
+        feed_item,
+        telegram=telegram,
+        api_token=api_token,
+    )
+    if not sent.get("ok"):
+        return False
+    edited_message_id = str(sent.get("message_id") or "").strip()
+    message_id = edited_message_id if edited_message_id and edited_message_id != "0" else stream_message_id
+    _record_final_delivery_success(
+        store,
+        item,
+        entry,
+        thread_id=thread_id,
+        message_ids=[message_id],
+        content_hash=content_hash,
+        identity=identity,
+        bot_kind=bot_kind,
+    )
+    return True
 
 
 def _suppress_historical_final(store: dict[str, Any], item: dict[str, Any], content_hash: str) -> bool:
@@ -693,6 +775,17 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
         entry.setdefault("last_clean_message_id", "0")
         entry["last_clean_message_ids"] = ["0"]
         return True
+    if _promote_working_to_final(
+        store,
+        item,
+        entry,
+        runtime,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        content_hash=content_hash,
+        identity=identity,
+    ):
+        return True
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
     sent = send_feed_item(
@@ -710,15 +803,16 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
     message_ids: list[str] = []
     for message_id in split_legacy_message_ids(sent):
         message_ids.append(message_id)
-        state.bind_message_to_worker(store, message_id, entry, topic_id=thread_id, kind="final", turn_id=turn_id, bot_kind=bot_kind)
-    state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
-    entry["last_turn_id"] = turn_id
-    entry["last_clean_hash"] = content_hash
-    entry["last_render_version"] = RENDER_VERSION
-    entry["last_clean_bot_kind"] = bot_kind
-    _record_delivery_success(entry, bot_kind)
-    entry["last_clean_message_id"] = message_ids[0] if message_ids else ""
-    entry["last_clean_message_ids"] = [item for item in message_ids if item]
+    _record_final_delivery_success(
+        store,
+        item,
+        entry,
+        thread_id=thread_id,
+        message_ids=message_ids,
+        content_hash=content_hash,
+        identity=identity,
+        bot_kind=bot_kind,
+    )
     return True
 
 

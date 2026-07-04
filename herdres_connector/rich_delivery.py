@@ -292,24 +292,29 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
     return _join_blocks(parts)
 
 
-def render_final_reply_html(value: str) -> str:
+def render_final_reply_html(value: str, *, seen_heading: bool = False) -> str:
     clean = sanitize_text(str(value or ""), MAX_REPLY_CHARS).strip()
     if not clean:
         return ""
-    return _render_final_reply_blocks(clean.splitlines())
+    return _render_final_reply_blocks(clean.splitlines(), seen_heading=seen_heading)
 
 
 def render_assistant_response_html(assistant_final: str) -> str:
     # The Response is the answer the reader came for, so it renders as the open
-    # top-level body (not buried in a <details> card): a colored bold marker, one
-    # breath, then the rich blocks. The de-emphasized prompt sits below it.
+    # top-level body (not buried in a <details> card): a bold marker, one blank
+    # line, then the rich blocks.
+    #
+    # Spacing note (empirical, from Telegram rich rendering): <p>/<h4> block
+    # margins are negligible (a <p> title glues to the body) and a single <br>
+    # glues too -- only a blank line (<br><br>) makes a visible gap. To keep that
+    # gap to ONE empty line rather than a huge one, the body's headings are
+    # demoted to <h4> (negligible top margin) so a full <h3> heading doesn't stack
+    # its own margin on top of the blank line below the title.
     clean = str(assistant_final or "").strip()
     if not clean:
         return ""
-    body_html = render_final_reply_html(clean) or _rich_paragraph(clean)
+    body_html = render_final_reply_html(clean, seen_heading=True) or _rich_paragraph(clean)
     marker = f"<b>{RESPONSE_ICON} {RESPONSE_LABEL}</b>"
-    # Blank line below the title so the body isn't glued to it (a single <br>
-    # only moves to the next line in Telegram rich rendering — no visible gap).
     return f"{marker}<br><br>{body_html}"
 
 
