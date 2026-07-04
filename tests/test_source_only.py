@@ -1161,6 +1161,83 @@ def test_topic_icon_not_modified_repairs_local_icon_state(monkeypatch):
     assert "last_topic_icon_error" not in entry
 
 
+def test_active_source_status_with_completed_turn_uses_idle_topic_icon(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire(
+        turns={
+            "turns": [
+                {
+                    "id": "turn-done",
+                    "worker_id": "worker-1",
+                    "space_id": "space-1",
+                    "assistant_final_text": "done",
+                    "complete": True,
+                }
+            ]
+        },
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "codex",
+                "status": "active",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ],
+        spaces=[{"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"}],
+    )
+
+    result = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+    entry = next(iter(state.source_space_entries(store).values()))
+
+    assert result["icon_updated"] == 1
+    assert entry["status"] == "idle"
+    assert entry["active_worker_status"] == "idle"
+    assert entry["last_topic_icon"] == "✅"
+    assert telegram.icon_edits == [("-100", "77", "icon-idle")]
+
+
+def test_open_turn_in_space_keeps_topic_icon_working_when_worker_id_shifted(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire(
+        turns={
+            "turns": [
+                {
+                    "id": "turn-open",
+                    "worker_id": "worker-old",
+                    "space_id": "space-1",
+                    "assistant_stream_text": "working",
+                    "complete": False,
+                    "has_open_turn": True,
+                }
+            ]
+        },
+        workers=[
+            {
+                "id": "worker-new",
+                "name": "codex",
+                "status": "active",
+                "space_id": "space-1",
+                "fingerprint": "fp-new",
+            }
+        ],
+        spaces=[{"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"}],
+    )
+
+    result = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+    entry = next(iter(state.source_space_entries(store).values()))
+
+    assert result["icon_updated"] == 1
+    assert entry["status"] == "working"
+    assert entry["active_worker_status"] == "working"
+    assert entry["last_topic_icon"] == "⚡️"
+    assert telegram.icon_edits == [("-100", "77", "icon-working")]
+
+
 def test_space_topic_pin_renders_worker_board_not_space_summary(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()

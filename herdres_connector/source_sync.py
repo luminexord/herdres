@@ -42,6 +42,47 @@ def _pending(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)]
 
 
+def _source_status(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_")
+    if raw == "active":
+        return "idle"
+    return normalized_status(value)
+
+
+def _turn_activity_status(item: dict[str, Any]) -> str:
+    if bool(item.get("complete")) or bool(item.get("assistant_final_text")):
+        return "idle"
+    if item.get("complete") is False or item.get("has_open_turn") is True or bool(item.get("assistant_stream_text")):
+        return "working"
+    return ""
+
+
+def _turn_activity_statuses(payload: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+    by_worker: dict[str, str] = {}
+    by_space: dict[str, str] = {}
+    for item in _turns(payload):
+        status = _turn_activity_status(item)
+        if not status:
+            continue
+        worker_id = compact_ws(item.get("worker_id"), 160)
+        space_id = compact_ws(item.get("space_id"), 160)
+        if worker_id and worker_id not in by_worker:
+            by_worker[worker_id] = status
+        if space_id and space_id not in by_space:
+            by_space[space_id] = status
+    return by_worker, by_space
+
+
+def _effective_worker_status(worker: dict[str, Any], turn_status_by_worker: dict[str, str]) -> str:
+    raw_status = normalized_status(worker.get("status"))
+    if raw_status in {"closed", "failed"}:
+        return raw_status
+    worker_id = compact_ws(worker.get("id"), 160)
+    if worker_id and turn_status_by_worker.get(worker_id):
+        return turn_status_by_worker[worker_id]
+    return _source_status(worker.get("status"))
+
+
 def _worker_is_open(worker: dict[str, Any]) -> bool:
     return normalized_status(worker.get("status")) not in {"closed", "failed"}
 
@@ -86,9 +127,10 @@ def _space_is_open(space: dict[str, Any]) -> bool:
     return normalized_status(space.get("status")) not in {"closed", "failed"}
 
 
-def _select_space_worker(workers: list[dict[str, Any]]) -> dict[str, Any]:
+def _select_space_worker(workers: list[dict[str, Any]], turn_status_by_worker: dict[str, str] | None = None) -> dict[str, Any]:
+    turn_status_by_worker = turn_status_by_worker or {}
     for wanted in ("working", "attention", "idle"):
-        matches = [worker for worker in workers if normalized_status(worker.get("status")) == wanted]
+        matches = [worker for worker in workers if _effective_worker_status(worker, turn_status_by_worker) == wanted]
         if matches:
             return max(matches, key=lambda worker: str(worker.get("last_seen_at") or ""))
     return max(workers, key=lambda worker: str(worker.get("last_seen_at") or "")) if workers else {}
@@ -511,9 +553,17 @@ def _sync_topic_pinned(store: dict[str, Any], entry: dict[str, Any], runtime: Sy
     return True
 
 
-def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, int]:
+def _sync_sources(
+    store: dict[str, Any],
+    snapshot: dict[str, Any],
+    turns_payload: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+) -> dict[str, int]:
     counts = {"created": 0, "updated": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
     topic_mode = config.source_topic_mode()
+    turn_status_by_worker, turn_status_by_space = _turn_activity_statuses(turns_payload)
     spaces = {compact_ws(item.get("id"), 160): item for item in _spaces(snapshot) if compact_ws(item.get("id"), 160)}
     workers_by_space: dict[str, list[dict[str, Any]]] = {}
     for worker in _workers(snapshot):
@@ -521,7 +571,7 @@ def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: Sync
         existing_key = state.find_entry_key_by_worker(store, compact_ws(worker.get("id"), 160))
         before = dict(state.source_worker_entries(store).get(existing_key) or {}) if existing_key is not None else {}
         _key, entry, created = state.upsert_worker_entry(store, worker)
-        entry["status"] = normalized_status(worker.get("status"))
+        entry["status"] = _effective_worker_status(worker, turn_status_by_worker)
         counts["created"] += int(created)
         counts["updated"] += int(not created and before != entry)
         if not _worker_is_open(worker):
@@ -551,16 +601,16 @@ def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: Sync
         existing_key = state.find_entry_key_by_space(store, space_id)
         before = dict(state.source_space_entries(store).get(existing_key) or {}) if existing_key is not None else {}
         _key, entry, created = state.upsert_space_entry(store, space)
-        selected = _select_space_worker(selectable)
+        selected = _select_space_worker(selectable, turn_status_by_worker)
         seen_space_keys.add(_key)
-        entry["status"] = normalized_status(selected.get("status") or space.get("status"))
+        entry["status"] = turn_status_by_space.get(space_id) or _effective_worker_status(selected, turn_status_by_worker) or _source_status(space.get("status"))
         entry["worker_count"] = len(selectable)
         entry["worker_ids"] = [compact_ws(worker.get("id"), 160) for worker in selectable if compact_ws(worker.get("id"), 160)]
         if selected:
             entry["active_worker_id"] = compact_ws(selected.get("id"), 160)
             entry["active_worker_fingerprint"] = compact_ws(selected.get("fingerprint"), 160)
             entry["active_worker_name"] = compact_ws(selected.get("name"), 80)
-            entry["active_worker_status"] = normalized_status(selected.get("status"))
+            entry["active_worker_status"] = turn_status_by_space.get(space_id) or _effective_worker_status(selected, turn_status_by_worker)
         topic_needed, topic_created = _ensure_topic(store, space, entry, runtime, chat_id=chat_id)
         counts["created"] += int(created or topic_created or topic_needed)
         counts["updated"] += int(not created and before != entry)
@@ -1045,7 +1095,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "tendwire_outbox": {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False},
             }
     changed = False
-    source_counts = _sync_sources(store, snapshot, runtime, chat_id=chat_id)
+    source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
     message_bindings = _backfill_message_bindings(store)
     bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
     turn_counts = {"feed_sent": 0, "sent": 0, "updated": 0} if bootstrapped else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id)
