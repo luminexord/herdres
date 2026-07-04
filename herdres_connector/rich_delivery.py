@@ -671,12 +671,17 @@ def plain_chunks_for_result(text: str) -> list[str]:
 
 
 def turn_item_from_source(item: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+    stream_text = str(item.get("assistant_stream_text") or "")
+    final_text = str(item.get("assistant_final_text") or "")
+    if not final_text and item.get("complete") is True:
+        final_text = stream_text
+        stream_text = ""
     return {
         "kind": "turn",
         "title": worker_label(entry),
         "user_text": str(item.get("user_text") or ""),
-        "worklog_text": str(item.get("assistant_stream_text") or "") if not item.get("assistant_final_text") else "",
+        "worklog_text": stream_text if not final_text else "",
         "worklog_label": WORKING_LABEL,
-        "assistant_final_text": str(item.get("assistant_final_text") or item.get("assistant_stream_text") or ""),
+        "assistant_final_text": final_text,
         "prompt_collapse_chars": 700,
     }

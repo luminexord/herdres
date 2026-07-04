@@ -7,7 +7,7 @@ import herdres
 import herdres_gateway
 from herdres_connector import state
 from herdres_connector.rendering import render_status_overview
-from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_turn_item_html
+from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_turn_item_html, turn_item_from_source
 from herdres_connector.safe import public_prune
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient, drain_outbox
@@ -187,6 +187,43 @@ def test_status_overview_disambiguates_duplicate_agent_labels():
     assert html.splitlines() == ["Codex 🟢", "Codex 1-2 🟢"]
 
 
+def test_source_working_turn_renders_working_not_response():
+    item = turn_item_from_source(
+        {
+            "id": "turn-working",
+            "worker_id": "worker-1",
+            "assistant_stream_text": "I am checking the current path.",
+            "complete": False,
+        },
+        {"topic_name": "Project"},
+    )
+    html = render_turn_item_html(item)
+
+    assert item["assistant_final_text"] == ""
+    assert item["worklog_text"] == "I am checking the current path."
+    assert "✅ Response" not in html
+    assert "Working" in html
+    assert "I am checking the current path." in html
+
+
+def test_source_completed_stream_only_turn_can_render_response():
+    item = turn_item_from_source(
+        {
+            "id": "turn-final",
+            "worker_id": "worker-1",
+            "assistant_stream_text": "Final text from a completed stream-only turn.",
+            "complete": True,
+        },
+        {"topic_name": "Project"},
+    )
+    html = render_turn_item_html(item)
+
+    assert item["assistant_final_text"] == "Final text from a completed stream-only turn."
+    assert item["worklog_text"] == ""
+    assert "✅ Response" in html
+    assert "Final text from a completed stream-only turn." in html
+
+
 def test_first_sync_bootstraps_current_turns_without_telegram_posts(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
@@ -284,6 +321,100 @@ def test_source_final_uses_configured_managed_bot_voice(monkeypatch):
     binding = state.find_message_binding(store, entry["last_clean_message_id"], topic_id="77")
     assert binding is not None
     assert binding["bot_kind"] == "codex"
+
+
+def test_per_agent_bot_reply_targets_original_worker_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    store = _store()
+    store["telegram"]["managed_bots"] = {
+        "claude": {"enabled": True, "token": "claude-token"},
+        "codex": {"enabled": True, "token": "codex-token"},
+    }
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire(
+        turns={
+            "turns": [
+                {
+                    "id": "turn-claude",
+                    "worker_id": "worker-claude",
+                    "worker_fingerprint": "fp-claude",
+                    "assistant_final_text": "Claude final",
+                    "complete": True,
+                },
+                {
+                    "id": "turn-codex",
+                    "worker_id": "worker-codex",
+                    "worker_fingerprint": "fp-codex",
+                    "assistant_final_text": "Codex final",
+                    "complete": True,
+                },
+            ]
+        },
+        workers=[
+            {
+                "id": "worker-claude",
+                "name": "claude",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-claude",
+                "meta": {"agent": "claude"},
+            },
+            {
+                "id": "worker-codex",
+                "name": "codex",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-codex",
+                "meta": {"agent": "codex"},
+            },
+        ],
+    )
+
+    result = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+    state.save_state(store)
+    claude_message_id = next(sent[3] for sent in telegram.sent if "Claude final" in sent[1])
+    codex_message_id = next(sent[3] for sent in telegram.sent if "Codex final" in sent[1])
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    claude_reply = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "9001",
+            "reply_to_message_id": claude_message_id,
+            "text": "/send reply to claude",
+        }
+    )
+    codex_reply = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "9002",
+            "reply_to_message_id": codex_message_id,
+            "text": "/send reply to codex",
+        }
+    )
+
+    assert result["feed_sent"] == 2
+    assert any(call[0] == "sendRichMessage" and call[2] == "claude-token" for call in telegram.api_calls)
+    assert any(call[0] == "sendRichMessage" and call[2] == "codex-token" for call in telegram.api_calls)
+    assert claude_reply == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert codex_reply == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert [command["target"] for command in fake.commands] == [
+        {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"},
+        {"worker_id": "worker-codex", "worker_fingerprint": "fp-codex"},
+    ]
+    assert [command["instruction"] for command in fake.commands] == [
+        {"text": "reply to claude"},
+        {"text": "reply to codex"},
+    ]
 
 
 def test_sync_backfills_existing_message_bindings(monkeypatch):
