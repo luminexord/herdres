@@ -5,8 +5,7 @@ This branch installs only:
 - `herdres`
 - `herdres-gateway`
 - `herdres_connector/*.py`
-- `herdres.service`
-- `herdres.timer`
+- `herdres.service` (source sync loop; replaces the old `herdres.timer`)
 - `herdres-gateway.service`
 
 ```sh
@@ -28,10 +27,23 @@ Start only the source connector services:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now herdres.timer herdres-gateway.service
+systemctl --user enable --now herdres.service herdres-gateway.service
 ```
 
-`herdr-server.service` is not managed by Herdres.
+`herdr-server.service` is not managed by Herdres. There is no `herdres.timer`
+on this branch; `herdres.service` runs the sync loop directly.
+
+## Rollback
+
+This branch is source-only and does not support disabling Tendwire via
+environment. To roll back, switch to a legacy (non-tendwired) Herdres branch or
+tag and reinstall — it is a code switch, not `HERDRES_TENDWIRE_MODE=off`:
+
+```sh
+systemctl --user disable --now herdres.service herdres-gateway.service
+git checkout <legacy-herdres-tag>
+./install-user.sh
+```
 
 Optional inbound voice-note transcription is disabled by default. To enable it:
 
