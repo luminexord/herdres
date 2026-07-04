@@ -2369,3 +2369,31 @@ def test_retired_worker_turns_are_not_delivered(monkeypatch):
     sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
 
     assert all("stale final" not in html for _chat, html, _kw, _mid in telegram.sent)
+
+
+def test_closed_worker_turns_are_not_delivered(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire(
+        turns={
+            "turns": [
+                {
+                    "id": "turn-closed-worker",
+                    "worker_id": "worker-phantom",
+                    "space_id": "space-1",
+                    "complete": False,
+                    "has_open_turn": True,
+                }
+            ]
+        },
+        workers=[
+            {"id": "worker-phantom", "name": "codex", "status": "closed", "space_id": "space-1", "fingerprint": "fp-ghost"},
+            {"id": "worker-live", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-live"},
+        ],
+        spaces=[{"id": "space-1", "name": "contexto", "status": "active", "fingerprint": "space-fp"}],
+    )
+
+    sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+
+    assert all("Work is in progress" not in html for _chat, html, _kw, _mid in telegram.sent)
