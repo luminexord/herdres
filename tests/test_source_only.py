@@ -6,6 +6,7 @@ from pathlib import Path
 import herdres
 import herdres_gateway
 from herdres_connector import state
+from herdres_connector.managed_bots import managed_bot_kind_for_key, managed_bot_tokens
 from herdres_connector.rendering import render_status_overview
 from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_turn_item_html, turn_item_from_source
 from herdres_connector.safe import public_prune
@@ -323,6 +324,39 @@ def test_source_final_uses_configured_managed_bot_voice(monkeypatch):
     assert binding["bot_kind"] == "codex"
 
 
+def test_source_voice_shared_uses_manager_bot_even_when_token_configured(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    store = _store()
+    store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
+    _space_key, space, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    space["voice_mode"] = "shared"
+    telegram = FakeTelegram()
+    turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "assistant_final_text": "Codex final",
+                "complete": True,
+            }
+        ]
+    }
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+
+    assert result["feed_sent"] == 1
+    assert not any(call[0] == "sendRichMessage" and call[2] == "codex-token" for call in telegram.api_calls)
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert entry["managed_voice_active"] is False
+    assert entry["last_clean_bot_kind"] == "manager"
+
+
 def test_per_agent_bot_reply_targets_original_worker_once(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
@@ -415,6 +449,19 @@ def test_per_agent_bot_reply_targets_original_worker_once(tmp_path, monkeypatch)
         {"text": "reply to claude"},
         {"text": "reply to codex"},
     ]
+
+
+def test_managed_bot_tokens_include_env_and_state_tokens(monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    monkeypatch.setenv("HERDRES_MANAGED_BOT_CODEX_TOKEN", "codex-token")
+    telegram = {"managed_bots": {"claude": {"enabled": True, "token": "claude-token"}}}
+
+    records = managed_bot_tokens(telegram)
+    by_kind = {kind: (key, token) for key, kind, token in records}
+
+    assert by_kind["codex"][1] == "codex-token"
+    assert by_kind["claude"][1] == "claude-token"
+    assert managed_bot_kind_for_key(by_kind["codex"][0]) == "codex"
 
 
 def test_sync_backfills_existing_message_bindings(monkeypatch):
@@ -1596,6 +1643,81 @@ def test_command_reply_at_alias_targets_worker_in_space(tmp_path, monkeypatch):
     assert request["instruction"] == {"text": "hello there"}
 
 
+def test_command_reply_target_bot_kind_targets_worker_in_space(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
+    )
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-claude", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-claude"},
+    )
+    _space_key, entry, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    entry["active_worker_id"] = "worker-codex"
+    entry["active_worker_fingerprint"] = "fp-codex"
+    state.save_state(store)
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    result = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "999",
+            "target_bot_kind": "claude",
+            "text": "hello from child bot",
+        }
+    )
+
+    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
+    request = fake.commands[0]
+    assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
+    assert request["instruction"] == {"text": "hello from child bot"}
+
+
+def test_voice_command_sets_space_voice_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
+    )
+    _space_key, entry, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    entry["voice_mode"] = "per_agent"
+    state.save_state(store)
+
+    result = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "999",
+            "text": "/voice shared",
+        }
+    )
+    reloaded = state.load_state()
+    space = next(iter(state.source_space_entries(reloaded).values()))
+    worker = next(iter(state.source_worker_entries(reloaded).values()))
+
+    assert result["voice_mode"] == "shared"
+    assert "Voice mode: shared." == result["reply"]
+    assert space["voice_mode"] == "shared"
+    assert worker["managed_voice_active"] is False
+
+
 def test_command_reply_unknown_at_alias_fails_safely(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
@@ -1657,6 +1779,75 @@ def test_gateway_maps_only_source_topic(monkeypatch):
     assert payload is not None
     assert payload["topic_id"] == "77"
     assert herdres_gateway._payload_for_message({"chat": {"id": "-100"}, "message_thread_id": 78}, store) is None
+
+
+def test_gateway_child_bot_payload_targets_child_kind(monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    store = _store()
+    store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
+    state.upsert_worker_entry(
+        store,
+        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
+    )
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    key = managed_bot_tokens(store["telegram"])[0][0]
+
+    payload = herdres_gateway._payload_for_message(
+        {
+            "chat": {"id": "-100", "is_forum": True},
+            "message_thread_id": 77,
+            "message_id": 10,
+            "from": {"id": "1", "is_bot": False},
+            "text": "hello",
+        },
+        store,
+        bot_key=key,
+    )
+
+    assert payload is not None
+    assert payload["target_bot_kind"] == "codex"
+
+
+def test_gateway_manager_skips_reply_owned_by_child_bot(monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    store = _store()
+    store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
+    _worker_key, worker, _created = state.upsert_worker_entry(
+        store,
+        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
+    )
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    state.bind_message_to_worker(store, "555", worker, topic_id="77", kind="final", turn_id="turn-1", bot_kind="codex")
+
+    payload = herdres_gateway._payload_for_message(
+        {
+            "chat": {"id": "-100", "is_forum": True},
+            "message_thread_id": 77,
+            "message_id": 10,
+            "reply_to_message": {"message_id": 555},
+            "from": {"id": "1", "is_bot": False},
+            "text": "reply to codex",
+        },
+        store,
+    )
+
+    assert payload is None
+
+
+def test_gateway_offset_path_is_per_managed_bot():
+    manager_path = herdres_gateway._offset_path_for("manager")
+    child_path = herdres_gateway._offset_path_for("managed-codex-token")
+
+    assert child_path != manager_path
+    assert str(child_path).endswith("gateway.offset.managed-codex-token")
 
 
 def test_runtime_has_no_direct_herdr_pane_api_names():

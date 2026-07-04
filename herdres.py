@@ -15,6 +15,7 @@ import sys
 from typing import Any
 
 from herdres_connector import config, doctor, state
+from herdres_connector.managed_bots import managed_bot_kind_for_username
 from herdres_connector.safe import compact_ws, public_prune, sanitize_text, short_hash
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient
@@ -48,6 +49,10 @@ def _send_text_from_payload(payload: dict[str, Any]) -> str:
     return text
 
 
+def _raw_text_from_payload(payload: dict[str, Any]) -> str:
+    return str(payload.get("text") or payload.get("caption") or "").strip()
+
+
 def _split_target_alias(text: str) -> tuple[str, str]:
     parts = str(text or "").strip().split(maxsplit=1)
     if not parts or not parts[0].startswith("@"):
@@ -76,6 +81,51 @@ def _worker_entry_from_alias(store: dict[str, Any], alias: str, entry: dict[str,
         alias,
         space_id=str(entry.get("tendwire_space_id") or entry.get("space_id") or ""),
     )
+
+
+def _space_entry_for_entry(store: dict[str, Any], entry: dict[str, Any]) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    if str(entry.get("entry_type") or "") == "space":
+        key = state.find_entry_key_by_space(store, str(entry.get("tendwire_space_id") or entry.get("space_id") or ""))
+        return (key, entry) if key else (None, None)
+    return state.find_space_entry_by_id(store, str(entry.get("tendwire_space_id") or entry.get("space_id") or ""))
+
+
+def _normalize_voice_mode(value: Any) -> str:
+    clean = str(value or "").strip().lower().replace("-", "_")
+    if clean in {"per_agent", "peragent", "agent", "agents", "voice"}:
+        return "per_agent"
+    if clean in {"shared", "manager", "single"}:
+        return "shared"
+    return ""
+
+
+def _voice_mode_reply(store: dict[str, Any], entry: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
+    raw = _raw_text_from_payload(payload)
+    if not raw.startswith("/voice"):
+        return None
+    command, _, rest = raw.partition(" ")
+    command_name = command[1:].split("@", 1)[0].strip().lower().replace("-", "_")
+    if command_name != "voice":
+        return None
+    _space_key, space_entry = _space_entry_for_entry(store, entry)
+    if space_entry is None:
+        return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "missing_space"}
+    requested = _normalize_voice_mode(rest or "status")
+    if requested:
+        space_entry["voice_mode"] = requested
+        space_entry["managed_voice_active"] = requested == "per_agent"
+        for worker in state.source_worker_entries(store).values():
+            if str(worker.get("tendwire_space_id") or worker.get("space_id") or "") == str(space_entry.get("tendwire_space_id") or space_entry.get("space_id") or ""):
+                worker["voice_mode"] = requested
+                worker["managed_voice_active"] = requested == "per_agent"
+    current = _normalize_voice_mode(space_entry.get("voice_mode")) or ("per_agent" if config.managed_bots_enabled() else "shared")
+    label = "per-agent" if current == "per_agent" else "shared"
+    return {"handled": True, "reply": f"Voice mode: {label}.", "status": "voice_mode", "voice_mode": current}
+
+
+def _managed_bot_kind_for_alias(store: dict[str, Any], alias: str) -> str:
+    telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
+    return managed_bot_kind_for_username(telegram, alias)
 
 
 def _request_id(entry: dict[str, Any], payload: dict[str, Any], text: str) -> str:
@@ -145,6 +195,10 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         _key, entry = state.find_entry_by_thread(store, str(payload.get("topic_id") or ""))
         if entry is None:
             return {"handled": False}
+        voice_reply = _voice_mode_reply(store, entry, payload)
+        if voice_reply is not None:
+            state.save_state(store)
+            return voice_reply
         text = _send_text_from_payload(payload)
         alias, clean_text = _split_target_alias(text)
         if alias:
@@ -153,11 +207,25 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 entry = alias_entry
                 text = clean_text
             else:
-                return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "unknown_target_alias"}
+                alias_kind = _managed_bot_kind_for_alias(store, alias)
+                _kind_key, kind_entry = _worker_entry_from_alias(store, alias_kind, entry)
+                if alias_kind and kind_entry is not None:
+                    entry = kind_entry
+                    text = clean_text
+                else:
+                    return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "unknown_target_alias"}
         else:
             _reply_key, reply_entry = _worker_entry_from_reply(store, payload)
             if reply_entry is not None:
                 entry = reply_entry
+            else:
+                target_bot_kind = str(payload.get("target_bot_kind") or "").strip().lower()
+                if target_bot_kind:
+                    _kind_key, kind_entry = _worker_entry_from_alias(store, target_bot_kind, entry)
+                    if kind_entry is not None:
+                        entry = kind_entry
+                    else:
+                        return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "unknown_target_bot"}
         if not text:
             return {"handled": True, "reply": "Send a message in this topic or use /send <instruction>."}
         request = _command_request(entry, payload, text)

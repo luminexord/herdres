@@ -49,8 +49,11 @@ HERDRES_MANAGED_BOT_CODEX_TOKEN=...
 HERDRES_MANAGED_BOT_CLAUDE_TOKEN=...
 ```
 
-Unconfigured agent kinds fall back to the manager bot. Do not commit real bot
-tokens or local bot names.
+Voice here means Telegram bot identity and inbound routing, not audio STT/TTS.
+When enabled, Herdres polls configured child bots as well as the manager bot.
+Use `/voice per_agent` or `/voice shared` inside a space topic to switch that
+space. Unconfigured agent kinds fall back to the manager bot. Do not commit real
+bot tokens or local bot names.
 
 ## Install
 
