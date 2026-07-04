@@ -8,7 +8,7 @@ import herdres_gateway
 from herdres_connector import state
 from herdres_connector.managed_bots import managed_bot_kind_for_key, managed_bot_tokens
 from herdres_connector.rendering import render_status_overview
-from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_turn_item_html, turn_item_from_source
+from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, RICH_SINGLE_MESSAGE_CHARS, render_feed_item_delivery_html_parts, render_turn_item_html, turn_item_from_source
 from herdres_connector.safe import public_prune
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient, drain_outbox
@@ -832,6 +832,79 @@ def test_sync_sends_all_long_final_response_parts(monkeypatch):
     assert any(tail in message for message in response_messages)
     entry = next(iter(state.source_worker_entries(store).values()))
     assert len(entry["last_clean_message_ids"]) == len(response_messages)
+
+
+def _recent_cutoff_response_text():
+    return """Fixed both issues and pushed to `origin/tendwired`.
+
+What changed:
+- Voice transcription is now enabled locally.
+- Installed `sherpa-onnx`, `numpy`, and the Parakeet STT model into `~/.local/share/herdres/speech-venv`.
+- `herdres-gateway.service` now prefers that venv in `PATH`.
+- Restarted only `herdres-gateway.service`.
+- Did not restart Herdr.
+
+The different-bot issue was a real bug: child bot pollers could race on the same unaddressed topic message, and whichever child saw it first could claim the target. Now child bots only handle explicit targets: replies to that bot's message or `@bot` mentions. Normal topic messages go through the manager path and route by active worker/state.
+
+Verification:
+- `63 passed`
+- `herdres speech check`: `input_enabled=true`, `sherpa_onnx=true`, `stt_model=true`, `ffmpeg=true`
+- `herdres doctor`: healthy
+- source smoke: `direct_herdr_calls=0`
+- `herdr-server.service`: active, status-only checked
+- legacy timer: inactive
+
+Pushed:
+- `4557d20 Prevent child bot target races`
+- branch: `tendwired`"""
+
+
+def test_medium_final_response_splits_before_rich_display_cutoff():
+    parts = render_feed_item_delivery_html_parts(
+        {"kind": "turn", "assistant_final_text": _recent_cutoff_response_text()}
+    )
+
+    combined_plain = "\n".join(parts)
+    assert len(parts) > 1
+    assert all(len(part) <= RICH_SINGLE_MESSAGE_CHARS for part in parts)
+    assert "4557d20 Prevent child bot target races" in combined_plain
+    assert "branch: <code>tendwired</code>" in combined_plain
+
+
+def test_promoted_working_final_uses_split_send_not_cutting_rich_tail(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    working_turns = {
+        "turns": [
+            {
+                "id": "turn-medium",
+                "worker_id": "worker-1",
+                "assistant_stream_text": "Working on it.",
+                "complete": False,
+            }
+        ]
+    }
+    final_turns = {
+        "turns": [
+            {
+                "id": "turn-medium",
+                "worker_id": "worker-1",
+                "assistant_final_text": _recent_cutoff_response_text(),
+                "complete": True,
+            }
+        ]
+    }
+
+    sync_once(store, SyncRuntime(FakeTendwire(turns=working_turns), telegram, with_outbox=False))
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns=final_turns), telegram, with_outbox=False))
+
+    response_messages = [sent[1] for sent in telegram.sent if "✅ Response" in sent[1]]
+    assert result["feed_sent"] == 1
+    assert len(response_messages) > 1
+    assert not any("4557d20 Prevent chi" in edit[2] for edit in telegram.edited)
+    assert "4557d20 Prevent child bot target races" in "\n".join(response_messages)
+    assert "branch: <code>tendwired</code>" in "\n".join(response_messages)
 
 
 def test_expandable_blockquote_has_delivery_fallbacks():

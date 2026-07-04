@@ -20,8 +20,9 @@ from .safe import sanitize_text
 from .telegram_delivery import RateLimited, TelegramClient, TelegramError
 
 
-MAX_REPLY_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "16000"))
+MAX_REPLY_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "64000"))
 MAX_RICH_HTML_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS", "14000"))
+RICH_SINGLE_MESSAGE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SINGLE_MESSAGE_CHARS", "1000"))
 RICH_SAFE_CHARS = 12000
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 WORKLOG_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_WORKLOG_MAX_CHARS", "1200"))
@@ -299,7 +300,7 @@ def render_final_reply_html(value: str, *, seen_heading: bool = False) -> str:
     return _render_final_reply_blocks(clean.splitlines(), seen_heading=seen_heading)
 
 
-def render_assistant_response_html(assistant_final: str) -> str:
+def render_assistant_response_html(assistant_final: str, *, label: str = RESPONSE_LABEL) -> str:
     # The Response is the answer the reader came for, so it renders as the open
     # top-level body (not buried in a <details> card): a bold marker, one blank
     # line, then the rich blocks.
@@ -314,7 +315,7 @@ def render_assistant_response_html(assistant_final: str) -> str:
     if not clean:
         return ""
     body_html = render_final_reply_html(clean, seen_heading=True) or _rich_paragraph(clean)
-    marker = f"<b>{RESPONSE_ICON} {RESPONSE_LABEL}</b>"
+    marker = f"<b>{RESPONSE_ICON} {_html_text(label or RESPONSE_LABEL, 80)}</b>"
     return f"{marker}<br><br>{body_html}"
 
 
@@ -352,7 +353,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     worklog_label = str(item.get("worklog_label") or WORKING_LABEL).strip() or WORKING_LABEL
     assistant_final = str(item.get("assistant_final_text") or "").strip()
     parts: list[str] = []
-    response_html = render_assistant_response_html(assistant_final)
+    response_html = render_assistant_response_html(assistant_final, label=str(item.get("response_label") or RESPONSE_LABEL))
     if response_html:
         parts.append(response_html)
     if user_text:
@@ -374,6 +375,42 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     if summary:
         parts.append(render_final_reply_html(summary) or _rich_paragraph(summary))
     return _join_blocks(parts)
+
+
+def _turn_response_text(item: dict[str, Any]) -> str:
+    return sanitize_text(str(item.get("assistant_final_text") or ""), MAX_REPLY_CHARS).strip()
+
+
+def _turn_item_delivery_parts(item: dict[str, Any], *, live: bool = False) -> list[dict[str, Any]]:
+    if live or str(item.get("kind") or "").lower() != "turn":
+        return [item]
+    final_text = _turn_response_text(item)
+    if not final_text:
+        return [item]
+    if len(render_turn_item_html(item)) <= RICH_SINGLE_MESSAGE_CHARS:
+        return [item]
+    chunks = split_text_chunks(final_text, limit=700)
+    if len(chunks) <= 1:
+        return [item]
+    total = len(chunks)
+    parts: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks, start=1):
+        part = dict(item)
+        part["assistant_final_text"] = chunk
+        part["response_label"] = f"{RESPONSE_LABEL} {index}/{total}"
+        if index > 1:
+            part["user_text"] = ""
+            part["worklog_text"] = ""
+        parts.append(part)
+    return parts
+
+
+def render_feed_item_delivery_html_parts(item: dict[str, Any], *, live: bool = False) -> list[str]:
+    return [render_feed_item_html(part, live=live) for part in _turn_item_delivery_parts(item, live=live)]
+
+
+def feed_item_requires_send_split(item: dict[str, Any], *, live: bool = False) -> bool:
+    return len(render_feed_item_delivery_html_parts(item, live=live)) > 1
 
 
 def item_plain_text(item: dict[str, Any]) -> str:
@@ -518,7 +555,7 @@ def send_rich_message(
     api_token: str | None = None,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
-    rendered_fallback = sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
+    rendered_fallback = sanitize_text(html_to_plain(html_text, limit=MAX_REPLY_CHARS), MAX_REPLY_CHARS)
     fallback = rendered_fallback or fallback_text or sanitize_text(str(html_text or ""), MAX_REPLY_CHARS)
     if not rich_message_send_enabled(telegram):
         return _fallback_send(target, chat_id, fallback, thread_id=thread_id, notify=notify, reply_to_message_id=reply_to_message_id)
@@ -577,7 +614,7 @@ def edit_rich_message(
     api_token: str | None = None,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
-    rendered_fallback = sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
+    rendered_fallback = sanitize_text(html_to_plain(html_text, limit=MAX_REPLY_CHARS), MAX_REPLY_CHARS)
     fallback = rendered_fallback or fallback_text or sanitize_text(str(html_text or ""), MAX_REPLY_CHARS)
     if not rich_message_send_enabled(telegram):
         return target.edit_message(chat_id, message_id, fallback)
@@ -627,17 +664,47 @@ def send_feed_item(
     live: bool = False,
     api_token: str | None = None,
 ) -> dict[str, Any]:
-    return send_rich_message(
-        client,
-        chat_id,
-        render_feed_item_html(item, live=live),
-        telegram=telegram,
-        fallback_text=item_plain_text(item),
-        thread_id=thread_id,
-        notify=notify,
-        reply_to_message_id=reply_to_message_id,
-        api_token=api_token,
-    )
+    html_parts = render_feed_item_delivery_html_parts(item, live=live)
+    if len(html_parts) <= 1:
+        return send_rich_message(
+            client,
+            chat_id,
+            html_parts[0] if html_parts else render_feed_item_html(item, live=live),
+            telegram=telegram,
+            fallback_text=item_plain_text(item),
+            thread_id=thread_id,
+            notify=notify,
+            reply_to_message_id=reply_to_message_id,
+            api_token=api_token,
+        )
+    message_ids: list[str] = []
+    formats: list[str] = []
+    last_result: dict[str, Any] = {}
+    for index, html_part in enumerate(html_parts):
+        result = send_rich_message(
+            client,
+            chat_id,
+            html_part,
+            telegram=telegram,
+            fallback_text=html_to_plain(html_part, limit=MAX_REPLY_CHARS),
+            thread_id=thread_id,
+            notify=notify,
+            reply_to_message_id=reply_to_message_id if index == 0 else None,
+            api_token=api_token,
+        )
+        last_result = result
+        if not result.get("ok"):
+            result["partial_message_ids"] = message_ids
+            return result
+        message_ids.extend(split_legacy_message_ids(result))
+        formats.append(str(result.get("format") or ""))
+    return {
+        "ok": True,
+        "format": "rich-split",
+        "formats": formats,
+        "message_id": message_ids[0] if message_ids else str(last_result.get("message_id") or ""),
+        "message_ids": message_ids,
+    }
 
 
 def edit_feed_item(

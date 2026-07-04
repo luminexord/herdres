@@ -8,7 +8,7 @@ from typing import Any
 from . import config, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
-from .rich_delivery import edit_feed_item, render_feed_item_html, send_feed_item, split_legacy_message_ids, turn_item_from_source
+from .rich_delivery import edit_feed_item, feed_item_requires_send_split, render_feed_item_html, send_feed_item, split_legacy_message_ids, turn_item_from_source
 from .safe import compact_ws, short_hash
 from .telegram_delivery import MESSAGE_TEXT_LIMIT, TelegramClient, drain_outbox, topic_icon_id
 from .tendwire_client import TendwireClient
@@ -392,7 +392,7 @@ def _promote_working_to_final(
     feed_item = turn_item_from_source(item, entry)
     # Telegram legacy edits cannot split. If the final view is too large for a
     # single safe edit, use the send path instead so long responses are split.
-    if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT:
+    if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(feed_item):
         return False
     sent = edit_feed_item(
         runtime.telegram,
