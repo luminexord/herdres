@@ -258,6 +258,11 @@ class SetupWizardTests(unittest.TestCase):
         # os.environ before preflight must NOT be clobbered by a stale on-disk
         # herdres.env/.hermes value — _load_dotenv_file's "key not in os.environ"
         # guard must hold, so preflight verifies the NEW token.
+        # The real load_dotenv populates os.environ from the real ~/.config herdres.env;
+        # snapshot + restore the FULL env so those vars (e.g. PER_AGENT) don't leak into
+        # later, unrelated tests (the setUp's keep-list only covers the token keys).
+        _env0 = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(_env0)))
         stale = "111111:" + "S" * 35
         # On-disk files carry the STALE token for BOTH keys telegram_token() reads
         # (HERDRES_OUTBOUND_BOT_TOKEN is preferred, then TELEGRAM_BOT_TOKEN); the
