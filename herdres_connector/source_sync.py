@@ -274,20 +274,90 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
     if not emoji_id:
         entry["last_topic_icon_missing"] = emoji
         return False
-    if entry.get("last_topic_icon") == emoji:
+    if entry.get("last_topic_icon") == emoji and entry.get("last_topic_icon_id") == emoji_id:
         return False
     if runtime.dry_run:
         entry["last_topic_icon"] = emoji
+        entry["last_topic_icon_id"] = emoji_id
         entry.pop("last_topic_icon_missing", None)
         return True
     result = runtime.telegram.edit_topic_icon(chat_id, thread_id, emoji_id)
     if result.get("ok") or _topic_not_modified(result.get("error")):
         entry["last_topic_icon"] = emoji
+        entry["last_topic_icon_id"] = emoji_id
         entry.pop("last_topic_icon_missing", None)
         entry.pop("last_topic_icon_error", None)
         return True
     entry["last_topic_icon_error"] = compact_ws(result.get("error"), 240)
     return False
+
+
+def _legacy_pinned_message_id_for_topic(store: dict[str, Any], topic_id: str) -> str:
+    if not topic_id:
+        return ""
+    spaces = store.get("spaces") if isinstance(store.get("spaces"), dict) else {}
+    for entry in spaces.values():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("topic_id") or "") != topic_id:
+            continue
+        message_id = str(entry.get("pinned_status_message_id") or "")
+        if message_id:
+            return message_id
+    return ""
+
+
+def _record_topic_pinned_status(entry: dict[str, Any], *, message_id: str, content_hash: str, pinned: bool = False) -> None:
+    entry["pinned_status_message_id"] = str(message_id)
+    entry["pinned_status_hash"] = content_hash
+    if pinned:
+        entry["pinned_status_pinned"] = True
+    entry.pop("pinned_status_last_error", None)
+
+
+def _sync_topic_pinned(store: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
+    thread_id = str(entry.get("topic_id") or "")
+    if not thread_id:
+        return False
+    html = render_status_overview([entry])
+    content_hash = short_hash(html, 20)
+    message_id = str(entry.get("pinned_status_message_id") or "") or _legacy_pinned_message_id_for_topic(store, thread_id)
+    if message_id and entry.get("pinned_status_hash") == content_hash and entry.get("pinned_status_pinned"):
+        return False
+    if runtime.dry_run:
+        _record_topic_pinned_status(entry, message_id=message_id or "0", content_hash=content_hash, pinned=True)
+        return True
+    sent: dict[str, Any]
+    if message_id:
+        sent = runtime.telegram.edit_message(chat_id, message_id, html)
+        if sent.get("ok"):
+            pass
+        elif _message_missing(sent.get("error")):
+            entry.pop("pinned_status_message_id", None)
+            message_id = ""
+        elif _topic_missing(sent.get("error")):
+            entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
+            return False
+        else:
+            entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
+            return False
+    if not message_id:
+        sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
+        if not sent.get("ok"):
+            entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
+            return False
+        message_id = str(sent.get("message_id") or "")
+        if not message_id:
+            entry["pinned_status_last_error"] = "Telegram returned no message id for topic pinned status"
+            return False
+    pin_result = runtime.telegram.pin_message(chat_id, message_id)
+    pinned = bool(pin_result.get("ok"))
+    _record_topic_pinned_status(entry, message_id=message_id, content_hash=content_hash, pinned=pinned)
+    if not pinned:
+        entry["pinned_status_pin_error"] = compact_ws(pin_result.get("error"), 240)
+    else:
+        entry.pop("pinned_status_pin_error", None)
+    return True
 
 
 def _sync_sources(store: dict[str, Any], snapshot: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, int]:
@@ -754,6 +824,13 @@ def _sync_pinned(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -
     return False
 
 
+def _sync_topic_pinned_statuses(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> int:
+    updated = 0
+    for entry in state.source_entries(store).values():
+        updated += int(_sync_topic_pinned(store, entry, runtime, chat_id=chat_id))
+    return updated
+
+
 def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     config.require_source_mode()
     chat_id = config.telegram_chat_id(store)
@@ -796,7 +873,8 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         or message_bindings
     )
     pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
-    changed = changed or pinned_changed
+    topic_pinned_updated = _sync_topic_pinned_statuses(store, runtime, chat_id=chat_id)
+    changed = changed or pinned_changed or bool(topic_pinned_updated)
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
     if runtime.with_outbox:
         remaining = max(0, runtime.max_sends - int(turn_counts["sent"]))
@@ -810,7 +888,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "panes": source_counts["panes"],
         "spaces": source_counts["spaces"],
         "icon_updated": source_counts["icon_updated"],
-        "pinned_status_updated": int(pinned_changed),
+        "pinned_status_updated": int(pinned_changed) + topic_pinned_updated,
         "feed_sent": turn_counts["feed_sent"],
         "sent": turn_counts["sent"],
         "turn_updates": turn_counts["updated"],

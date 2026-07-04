@@ -948,6 +948,30 @@ def test_topic_icon_cache_is_fetched_and_working_icon_updates(monkeypatch):
     assert store["telegram"]["forum_topic_icons"]["by_emoji"]["⚡️"] == "icon-working"
     entry = next(iter(state.source_space_entries(store).values()))
     assert entry["last_topic_icon"] == "⚡️"
+    assert entry["last_topic_icon_id"] == "icon-working"
+
+
+def test_topic_icon_reapplies_when_local_emoji_state_lacks_icon_id(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    store["spaces"]["space:space-1:existing"] = {
+        "source": "tendwire",
+        "entry_type": "space",
+        "tendwire_space_id": "space-1",
+        "space_id": "space-1",
+        "topic_name": "Project",
+        "topic_id": "77",
+        "last_topic_icon": "⚡️",
+    }
+    telegram = FakeTelegram()
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns={"turns": []}), telegram, with_outbox=False))
+
+    assert result["icon_updated"] == 1
+    assert telegram.icon_edits == [("-100", "77", "icon-working")]
+    entry = next(iter(state.source_space_entries(store).values()))
+    assert entry["last_topic_icon"] == "⚡️"
+    assert entry["last_topic_icon_id"] == "icon-working"
 
 
 def test_topic_icon_not_modified_repairs_local_icon_state(monkeypatch):
@@ -966,7 +990,29 @@ def test_topic_icon_not_modified_repairs_local_icon_state(monkeypatch):
     assert result["icon_updated"] == 1
     entry = next(iter(state.source_space_entries(store).values()))
     assert entry["last_topic_icon"] == "⚡️"
+    assert entry["last_topic_icon_id"] == "icon-working"
     assert "last_topic_icon_error" not in entry
+
+
+def test_topic_pinned_status_reuses_legacy_topic_pin(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    store["spaces"]["workspace:space-1"] = {
+        "topic_name": "Project",
+        "topic_id": "77",
+        "pinned_status_message_id": "55",
+    }
+    telegram = FakeTelegram()
+
+    result = sync_once(store, SyncRuntime(FakeTendwire(turns={"turns": []}), telegram, with_outbox=False))
+    entry = next(iter(state.source_space_entries(store).values()))
+
+    assert result["pinned_status_updated"] >= 1
+    assert entry["pinned_status_message_id"] == "55"
+    assert entry["pinned_status_pinned"] is True
+    assert ("-100", "55") in telegram.pins
+    assert any(edit[1] == "55" for edit in telegram.edited)
+    assert not any(sent[2].get("thread_id") == "77" for sent in telegram.sent)
 
 
 def test_pinned_status_falls_back_when_general_thread_is_missing(monkeypatch):
@@ -983,7 +1029,7 @@ def test_pinned_status_falls_back_when_general_thread_is_missing(monkeypatch):
 
     result = sync_once(store, SyncRuntime(FakeTendwire(turns={"turns": []}), telegram, with_outbox=False))
 
-    assert result["pinned_status_updated"] == 1
+    assert result["pinned_status_updated"] >= 1
     assert telegram.pins
     assert store["telegram"]["pinned_status_message_id"]
     assert "pinned_status_last_error" not in store["telegram"]
