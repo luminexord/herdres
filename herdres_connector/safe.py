@@ -29,6 +29,10 @@ FORBIDDEN_PUBLIC_KEYS = {
 
 SECRET_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
 
+# public_prune guards keys and secrets; it must not destroy turn content.
+# Rendering enforces its own per-message size limits downstream.
+PRUNE_TEXT_LIMIT = 64000
+
 
 def sanitize_text(value: Any, limit: int = 4000) -> str:
     text = str(value or "")
@@ -64,5 +68,5 @@ def public_prune(value: Any) -> Any:
     if isinstance(value, list):
         return [public_prune(item) for item in value]
     if isinstance(value, str):
-        return sanitize_text(value, 1000)
+        return sanitize_text(value, PRUNE_TEXT_LIMIT)
     return value
