@@ -42,6 +42,34 @@ def _pending(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)]
 
 
+def _normalize_voice_mode(value: Any) -> str:
+    clean = str(value or "").strip().lower().replace("-", "_")
+    if clean in {"per_agent", "peragent", "agent", "agents", "voice"}:
+        return "per_agent"
+    return "shared"
+
+
+def _default_voice_mode() -> str:
+    return "per_agent" if config.managed_bots_enabled() else "shared"
+
+
+def _entry_voice_mode(entry: dict[str, Any] | None) -> str:
+    if isinstance(entry, dict) and str(entry.get("voice_mode") or "").strip():
+        return _normalize_voice_mode(entry.get("voice_mode"))
+    return _default_voice_mode()
+
+
+def _space_voice_mode(store: dict[str, Any], space_id: str | None) -> str:
+    _space_key, space_entry = state.find_space_entry_by_id(store, str(space_id or ""))
+    return _entry_voice_mode(space_entry)
+
+
+def _stamp_managed_voice(entry: dict[str, Any], voice_mode: str) -> None:
+    mode = _normalize_voice_mode(voice_mode)
+    entry["voice_mode"] = mode
+    entry["managed_voice_active"] = mode == "per_agent"
+
+
 def _source_status(value: Any) -> str:
     raw = str(value or "").strip().lower().replace("-", "_")
     if raw == "active":
@@ -152,6 +180,9 @@ def _delivery_entry(space_entry: dict[str, Any], worker_entry: dict[str, Any] | 
     entry["tendwire_fingerprint"] = worker_entry.get("tendwire_fingerprint") or space_entry.get("active_worker_fingerprint")
     entry["agent"] = worker_entry.get("agent") or entry.get("agent")
     entry["managed_bot_kind"] = worker_entry.get("managed_bot_kind") or managed_bot_kind_for_entry(worker_entry)
+    voice_mode = _entry_voice_mode(space_entry)
+    entry["voice_mode"] = voice_mode
+    entry["managed_voice_active"] = voice_mode == "per_agent"
     return entry
 
 
@@ -572,6 +603,7 @@ def _sync_sources(
         before = dict(state.source_worker_entries(store).get(existing_key) or {}) if existing_key is not None else {}
         _key, entry, created = state.upsert_worker_entry(store, worker)
         entry["status"] = _effective_worker_status(worker, turn_status_by_worker)
+        _stamp_managed_voice(entry, _space_voice_mode(store, space_id))
         counts["created"] += int(created)
         counts["updated"] += int(not created and before != entry)
         if not _worker_is_open(worker):
@@ -601,6 +633,9 @@ def _sync_sources(
         existing_key = state.find_entry_key_by_space(store, space_id)
         before = dict(state.source_space_entries(store).get(existing_key) or {}) if existing_key is not None else {}
         _key, entry, created = state.upsert_space_entry(store, space)
+        if not entry.get("voice_mode"):
+            entry["voice_mode"] = _default_voice_mode()
+        _stamp_managed_voice(entry, _entry_voice_mode(entry))
         selected = _select_space_worker(selectable, turn_status_by_worker)
         seen_space_keys.add(_key)
         entry["status"] = turn_status_by_space.get(space_id) or _effective_worker_status(selected, turn_status_by_worker) or _source_status(space.get("status"))
