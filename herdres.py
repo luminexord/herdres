@@ -21,7 +21,7 @@ from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient
 from herdres_connector.tendwire_client import TendwireClient
 
-VERSION = "tendwired-source-only"
+VERSION = "0.5.0-tendwired-source-only"
 SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the target again."
 
 
