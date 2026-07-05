@@ -230,21 +230,57 @@ def speech_reply_max_chars() -> int:
         return 600
 
 
-def trim_for_speech(text: str, *, max_chars: int | None = None) -> str:
-    """Strip code blocks / inline code / URLs / markdown from an agent reply and cap it to a speakable
-    length on a sentence boundary, so TTS reads a short answer rather than code aloud."""
-    if max_chars is None:
-        max_chars = speech_reply_max_chars()
+def _clean_for_speech(text: str) -> str:
+    """Strip code blocks / inline code / URLs / markdown so TTS reads prose, not code aloud."""
     s = _CODE_FENCE_RE.sub(" (code omitted) ", str(text or ""))
     s = _INLINE_CODE_RE.sub(lambda m: m.group(0).strip("`"), s)
     s = _URL_RE.sub("a link", s)
     s = re.sub(r"[*_#>`]+", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _cut_at_boundary(s: str, max_chars: int) -> tuple[str, str]:
+    """Split `s` into a ≤max_chars head (preferring a sentence, else word, boundary) and the rest."""
     if len(s) <= max_chars:
-        return s
+        return s, ""
     cut = s[:max_chars]
     boundary = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
-    return (cut[: boundary + 1] if boundary > max_chars // 2 else cut).strip()
+    if boundary <= max_chars // 2:
+        boundary = cut.rfind(" ")            # no sentence break — fall back to a word break
+    idx = boundary + 1 if boundary > 0 else max_chars
+    return s[:idx].strip(), s[idx:].strip()
+
+
+def trim_for_speech(text: str, *, max_chars: int | None = None) -> str:
+    """Clean an agent reply and cap it to a single speakable chunk on a sentence boundary."""
+    if max_chars is None:
+        max_chars = speech_reply_max_chars()
+    head, _rest = _cut_at_boundary(_clean_for_speech(text), max_chars)
+    return head
+
+
+def speech_reply_max_chunks() -> int:
+    """Cap the number of voice notes one reply is split into, so a long reply can't flood the topic."""
+    try:
+        return max(1, int(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_MAX_CHUNKS", "5") or "5"))
+    except ValueError:
+        return 5
+
+
+def speech_reply_chunks(text: str, *, max_chars: int | None = None, max_chunks: int | None = None) -> list[str]:
+    """Split a cleaned reply into up to `max_chunks` speakable chunks of ≤`max_chars`, so a long answer
+    is spoken as several voice notes instead of being truncated to one."""
+    if max_chars is None:
+        max_chars = speech_reply_max_chars()
+    if max_chunks is None:
+        max_chunks = speech_reply_max_chunks()
+    s = _clean_for_speech(text)
+    chunks: list[str] = []
+    while s and len(chunks) < max_chunks:
+        head, s = _cut_at_boundary(s, max_chars)
+        if head:
+            chunks.append(head)
+    return chunks
 
 
 def _load_tts():
