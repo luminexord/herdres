@@ -1,5 +1,26 @@
 # Install
 
+## Prerequisite: Tendwire
+
+Herdres does not function on its own. It has no observation, worker identity,
+turn/pending, command routing, or backend-health logic of its own — every one of
+those comes from Tendwire over the `tendwire` CLI/daemon. Install Tendwire first:
+
+```sh
+git clone https://github.com/plotarmordev/tendwire.git ~/tendwire
+cd ~/tendwire
+python3 -m venv .venv && . .venv/bin/activate
+python -m pip install -e .
+tendwire doctor --json
+```
+
+See [Tendwire's own INSTALL.md](https://github.com/plotarmordev/tendwire/blob/main/INSTALL.md)
+for the `tendwired.service` daemon setup. Herdres finds Tendwire via the
+`tendwire` binary on `PATH`, or falls back to `TENDWIRE_SOURCE_DIR`
+(default `~/tendwire/src`) and runs it as `python -m tendwire.cli`.
+
+## Herdres itself
+
 This branch installs only:
 
 - `herdres`
