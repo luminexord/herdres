@@ -324,3 +324,52 @@ def test_command_reply_no_flag_for_plain_message(tmp_path, monkeypatch):
         herdres.command_reply({"topic_id": "77", "user_id": "1", "text": "hello", "reply_to_message_id": "555"})
     saved = state.load_state(statepath)
     assert saved["panes"]["worker:w1"].get("speak_next_reply") is None
+
+
+# --- trigger phrase is a bridge directive: stripped before the pane sees it ---
+
+def test_strip_speech_reply_trigger():
+    assert speech.strip_speech_reply_trigger("reply by voice: say hello") == "say hello"
+    assert speech.strip_speech_reply_trigger("Explain that to me? Reply by voice") == "Explain that to me"
+    assert speech.strip_speech_reply_trigger("reply by voice") == ""
+    assert speech.strip_speech_reply_trigger("no trigger here") == "no trigger here"
+
+
+def test_command_reply_arms_flag_and_strips_trigger(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    store = _store()
+    store["panes"]["worker:w1"] = {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
+                                   "tendwire_space_id": "s1", "topic_id": "77"}
+    state.save_state(store)
+    sent = {}
+
+    def fake_command(self, request):
+        sent.update(request)
+        return {"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}
+
+    with patch.object(herdres.TendwireClient, "command", fake_command):
+        herdres.command_reply({"topic_id": "77", "user_id": "1",
+                               "text": "Summarize the file? Reply by voice"})
+    assert sent["instruction"]["text"] == "Summarize the file"     # phrase never reaches the agent
+    saved = state.load_state(statepath)
+    assert saved["panes"]["worker:w1"].get("speak_next_reply") is True  # bridge owns the voice
+
+
+def test_command_reply_standalone_trigger_arms_without_submitting(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    store = _store()
+    store["panes"]["worker:w1"] = {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
+                                   "tendwire_space_id": "s1", "topic_id": "77"}
+    state.save_state(store)
+    with patch.object(herdres.TendwireClient, "command") as cmd:
+        result = herdres.command_reply({"topic_id": "77", "user_id": "1", "text": "reply by voice"})
+    cmd.assert_not_called()                                        # nothing submitted to the pane
+    assert "spoken" in result["reply"]
+    saved = state.load_state(statepath)
+    assert saved["panes"]["worker:w1"].get("speak_next_reply") is True

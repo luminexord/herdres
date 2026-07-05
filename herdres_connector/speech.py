@@ -223,6 +223,18 @@ def speech_reply_triggered(user_text: str | None) -> bool:
     return bool(trig) and trig in str(user_text or "").lower()
 
 
+def strip_speech_reply_trigger(text: str) -> str:
+    """Remove one occurrence of the trigger phrase (plus adjacent punctuation) from an instruction.
+    The phrase is a BRIDGE directive ("speak the reply back"), not part of the task — delivering it to
+    the agent makes the agent think IT must produce audio (e.g. it starts installing TTS)."""
+    trig = speech_reply_trigger()
+    raw = str(text or "")
+    if not trig:
+        return raw.strip()
+    pattern = re.compile(r"[\s,;:.!?\-–—]*" + re.escape(trig) + r"[\s,;:.!?\-–—]*", re.IGNORECASE)
+    return pattern.sub(" ", raw, count=1).strip()
+
+
 def speech_reply_max_chars() -> int:
     try:
         return max(1, int(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_MAX_CHARS", "600") or "600"))

@@ -269,6 +269,15 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         voice_text = _voice_submission_text(payload, clean_text if alias else "")
         if voice_text:
             text = voice_text
+        # "reply by voice" is a BRIDGE directive: arm the one-shot speak flag and STRIP the phrase so
+        # the agent never sees it (an agent reading it thinks it must produce audio itself and goes
+        # off installing TTS). A standalone trigger just arms the flag without submitting a turn.
+        if text and speech.speech_reply_triggered(text):
+            entry["speak_next_reply"] = True
+            text = speech.strip_speech_reply_trigger(text)
+            if not text:
+                state.save_state(store)
+                return {"handled": True, "reply": "🎙️ Got it — the next reply will be spoken."}
         if not text:
             if voice_payload:
                 return {"handled": True, "reply": _voice_unavailable_reply(payload)}
