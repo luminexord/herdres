@@ -124,6 +124,11 @@ def _source_state() -> tuple[dict, str]:
 
 
 class TendwireModeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests exercise the CLI snapshot path (mock run_cmd); disable the daemon-socket
+        # fast-path so they stay deterministic regardless of a live tendwired.sock on the host.
+        self.enterContext(patch.object(herdres, "tendwire_daemon_socket_path", return_value=""))
+
     def test_parse_tendwire_mode_defaults_to_off(self) -> None:
         self.assertEqual(herdres_tendwire.parse_mode({}), "off")
 
@@ -1941,6 +1946,9 @@ class TendwireModeTests(unittest.TestCase):
 
 
 class TendwireConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(patch.object(herdres, "tendwire_daemon_socket_path", return_value=""))
+
     def test_child_env_preserves_parent_and_overrides_only_tendwire_keys(self) -> None:
         parent = {
             "PATH": "/bin:/usr/bin",
@@ -2198,6 +2206,9 @@ class TendwireConfigTests(unittest.TestCase):
 
 
 class TendwireHybridTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(patch.object(herdres, "tendwire_daemon_socket_path", return_value=""))
+
     def test_source_turn_for_pane_prefers_matching_worker_fingerprint(self) -> None:
         pane = {
             "worker_id": "worker-1",

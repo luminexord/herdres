@@ -1197,12 +1197,17 @@ def cached_turns_payload(
     sanitize: Sanitizer = _default_sanitize,
     env: Any | None = None,
     default_herdr_bin: str = DEFAULT_HERDR_BIN,
+    load: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    # Memoized for the whole sync/event (cleared by clear_turns_payload_cache): turns are read once
+    # per pane, so this collapses N fetches into one and guarantees every pane sees one consistent
+    # payload. `load` lets a caller supply the fetch (e.g. the daemon-socket fast path); it defaults
+    # to the CLI turns_payload.
     global _TURNS_PAYLOAD_CACHE
     with _TURNS_PAYLOAD_CACHE_LOCK:
         if _TURNS_PAYLOAD_CACHE is not None:
             return _TURNS_PAYLOAD_CACHE
-    data = turns_payload(
+    data = load() if load is not None else turns_payload(
         runner=runner,
         sanitize=sanitize,
         env=env,

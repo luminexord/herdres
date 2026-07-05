@@ -40,6 +40,7 @@ except Exception:  # pragma: no cover - speech is strictly additive
     herdres_speech = None  # type: ignore
 
 import herdres_tendwire
+from herdres_connector import daemon_socket as tendwire_daemon_socket
 from herdres_connector import doctor as connector_doctor
 from herdres_connector import formatter as connector_formatter
 from herdres_connector import source_state as connector_source_state
@@ -2007,7 +2008,35 @@ def tendwire_source_smoke_once(args: Any) -> dict[str, Any]:
         return result
 
 
+def tendwire_daemon_socket_path() -> str:
+    """Unix socket of the local Tendwire daemon. HERDRES_TENDWIRE_SOCKET overrides; otherwise it sits
+    next to the DB (the daemon's default is data_dir/tendwire.sock). Empty string disables the fast
+    path (fall back to the CLI)."""
+    override = os.getenv("HERDRES_TENDWIRE_SOCKET", "").strip()
+    if override:
+        return os.path.expanduser(override)
+    db = herdres_tendwire.db_path()
+    return os.path.join(os.path.dirname(db), "tendwire.sock") if db else ""
+
+
+def tendwire_socket_timeout() -> float:
+    # Runs under the global sync lock, so keep it tight: a momentarily-busy (single-threaded) daemon
+    # fails over to the CLI in ~1s rather than stalling the lock. Normal answer is ~20ms.
+    try:
+        return max(0.1, float(os.getenv("HERDRES_TENDWIRE_SOCKET_TIMEOUT_SECONDS", "1") or "1"))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def tendwire_snapshot() -> dict[str, Any]:
+    # Fast path: query the warm daemon over its socket (~20ms) instead of spawning the CLI (~0.6-2s),
+    # which must never run under the global sync lock. Any socket-path failure falls open to the CLI.
+    sock = tendwire_daemon_socket_path()
+    if sock:
+        try:
+            return tendwire_daemon_socket.snapshot(sock, timeout=tendwire_socket_timeout())
+        except Exception:  # fail-open: never let a fast-path error escape as a backend degrade
+            pass
     try:
         return _tendwire_client().snapshot()
     except herdres_tendwire.TendwireCallError as exc:
@@ -2015,8 +2044,23 @@ def tendwire_snapshot() -> dict[str, Any]:
 
 
 def tendwire_turns() -> dict[str, Any]:
+    # tendwire_turns is called once PER PANE, so it must stay behind the per-sync turns cache. The
+    # loader (socket fast path, CLI fallback) is invoked at most once per sync; every pane reads one
+    # consistent payload.
+    sock = tendwire_daemon_socket_path()
+
+    def _load() -> dict[str, Any]:
+        if sock:
+            try:
+                return tendwire_daemon_socket.turns(sock, timeout=tendwire_socket_timeout())
+            except Exception:  # fail-open to the CLI
+                pass
+        return herdres_tendwire.turns_payload(
+            runner=run_cmd, sanitize=sanitize_text, default_herdr_bin=DEFAULT_HERDR_BIN)
+
     try:
-        return _tendwire_client().turns()
+        return herdres_tendwire.cached_turns_payload(
+            runner=run_cmd, sanitize=sanitize_text, default_herdr_bin=DEFAULT_HERDR_BIN, load=_load)
     except herdres_tendwire.TendwireCallError as exc:
         raise BridgeError(str(exc)) from exc
 
