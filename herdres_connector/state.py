@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import fcntl
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,61 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
     os.replace(tmp, state_file)
 
 
+# Off-lock delivery (issue #122): sync_once holds state_lock() across the whole source-mode delivery
+# loop, so queued inbound commands (which also take state_lock()) stall behind its Telegram sends.
+# released_lock() drops the held lock for a bounded window and re-acquires it, so the delivery loop can
+# yield between items. The held fd + release depth are THREAD-LOCAL: fcntl.flock is per open-file
+# description, so an in-process caller with two concurrent state_lock() holders (e.g. an embedded
+# runner) would let one thread's released_lock() unlock another thread's fd; per-thread state keeps
+# each holder dropping only its OWN fd. (Prod routes inbound commands through subprocesses, one holder
+# per process, where this is equivalent to a module global.)
+_LOCK_STATE = threading.local()
+
+
+def _held_lock_fd() -> int | None:
+    return getattr(_LOCK_STATE, "held_fd", None)
+
+
+def lock_held() -> bool:
+    """True when this thread is inside a state_lock() (so released_lock() would actually drop it).
+    Lets the delivery loop's yield stay inert when sync_once runs outside the lock (tests/dry-run),
+    where there is nothing to yield and no on-disk state to reload."""
+    return _held_lock_fd() is not None
+
+
+class _ReleasedLock:
+    """Drop the state lock (if held) for the `with` body, then re-acquire it on exit. A no-op when no
+    lock is held (called directly in tests) or when already nested inside another released window (the
+    depth guard prevents a double-unlock)."""
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+
+    def __enter__(self) -> "_ReleasedLock":
+        depth = getattr(_LOCK_STATE, "release_depth", 0)
+        held = _held_lock_fd()
+        if held is not None and depth == 0:
+            self._fd = held
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            _LOCK_STATE.release_depth = depth + 1
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        if self._fd is not None:
+            _LOCK_STATE.release_depth = getattr(_LOCK_STATE, "release_depth", 1) - 1
+            # Re-acquire BLOCKING so the caller resumes holding the lock exactly as before. A failure
+            # (the lock file vanished) propagates and aborts the pass rather than continuing unlocked.
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return False
+
+
+def released_lock() -> "_ReleasedLock":
+    # Single-window contract: a released_lock() nested inside another released window is intentionally
+    # inert (its body runs but the lock is NOT dropped again) — the depth guard prevents a double
+    # unlock. Today only the sync_once turn/pending loop opens one window at a time.
+    return _ReleasedLock()
+
+
 @contextmanager
 def state_lock(path: Path | None = None):
     state_file = path or config.state_path()
@@ -46,9 +102,14 @@ def state_lock(path: Path | None = None):
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     with lock_file.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
+        # Expose the held fd so released_lock() can drop it around slow off-lock sends. Save/restore
+        # (rather than force None) so a nested state_lock can't strand an outer holder.
+        prev_held = _held_lock_fd()
+        _LOCK_STATE.held_fd = handle.fileno()
         try:
             yield
         finally:
+            _LOCK_STATE.held_fd = prev_held
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 

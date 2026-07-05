@@ -903,6 +903,10 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
     panes = store.get("panes") if isinstance(store.get("panes"), dict) else {}
     audit = store.setdefault("telegram_deleted_topics", [])
     deleted_topic_ids: set[str] = set()
+    # Bound real topic-delete calls per pass so a first source sync (which can reclassify many legacy
+    # per-worker topics at once) amortizes the deletes over ticks instead of one burst under the lock.
+    delete_cap = config.source_orphan_delete_cap()
+    deletes_issued = 0
 
     def clear_worker_topic_refs(topic_id: str, reason: str) -> None:
         for worker_key, worker_entry in list(state.source_worker_entries(store).items()):
@@ -931,6 +935,9 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
                 deleted_topic_ids.add(topic_id)
             result["changed"] = True
             continue
+        if deletes_issued >= delete_cap:
+            continue  # per-pass delete budget spent; retry this topic next tick (record untouched)
+        deletes_issued += 1
         deleted = runtime.telegram.delete_topic(chat_id, topic_id)
         if not deleted.get("ok"):
             if _topic_missing(deleted.get("error")):
@@ -961,12 +968,15 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
             continue
         topic_id = str(entry.get("topic_id") or "")
         should_delete = config.delete_done_council_topics() and _entry_is_council_topic(entry) and bool(topic_id)
+        if should_delete and not runtime.dry_run and topic_id not in deleted_topic_ids and deletes_issued >= delete_cap:
+            continue  # budget spent; retry this space's delete+prune next tick (record untouched)
         if should_delete and topic_id not in deleted_topic_ids:
             if runtime.dry_run:
                 result["deleted"] += 1
                 deleted_topic_ids.add(topic_id)
                 result["changed"] = True
                 continue
+            deletes_issued += 1
             deleted = runtime.telegram.delete_topic(chat_id, topic_id)
             if not deleted.get("ok"):
                 if _topic_missing(deleted.get("error")):
@@ -1300,6 +1310,7 @@ def _sync_turns(
     *,
     chat_id: str,
     live_worker_ids: set[str] | None = None,
+    yield_barrier: Any | None = None,
 ) -> dict[str, int]:
     counts = {"feed_sent": 0, "sent": 0, "updated": 0}
     turns = _turns(turns_payload)
@@ -1346,7 +1357,8 @@ def _sync_turns(
             latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
     seen_final_workers: set[str] = set()
     seen_working_workers: set[str] = set()
-    for item in turns:
+    turn_count = len(turns)
+    for idx, item in enumerate(turns):
         _key, entry = _entry_for_turn(store, item)
         if entry is None:
             continue
@@ -1377,10 +1389,22 @@ def _sync_turns(
         counts["feed_sent"] += int(delivered)
         counts["sent"] += int(delivered)
         counts["updated"] += int((not delivered and before != entry) or (repaired_open_final and not delivered))
-    for item in _pending(pending_payload):
+        # Only turns that changed the store did a Telegram send (the slow part). After such a turn,
+        # yield the state lock so a queued inbound command can interleave instead of stalling behind
+        # the rest of the loop. The barrier commits `store` under the lock, releases briefly, then
+        # reloads in place — so a competitor's write survives and `entry` is re-derived fresh next
+        # iteration (no detached reference). Skip after the last turn (nothing left to unblock for).
+        if yield_barrier is not None and (delivered or before != entry) and idx + 1 < turn_count:
+            yield_barrier()
+    pending_items = _pending(pending_payload)
+    pending_count = len(pending_items)
+    for p_idx, item in enumerate(pending_items):
         delivered = _deliver_pending(store, item, runtime, chat_id=chat_id)
         counts["feed_sent"] += int(delivered)
         counts["sent"] += int(delivered)
+        # Same yield between delivered pending prompts (each is a send under the lock).
+        if yield_barrier is not None and delivered and p_idx + 1 < pending_count:
+            yield_barrier()
     return counts
 
 
@@ -1488,10 +1512,39 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         if _worker_is_open(worker)
     }
     live_worker_ids.discard("")
+
+    def _yield_between_turns() -> None:
+        # Inert unless actually holding the state lock (the shim wraps sync_once in state_lock();
+        # tests/dry-run call sync_once directly). Commit under the lock so a competitor's load-modify-
+        # save lands on top of ours, release briefly, then reload IN PLACE (the shim owns the `store`
+        # reference and saves it after us) so committed deliveries + the additive turn-delivery ledger
+        # survive both sides.
+        if not state.lock_held():
+            return
+        state.save_state(store)
+        with state.released_lock():
+            pass
+        fresh = state.load_state()
+        store.clear()
+        store.update(fresh)
+
+    yield_barrier = (
+        _yield_between_turns
+        if config.offlock_interpane_yield_enabled() and not runtime.dry_run
+        else None
+    )
     turn_counts = (
         {"feed_sent": 0, "sent": 0, "updated": 0}
         if bootstrapped
-        else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id, live_worker_ids=live_worker_ids)
+        else _sync_turns(
+            store,
+            turns_payload,
+            pending_payload,
+            runtime,
+            chat_id=chat_id,
+            live_worker_ids=live_worker_ids,
+            yield_barrier=yield_barrier,
+        )
     )
     routing_repaired += _repair_space_mode_routing_state(store)
     topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id)
