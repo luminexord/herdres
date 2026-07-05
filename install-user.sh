@@ -16,6 +16,41 @@ rm -f \
     "$HOME/.local/bin/herdres_connector/formatter.py" \
     "$HOME/.local/bin/herdres_connector/source_state.py"
 
+# The monolith wrote herdres-decision-hook entries into the REAL ~/.claude/settings.json. We just
+# removed the script (above); a dangling hook -> missing script blocks ALL Claude Code prompts, so
+# strip those entries too. Guarded + backed up + never fails the install (best-effort).
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+if [ -f "$CLAUDE_SETTINGS" ] && grep -q "herdres-decision-hook" "$CLAUDE_SETTINGS" 2>/dev/null && command -v python3 >/dev/null 2>&1; then
+    cp -a "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak-herdres-uninstall" 2>/dev/null || true
+    python3 - "$CLAUDE_SETTINGS" <<'PY' || true
+import json, sys
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+hooks = d.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(0)
+for event, groups in list(hooks.items()):
+    if not isinstance(groups, list):
+        continue
+    new_groups = []
+    for g in groups:
+        inner = g.get("hooks", []) if isinstance(g, dict) else []
+        kept = [h for h in inner if isinstance(h, dict) and "herdres-decision-hook" not in str(h.get("command", ""))]
+        if kept:
+            g["hooks"] = kept
+            new_groups.append(g)
+    if new_groups:
+        hooks[event] = new_groups
+    else:
+        del hooks[event]
+json.dump(d, open(p, "w"), indent=2)
+PY
+    printf '%s\n' "Removed stale herdres-decision-hook entries from ~/.claude/settings.json."
+fi
+
 [ -f "$HOME/.config/herdres/herdres.env" ] || \
     install -Dm600 .env.example "$HOME/.config/herdres/herdres.env"
 
