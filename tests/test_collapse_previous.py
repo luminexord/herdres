@@ -4,6 +4,7 @@ HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS (the user's env sets =1)."""
 from __future__ import annotations
 
 from herdres_connector import config, source_sync, state
+from herdres_connector.managed_bots import MANAGER_BOT_KIND
 from herdres_connector.rich_delivery import render_turn_item_html
 from herdres_connector.source_sync import SyncRuntime, _sync_turns
 
@@ -64,8 +65,8 @@ def _folded_store(monkeypatch):
     # both turns already delivered + bound (the sweep edits the OLD one)
     state.mark_delivered(store, "final:turn-new:whatever", {"worker_id": "w1", "turn_id": "turn-new"})
     state.mark_delivered(store, "final:turn-old:whatever", {"worker_id": "w1", "turn_id": "turn-old"})
-    state.bind_message_to_worker(store, "400", store["panes"]["worker:w1"], topic_id="77", kind="final", turn_id="turn-old")
-    state.bind_message_to_worker(store, "501", store["panes"]["worker:w1"], topic_id="77", kind="final", turn_id="turn-new")
+    state.bind_message_to_worker(store, "400", store["panes"]["worker:w1"], topic_id="77", kind="final", turn_id="turn-old", bot_kind=MANAGER_BOT_KIND)
+    state.bind_message_to_worker(store, "501", store["panes"]["worker:w1"], topic_id="77", kind="final", turn_id="turn-new", bot_kind=MANAGER_BOT_KIND)
     return store
 
 
@@ -121,3 +122,41 @@ def test_fold_failure_bounded_by_attempt_cap(monkeypatch):
     binding = state.message_bindings(store)["400"]
     assert binding.get("folded") is None
     assert int(binding.get("fold_attempts") or 0) == source_sync._FOLD_ATTEMPT_CAP   # gave up at the cap
+
+
+def test_fold_skipped_when_binding_lacks_bot_kind(monkeypatch):
+    # A binding that doesn't record which bot sent the message must NOT be folded (a wrong-bot edit
+    # 404s and would falsely mark the fold done). It just stays unfolded, honestly.
+    store = _folded_store(monkeypatch)
+    state.message_bindings(store)["400"].pop("bot_kind", None)
+    telegram = _run(store, monkeypatch)
+    assert not any(mid == "400" for _c, mid, _h in telegram.edited)
+    assert state.message_bindings(store)["400"].get("folded") is None
+
+
+def test_fold_per_pass_cap(monkeypatch):
+    # Many superseded finals fold at most _FOLD_PASS_CAP per pass (self-healing sweep, no burst).
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    turns = [{"id": "turn-new", "worker_id": "w1", "worker_fingerprint": "fp1",
+              "assistant_final_text": "New answer", "complete": True}]
+    store["panes"]["worker:w1"] = {
+        "source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
+        "tendwire_space_id": "s1", "topic_id": "77", "last_clean_message_id": "900",
+    }
+    for i in range(6):   # six superseded finals with bindings
+        tid = f"turn-old-{i}"
+        turns.append({"id": tid, "worker_id": "w1", "worker_fingerprint": "fp1",
+                      "assistant_final_text": f"Old {i}", "complete": True})
+        state.mark_delivered(store, f"final:{tid}:x", {"worker_id": "w1", "turn_id": tid})
+        state.bind_message_to_worker(store, str(400 + i), store["panes"]["worker:w1"],
+                                     topic_id="77", kind="final", turn_id=tid, bot_kind=MANAGER_BOT_KIND)
+    state.mark_delivered(store, "final:turn-new:x", {"worker_id": "w1", "turn_id": "turn-new"})
+    state.bind_message_to_worker(store, "900", store["panes"]["worker:w1"], topic_id="77",
+                                 kind="final", turn_id="turn-new", bot_kind=MANAGER_BOT_KIND)
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "1")
+    telegram = FakeTelegram()
+    _sync_turns(store, {"turns": turns}, {"pending": []}, SyncRuntime(FakeTendwire(), telegram, with_outbox=False), chat_id="-100")
+    assert len(telegram.edited) == source_sync._FOLD_PASS_CAP     # capped this pass
+    folded = [m for m, b in state.message_bindings(store).items() if b.get("folded")]
+    assert len(folded) == source_sync._FOLD_PASS_CAP              # rest fold on later passes

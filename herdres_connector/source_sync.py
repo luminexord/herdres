@@ -665,6 +665,7 @@ def _suppress_historical_final(store: dict[str, Any], item: dict[str, Any], cont
 
 
 _FOLD_ATTEMPT_CAP = 3
+_FOLD_PASS_CAP = 3
 
 
 def _fold_superseded_final(
@@ -674,6 +675,7 @@ def _fold_superseded_final(
     runtime: SyncRuntime,
     *,
     chat_id: str,
+    fold_state: dict[str, int] | None = None,
 ) -> bool:
     """Collapse the Response of a SUPERSEDED final (opt-in via
     HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS): re-render the previously delivered message with
@@ -684,6 +686,8 @@ def _fold_superseded_final(
     split final has no single message to re-render). Never touches the latest delivery."""
     if runtime.dry_run or not config.response_collapse_previous_default():
         return False
+    if fold_state is not None and fold_state.get("issued", 0) >= _FOLD_PASS_CAP:
+        return False  # per-pass edit budget spent; the sweep is self-healing, rest folds next ticks
     if not str(item.get("assistant_final_text") or "").strip():
         return False
     bindings = _final_delivery_bindings(store, _turn_id(item))
@@ -696,19 +700,33 @@ def _fold_superseded_final(
         return False  # belt-and-braces: never fold the latest delivered message
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
-    stored_bot_kind = str(binding.get("bot_kind") or entry.get("last_clean_bot_kind") or MANAGER_BOT_KIND)
-    if stored_bot_kind != bot_kind:
-        return False  # can only edit a message from the bot that sent it
+    # Only fold when the binding ITSELF records which bot sent the message. Guessing from
+    # last_clean_bot_kind describes the LATEST delivery's bot, not this old message's — a wrong-bot
+    # edit 404s and would falsely mark the fold done.
+    stored_bot_kind = str(binding.get("bot_kind") or "")
+    if not stored_bot_kind or stored_bot_kind != bot_kind:
+        return False
     folded_item = dict(turn_item_from_source(item, entry))
     folded_item["collapse_response"] = True
-    sent = edit_feed_item(
-        runtime.telegram,
-        chat_id,
-        message_id,
-        folded_item,
-        telegram=telegram,
-        api_token=api_token,
-    )
+    # Same oversize/split guards as _replace_changed_final: never let a cosmetic fold degrade a rich
+    # message through the too-large -> legacy-plain fallback.
+    if len(render_feed_item_html(folded_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(folded_item):
+        return False
+    if fold_state is not None:
+        fold_state["issued"] = fold_state.get("issued", 0) + 1
+    try:
+        sent = edit_feed_item(
+            runtime.telegram,
+            chat_id,
+            message_id,
+            folded_item,
+            telegram=telegram,
+            api_token=api_token,
+        )
+    except Exception as exc:  # a rate-limit/transport blip must not abort the sync pass
+        print(f"herdres fold edit failed: {exc}", file=sys.stderr)
+        binding["fold_attempts"] = int(binding.get("fold_attempts") or 0) + 1
+        return True
     error = str(sent.get("error") or "").lower()
     if sent.get("ok") or "not found" in error or _topic_missing(sent.get("error")):
         binding["folded"] = True  # done (or the message/topic is gone — nothing left to fold)
@@ -1583,6 +1601,7 @@ def _sync_turns(
             latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
     seen_final_workers: set[str] = set()
     seen_working_workers: set[str] = set()
+    fold_state: dict[str, int] = {"issued": 0}
     turn_count = len(turns)
     for idx, item in enumerate(turns):
         entry_key, entry = _entry_for_turn(store, item)
@@ -1597,7 +1616,7 @@ def _sync_turns(
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 delivered = False
                 counts["updated"] += int(_suppress_historical_final(store, item, _turn_content_hash(item, "final")))
-                counts["updated"] += int(_fold_superseded_final(store, item, entry, runtime, chat_id=chat_id))
+                counts["updated"] += int(_fold_superseded_final(store, item, entry, runtime, chat_id=chat_id, fold_state=fold_state))
                 continue
             if worker_key in seen_final_workers:
                 continue
