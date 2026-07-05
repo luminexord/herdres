@@ -147,11 +147,16 @@ def _entry_status_is_finished(entry: dict[str, Any]) -> bool:
 
 
 def _entry_is_council_topic(entry: dict[str, Any]) -> bool:
+    """Ephemeral gitmoot delegation/council entries (gm-local-as workers, "gitmoot · local-as"
+    delegation spaces, "Council · …" topics). The markers are deliberately PRECISE: a bare "gitmoot"
+    substring would also match regular panes whose topic is named after the /root/gitmoot project
+    dir (labels/cwd naming), and done-council cleanup would then delete a normal pane's topic every
+    time it finished a task (live incident: "Gitmoot2"/"gitmoot 2" churned create/delete)."""
     material = " ".join(
         str(entry.get(key) or "").lower()
         for key in ("topic_name", "worker_name", "agent", "space_topic_name")
     )
-    return any(marker in material for marker in ("council", "gitmoot", "gm-local", "gm_"))
+    return any(marker in material for marker in ("council", "gm-local", "gm_", "gitmoot \u00b7"))
 
 
 def _should_delete_done_council_topic(entry: dict[str, Any]) -> bool:

@@ -120,3 +120,14 @@ def test_rename_skips_closed_workers_and_capped_attempts():
     ]
     _assigned, renames = source_sync._assign_worker_topic_names(store, workers)
     assert renames == {}                     # closed pane + capped-attempts pane both skipped
+
+
+def test_council_heuristic_never_matches_project_named_panes():
+    # Live incident: a bare "gitmoot" marker matched regular panes whose topics are named after the
+    # /root/gitmoot project dir, and done-council cleanup deleted their topics on every task finish.
+    from herdres_connector.source_sync import _entry_is_council_topic
+    assert _entry_is_council_topic({"topic_name": "gitmoot 2", "worker_name": "claude", "agent": "claude"}) is False
+    assert _entry_is_council_topic({"topic_name": "Gitmoot2", "worker_name": "claude", "agent": "claude"}) is False
+    assert _entry_is_council_topic({"topic_name": "audit-x", "worker_name": "gm-local-as-1", "agent": "agent"}) is True
+    assert _entry_is_council_topic({"topic_name": "gitmoot · local-as", "worker_name": "", "agent": ""}) is True
+    assert _entry_is_council_topic({"topic_name": "Council · 1Q", "worker_name": "", "agent": ""}) is True
