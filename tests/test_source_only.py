@@ -72,7 +72,9 @@ class FakeTelegram:
             "pins": [],
             "api_calls": [],
             "icon_edits": [],
+            "voice_notes": [],
         }
+        shared.setdefault("voice_notes", [])
         self._shared = shared
         self.sent = shared["sent"]
         self.edited = shared["edited"]
@@ -81,6 +83,7 @@ class FakeTelegram:
         self.pins = shared["pins"]
         self.api_calls = shared["api_calls"]
         self.icon_edits = shared["icon_edits"]
+        self.voice_notes = shared["voice_notes"]
 
     def with_token(self, token):
         return FakeTelegram(token=token, shared=self._shared)
@@ -142,6 +145,11 @@ class FakeTelegram:
     def pin_message(self, chat_id, message_id):
         self.pins.append((chat_id, str(message_id)))
         return {"ok": True}
+
+    def send_voice(self, chat_id, file_path, **kwargs):
+        message_id = str(900 + len(self.voice_notes))
+        self.voice_notes.append((str(chat_id), str(file_path), dict(kwargs), message_id))
+        return {"ok": True, "message_id": message_id}
 
 
 def _store():

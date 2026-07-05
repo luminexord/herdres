@@ -100,6 +100,40 @@ def topic_icon_cache_ttl_seconds(env: Any | None = None) -> int:
         return 86400
 
 
+def offlock_interpane_yield_enabled(env: Any | None = None) -> bool:
+    """Whether sync_once briefly releases the state lock between delivered turns so a queued inbound
+    command can interleave instead of stalling behind the whole delivery loop's Telegram sends (the
+    source-mode jam, #122). Read at call time, not import-time, so the plugin/subprocess paths (no
+    systemd EnvironmentFile) still honour it."""
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_OFFLOCK_INTERPANE_YIELD", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def source_orphan_delete_cap(env: Any | None = None) -> int:
+    """Per-pass topic-delete cap for _cleanup_topics. Bounds the first source syncs (which prune many
+    legacy per-worker topics) so the deletes amortize over several timer ticks instead of one long
+    delete burst under the state lock. Read at call time. 0 pauses topic deletion entirely (a
+    deliberate operator knob), so remaining stale topics are not reclaimed until it is raised."""
+    source = os.environ if env is None else env
+    try:
+        return max(0, int(str(source.get("HERDR_TELEGRAM_TOPICS_SOURCE_DELETE_LIMIT", "3") or "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def source_topic_create_cap(env: Any | None = None) -> int:
+    """Per-pass topic-create cap for _sync_sources. Bounds the first source syncs (which create a topic
+    per open worker/space at once) so the creates amortize over several ticks instead of one create
+    burst under the state lock. Read at call time. Raise HERDR_TELEGRAM_TOPICS_MAX_CREATES to backfill
+    many topics in one pass; 0 pauses topic creation until it is raised."""
+    source = os.environ if env is None else env
+    try:
+        return max(0, int(str(source.get("HERDR_TELEGRAM_TOPICS_MAX_CREATES", "3") or "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
 def managed_bots_enabled(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "0") or "").strip().lower()

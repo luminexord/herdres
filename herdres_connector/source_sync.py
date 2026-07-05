@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import Any
 
-from . import config, state
+from . import config, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import edit_feed_item, feed_item_requires_send_split, render_feed_item_html, send_feed_item, split_legacy_message_ids, turn_item_from_source
@@ -669,6 +670,7 @@ def _ensure_topic(
     runtime: SyncRuntime,
     *,
     chat_id: str,
+    can_create: bool = True,
 ) -> tuple[bool, bool]:
     if entry.get("topic_id"):
         return False, False
@@ -678,6 +680,8 @@ def _ensure_topic(
         return False, False
     if runtime.dry_run:
         return True, False
+    if not can_create:
+        return True, False   # real create deferred by the per-pass create cap; retry next tick
     topic_name = entry.get("topic_name") or state.topic_name_for_space(source)
     created = runtime.telegram.create_topic(chat_id, topic_name, icon_color=topic_color_for_name(topic_name))
     if created.get("ok") and created.get("topic_id"):
@@ -844,6 +848,37 @@ def _sync_topic_pinned(store: dict[str, Any], entry: dict[str, Any], runtime: Sy
     return True
 
 
+def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, Any]]) -> dict[str, str]:
+    """Map each not-yet-topiced worker id -> a unique topic name (cwd basename, numbered on collision).
+    Names already bound to a created topic are reserved and never renumbered, so numbers stay stable as
+    panes come and go. Ordered by worker id for deterministic numbering."""
+    # Reserved names are compared case-INSENSITIVELY to match _ensure_topic's reuse lookup
+    # (find_legacy_topic_id_by_name uses .casefold()); otherwise "Foo"/"foo" would look distinct here
+    # yet still collapse into one topic there.
+    reserved: set[str] = set()
+    entries = state.source_worker_entries(store)
+    for entry in entries.values():
+        if entry.get("topic_id") and entry.get("topic_name"):
+            reserved.add(compact_ws(entry.get("topic_name"), 120).casefold())
+    assigned: dict[str, str] = {}
+    for worker in sorted(workers, key=lambda w: compact_ws(w.get("id"), 160)):
+        wid = compact_ws(worker.get("id"), 160)
+        if not wid:
+            continue
+        key = state.find_entry_key_by_worker(store, wid)
+        existing = entries.get(key) if key is not None else None
+        if existing and existing.get("topic_id"):
+            continue  # already has a topic; its name is locked
+        base = state.topic_name_for_worker(worker)
+        name, n = base, 2
+        while name.casefold() in reserved:
+            name = f"{base} {n}"
+            n += 1
+        reserved.add(name.casefold())
+        assigned[wid] = name
+    return assigned
+
+
 def _sync_sources(
     store: dict[str, Any],
     snapshot: dict[str, Any],
@@ -854,6 +889,13 @@ def _sync_sources(
 ) -> dict[str, int]:
     counts = {"created": 0, "updated": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
     topic_mode = config.source_topic_mode()
+    # Bound real topic-create calls per pass so a first source sync (a topic per open worker/space)
+    # amortizes creation over ticks instead of one create burst under the state lock.
+    create_cap = config.source_topic_create_cap()
+    creates_issued = 0
+    # One topic per pane, named by cwd basename; disambiguate same-name panes (e.g. two /root/gitmoot
+    # panes -> "gitmoot", "gitmoot 2"). Names on already-created topics are locked so numbers stay stable.
+    worker_topic_names = _assign_worker_topic_names(store, _workers(snapshot)) if topic_mode == "worker" else {}
     live_worker_ids = {
         compact_ws(worker.get("id"), 160)
         for worker in _workers(snapshot)
@@ -870,6 +912,11 @@ def _sync_sources(
         _key, entry, created = state.upsert_worker_entry(store, worker)
         entry["status"] = _effective_worker_status(worker, turn_status_by_worker)
         _stamp_managed_voice(entry, _space_voice_mode(store, space_id))
+        # Apply the cwd-based, disambiguated name before the topic is created (once it has a topic_id
+        # the name is locked, so a later renumber can't rename an existing topic).
+        wid = compact_ws(worker.get("id"), 160)
+        if not entry.get("topic_id") and wid in worker_topic_names:
+            entry["topic_name"] = worker_topic_names[wid]
         counts["created"] += int(created)
         counts["updated"] += int(not created and before != entry)
         if not _worker_is_open(worker):
@@ -877,7 +924,10 @@ def _sync_sources(
         if space_id:
             workers_by_space.setdefault(space_id, []).append(worker)
         if topic_mode == "worker" and not _should_delete_done_council_topic(entry):
-            topic_needed, topic_created = _ensure_topic(store, worker, entry, runtime, chat_id=chat_id)
+            topic_needed, topic_created = _ensure_topic(
+                store, worker, entry, runtime, chat_id=chat_id, can_create=creates_issued < create_cap
+            )
+            creates_issued += int(topic_created)
             counts["created"] += int(topic_created or topic_needed)
             counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["panes"] += 1
@@ -914,7 +964,10 @@ def _sync_sources(
             entry["active_worker_fingerprint"] = compact_ws(selected.get("fingerprint"), 160)
             entry["active_worker_name"] = compact_ws(selected.get("name"), 80)
             entry["active_worker_status"] = _dominant_status(space_turn_status, selected_status)
-        topic_needed, topic_created = _ensure_topic(store, space, entry, runtime, chat_id=chat_id)
+        topic_needed, topic_created = _ensure_topic(
+            store, space, entry, runtime, chat_id=chat_id, can_create=creates_issued < create_cap
+        )
+        creates_issued += int(topic_created)
         counts["created"] += int(created or topic_created or topic_needed)
         counts["updated"] += int(not created and before != entry)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
@@ -935,6 +988,10 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
     panes = store.get("panes") if isinstance(store.get("panes"), dict) else {}
     audit = store.setdefault("telegram_deleted_topics", [])
     deleted_topic_ids: set[str] = set()
+    # Bound real topic-delete calls per pass so a first source sync (which can reclassify many legacy
+    # per-worker topics at once) amortizes the deletes over ticks instead of one burst under the lock.
+    delete_cap = config.source_orphan_delete_cap()
+    deletes_issued = 0
 
     def clear_worker_topic_refs(topic_id: str, reason: str) -> None:
         for worker_key, worker_entry in list(state.source_worker_entries(store).items()):
@@ -963,6 +1020,9 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
                 deleted_topic_ids.add(topic_id)
             result["changed"] = True
             continue
+        if deletes_issued >= delete_cap:
+            continue  # per-pass delete budget spent; retry this topic next tick (record untouched)
+        deletes_issued += 1
         deleted = runtime.telegram.delete_topic(chat_id, topic_id)
         if not deleted.get("ok"):
             if _topic_missing(deleted.get("error")):
@@ -993,12 +1053,15 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
             continue
         topic_id = str(entry.get("topic_id") or "")
         should_delete = config.delete_done_council_topics() and _entry_is_council_topic(entry) and bool(topic_id)
+        if should_delete and not runtime.dry_run and topic_id not in deleted_topic_ids and deletes_issued >= delete_cap:
+            continue  # budget spent; retry this space's delete+prune next tick (record untouched)
         if should_delete and topic_id not in deleted_topic_ids:
             if runtime.dry_run:
                 result["deleted"] += 1
                 deleted_topic_ids.add(topic_id)
                 result["changed"] = True
                 continue
+            deletes_issued += 1
             deleted = runtime.telegram.delete_topic(chat_id, topic_id)
             if not deleted.get("ok"):
                 if _topic_missing(deleted.get("error")):
@@ -1159,6 +1222,94 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
         return True
     _record_delivery_error(entry, sent, bot_kind)
     return False
+
+
+def _refind_entry(store: dict[str, Any], entry_key: str | None) -> dict[str, Any] | None:
+    if not entry_key:
+        return None
+    for bucket in ("panes", "spaces"):
+        candidate = (store.get(bucket) or {}).get(entry_key)
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def _speak_reply(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    entry_key: str | None,
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    thread_id: str,
+    reply_to: str | None,
+) -> dict[str, Any]:
+    """Strictly additive (issue #4): after a final text turn is delivered, optionally speak it back as
+    one or more Telegram voice notes (long replies are chunked). Fires on the one-shot speak_next_reply
+    (owner replied to a voice note), the trigger phrase, or force-all. Never breaks the delivered text
+    turn. Returns the entry to keep using (re-derived when we reload off-lock).
+
+    Phase 2: SYNTHESIS + SEND run OFF the state lock. We commit the delivered turn first, drop the lock
+    for the ~1-3s synth (no `store` mutation in that window), then reload — so a competitor's write
+    during synth survives — and record the sent voice-note ids on the freshly-reloaded entry."""
+    if runtime.dry_run:
+        return entry  # preview pass: don't consume the flag or synth; the real send speaks
+    want = bool(entry.pop("speak_next_reply", None))
+    if not (want or speech.speech_reply_triggered(item.get("user_text")) or speech.speech_replies_enabled()):
+        return entry
+    chunks = speech.speech_reply_chunks(item.get("assistant_final_text") or item.get("assistant_stream_text") or "")
+    if not chunks:
+        return entry
+    api_token, _bot_kind = _delivery_bot(store, entry)
+    client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
+
+    def _synth_and_send() -> list[str]:
+        # Runs OFF the lock: synth to OGG + upload. Touches no `store` state (so a competitor holding
+        # the lock meanwhile can't be clobbered); the returned ids are recorded after we re-acquire.
+        ids: list[str] = []
+        for i, chunk in enumerate(chunks):
+            try:
+                dest = speech.outbound_speech_dir(prune=(i == 0)) / f"reply-{short_hash({'t': _turn_id(item), 'i': i, 'h': chunk}, 16)}.ogg"
+                if not speech.speech_request("tts", {"text": chunk, "dest": str(dest)}).get("ok"):
+                    continue
+                sent = client.send_voice(
+                    chat_id, dest, thread_id=thread_id,
+                    reply_to_message_id=(reply_to if i == 0 else None), notify=False,
+                )
+                if sent.get("ok") and sent.get("message_id"):
+                    ids.append(str(sent.get("message_id")))
+            except Exception as exc:  # one chunk failing must not abort the rest or the text turn
+                print(f"herdres speak-reply chunk failed: {exc}", file=sys.stderr)
+        return ids
+
+    if not state.lock_held():
+        # No lock to release (tests / dry callers): synth+send inline and record on the given entry.
+        for vid in _synth_and_send():
+            state.record_voice_reply_message_id(entry, vid)
+        return entry
+
+    # Commit the delivered turn, synth+send OFF the lock, then reload and record on the fresh entry.
+    state.save_state(store)
+    with state.released_lock():
+        voice_ids = _synth_and_send()
+    fresh = state.load_state()
+    store.clear()
+    store.update(fresh)
+    target = _refind_entry(store, entry_key)
+    if target is None:
+        # A competitor pruned this entry during the off-lock synth. The notes were sent, but recording
+        # their ids on the detached pre-reload entry wouldn't persist (save_state writes `store`), so
+        # skip it — leave a breadcrumb rather than silently drop the tracking.
+        if voice_ids:
+            print(f"herdres speak-reply: entry {entry_key} gone after off-lock synth; "
+                  f"{len(voice_ids)} voice id(s) unrecorded", file=sys.stderr)
+        return entry
+    for vid in voice_ids:
+        state.record_voice_reply_message_id(target, vid)
+    if voice_ids:
+        state.save_state(store)
+    return target
 
 
 def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
@@ -1332,6 +1483,7 @@ def _sync_turns(
     *,
     chat_id: str,
     live_worker_ids: set[str] | None = None,
+    yield_barrier: Any | None = None,
 ) -> dict[str, int]:
     counts = {"feed_sent": 0, "sent": 0, "updated": 0}
     turns = _turns(turns_payload)
@@ -1378,8 +1530,9 @@ def _sync_turns(
             latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
     seen_final_workers: set[str] = set()
     seen_working_workers: set[str] = set()
-    for item in turns:
-        _key, entry = _entry_for_turn(store, item)
+    turn_count = len(turns)
+    for idx, item in enumerate(turns):
+        entry_key, entry = _entry_for_turn(store, item)
         if entry is None:
             continue
         before = dict(entry)
@@ -1396,6 +1549,16 @@ def _sync_turns(
                 continue
             seen_final_workers.add(worker_key)
             delivered = _deliver_final(store, item, entry, runtime, chat_id=chat_id)
+            if delivered:
+                # Speak seam AFTER _deliver_final so it fires for every delivery branch (raw send,
+                # promote-working-to-final, replace-changed-final), not just the raw path — the flag
+                # is consumed here exactly once per delivered final. It may reload `store` off-lock
+                # (Phase 2), so it returns the entry to keep using this iteration.
+                entry = _speak_reply(
+                    store, item, entry, entry_key, runtime,
+                    chat_id=chat_id, thread_id=str(entry.get("topic_id") or ""),
+                    reply_to=str(entry.get("last_clean_message_id") or "") or None,
+                )
         elif item.get("assistant_stream_text") or _turn_is_working_placeholder(item, entry):
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 continue
@@ -1409,10 +1572,22 @@ def _sync_turns(
         counts["feed_sent"] += int(delivered)
         counts["sent"] += int(delivered)
         counts["updated"] += int((not delivered and before != entry) or (repaired_open_final and not delivered))
-    for item in _pending(pending_payload):
+        # Only turns that changed the store did a Telegram send (the slow part). After such a turn,
+        # yield the state lock so a queued inbound command can interleave instead of stalling behind
+        # the rest of the loop. The barrier commits `store` under the lock, releases briefly, then
+        # reloads in place — so a competitor's write survives and `entry` is re-derived fresh next
+        # iteration (no detached reference). Skip after the last turn (nothing left to unblock for).
+        if yield_barrier is not None and (delivered or before != entry) and idx + 1 < turn_count:
+            yield_barrier()
+    pending_items = _pending(pending_payload)
+    pending_count = len(pending_items)
+    for p_idx, item in enumerate(pending_items):
         delivered = _deliver_pending(store, item, runtime, chat_id=chat_id)
         counts["feed_sent"] += int(delivered)
         counts["sent"] += int(delivered)
+        # Same yield between delivered pending prompts (each is a send under the lock).
+        if yield_barrier is not None and delivered and p_idx + 1 < pending_count:
+            yield_barrier()
     return counts
 
 
@@ -1520,10 +1695,39 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         if _worker_is_open(worker)
     }
     live_worker_ids.discard("")
+
+    def _yield_between_turns() -> None:
+        # Inert unless actually holding the state lock (the shim wraps sync_once in state_lock();
+        # tests/dry-run call sync_once directly). Commit under the lock so a competitor's load-modify-
+        # save lands on top of ours, release briefly, then reload IN PLACE (the shim owns the `store`
+        # reference and saves it after us) so committed deliveries + the additive turn-delivery ledger
+        # survive both sides.
+        if not state.lock_held():
+            return
+        state.save_state(store)
+        with state.released_lock():
+            pass
+        fresh = state.load_state()
+        store.clear()
+        store.update(fresh)
+
+    yield_barrier = (
+        _yield_between_turns
+        if config.offlock_interpane_yield_enabled() and not runtime.dry_run
+        else None
+    )
     turn_counts = (
         {"feed_sent": 0, "sent": 0, "updated": 0}
         if bootstrapped
-        else _sync_turns(store, turns_payload, pending_payload, runtime, chat_id=chat_id, live_worker_ids=live_worker_ids)
+        else _sync_turns(
+            store,
+            turns_payload,
+            pending_payload,
+            runtime,
+            chat_id=chat_id,
+            live_worker_ids=live_worker_ids,
+            yield_barrier=yield_barrier,
+        )
     )
     routing_repaired += _repair_space_mode_routing_state(store)
     topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id)
