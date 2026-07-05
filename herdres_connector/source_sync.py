@@ -848,6 +848,9 @@ def _sync_topic_pinned(store: dict[str, Any], entry: dict[str, Any], runtime: Sy
     return True
 
 
+_RENAME_ATTEMPT_CAP = 3
+
+
 def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, Any]]) -> dict[str, str]:
     """Map each not-yet-topiced worker id -> a unique topic name (cwd basename, numbered on collision).
     Names already bound to a created topic are reserved and never renumbered, so numbers stay stable as
@@ -878,8 +881,9 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
         current = compact_ws(existing.get("topic_name"), 120)
         keep = _is_variant_of(current, state.topic_name_for_worker(worker))
         keeps[wid] = keep
-        if not keep:
-            reserved.discard(current.casefold())  # being renamed away — its old name frees up
+        # NOTE: the old name stays RESERVED even when a rename is proposed — freeing it mid-pass
+        # would let a new pane take it and collide into this topic via _ensure_topic's reuse-by-name
+        # (two live panes sharing one topic). It frees naturally on the pass AFTER the rename lands.
     assigned: dict[str, str] = {}
     renames: dict[str, str] = {}
     for worker in ordered:
@@ -891,6 +895,10 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
         has_topic = bool(existing and existing.get("topic_id"))
         if has_topic and keeps.get(wid, True):
             continue  # topic name still matches its desired base; locked
+        if has_topic and not _worker_is_open(worker):
+            continue  # never rename a closed pane's topic (and never burn budget on it)
+        if has_topic and int((existing or {}).get("rename_attempts") or 0) >= _RENAME_ATTEMPT_CAP:
+            continue  # permanently-failing rename: stop proposing (no per-pass budget burn)
         base = state.topic_name_for_worker(worker)
         name, n = base, 2
         while name.casefold() in reserved:
@@ -966,6 +974,15 @@ def _sync_sources(
             renames_issued += 1
             if renamed.get("ok"):
                 entry["topic_name"] = worker_topic_renames[wid]
+                entry.pop("rename_attempts", None)
+            elif _topic_missing(renamed.get("error")):
+                # the topic is gone (hand-deleted): drop the mapping so _ensure_topic recreates it
+                # under the new name instead of renaming a ghost forever.
+                entry.pop("topic_id", None)
+                entry["topic_name"] = worker_topic_renames[wid]
+                entry.pop("rename_attempts", None)
+            else:
+                entry["rename_attempts"] = int(entry.get("rename_attempts") or 0) + 1
         model = model_by_worker.get(wid)
         if model:
             entry["model"] = model

@@ -88,3 +88,35 @@ def test_assign_keeps_matching_names_and_numbered_variants():
     assigned, renames = source_sync._assign_worker_topic_names(
         store, [_w("/root/gitmoot", "a"), _w("/root/gitmoot", "b")])
     assert assigned == {} and renames == {}
+
+
+def test_rename_candidates_old_name_stays_reserved():
+    # While a rename is pending, a NEW pane must not take the old name (it would collide into the
+    # old topic via _ensure_topic's reuse-by-name). It gets a numbered variant instead.
+    store = {"version": 2, "spaces": {}, "panes": {
+        "worker:a": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "a",
+                     "topic_id": "1", "topic_name": "doro"},
+    }}
+    workers = [
+        {"id": "a", "name": "claude", "status": "active", "meta": {"label": "alpha"}},   # relabeled
+        {"id": "b", "name": "claude", "status": "active", "meta": {"label": "doro"}},    # new pane wants "doro"
+    ]
+    assigned, renames = source_sync._assign_worker_topic_names(store, workers)
+    assert renames == {"a": "alpha"}
+    assert assigned == {"b": "doro 2"}      # old name still reserved -> numbered, no collision
+
+
+def test_rename_skips_closed_workers_and_capped_attempts():
+    store = {"version": 2, "spaces": {}, "panes": {
+        "worker:closed": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "closed",
+                          "topic_id": "1", "topic_name": "oldname"},
+        "worker:failing": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "failing",
+                           "topic_id": "2", "topic_name": "othername",
+                           "rename_attempts": source_sync._RENAME_ATTEMPT_CAP},
+    }}
+    workers = [
+        {"id": "closed", "name": "claude", "status": "closed", "meta": {"label": "newname"}},
+        {"id": "failing", "name": "claude", "status": "active", "meta": {"label": "wanted"}},
+    ]
+    _assigned, renames = source_sync._assign_worker_topic_names(store, workers)
+    assert renames == {}                     # closed pane + capped-attempts pane both skipped
