@@ -855,28 +855,53 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
     # Reserved names are compared case-INSENSITIVELY to match _ensure_topic's reuse lookup
     # (find_legacy_topic_id_by_name uses .casefold()); otherwise "Foo"/"foo" would look distinct here
     # yet still collapse into one topic there.
-    reserved: set[str] = set()
+    def _is_variant_of(current: str, base: str) -> bool:
+        # "gitmoot" and "gitmoot 3" are both variants of base "gitmoot" — keep them (stable numbering).
+        cur, b = current.casefold(), base.casefold()
+        return cur == b or (cur.startswith(b + " ") and current[len(base) + 1 :].strip().isdigit())
+
     entries = state.source_worker_entries(store)
+    # EVERY existing topic name starts reserved (absent/closed workers' topics included — a new pane
+    # must never collide with them, or _ensure_topic's reuse-by-name would collapse into their topic).
+    reserved: set[str] = set()
     for entry in entries.values():
         if entry.get("topic_id") and entry.get("topic_name"):
             reserved.add(compact_ws(entry.get("topic_name"), 120).casefold())
+    keeps: dict[str, bool] = {}
+    ordered = sorted(workers, key=lambda w: compact_ws(w.get("id"), 160))
+    for worker in ordered:
+        wid = compact_ws(worker.get("id"), 160)
+        key = state.find_entry_key_by_worker(store, wid) if wid else None
+        existing = entries.get(key) if key is not None else None
+        if not existing or not existing.get("topic_id") or not existing.get("topic_name"):
+            continue
+        current = compact_ws(existing.get("topic_name"), 120)
+        keep = _is_variant_of(current, state.topic_name_for_worker(worker))
+        keeps[wid] = keep
+        if not keep:
+            reserved.discard(current.casefold())  # being renamed away — its old name frees up
     assigned: dict[str, str] = {}
-    for worker in sorted(workers, key=lambda w: compact_ws(w.get("id"), 160)):
+    renames: dict[str, str] = {}
+    for worker in ordered:
         wid = compact_ws(worker.get("id"), 160)
         if not wid:
             continue
         key = state.find_entry_key_by_worker(store, wid)
         existing = entries.get(key) if key is not None else None
-        if existing and existing.get("topic_id"):
-            continue  # already has a topic; its name is locked
+        has_topic = bool(existing and existing.get("topic_id"))
+        if has_topic and keeps.get(wid, True):
+            continue  # topic name still matches its desired base; locked
         base = state.topic_name_for_worker(worker)
         name, n = base, 2
         while name.casefold() in reserved:
             name = f"{base} {n}"
             n += 1
         reserved.add(name.casefold())
-        assigned[wid] = name
-    return assigned
+        if has_topic:
+            renames[wid] = name   # desired name changed (e.g. the pane label appeared) -> rename in place
+        else:
+            assigned[wid] = name
+    return assigned, renames
 
 
 def _sync_sources(
@@ -893,9 +918,23 @@ def _sync_sources(
     # amortizes creation over ticks instead of one create burst under the state lock.
     create_cap = config.source_topic_create_cap()
     creates_issued = 0
-    # One topic per pane, named by cwd basename; disambiguate same-name panes (e.g. two /root/gitmoot
-    # panes -> "gitmoot", "gitmoot 2"). Names on already-created topics are locked so numbers stay stable.
-    worker_topic_names = _assign_worker_topic_names(store, _workers(snapshot)) if topic_mode == "worker" else {}
+    # One topic per pane, named by the pane label (else cwd basename); disambiguate same-name panes
+    # ("gitmoot", "gitmoot 2"). Existing topics keep their name while it still matches the desired
+    # base; when the desired name CHANGES (a pane label appeared/changed), the topic is renamed in
+    # place (bounded per pass) so history is preserved.
+    worker_topic_names: dict[str, str] = {}
+    worker_topic_renames: dict[str, str] = {}
+    if topic_mode == "worker":
+        worker_topic_names, worker_topic_renames = _assign_worker_topic_names(store, _workers(snapshot))
+    renames_issued = 0
+    # Latest model per worker from the turn rows (recency-ordered: first non-empty wins). Stamped
+    # cache-and-keep so an idle pane keeps showing its last-known model on the pinned board.
+    model_by_worker: dict[str, str] = {}
+    for row in _turns(turns_payload):
+        row_wid = compact_ws(row.get("worker_id"), 160)
+        row_model = compact_ws(row.get("model"), 80)
+        if row_wid and row_model and row_wid not in model_by_worker:
+            model_by_worker[row_wid] = row_model
     live_worker_ids = {
         compact_ws(worker.get("id"), 160)
         for worker in _workers(snapshot)
@@ -917,6 +956,19 @@ def _sync_sources(
         wid = compact_ws(worker.get("id"), 160)
         if not entry.get("topic_id") and wid in worker_topic_names:
             entry["topic_name"] = worker_topic_names[wid]
+        elif (
+            entry.get("topic_id")
+            and wid in worker_topic_renames
+            and not runtime.dry_run
+            and renames_issued < create_cap
+        ):
+            renamed = runtime.telegram.rename_topic(chat_id, str(entry["topic_id"]), worker_topic_renames[wid])
+            renames_issued += 1
+            if renamed.get("ok"):
+                entry["topic_name"] = worker_topic_renames[wid]
+        model = model_by_worker.get(wid)
+        if model:
+            entry["model"] = model
         counts["created"] += int(created)
         counts["updated"] += int(not created and before != entry)
         if not _worker_is_open(worker):
@@ -963,6 +1015,9 @@ def _sync_sources(
             entry["active_worker_id"] = compact_ws(selected.get("id"), 160)
             entry["active_worker_fingerprint"] = compact_ws(selected.get("fingerprint"), 160)
             entry["active_worker_name"] = compact_ws(selected.get("name"), 80)
+            selected_model = model_by_worker.get(compact_ws(selected.get("id"), 160))
+            if selected_model:
+                entry["active_worker_model"] = selected_model
             entry["active_worker_status"] = _dominant_status(space_turn_status, selected_status)
         topic_needed, topic_created = _ensure_topic(
             store, space, entry, runtime, chat_id=chat_id, can_create=creates_issued < create_cap
