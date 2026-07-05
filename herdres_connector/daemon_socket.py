@@ -87,3 +87,9 @@ def snapshot(socket_path: str, *, timeout: float = 2.0) -> dict[str, Any]:
 def turns(socket_path: str, *, timeout: float = 2.0) -> dict[str, Any]:
     """Turn feed (same shape as `tendwire turns --json`)."""
     return request(socket_path, "turn.list", timeout=timeout)
+
+
+def connector(socket_path: str, action: str, params: dict[str, Any] | None = None, *, timeout: float = 2.0) -> dict[str, Any]:
+    """Neutral connector-outbox op (poll/ack/fail/defer/reclaim) — same payloads as
+    `tendwire connector <action> --json`. `action` maps to the `connector.<action>` daemon method."""
+    return request(socket_path, f"connector.{str(action).strip().lower()}", params, timeout=timeout)

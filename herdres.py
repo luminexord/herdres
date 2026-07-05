@@ -2070,6 +2070,17 @@ def tendwire_command(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def tendwire_connector_call(action: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    # Fast path: the connector outbox is drained under the global lock in source mode; spawning the
+    # CLI per poll/ack/... piles up event processes (same failure as snapshot/turns). Query the
+    # daemon socket (~50ms) with the CLI as a fail-open fallback.
+    sock = tendwire_daemon_socket_path()
+    if sock:
+        try:
+            call_params = dict(params or {})
+            call_params.setdefault("name", herdres_tendwire.connector_name())
+            return tendwire_daemon_socket.connector(sock, action, call_params, timeout=tendwire_socket_timeout())
+        except Exception:  # fail-open to the CLI
+            pass
     return _tendwire_client().connector_call(action, params)
 
 
