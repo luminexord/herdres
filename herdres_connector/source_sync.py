@@ -816,6 +816,37 @@ def _sync_topic_pinned(store: dict[str, Any], entry: dict[str, Any], runtime: Sy
     return True
 
 
+def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, Any]]) -> dict[str, str]:
+    """Map each not-yet-topiced worker id -> a unique topic name (cwd basename, numbered on collision).
+    Names already bound to a created topic are reserved and never renumbered, so numbers stay stable as
+    panes come and go. Ordered by worker id for deterministic numbering."""
+    # Reserved names are compared case-INSENSITIVELY to match _ensure_topic's reuse lookup
+    # (find_legacy_topic_id_by_name uses .casefold()); otherwise "Foo"/"foo" would look distinct here
+    # yet still collapse into one topic there.
+    reserved: set[str] = set()
+    entries = state.source_worker_entries(store)
+    for entry in entries.values():
+        if entry.get("topic_id") and entry.get("topic_name"):
+            reserved.add(compact_ws(entry.get("topic_name"), 120).casefold())
+    assigned: dict[str, str] = {}
+    for worker in sorted(workers, key=lambda w: compact_ws(w.get("id"), 160)):
+        wid = compact_ws(worker.get("id"), 160)
+        if not wid:
+            continue
+        key = state.find_entry_key_by_worker(store, wid)
+        existing = entries.get(key) if key is not None else None
+        if existing and existing.get("topic_id"):
+            continue  # already has a topic; its name is locked
+        base = state.topic_name_for_worker(worker)
+        name, n = base, 2
+        while name.casefold() in reserved:
+            name = f"{base} {n}"
+            n += 1
+        reserved.add(name.casefold())
+        assigned[wid] = name
+    return assigned
+
+
 def _sync_sources(
     store: dict[str, Any],
     snapshot: dict[str, Any],
@@ -830,6 +861,9 @@ def _sync_sources(
     # amortizes creation over ticks instead of one create burst under the state lock.
     create_cap = config.source_topic_create_cap()
     creates_issued = 0
+    # One topic per pane, named by cwd basename; disambiguate same-name panes (e.g. two /root/gitmoot
+    # panes -> "gitmoot", "gitmoot 2"). Names on already-created topics are locked so numbers stay stable.
+    worker_topic_names = _assign_worker_topic_names(store, _workers(snapshot)) if topic_mode == "worker" else {}
     live_worker_ids = {
         compact_ws(worker.get("id"), 160)
         for worker in _workers(snapshot)
@@ -846,6 +880,11 @@ def _sync_sources(
         _key, entry, created = state.upsert_worker_entry(store, worker)
         entry["status"] = _effective_worker_status(worker, turn_status_by_worker)
         _stamp_managed_voice(entry, _space_voice_mode(store, space_id))
+        # Apply the cwd-based, disambiguated name before the topic is created (once it has a topic_id
+        # the name is locked, so a later renumber can't rename an existing topic).
+        wid = compact_ws(worker.get("id"), 160)
+        if not entry.get("topic_id") and wid in worker_topic_names:
+            entry["topic_name"] = worker_topic_names[wid]
         counts["created"] += int(created)
         counts["updated"] += int(not created and before != entry)
         if not _worker_is_open(worker):
