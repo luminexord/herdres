@@ -1153,43 +1153,92 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
     return False
 
 
+def _refind_entry(store: dict[str, Any], entry_key: str | None) -> dict[str, Any] | None:
+    if not entry_key:
+        return None
+    for bucket in ("panes", "spaces"):
+        candidate = (store.get(bucket) or {}).get(entry_key)
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
 def _speak_reply(
     store: dict[str, Any],
     item: dict[str, Any],
     entry: dict[str, Any],
+    entry_key: str | None,
     runtime: SyncRuntime,
     *,
     chat_id: str,
     thread_id: str,
     reply_to: str | None,
-) -> None:
+) -> dict[str, Any]:
     """Strictly additive (issue #4): after a final text turn is delivered, optionally speak it back as
-    a Telegram voice note. Fires when the owner replied to one of this pane's voice notes
-    (one-shot speak_next_reply), the prompt contained the trigger phrase, or force-all is on. Never
-    raises — a synth/send failure just leaves the delivered text turn untouched.
+    one or more Telegram voice notes (long replies are chunked). Fires on the one-shot speak_next_reply
+    (owner replied to a voice note), the trigger phrase, or force-all. Never breaks the delivered text
+    turn. Returns the entry to keep using (re-derived when we reload off-lock).
 
-    NOTE: synthesis (~1-3s) runs UNDER the state lock in Phase 1. Moving it off-lock needs the
-    commit-before/reload-after dance (else it clobbers vs the inter-turn yield barrier) — a Phase 2
-    item. Speaking is opt-in and infrequent, so the on-lock cost is acceptable for now."""
+    Phase 2: SYNTHESIS + SEND run OFF the state lock. We commit the delivered turn first, drop the lock
+    for the ~1-3s synth (no `store` mutation in that window), then reload — so a competitor's write
+    during synth survives — and record the sent voice-note ids on the freshly-reloaded entry."""
     if runtime.dry_run:
-        return  # preview pass: don't consume the flag or synth; the real send speaks
+        return entry  # preview pass: don't consume the flag or synth; the real send speaks
     want = bool(entry.pop("speak_next_reply", None))
     if not (want or speech.speech_reply_triggered(item.get("user_text")) or speech.speech_replies_enabled()):
-        return
-    spoken = speech.trim_for_speech(item.get("assistant_final_text") or item.get("assistant_stream_text") or "")
-    if not spoken:
-        return
-    try:
-        dest = speech.outbound_speech_dir(prune=True) / f"reply-{short_hash({'t': _turn_id(item), 'h': spoken}, 16)}.ogg"
-        if not speech.speech_request("tts", {"text": spoken, "dest": str(dest)}).get("ok"):
-            return
-        api_token, _bot_kind = _delivery_bot(store, entry)
-        client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
-        sent = client.send_voice(chat_id, dest, thread_id=thread_id, reply_to_message_id=reply_to, notify=False)
-        if sent.get("ok") and sent.get("message_id"):
-            state.record_voice_reply_message_id(entry, str(sent.get("message_id")))
-    except Exception as exc:  # additive: never break the delivered text turn — but leave a breadcrumb
-        print(f"herdres speak-reply failed: {exc}", file=sys.stderr)
+        return entry
+    chunks = speech.speech_reply_chunks(item.get("assistant_final_text") or item.get("assistant_stream_text") or "")
+    if not chunks:
+        return entry
+    api_token, _bot_kind = _delivery_bot(store, entry)
+    client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
+
+    def _synth_and_send() -> list[str]:
+        # Runs OFF the lock: synth to OGG + upload. Touches no `store` state (so a competitor holding
+        # the lock meanwhile can't be clobbered); the returned ids are recorded after we re-acquire.
+        ids: list[str] = []
+        for i, chunk in enumerate(chunks):
+            try:
+                dest = speech.outbound_speech_dir(prune=(i == 0)) / f"reply-{short_hash({'t': _turn_id(item), 'i': i, 'h': chunk}, 16)}.ogg"
+                if not speech.speech_request("tts", {"text": chunk, "dest": str(dest)}).get("ok"):
+                    continue
+                sent = client.send_voice(
+                    chat_id, dest, thread_id=thread_id,
+                    reply_to_message_id=(reply_to if i == 0 else None), notify=False,
+                )
+                if sent.get("ok") and sent.get("message_id"):
+                    ids.append(str(sent.get("message_id")))
+            except Exception as exc:  # one chunk failing must not abort the rest or the text turn
+                print(f"herdres speak-reply chunk failed: {exc}", file=sys.stderr)
+        return ids
+
+    if not state.lock_held():
+        # No lock to release (tests / dry callers): synth+send inline and record on the given entry.
+        for vid in _synth_and_send():
+            state.record_voice_reply_message_id(entry, vid)
+        return entry
+
+    # Commit the delivered turn, synth+send OFF the lock, then reload and record on the fresh entry.
+    state.save_state(store)
+    with state.released_lock():
+        voice_ids = _synth_and_send()
+    fresh = state.load_state()
+    store.clear()
+    store.update(fresh)
+    target = _refind_entry(store, entry_key)
+    if target is None:
+        # A competitor pruned this entry during the off-lock synth. The notes were sent, but recording
+        # their ids on the detached pre-reload entry wouldn't persist (save_state writes `store`), so
+        # skip it — leave a breadcrumb rather than silently drop the tracking.
+        if voice_ids:
+            print(f"herdres speak-reply: entry {entry_key} gone after off-lock synth; "
+                  f"{len(voice_ids)} voice id(s) unrecorded", file=sys.stderr)
+        return entry
+    for vid in voice_ids:
+        state.record_voice_reply_message_id(target, vid)
+    if voice_ids:
+        state.save_state(store)
+    return target
 
 
 def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
@@ -1412,7 +1461,7 @@ def _sync_turns(
     seen_working_workers: set[str] = set()
     turn_count = len(turns)
     for idx, item in enumerate(turns):
-        _key, entry = _entry_for_turn(store, item)
+        entry_key, entry = _entry_for_turn(store, item)
         if entry is None:
             continue
         before = dict(entry)
@@ -1432,9 +1481,10 @@ def _sync_turns(
             if delivered:
                 # Speak seam AFTER _deliver_final so it fires for every delivery branch (raw send,
                 # promote-working-to-final, replace-changed-final), not just the raw path — the flag
-                # is consumed here exactly once per delivered final.
-                _speak_reply(
-                    store, item, entry, runtime,
+                # is consumed here exactly once per delivered final. It may reload `store` off-lock
+                # (Phase 2), so it returns the entry to keep using this iteration.
+                entry = _speak_reply(
+                    store, item, entry, entry_key, runtime,
                     chat_id=chat_id, thread_id=str(entry.get("topic_id") or ""),
                     reply_to=str(entry.get("last_clean_message_id") or "") or None,
                 )

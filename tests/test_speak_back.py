@@ -179,6 +179,90 @@ def test_speak_seam_skipped_in_dry_run(monkeypatch):
     assert entry.get("speak_next_reply") is True       # flag preserved for the real send
 
 
+# --- Phase 2: chunking + off-lock synth --------------------------------------
+
+def test_speech_reply_chunks(monkeypatch):
+    monkeypatch.delenv("HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_MAX_CHARS", raising=False)
+    text = " ".join(f"Sentence number {i} here." for i in range(50))
+    chunks = speech.speech_reply_chunks(text, max_chars=40, max_chunks=3)
+    assert len(chunks) == 3                              # capped at max_chunks
+    assert all(len(c) <= 40 for c in chunks)            # each within the size cap
+    assert speech.speech_reply_chunks("Short answer.", max_chars=600) == ["Short answer."]
+    assert speech.speech_reply_chunks("") == []
+
+
+def test_speak_seam_chunks_long_reply_into_multiple_notes(monkeypatch):
+    store, entry = _worker_store(monkeypatch, speak_next_reply=True)
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_MAX_CHARS", "30")
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
+    monkeypatch.setattr(speech, "speech_request", lambda ep, pl: {"ok": True, "path": pl.get("dest")})
+    monkeypatch.setattr(source_sync, "_deliver_final", lambda *a, **k: True)
+    long_item = {"id": "t1", "worker_id": "w1", "worker_fingerprint": "fp1", "complete": True,
+                 "assistant_final_text": "First part is done here. Second part also done. Third part finished."}
+    _run_turns(store, long_item, runtime)
+    assert len(telegram.voice_notes) >= 2                       # spoken as several voice notes
+    assert len(entry.get("voice_reply_message_ids") or []) == len(telegram.voice_notes)  # all recorded
+
+
+def test_speak_seam_offlock_synth_no_clobber(tmp_path, monkeypatch):
+    # Phase 2: synth runs OFF the state lock. A competitor writing state.json DURING synth must survive
+    # (the seam commits before releasing, reloads after) — no clobber, and the voice id still records.
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    store = _store()
+    store["panes"]["worker:w1"] = {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
+                                   "tendwire_space_id": "s1", "topic_id": "77", "speak_next_reply": True}
+    state.save_state(store)
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
+
+    def fake_tts(_ep, pl):
+        # runs inside the released (off-lock) window: a competitor grabs the freed lock and writes.
+        disk = json.loads(statepath.read_text())
+        disk["competitor_sentinel"] = "written-during-synth"
+        statepath.write_text(json.dumps(disk))
+        return {"ok": True, "path": pl.get("dest")}
+
+    monkeypatch.setattr(speech, "speech_request", fake_tts)
+    monkeypatch.setattr(source_sync, "_deliver_final", lambda *a, **k: True)
+    with state.state_lock(path=statepath):
+        source_sync._sync_turns(store, _turns_of(_final_item()), {"pending": []}, runtime, chat_id="-100")
+
+    assert store.get("competitor_sentinel") == "written-during-synth"   # competitor write survived reload
+    assert len(telegram.voice_notes) == 1
+    assert store["panes"]["worker:w1"].get("voice_reply_message_ids") == ["900"]   # recorded on fresh entry
+
+
+def test_speak_seam_offlock_entry_pruned_during_synth(tmp_path, monkeypatch):
+    # If a competitor prunes the entry during off-lock synth, the seam must not crash or resurrect it;
+    # the voice notes were sent but their ids can't persist (entry gone) — handled gracefully.
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    store = _store()
+    store["panes"]["worker:w1"] = {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
+                                   "tendwire_space_id": "s1", "topic_id": "77", "speak_next_reply": True}
+    state.save_state(store)
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
+
+    def fake_tts(_ep, pl):
+        disk = json.loads(statepath.read_text())
+        disk["panes"].pop("worker:w1", None)   # competitor prunes the entry mid-synth
+        statepath.write_text(json.dumps(disk))
+        return {"ok": True, "path": pl.get("dest")}
+
+    monkeypatch.setattr(speech, "speech_request", fake_tts)
+    monkeypatch.setattr(source_sync, "_deliver_final", lambda *a, **k: True)
+    with state.state_lock(path=statepath):
+        source_sync._sync_turns(store, _turns_of(_final_item()), {"pending": []}, runtime, chat_id="-100")
+
+    assert "worker:w1" not in store["panes"]           # competitor prune survived, not resurrected
+    assert len(telegram.voice_notes) == 1              # note was still sent, no crash
+
+
 # --- outbound-speech dir hygiene ---------------------------------------------
 
 def test_outbound_speech_dir_prunes_and_rejects_symlink(tmp_path, monkeypatch):
