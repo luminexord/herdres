@@ -10,6 +10,9 @@ receipts, backend health, and connector outbox. Herdres owns Telegram polling,
 topics, message send/edit, compact working updates, final response display, and
 Telegram delivery dedup.
 
+**Requires [Tendwire](https://github.com/plotarmordev/tendwire)** — Herdres has
+no functionality without it. See [INSTALL.md](INSTALL.md) for setup order.
+
 ## Runtime
 
 ```text
