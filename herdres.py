@@ -8297,6 +8297,26 @@ def live_card_enabled() -> bool:
     return bool(LIVE_CARD_ENABLED)
 
 
+def offlock_interpane_yield_enabled() -> bool:
+    """Whether sync_once briefly releases the global lock between panes so a queued
+    event/command can interleave instead of stalling behind the whole pane loop's
+    Telegram sends (the source-mode jam). Read at call time, not import-time, so the
+    Herdr plugin's `herdres event` (no systemd EnvironmentFile) still honours it."""
+    return parse_bool_env("HERDRES_OFFLOCK_INTERPANE_YIELD", "1")
+
+
+def source_orphan_delete_cap() -> int:
+    """Per-pass topic-delete cap during Tendwire source reclassification. Lower than the general
+    DUPLICATE_TOPIC_DELETE_LIMIT so the first source syncs (which prune many legacy per-pane topics)
+    amortize the deletes over several timer ticks instead of one long delete burst under the global
+    lock. The abandon-set/cap-consumption hardening already prevents retry-loops, so amortizing is
+    safe. Read at call time (the plugin's `herdres event` has no systemd EnvironmentFile)."""
+    try:
+        return max(0, int(os.getenv("HERDR_TELEGRAM_TOPICS_SOURCE_DELETE_LIMIT", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
 def working_badge_enabled() -> bool:
     # Read at runtime, not as a module constant: the Herdr plugin runs `herdres event` and
     # load_dotenv() executes inside the handler (the import-time flag gotcha).
@@ -13966,7 +13986,7 @@ def sync_once() -> dict[str, Any]:
         telegram,
         set(workspace_labels),
         panes,
-        delete_cap=DUPLICATE_TOPIC_DELETE_LIMIT,
+        delete_cap=(source_orphan_delete_cap() if source_read else DUPLICATE_TOPIC_DELETE_LIMIT),
         result=prune_stats,
     )
     if tier0_pruned or orphan_pruned:
@@ -14055,9 +14075,28 @@ def sync_once() -> dict[str, Any]:
     # its icon lands this sync but one cycle after its first marker — self-corrects next
     # sync.) Agent statuses don't change during the loop, so pre-loop is accurate.
     update_topic_icons_for_spaces(state, chat_id, telegram, panes, counters)
-    for pane in panes:
-        if sync_pane_once(state, chat_id, telegram, pane, counters, caps):
+    # Source mode delivers to ~20 panes; holding the global lock across every pane's Telegram
+    # sends starves queued events/commands (they wait on the lock the whole loop). Only panes that
+    # CHANGED did network sends (the slow part); after such a pane, commit its work UNDER the lock,
+    # briefly yield the lock so a waiting event/command can interleave, then reload from disk.
+    # Committing before the yield means a competitor loads-modifies-saves on top of our state, and
+    # reloading picks up their write — so committed scalars and the additive turn-delivery ledger
+    # survive on both sides. `telegram` aliases state["telegram"], so re-link it to the reloaded
+    # state (else later panes would mutate a detached copy that the final save drops). Unchanged
+    # panes did no send and mutated nothing, so we neither save nor yield after them (no window for a
+    # competitor to write, nothing to lose) — this keeps the per-pane save+reload off the common path.
+    interpane_yield = offlock_interpane_yield_enabled()
+    pane_count = len(panes)
+    for idx, pane in enumerate(panes):
+        pane_changed = sync_pane_once(state, chat_id, telegram, pane, counters, caps)
+        if pane_changed:
             changed = True
+        if interpane_yield and pane_changed and idx + 1 < pane_count:
+            save_state(state)
+            with released_lock():
+                pass
+            state = load_state()
+            telegram = state.setdefault("telegram", {})
     devin_glm_started = 0
     devin_glm_result = {"changed": False, "started": 0} if source_read else ensure_devin_glm_space_seats(state, panes)
     if devin_glm_result.get("changed"):
@@ -16799,6 +16838,51 @@ def probe_rich(thread_id: str | None = None) -> dict[str, Any]:
     return {"ok": bool(result.get("ok")), "format": result.get("format"), "message_id": message_id, "deleted": deleted}
 
 
+# Off-lock delivery (issue #63 + source-mode sync/event): the global fcntl lock is held for the whole
+# body of sync_once/event_once/command_reply, including slow Telegram network sends. released_lock()
+# drops it around just the send so queued commands/events don't stall behind network I/O.
+# The held fd + release depth are THREAD-LOCAL: fcntl.flock is per open-file-description, so the
+# gateway's embedded runner (one thread per bot token) can have two in-flight with_lock holders in one
+# process; a module global would let one thread's released_lock() unlock another thread's fd. Per-thread
+# state keeps each holder dropping only its OWN fd. (Prod runs the SUBPROCESS runner, one holder per
+# process, where this is equivalent to a module global.)
+_LOCK_STATE = threading.local()
+
+
+def _held_lock_fd() -> int | None:
+    return getattr(_LOCK_STATE, "held_fd", None)
+
+
+class _ReleasedLock:
+    """Drop the global fcntl lock (if held) for the `with` body, then re-acquire it on exit. A no-op
+    when no lock is held (called directly in tests) or when already nested inside another released
+    window (the depth guard prevents a double-unlock)."""
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+
+    def __enter__(self) -> "_ReleasedLock":
+        depth = getattr(_LOCK_STATE, "release_depth", 0)
+        held = _held_lock_fd()
+        if held is not None and depth == 0:
+            self._fd = held
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            _LOCK_STATE.release_depth = depth + 1
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        if self._fd is not None:
+            _LOCK_STATE.release_depth = getattr(_LOCK_STATE, "release_depth", 1) - 1
+            # Re-acquire BLOCKING so the caller resumes holding the lock exactly as before. A failure
+            # (the lock file vanished) propagates and aborts the turn rather than continuing unlocked.
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return False
+
+
+def released_lock() -> "_ReleasedLock":
+    return _ReleasedLock()
+
+
 def with_lock(fn, *, blocking: bool = False):
     path = lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -16808,7 +16892,14 @@ def with_lock(fn, *, blocking: bool = False):
             fcntl.flock(lock_fh.fileno(), flags)
         except BlockingIOError:
             return {"ok": True, "changed": False, "message": "another sync is running"}
-        return fn()
+        # Expose the held fd so released_lock() can drop it around slow off-lock sends. Save/restore
+        # (rather than force None) so a nested with_lock can't strand an outer holder.
+        _prev_held_fd = _held_lock_fd()
+        _LOCK_STATE.held_fd = lock_fh.fileno()
+        try:
+            return fn()
+        finally:
+            _LOCK_STATE.held_fd = _prev_held_fd
 
 
 # --- setup wizard ------------------------------------------------------------

@@ -1465,6 +1465,71 @@ class TendwireModeTests(unittest.TestCase):
         create_topic.assert_not_called()
         save_state.assert_called()
 
+    def test_sync_once_interpane_yield_relinks_telegram_across_reload(self) -> None:
+        # Regression: sync_once yields the lock between changed panes with save_state()/load_state().
+        # `telegram` aliases state["telegram"]; after the reload it must be re-linked to the fresh
+        # state, else pane 2..N mutate a detached copy that the final save silently drops. Uses a
+        # disk-backed load/save (fresh deep copies, like the real functions) so the detachment is real.
+        import copy
+
+        worker2 = {
+            "id": "worker-2",
+            "space_id": "workspace-2",
+            "name": "claude",
+            "status": "active",
+            "status_line": "Working",
+            "last_seen_at": "2026-06-28T12:00:00+00:00",
+            "fingerprint": "fp-2",
+            "meta": {"agent": "claude", "tab_id": "workspace-2:t1", "cwd": "/x", "foreground_cwd": "/x"},
+        }
+        snap = _snapshot(_snapshot()["workers"][0], worker2)
+        panes = _source_read_panes(snap)
+        self.assertEqual(len(panes), 2)
+
+        disk = {"state": {"version": 1, "enabled": True, "telegram": {"chat_id": "-100", "general_thread_id": "1"},
+                          "spaces": {}, "panes": {}}}
+        calls: list[str] = []
+
+        def fake_load_state():
+            return copy.deepcopy(disk["state"])
+
+        def fake_save_state(st, **kw):
+            disk["state"] = copy.deepcopy(st)
+
+        def fake_sync_pane_once(state, chat_id, telegram, pane, counters, caps):
+            telegram[f"seen_{herdres.pane_key(pane)}"] = True   # mutate the detachment-prone arg
+            calls.append(herdres.pane_key(pane))
+            return True                                         # changed -> triggers the yield
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {"HERDRES_TENDWIRE_MODE": "source"}, clear=True))
+            stack.enter_context(patch.object(herdres, "load_dotenv"))
+            stack.enter_context(patch.object(herdres, "load_state", side_effect=fake_load_state))
+            stack.enter_context(patch.object(herdres, "save_state", side_effect=fake_save_state))
+            stack.enter_context(patch.object(herdres, "observed_agent_panes", return_value=panes))
+            stack.enter_context(patch.object(herdres, "sync_pane_once", side_effect=fake_sync_pane_once))
+            stack.enter_context(patch.object(herdres, "tendwire_snapshot", return_value=snap))
+            stack.enter_context(patch.object(herdres, "tendwire_turns", return_value={"schema_version": 1, "turns": []}))
+            stack.enter_context(patch.object(herdres, "drain_tendwire_connector_outbox",
+                                             return_value={"changed": False, "polled": 0}))
+            stack.enter_context(patch.object(herdres, "reconcile_known_gone_spaces", return_value=0))
+            stack.enter_context(patch.object(herdres, "prune_orphan_spaces", return_value=0))
+            stack.enter_context(patch.object(herdres, "preflight_is_fresh", return_value=True))
+            stack.enter_context(patch.object(herdres, "workspace_label_map", return_value={}))
+            stack.enter_context(patch.object(herdres, "update_topic_icons_for_spaces"))
+            stack.enter_context(patch.object(herdres, "reconcile_pinned_status_views",
+                                             return_value={"changed": False, "updated": 0}))
+            stack.enter_context(patch.object(herdres, "ensure_managed_bot_setup_message", return_value=False))
+            stack.enter_context(patch.object(herdres, "ensure_managed_bot_group_access_message", return_value=False))
+            stack.enter_context(patch.object(herdres, "ensure_multibot_offer_message", return_value=False))
+            result = herdres.sync_once()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(calls), 2)                                  # both panes processed
+        tg = disk["state"]["telegram"]
+        self.assertTrue(tg.get(f"seen_{calls[0]}"))                      # pane 1 write persisted
+        self.assertTrue(tg.get(f"seen_{calls[1]}"))                      # pane 2 write survived the reload (the fix)
+
     def test_source_read_snapshot_failure_preserves_existing_source_entries(self) -> None:
         state, key = _source_state()
         proc = subprocess.CompletedProcess(["tendwire", "snapshot", "--json"], 1, stdout="", stderr="socket down")
