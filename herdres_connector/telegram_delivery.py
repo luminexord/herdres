@@ -6,8 +6,10 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from . import config, state
@@ -46,6 +48,21 @@ def _cache_fresh(value: str, ttl_seconds: int) -> bool:
 def _topic_missing(error: Any) -> bool:
     text = str(error or "").lower()
     return "topic_id_invalid" in text or "message thread not found" in text
+
+
+def _multipart_body(boundary: str, fields: dict[str, str], file_field: str, filename: str,
+                    content_type: str, content: bytes) -> bytes:
+    parts: list[bytes] = []
+    for key, value in fields.items():
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+        parts.append(f"{value}\r\n".encode())
+    parts.append(f"--{boundary}\r\n".encode())
+    parts.append(f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'.encode())
+    parts.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+    parts.append(content)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return b"".join(parts)
 
 
 @dataclass(frozen=True)
@@ -152,6 +169,60 @@ class TelegramClient:
             except TelegramError as exc:
                 last_error = str(exc)
         return {"ok": False, "error": sanitize_text(last_error, 300)}
+
+    def send_voice(
+        self,
+        chat_id: str,
+        file_path: str | Path,
+        *,
+        thread_id: str | int | None = None,
+        reply_to_message_id: str | int | None = None,
+        notify: bool = False,
+    ) -> dict[str, Any]:
+        """Upload an OGG/Opus file as a Telegram voice note (multipart). Additive to the text turn —
+        callers treat a False/error result as "text-only", never an error."""
+        if self.dry_run:
+            return {"ok": True, "message_id": "0"}
+        if not self.configured():
+            raise TelegramError("Telegram bot token is not configured")
+        path = Path(file_path)
+        try:
+            audio = path.read_bytes()
+        except OSError as exc:
+            return {"ok": False, "error": sanitize_text(str(exc), 200)}
+        if not audio:
+            return {"ok": False, "error": "empty voice file"}
+        fields: dict[str, str] = {"chat_id": str(chat_id), "disable_notification": "false" if notify else "true"}
+        if thread_id:
+            fields["message_thread_id"] = str(thread_id)
+        if reply_to_message_id:
+            fields["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
+        boundary = "----herdres" + uuid.uuid4().hex
+        body = _multipart_body(boundary, fields, "voice", path.name or "reply.ogg", "audio/ogg", audio)
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{self.token}/sendVoice",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=max(self.timeout, 60.0)) as response:
+                data = json.loads(response.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                parsed = json.loads(detail)
+            except json.JSONDecodeError:
+                parsed = {}
+            params = parsed.get("parameters") if isinstance(parsed.get("parameters"), dict) else {}
+            if exc.code == 429:
+                raise RateLimited(int(params.get("retry_after") or 1), sanitize_text(parsed.get("description") or detail, 300)) from exc
+            raise TelegramError(sanitize_text(parsed.get("description") or detail or str(exc), 300)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise TelegramError(sanitize_text(str(exc), 300)) from exc
+        if not isinstance(data, dict) or not data.get("ok"):
+            raise TelegramError(sanitize_text((data or {}).get("description") or "Telegram sendVoice error", 300))
+        result = data.get("result") or {}
+        return {"ok": True, "message_id": str(result.get("message_id") or "0")}
 
     def edit_message(self, chat_id: str, message_id: str | int, html_text: str) -> dict[str, Any]:
         base_payload = {
