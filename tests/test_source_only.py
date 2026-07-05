@@ -111,11 +111,12 @@ class FakeTelegram:
                     {"emoji": "✅", "custom_emoji_id": "icon-idle"},
                     {"emoji": "❓", "custom_emoji_id": "icon-attention"},
                     {"emoji": "‼️", "custom_emoji_id": "icon-failed"},
+                    {"emoji": "🦊", "custom_emoji_id": "icon-fox"},
                 ],
             }
         return {"ok": True, "result": {"message_id": 0}}
 
-    def create_topic(self, _chat_id, name):
+    def create_topic(self, _chat_id, name, icon_color=None):
         self.topics.append(name)
         return {"ok": True, "topic_id": str(76 + len(self.topics))}
 
@@ -1297,12 +1298,14 @@ def test_topic_icon_cache_is_fetched_and_working_icon_updates(monkeypatch):
         ),
     )
 
+    # Routine working status no longer flips a status icon; the topic gets its
+    # stable identity icon once (the only non-reserved emoji in the fake set).
     assert result["icon_updated"] == 1
-    assert telegram.icon_edits == [("-100", "77", "icon-working")]
+    assert telegram.icon_edits == [("-100", "77", "icon-fox")]
     assert store["telegram"]["forum_topic_icons"]["by_emoji"]["⚡️"] == "icon-working"
     entry = next(iter(state.source_space_entries(store).values()))
-    assert entry["last_topic_icon"] == "⚡️"
-    assert entry["last_topic_icon_id"] == "icon-working"
+    assert entry["last_topic_icon"] == "🦊"
+    assert entry["last_topic_icon_id"] == "icon-fox"
 
 
 def test_topic_icon_reapplies_when_local_emoji_state_lacks_icon_id(monkeypatch):
@@ -1322,10 +1325,10 @@ def test_topic_icon_reapplies_when_local_emoji_state_lacks_icon_id(monkeypatch):
     result = sync_once(store, SyncRuntime(FakeTendwire(turns={"turns": []}), telegram, with_outbox=False))
 
     assert result["icon_updated"] == 1
-    assert telegram.icon_edits == [("-100", "77", "icon-working")]
+    assert telegram.icon_edits == [("-100", "77", "icon-fox")]
     entry = next(iter(state.source_space_entries(store).values()))
-    assert entry["last_topic_icon"] == "⚡️"
-    assert entry["last_topic_icon_id"] == "icon-working"
+    assert entry["last_topic_icon"] == "🦊"
+    assert entry["last_topic_icon_id"] == "icon-fox"
 
 
 def test_topic_icon_not_modified_repairs_local_icon_state(monkeypatch):
@@ -1343,8 +1346,8 @@ def test_topic_icon_not_modified_repairs_local_icon_state(monkeypatch):
 
     assert result["icon_updated"] == 1
     entry = next(iter(state.source_space_entries(store).values()))
-    assert entry["last_topic_icon"] == "⚡️"
-    assert entry["last_topic_icon_id"] == "icon-working"
+    assert entry["last_topic_icon"] == "🦊"
+    assert entry["last_topic_icon_id"] == "icon-fox"
     assert "last_topic_icon_error" not in entry
 
 
@@ -1382,8 +1385,8 @@ def test_active_source_status_with_completed_turn_uses_idle_topic_icon(monkeypat
     assert result["icon_updated"] == 1
     assert entry["status"] == "idle"
     assert entry["active_worker_status"] == "idle"
-    assert entry["last_topic_icon"] == "✅"
-    assert telegram.icon_edits == [("-100", "77", "icon-idle")]
+    assert entry["last_topic_icon"] == "🦊"
+    assert telegram.icon_edits == [("-100", "77", "icon-fox")]
 
 
 def test_open_turn_from_retired_worker_id_does_not_pin_topic_icon(monkeypatch):
@@ -1423,8 +1426,8 @@ def test_open_turn_from_retired_worker_id_does_not_pin_topic_icon(monkeypatch):
     assert result["icon_updated"] == 1
     assert entry["status"] == "idle"
     assert entry["active_worker_status"] == "idle"
-    assert entry["last_topic_icon"] == "✅"
-    assert telegram.icon_edits == [("-100", "77", "icon-idle")]
+    assert entry["last_topic_icon"] == "🦊"
+    assert telegram.icon_edits == [("-100", "77", "icon-fox")]
 
 
 def test_public_raw_status_working_overrides_done_source_status(monkeypatch):
@@ -1453,7 +1456,7 @@ def test_public_raw_status_working_overrides_done_source_status(monkeypatch):
     assert result["feed_sent"] == 0
     assert entry["status"] == "working"
     assert entry["active_worker_status"] == "working"
-    assert entry["last_topic_icon"] == "⚡️"
+    assert entry["last_topic_icon"] == "🦊"
 
 
 def test_empty_current_turn_for_working_worker_sends_compact_working_update(monkeypatch):
@@ -2397,3 +2400,43 @@ def test_closed_worker_turns_are_not_delivered(monkeypatch):
     sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
 
     assert all("Work is in progress" not in html for _chat, html, _kw, _mid in telegram.sent)
+
+
+def test_attention_status_flips_alert_icon_and_recovery_restores_identity(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+
+    def tendwire_with_status(status):
+        return FakeTendwire(
+            turns={"turns": []},
+            workers=[{"id": "worker-1", "name": "Alpha", "status": status, "space_id": "space-1", "fingerprint": "fp-1"}],
+        )
+
+    # First sync: identity icon assigned once.
+    sync_once(store, SyncRuntime(tendwire_with_status("working"), telegram, with_outbox=False))
+    assert telegram.icon_edits == [("-100", "77", "icon-fox")]
+
+    # Routine flips never touch the icon again.
+    sync_once(store, SyncRuntime(tendwire_with_status("idle"), telegram, with_outbox=False))
+    sync_once(store, SyncRuntime(tendwire_with_status("working"), telegram, with_outbox=False))
+    assert telegram.icon_edits == [("-100", "77", "icon-fox")]
+
+    # Attention flips to the alert icon.
+    sync_once(store, SyncRuntime(tendwire_with_status("attention"), telegram, with_outbox=False))
+    assert telegram.icon_edits[-1] == ("-100", "77", "icon-attention")
+
+    # Recovery restores the identity icon.
+    sync_once(store, SyncRuntime(tendwire_with_status("idle"), telegram, with_outbox=False))
+    assert telegram.icon_edits[-1] == ("-100", "77", "icon-fox")
+    entry = next(iter(state.source_space_entries(store).values()))
+    assert entry["last_topic_icon"] == "🦊"
+
+
+def test_new_topics_are_created_with_deterministic_color(monkeypatch):
+    from herdres_connector.source_sync import topic_color_for_name
+    from herdres_connector.telegram_delivery import TOPIC_ICON_COLORS
+
+    color = topic_color_for_name("demoapp")
+    assert color in TOPIC_ICON_COLORS
+    assert topic_color_for_name("demoapp") == color  # deterministic

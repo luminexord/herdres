@@ -87,7 +87,7 @@ class FakeTelegram:
     def pin_message(self, _chat_id, _message_id):
         return {"ok": True}
 
-    def create_topic(self, _chat_id, _name):
+    def create_topic(self, _chat_id, _name, icon_color=None):
         return {"ok": True, "topic_id": "77"}
 
     def edit_topic_icon(self, chat_id, thread_id, emoji_id):

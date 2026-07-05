@@ -10,7 +10,7 @@ from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bo
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import edit_feed_item, feed_item_requires_send_split, render_feed_item_html, send_feed_item, split_legacy_message_ids, turn_item_from_source
 from .safe import compact_ws, short_hash
-from .telegram_delivery import MESSAGE_TEXT_LIMIT, TelegramClient, drain_outbox, topic_icon_id
+from .telegram_delivery import MESSAGE_TEXT_LIMIT, TOPIC_ICON_COLORS, TelegramClient, drain_outbox, topic_icon_catalog, topic_icon_id
 from .tendwire_client import TendwireClient
 
 RENDER_VERSION = "telegram-rich-v26-clean"
@@ -678,7 +678,8 @@ def _ensure_topic(
         return False, False
     if runtime.dry_run:
         return True, False
-    created = runtime.telegram.create_topic(chat_id, entry.get("topic_name") or state.topic_name_for_space(source))
+    topic_name = entry.get("topic_name") or state.topic_name_for_space(source)
+    created = runtime.telegram.create_topic(chat_id, topic_name, icon_color=topic_color_for_name(topic_name))
     if created.get("ok") and created.get("topic_id"):
         entry["topic_id"] = str(created["topic_id"])
         return True, True
@@ -686,14 +687,45 @@ def _ensure_topic(
     return False, False
 
 
+_ALERT_STATUSES = frozenset({"attention", "failed"})
+_RESERVED_STATUS_EMOJIS = frozenset({"\u2753", "\u203c\ufe0f", "\u2705", "\u26a1\ufe0f", "\u2615\ufe0f"})
+
+
+def _identity_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime) -> tuple[str, str]:
+    """Deterministic per-topic identity icon from the allowed forum icon set."""
+    catalog = topic_icon_catalog(store, runtime.telegram)
+    choices = sorted(emoji for emoji in catalog if emoji not in _RESERVED_STATUS_EMOJIS)
+    if not choices:
+        return "", ""
+    key = compact_ws(entry.get("topic_name") or entry.get("topic_id"), 80)
+    emoji = choices[int(short_hash({"topic_icon": key}, 8), 16) % len(choices)]
+    return emoji, catalog.get(emoji, "")
+
+
+def topic_color_for_name(name: str) -> int:
+    return TOPIC_ICON_COLORS[int(short_hash({"topic_color": compact_ws(name, 80)}, 8), 16) % len(TOPIC_ICON_COLORS)]
+
+
 def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
+    """Alert-only status icons: flip to attention/failed markers, restore the
+    topic's stable identity icon on recovery, and never churn icons (which post
+    unread-generating service messages) for routine working/idle transitions."""
     if not config.topic_status_icons_enabled():
         return False
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
         return False
-    emoji = status_emoji(entry.get("status") or entry.get("tendwire_status_line"))
-    emoji_id = topic_icon_id(store, emoji, runtime.telegram)
+    status = normalized_status(entry.get("status") or entry.get("tendwire_status_line"))
+    current = str(entry.get("last_topic_icon") or "")
+    if status in _ALERT_STATUSES:
+        emoji = status_emoji(status)
+        emoji_id = topic_icon_id(store, emoji, runtime.telegram)
+    else:
+        if current and current not in _RESERVED_STATUS_EMOJIS and entry.get("last_topic_icon_id"):
+            return False
+        emoji, emoji_id = _identity_topic_icon(store, entry, runtime)
+        if not emoji:
+            return False
     if not emoji_id:
         entry["last_topic_icon_missing"] = emoji
         return False

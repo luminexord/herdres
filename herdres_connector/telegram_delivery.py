@@ -181,8 +181,10 @@ class TelegramClient:
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
-    def create_topic(self, chat_id: str, name: str) -> dict[str, Any]:
+    def create_topic(self, chat_id: str, name: str, icon_color: int | None = None) -> dict[str, Any]:
         payload = {"chat_id": chat_id, "name": sanitize_text(name, 128)}
+        if icon_color:
+            payload["icon_color"] = str(int(icon_color))
         try:
             result = self.api("createForumTopic", payload).get("result") or {}
             return {"ok": True, "topic_id": str(result.get("message_thread_id") or "")}
@@ -211,6 +213,24 @@ class TelegramClient:
             return {"ok": True}
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
+
+# Telegram's fixed allowed createForumTopic colors.
+TOPIC_ICON_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
+
+
+def topic_icon_catalog(store: dict[str, Any], telegram_client: TelegramClient | None = None) -> dict[str, str]:
+    """Return the emoji -> custom_emoji_id map of the forum topic icon set."""
+    telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
+    icons = telegram.get("forum_topic_icons") if isinstance(telegram, dict) else {}
+    by_emoji = icons.get("by_emoji") if isinstance(icons, dict) and isinstance(icons.get("by_emoji"), dict) else {}
+    if not by_emoji:
+        # Populate the cache through the existing fetch path.
+        topic_icon_id(store, "\u2705", telegram_client)
+        telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
+        icons = telegram.get("forum_topic_icons") if isinstance(telegram, dict) else {}
+        by_emoji = icons.get("by_emoji") if isinstance(icons, dict) and isinstance(icons.get("by_emoji"), dict) else {}
+    return {str(k): str(v) for k, v in by_emoji.items() if v}
 
 
 def topic_icon_id(store: dict[str, Any], emoji: str, telegram_client: TelegramClient | None = None) -> str:
