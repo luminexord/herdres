@@ -159,39 +159,65 @@ def _max_decode_seconds() -> int:
         return 600
 
 
+def _stt_normalize_filter() -> str:
+    """ffmpeg audio filter applied before STT. Telegram voice notes are often recorded very quietly
+    (mean loudness well below -40 dB), which parakeet transcribes to nothing; loudnorm brings the
+    signal up to a consistent level. Set HERDR_TELEGRAM_TOPICS_SPEECH_NORMALIZE=0 to disable."""
+    raw = str(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_NORMALIZE", "1") or "1").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return ""
+    return str(
+        os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_NORMALIZE_FILTER", "loudnorm=I=-16:TP=-1.5:LRA=11") or ""
+    ).strip()
+
+
 def _decode_to_pcm(path: Path) -> bytes | None:
     ffmpeg = _ffmpeg()
     if not ffmpeg:
         return None
+    norm = _stt_normalize_filter()
+
+    def _cmd(with_filter: bool) -> list[str]:
+        cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path),
+               "-ar", str(STT_SAMPLE_RATE), "-ac", "1", "-t", str(_max_decode_seconds())]
+        if with_filter and norm:
+            cmd += ["-af", norm]
+        cmd += ["-f", "f32le", "-"]
+        return cmd
+
     try:
-        proc = subprocess.run(
-            [
-                ffmpeg,
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(path),
-                "-ar",
-                str(STT_SAMPLE_RATE),
-                "-ac",
-                "1",
-                "-t",
-                str(_max_decode_seconds()),
-                "-f",
-                "f32le",
-                "-",
-            ],
-            capture_output=True,
-            timeout=45,
-            check=False,
-        )
+        proc = subprocess.run(_cmd(True), capture_output=True, timeout=45, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0 or not proc.stdout:
-        return None
+        # loudnorm can fail on odd/short inputs; retry once without the filter before giving up.
+        if not norm:
+            return None
+        try:
+            proc = subprocess.run(_cmd(False), capture_output=True, timeout=45, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0 or not proc.stdout:
+            return None
     return proc.stdout
+
+
+def _stt_chunk_samples() -> int:
+    """Window length (in samples) for long-audio chunking. parakeet-tdt returns an EMPTY result once a
+    single decode pass exceeds ~15s, so anything longer must be windowed. Default 14s; override with
+    HERDR_TELEGRAM_TOPICS_SPEECH_CHUNK_SECONDS."""
+    try:
+        secs = max(1, int(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_CHUNK_SECONDS", "14") or "14"))
+    except ValueError:
+        secs = 14
+    return secs * STT_SAMPLE_RATE
+
+
+def _decode_samples(recognizer, samples) -> str:
+    stream = recognizer.create_stream()
+    stream.accept_waveform(STT_SAMPLE_RATE, samples)
+    recognizer.decode_stream(stream)
+    return str(getattr(stream.result, "text", "") or "").strip()
 
 
 def transcribe(path: str | Path) -> str:
@@ -209,10 +235,23 @@ def transcribe(path: str | Path) -> str:
         except Exception:
             samples = array.array("f")
             samples.frombytes(pcm)
-        stream = recognizer.create_stream()
-        stream.accept_waveform(STT_SAMPLE_RATE, samples)
-        recognizer.decode_stream(stream)
-        return str(getattr(stream.result, "text", "") or "").strip()
+        n = len(samples)
+        chunk = _stt_chunk_samples()
+        # Short clip: single pass (parakeet handles it, and one pass avoids boundary artifacts).
+        if n <= chunk:
+            return _decode_samples(recognizer, samples)
+        # Long clip: window it. A ~1s overlap keeps a word from being clipped exactly on a boundary;
+        # a duplicated boundary word is far less bad than a silently-empty transcript.
+        overlap = STT_SAMPLE_RATE
+        step = max(1, chunk - overlap)
+        parts: list[str] = []
+        i = 0
+        while i < n:
+            piece = _decode_samples(recognizer, samples[i:i + chunk])
+            if piece:
+                parts.append(piece)
+            i += step
+        return " ".join(parts).strip()
     except Exception:
         return ""
 
