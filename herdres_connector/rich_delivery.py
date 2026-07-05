@@ -360,7 +360,19 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     worklog_label = str(item.get("worklog_label") or WORKING_LABEL).strip() or WORKING_LABEL
     assistant_final = str(item.get("assistant_final_text") or "").strip()
     parts: list[str] = []
-    response_html = render_assistant_response_html(assistant_final, label=str(item.get("response_label") or RESPONSE_LABEL))
+    if assistant_final and item.get("collapse_response"):
+        # Superseded final: the Response folds into a closed <details> with a one-line preview, so
+        # older answers read as a compact history while staying expandable in place.
+        body_html = render_final_reply_html(assistant_final, seen_heading=True) or _rich_paragraph(assistant_final)
+        response_html = _rich_details_quote_html(
+            str(item.get("response_label") or RESPONSE_LABEL),
+            body_html,
+            icon=RESPONSE_ICON,
+            open_by_default=False,
+            preview=_prompt_preview(assistant_final),
+        )
+    else:
+        response_html = render_assistant_response_html(assistant_final, label=str(item.get("response_label") or RESPONSE_LABEL))
     if response_html:
         parts.append(response_html)
     if user_text:

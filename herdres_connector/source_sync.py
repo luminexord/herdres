@@ -663,6 +663,59 @@ def _suppress_historical_final(store: dict[str, Any], item: dict[str, Any], cont
     )
 
 
+
+_FOLD_ATTEMPT_CAP = 3
+
+
+def _fold_superseded_final(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+) -> bool:
+    """Collapse the Response of a SUPERSEDED final (opt-in via
+    HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS): re-render the previously delivered message with
+    collapse_response=True so only the newest answer stays expanded. Runs in the historical-final
+    branch of _sync_turns, which sees every non-latest completed final WITH its content each sync (the
+    store retains a short per-worker turn history) — a self-healing sweep, no extra text persisted.
+    Idempotent via binding["folded"]; bounded by _FOLD_ATTEMPT_CAP; single-message finals only (a
+    split final has no single message to re-render). Never touches the latest delivery."""
+    if runtime.dry_run or not config.response_collapse_previous_default():
+        return False
+    if not str(item.get("assistant_final_text") or "").strip():
+        return False
+    bindings = _final_delivery_bindings(store, _turn_id(item))
+    if len(bindings) != 1:
+        return False
+    message_id, binding = bindings[0]
+    if not message_id or binding.get("folded") or int(binding.get("fold_attempts") or 0) >= _FOLD_ATTEMPT_CAP:
+        return False
+    if str(message_id) == str(entry.get("last_clean_message_id") or ""):
+        return False  # belt-and-braces: never fold the latest delivered message
+    telegram = _telegram_state(store)
+    api_token, bot_kind = _delivery_bot(store, entry)
+    stored_bot_kind = str(binding.get("bot_kind") or entry.get("last_clean_bot_kind") or MANAGER_BOT_KIND)
+    if stored_bot_kind != bot_kind:
+        return False  # can only edit a message from the bot that sent it
+    folded_item = dict(turn_item_from_source(item, entry))
+    folded_item["collapse_response"] = True
+    sent = edit_feed_item(
+        runtime.telegram,
+        chat_id,
+        message_id,
+        folded_item,
+        telegram=telegram,
+        api_token=api_token,
+    )
+    error = str(sent.get("error") or "").lower()
+    if sent.get("ok") or "not found" in error or _topic_missing(sent.get("error")):
+        binding["folded"] = True  # done (or the message/topic is gone — nothing left to fold)
+        return True
+    binding["fold_attempts"] = int(binding.get("fold_attempts") or 0) + 1
+    return True
+
 def _ensure_topic(
     store: dict[str, Any],
     source: dict[str, Any],
@@ -1544,6 +1597,7 @@ def _sync_turns(
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 delivered = False
                 counts["updated"] += int(_suppress_historical_final(store, item, _turn_content_hash(item, "final")))
+                counts["updated"] += int(_fold_superseded_final(store, item, entry, runtime, chat_id=chat_id))
                 continue
             if worker_key in seen_final_workers:
                 continue
