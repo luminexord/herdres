@@ -174,6 +174,39 @@ class TendwireSnapshotFastPathTests(unittest.TestCase):
         self.assertEqual(out, {"turns": ["cli"]})
         cli.assert_called_once()
 
+    def test_connector_maps_action_to_method(self):
+        srv = _OneShotServer(json.dumps({"ok": True, "result": {"items": []}}).encode() + b"\n")
+        self.addCleanup(srv.close)
+        out = daemon_socket.connector(srv.path, "Poll", {"name": "attention"}, timeout=3)
+        self.assertEqual(out, {"items": []})
+        self.assertEqual(srv.request.get("method"), "connector.poll")  # normalized + prefixed
+        self.assertEqual(srv.request.get("params"), {"name": "attention"})
+
+    def test_connector_call_prefers_socket_and_defaults_name(self):
+        sock = Mock(return_value={"items": [], "status": "ok"})
+        with patch.object(herdres, "tendwire_daemon_socket_path", return_value="/s.sock"), \
+                patch.object(herdres.tendwire_daemon_socket, "connector", sock), \
+                patch.object(herdres.herdres_tendwire, "connector_name", return_value="attention"), \
+                patch.object(herdres, "_tendwire_client") as cli:
+            out = herdres.tendwire_connector_call("poll", {"limit": 2})
+        self.assertEqual(out["status"], "ok")
+        # name defaulted into params; CLI never touched
+        self.assertEqual(sock.call_args.args[1], "poll")
+        self.assertEqual(sock.call_args.args[2].get("name"), "attention")
+        cli.assert_not_called()
+
+    def test_connector_call_falls_back_to_cli(self):
+        client = Mock()
+        client.connector_call.return_value = {"items": ["cli"], "status": "ok"}
+        with patch.object(herdres, "tendwire_daemon_socket_path", return_value="/s.sock"), \
+                patch.object(herdres.tendwire_daemon_socket, "connector",
+                             side_effect=daemon_socket.DaemonUnavailable("down")), \
+                patch.object(herdres.herdres_tendwire, "connector_name", return_value="attention"), \
+                patch.object(herdres, "_tendwire_client", return_value=client):
+            out = herdres.tendwire_connector_call("poll", {"limit": 2})
+        self.assertEqual(out, {"items": ["cli"], "status": "ok"})
+        client.connector_call.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

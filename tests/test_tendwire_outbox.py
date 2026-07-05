@@ -52,6 +52,11 @@ def _state() -> dict:
 
 
 class TendwireOutboxTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests exercise the connector CLI path (mock run_cmd); disable the daemon-socket fast
+        # path so they stay deterministic regardless of a live tendwired.sock on the host.
+        self.enterContext(patch.object(herdres, "tendwire_daemon_socket_path", return_value=""))
+
     def test_tendwire_outbox_helpers_normalize_payload_and_identity(self) -> None:
         item = _item()
         payload = herdres_tendwire.outbox_item_payload(item)
