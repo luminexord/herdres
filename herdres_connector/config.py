@@ -122,6 +122,18 @@ def source_orphan_delete_cap(env: Any | None = None) -> int:
         return 3
 
 
+def source_topic_create_cap(env: Any | None = None) -> int:
+    """Per-pass topic-create cap for _sync_sources. Bounds the first source syncs (which create a topic
+    per open worker/space at once) so the creates amortize over several ticks instead of one create
+    burst under the state lock. Read at call time. Raise HERDR_TELEGRAM_TOPICS_MAX_CREATES to backfill
+    many topics in one pass; 0 pauses topic creation until it is raised."""
+    source = os.environ if env is None else env
+    try:
+        return max(0, int(str(source.get("HERDR_TELEGRAM_TOPICS_MAX_CREATES", "3") or "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
 def managed_bots_enabled(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "0") or "").strip().lower()
