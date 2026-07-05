@@ -139,6 +139,31 @@ def source_entries(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return source_worker_entries(data) if config.source_topic_mode() == "worker" else source_space_entries(data)
 
 
+VOICE_REPLY_ID_HISTORY = 30
+
+
+def record_voice_reply_message_id(entry: dict[str, Any], message_id: str | int) -> None:
+    """Remember the message-ids of the voice notes we send for an entry (bounded ring) so a Telegram
+    reply TO one of them can be recognized and auto-enable 'speak the next reply'."""
+    mid = str(message_id or "").strip()
+    if not mid or not isinstance(entry, dict):
+        return
+    ids = [str(x) for x in entry.get("voice_reply_message_ids")] if isinstance(entry.get("voice_reply_message_ids"), list) else []
+    if mid in ids:
+        ids.remove(mid)
+    ids.append(mid)
+    entry["voice_reply_message_ids"] = ids[-VOICE_REPLY_ID_HISTORY:]
+
+
+def message_is_voice_reply(entry: dict[str, Any], reply_to_message_id: str | int | None) -> bool:
+    """True when reply_to_message_id points at one of this entry's own voice notes."""
+    rt = str(reply_to_message_id or "").strip()
+    if not rt or not isinstance(entry, dict):
+        return False
+    ids = entry.get("voice_reply_message_ids")
+    return isinstance(ids, list) and rt in {str(x) for x in ids}
+
+
 def find_entry_key_by_worker(data: dict[str, Any], worker_id: str) -> str | None:
     for key, entry in source_worker_entries(data).items():
         if str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "") == worker_id:

@@ -11,8 +11,10 @@ from __future__ import annotations
 import array
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -49,6 +51,25 @@ STT_MODELS: dict[str, dict[str, Any]] = {
 
 _STT_RECOGNIZER: object | None = None
 _STT_LOAD_FAILED = False
+
+# --- outbound TTS (issue #4: speak the agent's reply back as a Telegram voice note) ---
+DEFAULT_TTS_MODEL = "kokoro-en-v0_19"
+TTS_MODELS: dict[str, dict[str, Any]] = {
+    "kokoro-en-v0_19": {
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2",
+        "sha256": "",  # not published for tts-models; the pinned URL is the trust anchor
+        "archive_subdir": "kokoro-en-v0_19",
+        "engine": "kokoro",
+        "sample_rate": 24000,
+        "present": ["model.onnx", "voices.bin", "tokens.txt", "espeak-ng-data"],
+    },
+}
+_TTS_ENGINE: object | None = None
+_TTS_LOAD_FAILED = False
+
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+_URL_RE = re.compile(r"https?://\S+")
 
 
 def _flag(name: str, default: str = "0") -> bool:
@@ -107,6 +128,197 @@ def sherpa_available() -> bool:
         return False
 
 
+def _tts_model_spec() -> dict[str, Any] | None:
+    model = os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_TTS_MODEL", DEFAULT_TTS_MODEL).strip() or DEFAULT_TTS_MODEL
+    spec = TTS_MODELS.get(model)
+    return spec if isinstance(spec, dict) else None
+
+
+def tts_model_dir() -> Path:
+    model = os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_TTS_MODEL", DEFAULT_TTS_MODEL).strip() or DEFAULT_TTS_MODEL
+    return speech_models_dir() / model
+
+
+def tts_model_present() -> bool:
+    spec = _tts_model_spec()
+    if not spec:
+        return False
+    d = tts_model_dir()
+    return all((d / str(name)).exists() for name in spec.get("present") or ())
+
+
+def _tts_sample_rate() -> int:
+    return int((_tts_model_spec() or {}).get("sample_rate") or 24000)
+
+
+def _tts_sid() -> int:
+    try:
+        return max(0, int(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_TTS_SID", "0") or "0"))
+    except ValueError:
+        return 0
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _prune_speech_dir(base: Path, *, keep: int = 64, part_stale_seconds: int = 600) -> None:
+    """Bound the outbound-speech dir: keep the newest `keep` finished .ogg files and sweep only STALE
+    .part files, so synthesized replies don't accumulate unbounded in the long-lived process."""
+    try:
+        entries = [p for p in base.iterdir() if p.is_file() and not p.is_symlink()]
+    except OSError:
+        return
+    now = time.time()
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for part in (p for p in entries if p.name.endswith(".part")):
+        if now - _mtime(part) > part_stale_seconds:
+            _unlink_quietly(part)
+    finals = [p for p in entries if p.name.endswith(".ogg")]
+    for stale in sorted(finals, key=_mtime, reverse=True)[keep:]:
+        _unlink_quietly(stale)
+
+
+def outbound_speech_dir(*, prune: bool = False) -> Path:
+    base = config.state_path().parent / "outbound-speech"
+    if base.is_symlink():
+        raise RuntimeError("outbound speech directory path is unsafe (symlink)")
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.chmod(0o700)
+    except OSError:
+        pass
+    if prune:
+        _prune_speech_dir(base)
+    return base
+
+
+def speech_replies_enabled() -> bool:
+    """Force EVERY reply to be spoken back (issue #4). Default off; the per-turn triggers below
+    (reply-to-voice auto-mode, the trigger phrase) are the normal opt-in."""
+    return _flag("HERDR_TELEGRAM_TOPICS_SPEECH_REPLIES", "0")
+
+
+def speech_reply_on_voice_reply_enabled() -> bool:
+    """When the owner replies to one of the agent's voice notes, speak the next reply back too."""
+    return _flag("HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_ON_VOICE_REPLY", "1")
+
+
+def speech_reply_trigger() -> str:
+    return os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_TRIGGER", "reply by voice").strip()
+
+
+def speech_reply_triggered(user_text: str | None) -> bool:
+    """True when the owner's prompt contains the trigger phrase, so just THIS reply is spoken."""
+    trig = speech_reply_trigger().lower()
+    return bool(trig) and trig in str(user_text or "").lower()
+
+
+def speech_reply_max_chars() -> int:
+    try:
+        return max(1, int(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_MAX_CHARS", "600") or "600"))
+    except ValueError:
+        return 600
+
+
+def trim_for_speech(text: str, *, max_chars: int | None = None) -> str:
+    """Strip code blocks / inline code / URLs / markdown from an agent reply and cap it to a speakable
+    length on a sentence boundary, so TTS reads a short answer rather than code aloud."""
+    if max_chars is None:
+        max_chars = speech_reply_max_chars()
+    s = _CODE_FENCE_RE.sub(" (code omitted) ", str(text or ""))
+    s = _INLINE_CODE_RE.sub(lambda m: m.group(0).strip("`"), s)
+    s = _URL_RE.sub("a link", s)
+    s = re.sub(r"[*_#>`]+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) <= max_chars:
+        return s
+    cut = s[:max_chars]
+    boundary = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    return (cut[: boundary + 1] if boundary > max_chars // 2 else cut).strip()
+
+
+def _load_tts():
+    """Return the warm Kokoro TTS engine, or None if anything is unavailable. Same re-attempt policy
+    as _load_stt: cheap retries until a PRESENT-but-unloadable model is cached as failed."""
+    global _TTS_ENGINE, _TTS_LOAD_FAILED
+    if _TTS_ENGINE is not None:
+        return _TTS_ENGINE
+    if _TTS_LOAD_FAILED:
+        return None
+    try:
+        import sherpa_onnx  # type: ignore
+    except Exception:
+        return None
+    d = tts_model_dir()
+    model, voices, tokens, data = (d / "model.onnx", d / "voices.bin", d / "tokens.txt", d / "espeak-ng-data")
+    if not (model.is_file() and voices.is_file() and tokens.is_file() and data.is_dir()):
+        return None  # not installed yet — re-check next call
+    try:
+        threads = max(1, int(os.getenv("HERDR_TELEGRAM_TOPICS_SPEECH_THREADS", "2") or "2"))
+        cfg = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
+                    model=str(model), voices=str(voices), tokens=str(tokens), data_dir=str(data)),
+                num_threads=threads, provider="cpu",
+            ),
+        )
+        _TTS_ENGINE = sherpa_onnx.OfflineTts(cfg)
+    except Exception as exc:
+        _TTS_LOAD_FAILED = True  # present-but-unloadable; log so the warm process isn't silent
+        print(f"herdres speech: TTS model present but failed to load: {exc}", file=sys.stderr)
+    return _TTS_ENGINE
+
+
+def _encode_pcm_to_ogg(pcm: bytes, sample_rate: int, dest: Path) -> bool:
+    """Encode raw float32-LE mono PCM to an OGG/Opus file (what Telegram sendVoice wants) via ffmpeg."""
+    ff = _ffmpeg()
+    if not ff:
+        return False
+    try:
+        proc = subprocess.run(
+            [ff, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "f32le", "-ar", str(sample_rate), "-ac", "1", "-i", "pipe:0",
+             "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", str(dest)],
+            input=pcm, capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and dest.is_file() and dest.stat().st_size > 0
+
+
+def synthesize(text: str, dest: str | Path) -> bool:
+    """Synthesize `text` to an OGG/Opus voice file at `dest`. Returns False on ANY failure (engine/
+    model/ffmpeg absent or error) — the caller just skips the spoken reply; the text turn is untouched."""
+    spoken = (text or "").strip()
+    if not spoken:
+        return False
+    engine = _load_tts()
+    if engine is None:
+        return False
+    try:
+        audio = engine.generate(spoken, sid=_tts_sid(), speed=1.0)
+        try:
+            import numpy as np  # type: ignore
+
+            pcm = np.asarray(audio.samples, dtype=np.float32).tobytes()
+        except Exception:
+            pcm = array.array("f", list(audio.samples)).tobytes()
+        sr = int(getattr(audio, "sample_rate", 0) or _tts_sample_rate())
+        return _encode_pcm_to_ogg(pcm, sr, Path(dest))
+    except Exception:
+        return False
+
+
 def check() -> dict[str, Any]:
     return {
         "sherpa_onnx": sherpa_available(),
@@ -114,6 +326,8 @@ def check() -> dict[str, Any]:
         "stt_model": stt_model_present(),
         "stt_model_dir": str(stt_model_dir()),
         "input_enabled": speech_input_enabled(),
+        "tts_model": tts_model_present(),
+        "tts_model_dir": str(tts_model_dir()),
     }
 
 
@@ -259,6 +473,13 @@ def transcribe(path: str | Path) -> str:
 def speech_request(endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
     if endpoint == "stt":
         return {"text": transcribe(payload.get("path", ""))}
+    if endpoint == "tts":
+        # No speech sidecar in the source-only RC: synthesize in-process (Kokoro, ~1-3s). In Phase 1
+        # this runs under the caller's state lock (source_sync._speak_reply); moving it off-lock is a
+        # Phase 2 item (needs commit-before/reload-after vs the inter-turn yield barrier).
+        dest = str(payload.get("dest") or "")
+        ok = bool(dest) and synthesize(payload.get("text", ""), dest)
+        return {"ok": ok, "path": dest if ok else ""}
     return {}
 
 

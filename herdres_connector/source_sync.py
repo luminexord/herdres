@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import Any
 
-from . import config, state
+from . import config, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import edit_feed_item, feed_item_requires_send_split, render_feed_item_html, send_feed_item, split_legacy_message_ids, turn_item_from_source
@@ -1152,6 +1153,45 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
     return False
 
 
+def _speak_reply(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    thread_id: str,
+    reply_to: str | None,
+) -> None:
+    """Strictly additive (issue #4): after a final text turn is delivered, optionally speak it back as
+    a Telegram voice note. Fires when the owner replied to one of this pane's voice notes
+    (one-shot speak_next_reply), the prompt contained the trigger phrase, or force-all is on. Never
+    raises — a synth/send failure just leaves the delivered text turn untouched.
+
+    NOTE: synthesis (~1-3s) runs UNDER the state lock in Phase 1. Moving it off-lock needs the
+    commit-before/reload-after dance (else it clobbers vs the inter-turn yield barrier) — a Phase 2
+    item. Speaking is opt-in and infrequent, so the on-lock cost is acceptable for now."""
+    if runtime.dry_run:
+        return  # preview pass: don't consume the flag or synth; the real send speaks
+    want = bool(entry.pop("speak_next_reply", None))
+    if not (want or speech.speech_reply_triggered(item.get("user_text")) or speech.speech_replies_enabled()):
+        return
+    spoken = speech.trim_for_speech(item.get("assistant_final_text") or item.get("assistant_stream_text") or "")
+    if not spoken:
+        return
+    try:
+        dest = speech.outbound_speech_dir(prune=True) / f"reply-{short_hash({'t': _turn_id(item), 'h': spoken}, 16)}.ogg"
+        if not speech.speech_request("tts", {"text": spoken, "dest": str(dest)}).get("ok"):
+            return
+        api_token, _bot_kind = _delivery_bot(store, entry)
+        client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
+        sent = client.send_voice(chat_id, dest, thread_id=thread_id, reply_to_message_id=reply_to, notify=False)
+        if sent.get("ok") and sent.get("message_id"):
+            state.record_voice_reply_message_id(entry, str(sent.get("message_id")))
+    except Exception as exc:  # additive: never break the delivered text turn — but leave a breadcrumb
+        print(f"herdres speak-reply failed: {exc}", file=sys.stderr)
+
+
 def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
@@ -1389,6 +1429,15 @@ def _sync_turns(
                 continue
             seen_final_workers.add(worker_key)
             delivered = _deliver_final(store, item, entry, runtime, chat_id=chat_id)
+            if delivered:
+                # Speak seam AFTER _deliver_final so it fires for every delivery branch (raw send,
+                # promote-working-to-final, replace-changed-final), not just the raw path — the flag
+                # is consumed here exactly once per delivered final.
+                _speak_reply(
+                    store, item, entry, runtime,
+                    chat_id=chat_id, thread_id=str(entry.get("topic_id") or ""),
+                    reply_to=str(entry.get("last_clean_message_id") or "") or None,
+                )
         elif item.get("assistant_stream_text") or _turn_is_working_placeholder(item, entry):
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 continue
