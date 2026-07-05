@@ -1,4 +1,6 @@
-# Herdres Tendwired
+<img width="2048" height="2048" alt="herdres" src="https://github.com/user-attachments/assets/d8324729-676a-49d8-9d24-800a8a411348" />
+
+# Herdres
 
 This branch is a tiny source-mode-only Telegram connector for Tendwire.
 
