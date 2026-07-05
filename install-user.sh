@@ -3,6 +3,11 @@ set -eu
 
 install -Dm755 herdres.py "$HOME/.local/bin/herdres"
 install -Dm755 herdres_gateway.py "$HOME/.local/bin/herdres-gateway"
+# Turn adapter: the tendwire daemon captures turn content by running `herdr pane turn`, which some
+# herdr builds lack. tendwired.service must set TENDWIRE_HERDR_BIN to this adapter (and
+# HERDR_REAL_BIN to the real herdr) or turn finals are never captured — the topic then shows
+# "Work is in progress" forever. See systemd/user/tendwired.service.example.
+install -Dm755 herdr_turn_adapter.py "$HOME/.local/bin/herdr_turn_adapter.py"
 find herdres_connector -type f -name '*.py' | while IFS= read -r f; do
     install -Dm644 "$f" "$HOME/.local/bin/$f"
 done

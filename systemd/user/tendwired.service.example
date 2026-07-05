@@ -1,0 +1,35 @@
+# Tendwire daemon unit — TEMPLATE. Herdres (source-only) requires a running tendwired; copy this to
+# ~/.config/systemd/user/tendwired.service, adjust the PYTHONPATH to your tendwire checkout, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now tendwired.service
+#
+# LOAD-BEARING settings (each one broke prod when wrong):
+#  * TENDWIRE_HERDR_BIN must point at herdr_turn_adapter.py (installed by install-user.sh), NOT the
+#    raw herdr binary: tendwired captures turn content by running `herdr pane turn`, which some herdr
+#    builds lack. With the raw binary the capture fails SILENTLY and every topic shows
+#    "Work is in progress" forever (finals are never delivered).
+#  * HERDR_REAL_BIN tells the adapter where the real herdr lives (it passes every other subcommand
+#    through).
+#  * TENDWIRE_RECONCILE_INTERVAL_SECONDS: worker->pane bindings are validated by fingerprint on every
+#    command submit, and fingerprints churn whenever a turn completes. The default reconcile interval
+#    (300s) leaves bindings stale for up to 5 minutes, so replying to an agent right after it finishes
+#    fails with "Could not send safely" (stale_target). 15s shrinks that window to seconds.
+[Unit]
+Description=Tendwire daemon (observes Herdr; source-mode control plane)
+After=default.target
+
+[Service]
+Type=simple
+# Adjust to your tendwire checkout (or drop if tendwire is pip-installed):
+Environment=PYTHONPATH=%h/tendwire/src
+Environment=TENDWIRE_HERDR_BACKEND=socket
+Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr_turn_adapter.py
+Environment=HERDR_REAL_BIN=%h/.local/bin/herdr
+Environment=TENDWIRE_HERDR_TIMEOUT_SECONDS=6
+Environment=TENDWIRE_RECONCILE_INTERVAL_SECONDS=15
+Environment=TENDWIRE_DB_PATH=%h/.local/share/tendwire/tendwire.db
+ExecStart=/usr/bin/python3 -m tendwire.cli daemon --db-path %h/.local/share/tendwire/tendwire.db
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
