@@ -262,6 +262,13 @@ class TelegramClient:
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
+    def rename_topic(self, chat_id: str, thread_id: str, name: str) -> dict[str, Any]:
+        try:
+            self.api("editForumTopic", {"chat_id": chat_id, "message_thread_id": str(thread_id), "name": sanitize_text(name, 128)})
+            return {"ok": True}
+        except TelegramError as exc:
+            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
     def edit_topic_icon(self, chat_id: str, thread_id: str, emoji_id: str) -> dict[str, Any]:
         if not emoji_id:
             return {"ok": False, "skipped": True}

@@ -257,10 +257,13 @@ _GENERIC_CWD_NAMES = {"", "root", "~", "home", "tmp", "temp"}
 
 
 def topic_name_for_worker(worker: dict[str, Any]) -> str:
-    """Name a worker's topic after its working directory (the project), e.g. /root/herdres -> "herdres".
-    Tendwire sends the path as meta.cwd/foreground_cwd; the monolith named topics the same way. Falls
-    back to an explicit cwd_name/space_name, then the agent name, then the worker id."""
+    """Name a worker's topic after the user's PANE LABEL when herdr has one ("doro", "Gitmoot2", ...)
+    — tendwire exposes it as meta.label — else the working-directory basename (the project,
+    /root/herdres -> "herdres"), else space/cwd name, agent name, worker id."""
     meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+    label = compact_ws(meta.get("label"), 120)
+    if label:
+        return label
     cwd = str(meta.get("foreground_cwd") or meta.get("cwd") or "").strip().rstrip("/")
     base = os.path.basename(cwd).strip() if cwd else ""
     if base and base.casefold() not in _GENERIC_CWD_NAMES:
