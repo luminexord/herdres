@@ -273,6 +273,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             if voice_payload:
                 return {"handled": True, "reply": _voice_unavailable_reply(payload)}
             return {"handled": True, "reply": "Send a message in this topic or use /send <instruction>."}
+        # Reply-to-voice auto-mode (#4): replying to one of this pane's voice notes speaks the next
+        # reply back. One-shot flag consumed at delivery (_speak_reply in source_sync).
+        if speech.speech_reply_on_voice_reply_enabled() and state.message_is_voice_reply(
+            entry, payload.get("reply_to_message_id")
+        ):
+            entry["speak_next_reply"] = True
         request = _command_request(entry, payload, text)
         client = TendwireClient()
         response = client.command(request)
