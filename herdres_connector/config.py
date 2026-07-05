@@ -80,6 +80,15 @@ def delete_done_council_topics(env: Any | None = None) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def response_collapse_previous_default(env: Any | None = None) -> bool:
+    """Collapse the Response section of SUPERSEDED (non-latest) finals so the topic reads as a tidy
+    history: only the newest answer stays expanded. Read at call time (runtime-flag idiom); default
+    OFF to match the monolith — HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS=1 enables it."""
+    source = os.environ if env is None else env
+    value = str(source.get("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def topic_status_icons_enabled(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "1") or "").strip().lower()
