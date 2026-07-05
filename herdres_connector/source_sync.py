@@ -669,6 +669,7 @@ def _ensure_topic(
     runtime: SyncRuntime,
     *,
     chat_id: str,
+    can_create: bool = True,
 ) -> tuple[bool, bool]:
     if entry.get("topic_id"):
         return False, False
@@ -678,6 +679,8 @@ def _ensure_topic(
         return False, False
     if runtime.dry_run:
         return True, False
+    if not can_create:
+        return True, False   # real create deferred by the per-pass create cap; retry next tick
     created = runtime.telegram.create_topic(chat_id, entry.get("topic_name") or state.topic_name_for_space(source))
     if created.get("ok") and created.get("topic_id"):
         entry["topic_id"] = str(created["topic_id"])
@@ -822,6 +825,10 @@ def _sync_sources(
 ) -> dict[str, int]:
     counts = {"created": 0, "updated": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
     topic_mode = config.source_topic_mode()
+    # Bound real topic-create calls per pass so a first source sync (a topic per open worker/space)
+    # amortizes creation over ticks instead of one create burst under the state lock.
+    create_cap = config.source_topic_create_cap()
+    creates_issued = 0
     live_worker_ids = {
         compact_ws(worker.get("id"), 160)
         for worker in _workers(snapshot)
@@ -845,7 +852,10 @@ def _sync_sources(
         if space_id:
             workers_by_space.setdefault(space_id, []).append(worker)
         if topic_mode == "worker" and not _should_delete_done_council_topic(entry):
-            topic_needed, topic_created = _ensure_topic(store, worker, entry, runtime, chat_id=chat_id)
+            topic_needed, topic_created = _ensure_topic(
+                store, worker, entry, runtime, chat_id=chat_id, can_create=creates_issued < create_cap
+            )
+            creates_issued += int(topic_created)
             counts["created"] += int(topic_created or topic_needed)
             counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["panes"] += 1
@@ -882,7 +892,10 @@ def _sync_sources(
             entry["active_worker_fingerprint"] = compact_ws(selected.get("fingerprint"), 160)
             entry["active_worker_name"] = compact_ws(selected.get("name"), 80)
             entry["active_worker_status"] = _dominant_status(space_turn_status, selected_status)
-        topic_needed, topic_created = _ensure_topic(store, space, entry, runtime, chat_id=chat_id)
+        topic_needed, topic_created = _ensure_topic(
+            store, space, entry, runtime, chat_id=chat_id, can_create=creates_issued < create_cap
+        )
+        creates_issued += int(topic_created)
         counts["created"] += int(created or topic_created or topic_needed)
         counts["updated"] += int(not created and before != entry)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))

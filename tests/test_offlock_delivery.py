@@ -15,7 +15,7 @@ import threading
 from unittest.mock import patch
 
 from herdres_connector import config, state
-from herdres_connector.source_sync import SyncRuntime, _cleanup_topics, sync_once
+from herdres_connector.source_sync import SyncRuntime, _cleanup_topics, _sync_sources, sync_once
 
 from test_source_only import FakeTelegram, FakeTendwire, _store
 
@@ -242,3 +242,23 @@ def test_cleanup_topics_delete_cap(tmp_path, monkeypatch):
     # the remaining 3 still carry their topic_id (untouched, retried next tick)
     remaining = [e for e in state.source_worker_entries(store).values() if e.get("topic_id")]
     assert len(remaining) == 3
+
+
+def test_sync_sources_create_cap(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MAX_CREATES", "2")
+    store = _store()
+    workers = [
+        {"id": f"worker-{i}", "name": f"w{i}", "status": "working", "space_id": "space-1",
+         "fingerprint": f"fp-{i}", "meta": {"agent": "codex"}}
+        for i in range(5)
+    ]
+    snapshot = {"ok": True, "spaces": [{"id": "space-1", "name": "S", "status": "active"}], "workers": workers}
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
+    _sync_sources(store, snapshot, {"turns": []}, runtime, chat_id="-100")
+    assert len(telegram.topics) == 2   # only 2 real creates this pass (5 workers, cap 2)
+    # the other 3 workers have no topic yet (deferred to next tick)
+    no_topic = [e for e in state.source_worker_entries(store).values() if not e.get("topic_id")]
+    assert len(no_topic) == 3
