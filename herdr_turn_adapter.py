@@ -714,10 +714,9 @@ def pane_devin_process_started_at(pane_id: str) -> int:
             continue
         if pid <= 0:
             continue
-        try:
-            starts.append(int(os.stat(f"/proc/{pid}").st_ctime))
-        except OSError:
-            continue
+        epoch = _proc_start_epoch(pid)
+        if epoch is not None:
+            starts.append(epoch)
     return min(starts) if starts else 0
 
 
@@ -1013,13 +1012,60 @@ def claude_sibling_count(pane: dict[str, Any]) -> int:
     return count or 1
 
 
-def proc_starttime(pid: int) -> str | None:
-    """Field 22 (starttime, in clock ticks) of /proc/<pid>/stat, or None.
+# --- Process introspection: portable across Linux (/proc) and macOS (ps) ------
+# The Linux path reads /proc/<pid>/* directly, which
+# does not exist on macOS. These helpers branch on platform. On macOS `ps -o
+# lstart=` returns the same ctime-format string that Claude Code writes as
+# `procStart` in ~/.claude/sessions/<PID>.json, so the PID-reuse guard keeps full
+# fidelity. Any miss returns None and the caller falls back to cwd heuristics.
+_IS_DARWIN = sys.platform == "darwin"
 
-    comm (field 2) can contain spaces and parentheses, so we split on the LAST
-    ')' and index the remainder: field 22 is index 19 of what follows ") ".
-    Used as a PID-reuse guard against Claude's pid->session mapping file.
+
+def _ps_field(pid: int, fmt: str) -> str | None:
+    """`ps -o <fmt>= -p <pid>` output (stripped) or None. Used on macOS/BSD."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", f"{fmt}=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    value = out.stdout.strip()
+    return value or None
+
+
+def _proc_start_epoch(pid: int) -> int | None:
+    """Process start time as a Unix epoch int, or None (PID-order tie-breaker)."""
+    if _IS_DARWIN:
+        value = _ps_field(pid, "lstart")
+        if not value:
+            return None
+        try:
+            import time as _time
+
+            return int(_time.mktime(_time.strptime(" ".join(value.split()), "%a %b %d %H:%M:%S %Y")))
+        except (ValueError, OverflowError):
+            return None
+    try:
+        return int(os.stat(f"/proc/{pid}").st_ctime)
+    except OSError:
+        return None
+
+
+def proc_starttime(pid: int) -> str | None:
+    """Stable process-start token, or None. PID-reuse guard vs Claude's map file.
+
+    Linux: field 22 (starttime, clock ticks) of /proc/<pid>/stat (comm at field 2
+    can hold spaces/parens, so split on the LAST ')' and index the remainder).
+    macOS: `ps -o lstart=`, which matches Claude's `procStart` ctime string.
     """
+    if _IS_DARWIN:
+        return _ps_field(pid, "lstart")
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
             data = handle.read()
@@ -1030,11 +1076,17 @@ def proc_starttime(pid: int) -> str | None:
 
 
 def proc_ppid(pid: int) -> int | None:
-    """Parent PID (field 4 of /proc/<pid>/stat), or None.
+    """Parent PID, or None. Used to walk up from a tool child to its claude parent.
 
-    Same comm-aware parse as proc_starttime: state is index 0 after ") ",
-    ppid is index 1. Used to walk up from a tool child to its claude parent.
+    Linux: field 4 of /proc/<pid>/stat (state index 0 after ") ", ppid index 1).
+    macOS: `ps -o ppid=`.
     """
+    if _IS_DARWIN:
+        value = _ps_field(pid, "ppid")
+        try:
+            return int(value) if value is not None else None
+        except ValueError:
+            return None
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
             data = handle.read()
@@ -1045,11 +1097,19 @@ def proc_ppid(pid: int) -> int | None:
 
 
 def proc_is_claude(pid: int) -> bool:
-    """True if /proc/<pid>/comm or its argv0 names the claude binary.
+    """True if the process names the claude binary (comm or argv0 basename).
 
-    comm is truncated to 15 chars (fine for "claude") and reads "node" for a
-    wrapper install, so we also check the argv0 basename as a fallback.
+    Linux: /proc/<pid>/comm (truncated to 15 chars; reads "node" for a wrapper
+    install, so argv0 from /proc/<pid>/cmdline is a fallback).
+    macOS: `ps -o comm=` and `ps -o args=` (argv0 basename).
     """
+    if _IS_DARWIN:
+        comm = _ps_field(pid, "comm") or ""
+        if comm and os.path.basename(comm) == "claude":
+            return True
+        args = _ps_field(pid, "args") or ""
+        argv0 = args.split(" ", 1)[0] if args else ""
+        return bool(argv0) and os.path.basename(argv0) == "claude"
     try:
         with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as handle:
             if handle.read().strip() == "claude":

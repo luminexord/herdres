@@ -1892,8 +1892,12 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         or topic_cleanup.get("changed")
         or message_bindings
     )
-    pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
-    topic_pinned_updated = _sync_topic_pinned_statuses(store, runtime, chat_id=chat_id)
+    if config.pinned_status_enabled():
+        pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
+        topic_pinned_updated = _sync_topic_pinned_statuses(store, runtime, chat_id=chat_id)
+    else:
+        pinned_changed = False
+        topic_pinned_updated = 0
     changed = changed or pinned_changed or bool(topic_pinned_updated)
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
     if runtime.with_outbox:
