@@ -258,8 +258,25 @@ def render_final_turn_chunks(item: dict[str, Any], entry: dict[str, Any], *, max
 
 def render_pending(item: dict[str, Any], entry: dict[str, Any]) -> str:
     label = html_escape(worker_label(entry), 80)
-    prompt = html_escape(item.get("prompt_text") or item.get("text") or "Input needed.", 3000)
-    return f"<b>Input Needed</b> · {label}\n\n{prompt}"
+    # tendwire's pending payload carries the content as `question` (+ optional structured choices);
+    # prompt_text/text are legacy shapes. Without `question` the user just saw "Input needed."
+    prompt = html_escape(
+        item.get("question") or item.get("prompt_text") or item.get("text") or "Input needed.", 3000
+    )
+    lines = [f"<b>Input Needed</b> · {label}", "", prompt]
+    choices = item.get("choices") if isinstance(item.get("choices"), list) else []
+    numbered = []
+    for i, choice in enumerate(choices, start=1):
+        text = choice.get("label") or choice.get("text") if isinstance(choice, dict) else choice
+        text = html_escape(str(text or ""), 200)
+        if text:
+            numbered.append(f"{i}. {text}")
+    if numbered:
+        lines.append("")
+        lines.extend(numbered)
+        lines.append("")
+        lines.append("<i>Reply with a number or type your answer.</i>")
+    return "\n".join(lines)
 
 
 def pretty_model_label(raw: Any) -> str:
