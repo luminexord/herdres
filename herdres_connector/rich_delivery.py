@@ -543,6 +543,10 @@ def _classify_telegram_error(error: Exception) -> str:
     return "transient"
 
 
+def _retry_rich_delivery(kind: str, error: Exception) -> dict[str, Any]:
+    return {"ok": False, "format": "rich", "kind": kind, "error": sanitize_text(str(error), 300)}
+
+
 def _fallback_send(
     client: TelegramClient,
     chat_id: str,
@@ -609,6 +613,8 @@ def send_rich_message(
         raise
     except TelegramError as exc:
         kind = _classify_telegram_error(exc)
+        if kind == "transient":
+            return _retry_rich_delivery(kind, exc)
         if kind == "capability":
             mark_rich_disabled(telegram, str(exc))
         elif kind == "bad_request":
@@ -656,6 +662,8 @@ def edit_rich_message(
         raise
     except TelegramError as exc:
         kind = _classify_telegram_error(exc)
+        if kind == "transient":
+            return _retry_rich_delivery(kind, exc)
         if kind == "not_modified":
             return {"ok": True, "format": "rich", "kind": kind, "message_id": str(message_id)}
         if kind in {"not_found", "topic_not_found"}:
