@@ -310,3 +310,15 @@ def test_space_mode_repairs_stale_cross_topic_message_bindings(monkeypatch):
     assert worker.get("topic_id") != "9988"
     assert "last_stream_message_id" not in worker
     assert state.find_message_binding(store, "11261") is None
+
+
+def test_render_pending_shows_question_and_choices():
+    from herdres_connector.rendering import render_pending
+    html = render_pending(
+        {"question": "Deploy to prod?", "choices": [{"label": "Yes, deploy"}, {"label": "Hold"}]},
+        {"topic_name": "gitmoot"},
+    )
+    assert "Deploy to prod?" in html
+    assert "1. Yes, deploy" in html and "2. Hold" in html
+    # tendwire's field is `question`; the old prompt_text-only lookup rendered a bare "Input needed."
+    assert "Input needed." not in html
