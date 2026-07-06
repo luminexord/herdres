@@ -8,6 +8,10 @@ install -Dm755 herdres_gateway.py "$HOME/.local/bin/herdres-gateway"
 # HERDR_REAL_BIN to the real herdr) or turn finals are never captured — the topic then shows
 # "Work is in progress" forever. See systemd/user/tendwired.service.example.
 install -Dm755 herdr_turn_adapter.py "$HOME/.local/bin/herdr_turn_adapter.py"
+# Pending-prompt hook: Claude Code fires PreToolUse the moment an AskUserQuestion/ExitPlanMode
+# prompt is shown (it is NOT in the session transcript until answered), so this passive recorder
+# is the only way the turn adapter can capture the question+choices for Telegram. Fails closed.
+install -Dm755 herdres_pending_hook.py "$HOME/.local/bin/herdres-pending-hook"
 find herdres_connector -type f -name '*.py' | while IFS= read -r f; do
     install -Dm644 "$f" "$HOME/.local/bin/$f"
 done
@@ -54,6 +58,46 @@ for event, groups in list(hooks.items()):
 json.dump(d, open(p, "w"), indent=2)
 PY
     printf '%s\n' "Removed stale herdres-decision-hook entries from ~/.claude/settings.json."
+fi
+# Register the pending-prompt hook (PreToolUse/PostToolUse on AskUserQuestion|ExitPlanMode +
+# SessionEnd cleanup). Guarded + backed up + idempotent + best-effort: a broken settings.json is
+# left untouched, and the entries point at the file we JUST installed (no dangling-hook P0).
+if command -v python3 >/dev/null 2>&1; then
+    python3 - "$HOME/.claude/settings.json" "$HOME/.local/bin/herdres-pending-hook" <<'HOOKPY' || true
+import json, os, shutil, sys
+path, hook = sys.argv[1], sys.argv[2]
+if not os.path.exists(hook):
+    sys.exit(0)
+try:
+    data = json.load(open(path)) if os.path.exists(path) else {}
+except Exception:
+    sys.exit(0)  # unreadable settings: do not touch
+if not isinstance(data, dict):
+    sys.exit(0)
+command = f"python3 '{hook}'"
+if command in json.dumps(data):
+    sys.exit(0)  # already registered
+if os.path.exists(path):
+    try:
+        shutil.copy2(path, path + ".bak-herdres-hook")
+    except Exception:
+        sys.exit(0)
+hooks = data.setdefault("hooks", {})
+def add(event, matcher):
+    groups = hooks.setdefault(event, [])
+    entry = {"hooks": [{"type": "command", "command": command, "timeout": 10}]}
+    if matcher:
+        entry["matcher"] = matcher
+    groups.append(entry)
+add("PreToolUse", "AskUserQuestion|ExitPlanMode")
+add("PostToolUse", "AskUserQuestion|ExitPlanMode")
+add("SessionEnd", "")
+tmp = path + ".tmp"
+os.makedirs(os.path.dirname(path), exist_ok=True)
+json.dump(data, open(tmp, "w"), indent=2)
+os.replace(tmp, path)
+print("Registered herdres-pending-hook in ~/.claude/settings.json.")
+HOOKPY
 fi
 
 [ -f "$HOME/.config/herdres/herdres.env" ] || \

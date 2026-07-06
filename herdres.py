@@ -190,6 +190,37 @@ def _target_for_entry(entry: dict[str, Any]) -> dict[str, str]:
     return {"space_id": space_id} if space_id else {}
 
 
+def _pending_number_reply(entry: dict[str, Any], text: str) -> tuple[str, str] | None:
+    """Validate a bare-number reply against the worker's LIVE pending prompt (backend-captured
+    question + choices). Returns (text_to_send, "") when valid — the digit itself, which the pane's
+    picker interprets natively — or ("", error_reply) to fail closed (stale prompt, out of range,
+    custom choice). None = not a number-reply situation; the text passes through unchanged."""
+    clean = str(text or "").strip()
+    if not clean.isdigit() or len(clean) > 2:
+        return None
+    try:
+        payload = TendwireClient().pending()
+    except Exception:
+        return None  # pending unavailable: don't block, pass the number through
+    worker_id = str(entry.get("active_worker_id") or entry.get("tendwire_worker_id") or "")
+    for row in payload.get("pending_interactions", []) if isinstance(payload, dict) else []:
+        if not isinstance(row, dict) or str(row.get("worker_id") or "") != worker_id:
+            continue
+        if str(row.get("status") or "open") != "open":
+            continue
+        choices = row.get("choices") if isinstance(row.get("choices"), list) else []
+        if not choices:
+            return None  # synthetic/choice-less pending: nothing to validate against
+        index = int(clean)
+        if not 1 <= index <= len(choices):
+            return ("", f"That prompt has {len(choices)} choices — reply 1–{len(choices)}, or type your answer.")
+        choice = choices[index - 1] if isinstance(choices[index - 1], dict) else {}
+        if not str(choice.get("value") or "").strip():
+            return ("", "That choice takes a custom answer — just type it as text.")
+        return (clean, "")
+    return None  # no live pending with choices for this worker: pass through
+
+
 def _command_request(entry: dict[str, Any], payload: dict[str, Any], text: str) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -282,6 +313,14 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             if voice_payload:
                 return {"handled": True, "reply": _voice_unavailable_reply(payload)}
             return {"handled": True, "reply": "Send a message in this topic or use /send <instruction>."}
+        # A bare number answering a live captured prompt: validate against the pending's choices and
+        # fail closed on stale/out-of-range/custom, else send the digit (the picker's native input).
+        number_reply = _pending_number_reply(entry, text)
+        if number_reply is not None:
+            mapped, error_reply = number_reply
+            if error_reply:
+                return {"handled": True, "reply": error_reply}
+            text = mapped
         # Reply-to-voice auto-mode (#4): replying to one of this pane's voice notes speaks the next
         # reply back. One-shot flag consumed at delivery (_speak_reply in source_sync).
         if speech.speech_reply_on_voice_reply_enabled() and state.message_is_voice_reply(
