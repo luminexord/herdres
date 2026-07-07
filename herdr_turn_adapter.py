@@ -7,6 +7,7 @@ the integration upgrade-safe: Herdr itself is never patched.
 
 from __future__ import annotations
 
+import calendar
 import contextlib
 import json
 import hashlib
@@ -1020,16 +1021,34 @@ def claude_sibling_count(pane: dict[str, Any]) -> int:
 # fidelity. Any miss returns None and the caller falls back to cwd heuristics.
 _IS_DARWIN = sys.platform == "darwin"
 
+# Keep each `ps` spawn short: the ancestor walk issues many per capture and
+# tendwired's capture window is only a few seconds, so one slow `ps` must not
+# starve the whole turn. The walk itself is already bounded (<=8 levels).
+_PS_TIMEOUT_SECONDS = 1.0
+
+# `ps -o lstart=` under LC_ALL=C, C-locale month names, one per index+1.
+_MONTHS = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
 
 def _ps_field(pid: int, fmt: str) -> str | None:
-    """`ps -o <fmt>= -p <pid>` output (stripped) or None. Used on macOS/BSD."""
+    """`ps -o <fmt>= -p <pid>` output (stripped) or None. Used on macOS/BSD.
+
+    LC_ALL=C/TZ=UTC are pinned to match the env Claude Code uses when it writes
+    `procStart` (`ps ... {LC_ALL:"C",TZ:"UTC"}`). Without this, `lstart` here is in
+    the local timezone/locale and differs from the recorded ctime string, so the
+    PID-reuse guard's strict compare rejects every valid record on a non-UTC Mac.
+    """
     try:
         out = subprocess.run(
             ["ps", "-o", f"{fmt}=", "-p", str(pid)],
             capture_output=True,
             text=True,
             check=False,
-            timeout=5,
+            timeout=_PS_TIMEOUT_SECONDS,
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1039,18 +1058,37 @@ def _ps_field(pid: int, fmt: str) -> str | None:
     return value or None
 
 
+def _lstart_to_epoch(value: str) -> int | None:
+    """`ps -o lstart=` ("Www Mmm D HH:MM:SS YYYY", C-locale/UTC) -> Unix epoch int.
+
+    Parsed with a fixed month map and timegm (not strptime %a/%b + mktime): the
+    former is LC_TIME-sensitive on the Python side and the latter assumes local
+    time, but _ps_field pins TZ=UTC so the fields are UTC.
+    """
+    parts = value.split()
+    if len(parts) != 5:
+        return None
+    _wday, mon, day, clock, year = parts
+    month = _MONTHS.get(mon)
+    if month is None:
+        return None
+    hms = clock.split(":")
+    if len(hms) != 3:
+        return None
+    try:
+        hour, minute, second = (int(part) for part in hms)
+        return calendar.timegm((int(year), month, int(day), hour, minute, second, 0, 0, 0))
+    except (ValueError, OverflowError):
+        return None
+
+
 def _proc_start_epoch(pid: int) -> int | None:
     """Process start time as a Unix epoch int, or None (PID-order tie-breaker)."""
     if _IS_DARWIN:
         value = _ps_field(pid, "lstart")
         if not value:
             return None
-        try:
-            import time as _time
-
-            return int(_time.mktime(_time.strptime(" ".join(value.split()), "%a %b %d %H:%M:%S %Y")))
-        except (ValueError, OverflowError):
-            return None
+        return _lstart_to_epoch(value)
     try:
         return int(os.stat(f"/proc/{pid}").st_ctime)
     except OSError:
@@ -1197,6 +1235,12 @@ def claude_session_record_for_pid(pid: int, expected_cwd: str = "") -> dict[str,
     except (TypeError, ValueError):
         return None
     started = proc_starttime(pid)
+    if _IS_DARWIN and started is None:
+        # A flaky `ps` for a *live* PID (an ordinary failure on macOS, unlike
+        # /proc on Linux) must not silently disable the reuse guard: fail closed
+        # so we fall through to cwd heuristics rather than trust an unverified
+        # (possibly stale, PID-recycled) record.
+        return None
     if started is not None and str(record.get("procStart")) != str(started):
         return None  # PID was recycled; this mapping file is stale.
     record_cwd = str(record.get("cwd") or "")

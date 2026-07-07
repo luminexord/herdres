@@ -98,7 +98,12 @@ def topic_status_icons_enabled(env: Any | None = None) -> bool:
 def pinned_status_enabled(env: Any | None = None) -> bool:
     """Whether to post the pinned status board(s) — the global overview pinned in
     General and the per-topic status line — which show each agent's selected model.
-    Default on; HERDRES_PINNED_STATUS=0 turns both off."""
+    Default on; HERDRES_PINNED_STATUS=0 turns both off.
+
+    Note: this only stops *updating* the boards. Any boards already pinned from a
+    prior run stay pinned, frozen at their last content — set the flag off before
+    first run, or unpin the existing boards manually, to avoid a stale board that
+    reads as live status."""
     source = os.environ if env is None else env
     value = str(source.get("HERDRES_PINNED_STATUS", "1") or "").strip().lower()
     return value not in {"0", "false", "no", "off"}
