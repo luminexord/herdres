@@ -20,3 +20,6 @@ ssh/server/node_modules/
 tg-cred.txt
 *.session
 *.session-journal
+
+# local clones of third-party repos (not part of herdres)
+repos/
