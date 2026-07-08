@@ -235,9 +235,10 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                 parts.append(f"<pre><code{class_attr}>{_html_text(chr(10).join(code_lines), 3000)}</code></pre>")
             previous_blank = False
             continue
-        # Pipe table (row + `---|---` delimiter): render as an aligned <pre> block. Must precede the
-        # paragraph fallthrough, which would otherwise emit the raw `| a | b |` / `|---|` markup.
-        table = try_render_table(lines, idx, limit=3000)
+        # Pipe table (row + `---|---` delimiter): render as a native <table> (the rich path turns it
+        # into a PageBlockTable). Cells use _rich_inline so bold/code/links inside cells render. Must
+        # precede the paragraph fallthrough, which would otherwise emit raw `| a | b |` / `|---|`.
+        table = try_render_table(lines, idx, cell_html=lambda c: _rich_inline(c, 160))
         if table is not None:
             parts.append(table[0])
             idx = table[1]
