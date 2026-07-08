@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Callable
 
 from .safe import compact_ws, html_escape, sanitize_text
 
@@ -65,7 +65,12 @@ def worker_label(entry: dict[str, Any] | None, worker: dict[str, Any] | None = N
 
 
 def html_to_plain(value: str, *, limit: int = 12000) -> str:
-    text = re.sub(r"<br\s*/?>", "\n", value)
+    # Table-aware: adjacent cells become ` | ` and row/block ends become newlines, so a <table> that
+    # never reaches the rich path (rich disabled / oversize fallback) degrades to readable
+    # `|`-separated rows rather than mashed-together cell text.
+    text = re.sub(r"</t[dh]>\s*<t[dh]\b[^>]*>", " | ", value, flags=re.IGNORECASE)
+    text = re.sub(r"</tr>\s*", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<br\s*/?>", "\n", text)
     text = re.sub(r"<[^>]+>", "", text)
     return sanitize_text(text, limit)
 
@@ -89,7 +94,7 @@ def _inline_markdown_html(text: str) -> str:
 
 # A GitHub-style pipe-table delimiter row, e.g. ``| :--- | ---: |`` or ``---|---``.
 _TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*$")
-_TABLE_MAX_CELL = 40
+_TABLE_MAX_ROWS = 40
 
 
 def _looks_like_table_row(line: str) -> bool:
@@ -99,84 +104,91 @@ def _looks_like_table_row(line: str) -> bool:
 def _looks_like_table_separator(line: str) -> bool:
     # Require a pipe: a bare `---`/`------` under a pipe-containing prose line (e.g. a horizontal rule
     # after "run `foo | grep bar`") is NOT a table delimiter — matching GitHub, which needs the pipe
-    # structure. This is the guard against mangling ordinary prose + rules into a fake <pre> box.
+    # structure. This is the guard against mangling ordinary prose + rules into a fake table.
     s = line.strip()
     return "-" in s and "|" in s and bool(_TABLE_SEPARATOR_RE.match(s))
 
 
-def _split_table_row(line: str) -> list[str]:
-    s = line.strip()
-    if s.startswith("|"):
-        s = s[1:]
-    if s.endswith("|"):
-        s = s[:-1]
-    # Split on unescaped pipes so a literal ``\|`` inside a cell stays put.
-    return [cell.replace("\\|", "|").strip() for cell in re.split(r"(?<!\\)\|", s)]
+def _table_cells(line: str) -> list[str]:
+    """Split a pipe-table row into cells, respecting inline-code spans and escaped ``\\|`` so a pipe
+    inside ``\\`a | b\\``` or written ``\\|`` does not create a spurious column (ported from the
+    pre-tendwire renderer)."""
+    text = str(line or "").strip()
+    if "|" not in text:
+        return []
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|") and not text.endswith("\\|"):
+        text = text[:-1]
+    cells: list[str] = []
+    buf: list[str] = []
+    in_code = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] == "|":
+            buf.append("|")
+            i += 2
+            continue
+        if ch == "`":
+            in_code = not in_code
+            buf.append(ch)
+        elif ch == "|" and not in_code:
+            cells.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    cells.append("".join(buf).strip())
+    return cells
 
 
-def _table_alignments(sep_cells: list[str]) -> list[str]:
-    aligns: list[str] = []
-    for cell in sep_cells:
-        c = cell.strip()
-        left, right = c.startswith(":"), c.endswith(":")
-        aligns.append("center" if left and right else "right" if right else "left")
-    return aligns
+def _render_table_html(rows: list[list[str]], *, cell_html: "Callable[[str], str]") -> str:
+    """Render parsed rows (first = header) as a native ``<table bordered striped>`` — the Telegram
+    rich-message path turns this into a real ``PageBlockTable`` (native table), far better than a
+    monospace box. Cell content is rendered rich (bold/code/links) via ``cell_html``."""
+    trimmed = rows[:_TABLE_MAX_ROWS]
+    width = max(len(row) for row in trimmed)
+    grid = [row + [""] * (width - len(row)) for row in trimmed]
+    header, body = grid[0], grid[1:]
+    html_rows = ["<tr>" + "".join(f"<th>{cell_html(cell)}</th>" for cell in header) + "</tr>"]
+    html_rows.extend(
+        "<tr>" + "".join(f"<td>{cell_html(cell)}</td>" for cell in row) + "</tr>" for row in body
+    )
+    return "<table bordered striped>\n" + "\n".join(html_rows) + "\n</table>"
 
 
-def _render_pipe_table(rows: list[list[str]], aligns: list[str], *, limit: int) -> str:
-    """Render a parsed pipe table as a column-aligned monospace <pre> block. Telegram has no <table>,
-    but <pre> is fixed-width, so padded columns read as a real table (and scroll horizontally if wide)
-    instead of leaking raw ``| a | b |`` / ``|---|`` markup."""
-    ncols = max(len(r) for r in rows)
-
-    def clip(cell: str) -> str:
-        return cell if len(cell) <= _TABLE_MAX_CELL else cell[: _TABLE_MAX_CELL - 1] + "…"
-
-    grid = [[clip(row[c]) if c < len(row) else "" for c in range(ncols)] for row in rows]
-    widths = [max(len(grid[r][c]) for r in range(len(grid))) for c in range(ncols)]
-    aligns = (aligns + ["left"] * ncols)[:ncols]
-
-    def pad(cell: str, width: int, align: str) -> str:
-        if align == "right":
-            return cell.rjust(width)
-        if align == "center":
-            slack = width - len(cell)
-            left = slack // 2
-            return " " * left + cell + " " * (slack - left)
-        return cell.ljust(width)
-
-    def row_line(cells: list[str]) -> str:
-        return " | ".join(pad(cells[c], widths[c], aligns[c]) for c in range(ncols)).rstrip()
-
-    lines = [row_line(grid[0]), "-+-".join("-" * widths[c] for c in range(ncols))]
-    lines += [row_line(r) for r in grid[1:]]
-    return f"<pre>{html_escape(chr(10).join(lines), limit)}</pre>"
-
-
-def try_render_table(lines: list[str], i: int, *, limit: int = 12000) -> tuple[str, int] | None:
+def try_render_table(
+    lines: list[str],
+    i: int,
+    *,
+    limit: int = 12000,
+    cell_html: "Callable[[str], str] | None" = None,
+) -> tuple[str, int] | None:
     """If a GitHub-style pipe table starts at ``lines[i]`` (a row immediately followed by a
-    ``---|---`` delimiter), render the whole block to an aligned <pre> and return
-    ``(html, next_index)``; otherwise return ``None``. Shared by both markdown engines so tables
-    render identically in turn cards and in the chunked/section paths."""
+    ``---|---`` delimiter), render the whole block to a native ``<table>`` and return
+    ``(html, next_index)``; otherwise ``None``. Shared by both markdown engines; each passes its own
+    ``cell_html`` inline renderer so cell content matches the surrounding formatting. ``limit`` is
+    accepted for signature stability (the native table isn't length-padded)."""
     if not (
         _looks_like_table_row(lines[i])
         and i + 1 < len(lines)
         and _looks_like_table_separator(lines[i + 1])
     ):
         return None
-    header = _split_table_row(lines[i])
-    aligns = _table_alignments(_split_table_row(lines[i + 1]))
+    render_cell = cell_html or (lambda c: _inline_markdown_html(c))
+    header = _table_cells(lines[i])
     data_rows: list[list[str]] = []
     j = i + 2
     while j < len(lines) and _looks_like_table_row(lines[j]):
         if _looks_like_table_separator(lines[j]):
             j += 1  # absorb a repeated interior `---|---` (LLMs use it to group sections)
             continue
-        data_rows.append(_split_table_row(lines[j]))
+        data_rows.append(_table_cells(lines[j]))
         j += 1
     if not any(cell.strip() for row in (header, *data_rows) for cell in row):
-        return None  # all-empty header/body → leave as plain text, not an empty <pre> box
-    return _render_pipe_table([header, *data_rows], aligns, limit=limit), j
+        return None  # all-empty header/body → leave as plain text, not an empty table
+    return _render_table_html([header, *data_rows], cell_html=render_cell), j
 
 
 def markdownish_to_html(value: Any, *, limit: int = 12000) -> str:
