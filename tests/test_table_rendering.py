@@ -65,3 +65,44 @@ def test_html_in_cells_is_escaped():
 def test_try_render_table_returns_none_off_table():
     assert try_render_table(["just a line"], 0) is None
     assert try_render_table(["| h |", "not a delimiter"], 0) is None
+
+
+# --- review-hardening regressions -------------------------------------------------------------
+
+def test_prose_pipe_above_bare_rule_is_not_a_table():
+    # MAJOR (review): "run `foo | grep bar`\n---\ntext" must stay prose — a bare --- rule is not a
+    # table delimiter. Requires a pipe in the delimiter row (GitHub behavior).
+    for engine in (markdownish_to_html, render_final_reply_html):
+        out = engine("Run `grep foo | wc -l` to count\n---\nNext paragraph.")
+        assert "<pre>" not in out
+        assert "Next paragraph" in out
+
+
+def test_bullet_with_pipe_above_rule_stays_a_bullet():
+    out = render_final_reply_html("- item one | two\n---\nmore")
+    assert "<pre>" not in out
+    assert "<li>" in out or "item one" in out
+
+
+def test_delimiter_without_pipe_is_rejected():
+    from herdres_connector.rendering import _looks_like_table_separator
+    assert _looks_like_table_separator("---") is False
+    assert _looks_like_table_separator("----------") is False
+    assert _looks_like_table_separator("|---|---|") is True
+    assert _looks_like_table_separator("---|---") is True
+
+
+def test_repeated_interior_separator_absorbed():
+    # A table that repeats its delimiter to group sections renders as ONE table with all rows.
+    md = "| A | B |\n|---|---|\n| 1 | 2 |\n|---|---|\n| 3 | 4 |"
+    for engine in (markdownish_to_html, render_final_reply_html):
+        out = engine(md)
+        assert out.count("<pre>") == 1
+        body = out.split("<pre>")[1].split("</pre>")[0]
+        assert "1" in body and "3" in body      # both sections inside the one table
+        assert "|---|" not in out               # no leaked delimiter
+
+
+def test_all_empty_table_left_as_text():
+    for md in ("| |\n|-|", "||||\n|-|"):
+        assert "<pre>" not in markdownish_to_html(md)

@@ -97,8 +97,11 @@ def _looks_like_table_row(line: str) -> bool:
 
 
 def _looks_like_table_separator(line: str) -> bool:
+    # Require a pipe: a bare `---`/`------` under a pipe-containing prose line (e.g. a horizontal rule
+    # after "run `foo | grep bar`") is NOT a table delimiter — matching GitHub, which needs the pipe
+    # structure. This is the guard against mangling ordinary prose + rules into a fake <pre> box.
     s = line.strip()
-    return "-" in s and bool(_TABLE_SEPARATOR_RE.match(s))
+    return "-" in s and "|" in s and bool(_TABLE_SEPARATOR_RE.match(s))
 
 
 def _split_table_row(line: str) -> list[str]:
@@ -165,9 +168,14 @@ def try_render_table(lines: list[str], i: int, *, limit: int = 12000) -> tuple[s
     aligns = _table_alignments(_split_table_row(lines[i + 1]))
     data_rows: list[list[str]] = []
     j = i + 2
-    while j < len(lines) and _looks_like_table_row(lines[j]) and not _looks_like_table_separator(lines[j]):
+    while j < len(lines) and _looks_like_table_row(lines[j]):
+        if _looks_like_table_separator(lines[j]):
+            j += 1  # absorb a repeated interior `---|---` (LLMs use it to group sections)
+            continue
         data_rows.append(_split_table_row(lines[j]))
         j += 1
+    if not any(cell.strip() for row in (header, *data_rows) for cell in row):
+        return None  # all-empty header/body → leave as plain text, not an empty <pre> box
     return _render_pipe_table([header, *data_rows], aligns, limit=limit), j
 
 
