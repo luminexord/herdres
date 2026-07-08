@@ -77,12 +77,33 @@ def test_transcribe_short_clip_single_pass(monkeypatch):
 def test_transcribe_long_clip_is_windowed(monkeypatch):
     rec, text = _run_transcribe(monkeypatch, 40 * STT_SAMPLE_RATE)   # 40s -> multiple windows
     chunk = 14 * STT_SAMPLE_RATE
-    step = chunk - STT_SAMPLE_RATE                                    # ~1s overlap
     assert len(rec.window_lengths) > 1                               # windowed, not one pass
     assert max(rec.window_lengths) <= chunk                          # no window exceeds the cap
-    # first window is a full chunk; a ~1s overlap means the step is chunk-1s
-    assert rec.window_lengths[0] == chunk
     assert text.startswith("seg")                                    # joined non-empty parts
+
+
+def test_transcribe_tail_window_is_full_size(monkeypatch):
+    # Regression: a 32s note used to end with a ~5s trailing window, which parakeet transcribes to
+    # EMPTY, silently dropping the end of the message. Every window must now be a full `chunk` so the
+    # tail is captured (windows are spaced evenly and the last ends exactly at n).
+    rec, _text = _run_transcribe(monkeypatch, 32 * STT_SAMPLE_RATE)
+    chunk = 14 * STT_SAMPLE_RATE
+    assert rec.window_lengths, "expected windowed decode"
+    assert all(w == chunk for w in rec.window_lengths)              # NO short trailing sliver
+    assert len(rec.window_lengths) >= 2
+
+
+def test_join_transcript_chunks_dedups_overlap():
+    # Consecutive windows re-decode a few overlapping seconds; the shared >=3-word run is trimmed.
+    joined = speech._join_transcript_chunks([
+        "the cat sat on the mat",
+        "on the mat and then left",       # "on the mat" overlaps -> trimmed
+    ])
+    assert joined == "the cat sat on the mat and then left"
+    # no clean overlap -> plain space-join (a little duplication beats a dropped tail)
+    assert speech._join_transcript_chunks(["hello world", "foo bar"]) == "hello world foo bar"
+    # empties skipped
+    assert speech._join_transcript_chunks(["", "only this", ""]) == "only this"
 
 
 # --- loudnorm bare-retry -----------------------------------------------------
