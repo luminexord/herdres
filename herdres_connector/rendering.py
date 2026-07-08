@@ -87,12 +87,105 @@ def _inline_markdown_html(text: str) -> str:
     return escaped
 
 
+# A GitHub-style pipe-table delimiter row, e.g. ``| :--- | ---: |`` or ``---|---``.
+_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*$")
+_TABLE_MAX_CELL = 40
+
+
+def _looks_like_table_row(line: str) -> bool:
+    return "|" in line and bool(line.strip())
+
+
+def _looks_like_table_separator(line: str) -> bool:
+    # Require a pipe: a bare `---`/`------` under a pipe-containing prose line (e.g. a horizontal rule
+    # after "run `foo | grep bar`") is NOT a table delimiter — matching GitHub, which needs the pipe
+    # structure. This is the guard against mangling ordinary prose + rules into a fake <pre> box.
+    s = line.strip()
+    return "-" in s and "|" in s and bool(_TABLE_SEPARATOR_RE.match(s))
+
+
+def _split_table_row(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    # Split on unescaped pipes so a literal ``\|`` inside a cell stays put.
+    return [cell.replace("\\|", "|").strip() for cell in re.split(r"(?<!\\)\|", s)]
+
+
+def _table_alignments(sep_cells: list[str]) -> list[str]:
+    aligns: list[str] = []
+    for cell in sep_cells:
+        c = cell.strip()
+        left, right = c.startswith(":"), c.endswith(":")
+        aligns.append("center" if left and right else "right" if right else "left")
+    return aligns
+
+
+def _render_pipe_table(rows: list[list[str]], aligns: list[str], *, limit: int) -> str:
+    """Render a parsed pipe table as a column-aligned monospace <pre> block. Telegram has no <table>,
+    but <pre> is fixed-width, so padded columns read as a real table (and scroll horizontally if wide)
+    instead of leaking raw ``| a | b |`` / ``|---|`` markup."""
+    ncols = max(len(r) for r in rows)
+
+    def clip(cell: str) -> str:
+        return cell if len(cell) <= _TABLE_MAX_CELL else cell[: _TABLE_MAX_CELL - 1] + "…"
+
+    grid = [[clip(row[c]) if c < len(row) else "" for c in range(ncols)] for row in rows]
+    widths = [max(len(grid[r][c]) for r in range(len(grid))) for c in range(ncols)]
+    aligns = (aligns + ["left"] * ncols)[:ncols]
+
+    def pad(cell: str, width: int, align: str) -> str:
+        if align == "right":
+            return cell.rjust(width)
+        if align == "center":
+            slack = width - len(cell)
+            left = slack // 2
+            return " " * left + cell + " " * (slack - left)
+        return cell.ljust(width)
+
+    def row_line(cells: list[str]) -> str:
+        return " | ".join(pad(cells[c], widths[c], aligns[c]) for c in range(ncols)).rstrip()
+
+    lines = [row_line(grid[0]), "-+-".join("-" * widths[c] for c in range(ncols))]
+    lines += [row_line(r) for r in grid[1:]]
+    return f"<pre>{html_escape(chr(10).join(lines), limit)}</pre>"
+
+
+def try_render_table(lines: list[str], i: int, *, limit: int = 12000) -> tuple[str, int] | None:
+    """If a GitHub-style pipe table starts at ``lines[i]`` (a row immediately followed by a
+    ``---|---`` delimiter), render the whole block to an aligned <pre> and return
+    ``(html, next_index)``; otherwise return ``None``. Shared by both markdown engines so tables
+    render identically in turn cards and in the chunked/section paths."""
+    if not (
+        _looks_like_table_row(lines[i])
+        and i + 1 < len(lines)
+        and _looks_like_table_separator(lines[i + 1])
+    ):
+        return None
+    header = _split_table_row(lines[i])
+    aligns = _table_alignments(_split_table_row(lines[i + 1]))
+    data_rows: list[list[str]] = []
+    j = i + 2
+    while j < len(lines) and _looks_like_table_row(lines[j]):
+        if _looks_like_table_separator(lines[j]):
+            j += 1  # absorb a repeated interior `---|---` (LLMs use it to group sections)
+            continue
+        data_rows.append(_split_table_row(lines[j]))
+        j += 1
+    if not any(cell.strip() for row in (header, *data_rows) for cell in row):
+        return None  # all-empty header/body → leave as plain text, not an empty <pre> box
+    return _render_pipe_table([header, *data_rows], aligns, limit=limit), j
+
+
 def markdownish_to_html(value: Any, *, limit: int = 12000) -> str:
     """Render common agent Markdown into Telegram HTML.
 
     This intentionally covers the small Markdown subset agents emit most often:
-    headings, bold/italic, inline code, fenced code blocks, and bullets. Unknown
-    Markdown remains readable plain text instead of leaking raw HTML.
+    headings, bold/italic, inline code, fenced code blocks, bullets, and pipe
+    tables. Unknown Markdown remains readable plain text instead of leaking raw
+    HTML.
     """
     text = sanitize_text(value, limit).strip()
     if not text:
@@ -100,8 +193,10 @@ def markdownish_to_html(value: Any, *, limit: int = 12000) -> str:
     rendered: list[str] = []
     in_code = False
     code_lines: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
         if line.strip().startswith("```"):
             if in_code:
                 rendered.append(f"<pre>{html_escape(chr(10).join(code_lines), limit)}</pre>")
@@ -110,28 +205,42 @@ def markdownish_to_html(value: Any, *, limit: int = 12000) -> str:
             else:
                 in_code = True
                 code_lines = []
+            i += 1
             continue
         if in_code:
             code_lines.append(line)
+            i += 1
+            continue
+        # Pipe table (row + `---|---` delimiter): render the block as one aligned <pre> here rather
+        # than leaking per-line `| a | b |` markup through the paragraph path.
+        table = try_render_table(lines, i, limit=limit)
+        if table is not None:
+            rendered.append(table[0])
+            i = table[1]
             continue
         stripped = line.strip()
         if not stripped:
             rendered.append("")
+            i += 1
             continue
         heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
         if heading:
             inner = _inline_markdown_html(heading.group(2).strip())
             rendered.append(inner if inner.startswith("<b>") and inner.endswith("</b>") else f"<b>{inner}</b>")
+            i += 1
             continue
         bullet = re.match(r"^[-*]\s+(.+)$", stripped)
         if bullet:
             rendered.append(f"• {_inline_markdown_html(bullet.group(1).strip())}")
+            i += 1
             continue
         numbered = re.match(r"^(\d+[.)])\s+(.+)$", stripped)
         if numbered:
             rendered.append(f"{html_escape(numbered.group(1), 16)} {_inline_markdown_html(numbered.group(2).strip())}")
+            i += 1
             continue
         rendered.append(_inline_markdown_html(line))
+        i += 1
     if in_code:
         rendered.append(f"<pre>{html_escape(chr(10).join(code_lines), limit)}</pre>")
     return "\n".join(rendered).strip()

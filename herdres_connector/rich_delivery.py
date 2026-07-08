@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 from . import config
-from .rendering import html_to_plain, split_text_chunks, worker_label
+from .rendering import html_to_plain, split_text_chunks, try_render_table, worker_label
 from .safe import sanitize_text
 from .telegram_delivery import RateLimited, TelegramClient, TelegramError
 
@@ -233,6 +233,14 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             else:
                 class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
                 parts.append(f"<pre><code{class_attr}>{_html_text(chr(10).join(code_lines), 3000)}</code></pre>")
+            previous_blank = False
+            continue
+        # Pipe table (row + `---|---` delimiter): render as an aligned <pre> block. Must precede the
+        # paragraph fallthrough, which would otherwise emit the raw `| a | b |` / `|---|` markup.
+        table = try_render_table(lines, idx, limit=3000)
+        if table is not None:
+            parts.append(table[0])
+            idx = table[1]
             previous_blank = False
             continue
         if _is_heading(line, first_block=not seen_heading, previous_blank=previous_blank):
