@@ -482,6 +482,37 @@ def _decode_samples(recognizer, samples) -> str:
     return str(getattr(stream.result, "text", "") or "").strip()
 
 
+def _join_transcript_chunks(parts: list[str]) -> str:
+    """Join windowed STT results, trimming the duplicated words where consecutive windows overlap
+    (each window re-decodes a few seconds of the previous one). Requires a >=3-word exact run to
+    treat as an overlap; otherwise falls back to a plain space-join — a little duplication beats a
+    dropped tail."""
+    out: list[str] = []
+    for piece in parts:
+        piece = str(piece or "").strip()
+        if not piece:
+            continue
+        if not out:
+            out.append(piece)
+            continue
+        prev_words = out[-1].split()
+        new_words = piece.split()
+
+        def _norm(word: str) -> str:
+            return word.lower().strip(".,!?;:")
+
+        max_k = min(len(prev_words), len(new_words), 30)
+        overlap_k = 0
+        for k in range(max_k, 2, -1):  # >=3 words to count as a real overlap
+            if [_norm(w) for w in prev_words[-k:]] == [_norm(w) for w in new_words[:k]]:
+                overlap_k = k
+                break
+        trimmed = " ".join(new_words[overlap_k:]) if overlap_k else piece
+        if trimmed:
+            out.append(trimmed)
+    return " ".join(out).strip()
+
+
 def transcribe(path: str | Path) -> str:
     recognizer = _load_stt()
     if recognizer is None:
@@ -502,18 +533,22 @@ def transcribe(path: str | Path) -> str:
         # Short clip: single pass (parakeet handles it, and one pass avoids boundary artifacts).
         if n <= chunk:
             return _decode_samples(recognizer, samples)
-        # Long clip: window it. A ~1s overlap keeps a word from being clipped exactly on a boundary;
-        # a duplicated boundary word is far less bad than a silently-empty transcript.
+        # Long clip: window it into full-size `chunk` passes spaced EVENLY so the last window ends
+        # exactly at `n`. A short trailing sliver (e.g. the final ~5s of a 32s note) makes parakeet
+        # return an EMPTY result and silently drops the end of the message (including any trailing
+        # "reply by voice" trigger); even, full-size windows keep the tail. The ~few-second overlap
+        # between windows is de-duplicated on join.
         overlap = STT_SAMPLE_RATE
         step = max(1, chunk - overlap)
+        window_count = max(2, (n - chunk + step - 1) // step + 1)
+        span = n - chunk
+        starts = [round(k * span / (window_count - 1)) for k in range(window_count)]
         parts: list[str] = []
-        i = 0
-        while i < n:
-            piece = _decode_samples(recognizer, samples[i:i + chunk])
+        for start in starts:
+            piece = _decode_samples(recognizer, samples[start:start + chunk])
             if piece:
                 parts.append(piece)
-            i += step
-        return " ".join(parts).strip()
+        return _join_transcript_chunks(parts)
     except Exception:
         return ""
 
