@@ -190,6 +190,13 @@ def _target_for_entry(entry: dict[str, Any]) -> dict[str, str]:
     return {"space_id": space_id} if space_id else {}
 
 
+# Choices whose selection needs the owner to then TYPE something (the picker's "write your own"
+# option): the turn adapter stamps these ids on AskUserQuestion's custom option and ExitPlanMode's
+# revise option. A bare number selecting one of these is refused so we never send a digit that leaves
+# the pane waiting for text the owner didn't provide.
+_FREETEXT_CHOICE_IDS = {"custom", "revise"}
+
+
 def _pending_number_reply(entry: dict[str, Any], text: str) -> tuple[str, str] | None:
     """Validate a bare-number reply against the worker's LIVE pending prompt (backend-captured
     question + choices). Returns (text_to_send, "") when valid — the digit itself, which the pane's
@@ -215,7 +222,15 @@ def _pending_number_reply(entry: dict[str, Any], text: str) -> tuple[str, str] |
         if not 1 <= index <= len(choices):
             return ("", f"That prompt has {len(choices)} choices — reply 1–{len(choices)}, or type your answer.")
         choice = choices[index - 1] if isinstance(choices[index - 1], dict) else {}
-        if not str(choice.get("value") or "").strip():
+        # tendwire dropped the private send_text 'value' from public pending.list (PR #3 review
+        # hardening), so a free-text option is now identified by its stable choice_id. The old
+        # empty-value check stays as a backstop for pre-sync daemons that still publish 'value'.
+        choice_id = str(choice.get("choice_id") or "").strip().lower()
+        value = choice.get("value")
+        needs_custom_text = choice_id in _FREETEXT_CHOICE_IDS or (
+            value is not None and not str(value).strip()
+        )
+        if needs_custom_text:
             return ("", "That choice takes a custom answer — just type it as text.")
         return (clean, "")
     return None  # no live pending with choices for this worker: pass through
