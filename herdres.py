@@ -311,7 +311,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         }
         state.save_state(store)
         if _command_succeeded(response):
-            return {"handled": True, "reply": _success_reply(response)}
+            return {"handled": True, "reply": _success_reply(response) if config.ack_on_send() else ""}
         return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": response.get("status") or "failed"}
 
 
