@@ -5,7 +5,7 @@ from pathlib import Path
 
 import herdres
 import herdres_gateway
-from herdres_connector import state
+from herdres_connector import source_sync, state
 from herdres_connector.managed_bots import managed_bot_kind_for_key, managed_bot_tokens
 from herdres_connector.rendering import render_status_overview
 from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_feed_item_delivery_html_parts, render_turn_item_html, turn_item_from_source
@@ -1247,6 +1247,43 @@ def test_only_latest_working_turn_per_worker_is_delivered(monkeypatch):
     assert telegram.sent == sent_before
 
 
+def test_delivered_turn_ledger_keeps_more_than_old_1000_limit():
+    store = {}
+    for index in range(1001):
+        state.mark_delivered(store, f"final:turn-{index}:hash", {"turn_id": f"turn-{index}"})
+
+    ledger = store["tendwire_source_delivered_turns"]
+    assert len(ledger) == 1001
+    assert "final:turn-0:hash" in ledger
+
+
+def test_same_turn_working_edits_are_rate_limited(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_WORKING_UPDATE_MIN_SECONDS", "15")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(source_sync.time, "time", lambda: now["value"])
+    store = _store()
+    telegram = FakeTelegram()
+    turns = {"turns": [{"id": "turn-current", "worker_id": "worker-1", "assistant_stream_text": "step 1", "complete": False}]}
+    tendwire = FakeTendwire(turns=turns)
+
+    first = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+    turns["turns"][0]["assistant_stream_text"] = "step 2"
+    second = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+    now["value"] = 1016.0
+    third = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+
+    assert first["feed_sent"] == 1
+    assert second["feed_sent"] == 0
+    assert third["feed_sent"] == 1
+    working_sends = [sent for sent in telegram.sent if "step 1" in sent[1]]
+    working_edits = [edited for edited in telegram.edited if "step 2" in edited[2]]
+    assert len(working_sends) == 1
+    assert len(working_edits) == 1
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert entry["last_stream_hash"] == source_sync._turn_content_hash(turns["turns"][0], "working")
+
+
 def test_current_worker_final_without_updated_at_beats_older_command_turn(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
@@ -1597,6 +1634,7 @@ def test_pinned_status_falls_back_when_general_thread_is_missing(monkeypatch):
 
 def test_working_update_edits_existing_message(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_WORKING_UPDATE_MIN_SECONDS", "0")
     store = _store()
     telegram = FakeTelegram()
     first_turns = {"turns": [{"id": "turn-1", "worker_id": "worker-1", "assistant_stream_text": "first", "complete": False}]}

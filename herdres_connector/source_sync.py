@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -337,6 +338,7 @@ _STREAM_DELIVERY_KEYS = (
     "last_stream_hash",
     "last_stream_message_id",
     "last_stream_bot_kind",
+    "last_stream_updated_at",
 )
 
 
@@ -362,6 +364,25 @@ def _entry_put(entry: dict[str, Any], key: str, value: Any) -> bool:
         return False
     entry[key] = value
     return True
+
+
+def _entry_float(entry: dict[str, Any], key: str) -> float:
+    try:
+        return float(entry.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _same_turn_working_update_too_soon(entry: dict[str, Any], turn_id: str, *, now: float) -> bool:
+    if not turn_id or entry.get("last_stream_turn_id") != turn_id:
+        return False
+    if not entry.get("last_stream_message_id"):
+        return False
+    min_seconds = config.working_update_min_seconds()
+    if min_seconds <= 0:
+        return False
+    last_at = _entry_float(entry, "last_stream_updated_at")
+    return bool(last_at and now - last_at < min_seconds)
 
 
 def _set_final_delivery(
@@ -426,6 +447,10 @@ def _set_stream_delivery(
     if bot_kind:
         changed = _entry_put(entry, "last_stream_bot_kind", bot_kind) or changed
     return changed
+
+
+def _record_stream_update_time(entry: dict[str, Any], now: float | None = None) -> None:
+    entry["last_stream_updated_at"] = f"{(time.time() if now is None else now):.3f}"
 
 
 def _changed_final_should_send_new_message(item: dict[str, Any], entry: dict[str, Any]) -> bool:
@@ -1330,8 +1355,12 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
     feed_item = turn_item_from_source(delivery_item, entry)
     if entry.get("last_stream_turn_id") == turn_id and entry.get("last_stream_hash") == content_hash:
         return False
+    now = time.time()
+    if _same_turn_working_update_too_soon(entry, turn_id, now=now):
+        return False
     if runtime.dry_run:
         _set_stream_delivery(entry, turn_id=turn_id, content_hash=content_hash, placeholder=True)
+        _record_stream_update_time(entry, now)
         return True
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
@@ -1365,6 +1394,7 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
             message_id=str(sent.get("message_id") or entry.get("last_stream_message_id") or ""),
             bot_kind=bot_kind,
         )
+        _record_stream_update_time(entry, now)
         _record_delivery_success(entry, bot_kind)
         state.bind_message_to_worker(store, entry.get("last_stream_message_id"), entry, topic_id=thread_id, kind="working", turn_id=turn_id, bot_kind=bot_kind)
         return True

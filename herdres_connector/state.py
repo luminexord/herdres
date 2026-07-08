@@ -13,6 +13,8 @@ from typing import Any
 from . import config
 from .safe import compact_ws, short_hash
 
+DELIVERED_TURN_LEDGER_LIMIT = 10000
+
 
 def load_state(path: Path | None = None) -> dict[str, Any]:
     state_file = path or config.state_path()
@@ -373,8 +375,8 @@ def mark_delivered(data: dict[str, Any], identity: str, record: dict[str, Any]) 
     if identity in ledger:
         return False
     ledger[identity] = record
-    if len(ledger) > 1000:
-        for key in list(ledger)[: len(ledger) - 1000]:
+    if len(ledger) > DELIVERED_TURN_LEDGER_LIMIT:
+        for key in list(ledger)[: len(ledger) - DELIVERED_TURN_LEDGER_LIMIT]:
             ledger.pop(key, None)
     return True
 

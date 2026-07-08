@@ -119,6 +119,19 @@ def offlock_interpane_yield_enabled(env: Any | None = None) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def working_update_min_seconds(env: Any | None = None) -> int:
+    """Minimum seconds between same-turn Working card edits.
+
+    The first Working card for a turn is still immediate. This only bounds
+    repeat edits for a turn that is already visible in Telegram.
+    """
+    source = os.environ if env is None else env
+    try:
+        return max(0, int(str(source.get("HERDR_TELEGRAM_TOPICS_WORKING_UPDATE_MIN_SECONDS", "30") or "30")))
+    except (TypeError, ValueError):
+        return 30
+
+
 def source_orphan_delete_cap(env: Any | None = None) -> int:
     """Per-pass topic-delete cap for _cleanup_topics. Bounds the first source syncs (which prune many
     legacy per-worker topics) so the deletes amortize over several timer ticks instead of one long
