@@ -118,6 +118,17 @@ def ack_on_send(env: Any | None = None) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def stable_worker_key_enabled(env: Any | None = None) -> bool:
+    """Reconcile worker entries by tendwire's meta.stable_key (a session-independent per-pane key) so a
+    worker-id re-letter across a herdr restart (claude-2 -> claude-2-2 for the same terminal) maps back
+    to the SAME entry/topic instead of stranding a duplicate. Default ON and safe-degrading: when the
+    snapshot carries no stable_key (older tendwire) it falls back to worker-id keying, i.e. today's
+    behavior. HERDRES_STABLE_WORKER_KEY=0 forces the legacy worker-id-only keying."""
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_STABLE_WORKER_KEY", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def delete_topic_icon_service_messages(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDR_TELEGRAM_TOPICS_DELETE_ICON_MESSAGES", "1") or "").strip().lower()

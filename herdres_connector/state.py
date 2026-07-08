@@ -173,6 +173,45 @@ def find_entry_key_by_worker(data: dict[str, Any], worker_id: str) -> str | None
     return None
 
 
+def worker_stable_key(worker: dict[str, Any]) -> str:
+    """tendwire's session-independent per-pane key (meta.stable_key), or "" when the worker exposes no
+    stable terminal identity. Lets a re-lettered worker id reconcile back to its existing entry."""
+    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+    return compact_ws(meta.get("stable_key"), 160)
+
+
+def find_entry_key_by_stable_key(data: dict[str, Any], stable_key: str) -> str | None:
+    if not stable_key:
+        return None
+    for key, entry in source_worker_entries(data).items():
+        if str(entry.get("tendwire_stable_key") or "") == stable_key:
+            return key
+    return None
+
+
+def _worker_matches_entry(worker: dict[str, Any], entry: dict[str, Any]) -> bool:
+    """Sanity gate for stable-key adoption: guard against a recycled pane id landing on an unrelated
+    entry by requiring the same agent and space (both stable for a terminal; cwd is deliberately NOT
+    checked, since a terminal legitimately changes directory)."""
+    return (
+        worker_agent(worker) == str(entry.get("agent") or "")
+        and compact_ws(worker.get("space_id"), 160) == str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+    )
+
+
+def resolve_worker_entry_key(data: dict[str, Any], worker: dict[str, Any]) -> str | None:
+    """Resolve a snapshot worker to its existing entry key. Prefer tendwire's stable per-pane key
+    (survives worker-id re-lettering across herdr restarts) when present, enabled, and passing the
+    agent/space sanity gate; otherwise fall back to worker-id keying (unchanged legacy behavior)."""
+    if config.stable_worker_key_enabled():
+        stable_key = worker_stable_key(worker)
+        if stable_key:
+            key = find_entry_key_by_stable_key(data, stable_key)
+            if key is not None and _worker_matches_entry(worker, source_worker_entries(data).get(key) or {}):
+                return key
+    return find_entry_key_by_worker(data, compact_ws(worker.get("id"), 160))
+
+
 def find_worker_entry_by_id(data: dict[str, Any], worker_id: str) -> tuple[str, dict[str, Any]] | tuple[None, None]:
     key = find_entry_key_by_worker(data, worker_id)
     if key is None:
@@ -329,7 +368,10 @@ def upsert_worker_entry(data: dict[str, Any], worker: dict[str, Any], *, topic_i
     agent = worker_agent(worker)
     meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
     model = compact_ws(worker.get("model") or meta.get("model"), 80)
-    key = find_entry_key_by_worker(data, worker_id)
+    stable_key = worker_stable_key(worker)
+    # Resolve by stable per-pane key first (so a re-lettered worker id re-points its EXISTING entry and
+    # keeps its topic), else by worker id. The entry KEY string is never rewritten — only the fields.
+    key = resolve_worker_entry_key(data, worker)
     created = False
     if key is None:
         key = f"worker:{worker_id}:{short_hash(fingerprint or worker_id, 10)}"
@@ -358,6 +400,8 @@ def upsert_worker_entry(data: dict[str, Any], worker: dict[str, Any], *, topic_i
         entry["topic_id"] = str(topic_id)
     if model:
         entry["model"] = model
+    if stable_key:
+        entry["tendwire_stable_key"] = stable_key
     panes[key] = entry
     return key, entry, created
 
