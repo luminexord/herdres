@@ -128,6 +128,18 @@ def stable_worker_key_enabled(env: Any | None = None) -> bool:
     value = str(source.get("HERDRES_STABLE_WORKER_KEY", "1") or "").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
+def reap_closed_worker_topics(env: Any | None = None) -> bool:
+    """Worker mode only: delete the Telegram topic of a worker that has durably FINISHED and left the
+    tendwire snapshot. herdr/tendwire re-letters worker ids positionally across restarts (claude-2 ->
+    claude-2-2 for a fresh terminal), so the connector mints a new topic for the re-registered pane and
+    the old one strands forever (worker-mode cleanup otherwise only deletes done-council topics). This
+    reaps those strays and frees their squatted names. DESTRUCTIVE (deletes finished topics + their
+    scrollback), so default OFF; HERDRES_REAP_CLOSED_WORKER_TOPICS=1 opts in. Guarded by finished-status
+    + N-pass absence + a non-empty-snapshot check + the per-pass delete cap."""
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_REAP_CLOSED_WORKER_TOPICS", "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
 
 def delete_topic_icon_service_messages(env: Any | None = None) -> bool:
     source = os.environ if env is None else env

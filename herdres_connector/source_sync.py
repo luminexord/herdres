@@ -951,6 +951,11 @@ def _sync_topic_pinned(store: dict[str, Any], entry: dict[str, Any], runtime: Sy
 
 _RENAME_ATTEMPT_CAP = 3
 
+# Consecutive sync passes a finished worker must be ABSENT from the tendwire snapshot before its
+# stranded topic is reaped (see config.reap_closed_worker_topics). A small streak absorbs a one-tick
+# partial snapshot without letting a genuinely-gone worker linger.
+_REAP_ABSENCE_STREAK = 2
+
 
 def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, Any]]) -> dict[str, str]:
     """Map each not-yet-topiced worker id -> a unique topic name (cwd basename, numbered on collision).
@@ -971,6 +976,13 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
     for entry in entries.values():
         if entry.get("topic_id") and entry.get("topic_name"):
             reserved.add(compact_ws(entry.get("topic_name"), 120).casefold())
+    # Names currently backing a real topic — a de-number target must be absent from this set (i.e. no
+    # other topic already holds the bare base name).
+    all_named = {
+        compact_ws(e.get("topic_name"), 120).casefold()
+        for e in entries.values()
+        if e.get("topic_id") and e.get("topic_name")
+    }
     keeps: dict[str, bool] = {}
     ordered = sorted(workers, key=lambda w: compact_ws(w.get("id"), 160))
     for worker in ordered:
@@ -994,6 +1006,21 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
         key = state.resolve_worker_entry_key(store, worker)
         existing = entries.get(key) if key is not None else None
         has_topic = bool(existing and existing.get("topic_id"))
+        # De-number a connector-minted suffix once its base name is free again. The marker
+        # (connector_numbered_base) is ONLY stamped by the worker-topic reaper when it deletes the
+        # namesake that forced the " N", so this can never rename a user's genuinely-numbered label.
+        marker = compact_ws((existing or {}).get("connector_numbered_base"), 120)
+        if has_topic and marker and _worker_is_open(worker):
+            current = compact_ws(existing.get("topic_name"), 120)
+            numbered_variant = (
+                current.casefold() != marker.casefold()
+                and current.casefold().startswith(marker.casefold() + " ")
+                and current[len(marker) + 1 :].strip().isdigit()
+            )
+            if numbered_variant and marker.casefold() not in all_named and marker.casefold() not in reserved:
+                renames[wid] = marker
+                reserved.add(marker.casefold())
+                continue
         if has_topic and keeps.get(wid, True):
             continue  # topic name still matches its desired base; locked
         if has_topic and not _worker_is_open(worker):
@@ -1076,12 +1103,14 @@ def _sync_sources(
             if renamed.get("ok"):
                 entry["topic_name"] = worker_topic_renames[wid]
                 entry.pop("rename_attempts", None)
+                entry.pop("connector_numbered_base", None)  # de-number (or any rename) satisfies the marker
             elif _topic_missing(renamed.get("error")):
                 # the topic is gone (hand-deleted): drop the mapping so _ensure_topic recreates it
                 # under the new name instead of renaming a ghost forever.
                 entry.pop("topic_id", None)
                 entry["topic_name"] = worker_topic_renames[wid]
                 entry.pop("rename_attempts", None)
+                entry.pop("connector_numbered_base", None)
             else:
                 entry["rename_attempts"] = int(entry.get("rename_attempts") or 0) + 1
         model = model_by_worker.get(wid)
@@ -1151,7 +1180,31 @@ def _sync_sources(
     return counts
 
 
-def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, Any]:
+def _stamp_denumber_marker(store: dict[str, Any], base_name: str, present_worker_ids: set[str] | None) -> None:
+    """After reaping the topic named `base_name`, mark the sibling still carrying a connector-minted
+    "base N" suffix so _assign_worker_topic_names de-numbers it back to the now-free base. Only ever
+    marks a present (live) sibling; a user's own "Sonnet 4"-style label is never a bare-base sibling."""
+    base = compact_ws(base_name, 120)
+    if not base:
+        return
+    low = base.casefold()
+    for entry in state.source_worker_entries(store).values():
+        wid = compact_ws(entry.get("tendwire_worker_id") or entry.get("worker_id"), 160)
+        if present_worker_ids is not None and wid not in present_worker_ids:
+            continue
+        current = compact_ws(entry.get("topic_name"), 120)
+        cur = current.casefold()
+        if cur != low and cur.startswith(low + " ") and current[len(base) + 1 :].strip().isdigit():
+            entry["connector_numbered_base"] = base
+
+
+def _cleanup_topics(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    snapshot_worker_ids: set[str] | None = None,
+) -> dict[str, Any]:
     result = {"deleted": 0, "failed": 0, "pruned": 0, "changed": False}
     visible_space_topics = {
         str(entry.get("topic_id"))
@@ -1165,6 +1218,61 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
     # per-worker topics at once) amortizes the deletes over ticks instead of one burst under the lock.
     delete_cap = config.source_orphan_delete_cap()
     deletes_issued = 0
+
+    # Worker-mode reaper (opt-in, DESTRUCTIVE): delete topics of workers that have durably FINISHED and
+    # left the tendwire snapshot. Positional worker-id churn across herdr restarts (claude-2 ->
+    # claude-2-2 for a fresh terminal) otherwise strands the old pane's topic forever, and its squatted
+    # name forces the live pane's topic to a " 2" suffix. Guards: opt-in flag, finished status, absence
+    # across _REAP_ABSENCE_STREAK passes, a non-empty snapshot, and the shared per-pass delete cap.
+    reap_enabled = (
+        config.reap_closed_worker_topics()
+        and config.source_topic_mode() == "worker"
+        and snapshot_worker_ids is not None
+    )
+    if reap_enabled and not snapshot_worker_ids and state.source_worker_entries(store):
+        reap_enabled = False  # a transient empty snapshot must never mass-reap live topics
+    if reap_enabled:
+        for key, entry in list(state.source_worker_entries(store).items()):
+            wid = compact_ws(entry.get("tendwire_worker_id") or entry.get("worker_id"), 160)
+            if wid and wid in snapshot_worker_ids:
+                if entry.pop("reap_miss_count", None) is not None:
+                    result["changed"] = True  # worker reappeared: reset its absence streak
+                continue
+            if not _entry_status_is_finished(entry):
+                continue  # never reap a live/unfinished worker on mere snapshot absence
+            topic_id = str(entry.get("topic_id") or "")
+            if runtime.dry_run:
+                # Preview every finished+absent topic (no streak, no state mutation).
+                if topic_id and topic_id not in deleted_topic_ids:
+                    result["deleted"] += 1
+                    deleted_topic_ids.add(topic_id)
+                    result["changed"] = True
+                continue
+            misses = min(int(entry.get("reap_miss_count") or 0) + 1, _REAP_ABSENCE_STREAK)
+            if misses < _REAP_ABSENCE_STREAK:
+                entry["reap_miss_count"] = misses
+                result["changed"] = True
+                continue
+            if not topic_id:
+                panes.pop(key, None)  # finished, gone, no topic: dead cruft
+                result["pruned"] += 1
+                result["changed"] = True
+                continue
+            if deletes_issued >= delete_cap:
+                continue  # per-pass delete budget spent; retry next tick (entry still eligible)
+            deletes_issued += 1
+            deleted = runtime.telegram.delete_topic(chat_id, topic_id)
+            if not deleted.get("ok") and not _topic_missing(deleted.get("error")):
+                result["failed"] += 1
+                entry["last_topic_delete_error"] = compact_ws(deleted.get("error"), 240)
+                continue
+            if deleted.get("ok"):
+                result["deleted"] += 1
+                deleted_topic_ids.add(topic_id)
+                audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": "reaped_closed_worker_topic"})
+            _stamp_denumber_marker(store, compact_ws(entry.get("topic_name"), 120), snapshot_worker_ids)
+            result["changed"] = True
+            panes.pop(key, None)
 
     def clear_worker_topic_refs(topic_id: str, reason: str) -> None:
         for worker_key, worker_entry in list(state.source_worker_entries(store).items()):
@@ -1910,7 +2018,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         )
     )
     routing_repaired += _repair_space_mode_routing_state(store)
-    topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id)
+    snapshot_worker_ids = {compact_ws(worker.get("id"), 160) for worker in _workers(snapshot)}
+    snapshot_worker_ids.discard("")
+    topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id, snapshot_worker_ids=snapshot_worker_ids)
     changed = changed or bool(
         source_counts["created"]
         or source_counts["updated"]
