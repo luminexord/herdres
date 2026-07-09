@@ -1,12 +1,14 @@
 """Worker-mode topic dedup: the reaper for stranded closed-worker topics (HERDRES_REAP_CLOSED_WORKER_TOPICS)
-and the reaper-gated de-numbering of the live sibling's " N" suffix.
+and the de-numbering of the live sibling's " N" suffix.
 
 Background: herdr/tendwire re-letters worker ids positionally across restarts (claude-2 -> claude-2-2 for
 a fresh terminal), so the connector mints a new topic for the re-registered pane while the old one strands
 (worker-mode cleanup otherwise only deletes done-council topics). The old topic keeps its name reserved,
-forcing the live pane to a "telegram-bot 2" suffix. These tests pin the opt-in reaper (finished + N-pass
-absence + non-empty-snapshot + delete-cap guards) and the de-numbering that only ever touches a sibling the
-reaper explicitly marked (never a user-authored "Sonnet 4"-style label).
+forcing the live pane to a "telegram-bot 2" suffix. These tests pin the opt-in reaper (STRICT closed/failed
+liveness — never 'done'/'idle' — + N-pass absence + non-degraded-snapshot + delete-cap guards) and the
+de-numbering, which fires only for a connector_numbered_base marker stamped at NUMBERING time (the moment
+the connector itself minted the " N"). That numbering-time provenance is the guard that a user-authored
+"Sonnet 4"-style label is never silently collapsed; the reaper never stamps markers by name-pattern.
 """
 from __future__ import annotations
 
@@ -110,6 +112,28 @@ def test_reaper_never_touches_unfinished_absent(monkeypatch):
     assert len(state.source_worker_entries(store)) == 1
 
 
+def test_reaper_never_reaps_done_idle_absent(monkeypatch):
+    # CRITICAL: herdr reports agent_status='done' for a pane that merely finished its last turn while the
+    # terminal stays OPEN — an ordinary idle agent (normalized_status('done') == 'idle', _worker_is_open
+    # True). Such a LIVE pane blipping out of the snapshot must NEVER be reaped, even past the streak;
+    # only a genuinely closed/failed pane is reap-eligible. A closed absent pane in the same store IS
+    # reaped, proving the gate discriminates by real liveness, not by the finished-council predicate.
+    monkeypatch.setenv("HERDRES_REAP_CLOSED_WORKER_TOPICS", "1")
+    store = _store_with([
+        _wentry("anchor", 299, "anchor", "working"),    # live anchor stays present -> snapshot stays healthy
+        _wentry("done-pane", 300, "alpha", "done"),     # LIVE idle agent (finished a turn), absent this pass
+        _wentry("closed-pane", 301, "beta", "closed"),  # genuinely gone, absent this pass
+    ])
+    rt = _runtime()
+    _clean(store, rt, present={"anchor"}, times=_REAP_ABSENCE_STREAK + 2)
+    assert "300" not in rt.telegram.deleted_topics    # 'done' (idle, live) pane never reaped
+    assert "301" in rt.telegram.deleted_topics         # closed pane reaped after the streak
+    survivors = {e["tendwire_worker_id"] for e in state.source_worker_entries(store).values()}
+    assert "done-pane" in survivors and "closed-pane" not in survivors
+    done_entry = next(e for e in state.source_worker_entries(store).values() if e["tendwire_worker_id"] == "done-pane")
+    assert "reap_miss_count" not in done_entry         # a live 'done' pane never even accrues the streak
+
+
 def test_reaper_empty_snapshot_guard(monkeypatch):
     # A transient fully-empty snapshot must never mass-reap while entries exist.
     monkeypatch.setenv("HERDRES_REAP_CLOSED_WORKER_TOPICS", "1")
@@ -118,6 +142,25 @@ def test_reaper_empty_snapshot_guard(monkeypatch):
     _clean(store, rt, present=set(), times=_REAP_ABSENCE_STREAK + 2)
     assert rt.telegram.deleted_topics == []
     assert len(state.source_worker_entries(store)) == 1
+
+
+def test_reaper_partial_snapshot_guard(monkeypatch):
+    # A DEGRADED/partial snapshot (some workers transiently missing) that shows NONE of the known-LIVE
+    # workers is untrustworthy: the absent closed entry must not march toward a reap on it. Only once a
+    # known-live worker reappears does the pass count as healthy and the streak advance.
+    monkeypatch.setenv("HERDRES_REAP_CLOSED_WORKER_TOPICS", "1")
+    store = _store_with([
+        _wentry("live-1", 200, "alpha", "idle"),      # a known-live anchor
+        _wentry("claude", 124, "claude", "closed"),   # stranded, absent
+    ])
+    rt = _runtime()
+    # Degraded passes: the snapshot shows only an unrelated id, none of our known-live workers -> skip.
+    _clean(store, rt, present={"stranger"}, times=_REAP_ABSENCE_STREAK + 2)
+    assert rt.telegram.deleted_topics == []
+    assert all("reap_miss_count" not in e for e in state.source_worker_entries(store).values())
+    # Healthy passes: the live anchor is back in the snapshot -> the absent closed entry reaps after the streak.
+    _clean(store, rt, present={"live-1"}, times=_REAP_ABSENCE_STREAK)
+    assert rt.telegram.deleted_topics == ["124"]
 
 
 def test_reaper_disabled_in_space_mode(monkeypatch):
@@ -158,39 +201,70 @@ def test_reaper_dry_run_previews_without_side_effects(monkeypatch):
     assert "reap_miss_count" not in next(iter(state.source_worker_entries(store).values()))
 
 
-# --- reaper-gated de-numbering ----------------------------------------------
+# --- numbering-time provenance + de-numbering -------------------------------
 
-def test_reap_marks_live_sibling_then_assign_denumbers(monkeypatch):
-    monkeypatch.setenv("HERDRES_REAP_CLOSED_WORKER_TOPICS", "1")
-    store = _store_with([
-        _wentry("claude-2", 26, "telegram-bot", "closed"),        # stranded, absent
-        _wentry("claude-2-2", 184, "telegram-bot 2", "working"),  # live numbered sibling
-    ])
-    rt = _runtime()
-    _clean(store, rt, present={"claude-2-2"}, times=_REAP_ABSENCE_STREAK)
-    assert rt.telegram.deleted_topics == ["26"]
-    live = next(e for e in state.source_worker_entries(store).values() if e["tendwire_worker_id"] == "claude-2-2")
-    assert live.get("connector_numbered_base") == "telegram-bot"   # marker stamped on the freed base's sibling
-
-    # next assignment pass proposes the de-number rename (base is now free).
+def test_numbering_time_provenance_marks_minted_suffix(monkeypatch):
+    # A NEW pane whose desired base is reserved by a stranded namesake is minted "<base> N"; the connector
+    # records connector_numbered_base at THAT numbering time (via _sync_sources), NOT by the reaper — this
+    # is the true provenance a later de-number relies on.
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    store = _store_with([_wentry("claude-2", 26, "telegram-bot", "closed")])   # stranded, holds the base
     worker = {"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1",
-              "meta": {"label": "telegram-bot 2"}}
-    _assigned, renames = _assign_worker_topic_names(store, [worker])
-    assert renames.get("claude-2-2") == "telegram-bot"
+              "fingerprint": "fp", "meta": {"label": "telegram-bot"}}
+    telegram = FakeTelegram()
+    sync_once(store, SyncRuntime(FakeTendwire(workers=[worker]), telegram, with_outbox=False))
+    live = next(e for e in state.source_worker_entries(store).values() if e["tendwire_worker_id"] == "claude-2-2")
+    assert live.get("topic_name") == "telegram-bot 2"             # numbered around the reserved base
+    assert live.get("connector_numbered_base") == "telegram-bot"  # provenance stamped at mint time
+
+
+def test_reap_frees_base_then_denumbers_minted_sibling(monkeypatch):
+    # End-to-end: the stranded closed namesake reaps, freeing the base; the live sibling that the connector
+    # minted "<base> 2" (carrying the numbering-time marker) de-numbers back to the bare base — no reaper
+    # name-pattern stamping involved.
+    monkeypatch.setenv("HERDRES_REAP_CLOSED_WORKER_TOPICS", "1")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    store = _store_with([
+        _wentry("claude-2", 26, "telegram-bot", "closed"),                    # stranded, absent
+        _wentry("claude-2-2", 184, "telegram-bot 2", "working",
+                connector_numbered_base="telegram-bot"),                       # minted sibling w/ provenance
+    ])
+    worker = {"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1",
+              "fingerprint": "fp", "meta": {"label": "telegram-bot"}}
+    telegram = FakeTelegram()
+    for _ in range(_REAP_ABSENCE_STREAK + 2):
+        sync_once(store, SyncRuntime(FakeTendwire(workers=[worker]), telegram, with_outbox=False))
+    assert "26" in telegram.deleted_topics
+    live = next(e for e in state.source_worker_entries(store).values() if e["tendwire_worker_id"] == "claude-2-2")
+    assert live.get("topic_name") == "telegram-bot"      # de-numbered back to the freed base
+    assert "connector_numbered_base" not in live          # marker cleared after the rename
+
+
+def test_assign_stamps_numbered_base_for_new_pane():
+    # Unit-level provenance: a not-yet-topiced pane forced to "<base> 2" is returned in numbered_bases,
+    # while the bare-base pane and a genuinely unique base are NOT (nothing was minted onto them).
+    store = _store_with([_wentry("w-a", 90, "foo", "working")])  # w-a already holds "foo"
+    workers = [
+        {"id": "w-a", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}},
+        {"id": "w-b", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}},
+        {"id": "w-c", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "bar"}},
+    ]
+    _assigned, _renames, numbered_bases = _assign_worker_topic_names(store, workers)
+    assert numbered_bases == {"w-b": "foo"}   # only the minted "foo 2" carries provenance
 
 
 def test_denumber_requires_the_marker():
-    # A live worker whose desired name IS its numbered label, without the reaper marker, is left alone —
-    # this is the guard that a user-authored "telegram-bot 2" label is never silently collapsed.
+    # A live worker whose desired name IS its numbered label, without the numbering-time marker, is left
+    # alone — this is the guard that a user-authored "telegram-bot 2" label is never silently collapsed.
     worker = {"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1",
               "meta": {"label": "telegram-bot 2"}}
     store = _store_with([_wentry("claude-2-2", 184, "telegram-bot 2", "working")])
-    _assigned, renames = _assign_worker_topic_names(store, [worker])
+    _assigned, renames, _bases = _assign_worker_topic_names(store, [worker])
     assert "claude-2-2" not in renames
 
     store = _store_with([_wentry("claude-2-2", 184, "telegram-bot 2", "working",
                                  connector_numbered_base="telegram-bot")])
-    _assigned, renames = _assign_worker_topic_names(store, [worker])
+    _assigned, renames, _bases = _assign_worker_topic_names(store, [worker])
     assert renames.get("claude-2-2") == "telegram-bot"
 
 
@@ -204,24 +278,24 @@ def test_denumber_holds_off_while_base_still_taken():
         {"id": "claude-x", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "telegram-bot"}},
         {"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "telegram-bot 2"}},
     ]
-    _assigned, renames = _assign_worker_topic_names(store, workers)
+    _assigned, renames, _bases = _assign_worker_topic_names(store, workers)
     assert "claude-2-2" not in renames
 
 
-def test_denumber_skips_closed_sibling(monkeypatch):
-    # Reaper marks only PRESENT siblings; a closed sibling is never renamed anyway.
+def test_reaper_never_stamps_denumber_marker_by_name_pattern(monkeypatch):
+    # Provenance is numbering-time only. When the reaper deletes a stranded "<base>" topic it must NOT
+    # stamp connector_numbered_base on a live sibling merely because its name matches "<base> N" — that
+    # name-pattern heuristic (now removed) could collapse a user's own "Sonnet 4" label. Only a mint stamps.
     monkeypatch.setenv("HERDRES_REAP_CLOSED_WORKER_TOPICS", "1")
     store = _store_with([
-        _wentry("claude-2", 26, "telegram-bot", "closed"),
-        _wentry("claude-2-2", 184, "telegram-bot 2", "closed"),  # sibling also closed/absent
+        _wentry("claude-2", 26, "Sonnet", "closed"),     # stranded namesake "Sonnet" -> reaped
+        _wentry("sonnet-b", 184, "Sonnet 4", "working"),  # user-authored label matching "Sonnet N", NO marker
     ])
     rt = _runtime()
-    # A decoy present id keeps the snapshot non-empty (both claude-2 and its sibling are absent/closed).
-    _clean(store, rt, present={"decoy"}, times=_REAP_ABSENCE_STREAK)
-    # claude-2's "telegram-bot" reaped; the absent sibling was NOT marked (marker only touches present ones).
-    assert "26" in rt.telegram.deleted_topics
-    for e in state.source_worker_entries(store).values():
-        assert "connector_numbered_base" not in e
+    _clean(store, rt, present={"sonnet-b"}, times=_REAP_ABSENCE_STREAK)
+    assert rt.telegram.deleted_topics == ["26"]           # stranded "Sonnet" reaped
+    live = next(e for e in state.source_worker_entries(store).values() if e["tendwire_worker_id"] == "sonnet-b")
+    assert "connector_numbered_base" not in live          # reaper never stamps by name-pattern
 
 
 def test_normal_numbering_unchanged():
@@ -233,7 +307,7 @@ def test_normal_numbering_unchanged():
         {"id": "w-b", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}},
         {"id": "w-c", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "bar"}},
     ]
-    assigned, renames = _assign_worker_topic_names(store, workers)
+    assigned, renames, _bases = _assign_worker_topic_names(store, workers)
     assert assigned.get("w-b") == "foo 2"   # distinct same-base live pane still numbered
     assert assigned.get("w-c") == "bar"     # unique base stays bare
     assert "w-a" not in renames             # existing holder untouched
