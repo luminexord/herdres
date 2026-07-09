@@ -975,7 +975,7 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
     ordered = sorted(workers, key=lambda w: compact_ws(w.get("id"), 160))
     for worker in ordered:
         wid = compact_ws(worker.get("id"), 160)
-        key = state.find_entry_key_by_worker(store, wid) if wid else None
+        key = state.resolve_worker_entry_key(store, worker) if wid else None
         existing = entries.get(key) if key is not None else None
         if not existing or not existing.get("topic_id") or not existing.get("topic_name"):
             continue
@@ -991,7 +991,7 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
         wid = compact_ws(worker.get("id"), 160)
         if not wid:
             continue
-        key = state.find_entry_key_by_worker(store, wid)
+        key = state.resolve_worker_entry_key(store, worker)
         existing = entries.get(key) if key is not None else None
         has_topic = bool(existing and existing.get("topic_id"))
         if has_topic and keeps.get(wid, True):
@@ -1055,7 +1055,7 @@ def _sync_sources(
     workers_by_space: dict[str, list[dict[str, Any]]] = {}
     for worker in _workers(snapshot):
         space_id = compact_ws(worker.get("space_id"), 160)
-        existing_key = state.find_entry_key_by_worker(store, compact_ws(worker.get("id"), 160))
+        existing_key = state.resolve_worker_entry_key(store, worker)
         before = dict(state.source_worker_entries(store).get(existing_key) or {}) if existing_key is not None else {}
         _key, entry, created = state.upsert_worker_entry(store, worker)
         entry["status"] = _effective_worker_status(worker, turn_status_by_worker)
