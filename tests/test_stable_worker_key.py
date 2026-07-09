@@ -93,6 +93,64 @@ def test_new_stable_key_creates_entry():
     assert len(state.source_worker_entries(store)) == 2
 
 
+# --- collision hardening: never fuse two distinct panes into one topic --------
+
+def test_closed_entry_collision_does_not_adopt():
+    # A new pane whose stable_key collides with an OLD, FINISHED entry must NOT adopt it (that would
+    # merge a dead agent's history into the new topic). It falls through to worker-id keying -> a
+    # fresh entry with its own topic, leaving the dead pane untouched.
+    store = _store()
+    dead_key, dead_entry, _c = state.upsert_worker_entry(
+        store, _worker("claude-2", stable="K1", status="closed"), topic_id="26"
+    )
+    new_key, new_entry, created = state.upsert_worker_entry(
+        store, _worker("claude-9", stable="K1", status="working"), topic_id="30"
+    )
+    assert created is True                                 # did NOT adopt the closed ghost
+    assert new_key != dead_key
+    assert new_entry["topic_id"] == "30"                   # its own topic
+    assert dead_entry["topic_id"] == "26"                  # dead pane untouched
+    assert dead_entry["tendwire_worker_id"] == "claude-2"  # not re-pointed
+    assert len(state.source_worker_entries(store)) == 2
+
+
+def test_stable_key_prefers_live_over_closed(monkeypatch):
+    # When the SAME stable_key exists on both a closed ghost and a live entry, a re-letter adopts the
+    # LIVE one (the skip-closed filter must not break legitimate reuse).
+    store = _store()
+    monkeypatch.setenv("HERDRES_STABLE_WORKER_KEY", "0")   # seed two entries sharing K1 (no adoption)
+    dead_key, _de, _dc = state.upsert_worker_entry(store, _worker("claude-2", stable="K1", status="closed"), topic_id="26")
+    live_key, _le, _lc = state.upsert_worker_entry(store, _worker("claude-3", stable="K1", status="working"), topic_id="28")
+    assert dead_key != live_key
+    monkeypatch.setenv("HERDRES_STABLE_WORKER_KEY", "1")
+    key, entry, created = state.upsert_worker_entry(store, _worker("claude-3-2", stable="K1", status="working"))
+    assert created is False
+    assert key == live_key                                 # adopted the LIVE entry, not the ghost
+    assert entry["topic_id"] == "28"
+    assert entry["tendwire_worker_id"] == "claude-3-2"
+    assert len(state.source_worker_entries(store)) == 2
+
+
+def test_two_live_entries_same_key_falls_back(monkeypatch):
+    # Two DISTINCT live panes ended up sharing a stable_key. A THIRD worker with that key must NOT be
+    # silently fused onto either — the resolver detects the duplicate and degrades to worker-id keying.
+    store = _store()
+    monkeypatch.setenv("HERDRES_STABLE_WORKER_KEY", "0")   # seed two live entries sharing K1
+    key_a, _ea, _ca = state.upsert_worker_entry(store, _worker("claude-2", stable="K1", status="working"), topic_id="26")
+    key_b, _eb, _cb = state.upsert_worker_entry(store, _worker("claude-3", stable="K1", status="working"), topic_id="28")
+    assert key_a != key_b
+    assert len(state.source_worker_entries(store)) == 2
+
+    # A direct query returns None (ambiguous), NOT the first match.
+    assert state.find_entry_key_by_stable_key(store, "K1") is None
+
+    monkeypatch.setenv("HERDRES_STABLE_WORKER_KEY", "1")
+    key_c, _ec, created = state.upsert_worker_entry(store, _worker("claude-9", stable="K1", status="working"))
+    assert created is True                                 # new entry, no fusion
+    assert key_c not in {key_a, key_b}
+    assert len(state.source_worker_entries(store)) == 3
+
+
 # --- end-to-end: restart reuses the topic, no " 2" -------------------------
 
 def test_sync_once_restart_reuses_topic_no_duplicate(monkeypatch):

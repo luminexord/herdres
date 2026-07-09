@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import fcntl
 import threading
 from contextlib import contextmanager
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config
+from .rendering import normalized_status
 from .safe import compact_ws, short_hash
 
 DELIVERED_TURN_LEDGER_LIMIT = 10000
@@ -180,12 +182,40 @@ def worker_stable_key(worker: dict[str, Any]) -> str:
     return compact_ws(meta.get("stable_key"), 160)
 
 
+def _entry_is_live(entry: dict[str, Any]) -> bool:
+    """Liveness gate for stable-key adoption: an entry is adoptable only while it has NOT reached a
+    terminal state. Prefer the effective status (stamped by the sync loop), else the raw tendwire
+    status. A closed/failed entry is a dead pane whose stable_key a NEW pane must not re-adopt."""
+    return normalized_status(entry.get("status") or entry.get("tendwire_raw_status")) not in {"closed", "failed"}
+
+
 def find_entry_key_by_stable_key(data: dict[str, Any], stable_key: str) -> str | None:
+    """Resolve a stable per-pane key to an existing entry, but ONLY when adoption is unambiguous:
+
+    - Skip closed/failed entries: a new pane whose key collides with an OLD, finished entry must NOT
+      land on it — it falls through (caller degrades to worker-id keying -> a fresh entry).
+    - Require exactly one LIVE match. If two or more live entries share the key (two distinct panes
+      ended up with the same stable_key), adopting either would fuse their histories, so adopt NONE
+      and leave a breadcrumb — the caller degrades to worker-id keying instead.
+
+    Returns the sole live matching entry key, or None."""
     if not stable_key:
         return None
-    for key, entry in source_worker_entries(data).items():
-        if str(entry.get("tendwire_stable_key") or "") == stable_key:
-            return key
+    live_matches = [
+        key
+        for key, entry in source_worker_entries(data).items()
+        if str(entry.get("tendwire_stable_key") or "") == stable_key and _entry_is_live(entry)
+    ]
+    if len(live_matches) == 1:
+        return live_matches[0]
+    if len(live_matches) > 1:
+        # Ambiguous: more than one live pane claims this stable_key. Never silently take the first
+        # (that fuses two agents into one topic) — fall back to worker-id keying.
+        print(
+            f"herdres stable-key collision: {len(live_matches)} live entries share stable_key "
+            f"{stable_key!r} ({', '.join(sorted(live_matches))}); falling back to worker-id keying",
+            file=sys.stderr,
+        )
     return None
 
 
