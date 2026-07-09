@@ -147,6 +147,19 @@ def _entry_status_is_finished(entry: dict[str, Any]) -> bool:
     return _worker_status_is_finished(entry.get("tendwire_raw_status") or entry.get("status"))
 
 
+def _entry_is_reapable(entry: dict[str, Any]) -> bool:
+    """Reap-eligibility for the worker-topic reaper: ONLY a genuinely closed/failed entry.
+
+    This is the strict inverse of _worker_is_open on the persisted entry fields — deliberately NOT
+    _entry_status_is_finished, which also counts 'done'/'complete' as finished (the done-council
+    cleanup relies on that, so it is left untouched). Here 'done'/'idle'/'working' are all LIVE:
+    normalized_status('done') == 'idle', an idle agent whose terminal is still open. herdr reports
+    agent_status='done' for a pane that merely finished its last turn, so such a pane dropping out of
+    a snapshot for a reconcile-lag blip must NEVER be reaped (it would take the whole scrollback).
+    Only 'closed'/'failed' — a truly gone pane — is reapable."""
+    return normalized_status(entry.get("tendwire_raw_status") or entry.get("status")) in {"closed", "failed"}
+
+
 def _entry_is_council_topic(entry: dict[str, Any]) -> bool:
     """Ephemeral gitmoot delegation/council entries (gm-local-as workers, "gitmoot · local-as"
     delegation spaces, "Council · …" topics). The markers are deliberately PRECISE: a bare "gitmoot"
@@ -951,8 +964,15 @@ def _sync_topic_pinned(store: dict[str, Any], entry: dict[str, Any], runtime: Sy
 
 _RENAME_ATTEMPT_CAP = 3
 
+# Consecutive sync passes a finished worker must be ABSENT from the tendwire snapshot before its
+# stranded topic is reaped (see config.reap_closed_worker_topics). A small streak absorbs a one-tick
+# partial snapshot without letting a genuinely-gone worker linger.
+_REAP_ABSENCE_STREAK = 2
 
-def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, Any]]) -> dict[str, str]:
+
+def _assign_worker_topic_names(
+    store: dict[str, Any], workers: list[dict[str, Any]]
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
     """Map each not-yet-topiced worker id -> a unique topic name (cwd basename, numbered on collision).
     Names already bound to a created topic are reserved and never renumbered, so numbers stay stable as
     panes come and go. Ordered by worker id for deterministic numbering."""
@@ -971,6 +991,13 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
     for entry in entries.values():
         if entry.get("topic_id") and entry.get("topic_name"):
             reserved.add(compact_ws(entry.get("topic_name"), 120).casefold())
+    # Names currently backing a real topic — a de-number target must be absent from this set (i.e. no
+    # other topic already holds the bare base name).
+    all_named = {
+        compact_ws(e.get("topic_name"), 120).casefold()
+        for e in entries.values()
+        if e.get("topic_id") and e.get("topic_name")
+    }
     keeps: dict[str, bool] = {}
     ordered = sorted(workers, key=lambda w: compact_ws(w.get("id"), 160))
     for worker in ordered:
@@ -987,6 +1014,11 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
         # (two live panes sharing one topic). It frees naturally on the pass AFTER the rename lands.
     assigned: dict[str, str] = {}
     renames: dict[str, str] = {}
+    # wid -> base for names the connector itself minted a " N" suffix onto this pass (name != base after
+    # the while-reserved loop). _sync_sources stamps this as connector_numbered_base on the entry when it
+    # applies the name — numbering-time provenance, so a later de-number acts only on connector-minted
+    # numbers and can never collapse a user's own "Sonnet 4"-style label.
+    numbered_bases: dict[str, str] = {}
     for worker in ordered:
         wid = compact_ws(worker.get("id"), 160)
         if not wid:
@@ -994,6 +1026,22 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
         key = state.resolve_worker_entry_key(store, worker)
         existing = entries.get(key) if key is not None else None
         has_topic = bool(existing and existing.get("topic_id"))
+        # De-number a connector-minted suffix once its base name is free again. The marker
+        # (connector_numbered_base) is stamped at NUMBERING time (when the connector mints the " N" —
+        # see the while-reserved loop below, applied in _sync_sources), so it records true provenance
+        # and this can never rename a user's genuinely-numbered label.
+        marker = compact_ws((existing or {}).get("connector_numbered_base"), 120)
+        if has_topic and marker and _worker_is_open(worker):
+            current = compact_ws(existing.get("topic_name"), 120)
+            numbered_variant = (
+                current.casefold() != marker.casefold()
+                and current.casefold().startswith(marker.casefold() + " ")
+                and current[len(marker) + 1 :].strip().isdigit()
+            )
+            if numbered_variant and marker.casefold() not in all_named and marker.casefold() not in reserved:
+                renames[wid] = marker
+                reserved.add(marker.casefold())
+                continue
         if has_topic and keeps.get(wid, True):
             continue  # topic name still matches its desired base; locked
         if has_topic and not _worker_is_open(worker):
@@ -1006,11 +1054,24 @@ def _assign_worker_topic_names(store: dict[str, Any], workers: list[dict[str, An
             name = f"{base} {n}"
             n += 1
         reserved.add(name.casefold())
+        if name.casefold() != base.casefold():
+            numbered_bases[wid] = base   # connector-minted number -> record its base as provenance
         if has_topic:
             renames[wid] = name   # desired name changed (e.g. the pane label appeared) -> rename in place
         else:
             assigned[wid] = name
-    return assigned, renames
+    return assigned, renames, numbered_bases
+
+
+def _stamp_numbered_base(entry: dict[str, Any], wid: str, numbered_bases: dict[str, str]) -> None:
+    """Apply numbering-time provenance to an entry as its name is set: stamp connector_numbered_base
+    when the connector minted a " N" suffix onto this pane's name, else clear any prior marker (a
+    de-number or a bare rename removes the connector-minted number)."""
+    base = numbered_bases.get(wid)
+    if base:
+        entry["connector_numbered_base"] = base
+    else:
+        entry.pop("connector_numbered_base", None)
 
 
 def _sync_sources(
@@ -1033,8 +1094,9 @@ def _sync_sources(
     # place (bounded per pass) so history is preserved.
     worker_topic_names: dict[str, str] = {}
     worker_topic_renames: dict[str, str] = {}
+    worker_numbered_bases: dict[str, str] = {}
     if topic_mode == "worker":
-        worker_topic_names, worker_topic_renames = _assign_worker_topic_names(store, _workers(snapshot))
+        worker_topic_names, worker_topic_renames, worker_numbered_bases = _assign_worker_topic_names(store, _workers(snapshot))
     renames_issued = 0
     # Latest model per worker from the turn rows (recency-ordered: first non-empty wins). Stamped
     # cache-and-keep so an idle pane keeps showing its last-known model on the pinned board.
@@ -1065,6 +1127,7 @@ def _sync_sources(
         wid = compact_ws(worker.get("id"), 160)
         if not entry.get("topic_id") and wid in worker_topic_names:
             entry["topic_name"] = worker_topic_names[wid]
+            _stamp_numbered_base(entry, wid, worker_numbered_bases)
         elif (
             entry.get("topic_id")
             and wid in worker_topic_renames
@@ -1076,12 +1139,14 @@ def _sync_sources(
             if renamed.get("ok"):
                 entry["topic_name"] = worker_topic_renames[wid]
                 entry.pop("rename_attempts", None)
+                _stamp_numbered_base(entry, wid, worker_numbered_bases)  # stamp if renamed TO a minted number, else clear
             elif _topic_missing(renamed.get("error")):
                 # the topic is gone (hand-deleted): drop the mapping so _ensure_topic recreates it
                 # under the new name instead of renaming a ghost forever.
                 entry.pop("topic_id", None)
                 entry["topic_name"] = worker_topic_renames[wid]
                 entry.pop("rename_attempts", None)
+                _stamp_numbered_base(entry, wid, worker_numbered_bases)
             else:
                 entry["rename_attempts"] = int(entry.get("rename_attempts") or 0) + 1
         model = model_by_worker.get(wid)
@@ -1151,7 +1216,13 @@ def _sync_sources(
     return counts
 
 
-def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> dict[str, Any]:
+def _cleanup_topics(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    snapshot_worker_ids: set[str] | None = None,
+) -> dict[str, Any]:
     result = {"deleted": 0, "failed": 0, "pruned": 0, "changed": False}
     visible_space_topics = {
         str(entry.get("topic_id"))
@@ -1165,6 +1236,83 @@ def _cleanup_topics(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str
     # per-worker topics at once) amortizes the deletes over ticks instead of one burst under the lock.
     delete_cap = config.source_orphan_delete_cap()
     deletes_issued = 0
+
+    # Worker-mode reaper (opt-in, DESTRUCTIVE): delete topics of workers that have durably CLOSED/FAILED
+    # and left the tendwire snapshot. Positional worker-id churn across herdr restarts (claude-2 ->
+    # claude-2-2 for a fresh terminal) otherwise strands the old pane's topic forever, and its squatted
+    # name forces the live pane's topic to a " 2" suffix. Guards: opt-in flag, strict closed/failed
+    # liveness (NOT 'done'/'idle'), absence across _REAP_ABSENCE_STREAK passes, a non-degraded snapshot,
+    # and the shared per-pass delete cap.
+    reap_enabled = (
+        config.reap_closed_worker_topics()
+        and config.source_topic_mode() == "worker"
+        and snapshot_worker_ids is not None
+    )
+    if reap_enabled and not snapshot_worker_ids and state.source_worker_entries(store):
+        reap_enabled = False  # a transient empty snapshot must never mass-reap live topics
+    if reap_enabled:
+        # Degraded/partial-snapshot guard: if NONE of the workers we still consider LIVE appear in this
+        # snapshot, treat the whole pass as untrustworthy (a tendwire reconcile-lag / binding-expiry blip
+        # that transiently dropped live panes) and skip reaping — otherwise the absent closed entries
+        # keep marching toward a delete on a bad pass. A purely-closed store has no live anchor to check,
+        # so it still reaps normally.
+        live_known_ids = {
+            compact_ws(entry.get("tendwire_worker_id") or entry.get("worker_id"), 160)
+            for entry in state.source_worker_entries(store).values()
+            if not _entry_is_reapable(entry)
+        }
+        live_known_ids.discard("")
+        if live_known_ids and not (live_known_ids & snapshot_worker_ids):
+            reap_enabled = False
+    if reap_enabled:
+        for key, entry in list(state.source_worker_entries(store).items()):
+            wid = compact_ws(entry.get("tendwire_worker_id") or entry.get("worker_id"), 160)
+            if wid and wid in snapshot_worker_ids:
+                if entry.pop("reap_miss_count", None) is not None:
+                    result["changed"] = True  # worker reappeared: reset its absence streak
+                continue
+            if not _entry_is_reapable(entry):
+                # Only a genuinely closed/failed pane is reapable. 'done'/'idle'/'working' is a LIVE
+                # idle/busy agent (normalized_status('done') == 'idle') whose terminal is still open — a
+                # snapshot-absence blip must never delete its topic (and whole scrollback).
+                continue
+            topic_id = str(entry.get("topic_id") or "")
+            if runtime.dry_run:
+                # Preview every closed/failed+absent topic (no streak, no state mutation).
+                if topic_id and topic_id not in deleted_topic_ids:
+                    result["deleted"] += 1
+                    deleted_topic_ids.add(topic_id)
+                    result["changed"] = True
+                continue
+            misses = min(int(entry.get("reap_miss_count") or 0) + 1, _REAP_ABSENCE_STREAK)
+            if misses < _REAP_ABSENCE_STREAK:
+                entry["reap_miss_count"] = misses
+                result["changed"] = True
+                continue
+            if not topic_id:
+                panes.pop(key, None)  # finished, gone, no topic: dead cruft
+                result["pruned"] += 1
+                result["changed"] = True
+                continue
+            if deletes_issued >= delete_cap:
+                continue  # per-pass delete budget spent; retry next tick (entry still eligible)
+            deletes_issued += 1
+            deleted = runtime.telegram.delete_topic(chat_id, topic_id)
+            if not deleted.get("ok") and not _topic_missing(deleted.get("error")):
+                result["failed"] += 1
+                entry["last_topic_delete_error"] = compact_ws(deleted.get("error"), 240)
+                continue
+            if deleted.get("ok"):
+                result["deleted"] += 1
+                deleted_topic_ids.add(topic_id)
+                audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": "reaped_closed_worker_topic"})
+            # No de-number marker is stamped here: provenance is recorded at NUMBERING time (see
+            # _assign_worker_topic_names / _stamp_numbered_base). Reaping merely frees the base name; the
+            # live sibling that the connector minted "<base> N" already carries connector_numbered_base and
+            # de-numbers on the next assign pass. Stamping by name-pattern at reap time could collapse a
+            # user's own "<base> N" label, so it is deliberately gone.
+            result["changed"] = True
+            panes.pop(key, None)
 
     def clear_worker_topic_refs(topic_id: str, reason: str) -> None:
         for worker_key, worker_entry in list(state.source_worker_entries(store).items()):
@@ -1910,7 +2058,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         )
     )
     routing_repaired += _repair_space_mode_routing_state(store)
-    topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id)
+    snapshot_worker_ids = {compact_ws(worker.get("id"), 160) for worker in _workers(snapshot)}
+    snapshot_worker_ids.discard("")
+    topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id, snapshot_worker_ids=snapshot_worker_ids)
     changed = changed or bool(
         source_counts["created"]
         or source_counts["updated"]

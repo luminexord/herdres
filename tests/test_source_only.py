@@ -69,17 +69,20 @@ class FakeTelegram:
             "edited": [],
             "topics": [],
             "deleted_topics": [],
+            "renamed_topics": [],
             "pins": [],
             "api_calls": [],
             "icon_edits": [],
             "voice_notes": [],
         }
         shared.setdefault("voice_notes", [])
+        shared.setdefault("renamed_topics", [])
         self._shared = shared
         self.sent = shared["sent"]
         self.edited = shared["edited"]
         self.topics = shared["topics"]
         self.deleted_topics = shared["deleted_topics"]
+        self.renamed_topics = shared["renamed_topics"]
         self.pins = shared["pins"]
         self.api_calls = shared["api_calls"]
         self.icon_edits = shared["icon_edits"]
@@ -122,6 +125,10 @@ class FakeTelegram:
     def create_topic(self, _chat_id, name, icon_color=None):
         self.topics.append(name)
         return {"ok": True, "topic_id": str(76 + len(self.topics))}
+
+    def rename_topic(self, chat_id, thread_id, name):
+        self.renamed_topics.append((str(chat_id), str(thread_id), str(name)))
+        return {"ok": True}
 
     def edit_topic_icon(self, chat_id, thread_id, emoji_id):
         self.icon_edits.append((str(chat_id), str(thread_id), str(emoji_id)))
