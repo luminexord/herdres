@@ -7,11 +7,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import config, speech, state
+from . import accounts, config, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import edit_feed_item, feed_item_requires_send_split, render_feed_item_html, send_feed_item, split_legacy_message_ids, turn_item_from_source
-from .safe import compact_ws, short_hash
+from .safe import compact_ws, html_escape, short_hash
 from .telegram_delivery import MESSAGE_TEXT_LIMIT, TOPIC_ICON_COLORS, TelegramClient, drain_outbox, topic_icon_catalog, topic_icon_id
 from .tendwire_client import TendwireClient
 
@@ -917,11 +917,35 @@ def _status_entries_for_topic_pin(store: dict[str, Any], entry: dict[str, Any]) 
     return workers or ([entry] if _entry_open_for_pin(entry) else [])
 
 
+def _account_lines_html(entries: list[dict[str, Any]]) -> str:
+    """The who-am-I/usage footer for a pinned board: one line per account kind present in
+    `entries` ('' when disabled or nothing resolvable). Escaped, ready to append."""
+    if not config.pinned_account_enabled():
+        return ""
+    kinds: list[str] = []
+    for entry in entries:
+        for field in ("agent", "worker_name", "tendwire_worker_id", "worker_id", "active_worker_id"):
+            kind = accounts.agent_kind(entry.get(field))
+            if kind:
+                if kind not in kinds:
+                    kinds.append(kind)
+                break
+    if not kinds:
+        return ""
+    snapshot = accounts.usage_snapshot()
+    lines = [line for kind in sorted(kinds) for line in (accounts.account_line(kind, snapshot=snapshot),) if line]
+    return "\n".join(html_escape(line, 200) for line in lines)
+
+
 def _sync_topic_pinned(store: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
         return False
-    html = render_status_overview(_status_entries_for_topic_pin(store, entry))
+    pin_entries = _status_entries_for_topic_pin(store, entry)
+    html = render_status_overview(pin_entries)
+    account_html = _account_lines_html(pin_entries or [entry])
+    if account_html:
+        html = f"{html}\n{account_html}"
     content_hash = short_hash(html, 20)
     message_id = str(entry.get("pinned_status_message_id") or "") or _legacy_pinned_message_id_for_topic(store, thread_id)
     if message_id and entry.get("pinned_status_hash") == content_hash and entry.get("pinned_status_pinned"):
@@ -1946,6 +1970,9 @@ def _sync_pinned(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -
     if not entries:
         return False
     html = render_status_overview(entries)
+    account_html = _account_lines_html(entries)
+    if account_html:
+        html = f"{html}\n{account_html}"
     telegram = store.setdefault("telegram", {})
     message_id = str(telegram.get("pinned_status_message_id") or "")
     content_hash = short_hash(html, 20)

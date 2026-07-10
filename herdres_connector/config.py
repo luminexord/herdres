@@ -109,6 +109,29 @@ def pinned_status_enabled(env: Any | None = None) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def pinned_account_enabled(env: Any | None = None) -> bool:
+    """Append a who-am-I/usage line to the pinned status boards (plan tier from the CLI
+    credential files — named metadata fields only, never tokens — plus today's ccusage
+    meter). Default on; degrades to no line when ccusage or the credential files are
+    absent. HERDRES_PINNED_ACCOUNT=0 turns it off."""
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_PINNED_ACCOUNT", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def usage_refresh_seconds(env: Any | None = None) -> int:
+    """Disk-cache TTL for the ccusage snapshot behind the pinned account line. Coarse on
+    purpose: every refresh can change the line and re-edit every pinned board, so this TTL
+    is the pin-edit rate limiter. HERDRES_USAGE_REFRESH_SECONDS, default 300."""
+    source = os.environ if env is None else env
+    raw = str(source.get("HERDRES_USAGE_REFRESH_SECONDS", "") or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 300
+    return value if value > 0 else 300
+
+
 def ack_on_send(env: Any | None = None) -> bool:
     """Whether to reply with a 'Sent to Tendwire worker' ack after a successful
     inbound send. Default on; HERDRES_ACK_ON_SEND=0 suppresses it, so you only see
