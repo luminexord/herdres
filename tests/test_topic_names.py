@@ -3,10 +3,34 @@
 from __future__ import annotations
 
 from herdres_connector import source_sync, state
+from test_source_only import _source_worker
+
+
+def _worker(worker):
+    result = dict(worker)
+    meta = dict(result.get("meta") or {})
+    identity = _source_worker({"id": result["id"]})["meta"]
+    meta["stable_key"] = identity["stable_key"]
+    meta["stable_key_version"] = identity["stable_key_version"]
+    result["meta"] = meta
+    return result
+
+
+def _wentry(worker_id, **extra):
+    identity = _worker({"id": worker_id})["meta"]
+    return {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "tendwire_worker_id": worker_id,
+        "tendwire_stable_key": identity["stable_key"],
+        "tendwire_stable_key_version": identity["stable_key_version"],
+        "tendwire_stable_identity_class": "current_v1",
+        **extra,
+    }
 
 
 def _w(cwd, wid="w", name="claude"):
-    return {"id": wid, "name": name, "meta": {"foreground_cwd": cwd, "cwd": cwd}}
+    return _worker({"id": wid, "name": name, "meta": {"foreground_cwd": cwd, "cwd": cwd}})
 
 
 def test_topic_name_from_cwd_basename():
@@ -17,7 +41,7 @@ def test_topic_name_from_cwd_basename():
 
 def test_topic_name_generic_cwd_falls_back_to_agent():
     assert state.topic_name_for_worker(_w("/root", name="claude")) == "claude"   # generic root
-    assert state.topic_name_for_worker({"id": "x", "name": "codex", "meta": {}}) == "codex"  # no cwd
+    assert state.topic_name_for_worker(_worker({"id": "x", "name": "codex", "meta": {}})) == "codex"  # no cwd
     assert state.topic_name_for_worker(_w("/tmp", name="claude")) == "claude"     # generic tmp
 
 
@@ -32,8 +56,7 @@ def test_assign_disambiguates_same_dir_panes_ordered_by_id():
 def test_assign_reserves_locked_names_and_numbers_around_them():
     # A gitmoot pane already has a created topic named "gitmoot"; a new gitmoot pane must not collide.
     store = {"version": 2, "spaces": {}, "panes": {
-        "worker:claude-1": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "claude-1",
-                             "topic_id": "500", "topic_name": "gitmoot"},
+        "worker:claude-1": _wentry("claude-1", topic_id="500", topic_name="gitmoot"),
     }}
     workers = [_w("/root/gitmoot", "claude-1"), _w("/root/gitmoot", "claude-9")]
     got, _renames, _bases = source_sync._assign_worker_topic_names(store, workers)
@@ -48,15 +71,14 @@ def test_assign_dedup_is_case_insensitive():
     got, _r, _bases = source_sync._assign_worker_topic_names(store, [_w("/root/Foo", "a"), _w("/root/foo", "b")])
     assert got["a"] == "Foo" and got["b"] == "foo 2"
     store2 = {"version": 2, "spaces": {}, "panes": {
-        "worker:a": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "a",
-                     "topic_id": "1", "topic_name": "Herdres"},
+        "worker:a": _wentry("a", topic_id="1", topic_name="Herdres"),
     }}
     got2, _renames2, _bases = source_sync._assign_worker_topic_names(store2, [_w("/root/herdres", "z")])
     assert got2["z"] == "herdres 2"                    # numbers around the case-different locked name
 
 
 def _w_labeled(label, wid, cwd="/root/temp"):
-    return {"id": wid, "name": "claude", "meta": {"label": label, "foreground_cwd": cwd, "cwd": cwd}}
+    return _worker({"id": wid, "name": "claude", "meta": {"label": label, "foreground_cwd": cwd, "cwd": cwd}})
 
 
 def test_topic_name_prefers_pane_label():
@@ -69,8 +91,7 @@ def test_assign_proposes_rename_when_label_appears():
     # topic was created under the cwd fallback name ("claude 2"); the pane label ("doro") now flows
     # through tendwire -> the entry is proposed for an in-place RENAME, not a new topic.
     store = {"version": 2, "spaces": {}, "panes": {
-        "worker:claude-7": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "claude-7",
-                             "topic_id": "9018", "topic_name": "claude 2"},
+        "worker:claude-7": _wentry("claude-7", topic_id="9018", topic_name="claude 2"),
     }}
     assigned, renames, _bases = source_sync._assign_worker_topic_names(store, [_w_labeled("doro", "claude-7")])
     assert assigned == {}
@@ -80,10 +101,8 @@ def test_assign_proposes_rename_when_label_appears():
 def test_assign_keeps_matching_names_and_numbered_variants():
     # names still matching their desired base (incl. "base N" variants) are kept — no rename churn.
     store = {"version": 2, "spaces": {}, "panes": {
-        "worker:a": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "a",
-                     "topic_id": "1", "topic_name": "gitmoot"},
-        "worker:b": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "b",
-                     "topic_id": "2", "topic_name": "gitmoot 2"},
+        "worker:a": _wentry("a", topic_id="1", topic_name="gitmoot"),
+        "worker:b": _wentry("b", topic_id="2", topic_name="gitmoot 2"),
     }}
     assigned, renames, _bases = source_sync._assign_worker_topic_names(
         store, [_w("/root/gitmoot", "a"), _w("/root/gitmoot", "b")])
@@ -94,12 +113,11 @@ def test_rename_candidates_old_name_stays_reserved():
     # While a rename is pending, a NEW pane must not take the old name (it would collide into the
     # old topic via _ensure_topic's reuse-by-name). It gets a numbered variant instead.
     store = {"version": 2, "spaces": {}, "panes": {
-        "worker:a": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "a",
-                     "topic_id": "1", "topic_name": "doro"},
+        "worker:a": _wentry("a", topic_id="1", topic_name="doro"),
     }}
     workers = [
-        {"id": "a", "name": "claude", "status": "active", "meta": {"label": "alpha"}},   # relabeled
-        {"id": "b", "name": "claude", "status": "active", "meta": {"label": "doro"}},    # new pane wants "doro"
+        _worker({"id": "a", "name": "claude", "status": "active", "meta": {"label": "alpha"}}),  # relabeled
+        _worker({"id": "b", "name": "claude", "status": "active", "meta": {"label": "doro"}}),   # new pane wants "doro"
     ]
     assigned, renames, _bases = source_sync._assign_worker_topic_names(store, workers)
     assert renames == {"a": "alpha"}
@@ -108,15 +126,17 @@ def test_rename_candidates_old_name_stays_reserved():
 
 def test_rename_skips_closed_workers_and_capped_attempts():
     store = {"version": 2, "spaces": {}, "panes": {
-        "worker:closed": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "closed",
-                          "topic_id": "1", "topic_name": "oldname"},
-        "worker:failing": {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "failing",
-                           "topic_id": "2", "topic_name": "othername",
-                           "rename_attempts": source_sync._RENAME_ATTEMPT_CAP},
+        "worker:closed": _wentry("closed", topic_id="1", topic_name="oldname"),
+        "worker:failing": _wentry(
+            "failing",
+            topic_id="2",
+            topic_name="othername",
+            rename_attempts=source_sync._RENAME_ATTEMPT_CAP,
+        ),
     }}
     workers = [
-        {"id": "closed", "name": "claude", "status": "closed", "meta": {"label": "newname"}},
-        {"id": "failing", "name": "claude", "status": "active", "meta": {"label": "wanted"}},
+        _worker({"id": "closed", "name": "claude", "status": "closed", "meta": {"label": "newname"}}),
+        _worker({"id": "failing", "name": "claude", "status": "active", "meta": {"label": "wanted"}}),
     ]
     _assigned, renames, _bases = source_sync._assign_worker_topic_names(store, workers)
     assert renames == {}                     # closed pane + capped-attempts pane both skipped

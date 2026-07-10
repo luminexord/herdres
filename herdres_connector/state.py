@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
-import sys
-import fcntl
+import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from . import config
 from .rendering import normalized_status
 from .safe import compact_ws, short_hash
 
 DELIVERED_TURN_LEDGER_LIMIT = 10000
+
+STABLE_WORKER_KEY_VERSION = 1
+STABLE_WORKER_KEY_RE = re.compile(r"^wsk1_[0-9a-f]{64}$")
+LEGACY_WORKER_KEY_RE = re.compile(r"^[0-9a-f]{24}$")
 
 
 def load_state(path: Path | None = None) -> dict[str, Any]:
@@ -168,79 +173,491 @@ def message_is_voice_reply(entry: dict[str, Any], reply_to_message_id: str | int
     return isinstance(ids, list) and rt in {str(x) for x in ids}
 
 
-def find_entry_key_by_worker(data: dict[str, Any], worker_id: str) -> str | None:
-    for key, entry in source_worker_entries(data).items():
-        if str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "") == worker_id:
-            return key
-    return None
+def valid_stable_worker_key_pair(stable_key: Any, version: Any) -> bool:
+    """Return whether a public Tendwire stable-worker identity is exactly v1.
 
-
-def worker_stable_key(worker: dict[str, Any]) -> str:
-    """tendwire's session-independent per-pane key (meta.stable_key), or "" when the worker exposes no
-    stable terminal identity. Lets a re-lettered worker id reconcile back to its existing entry."""
-    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
-    return compact_ws(meta.get("stable_key"), 160)
-
-
-def _entry_is_live(entry: dict[str, Any]) -> bool:
-    """Liveness gate for stable-key adoption: an entry is adoptable only while it has NOT reached a
-    terminal state. Prefer the effective status (stamped by the sync loop), else the raw tendwire
-    status. A closed/failed entry is a dead pane whose stable_key a NEW pane must not re-adopt."""
-    return normalized_status(entry.get("status") or entry.get("tendwire_raw_status")) not in {"closed", "failed"}
-
-
-def find_entry_key_by_stable_key(data: dict[str, Any], stable_key: str) -> str | None:
-    """Resolve a stable per-pane key to an existing entry, but ONLY when adoption is unambiguous:
-
-    - Skip closed/failed entries: a new pane whose key collides with an OLD, finished entry must NOT
-      land on it — it falls through (caller degrades to worker-id keying -> a fresh entry).
-    - Require exactly one LIVE match. If two or more live entries share the key (two distinct panes
-      ended up with the same stable_key), adopting either would fuse their histories, so adopt NONE
-      and leave a breadcrumb — the caller degrades to worker-id keying instead.
-
-    Returns the sole live matching entry key, or None."""
-    if not stable_key:
-        return None
-    live_matches = [
-        key
-        for key, entry in source_worker_entries(data).items()
-        if str(entry.get("tendwire_stable_key") or "") == stable_key and _entry_is_live(entry)
-    ]
-    if len(live_matches) == 1:
-        return live_matches[0]
-    if len(live_matches) > 1:
-        # Ambiguous: more than one live pane claims this stable_key. Never silently take the first
-        # (that fuses two agents into one topic) — fall back to worker-id keying.
-        print(
-            f"herdres stable-key collision: {len(live_matches)} live entries share stable_key "
-            f"{stable_key!r} ({', '.join(sorted(live_matches))}); falling back to worker-id keying",
-            file=sys.stderr,
-        )
-    return None
-
-
-def _worker_matches_entry(worker: dict[str, Any], entry: dict[str, Any]) -> bool:
-    """Sanity gate for stable-key adoption: guard against a recycled pane id landing on an unrelated
-    entry by requiring the same agent and space (both stable for a terminal; cwd is deliberately NOT
-    checked, since a terminal legitimately changes directory)."""
+    Deliberately do not coerce or trim either field: bool is an int subclass,
+    strings such as ``"1"`` are not protocol version 1, and whitespace around
+    a key makes it malformed rather than equivalent.
+    """
     return (
-        worker_agent(worker) == str(entry.get("agent") or "")
-        and compact_ws(worker.get("space_id"), 160) == str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+        isinstance(stable_key, str)
+        and STABLE_WORKER_KEY_RE.fullmatch(stable_key) is not None
+        and type(version) is int
+        and version == STABLE_WORKER_KEY_VERSION
     )
 
 
-def resolve_worker_entry_key(data: dict[str, Any], worker: dict[str, Any]) -> str | None:
-    """Resolve a snapshot worker to its existing entry key. Prefer tendwire's stable per-pane key
-    (survives worker-id re-lettering across herdr restarts) when present, enabled, and passing the
-    agent/space sanity gate; otherwise fall back to worker-id keying (unchanged legacy behavior)."""
-    if config.stable_worker_key_enabled():
-        stable_key = worker_stable_key(worker)
-        if stable_key:
-            key = find_entry_key_by_stable_key(data, stable_key)
-            if key is not None and _worker_matches_entry(worker, source_worker_entries(data).get(key) or {}):
-                return key
-    return find_entry_key_by_worker(data, compact_ws(worker.get("id"), 160))
+def worker_stable_identity_class(worker: dict[str, Any]) -> str:
+    """Classify the identity carried by this exact source observation."""
+    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+    has_key = "stable_key" in meta
+    has_version = "stable_key_version" in meta
+    if not has_key and not has_version:
+        return "absent"
+    if has_key != has_version:
+        return "partial"
+    stable_key = meta.get("stable_key")
+    version = meta.get("stable_key_version")
+    if valid_stable_worker_key_pair(stable_key, version):
+        return "current_v1"
+    if (
+        isinstance(stable_key, str)
+        and STABLE_WORKER_KEY_RE.fullmatch(stable_key) is not None
+        and type(version) is int
+        and version != STABLE_WORKER_KEY_VERSION
+    ):
+        return "unknown_version"
+    return "malformed"
 
+
+def worker_stable_identity(worker: dict[str, Any]) -> tuple[str, int] | None:
+    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+    stable_key = meta.get("stable_key")
+    version = meta.get("stable_key_version")
+    if not valid_stable_worker_key_pair(stable_key, version):
+        return None
+    return stable_key, STABLE_WORKER_KEY_VERSION
+
+
+def worker_stable_key(worker: dict[str, Any]) -> str:
+    """Return only a fully validated Tendwire v1 worker key."""
+    identity = worker_stable_identity(worker)
+    return identity[0] if identity is not None else ""
+
+
+def canonical_worker_observation_key(worker: dict[str, Any]) -> tuple[str, ...]:
+    """Return the shared total ordering key for one immutable snapshot row.
+
+    Reconciliation, reservations, and topic naming must observe rows in the
+    same order.  The explicit identity class/raw pair prevents absent and
+    malformed identities from tying, the liveness component gives live rows
+    deterministic precedence over terminal copies, and the canonical full row
+    covers every current and future field that an upsert may persist.
+    """
+    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+
+    def raw_field(name: str) -> str:
+        if name not in meta:
+            return "missing"
+        return "present:" + json.dumps(
+            meta.get(name),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+
+    return (
+        compact_ws(worker.get("id"), 160),
+        "1"
+        if normalized_status(worker.get("status")) in {"closed", "failed"}
+        else "0",
+        worker_stable_identity_class(worker),
+        raw_field("stable_key"),
+        raw_field("stable_key_version"),
+        json.dumps(
+            worker,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ),
+    )
+
+
+def entry_stable_identity(entry: dict[str, Any]) -> tuple[str, int] | None:
+    stable_key = entry.get("tendwire_stable_key")
+    version = entry.get("tendwire_stable_key_version")
+    if not valid_stable_worker_key_pair(stable_key, version):
+        return None
+    return stable_key, STABLE_WORKER_KEY_VERSION
+
+
+def message_binding_stable_identity(binding: dict[str, Any]) -> tuple[str, int] | None:
+    stable_key = binding.get("stable_key")
+    version = binding.get("stable_key_version")
+    if not valid_stable_worker_key_pair(stable_key, version):
+        return None
+    return stable_key, STABLE_WORKER_KEY_VERSION
+
+
+def _entry_legacy_identity_kind(entry: dict[str, Any]) -> str:
+    """Classify only states eligible for same-worker, one-time v1 migration."""
+    stable_key = entry.get("tendwire_stable_key")
+    version = entry.get("tendwire_stable_key_version")
+    if version is None and (stable_key is None or stable_key == ""):
+        return "absent"
+    if version is None and isinstance(stable_key, str) and LEGACY_WORKER_KEY_RE.fullmatch(stable_key):
+        return "legacy24"
+    return "invalid"
+
+
+def entry_is_quarantined(entry: dict[str, Any]) -> bool:
+    # Private quarantine markers are write-once and presence-based. Treat any
+    # persisted value as quarantined rather than coercing malformed state.
+    return "stable_key_quarantined" in entry
+
+
+def _entry_identity_is_allowed(entry: dict[str, Any]) -> bool:
+    """Only an exact persisted v1 identity is independently routable."""
+    return entry_stable_identity(entry) is not None
+
+
+def _entry_is_live(entry: dict[str, Any]) -> bool:
+    return normalized_status(entry.get("status") or entry.get("tendwire_raw_status")) not in {"closed", "failed"}
+
+
+def entry_is_routable(entry: dict[str, Any]) -> bool:
+    return (
+        not entry_is_quarantined(entry)
+        and _entry_identity_is_allowed(entry)
+        and _entry_is_live(entry)
+    )
+
+
+def _worker_entry_keys_by_worker(data: dict[str, Any], worker_id: str) -> list[str]:
+    if not worker_id:
+        return []
+    return [
+        key
+        for key, entry in source_worker_entries(data).items()
+        if entry_is_routable(entry)
+        and str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "") == worker_id
+    ]
+
+
+def _worker_entry_keys_by_worker_any_status(data: dict[str, Any], worker_id: str) -> list[str]:
+    if not worker_id:
+        return []
+    return [
+        key
+        for key, entry in source_worker_entries(data).items()
+        if not entry_is_quarantined(entry)
+        and _entry_identity_is_allowed(entry)
+        and str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "") == worker_id
+    ]
+
+
+def _all_worker_entry_keys_by_worker(data: dict[str, Any], worker_id: str) -> list[str]:
+    if not worker_id:
+        return []
+    return [
+        key
+        for key, entry in source_worker_entries(data).items()
+        if str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "") == worker_id
+    ]
+
+
+def _legacy_worker_entry_keys_by_worker(data: dict[str, Any], worker_id: str) -> list[str]:
+    """Return migration-only state; callers must also validate the current v1 worker."""
+    return [
+        key
+        for key in _all_worker_entry_keys_by_worker(data, worker_id)
+        if not entry_is_quarantined(source_worker_entries(data).get(key) or {})
+        and _entry_is_live(source_worker_entries(data).get(key) or {})
+        and _entry_legacy_identity_kind(source_worker_entries(data).get(key) or {})
+        in {"absent", "legacy24"}
+    ]
+
+
+def find_entry_key_by_worker(data: dict[str, Any], worker_id: str) -> str | None:
+    """Resolve only one live worker whose validated stable identity is also unique."""
+    matches = _worker_entry_keys_by_worker(data, worker_id)
+    if len(matches) != 1:
+        return None
+    entry = source_worker_entries(data).get(matches[0]) or {}
+    return matches[0] if worker_entry_is_uniquely_routable(data, matches[0], entry) else None
+
+
+def _all_worker_entry_keys_by_stable_key(data: dict[str, Any], stable_key: str) -> list[str]:
+    if STABLE_WORKER_KEY_RE.fullmatch(stable_key) is None:
+        return []
+    return [
+        key
+        for key, entry in source_worker_entries(data).items()
+        if entry_stable_identity(entry) == (stable_key, STABLE_WORKER_KEY_VERSION)
+    ]
+
+
+def _worker_entry_keys_by_stable_key(data: dict[str, Any], stable_key: str) -> list[str]:
+    if STABLE_WORKER_KEY_RE.fullmatch(stable_key) is None:
+        return []
+    return [
+        key
+        for key, entry in source_worker_entries(data).items()
+        if entry_is_routable(entry)
+        and entry_stable_identity(entry) == (stable_key, STABLE_WORKER_KEY_VERSION)
+    ]
+
+
+def worker_entry_is_uniquely_routable(
+    data: dict[str, Any], key: str, entry: dict[str, Any]
+) -> bool:
+    if not entry_is_routable(entry):
+        return False
+    worker_id = str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "")
+    identity = entry_stable_identity(entry)
+    if identity is None:
+        return False
+    return (
+        _worker_entry_keys_by_worker(data, worker_id) == [key]
+        and _worker_entry_keys_by_stable_key(data, identity[0]) == [key]
+    )
+
+
+def find_entry_key_by_stable_key(data: dict[str, Any], stable_key: str) -> str | None:
+    """Resolve a validated v1 key only when exactly one live entry owns it."""
+    matches = _worker_entry_keys_by_stable_key(data, stable_key)
+    return matches[0] if len(matches) == 1 else None
+
+
+def find_worker_entry_by_stable_key(
+    data: dict[str, Any], stable_key: str
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    key = find_entry_key_by_stable_key(data, stable_key)
+    if key is None:
+        return None, None
+    return key, source_worker_entries(data).get(key)
+
+
+def blocked_worker_stable_keys(data: dict[str, Any], workers: list[dict[str, Any]]) -> set[str]:
+    """Preflight every snapshot observation and persisted entry before any naming/upsert.
+
+    A key is blocked when either snapshot or persisted state cannot prove a
+    one-to-one worker-id/stable-identity owner.  This is deliberately computed
+    against the immutable pre-pass graph; mutations during reconciliation may
+    not make a later row appear safe.
+    """
+    claims: dict[str, list[str]] = {}
+    keys_by_worker: dict[str, list[str]] = {}
+    for worker in workers:
+        stable_key = worker_stable_key(worker)
+        worker_id = compact_ws(worker.get("id"), 160)
+        if stable_key and worker_id:
+            claims.setdefault(stable_key, []).append(worker_id)
+            keys_by_worker.setdefault(worker_id, []).append(stable_key)
+    blocked = {
+        stable_key
+        for stable_key, worker_ids in claims.items()
+        if len(worker_ids) > 1
+    }
+    for stable_keys in keys_by_worker.values():
+        if len(stable_keys) > 1:
+            blocked.update(stable_keys)
+    persisted_by_stable: dict[str, list[str]] = {}
+    persisted_by_worker: dict[str, list[str]] = {}
+    for key, entry in source_worker_entries(data).items():
+        identity = entry_stable_identity(entry)
+        if identity is None:
+            continue
+        if entry_is_quarantined(entry):
+            blocked.add(identity[0])
+            continue
+        if not entry_is_routable(entry):
+            continue
+        worker_id = str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "")
+        persisted_by_stable.setdefault(identity[0], []).append(key)
+        if worker_id:
+            persisted_by_worker.setdefault(worker_id, []).append(key)
+    blocked.update(
+        stable_key
+        for stable_key, entry_keys in persisted_by_stable.items()
+        if len(entry_keys) > 1
+    )
+    for entry_keys in persisted_by_worker.values():
+        if len(entry_keys) <= 1:
+            continue
+        blocked.update(
+            identity[0]
+            for key in entry_keys
+            if (identity := entry_stable_identity(source_worker_entries(data).get(key) or {}))
+            is not None
+        )
+    return blocked
+
+
+def conflicting_snapshot_worker_ids(workers: list[dict[str, Any]]) -> set[str]:
+    claims: dict[str, int] = {}
+    for worker in workers:
+        worker_id = compact_ws(worker.get("id"), 160)
+        if worker_id:
+            claims[worker_id] = claims.get(worker_id, 0) + 1
+    return {worker_id for worker_id, count in claims.items() if count > 1}
+
+
+def _worker_matches_legacy_entry(worker: dict[str, Any], entry: dict[str, Any]) -> bool:
+    """Legacy migration has no authoritative handle, so retain the old sanity gate."""
+    return (
+        worker_agent(worker) == str(entry.get("agent") or "")
+        and compact_ws(worker.get("space_id"), 160)
+        == str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+    )
+
+
+def resolve_worker_entry_key(
+    data: dict[str, Any],
+    worker: dict[str, Any],
+    *,
+    blocked_stable_keys: set[str] | None = None,
+) -> str | None:
+    """Resolve a current v1 worker, allowing legacy state only as migration input."""
+    worker_id = compact_ws(worker.get("id"), 160)
+    identity = worker_stable_identity(worker)
+    if identity is None:
+        return None
+
+    is_finished = normalized_status(worker.get("status")) in {"closed", "failed"}
+    worker_matches = (
+        _worker_entry_keys_by_worker_any_status(data, worker_id)
+        if is_finished
+        else _worker_entry_keys_by_worker(data, worker_id)
+    )
+    if is_finished:
+        if len(worker_matches) != 1:
+            return None
+        entry = source_worker_entries(data).get(worker_matches[0]) or {}
+        return worker_matches[0] if entry_stable_identity(entry) == identity else None
+
+    stable_key = identity[0]
+    stable_matches = _worker_entry_keys_by_stable_key(data, stable_key)
+    if stable_key in (blocked_stable_keys or set()):
+        if len(worker_matches) != 1:
+            return None
+        entry = source_worker_entries(data).get(worker_matches[0]) or {}
+        return worker_matches[0] if entry_stable_identity(entry) == identity else None
+    if len(stable_matches) > 1:
+        return None
+    if len(stable_matches) == 1:
+        return stable_matches[0]
+    migration_matches = _legacy_worker_entry_keys_by_worker(data, worker_id)
+    if len(migration_matches) != 1:
+        return None
+    entry = source_worker_entries(data).get(migration_matches[0]) or {}
+    return migration_matches[0] if _worker_matches_legacy_entry(worker, entry) else None
+
+def _resolve_worker_upsert_entry_key(
+    data: dict[str, Any],
+    worker: dict[str, Any],
+    *,
+    blocked_stable_keys: set[str] | None = None,
+    blocked_worker_ids: set[str] | None = None,
+) -> str | None:
+    """Resolve the row an upsert would own without mutating reconciliation state."""
+    worker_id = compact_ws(worker.get("id"), 160)
+    identity = worker_stable_identity(worker)
+    raw_exact_matches = _all_worker_entry_keys_by_worker(data, worker_id)
+    exact_matches = _worker_entry_keys_by_worker(data, worker_id)
+    if worker_id in (blocked_worker_ids or set()):
+        exact_identity_matches = [
+            match_key
+            for match_key in raw_exact_matches
+            if entry_stable_identity(source_worker_entries(data).get(match_key) or {})
+            == identity
+        ]
+        key = (
+            exact_identity_matches[0]
+            if len(exact_identity_matches) == 1
+            else None
+        )
+    else:
+        key = resolve_worker_entry_key(
+            data, worker, blocked_stable_keys=blocked_stable_keys
+        )
+    if (
+        key is None
+        and identity is None
+        and worker_id not in (blocked_worker_ids or set())
+    ):
+        candidates = exact_matches if len(exact_matches) == 1 else raw_exact_matches
+        if len(candidates) == 1:
+            key = candidates[0]
+    if key is None and identity is not None:
+        repeated_claimants = [
+            match_key
+            for match_key in raw_exact_matches
+            if entry_is_quarantined(source_worker_entries(data).get(match_key) or {})
+            and entry_stable_identity(source_worker_entries(data).get(match_key) or {})
+            == identity
+        ]
+        if len(repeated_claimants) == 1:
+            key = repeated_claimants[0]
+    return key
+
+
+def precompute_worker_entry_reservations(
+    data: dict[str, Any],
+    workers: list[dict[str, Any]],
+    *,
+    blocked_stable_keys: set[str] | None = None,
+    blocked_worker_ids: set[str] | None = None,
+) -> Mapping[int, str | None]:
+    """Freeze a one-to-one snapshot-row -> persisted-row plan for one sync pass.
+
+    Resolution is performed entirely against the pre-pass graph. Competing
+    snapshot rows never share a persisted row; unresolved rows are
+    deterministically paired with exact-identity storage owners only to keep
+    quarantine repeatable.
+    """
+    preliminary = {
+        id(worker): _resolve_worker_upsert_entry_key(
+            data,
+            worker,
+            blocked_stable_keys=blocked_stable_keys,
+            blocked_worker_ids=blocked_worker_ids,
+        )
+        for worker in workers
+    }
+    claim_counts: dict[str, int] = {}
+    for candidate in preliminary.values():
+        if candidate is not None:
+            claim_counts[candidate] = claim_counts.get(candidate, 0) + 1
+    reservations = {
+        worker_ref: (
+            candidate
+            if candidate is not None and claim_counts.get(candidate) == 1
+            else None
+        )
+        for worker_ref, candidate in preliminary.items()
+    }
+    claimed = {
+        candidate for candidate in reservations.values() if candidate is not None
+    }
+    ordered_workers = sorted(workers, key=canonical_worker_observation_key)
+    entries = source_worker_entries(data)
+    for worker in ordered_workers:
+        worker_ref = id(worker)
+        worker_id = compact_ws(worker.get("id"), 160)
+        if reservations[worker_ref] is not None:
+            continue
+        identity = worker_stable_identity(worker)
+        fingerprint = compact_ws(worker.get("fingerprint"), 160)
+        allow_nonquarantined = (
+            worker_id in (blocked_worker_ids or set())
+            or (
+                identity is not None
+                and identity[0] in (blocked_stable_keys or set())
+            )
+        )
+        candidates = [
+            key
+            for key in _all_worker_entry_keys_by_worker(data, worker_id)
+            if entry_stable_identity(entries.get(key) or {}) == identity
+            and (
+                allow_nonquarantined
+                or entry_is_quarantined(entries.get(key) or {})
+            )
+            and key not in claimed
+        ]
+        candidates.sort(
+            key=lambda key: (
+                compact_ws((entries.get(key) or {}).get("tendwire_fingerprint"), 160)
+                != fingerprint,
+                key,
+            )
+        )
+        if candidates:
+            reservations[worker_ref] = candidates[0]
+            claimed.add(candidates[0])
+    return MappingProxyType(reservations)
 
 def find_worker_entry_by_id(data: dict[str, Any], worker_id: str) -> tuple[str, dict[str, Any]] | tuple[None, None]:
     key = find_entry_key_by_worker(data, worker_id)
@@ -265,6 +682,8 @@ def find_worker_entry_by_alias(
         return None, None
     candidates: list[tuple[str, dict[str, Any]]] = []
     for key, entry in source_worker_entries(data).items():
+        if not worker_entry_is_uniquely_routable(data, key, entry):
+            continue
         if space_id and str(entry.get("tendwire_space_id") or entry.get("space_id") or "") != str(space_id):
             continue
         values = (
@@ -300,14 +719,129 @@ def find_space_entry_by_id(data: dict[str, Any], space_id: str | None) -> tuple[
         return None, None
     return key, source_space_entries(data).get(key)
 
+def worker_entry_allowed_topic_ids(
+    data: dict[str, Any], entry: dict[str, Any]
+) -> set[str]:
+    """Return current source topics on which this exact worker may be targeted."""
+    topic_ids = {str(entry.get("topic_id") or "")}
+    space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+    for space_entry in source_space_entries(data).values():
+        if "stale_space_topic" in space_entry:
+            continue
+        if (
+            space_id
+            and str(
+                space_entry.get("tendwire_space_id")
+                or space_entry.get("space_id")
+                or ""
+            )
+            == space_id
+        ):
+            topic_ids.add(str(space_entry.get("topic_id") or ""))
+    topic_ids.discard("")
+    return topic_ids
+
+
+_SPACE_ACTIVE_WORKER_FIELDS = (
+    "active_worker_id",
+    "active_worker_fingerprint",
+    "active_worker_stable_key",
+    "active_worker_stable_key_version",
+    "active_worker_name",
+    "active_worker_model",
+    "active_worker_status",
+)
+
+
+def clear_space_active_worker(entry: dict[str, Any]) -> None:
+    for field in _SPACE_ACTIVE_WORKER_FIELDS:
+        entry.pop(field, None)
+
+
+def cache_space_active_worker(
+    entry: dict[str, Any], worker_entry: dict[str, Any]
+) -> bool:
+    identity = entry_stable_identity(worker_entry)
+    worker_id = str(
+        worker_entry.get("tendwire_worker_id")
+        or worker_entry.get("worker_id")
+        or ""
+    )
+    fingerprint = str(worker_entry.get("tendwire_fingerprint") or "")
+    if identity is None or not worker_id or not fingerprint:
+        clear_space_active_worker(entry)
+        return False
+    entry["active_worker_id"] = worker_id
+    entry["active_worker_fingerprint"] = fingerprint
+    entry["active_worker_stable_key"] = identity[0]
+    entry["active_worker_stable_key_version"] = identity[1]
+    entry["active_worker_name"] = compact_ws(
+        worker_entry.get("worker_name") or worker_entry.get("agent"), 80
+    )
+    return True
+
+
+def active_worker_entry_for_space(
+    data: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    topic_id: str | None = None,
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    """Resolve a space's cached active worker only with exact current provenance."""
+    if "stale_space_topic" in entry:
+        return None, None
+    worker_id = str(entry.get("active_worker_id") or "")
+    fingerprint = str(entry.get("active_worker_fingerprint") or "")
+    cached_identity = (
+        entry.get("active_worker_stable_key"),
+        entry.get("active_worker_stable_key_version"),
+    )
+    if (
+        not worker_id
+        or not fingerprint
+        or not valid_stable_worker_key_pair(*cached_identity)
+    ):
+        return None, None
+    key, worker_entry = find_worker_entry_by_id(data, worker_id)
+    if key is None or worker_entry is None:
+        return None, None
+    space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+    worker_space_id = str(
+        worker_entry.get("tendwire_space_id") or worker_entry.get("space_id") or ""
+    )
+    if (
+        not space_id
+        or worker_space_id != space_id
+        or str(worker_entry.get("tendwire_fingerprint") or "") != fingerprint
+        or entry_stable_identity(worker_entry) != cached_identity
+    ):
+        return None, None
+    requested_topic = str(topic_id or entry.get("topic_id") or "")
+    if (
+        not requested_topic
+        or requested_topic not in worker_entry_allowed_topic_ids(data, worker_entry)
+    ):
+        return None, None
+    return key, worker_entry
+
 
 def find_entry_by_thread(data: dict[str, Any], thread_id: str | None) -> tuple[str, dict[str, Any]] | tuple[None, None]:
     if not thread_id:
         return None, None
+    candidates: list[tuple[str, dict[str, Any]]] = []
     for key, entry in source_entries(data).items():
-        if str(entry.get("topic_id") or "") == str(thread_id):
-            return key, entry
-    return None, None
+        if str(entry.get("topic_id") or "") != str(thread_id):
+            continue
+        if str(entry.get("entry_type") or "") == "worker":
+            if worker_entry_is_uniquely_routable(data, key, entry):
+                candidates.append((key, entry))
+            continue
+        active_key, active_worker = active_worker_entry_for_space(
+            data, entry, topic_id=str(thread_id)
+        )
+        if active_key is not None and active_worker is not None:
+            candidates.append((key, entry))
+    return candidates[0] if len(candidates) == 1 else (None, None)
 
 
 def worker_agent(worker: dict[str, Any]) -> str:
@@ -353,13 +887,18 @@ def find_legacy_topic_id_by_name(data: dict[str, Any], name: str) -> str:
     wanted = compact_ws(name, 120).casefold()
     if not wanted:
         return ""
-    for entry in source_space_entries(data).values():
-        if compact_ws(entry.get("topic_name"), 120).casefold() == wanted and entry.get("topic_id"):
-            return str(entry["topic_id"])
-    for entry in source_worker_entries(data).values():
-        if compact_ws(entry.get("topic_name"), 120).casefold() == wanted and entry.get("topic_id"):
-            return str(entry["topic_id"])
-    return ""
+    eligible_entries = list(source_space_entries(data).values())
+    eligible_entries.extend(
+        entry
+        for key, entry in source_worker_entries(data).items()
+        if worker_entry_is_uniquely_routable(data, key, entry)
+    )
+    matches = {
+        str(entry["topic_id"])
+        for entry in eligible_entries
+        if compact_ws(entry.get("topic_name"), 120).casefold() == wanted and entry.get("topic_id")
+    }
+    return next(iter(matches)) if len(matches) == 1 else ""
 
 
 def upsert_space_entry(data: dict[str, Any], space: dict[str, Any], *, topic_id: str = "") -> tuple[str, dict[str, Any], bool]:
@@ -388,26 +927,255 @@ def upsert_space_entry(data: dict[str, Any], space: dict[str, Any], *, topic_id:
     if topic_id:
         entry["topic_id"] = str(topic_id)
     spaces[key] = entry
+    if not any(field in entry for field in _SPACE_ACTIVE_WORKER_FIELDS):
+        candidates = [
+            worker_entry
+            for worker_key, worker_entry in source_worker_entries(data).items()
+            if str(
+                worker_entry.get("tendwire_space_id")
+                or worker_entry.get("space_id")
+                or ""
+            )
+            == space_id
+            and worker_entry_is_uniquely_routable(
+                data, worker_key, worker_entry
+            )
+        ]
+        if len(candidates) == 1:
+            cache_space_active_worker(entry, candidates[0])
     return key, entry, created
 
 
-def upsert_worker_entry(data: dict[str, Any], worker: dict[str, Any], *, topic_id: str = "") -> tuple[str, dict[str, Any], bool]:
+def _binding_matches_previous_entry(
+    binding: dict[str, Any],
+    *,
+    worker_id: str,
+    fingerprint: str,
+    space_id: str,
+) -> bool:
+    if not worker_id or str(binding.get("worker_id") or "") != worker_id:
+        return False
+    bound_fingerprint = str(binding.get("worker_fingerprint") or "")
+    bound_space = str(binding.get("space_id") or "")
+    if fingerprint and bound_fingerprint and bound_fingerprint != fingerprint:
+        return False
+    if space_id and bound_space and bound_space != space_id:
+        return False
+    return True
+
+
+def _binding_topic_ids_for_entry(
+    data: dict[str, Any], entry: dict[str, Any], space_id: str
+) -> set[str]:
+    topic_ids = {str(entry.get("topic_id") or "")}
+    for space_entry in source_space_entries(data).values():
+        if str(space_entry.get("tendwire_space_id") or space_entry.get("space_id") or "") == space_id:
+            topic_ids.add(str(space_entry.get("topic_id") or ""))
+    topic_ids.discard("")
+    return topic_ids
+
+
+def quarantine_worker_entry(data: dict[str, Any], key: str, *, reason: str) -> bool:
+    entry = source_worker_entries(data).get(key)
+    if entry is None:
+        return False
+    changed = entry.get("stable_key_quarantined") is not True
+    entry["stable_key_quarantined"] = True
+    if "stable_key_quarantine_reason" not in entry:
+        entry["stable_key_quarantine_reason"] = reason
+        changed = True
+    worker_id = str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "")
+    fingerprint = str(entry.get("tendwire_fingerprint") or "")
+    space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+    identity = entry_stable_identity(entry)
+    bindings = data.get("telegram_message_bindings")
+    if not isinstance(bindings, dict):
+        return changed
+    for binding in bindings.values():
+        if not isinstance(binding, dict) or not _binding_matches_previous_entry(
+            binding, worker_id=worker_id, fingerprint=fingerprint, space_id=space_id
+        ):
+            continue
+        if binding.get("routing_quarantined") is not True:
+            binding["routing_quarantined"] = True
+            changed = True
+        if identity is not None:
+            if binding.get("stable_key") != identity[0]:
+                binding["stable_key"] = identity[0]
+                changed = True
+            if binding.get("stable_key_version") != identity[1]:
+                binding["stable_key_version"] = identity[1]
+                changed = True
+    return changed
+
+
+def quarantine_worker_stable_key_owners(
+    data: dict[str, Any], stable_keys: set[str], *, reason: str
+) -> int:
+    """Quarantine every persisted exact-v1 owner of a preflight-blocked key."""
+    changed = 0
+    for key, entry in list(source_worker_entries(data).items()):
+        identity = entry_stable_identity(entry)
+        if identity is not None and identity[0] in stable_keys:
+            changed += int(quarantine_worker_entry(data, key, reason=reason))
+    return changed
+
+
+def _retarget_worker_bindings(
+    data: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    previous_worker_id: str,
+    previous_fingerprint: str,
+    previous_space_id: str,
+    previous_topic_ids: set[str],
+) -> None:
+    identity = entry_stable_identity(entry)
+    if identity is None:
+        return
+    bindings = data.get("telegram_message_bindings")
+    if not isinstance(bindings, dict):
+        return
+    for binding in bindings.values():
+        if not isinstance(binding, dict) or not _binding_matches_previous_entry(
+            binding,
+            worker_id=previous_worker_id,
+            fingerprint=previous_fingerprint,
+            space_id=previous_space_id,
+        ):
+            continue
+        if "routing_quarantined" in binding:
+            continue
+        bound_topic_id = str(binding.get("topic_id") or "")
+        has_stable_fields = "stable_key" in binding or "stable_key_version" in binding
+        binding_identity = message_binding_stable_identity(binding)
+        if (
+            not bound_topic_id
+            or bound_topic_id not in previous_topic_ids
+            or (has_stable_fields and binding_identity != identity)
+        ):
+            binding["routing_quarantined"] = True
+            continue
+        binding["worker_id"] = str(entry.get("tendwire_worker_id") or "")
+        binding["worker_fingerprint"] = str(entry.get("tendwire_fingerprint") or "")
+        binding["space_id"] = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+        binding["stable_key"] = identity[0]
+        binding["stable_key_version"] = identity[1]
+
+
+def upsert_worker_entry(
+    data: dict[str, Any],
+    worker: dict[str, Any],
+    *,
+    topic_id: str = "",
+    blocked_stable_keys: set[str] | None = None,
+    blocked_worker_ids: set[str] | None = None,
+    preplanned_key: str | None = None,
+    use_preplanned_key: bool = False,
+    reserved_entry_keys: frozenset[str] | None = None,
+) -> tuple[str, dict[str, Any], bool]:
     worker_id = compact_ws(worker.get("id"), 160)
     fingerprint = compact_ws(worker.get("fingerprint"), 160)
     space_id = compact_ws(worker.get("space_id"), 160)
     agent = worker_agent(worker)
     meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
     model = compact_ws(worker.get("model") or meta.get("model"), 80)
-    stable_key = worker_stable_key(worker)
-    # Resolve by stable per-pane key first (so a re-lettered worker id re-points its EXISTING entry and
-    # keeps its topic), else by worker id. The entry KEY string is never rewritten — only the fields.
-    key = resolve_worker_entry_key(data, worker)
-    created = False
+    identity_class = worker_stable_identity_class(worker)
+    identity = worker_stable_identity(worker)
+    raw_exact_matches = _all_worker_entry_keys_by_worker(data, worker_id)
+    exact_matches = _worker_entry_keys_by_worker(data, worker_id)
+    all_stable_matches = (
+        _all_worker_entry_keys_by_stable_key(data, identity[0]) if identity is not None else []
+    )
+    stable_matches = [
+        match_key
+        for match_key in all_stable_matches
+        if entry_is_routable(source_worker_entries(data).get(match_key) or {})
+    ]
+    releasable_closed_history = {
+        match_key
+        for match_key in all_stable_matches
+        if not entry_is_quarantined(source_worker_entries(data).get(match_key) or {})
+        and not _entry_is_live(source_worker_entries(data).get(match_key) or {})
+    }
+    key = (
+        preplanned_key
+        if use_preplanned_key
+        else _resolve_worker_upsert_entry_key(
+            data,
+            worker,
+            blocked_stable_keys=blocked_stable_keys,
+            blocked_worker_ids=blocked_worker_ids,
+        )
+    )
+    blocked_key = identity is not None and identity[0] in (blocked_stable_keys or set())
+    if blocked_key:
+        for collided_key in all_stable_matches:
+            quarantine_worker_entry(
+                data, collided_key, reason="snapshot_stable_key_conflict"
+            )
+    protected_entry_keys = reserved_entry_keys or frozenset()
     if key is None:
-        key = f"worker:{worker_id}:{short_hash(fingerprint or worker_id, 10)}"
-        created = True
+        if len(stable_matches) > 1:
+            for collided_key in stable_matches:
+                quarantine_worker_entry(data, collided_key, reason="persisted_stable_key_collision")
+        for conflicting_key in raw_exact_matches:
+            if conflicting_key not in protected_entry_keys:
+                quarantine_worker_entry(data, conflicting_key, reason="stable_key_mismatch")
+    else:
+        for conflicting_key in exact_matches:
+            if conflicting_key != key and conflicting_key not in protected_entry_keys:
+                quarantine_worker_entry(data, conflicting_key, reason="recycled_worker_id")
+
+    if identity is not None:
+        for historical_key in all_stable_matches:
+            historical_entry = source_worker_entries(data).get(historical_key) or {}
+            if historical_key == key or entry_is_routable(historical_entry):
+                continue
+            quarantine_worker_entry(
+                data, historical_key, reason="closed_stable_key_reuse"
+            )
+            if historical_key in releasable_closed_history:
+                # A closed, previously nonquarantined row is history rather
+                # than conflicting provenance.  Its bindings stay quarantined,
+                # but release the public identity pair so that this deliberate
+                # retirement cannot poison the new live owner on the next pass.
+                historical_entry["retired_tendwire_stable_key"] = identity[0]
+                historical_entry["retired_tendwire_stable_key_version"] = identity[1]
+                historical_entry["tendwire_stable_identity_class"] = "retired_closed_v1"
+                historical_entry.pop("tendwire_stable_key", None)
+                historical_entry.pop("tendwire_stable_key_version", None)
+
+    must_quarantine = (
+        identity_class != "current_v1"
+        or blocked_key
+        or worker_id in (blocked_worker_ids or set())
+    )
+    quarantine_reason = (
+        "snapshot_worker_key_conflict"
+        if worker_id in (blocked_worker_ids or set())
+        else "snapshot_stable_key_conflict"
+        if blocked_key
+        else f"source_identity_{identity_class}"
+    )
+    created = key is None
     panes = data.setdefault("panes", {})
+    if key is None:
+        base_key = f"worker:{worker_id}:{short_hash(fingerprint or worker_id, 10)}"
+        key = base_key
+        suffix = 2
+        while key in panes:
+            key = f"{base_key}:{suffix}"
+            suffix += 1
     entry = panes.get(key) if isinstance(panes.get(key), dict) else {}
+    previous_worker_id = str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "")
+    previous_fingerprint = str(entry.get("tendwire_fingerprint") or "")
+    previous_space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+    previous_topic_ids = _binding_topic_ids_for_entry(data, entry, previous_space_id)
+    if must_quarantine and not created:
+        # Quarantine historical bindings before observation fields such as the
+        # fingerprint are refreshed, or they would no longer match their owner.
+        quarantine_worker_entry(data, key, reason=quarantine_reason)
     entry.update(
         {
             "source": "tendwire",
@@ -417,6 +1185,7 @@ def upsert_worker_entry(data: dict[str, Any], worker: dict[str, Any], *, topic_i
             "tendwire_space_id": space_id,
             "space_id": space_id,
             "tendwire_fingerprint": fingerprint,
+            "tendwire_stable_identity_class": identity_class,
             "agent": agent,
             "managed_bot_kind": agent if agent in config.MANAGED_BOT_KINDS else "",
             "worker_name": compact_ws(worker.get("name") or worker_id, 80),
@@ -426,13 +1195,25 @@ def upsert_worker_entry(data: dict[str, Any], worker: dict[str, Any], *, topic_i
             "topic_name": entry.get("topic_name") or topic_name_for_worker(worker),
         }
     )
-    if topic_id:
+    if topic_id and not must_quarantine:
         entry["topic_id"] = str(topic_id)
     if model:
         entry["model"] = model
-    if stable_key:
-        entry["tendwire_stable_key"] = stable_key
+    if identity is not None:
+        entry["tendwire_stable_key"] = identity[0]
+        entry["tendwire_stable_key_version"] = identity[1]
     panes[key] = entry
+    if not created and identity is not None and not must_quarantine:
+        _retarget_worker_bindings(
+            data,
+            entry,
+            previous_worker_id=previous_worker_id,
+            previous_fingerprint=previous_fingerprint,
+            previous_space_id=previous_space_id,
+            previous_topic_ids=previous_topic_ids,
+        )
+    if must_quarantine:
+        quarantine_worker_entry(data, key, reason=quarantine_reason)
     return key, entry, created
 
 
@@ -477,7 +1258,7 @@ def bind_message_to_worker(
     if not message or message == "0":
         return
     bindings = message_bindings(data)
-    bindings[message] = {
+    binding = {
         "topic_id": str(topic_id or entry.get("topic_id") or ""),
         "worker_id": str(entry.get("tendwire_worker_id") or entry.get("active_worker_id") or ""),
         "worker_fingerprint": str(entry.get("tendwire_fingerprint") or entry.get("active_worker_fingerprint") or ""),
@@ -486,6 +1267,13 @@ def bind_message_to_worker(
         "turn_id": str(turn_id or ""),
         "bot_kind": str(bot_kind or ""),
     }
+    identity = entry_stable_identity(entry)
+    if identity is not None:
+        binding["stable_key"] = identity[0]
+        binding["stable_key_version"] = identity[1]
+    if entry_is_quarantined(entry):
+        binding["routing_quarantined"] = True
+    bindings[message] = binding
     if len(bindings) > 2000:
         for key in list(bindings)[: len(bindings) - 2000]:
             bindings.pop(key, None)

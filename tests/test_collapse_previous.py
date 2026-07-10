@@ -8,7 +8,7 @@ from herdres_connector.managed_bots import MANAGER_BOT_KIND
 from herdres_connector.rich_delivery import render_turn_item_html
 from herdres_connector.source_sync import SyncRuntime, _sync_turns
 
-from test_source_only import FakeTelegram, FakeTendwire, _store
+from test_source_only import FakeTelegram, FakeTendwire, _source_worker, _store
 
 
 # --- flag ---------------------------------------------------------------------
@@ -56,17 +56,24 @@ def _two_turn_payload():
 def _folded_store(monkeypatch):
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     store = _store()
-    store["panes"]["worker:w1"] = {
-        "source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
-        "tendwire_space_id": "s1", "topic_id": "77",
-        "last_clean_message_id": "501",       # the NEW final's message (never folded)
-        "last_clean_hash": "irrelevant",
-    }
+    _worker_key, worker, _created = state.upsert_worker_entry(
+        store,
+        _source_worker({
+            "id": "w1",
+            "name": "w1",
+            "status": "idle",
+            "space_id": "s1",
+            "fingerprint": "fp1",
+        }),
+        topic_id="77",
+    )
+    worker["last_clean_message_id"] = "501"  # the NEW final's message (never folded)
+    worker["last_clean_hash"] = "irrelevant"
     # both turns already delivered + bound (the sweep edits the OLD one)
     state.mark_delivered(store, "final:turn-new:whatever", {"worker_id": "w1", "turn_id": "turn-new"})
     state.mark_delivered(store, "final:turn-old:whatever", {"worker_id": "w1", "turn_id": "turn-old"})
-    state.bind_message_to_worker(store, "400", store["panes"]["worker:w1"], topic_id="77", kind="final", turn_id="turn-old", bot_kind=MANAGER_BOT_KIND)
-    state.bind_message_to_worker(store, "501", store["panes"]["worker:w1"], topic_id="77", kind="final", turn_id="turn-new", bot_kind=MANAGER_BOT_KIND)
+    state.bind_message_to_worker(store, "400", worker, topic_id="77", kind="final", turn_id="turn-old", bot_kind=MANAGER_BOT_KIND)
+    state.bind_message_to_worker(store, "501", worker, topic_id="77", kind="final", turn_id="turn-new", bot_kind=MANAGER_BOT_KIND)
     return store
 
 
@@ -140,19 +147,27 @@ def test_fold_per_pass_cap(monkeypatch):
     store = _store()
     turns = [{"id": "turn-new", "worker_id": "w1", "worker_fingerprint": "fp1",
               "assistant_final_text": "New answer", "complete": True}]
-    store["panes"]["worker:w1"] = {
-        "source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
-        "tendwire_space_id": "s1", "topic_id": "77", "last_clean_message_id": "900",
-    }
+    _worker_key, worker, _created = state.upsert_worker_entry(
+        store,
+        _source_worker({
+            "id": "w1",
+            "name": "w1",
+            "status": "idle",
+            "space_id": "s1",
+            "fingerprint": "fp1",
+        }),
+        topic_id="77",
+    )
+    worker["last_clean_message_id"] = "900"
     for i in range(6):   # six superseded finals with bindings
         tid = f"turn-old-{i}"
         turns.append({"id": tid, "worker_id": "w1", "worker_fingerprint": "fp1",
                       "assistant_final_text": f"Old {i}", "complete": True})
         state.mark_delivered(store, f"final:{tid}:x", {"worker_id": "w1", "turn_id": tid})
-        state.bind_message_to_worker(store, str(400 + i), store["panes"]["worker:w1"],
+        state.bind_message_to_worker(store, str(400 + i), worker,
                                      topic_id="77", kind="final", turn_id=tid, bot_kind=MANAGER_BOT_KIND)
     state.mark_delivered(store, "final:turn-new:x", {"worker_id": "w1", "turn_id": "turn-new"})
-    state.bind_message_to_worker(store, "900", store["panes"]["worker:w1"], topic_id="77",
+    state.bind_message_to_worker(store, "900", worker, topic_id="77",
                                  kind="final", turn_id="turn-new", bot_kind=MANAGER_BOT_KIND)
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "1")
     telegram = FakeTelegram()

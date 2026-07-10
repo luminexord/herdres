@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from herdres_connector import state
 from herdres_connector.source_sync import SyncRuntime, sync_once
+from test_source_only import _source_worker
 
 
 class FakeTendwire:
     def __init__(self, turns=None, workers=None, spaces=None):
         self._turns = turns if turns is not None else {"turns": []}
-        self._workers = workers if workers is not None else [
+        raw_workers = workers if workers is not None else [
             {
                 "id": "worker-live",
                 "name": "claude",
@@ -17,6 +18,7 @@ class FakeTendwire:
                 "meta": {"agent": "claude", "raw_status": "working"},
             }
         ]
+        self._workers = [_source_worker(worker) for worker in raw_workers]
         self._spaces = spaces if spaces is not None else [
             {
                 "id": "space-workers",
@@ -126,7 +128,7 @@ def test_repaired_same_turn_id_with_changed_final_edits_existing_final(monkeypat
         }
     )
     tendwire._workers[0]["status"] = "idle"
-    tendwire._workers[0]["meta"] = {"agent": "claude"}
+    tendwire._workers[0]["meta"].pop("raw_status", None)
 
     first = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
     worker = next(iter(state.source_worker_entries(store).values()))
@@ -171,7 +173,7 @@ def test_same_turn_id_with_new_user_prompt_sends_new_visible_final(monkeypatch):
         }
     )
     tendwire._workers[0]["status"] = "idle"
-    tendwire._workers[0]["meta"] = {"agent": "claude"}
+    tendwire._workers[0]["meta"].pop("raw_status", None)
 
     first = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
     first_sent_count = len(telegram.sent)
@@ -242,6 +244,14 @@ def test_turn_with_matching_worker_in_different_space_is_not_cross_delivered(mon
 def test_space_mode_repairs_stale_cross_topic_message_bindings(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
+    source_worker = _source_worker({
+        "id": "codex",
+        "name": "codex",
+        "status": "active",
+        "space_id": "space-herdres",
+        "fingerprint": "fp-herdres",
+        "meta": {"agent": "codex"},
+    })
     store["spaces"] = {
         "space:space-herdres": {
             "source": "tendwire",
@@ -266,6 +276,10 @@ def test_space_mode_repairs_stale_cross_topic_message_bindings(monkeypatch):
             "entry_type": "worker",
             "tendwire_worker_id": "codex",
             "worker_id": "codex",
+            "tendwire_fingerprint": "fp-herdres",
+            "tendwire_stable_identity_class": "current_v1",
+            "tendwire_stable_key": source_worker["meta"]["stable_key"],
+            "tendwire_stable_key_version": source_worker["meta"]["stable_key_version"],
             "tendwire_space_id": "space-herdres",
             "space_id": "space-herdres",
             "topic_id": "9988",
@@ -287,16 +301,7 @@ def test_space_mode_repairs_stale_cross_topic_message_bindings(monkeypatch):
         bot_kind="codex",
     )
     tendwire = FakeTendwire(
-        workers=[
-            {
-                "id": "codex",
-                "name": "codex",
-                "status": "active",
-                "space_id": "space-herdres",
-                "fingerprint": "fp-herdres",
-                "meta": {"agent": "codex"},
-            }
-        ],
+        workers=[source_worker],
         spaces=[
             {"id": "space-herdres", "name": "Herdres", "status": "active", "fingerprint": "space-herdres-fp"},
             {"id": "space-px", "name": "projectx", "status": "active", "fingerprint": "space-px-fp"},

@@ -23,7 +23,7 @@ from herdres_connector.source_sync import (
     sync_once,
 )
 
-from test_source_only import FakeTelegram, FakeTendwire, _store
+from test_source_only import FakeTelegram, FakeTendwire, _source_worker, _store
 
 
 @pytest.fixture(autouse=True)
@@ -32,11 +32,25 @@ def _worker_mode(monkeypatch):
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
 
 
+def _worker(worker):
+    result = dict(worker)
+    meta = dict(result.get("meta") or {})
+    identity = _source_worker({"id": result["id"]})["meta"]
+    meta["stable_key"] = identity["stable_key"]
+    meta["stable_key_version"] = identity["stable_key_version"]
+    result["meta"] = meta
+    return result
+
+
 def _wentry(worker_id, topic_id=None, topic_name="x", status="closed", **extra):
+    identity = _worker({"id": worker_id})["meta"]
     entry = {
         "source": "tendwire",
         "entry_type": "worker",
         "tendwire_worker_id": worker_id,
+        "tendwire_stable_key": identity["stable_key"],
+        "tendwire_stable_key_version": identity["stable_key_version"],
+        "tendwire_stable_identity_class": "current_v1",
         "worker_id": worker_id,
         "worker_name": "claude",
         "topic_name": topic_name,
@@ -209,8 +223,8 @@ def test_numbering_time_provenance_marks_minted_suffix(monkeypatch):
     # is the true provenance a later de-number relies on.
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
     store = _store_with([_wentry("claude-2", 26, "telegram-bot", "closed")])   # stranded, holds the base
-    worker = {"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1",
-              "fingerprint": "fp", "meta": {"label": "telegram-bot"}}
+    worker = _worker({"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1",
+                      "fingerprint": "fp", "meta": {"label": "telegram-bot"}})
     telegram = FakeTelegram()
     sync_once(store, SyncRuntime(FakeTendwire(workers=[worker]), telegram, with_outbox=False))
     live = next(e for e in state.source_worker_entries(store).values() if e["tendwire_worker_id"] == "claude-2-2")
@@ -229,8 +243,8 @@ def test_reap_frees_base_then_denumbers_minted_sibling(monkeypatch):
         _wentry("claude-2-2", 184, "telegram-bot 2", "working",
                 connector_numbered_base="telegram-bot"),                       # minted sibling w/ provenance
     ])
-    worker = {"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1",
-              "fingerprint": "fp", "meta": {"label": "telegram-bot"}}
+    worker = _worker({"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1",
+                      "fingerprint": "fp", "meta": {"label": "telegram-bot"}})
     telegram = FakeTelegram()
     for _ in range(_REAP_ABSENCE_STREAK + 2):
         sync_once(store, SyncRuntime(FakeTendwire(workers=[worker]), telegram, with_outbox=False))
@@ -245,9 +259,9 @@ def test_assign_stamps_numbered_base_for_new_pane():
     # while the bare-base pane and a genuinely unique base are NOT (nothing was minted onto them).
     store = _store_with([_wentry("w-a", 90, "foo", "working")])  # w-a already holds "foo"
     workers = [
-        {"id": "w-a", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}},
-        {"id": "w-b", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}},
-        {"id": "w-c", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "bar"}},
+        _worker({"id": "w-a", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}}),
+        _worker({"id": "w-b", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}}),
+        _worker({"id": "w-c", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "bar"}}),
     ]
     _assigned, _renames, numbered_bases = _assign_worker_topic_names(store, workers)
     assert numbered_bases == {"w-b": "foo"}   # only the minted "foo 2" carries provenance
@@ -256,8 +270,8 @@ def test_assign_stamps_numbered_base_for_new_pane():
 def test_denumber_requires_the_marker():
     # A live worker whose desired name IS its numbered label, without the numbering-time marker, is left
     # alone — this is the guard that a user-authored "telegram-bot 2" label is never silently collapsed.
-    worker = {"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1",
-              "meta": {"label": "telegram-bot 2"}}
+    worker = _worker({"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1",
+                      "meta": {"label": "telegram-bot 2"}})
     store = _store_with([_wentry("claude-2-2", 184, "telegram-bot 2", "working")])
     _assigned, renames, _bases = _assign_worker_topic_names(store, [worker])
     assert "claude-2-2" not in renames
@@ -275,8 +289,8 @@ def test_denumber_holds_off_while_base_still_taken():
         _wentry("claude-2-2", 184, "telegram-bot 2", "working", connector_numbered_base="telegram-bot"),
     ])
     workers = [
-        {"id": "claude-x", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "telegram-bot"}},
-        {"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "telegram-bot 2"}},
+        _worker({"id": "claude-x", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "telegram-bot"}}),
+        _worker({"id": "claude-2-2", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "telegram-bot 2"}}),
     ]
     _assigned, renames, _bases = _assign_worker_topic_names(store, workers)
     assert "claude-2-2" not in renames
@@ -303,9 +317,9 @@ def test_normal_numbering_unchanged():
     # "foo"/"foo 2" (the disambiguation the design must preserve), and a unique base stays bare.
     store = _store_with([_wentry("w-a", 90, "foo", "working")])  # w-a already holds "foo"
     workers = [
-        {"id": "w-a", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}},
-        {"id": "w-b", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}},
-        {"id": "w-c", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "bar"}},
+        _worker({"id": "w-a", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}}),
+        _worker({"id": "w-b", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "foo"}}),
+        _worker({"id": "w-c", "name": "claude", "status": "working", "space_id": "w1", "meta": {"label": "bar"}}),
     ]
     assigned, renames, _bases = _assign_worker_topic_names(store, workers)
     assert assigned.get("w-b") == "foo 2"   # distinct same-base live pane still numbered
@@ -334,8 +348,8 @@ def _live_state_fixture():
 
 def _live_workers():
     def w(wid, cwd, status="idle"):
-        return {"id": wid, "name": "claude", "status": status, "space_id": "w1",
-                "fingerprint": f"fp-{wid}", "meta": {"cwd": cwd, "foreground_cwd": cwd}}
+        return _worker({"id": wid, "name": "claude", "status": status, "space_id": "w1",
+                        "fingerprint": f"fp-{wid}", "meta": {"cwd": cwd, "foreground_cwd": cwd}})
     return [
         w("claude-1-1", "/repo"),
         w("claude-1-2", "/repo/whispr-bro"),

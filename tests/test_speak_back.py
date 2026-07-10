@@ -14,7 +14,7 @@ from herdres_connector import source_sync, speech, state
 from herdres_connector.source_sync import SyncRuntime
 from herdres_connector.telegram_delivery import TelegramClient
 
-from test_source_only import FakeTelegram, FakeTendwire, _store
+from test_source_only import FakeTelegram, FakeTendwire, _source_worker, _store
 
 
 # --- state ring --------------------------------------------------------------
@@ -108,13 +108,22 @@ def _turns_of(item):
     return {"turns": [item]}
 
 
+def _persist_worker(store, **entry_extra):
+    key, entry, _created = state.upsert_worker_entry(store, _source_worker({
+        "id": "w1",
+        "name": "worker",
+        "status": "working",
+        "space_id": "s1",
+        "fingerprint": "fp1",
+    }), topic_id="77")
+    entry.update(entry_extra)
+    return key, entry
+
+
 def _worker_store(monkeypatch, **entry_extra):
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")  # _entry_for_turn resolves worker entries
     store = _store()
-    entry = {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
-             "tendwire_space_id": "s1", "topic_id": "77"}
-    entry.update(entry_extra)
-    store["panes"]["worker:w1"] = entry
+    _key, entry = _persist_worker(store, **entry_extra)
     return store, entry
 
 
@@ -212,8 +221,7 @@ def test_speak_seam_offlock_synth_no_clobber(tmp_path, monkeypatch):
     statepath = tmp_path / "state.json"
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
     store = _store()
-    store["panes"]["worker:w1"] = {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
-                                   "tendwire_space_id": "s1", "topic_id": "77", "speak_next_reply": True}
+    worker_key, _entry = _persist_worker(store, speak_next_reply=True)
     state.save_state(store)
     telegram = FakeTelegram()
     runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
@@ -232,7 +240,7 @@ def test_speak_seam_offlock_synth_no_clobber(tmp_path, monkeypatch):
 
     assert store.get("competitor_sentinel") == "written-during-synth"   # competitor write survived reload
     assert len(telegram.voice_notes) == 1
-    assert store["panes"]["worker:w1"].get("voice_reply_message_ids") == ["900"]   # recorded on fresh entry
+    assert store["panes"][worker_key].get("voice_reply_message_ids") == ["900"]   # recorded on fresh entry
 
 
 def test_speak_seam_offlock_entry_pruned_during_synth(tmp_path, monkeypatch):
@@ -242,15 +250,14 @@ def test_speak_seam_offlock_entry_pruned_during_synth(tmp_path, monkeypatch):
     statepath = tmp_path / "state.json"
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
     store = _store()
-    store["panes"]["worker:w1"] = {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
-                                   "tendwire_space_id": "s1", "topic_id": "77", "speak_next_reply": True}
+    worker_key, _entry = _persist_worker(store, speak_next_reply=True)
     state.save_state(store)
     telegram = FakeTelegram()
     runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
 
     def fake_tts(_ep, pl):
         disk = json.loads(statepath.read_text())
-        disk["panes"].pop("worker:w1", None)   # competitor prunes the entry mid-synth
+        disk["panes"].pop(worker_key, None)   # competitor prunes the entry mid-synth
         statepath.write_text(json.dumps(disk))
         return {"ok": True, "path": pl.get("dest")}
 
@@ -259,7 +266,7 @@ def test_speak_seam_offlock_entry_pruned_during_synth(tmp_path, monkeypatch):
     with state.state_lock(path=statepath):
         source_sync._sync_turns(store, _turns_of(_final_item()), {"pending": []}, runtime, chat_id="-100")
 
-    assert "worker:w1" not in store["panes"]           # competitor prune survived, not resurrected
+    assert worker_key not in store["panes"]           # competitor prune survived, not resurrected
     assert len(telegram.voice_notes) == 1              # note was still sent, no crash
 
 
@@ -293,10 +300,7 @@ def test_command_reply_sets_speak_next_reply_on_voice_reply(tmp_path, monkeypatc
     statepath = tmp_path / "state.json"
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
     store = _store()
-    store["panes"]["worker:w1"] = {
-        "source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
-        "tendwire_space_id": "s1", "topic_id": "77", "voice_reply_message_ids": ["901"],
-    }
+    worker_key, _entry = _persist_worker(store, voice_reply_message_ids=["901"])
     state.save_state(store)
 
     with patch.object(herdres.TendwireClient, "command", return_value={"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}):
@@ -306,7 +310,7 @@ def test_command_reply_sets_speak_next_reply_on_voice_reply(tmp_path, monkeypatc
         })
     assert result["handled"] is True
     saved = state.load_state(statepath)
-    assert saved["panes"]["worker:w1"].get("speak_next_reply") is True
+    assert saved["panes"][worker_key].get("speak_next_reply") is True
 
 
 def test_command_reply_no_flag_for_plain_message(tmp_path, monkeypatch):
@@ -315,15 +319,12 @@ def test_command_reply_no_flag_for_plain_message(tmp_path, monkeypatch):
     statepath = tmp_path / "state.json"
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
     store = _store()
-    store["panes"]["worker:w1"] = {
-        "source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
-        "tendwire_space_id": "s1", "topic_id": "77", "voice_reply_message_ids": ["901"],
-    }
+    worker_key, _entry = _persist_worker(store, voice_reply_message_ids=["901"])
     state.save_state(store)
     with patch.object(herdres.TendwireClient, "command", return_value={"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}):
         herdres.command_reply({"topic_id": "77", "user_id": "1", "text": "hello", "reply_to_message_id": "555"})
     saved = state.load_state(statepath)
-    assert saved["panes"]["worker:w1"].get("speak_next_reply") is None
+    assert saved["panes"][worker_key].get("speak_next_reply") is None
 
 
 # --- trigger phrase is a bridge directive: stripped before the pane sees it ---
@@ -341,8 +342,7 @@ def test_command_reply_arms_flag_and_strips_trigger(tmp_path, monkeypatch):
     statepath = tmp_path / "state.json"
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
     store = _store()
-    store["panes"]["worker:w1"] = {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
-                                   "tendwire_space_id": "s1", "topic_id": "77"}
+    worker_key, _entry = _persist_worker(store)
     state.save_state(store)
     sent = {}
 
@@ -355,7 +355,7 @@ def test_command_reply_arms_flag_and_strips_trigger(tmp_path, monkeypatch):
                                "text": "Summarize the file? Reply by voice"})
     assert sent["instruction"]["text"] == "Summarize the file"     # phrase never reaches the agent
     saved = state.load_state(statepath)
-    assert saved["panes"]["worker:w1"].get("speak_next_reply") is True  # bridge owns the voice
+    assert saved["panes"][worker_key].get("speak_next_reply") is True  # bridge owns the voice
 
 
 def test_command_reply_standalone_trigger_arms_without_submitting(tmp_path, monkeypatch):
@@ -364,12 +364,11 @@ def test_command_reply_standalone_trigger_arms_without_submitting(tmp_path, monk
     statepath = tmp_path / "state.json"
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
     store = _store()
-    store["panes"]["worker:w1"] = {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
-                                   "tendwire_space_id": "s1", "topic_id": "77"}
+    worker_key, _entry = _persist_worker(store)
     state.save_state(store)
     with patch.object(herdres.TendwireClient, "command") as cmd:
         result = herdres.command_reply({"topic_id": "77", "user_id": "1", "text": "reply by voice"})
     cmd.assert_not_called()                                        # nothing submitted to the pane
     assert "spoken" in result["reply"]
     saved = state.load_state(statepath)
-    assert saved["panes"]["worker:w1"].get("speak_next_reply") is True
+    assert saved["panes"][worker_key].get("speak_next_reply") is True

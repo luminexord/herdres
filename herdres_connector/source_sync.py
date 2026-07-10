@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from . import accounts, config, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token_for_entry
@@ -250,16 +250,11 @@ def _worker_entry_for_turn(store: dict[str, Any], worker_id: str, space_id: str)
         (key, entry)
         for key, entry in state.source_worker_entries(store).items()
         if _entry_worker_id(entry) == worker_id
+        and state.worker_entry_is_uniquely_routable(store, key, entry)
     ]
-    if not candidates:
-        return None, None
     if space_id:
-        matches = [(key, entry) for key, entry in candidates if _entry_space_id(entry) == space_id]
-        if matches:
-            return matches[0]
-        if any(_entry_space_id(entry) for _key, entry in candidates):
-            return None, None
-    return candidates[0]
+        candidates = [(key, entry) for key, entry in candidates if _entry_space_id(entry) == space_id]
+    return candidates[0] if len(candidates) == 1 else (None, None)
 
 
 def _telegram_state(store: dict[str, Any]) -> dict[str, Any]:
@@ -786,6 +781,11 @@ def _ensure_topic(
     chat_id: str,
     can_create: bool = True,
 ) -> tuple[bool, bool]:
+    if (
+        str(entry.get("entry_type") or "") == "worker"
+        and not state.entry_is_routable(entry)
+    ):
+        return False, False
     if entry.get("topic_id"):
         return False, False
     reused = state.find_legacy_topic_id_by_name(store, entry.get("topic_name") or "")
@@ -900,14 +900,17 @@ def _entry_open_for_pin(entry: dict[str, Any]) -> bool:
 
 def _status_entries_for_topic_pin(store: dict[str, Any], entry: dict[str, Any]) -> list[dict[str, Any]]:
     if str(entry.get("entry_type") or "") != "space":
-        return [entry] if _entry_open_for_pin(entry) else []
+        return [
+            entry
+        ] if _entry_open_for_pin(entry) and state.entry_is_routable(entry) else []
     space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
     worker_ids = entry.get("worker_ids")
     current_worker_ids = {str(worker_id) for worker_id in worker_ids if worker_id} if isinstance(worker_ids, list) else set()
     workers = [
         worker_entry
-        for worker_entry in state.source_worker_entries(store).values()
+        for worker_key, worker_entry in state.source_worker_entries(store).items()
         if _entry_open_for_pin(worker_entry)
+        and state.worker_entry_is_uniquely_routable(store, worker_key, worker_entry)
         and str(worker_entry.get("tendwire_space_id") or worker_entry.get("space_id") or "") == space_id
         and (
             not current_worker_ids
@@ -994,12 +997,38 @@ _RENAME_ATTEMPT_CAP = 3
 _REAP_ABSENCE_STREAK = 2
 
 
+def _ordered_workers(workers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(workers, key=state.canonical_worker_observation_key)
+
+
+def _worker_topic_assignment_keys(workers: list[dict[str, Any]]) -> dict[int, str]:
+    counts: dict[str, int] = {}
+    for worker in workers:
+        worker_id = compact_ws(worker.get("id"), 160)
+        counts[worker_id] = counts.get(worker_id, 0) + 1
+    result: dict[int, str] = {}
+    for worker in workers:
+        worker_id = compact_ws(worker.get("id"), 160)
+        if counts.get(worker_id) == 1:
+            result[id(worker)] = worker_id
+            continue
+        result[id(worker)] = "\x1f".join(
+            state.canonical_worker_observation_key(worker)
+        )
+    return result
+
+
 def _assign_worker_topic_names(
-    store: dict[str, Any], workers: list[dict[str, Any]]
+    store: dict[str, Any],
+    workers: list[dict[str, Any]],
+    *,
+    blocked_stable_keys: set[str] | None = None,
+    blocked_worker_ids: set[str] | None = None,
+    worker_entry_reservations: Mapping[int, str | None] | None = None,
 ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
     """Map each not-yet-topiced worker id -> a unique topic name (cwd basename, numbered on collision).
     Names already bound to a created topic are reserved and never renumbered, so numbers stay stable as
-    panes come and go. Ordered by worker id for deterministic numbering."""
+    panes come and go. Ordered by the shared canonical observation key for deterministic numbering."""
     # Reserved names are compared case-INSENSITIVELY to match _ensure_topic's reuse lookup
     # (find_legacy_topic_id_by_name uses .casefold()); otherwise "Foo"/"foo" would look distinct here
     # yet still collapse into one topic there.
@@ -1023,16 +1052,30 @@ def _assign_worker_topic_names(
         if e.get("topic_id") and e.get("topic_name")
     }
     keeps: dict[str, bool] = {}
-    ordered = sorted(workers, key=lambda w: compact_ws(w.get("id"), 160))
+    assignment_keys = _worker_topic_assignment_keys(workers)
+    ordered = _ordered_workers(workers)
     for worker in ordered:
         wid = compact_ws(worker.get("id"), 160)
-        key = state.resolve_worker_entry_key(store, worker) if wid else None
+        assignment_key = assignment_keys[id(worker)]
+        key = (
+            worker_entry_reservations.get(id(worker))
+            if worker_entry_reservations is not None
+            else (
+                None
+                if wid in (blocked_worker_ids or set())
+                else state.resolve_worker_entry_key(
+                    store, worker, blocked_stable_keys=blocked_stable_keys
+                )
+                if wid
+                else None
+            )
+        )
         existing = entries.get(key) if key is not None else None
         if not existing or not existing.get("topic_id") or not existing.get("topic_name"):
             continue
         current = compact_ws(existing.get("topic_name"), 120)
         keep = _is_variant_of(current, state.topic_name_for_worker(worker))
-        keeps[wid] = keep
+        keeps[assignment_key] = keep
         # NOTE: the old name stays RESERVED even when a rename is proposed — freeing it mid-pass
         # would let a new pane take it and collide into this topic via _ensure_topic's reuse-by-name
         # (two live panes sharing one topic). It frees naturally on the pass AFTER the rename lands.
@@ -1045,9 +1088,20 @@ def _assign_worker_topic_names(
     numbered_bases: dict[str, str] = {}
     for worker in ordered:
         wid = compact_ws(worker.get("id"), 160)
+        assignment_key = assignment_keys[id(worker)]
         if not wid:
             continue
-        key = state.resolve_worker_entry_key(store, worker)
+        key = (
+            worker_entry_reservations.get(id(worker))
+            if worker_entry_reservations is not None
+            else (
+                None
+                if wid in (blocked_worker_ids or set())
+                else state.resolve_worker_entry_key(
+                    store, worker, blocked_stable_keys=blocked_stable_keys
+                )
+            )
+        )
         existing = entries.get(key) if key is not None else None
         has_topic = bool(existing and existing.get("topic_id"))
         # De-number a connector-minted suffix once its base name is free again. The marker
@@ -1063,10 +1117,10 @@ def _assign_worker_topic_names(
                 and current[len(marker) + 1 :].strip().isdigit()
             )
             if numbered_variant and marker.casefold() not in all_named and marker.casefold() not in reserved:
-                renames[wid] = marker
+                renames[assignment_key] = marker
                 reserved.add(marker.casefold())
                 continue
-        if has_topic and keeps.get(wid, True):
+        if has_topic and keeps.get(assignment_key, True):
             continue  # topic name still matches its desired base; locked
         if has_topic and not _worker_is_open(worker):
             continue  # never rename a closed pane's topic (and never burn budget on it)
@@ -1079,11 +1133,11 @@ def _assign_worker_topic_names(
             n += 1
         reserved.add(name.casefold())
         if name.casefold() != base.casefold():
-            numbered_bases[wid] = base   # connector-minted number -> record its base as provenance
+            numbered_bases[assignment_key] = base   # connector-minted number -> record its base as provenance
         if has_topic:
-            renames[wid] = name   # desired name changed (e.g. the pane label appeared) -> rename in place
+            renames[assignment_key] = name   # desired name changed (e.g. the pane label appeared) -> rename in place
         else:
-            assigned[wid] = name
+            assigned[assignment_key] = name
     return assigned, renames, numbered_bases
 
 
@@ -1119,8 +1173,32 @@ def _sync_sources(
     worker_topic_names: dict[str, str] = {}
     worker_topic_renames: dict[str, str] = {}
     worker_numbered_bases: dict[str, str] = {}
+    workers = _workers(snapshot)
+    blocked_stable_keys = state.blocked_worker_stable_keys(store, workers)
+    blocked_worker_ids = state.conflicting_snapshot_worker_ids(workers)
+    counts["updated"] += state.quarantine_worker_stable_key_owners(
+        store,
+        blocked_stable_keys,
+        reason="preflight_stable_key_conflict",
+    )
+    worker_assignment_keys = _worker_topic_assignment_keys(workers)
+    worker_entry_reservations = state.precompute_worker_entry_reservations(
+        store,
+        workers,
+        blocked_stable_keys=blocked_stable_keys,
+        blocked_worker_ids=blocked_worker_ids,
+    )
+    reserved_entry_keys = frozenset(
+        key for key in worker_entry_reservations.values() if key is not None
+    )
     if topic_mode == "worker":
-        worker_topic_names, worker_topic_renames, worker_numbered_bases = _assign_worker_topic_names(store, _workers(snapshot))
+        worker_topic_names, worker_topic_renames, worker_numbered_bases = _assign_worker_topic_names(
+            store,
+            workers,
+            blocked_stable_keys=blocked_stable_keys,
+            blocked_worker_ids=blocked_worker_ids,
+            worker_entry_reservations=worker_entry_reservations,
+        )
     renames_issued = 0
     # Latest model per worker from the turn rows (recency-ordered: first non-empty wins). Stamped
     # cache-and-keep so an idle pane keeps showing its last-known model on the pinned board.
@@ -1139,38 +1217,53 @@ def _sync_sources(
     turn_status_by_worker, turn_status_by_space = _turn_activity_statuses(turns_payload, live_worker_ids)
     spaces = {compact_ws(item.get("id"), 160): item for item in _spaces(snapshot) if compact_ws(item.get("id"), 160)}
     workers_by_space: dict[str, list[dict[str, Any]]] = {}
-    for worker in _workers(snapshot):
+    for worker in _ordered_workers(workers):
         space_id = compact_ws(worker.get("space_id"), 160)
-        existing_key = state.resolve_worker_entry_key(store, worker)
+        existing_key = worker_entry_reservations.get(id(worker))
         before = dict(state.source_worker_entries(store).get(existing_key) or {}) if existing_key is not None else {}
-        _key, entry, created = state.upsert_worker_entry(store, worker)
+        _key, entry, created = state.upsert_worker_entry(
+            store,
+            worker,
+            blocked_stable_keys=blocked_stable_keys,
+            blocked_worker_ids=blocked_worker_ids,
+            preplanned_key=existing_key,
+            use_preplanned_key=True,
+            reserved_entry_keys=reserved_entry_keys,
+        )
         entry["status"] = _effective_worker_status(worker, turn_status_by_worker)
         _stamp_managed_voice(entry, _space_voice_mode(store, space_id))
+        if not state.worker_entry_is_uniquely_routable(store, _key, entry):
+            counts["created"] += int(created)
+            counts["updated"] += int(not created and before != entry)
+            continue
         # Apply the cwd-based, disambiguated name before the topic is created (once it has a topic_id
         # the name is locked, so a later renumber can't rename an existing topic).
         wid = compact_ws(worker.get("id"), 160)
-        if not entry.get("topic_id") and wid in worker_topic_names:
-            entry["topic_name"] = worker_topic_names[wid]
-            _stamp_numbered_base(entry, wid, worker_numbered_bases)
+        assignment_key = worker_assignment_keys[id(worker)]
+        if not entry.get("topic_id") and assignment_key in worker_topic_names:
+            entry["topic_name"] = worker_topic_names[assignment_key]
+            _stamp_numbered_base(entry, assignment_key, worker_numbered_bases)
         elif (
             entry.get("topic_id")
-            and wid in worker_topic_renames
+            and assignment_key in worker_topic_renames
             and not runtime.dry_run
             and renames_issued < create_cap
         ):
-            renamed = runtime.telegram.rename_topic(chat_id, str(entry["topic_id"]), worker_topic_renames[wid])
+            renamed = runtime.telegram.rename_topic(
+                chat_id, str(entry["topic_id"]), worker_topic_renames[assignment_key]
+            )
             renames_issued += 1
             if renamed.get("ok"):
-                entry["topic_name"] = worker_topic_renames[wid]
+                entry["topic_name"] = worker_topic_renames[assignment_key]
                 entry.pop("rename_attempts", None)
-                _stamp_numbered_base(entry, wid, worker_numbered_bases)  # stamp if renamed TO a minted number, else clear
+                _stamp_numbered_base(entry, assignment_key, worker_numbered_bases)
             elif _topic_missing(renamed.get("error")):
                 # the topic is gone (hand-deleted): drop the mapping so _ensure_topic recreates it
                 # under the new name instead of renaming a ghost forever.
                 entry.pop("topic_id", None)
-                entry["topic_name"] = worker_topic_renames[wid]
+                entry["topic_name"] = worker_topic_renames[assignment_key]
                 entry.pop("rename_attempts", None)
-                _stamp_numbered_base(entry, wid, worker_numbered_bases)
+                _stamp_numbered_base(entry, assignment_key, worker_numbered_bases)
             else:
                 entry["rename_attempts"] = int(entry.get("rename_attempts") or 0) + 1
         model = model_by_worker.get(wid)
@@ -1213,19 +1306,25 @@ def _sync_sources(
         _stamp_managed_voice(entry, _entry_voice_mode(entry))
         selected = _select_space_worker(selectable, turn_status_by_worker)
         seen_space_keys.add(_key)
+        entry.pop("stale_space_topic", None)
         selected_status = _effective_worker_status(selected, turn_status_by_worker) if selected else ""
         space_turn_status = turn_status_by_space.get(space_id) or ""
         entry["status"] = _dominant_status(space_turn_status, selected_status, _source_status(space.get("status")))
         entry["worker_count"] = len(selectable)
         entry["worker_ids"] = [compact_ws(worker.get("id"), 160) for worker in selectable if compact_ws(worker.get("id"), 160)]
+        state.clear_space_active_worker(entry)
         if selected:
-            entry["active_worker_id"] = compact_ws(selected.get("id"), 160)
-            entry["active_worker_fingerprint"] = compact_ws(selected.get("fingerprint"), 160)
-            entry["active_worker_name"] = compact_ws(selected.get("name"), 80)
-            selected_model = model_by_worker.get(compact_ws(selected.get("id"), 160))
-            if selected_model:
-                entry["active_worker_model"] = selected_model
-            entry["active_worker_status"] = _dominant_status(space_turn_status, selected_status)
+            _selected_key, selected_entry = state.find_worker_entry_by_id(
+                store, compact_ws(selected.get("id"), 160)
+            )
+            if selected_entry is not None and state.cache_space_active_worker(
+                entry, selected_entry
+            ):
+                entry["active_worker_name"] = compact_ws(selected.get("name"), 80)
+                selected_model = model_by_worker.get(compact_ws(selected.get("id"), 160))
+                if selected_model:
+                    entry["active_worker_model"] = selected_model
+                entry["active_worker_status"] = _dominant_status(space_turn_status, selected_status)
         topic_needed, topic_created = _ensure_topic(
             store, space, entry, runtime, chat_id=chat_id, can_create=creates_issued < create_cap
         )
@@ -1236,7 +1335,9 @@ def _sync_sources(
         counts["spaces"] += 1
     for key in list(state.source_space_entries(store)):
         if key not in seen_space_keys:
-            state.source_space_entries(store)[key]["stale_space_topic"] = True
+            stale_entry = state.source_space_entries(store)[key]
+            state.clear_space_active_worker(stale_entry)
+            stale_entry["stale_space_topic"] = True
     return counts
 
 
@@ -1484,6 +1585,8 @@ def _repair_space_mode_routing_state(store: dict[str, Any]) -> int:
 def _backfill_message_bindings(store: dict[str, Any]) -> int:
     before = set(state.message_bindings(store))
     for entry in state.source_worker_entries(store).values():
+        if not state.entry_is_routable(entry):
+            continue
         topic_id = str(entry.get("topic_id") or "")
         if not topic_id:
             _space_key, space_entry = state.find_space_entry_by_id(store, str(entry.get("tendwire_space_id") or entry.get("space_id") or ""))
@@ -2013,32 +2116,61 @@ def _sync_topic_pinned_statuses(store: dict[str, Any], runtime: SyncRuntime, *, 
     return updated
 
 
+def _tendwire_non_success(runtime: SyncRuntime, status: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": status,
+        "changed": False,
+        "created": 0,
+        "updated": 0,
+        "panes": 0,
+        "spaces": 0,
+        "icon_updated": 0,
+        "pinned_status_updated": 0,
+        "feed_sent": 0,
+        "sent": 0,
+        "routing_repaired": 0,
+        "message_bindings": 0,
+        "turn_updates": 0,
+        "topic_cleanup": {"deleted": 0, "failed": 0, "pruned": 0, "changed": False},
+        "tendwire_outbox": {
+            "enabled": runtime.with_outbox,
+            "polled": 0,
+            "delivered": 0,
+            "acked": 0,
+            "failed": 0,
+            "deferred": 0,
+            "changed": False,
+        },
+    }
+
+
+def _herdr_backend_explicitly_unhealthy(snapshot: dict[str, Any]) -> bool:
+    backend_health = snapshot.get("backend_health")
+    if not isinstance(backend_health, list):
+        return False
+    for item in backend_health:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name") or "").strip().lower() != "herdr":
+            continue
+        status = item.get("status")
+        if isinstance(status, str) and status.strip() and status.strip().lower().replace("-", "_") != "healthy":
+            return True
+    return False
+
+
 def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     config.require_source_mode()
-    chat_id = config.telegram_chat_id(store)
     snapshot = runtime.tendwire.snapshot()
+    if _herdr_backend_explicitly_unhealthy(snapshot):
+        return _tendwire_non_success(runtime, "tendwire_herdr_unhealthy")
+    chat_id = config.telegram_chat_id(store)
     turns_payload = runtime.tendwire.turns()
     pending_payload = runtime.tendwire.pending()
     for name, payload in (("snapshot", snapshot), ("turns", turns_payload), ("pending", pending_payload)):
         if payload.get("ok") is False:
-            return {
-                "ok": False,
-                "status": f"tendwire_{name}_failed",
-                "changed": False,
-                "created": 0,
-                "updated": 0,
-                "panes": 0,
-                "spaces": 0,
-                "icon_updated": 0,
-                "pinned_status_updated": 0,
-                "feed_sent": 0,
-                "sent": 0,
-                "routing_repaired": 0,
-                "message_bindings": 0,
-                "turn_updates": 0,
-                "topic_cleanup": {"deleted": 0, "failed": 0, "pruned": 0, "changed": False},
-                "tendwire_outbox": {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False},
-            }
+            return _tendwire_non_success(runtime, f"tendwire_{name}_failed")
     changed = False
     source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
     routing_repaired = _repair_space_mode_routing_state(store)

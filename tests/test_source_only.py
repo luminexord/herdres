@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import herdres
@@ -14,12 +15,36 @@ from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient, drain_outbox
 
 
+def _source_worker(worker, *, stable_identity=True):
+    """Return a test worker with a deterministic valid identity by default."""
+    result = dict(worker)
+    meta = dict(result.get("meta") or {})
+    if (
+        stable_identity
+        and "stable_key" not in meta
+        and "stable_key_version" not in meta
+    ):
+        material = f"{result.get('id') or ''}\0{result.get('fingerprint') or ''}"
+        meta["stable_key"] = "wsk1_" + hashlib.sha256(material.encode()).hexdigest()
+        meta["stable_key_version"] = 1
+    result["meta"] = meta
+    return result
+
+
 class FakeTendwire:
-    def __init__(self, *, turns=None, pending=None, workers=None, spaces=None):
+    def __init__(
+        self,
+        *,
+        turns=None,
+        pending=None,
+        workers=None,
+        spaces=None,
+        stable_identities=True,
+    ):
         self.commands = []
         self._turns = turns if turns is not None else {"turns": []}
         self._pending = pending if pending is not None else {"pending_interactions": []}
-        self._workers = workers if workers is not None else [
+        raw_workers = workers if workers is not None else [
             {
                 "id": "worker-1",
                 "name": "Alpha",
@@ -28,6 +53,10 @@ class FakeTendwire:
                 "fingerprint": "fp-1",
                 "meta": {"agent": "codex"},
             }
+        ]
+        self._workers = [
+            _source_worker(worker, stable_identity=stable_identities)
+            for worker in raw_workers
         ]
         self._spaces = spaces if spaces is not None else [
             {
@@ -304,17 +333,14 @@ def test_source_final_uses_configured_managed_bot_voice(monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
     store = _store()
     store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
-    _key, stale, _created = state.upsert_worker_entry(
-        store,
-        {
-            "id": "worker-1",
-            "name": "codex",
-            "status": "working",
-            "space_id": "space-1",
-            "fingerprint": "fp-1",
-            "meta": {"agent": "codex"},
-        },
-    )
+    _key, stale, _created = state.upsert_worker_entry(store, _source_worker({
+        "id": "worker-1",
+        "name": "codex",
+        "status": "working",
+        "space_id": "space-1",
+        "fingerprint": "fp-1",
+        "meta": {"agent": "codex"},
+    }), )
     stale["managed_bot_kind"] = "claude"
     telegram = FakeTelegram()
     turns = {
@@ -483,10 +509,7 @@ def test_managed_bot_tokens_include_env_and_state_tokens(monkeypatch):
 def test_sync_backfills_existing_message_bindings(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
-    _worker_key, worker, _created = state.upsert_worker_entry(
-        store,
-        {"id": "worker-1", "name": "Alpha", "status": "working", "space_id": "space-1", "fingerprint": "fp-1"},
-    )
+    _worker_key, worker, _created = state.upsert_worker_entry(store, _source_worker({"id": "worker-1", "name": "Alpha", "status": "working", "space_id": "space-1", "fingerprint": "fp-1"}), )
     worker["last_clean_message_id"] = "555"
     worker["last_turn_id"] = "turn-1"
     state.upsert_space_entry(
@@ -569,11 +592,7 @@ def test_worker_topic_mode_creates_one_topic_per_worker(monkeypatch):
 def test_space_topic_reuses_existing_same_name_worker_topic(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
-    _key, legacy, _created = state.upsert_worker_entry(
-        store,
-        {"id": "worker-old", "name": "Project", "status": "idle", "space_id": "old-space", "fingerprint": "old-fp"},
-        topic_id="123",
-    )
+    _key, legacy, _created = state.upsert_worker_entry(store, _source_worker({"id": "worker-old", "name": "Project", "status": "idle", "space_id": "old-space", "fingerprint": "old-fp"}), topic_id="123",)
     legacy["topic_name"] = "Project"
     telegram = FakeTelegram()
 
@@ -609,11 +628,7 @@ def test_space_without_open_worker_is_not_telegram_visible(monkeypatch):
 def test_space_mode_deletes_stale_worker_topics(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
-    _key, stale, _created = state.upsert_worker_entry(
-        store,
-        {"id": "worker-old", "name": "Old worker", "status": "idle", "space_id": "old-space", "fingerprint": "old-fp"},
-        topic_id="88",
-    )
+    _key, stale, _created = state.upsert_worker_entry(store, _source_worker({"id": "worker-old", "name": "Old worker", "status": "idle", "space_id": "old-space", "fingerprint": "old-fp"}), topic_id="88",)
     stale["topic_name"] = "Old worker"
     telegram = FakeTelegram()
 
@@ -629,11 +644,7 @@ def test_finished_council_worker_topic_is_deleted(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "gm-1", "name": "gm-local-as", "status": "done", "space_id": "space-1", "fingerprint": "fp-1"},
-        topic_id="88",
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "gm-1", "name": "gm-local-as", "status": "done", "space_id": "space-1", "fingerprint": "fp-1"}), topic_id="88",)
     telegram = FakeTelegram()
 
     result = sync_once(
@@ -685,11 +696,7 @@ def test_finished_council_space_topic_is_deleted(monkeypatch):
 def test_finished_council_worker_and_space_topic_delete_once(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "gm-1", "name": "gm-local-as", "status": "closed", "space_id": "space-1", "fingerprint": "fp-1"},
-        topic_id="88",
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "gm-1", "name": "gm-local-as", "status": "closed", "space_id": "space-1", "fingerprint": "fp-1"}), topic_id="88",)
     state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "gitmoot · local-as", "status": "active", "fingerprint": "space-fp"},
@@ -718,11 +725,7 @@ def test_finished_council_worker_and_space_topic_delete_once(monkeypatch):
 def test_finished_council_worker_does_not_delete_active_space_topic(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "gm-old", "name": "gm-local-as", "status": "done", "space_id": "space-1", "fingerprint": "fp-old"},
-        topic_id="88",
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "gm-old", "name": "gm-local-as", "status": "done", "space_id": "space-1", "fingerprint": "fp-old"}), topic_id="88",)
     state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "gitmoot · local-as", "status": "active", "fingerprint": "space-fp"},
@@ -1146,10 +1149,7 @@ def test_completed_turn_content_churn_is_not_reposted(monkeypatch):
 def test_delivered_final_turn_repairs_stale_entry_without_repost(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
-    _worker_key, worker, _created = state.upsert_worker_entry(
-        store,
-        {"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"},
-    )
+    _worker_key, worker, _created = state.upsert_worker_entry(store, _source_worker({"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"}), )
     worker["last_turn_id"] = "old-turn"
     worker["last_clean_message_id"] = "old-message"
     state.bind_message_to_worker(store, "555", worker, topic_id="77", kind="final", turn_id="turn-1", bot_kind="codex")
@@ -1552,17 +1552,14 @@ def test_empty_current_turn_for_working_worker_sends_compact_working_update(monk
 def test_space_topic_pin_renders_worker_board_not_space_summary(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {
-            "id": "worker-stale-claude",
-            "name": "claude",
-            "status": "idle",
-            "space_id": "space-1",
-            "fingerprint": "fp-stale",
-            "meta": {"agent": "claude"},
-        },
-    )
+    state.upsert_worker_entry(store, _source_worker({
+        "id": "worker-stale-claude",
+        "name": "claude",
+        "status": "idle",
+        "space_id": "space-1",
+        "fingerprint": "fp-stale",
+        "meta": {"agent": "claude"},
+    }), )
     telegram = FakeTelegram()
     tendwire = FakeTendwire(
         turns={"turns": []},
@@ -1737,10 +1734,7 @@ def test_completed_long_turn_sends_final_without_cutting_content(monkeypatch):
 def test_open_working_turn_repairs_stale_final_markers_then_finalizes(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
-    _worker_key, worker, _created = state.upsert_worker_entry(
-        store,
-        {"id": "worker-1", "name": "Alpha", "status": "working", "space_id": "space-1", "fingerprint": "fp-1"},
-    )
+    _worker_key, worker, _created = state.upsert_worker_entry(store, _source_worker({"id": "worker-1", "name": "Alpha", "status": "working", "space_id": "space-1", "fingerprint": "fp-1"}), )
     state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
@@ -1786,17 +1780,15 @@ def test_open_working_turn_repairs_stale_final_markers_then_finalizes(monkeypatc
 def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"}), )
     _space_key, entry, _created = state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
         topic_id="77",
     )
-    entry["active_worker_id"] = "worker-1"
-    entry["active_worker_fingerprint"] = "fp-1"
+    assert state.cache_space_active_worker(
+        entry, state.find_worker_entry_by_id(store, "worker-1")[1]
+    )
     state.save_state(store)
     fake = FakeTendwire()
 
@@ -1824,24 +1816,289 @@ def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path,
     assert "topic_id" not in encoded
 
 
+def test_invalid_snapshot_clears_stale_space_route_and_blocks_unbound_send_and_reply(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERDR_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "space")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json")
+    )
+    store = _store()
+    valid_worker = _source_worker(
+        {
+            "id": "worker-1",
+            "name": "Alpha",
+            "status": "idle",
+            "space_id": "space-1",
+            "fingerprint": "fp-valid",
+        }
+    )
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(workers=[valid_worker], turns={"turns": []}),
+            FakeTelegram(),
+            with_outbox=False,
+        ),
+    )
+    space = next(iter(state.source_space_entries(store).values()))
+    worker_key, worker = state.find_worker_entry_by_id(store, "worker-1")
+    assert worker_key is not None
+    assert worker is not None
+    topic_id = str(space["topic_id"])
+    state.bind_message_to_worker(
+        store, "500", worker, topic_id=topic_id, kind="final"
+    )
+    monkeypatch.setattr(
+        source_sync,
+        "_cleanup_topics",
+        lambda *_args, **_kwargs: {
+            "deleted": 0,
+            "failed": 0,
+            "pruned": 0,
+            "changed": False,
+        },
+    )
+
+    invalid_worker = {
+        "id": "worker-1",
+        "name": "Alpha",
+        "status": "idle",
+        "space_id": "space-1",
+        "fingerprint": "fp-invalid",
+        "meta": {"agent": "codex"},
+    }
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=[invalid_worker],
+                turns={"turns": []},
+                stable_identities=False,
+            ),
+            FakeTelegram(),
+            with_outbox=False,
+        ),
+    )
+
+    space = next(iter(state.source_space_entries(store).values()))
+    assert space["stale_space_topic"] is True
+    assert not any(key.startswith("active_worker_") for key in space)
+    assert state.find_entry_by_thread(store, topic_id) == (None, None)
+    assert state.message_bindings(store)["500"]["routing_quarantined"] is True
+    state.save_state(store)
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    assert (
+        herdres_gateway._payload_for_message(
+            {
+                "chat": {"id": "-100", "is_forum": True},
+                "message_thread_id": int(topic_id),
+                "message_id": 600,
+                "from": {"id": "1", "is_bot": False},
+                "text": "unbound gateway send",
+            },
+            store,
+        )
+        is None
+    )
+    unbound = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": topic_id,
+            "message_id": "601",
+            "text": "/send unbound command",
+        }
+    )
+    reply = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": topic_id,
+            "message_id": "602",
+            "reply_to_message_id": "500",
+            "text": "/send stale reply",
+        }
+    )
+
+    assert unbound == reply == {"handled": False}
+    assert fake.commands == []
+
+
+def test_space_route_requires_cached_exact_v1_identity(monkeypatch):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "space")
+    store = _store()
+    _worker_key, worker, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+    )
+    _space_key, space, _created = state.upsert_space_entry(
+        store,
+        {
+            "id": "space-1",
+            "name": "Project",
+            "status": "active",
+            "fingerprint": "space-fp",
+        },
+        topic_id="77",
+    )
+
+    assert state.find_entry_by_thread(store, "77")[1] is space
+    space.pop("active_worker_stable_key_version")
+    assert state.find_entry_by_thread(store, "77") == (None, None)
+    assert state.cache_space_active_worker(space, worker) is True
+    space["active_worker_stable_key"] = "wsk1_" + "f" * 64
+    assert state.find_entry_by_thread(store, "77") == (None, None)
+    assert state.cache_space_active_worker(space, worker) is True
+    assert state.find_entry_by_thread(store, "77")[1] is space
+
+
+def _stable_reply_worker(store):
+    return state.upsert_worker_entry(store, _source_worker({
+        "id": "worker-claude",
+        "name": "claude",
+        "status": "idle",
+        "space_id": "space-1",
+        "fingerprint": "fp-claude",
+        "meta": {
+            "agent": "claude",
+            "stable_key": "wsk1_" + "a" * 64,
+            "stable_key_version": 1,
+        },
+    }), topic_id="26",)
+
+
+def test_stable_reply_binding_requires_resolved_worker_topic_ownership():
+    store = _store()
+    worker_key, worker, _created = _stable_reply_worker(store)
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+
+    state.bind_message_to_worker(store, "500", worker, topic_id="99", kind="final")
+    assert herdres._worker_entry_from_reply(
+        store,
+        {"reply_to_message_id": "500", "topic_id": "99"},
+    ) == (None, None)
+
+    for message_id, topic_id in (("501", "26"), ("502", "77")):
+        state.bind_message_to_worker(store, message_id, worker, topic_id=topic_id, kind="final")
+        resolved_key, resolved_worker = herdres._worker_entry_from_reply(
+            store,
+            {"reply_to_message_id": message_id, "topic_id": topic_id},
+        )
+        assert resolved_key == worker_key
+        assert resolved_worker is worker
+
+def test_stable_reply_binding_requires_worker_and_identity_uniqueness_on_worker_and_space_topics():
+    store = _store()
+    worker_key, worker, _created = _stable_reply_worker(store)
+    _other_key, other, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-other",
+                "name": "codex",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-other",
+                "meta": {
+                    "agent": "codex",
+                    "stable_key": "wsk1_" + "b" * 64,
+                    "stable_key_version": 1,
+                },
+            }
+        ),
+        topic_id="28",
+    )
+    other["tendwire_worker_id"] = worker["tendwire_worker_id"]
+    other["worker_id"] = worker["worker_id"]
+    _space_key, space, _created = state.upsert_space_entry(
+        store,
+        {
+            "id": "space-1",
+            "name": "Project",
+            "status": "active",
+            "fingerprint": "space-fp",
+        },
+        topic_id="77",
+    )
+    assert state.cache_space_active_worker(space, worker) is True
+
+    stable_key = worker["tendwire_stable_key"]
+    assert state.find_worker_entry_by_stable_key(store, stable_key) == (
+        worker_key,
+        worker,
+    )
+    assert (
+        state.worker_entry_is_uniquely_routable(store, worker_key, worker)
+        is False
+    )
+    for message_id, topic_id in (("501", "26"), ("502", "77")):
+        state.bind_message_to_worker(
+            store,
+            message_id,
+            worker,
+            topic_id=topic_id,
+            kind="final",
+        )
+        assert herdres._worker_entry_from_reply(
+            store,
+            {"reply_to_message_id": message_id, "topic_id": topic_id},
+        ) == (None, None)
+
+
+
+def test_legacy_no_key_reply_binding_requires_resolved_worker_topic_ownership():
+    store = _store()
+    worker_key, worker, _created = _stable_reply_worker(store)
+
+    for message_id, topic_id in (("500", "99"), ("501", "26")):
+        state.bind_message_to_worker(store, message_id, worker, topic_id=topic_id, kind="final")
+        binding = store["telegram_message_bindings"][message_id]
+        binding.pop("stable_key")
+        binding.pop("stable_key_version")
+
+    assert herdres._worker_entry_from_reply(
+        store,
+        {"reply_to_message_id": "500", "topic_id": "99"},
+    ) == (None, None)
+    resolved_key, resolved_worker = herdres._worker_entry_from_reply(
+        store,
+        {"reply_to_message_id": "501", "topic_id": "26"},
+    )
+    assert resolved_key == worker_key
+    assert resolved_worker is worker
+
+
 def test_command_reply_to_agent_message_targets_original_worker(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
-    )
-    _worker_key, claude, _created = state.upsert_worker_entry(
-        store,
-        {"id": "worker-claude", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-claude"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"}), )
+    _worker_key, claude, _created = state.upsert_worker_entry(store, _source_worker({"id": "worker-claude", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-claude"}), )
     _space_key, entry, _created = state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
         topic_id="77",
     )
-    entry["active_worker_id"] = "worker-codex"
-    entry["active_worker_fingerprint"] = "fp-codex"
+    assert state.cache_space_active_worker(
+        entry, state.find_worker_entry_by_id(store, "worker-codex")[1]
+    )
     state.bind_message_to_worker(store, "555", claude, topic_id="77", kind="final", turn_id="turn-claude")
     state.save_state(store)
     fake = FakeTendwire()
@@ -1870,21 +2127,16 @@ def test_command_reply_to_agent_message_targets_original_worker(tmp_path, monkey
 def test_command_reply_at_alias_targets_worker_in_space(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
-    )
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-claude", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-claude"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"}), )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-claude", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-claude"}), )
     _space_key, entry, _created = state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
         topic_id="77",
     )
-    entry["active_worker_id"] = "worker-codex"
-    entry["active_worker_fingerprint"] = "fp-codex"
+    assert state.cache_space_active_worker(
+        entry, state.find_worker_entry_by_id(store, "worker-codex")[1]
+    )
     state.save_state(store)
     fake = FakeTendwire()
 
@@ -1911,21 +2163,16 @@ def test_command_reply_at_alias_targets_worker_in_space(tmp_path, monkeypatch):
 def test_command_reply_target_bot_kind_targets_worker_in_space(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
-    )
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-claude", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-claude"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"}), )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-claude", "name": "claude", "status": "idle", "space_id": "space-1", "fingerprint": "fp-claude"}), )
     _space_key, entry, _created = state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
         topic_id="77",
     )
-    entry["active_worker_id"] = "worker-codex"
-    entry["active_worker_fingerprint"] = "fp-codex"
+    assert state.cache_space_active_worker(
+        entry, state.find_worker_entry_by_id(store, "worker-codex")[1]
+    )
     state.save_state(store)
     fake = FakeTendwire()
 
@@ -1953,21 +2200,16 @@ def test_command_reply_target_bot_kind_targets_worker_in_space(tmp_path, monkeyp
 def test_command_reply_voice_transcript_targets_worker_in_space(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
-    )
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-kimi", "name": "kimi", "status": "idle", "space_id": "space-1", "fingerprint": "fp-kimi"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"}), )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-kimi", "name": "kimi", "status": "idle", "space_id": "space-1", "fingerprint": "fp-kimi"}), )
     _space_key, entry, _created = state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
         topic_id="77",
     )
-    entry["active_worker_id"] = "worker-codex"
-    entry["active_worker_fingerprint"] = "fp-codex"
+    assert state.cache_space_active_worker(
+        entry, state.find_worker_entry_by_id(store, "worker-codex")[1]
+    )
     state.save_state(store)
     fake = FakeTendwire()
 
@@ -2001,17 +2243,15 @@ def test_command_reply_voice_without_transcript_has_voice_specific_reply(tmp_pat
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     monkeypatch.delenv("HERDR_TELEGRAM_TOPICS_SPEECH_INPUT", raising=False)
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"}), )
     _space_key, entry, _created = state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
         topic_id="77",
     )
-    entry["active_worker_id"] = "worker-1"
-    entry["active_worker_fingerprint"] = "fp-1"
+    assert state.cache_space_active_worker(
+        entry, state.find_worker_entry_by_id(store, "worker-1")[1]
+    )
     state.save_state(store)
     fake = FakeTendwire()
 
@@ -2038,10 +2278,7 @@ def test_command_reply_voice_without_transcript_has_voice_specific_reply(tmp_pat
 def test_voice_command_sets_space_voice_mode(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"}), )
     _space_key, entry, _created = state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
@@ -2071,17 +2308,15 @@ def test_voice_command_sets_space_voice_mode(tmp_path, monkeypatch):
 def test_command_reply_unknown_at_alias_fails_safely(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"}), )
     _space_key, entry, _created = state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
         topic_id="77",
     )
-    entry["active_worker_id"] = "worker-codex"
-    entry["active_worker_fingerprint"] = "fp-codex"
+    assert state.cache_space_active_worker(
+        entry, state.find_worker_entry_by_id(store, "worker-codex")[1]
+    )
     state.save_state(store)
     fake = FakeTendwire()
 
@@ -2106,11 +2341,7 @@ def test_command_reply_unknown_at_alias_fails_safely(tmp_path, monkeypatch):
 
 def test_gateway_maps_only_source_topic(monkeypatch):
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"},
-        topic_id="78",
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"}), topic_id="78",)
     _space_key, entry, _created = state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
@@ -2135,10 +2366,7 @@ def test_gateway_child_bot_payload_targets_child_kind(monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
     store = _store()
     store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token", "username": "codex_bot"}}
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"}), )
     state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
@@ -2166,10 +2394,7 @@ def test_gateway_child_bot_does_not_claim_unaddressed_topic_message(monkeypatch)
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
     store = _store()
     store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"}), )
     state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
@@ -2208,10 +2433,7 @@ def test_gateway_voice_payload_includes_attachment(monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
     store = _store()
     store["telegram"]["managed_bots"] = {"kimi": {"enabled": True, "token": "kimi-token", "username": "kimi_bot"}}
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-kimi", "name": "kimi", "status": "idle", "space_id": "space-1", "fingerprint": "fp-kimi"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-kimi", "name": "kimi", "status": "idle", "space_id": "space-1", "fingerprint": "fp-kimi"}), )
     state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
@@ -2247,10 +2469,7 @@ def test_gateway_voice_payload_includes_attachment(monkeypatch):
 def test_gateway_pretranscribes_voice_before_command(monkeypatch, tmp_path):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
-    state.upsert_worker_entry(
-        store,
-        {"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"},
-    )
+    state.upsert_worker_entry(store, _source_worker({"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"}), )
     state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
@@ -2294,10 +2513,7 @@ def test_gateway_manager_skips_reply_owned_by_child_bot(monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
     store = _store()
     store["telegram"]["managed_bots"] = {"codex": {"enabled": True, "token": "codex-token"}}
-    _worker_key, worker, _created = state.upsert_worker_entry(
-        store,
-        {"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"},
-    )
+    _worker_key, worker, _created = state.upsert_worker_entry(store, _source_worker({"id": "worker-codex", "name": "codex", "status": "idle", "space_id": "space-1", "fingerprint": "fp-codex"}), )
     state.upsert_space_entry(
         store,
         {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},

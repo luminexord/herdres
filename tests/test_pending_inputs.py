@@ -8,7 +8,7 @@ from unittest.mock import patch
 import herdres
 from herdres_connector import state
 
-from test_source_only import _store
+from test_source_only import _source_worker, _store
 
 
 def _setup(tmp_path, monkeypatch):
@@ -16,8 +16,13 @@ def _setup(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
-    store["panes"]["worker:w1"] = {"source": "tendwire", "entry_type": "worker", "tendwire_worker_id": "w1",
-                                   "tendwire_space_id": "s1", "topic_id": "77"}
+    state.upsert_worker_entry(store, _source_worker({
+        "id": "w1",
+        "name": "worker",
+        "status": "working",
+        "space_id": "s1",
+        "fingerprint": "fp1",
+    }), topic_id="77")
     state.save_state(store)
 
 

@@ -17,7 +17,7 @@ from unittest.mock import patch
 from herdres_connector import config, state
 from herdres_connector.source_sync import SyncRuntime, _cleanup_topics, _sync_sources, sync_once
 
-from test_source_only import FakeTelegram, FakeTendwire, _store
+from test_source_only import FakeTelegram, FakeTendwire, _source_worker, _store
 
 
 def _reset_lock_state():
@@ -250,8 +250,10 @@ def test_sync_sources_create_cap(monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MAX_CREATES", "2")
     store = _store()
     workers = [
-        {"id": f"worker-{i}", "name": f"w{i}", "status": "working", "space_id": "space-1",
-         "fingerprint": f"fp-{i}", "meta": {"agent": "codex"}}
+        _source_worker(
+            {"id": f"worker-{i}", "name": f"w{i}", "status": "working", "space_id": "space-1",
+             "fingerprint": f"fp-{i}", "meta": {"agent": "codex"}},
+        )
         for i in range(5)
     ]
     snapshot = {"ok": True, "spaces": [{"id": "space-1", "name": "S", "status": "active"}], "workers": workers}

@@ -28,6 +28,55 @@ herdres sync
 
 Only `HERDRES_TENDWIRE_MODE=source` is supported.
 
+## Worker identity continuity
+
+Tendwire may publish a v1 worker handle in public worker metadata. Herdres
+treats a persisted worker entry as independently routable only when
+`meta.stable_key` is a string consisting of exactly `wsk1_` followed by 64
+lowercase hexadecimal characters and `meta.stable_key_version` is the exact
+integer `1` (not a string or boolean). Both fields must be present and valid.
+Malformed, partial, differently versioned, or decorated values are not stable
+identity.
+
+This check is deliberately syntactic. Tendwire derives the handle from its
+private 32-byte installation key, but Herdres never receives or reads that key,
+never sees raw pane identity, and cannot cryptographically distinguish a
+correctly shaped spoof from a Tendwire-generated handle. Authenticity therefore
+depends on the local Tendwire boundary and access controls around its public
+output, not on Herdres's format check. Herdres does not query Herdr to confirm an
+identity.
+
+With the same Tendwire installation key, moves within the same workspace/tab
+retain the handle and an existing worker topic. A cross-workspace move
+intentionally receives another handle. This reconciliation does not change the
+Telegram topic policy below: space topics remain the default and worker/pane
+topics remain opt-in.
+
+Persisted entries with no identity, or with the legacy 24-character lowercase
+hexadecimal identity, are not independently routable. They are migration-only:
+when a compatible current observation supplies an exact valid-v1 identity,
+Herdres may attach it to one unambiguous, live legacy entry for the same worker.
+That additive, idempotent migration retains the Telegram topic, message
+bindings, and delivery ledgers, so it neither creates a duplicate topic nor
+replays delivered turns. Ambiguous or unsafe candidates are quarantined.
+
+Before topic creation or selection, and before turn or reply routing, Herdres
+preflights current observations and persisted state. A missing, malformed,
+partial, or unknown identity, a fresh-snapshot collision, or a persisted
+collision is quarantined. A quarantined claimant is not routable and cannot
+receive or select a topic; repeated faulty snapshots update the same claimant
+rather than creating duplicate state entries or topics. A reply binding resolves
+only when its worker owns the binding topic directly or through that worker's
+matching Tendwire source-space topic.
+
+Tendwire's continuity set includes `installation.key`,
+`installation.key.sha256`, and the one-byte nonsecret
+`installation.key.initialized` sentinel. Once initialized, ordinary key loading
+never rotates the installation identity. A deliberate offline rotation requires
+an explicit acknowledged reset, changes every handle, and requires operator
+review of quarantined old bindings. See [INSTALL.md](INSTALL.md) for the paired
+backup, restore, and reset requirements.
+
 By default Herdres creates one Telegram topic per Tendwire space:
 
 ```sh

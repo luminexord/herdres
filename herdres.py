@@ -102,15 +102,50 @@ def _voice_unavailable_reply(payload: dict[str, Any]) -> str:
     return "Got your voice note, but it could not be transcribed. Send text, or run `herdres speech check`."
 
 
+def _worker_entry_matches_binding_topic(
+    store: dict[str, Any],
+    binding: dict[str, Any],
+    entry: dict[str, Any],
+) -> bool:
+    binding_topic = str(binding.get("topic_id") or "")
+    return bool(
+        binding_topic
+        and binding_topic in state.worker_entry_allowed_topic_ids(store, entry)
+    )
+
+
 def _worker_entry_from_reply(store: dict[str, Any], payload: dict[str, Any]) -> tuple[str, dict[str, Any]] | tuple[None, None]:
     binding = state.find_message_binding(
         store,
         payload.get("reply_to_message_id"),
         topic_id=payload.get("topic_id"),
     )
-    if not binding:
+    if not binding or "routing_quarantined" in binding:
         return None, None
-    return state.find_worker_entry_by_id(store, str(binding.get("worker_id") or ""))
+    identity = state.message_binding_stable_identity(binding)
+    has_stable_fields = "stable_key" in binding or "stable_key_version" in binding
+    if identity is not None:
+        key, entry = state.find_worker_entry_by_stable_key(store, identity[0])
+    elif has_stable_fields:
+        return None, None
+    else:
+        key, entry = state.find_worker_entry_by_id(store, str(binding.get("worker_id") or ""))
+        if entry is None:
+            return None, None
+        bound_fingerprint = str(binding.get("worker_fingerprint") or "")
+        bound_space = str(binding.get("space_id") or "")
+        if bound_fingerprint and bound_fingerprint != str(entry.get("tendwire_fingerprint") or ""):
+            return None, None
+        if bound_space and bound_space != str(entry.get("tendwire_space_id") or entry.get("space_id") or ""):
+            return None, None
+    if (
+        key is None
+        or entry is None
+        or not state.worker_entry_is_uniquely_routable(store, key, entry)
+        or not _worker_entry_matches_binding_topic(store, binding, entry)
+    ):
+        return None, None
+    return key, entry
 
 
 def _worker_entry_from_alias(store: dict[str, Any], alias: str, entry: dict[str, Any]) -> tuple[str, dict[str, Any]] | tuple[None, None]:
@@ -304,6 +339,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             _reply_key, reply_entry = _worker_entry_from_reply(store, payload)
             if reply_entry is not None:
                 entry = reply_entry
+            elif payload.get("reply_to_message_id") and state.find_message_binding(
+                store,
+                payload.get("reply_to_message_id"),
+                topic_id=payload.get("topic_id"),
+            ):
+                return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "ambiguous_reply_target"}
             else:
                 target_bot_kind = str(payload.get("target_bot_kind") or "").strip().lower()
                 if target_bot_kind:
