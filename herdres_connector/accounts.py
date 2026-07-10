@@ -1,23 +1,30 @@
-"""Who-am-I + usage for the pinned boards.
+"""Who-am-I + remaining-quota footer for the pinned boards.
 
 Reads plan metadata from the local CLI credential files (named fields only — NEVER the
-tokens themselves) and local usage from `ccusage`, and renders the compact account line
-appended to the pinned status boards, e.g.
+tokens themselves) and the REMAINING rate-limit headroom per window, rendered as e.g.
 
-    🔑 Max 20x · block $37 (1h35m) · today $593
-    🔑 ChatGPT Pro · today $371 · 215M tok
+    🔑 Max 20x · 5h 76% left (1h10m) · wk 68% left (Sun)
+    🔑 ChatGPT Pro · 5h 86% left (2h05m) · wk 98% left (Fri)
 
-The ccusage snapshot is disk-cached with a coarse TTL: every value change re-edits every
-pinned board, so the TTL (config.usage_refresh_seconds) is the pin-edit rate limiter, and
-all numbers are rounded coarsely for the same reason.
+Sources:
+- Claude: the OAuth usage endpoint the in-app /usage screen uses (bearer = the access
+  token from ~/.claude/.credentials.json, read in-process and never rendered/logged).
+- Codex: the `rate_limits` events the codex CLI writes into its session JSONL files
+  (primary = 5h window, secondary = weekly) — local, no network.
+
+The snapshot is disk-cached with a coarse TTL: every value change re-edits every pinned
+board, so the TTL (config.usage_refresh_seconds) is the pin-edit rate limiter, and reset
+countdowns are rounded to 5 minutes for the same reason.
 """
 from __future__ import annotations
 
 import base64
+import glob
 import json
-import subprocess
+import os
 import time
-from datetime import datetime, timezone
+import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,14 +32,16 @@ from . import config
 
 CLAUDE_CREDENTIALS_PATH = Path.home() / ".claude/.credentials.json"
 CODEX_AUTH_PATH = Path.home() / ".codex/auth.json"
+CODEX_SESSIONS_DIR = Path.home() / ".codex/sessions"
 USAGE_CACHE_PATH = Path.home() / ".local/share/herdres/usage_cache.json"
 
-# ccusage answers in ~2s with a --since filter; the cap only bounds a wedged run, which
-# would otherwise stall the whole sync pass (refresh happens at most once per TTL).
-CCUSAGE_TIMEOUT_SECONDS = 15
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+HTTP_TIMEOUT_SECONDS = 15
+_SESSION_TAIL_BYTES = 400_000
+_SESSION_FILES_TO_SCAN = 3
 
 # Process-local memo so one sync pass touching many topics reads/refreshes at most once,
-# even when ccusage is missing (a failed refresh would otherwise retry per topic).
+# even when the sources fail (a failed refresh would otherwise retry per topic).
 _MEMO: dict[str, Any] | None = None
 
 
@@ -44,7 +53,7 @@ def _read_json(path: Any) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-# --- identity (plan metadata only; tokens are never read out of these files) -----------
+# --- identity (plan metadata only; tokens are never rendered or logged) -----------------
 
 
 def agent_kind(value: Any) -> str:
@@ -113,66 +122,132 @@ def _pretty_codex_plan(identity: dict[str, str]) -> str:
     return "API key" if "api" in mode else (mode.capitalize() if mode else "")
 
 
-# --- usage snapshot (ccusage, disk-cached) ----------------------------------------------
+# --- remaining-quota collection ----------------------------------------------------------
 
 
-def _run_ccusage(args: list[str]) -> dict[str, Any]:
+def _window(used_percent: Any, resets_epoch: Any) -> dict[str, Any]:
+    window: dict[str, Any] = {}
+    if isinstance(used_percent, (int, float)):
+        window["used_percent"] = float(used_percent)
+    if isinstance(resets_epoch, (int, float)) and resets_epoch > 0:
+        window["resets_at"] = float(resets_epoch)
+    return window
+
+
+def _iso_epoch(value: Any) -> float | None:
     try:
-        proc = subprocess.run(
-            ["ccusage", *args, "--json"], capture_output=True, timeout=CCUSAGE_TIMEOUT_SECONDS
-        )
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
     except Exception:
-        return {}
-    if proc.returncode != 0:
-        return {}
+        return None
+
+
+def _http_get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
+    request = urllib.request.Request(url, headers=headers)
     try:
-        data = json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def _daily_totals(payload: dict[str, Any]) -> dict[str, Any]:
-    rows = payload.get("daily")
-    if not isinstance(rows, list) or not rows:
+def _claude_limits() -> dict[str, Any]:
+    """5h/weekly utilization from the OAuth usage endpoint (what in-app /usage shows)."""
+    oauth = _read_json(CLAUDE_CREDENTIALS_PATH).get("claudeAiOauth")
+    token = str(oauth.get("accessToken") or "") if isinstance(oauth, dict) else ""
+    if not token:
         return {}
-    row = rows[-1]
-    if not isinstance(row, dict):
+    payload = _http_get_json(CLAUDE_USAGE_URL, {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+    })
+    limits: dict[str, Any] = {}
+    for key, field in (("five_hour", "five_hour"), ("weekly", "seven_day"), ("weekly_opus", "seven_day_opus")):
+        raw = payload.get(field)
+        if isinstance(raw, dict):
+            window = _window(raw.get("utilization"), _iso_epoch(raw.get("resets_at")))
+            if window:
+                limits[key] = window
+    return limits
+
+
+def _last_rate_limits_line(path: Path) -> dict[str, Any]:
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _SESSION_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", "replace")
+    except Exception:
         return {}
-    totals: dict[str, Any] = {}
-    cost = row.get("totalCost") if row.get("totalCost") is not None else row.get("costUSD")
-    if isinstance(cost, (int, float)):
-        totals["today_cost"] = float(cost)
-    tokens = row.get("totalTokens")
-    if isinstance(tokens, (int, float)):
-        totals["today_tokens"] = int(tokens)
-    return totals
+    for line in reversed(tail.splitlines()):
+        if '"rate_limits"' not in line:
+            continue
+        try:
+            found = _dig_rate_limits(json.loads(line))
+        except Exception:
+            continue
+        if found:
+            return found
+    return {}
+
+
+def _dig_rate_limits(obj: Any) -> dict[str, Any]:
+    if isinstance(obj, dict):
+        limits = obj.get("rate_limits")
+        if isinstance(limits, dict):
+            return limits
+        for value in obj.values():
+            found = _dig_rate_limits(value)
+            if found:
+                return found
+    return {}
+
+
+def _codex_limits() -> dict[str, Any]:
+    """5h/weekly windows from the newest `rate_limits` event in the codex session logs
+    (primary = 5h, secondary = weekly). Local files only — no network."""
+    try:
+        files = sorted(
+            glob.glob(str(Path(CODEX_SESSIONS_DIR) / "**" / "*.jsonl"), recursive=True),
+            key=os.path.getmtime,
+        )
+    except Exception:
+        return {}
+    for path in reversed(files[-_SESSION_FILES_TO_SCAN:] if files else []):
+        raw = _last_rate_limits_line(Path(path))
+        if not raw:
+            continue
+        limits: dict[str, Any] = {}
+        for key, field in (("five_hour", "primary"), ("weekly", "secondary")):
+            window_raw = raw.get(field)
+            if isinstance(window_raw, dict):
+                window = _window(window_raw.get("used_percent"), window_raw.get("resets_at"))
+                if window:
+                    limits[key] = window
+        if limits:
+            return limits
+    return {}
 
 
 def _collect_usage(now: float) -> dict[str, Any]:
-    since = time.strftime("%Y%m%d", time.localtime(now))
     usage: dict[str, Any] = {}
-    claude = _daily_totals(_run_ccusage(["claude", "daily", "--since", since]))
-    blocks = _run_ccusage(["blocks", "--active"]).get("blocks")
-    block = blocks[0] if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict) else {}
-    if isinstance(block.get("costUSD"), (int, float)):
-        claude["block_cost"] = float(block["costUSD"])
-    if block.get("endTime"):
-        claude["block_end"] = str(block["endTime"])
+    claude = _claude_limits()
     if claude:
         usage["claude"] = claude
-    codex = _daily_totals(_run_ccusage(["codex", "daily", "--since", since]))
+    codex = _codex_limits()
     if codex:
         usage["codex"] = codex
     return usage
 
 
 def usage_snapshot(*, cache_path: Any = None, now: float | None = None, env: Any = None) -> dict[str, Any]:
-    """The ccusage numbers behind the account line, refreshed at most once per TTL.
+    """The remaining-quota numbers behind the account line, refreshed at most once per TTL.
 
-    Serves, in order: the process memo, the disk cache (shared across the timer's
-    one-process-per-tick runs), then a fresh ccusage collection. A failed refresh keeps
-    serving the last good snapshot rather than blanking the boards."""
+    Serves, in order: the process memo, the disk cache (shared across processes), then a
+    fresh collection. A failed refresh keeps serving the last good snapshot (and backs off
+    a full TTL) rather than blanking the boards."""
     global _MEMO
     current = time.time() if now is None else now
     ttl = config.usage_refresh_seconds(env)
@@ -189,7 +264,7 @@ def usage_snapshot(*, cache_path: Any = None, now: float | None = None, env: Any
     fresh = _collect_usage(current)
     if not fresh and cached:
         snapshot = dict(cached)
-        snapshot["fetched_at"] = current  # back off for a full TTL before retrying ccusage
+        snapshot["fetched_at"] = current  # back off for a full TTL before retrying the sources
     else:
         snapshot = {"fetched_at": current, **fresh}
     try:
@@ -204,61 +279,45 @@ def usage_snapshot(*, cache_path: Any = None, now: float | None = None, env: Any
 # --- the rendered line -------------------------------------------------------------------
 
 
-def _fmt_dollars(value: Any) -> str:
-    if not isinstance(value, (int, float)):
+def _fmt_countdown(resets_at: Any, now: float) -> str:
+    if not isinstance(resets_at, (int, float)):
         return ""
-    return f"${round(float(value)):,}"
-
-
-def _fmt_tokens(value: Any) -> str:
-    if not isinstance(value, (int, float)) or value <= 0:
-        return ""
-    count = float(value)
-    if count >= 1_000_000:
-        return f"{count / 1_000_000:.0f}M tok"
-    if count >= 1_000:
-        return f"{count / 1_000:.0f}k tok"
-    return f"{count:.0f} tok"
-
-
-def _fmt_block_left(end_iso: str, now: float) -> str:
-    try:
-        end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-        minutes = int((end.timestamp() - now) // 60)
-    except Exception:
-        return ""
+    minutes = int((resets_at - now) // 60)
     if minutes <= 0:
         return ""
     minutes -= minutes % 5  # coarse on purpose: every tick of this string re-edits every pin
     hours, mins = divmod(minutes, 60)
+    if hours >= 24:
+        return time.strftime("%a", time.localtime(resets_at))
     return f"{hours}h{mins:02d}m" if hours else f"{mins}m"
 
 
+def _fmt_window(label: str, window: Any, now: float) -> str:
+    if not isinstance(window, dict):
+        return ""
+    used = window.get("used_percent")
+    if not isinstance(used, (int, float)):
+        return ""
+    left = max(0, min(100, round(100 - used)))
+    part = f"{label} {left}% left"
+    if left <= 10:
+        part = f"⚠️ {part}"
+    countdown = _fmt_countdown(window.get("resets_at"), now)
+    return f"{part} ({countdown})" if countdown else part
+
+
 def account_line(kind: str, *, snapshot: dict[str, Any] | None = None, now: float | None = None, env: Any = None) -> str:
-    """The plain-text account/usage line for one agent kind ('' when unknown/unavailable)."""
+    """The plain-text account/remaining-quota line for one agent kind ('' when unknown)."""
     kind = agent_kind(kind)
     if not kind:
         return ""
     current = time.time() if now is None else now
     snapshot = usage_snapshot(env=env) if snapshot is None else snapshot
-    usage = snapshot.get(kind) if isinstance(snapshot.get(kind), dict) else {}
-    parts: list[str] = []
-    if kind == "claude":
-        plan = _pretty_claude_plan(claude_identity())
-        if plan:
-            parts.append(plan)
-        block_cost = _fmt_dollars(usage.get("block_cost"))
-        if block_cost:
-            left = _fmt_block_left(str(usage.get("block_end") or ""), current)
-            parts.append(f"block {block_cost} ({left})" if left else f"block {block_cost}")
-    else:
-        plan = _pretty_codex_plan(codex_identity())
-        if plan:
-            parts.append(plan)
-    today_cost = _fmt_dollars(usage.get("today_cost"))
-    if today_cost:
-        parts.append(f"today {today_cost}")
-    tokens = _fmt_tokens(usage.get("today_tokens"))
-    if tokens:
-        parts.append(tokens)
+    limits = snapshot.get(kind) if isinstance(snapshot.get(kind), dict) else {}
+    plan = _pretty_claude_plan(claude_identity()) if kind == "claude" else _pretty_codex_plan(codex_identity())
+    parts = [plan] if plan else []
+    for label, key in (("5h", "five_hour"), ("wk", "weekly"), ("opus wk", "weekly_opus")):
+        part = _fmt_window(label, limits.get(key), current)
+        if part:
+            parts.append(part)
     return "🔑 " + " · ".join(parts) if parts else ""
