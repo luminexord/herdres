@@ -110,17 +110,18 @@ def pinned_status_enabled(env: Any | None = None) -> bool:
 
 
 def pinned_account_enabled(env: Any | None = None) -> bool:
-    """Append a who-am-I/usage line to the pinned status boards (plan tier from the CLI
-    credential files — named metadata fields only, never tokens — plus today's ccusage
-    meter). Default on; degrades to no line when ccusage or the credential files are
-    absent. HERDRES_PINNED_ACCOUNT=0 turns it off."""
+    """Append a who-am-I/quota line to the pinned status boards: plan tier from the CLI
+    credential files (named metadata fields only, never tokens) plus the remaining 5h and
+    weekly rate-limit headroom (Claude: the OAuth usage endpoint behind in-app /usage;
+    Codex: the rate_limits events in its local session logs). Default on; degrades to no
+    line when the sources are absent. HERDRES_PINNED_ACCOUNT=0 turns it off."""
     source = os.environ if env is None else env
     value = str(source.get("HERDRES_PINNED_ACCOUNT", "1") or "").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
 
 def usage_refresh_seconds(env: Any | None = None) -> int:
-    """Disk-cache TTL for the ccusage snapshot behind the pinned account line. Coarse on
+    """Disk-cache TTL for the quota snapshot behind the pinned account line. Coarse on
     purpose: every refresh can change the line and re-edit every pinned board, so this TTL
     is the pin-edit rate limiter. HERDRES_USAGE_REFRESH_SECONDS, default 300."""
     source = os.environ if env is None else env
