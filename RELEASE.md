@@ -136,7 +136,7 @@ The paired gate must establish all of the following:
 ### Failed-plan operator evidence
 
 An `attempts_exhausted` plan must remain idle on ordinary sync until an operator
-issues exactly one explicit command:
+issues an explicit command for that failed generation:
 
 ```sh
 herdres tendwire recover-turn-final \
@@ -158,18 +158,27 @@ idempotency key and audit key. Local preflight must stop before RPC with:
   without an acknowledged receipt;
 - `recovery_receipt_inflight` for `telegram_applied` or `old_slot_retired`
   provider outcomes still awaiting durable ACK; and
-- `recovery_capacity_exceeded` when both immutable generations will not fit.
+- `recovery_capacity_exceeded` when both immutable generations will not fit or
+  every bounded audit slot is protected by a pending replacement plan.
 
 Typed Tendwire failures pass through. A malformed/mismatched response or any
 state change across the RPC is `recovery_state_uncertain`. Success must return a
-different token and new generation for the same revision, with exact prefix and
-executable counts. The old receipts remain byte-for-byte unchanged; Herdres
-clones the contiguous acknowledged prefix, retargets only its bindings, records
-the request-keyed audit, validates the suffix's predecessor against the old
-ACK-prefix barrier, and executes only the suffix. Output records both tokens,
-generation, prefix/executable/retained/prior-attempt counts, state, and
+different token and exact next generation for the same revision, with exact
+prefix and executable counts. A failed replacement must have one uniquely
+matching inherited recovery audit and request binding for the preceding
+generation. Herdres adds that audit's retained-failure count to the current
+failed tail and binds the inherited identity and cumulative count into
+preflight revalidation. Audits needed by pending replacements are protected
+from bounded-detail eviction; an all-protected audit table fails before RPC
+rather than stranding a later generation. The old receipts remain byte-for-byte
+unchanged. Herdres clones the contiguous acknowledged prefix, retargets only
+its bindings,
+records the request-keyed audit, validates the suffix's predecessor against the
+old ACK-prefix barrier, and executes only the suffix. Output records both
+tokens, generation, prefix/executable/retained/prior-attempt counts, state, and
 `idempotent_replay`. Repeating the same request returns the same audited token
-with `idempotent_replay=true`; there is no automatic recovery loop.
+with `idempotent_replay=true`; each generation requires one explicit request
+and there is no automatic recovery loop.
 
 Do not treat exact identity format as cryptographic proof: a correctly shaped
 spoof in altered public input is outside Herdres's ability to authenticate. Do

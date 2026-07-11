@@ -87,7 +87,7 @@ prepare, edit, send, or ledger update.
 ### Explicit failed-plan recovery
 
 An `attempts_exhausted` turn-final plan does not spin on later ordinary syncs.
-After investigating the provider outcome, an operator may request one explicit
+After investigating the provider outcome, an operator may request an explicit
 replacement generation:
 
 ```sh
@@ -115,15 +115,22 @@ Any malformed, mismatched, or state-changing success response becomes
 `recovery_state_uncertain`; no copied-state cutover occurs.
 
 A successful response must name the same content revision, a different
-`twplan1.` token in a new generation, the exact acknowledged-prefix count, and
-an active executable suffix. Herdres leaves every old receipt immutable, clones
-the acknowledged prefix under the new token, retargets only that prefix's
-bindings, records the request-keyed recovery audit, and executes only the
-suffix. The JSON output includes both plan tokens, generation, prefix and
-executable counts, retained failed-job and prior-attempt counts, state, and
-`idempotent_replay`. Repeating the same request ID for the same failed plan
-returns the audited token with `idempotent_replay=true`; reusing it for another
-plan conflicts. The command is one-shot and never installs an automatic
+`twplan1.` token in the exact next generation, the exact acknowledged-prefix
+count, and an active executable suffix. When a replacement generation also
+fails, Herdres requires exactly one matching prior recovery audit and request
+binding for that failed token and generation. The expected retained-failure
+count is the inherited audit count plus the current generation's failed tail;
+that audit identity and count are included in the pre-RPC state fingerprint.
+Audits referenced by pending replacement plans are never evicted; if all audit
+slots are protected, preflight returns `recovery_capacity_exceeded` before RPC.
+Herdres leaves every old receipt immutable, clones the acknowledged prefix
+under the new token, retargets only that prefix's bindings, records the
+request-keyed recovery audit, and executes only the suffix. The JSON output
+includes both plan tokens, generation, prefix and executable counts, retained
+failed-job and prior-attempt counts, state, and `idempotent_replay`. Repeating
+the same request ID for the same failed plan returns the audited token with
+`idempotent_replay=true`; reusing it for another plan conflicts. Each
+replacement is one-shot, uses a new request ID, and never installs an automatic
 recovery loop.
 
 ## Worker identity continuity

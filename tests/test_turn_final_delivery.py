@@ -1108,14 +1108,28 @@ class ExhaustedRecoveryTendwire(TurnFinalTendwire):
             for job in self._jobs
             if job["payload"]["plan_token"] == failed_plan_token
         ]
-        prefix_count = 0
+        inherited_prefix_count = int(
+            failed.get("acknowledged_prefix_count", 0)
+        )
+        local_prefix_count = 0
         for job in sorted(
             failed_jobs,
             key=lambda item: item["payload"]["sequence_index"],
         ):
             if job["status"] != "delivered":
                 break
-            prefix_count += 1
+            local_prefix_count += 1
+        prefix_count = inherited_prefix_count + local_prefix_count
+        current_failed_count = sum(
+            job["status"] == "dead_letter"
+            for job in failed_jobs[local_prefix_count:]
+        )
+        retained_failed_job_count = (
+            int(failed.get("retained_failed_job_count", 0))
+            + current_failed_count
+        )
+        generation = int(failed.get("generation", 1)) + 1
+        prior_attempt_count = int(failed.get("prior_attempt_count", 0)) + 3
         token = f"twplan1.plan{len(self._plans) + 1}"
         replacement = {
             "state": "active",
@@ -1124,6 +1138,10 @@ class ExhaustedRecoveryTendwire(TurnFinalTendwire):
             "part_count": failed["part_count"],
             "parts": deepcopy(failed["parts"]),
             "replaces": failed_plan_token,
+            "generation": generation,
+            "acknowledged_prefix_count": prefix_count,
+            "retained_failed_job_count": retained_failed_job_count,
+            "prior_attempt_count": prior_attempt_count,
         }
         self._plans[token] = replacement
         self._plan_by_revision[failed["revision"]] = token
@@ -1149,13 +1167,13 @@ class ExhaustedRecoveryTendwire(TurnFinalTendwire):
             "status": "recovered",
             "failed_plan_token": failed_plan_token,
             "plan_token": token,
-            "generation": 2,
+            "generation": generation,
             "content_revision": failed["revision"],
             "state": "active",
             "acknowledged_prefix_count": prefix_count,
             "executable_job_count": failed["part_count"] - prefix_count,
-            "retained_failed_job_count": 1,
-            "prior_attempt_count": 3,
+            "retained_failed_job_count": retained_failed_job_count,
+            "prior_attempt_count": prior_attempt_count,
             "idempotent_replay": False,
         }
         self._recoveries[request_id] = deepcopy(response)
@@ -1291,6 +1309,124 @@ def test_explicit_failed_plan_recovery_clones_prefix_and_never_replays_telegram(
         (failed_token, "operator-recovery-1"),
         (failed_token, "operator-recovery-1"),
     ]
+
+class FailSecondPartTwiceTelegram(DeletingTelegram):
+    def __init__(self):
+        super().__init__()
+        self.final_attempts = []
+
+    def send_message(self, chat_id, html, **kwargs):
+        self.final_attempts.append(html)
+        if len(self.final_attempts) in {2, 3}:
+            return {
+                "ok": False,
+                "kind": "permanent",
+                "error": "provider rejected bounded part",
+            }
+        return FakeTelegram.send_message(self, chat_id, html, **kwargs)
+
+
+def test_second_generation_recovery_inherits_failures_and_executes_only_suffix(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
+    text = ("second generation recovery\n\n" * 500) + "GENERATION_THREE_TAIL"
+    tendwire = ExhaustedRecoveryTendwire(
+        _turn_row("turn-recovery-3", "twrev1.recovery3", text)
+    )
+    telegram = FailSecondPartTwiceTelegram()
+    store = _store()
+
+    first_failure = sync_once(
+        store,
+        _runtime(tendwire, telegram, max_sends=100),
+    )
+    first_token = next(iter(tendwire._plans))
+    prefix_html = telegram.final_attempts[0]
+
+    monkeypatch.setattr(herdres.config, "load_env_file", lambda: None)
+    monkeypatch.setattr(herdres.config, "require_source_mode", lambda: None)
+    monkeypatch.setattr(herdres.state, "state_lock", lambda: nullcontext())
+    monkeypatch.setattr(herdres.state, "load_state", lambda: store)
+
+    def save_candidate(candidate):
+        saved = deepcopy(candidate)
+        store.clear()
+        store.update(saved)
+
+    monkeypatch.setattr(herdres.state, "save_state", save_candidate)
+    monkeypatch.setattr(herdres, "TendwireClient", lambda: tendwire)
+
+    first_code = herdres.cmd_recover_turn_final(
+        SimpleNamespace(
+            plan_token=first_token,
+            request_id="operator-recovery-generation-2",
+        )
+    )
+    generation_two = json.loads(capsys.readouterr().out)
+    second_token = generation_two["plan_token"]
+    second_failure = sync_once(
+        store,
+        _runtime(tendwire, telegram, max_sends=100),
+    )
+
+    second_code = herdres.cmd_recover_turn_final(
+        SimpleNamespace(
+            plan_token=second_token,
+            request_id="operator-recovery-generation-3",
+        )
+    )
+    generation_three = json.loads(capsys.readouterr().out)
+    third_token = generation_three["plan_token"]
+    completed = sync_once(
+        store,
+        _runtime(tendwire, telegram, max_sends=100),
+    )
+
+    assert first_failure["tendwire_turn_final"]["status"] == "attempts_exhausted"
+    assert first_code == 0
+    assert generation_two["generation"] == 2
+    assert generation_two["retained_failed_job_count"] == 1
+    assert second_failure["tendwire_turn_final"]["status"] == "attempts_exhausted"
+    assert second_code == 0
+    assert generation_three == {
+        "acknowledged_prefix_count": 1,
+        "content_revision": "twrev1.recovery3",
+        "executable_job_count": len(tendwire._plans[third_token]["parts"]) - 1,
+        "failed_plan_token": second_token,
+        "generation": 3,
+        "idempotent_replay": False,
+        "ok": True,
+        "plan_token": third_token,
+        "prior_attempt_count": 6,
+        "retained_failed_job_count": 2,
+        "schema_version": 1,
+        "state": "active",
+        "status": "recovered",
+    }
+    assert completed["tendwire_turn_final"]["acked"] == (
+        len(tendwire._plans[third_token]["parts"]) - 1
+    )
+    assert telegram.final_attempts.count(prefix_html) == 1
+    assert "GENERATION_THREE_TAIL" in telegram.final_attempts[-1]
+    assert [
+        job["payload"]["sequence_index"]
+        for job in tendwire._jobs
+        if job["payload"]["plan_token"] == third_token
+    ] == list(range(1, len(tendwire._plans[third_token]["parts"])))
+    second_generation_statuses = [
+        job["status"]
+        for job in tendwire._jobs
+        if job["payload"]["plan_token"] == second_token
+    ]
+    assert second_generation_statuses[0] == "dead_letter"
+    assert set(second_generation_statuses[1:]) == {"queued"}
+    assert next(iter(state.source_worker_entries(store).values()))[
+        "last_clean_plan_token"
+    ] == third_token
 
 
 @pytest.mark.parametrize(
@@ -1661,6 +1797,223 @@ def test_recovery_response_requires_exact_next_generation_and_failed_tail(
     )
 
     assert invalid["status"] == "recovery_state_uncertain"
+
+
+def test_inherited_recovery_audit_is_unique_and_revalidated_in_preflight():
+    store = _store()
+    worker = _manual_recovery_worker()
+    store["panes"]["worker"] = worker
+    response = _recovery_response()
+    herdres._clone_recovery_prefix(
+        store,
+        failed_plan_token="twplan1.failed",
+        plan_token="twplan1.replacement",
+        entry_key="worker",
+        prefix=[],
+        executable_job_count=1,
+        request_id="operator-generation-2",
+        response=response,
+    )
+    replacement_key = "turn-final:twplan1.replacement:000000"
+    state.reserve_tendwire_turn_job(
+        store,
+        replacement_key,
+        plan_token="twplan1.replacement",
+        content_revision="twrev1.recovery",
+        operation="upsert",
+        sequence_index=0,
+        part_ordinal=0,
+        part_count=1,
+        bot_kind="manager",
+    )
+    state.update_tendwire_turn_job(
+        store,
+        replacement_key,
+        substate="failed",
+    )
+
+    valid = herdres._turn_final_recovery_preflight(
+        store,
+        "twplan1.replacement",
+        "operator-generation-3",
+    )
+
+    assert valid["ok"] is True
+    assert valid["current_failed_tail_count"] == 1
+    assert valid["inherited_retained_failed_job_count"] == 1
+    assert valid["expected_retained_failed_job_count"] == 2
+    assert valid["inherited_audit_identity"][2:] == (
+        "twplan1.replacement",
+        2,
+        1,
+    )
+
+    duplicate = deepcopy(store)
+    original_request_key = herdres._recovery_request_key(
+        "operator-generation-2"
+    )
+    duplicate_request_key = herdres._recovery_request_key(
+        "operator-generation-2-duplicate"
+    )
+    duplicate["tendwire_turn_final_recoveries"][duplicate_request_key] = (
+        deepcopy(
+            duplicate["tendwire_turn_final_recoveries"][
+                original_request_key
+            ]
+        )
+    )
+    duplicate["tendwire_turn_final_recovery_requests"][
+        duplicate_request_key
+    ] = deepcopy(
+        duplicate["tendwire_turn_final_recovery_requests"][
+            original_request_key
+        ]
+    )
+    duplicate_result = herdres._turn_final_recovery_preflight(
+        duplicate,
+        "twplan1.replacement",
+        "operator-generation-3",
+    )
+    assert duplicate_result["status"] == "recovery_state_invalid"
+
+    wrong_generation = deepcopy(store)
+    wrong_generation["tendwire_turn_final_recoveries"][
+        original_request_key
+    ]["generation"] = 3
+    wrong_generation["tendwire_turn_final_recovery_requests"][
+        original_request_key
+    ]["generation"] = 3
+    wrong_generation_result = herdres._turn_final_recovery_preflight(
+        wrong_generation,
+        "twplan1.replacement",
+        "operator-generation-3",
+    )
+    assert wrong_generation_result["status"] == "recovery_state_invalid"
+
+    changed_count = deepcopy(store)
+    changed_count["tendwire_turn_final_recoveries"][
+        original_request_key
+    ]["retained_failed_job_count"] = 2
+    revalidated = herdres._turn_final_recovery_preflight(
+        changed_count,
+        "twplan1.replacement",
+        "operator-generation-3",
+    )
+    assert revalidated["ok"] is True
+    assert revalidated["expected_retained_failed_job_count"] == 3
+    assert revalidated["fingerprint"] != valid["fingerprint"]
+
+
+def test_pending_replacement_keeps_inherited_audit_at_capacity():
+    store = _store()
+    worker = _manual_recovery_worker()
+    store["panes"]["worker"] = worker
+    first_response = _recovery_response()
+    herdres._clone_recovery_prefix(
+        store,
+        failed_plan_token="twplan1.failed",
+        plan_token="twplan1.replacement",
+        entry_key="worker",
+        prefix=[],
+        executable_job_count=1,
+        request_id="operator-protected-generation-2",
+        response=first_response,
+    )
+    replacement_key = "turn-final:twplan1.replacement:000000"
+    state.reserve_tendwire_turn_job(
+        store,
+        replacement_key,
+        plan_token="twplan1.replacement",
+        content_revision="twrev1.recovery",
+        operation="upsert",
+        sequence_index=0,
+        part_ordinal=0,
+        part_count=1,
+        bot_kind="manager",
+    )
+    state.update_tendwire_turn_job(
+        store,
+        replacement_key,
+        substate="failed",
+    )
+
+    other = _manual_recovery_worker("twplan1.other0")
+    other["tendwire_worker_id"] = "worker-other"
+    other["tendwire_stable_key"] = "wsk1_" + ("d" * 64)
+    store["panes"]["other"] = other
+    for index in range(100):
+        failed = f"twplan1.other{index}"
+        replacement = f"twplan1.otherreplacement{index}"
+        other["pending_plan_token"] = failed
+        response = _recovery_response(
+            failed_plan_token=failed,
+            plan_token=replacement,
+        )
+        herdres._clone_recovery_prefix(
+            store,
+            failed_plan_token=failed,
+            plan_token=replacement,
+            entry_key="other",
+            prefix=[],
+            executable_job_count=1,
+            request_id=f"operator-other-{index}",
+            response=response,
+        )
+
+    protected_key = herdres._recovery_request_key(
+        "operator-protected-generation-2"
+    )
+    assert len(store["tendwire_turn_final_recoveries"]) == 100
+    assert protected_key in store["tendwire_turn_final_recoveries"]
+    preflight = herdres._turn_final_recovery_preflight(
+        store,
+        "twplan1.replacement",
+        "operator-protected-generation-3",
+    )
+    assert preflight["ok"] is True
+    assert preflight["expected_retained_failed_job_count"] == 2
+
+
+def test_recovery_stops_before_rpc_when_all_audits_protect_pending_plans():
+    store = _store()
+    worker = _manual_recovery_worker()
+    store["panes"]["worker"] = worker
+    failed_key = "turn-final:twplan1.failed:000000"
+    state.reserve_tendwire_turn_job(
+        store,
+        failed_key,
+        plan_token="twplan1.failed",
+        content_revision="twrev1.recovery",
+        operation="upsert",
+        sequence_index=0,
+        part_ordinal=0,
+        part_count=1,
+        bot_kind="manager",
+    )
+    state.update_tendwire_turn_job(store, failed_key, substate="failed")
+    audits = {}
+    request_bindings = {}
+    for index in range(herdres._TURN_FINAL_RECOVERY_AUDIT_LIMIT):
+        plan_token = f"twplan1.protected{index}"
+        request_key = f"protected-{index}"
+        protected = _manual_recovery_worker(plan_token)
+        protected["tendwire_worker_id"] = f"worker-protected-{index}"
+        protected["tendwire_stable_key"] = (
+            "wsk1_" + f"{index + 1:064x}"
+        )
+        store["panes"][f"protected-{index}"] = protected
+        audits[request_key] = {"plan_token": plan_token}
+        request_bindings[request_key] = {"plan_token": plan_token}
+    store["tendwire_turn_final_recoveries"] = audits
+    store["tendwire_turn_final_recovery_requests"] = request_bindings
+
+    preflight = herdres._turn_final_recovery_preflight(
+        store,
+        "twplan1.failed",
+        "operator-capacity-protected",
+    )
+
+    assert preflight["status"] == "recovery_capacity_exceeded"
 
 
 def test_recovery_request_binding_outlives_bounded_detail_audit():

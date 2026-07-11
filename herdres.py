@@ -559,6 +559,12 @@ _TURN_FINAL_RECOVERY_RESPONSE_KEYS = {
     "prior_attempt_count",
     "idempotent_replay",
 }
+_TURN_FINAL_RECOVERY_AUDIT_KEYS = _TURN_FINAL_RECOVERY_RESPONSE_KEYS - {
+    "schema_version",
+    "ok",
+    "status",
+    "idempotent_replay",
+}
 
 
 def _recovery_error(status: str, error: str) -> dict[str, Any]:
@@ -605,6 +611,130 @@ def _recovery_request_key(request_id: str) -> str:
 def _recovery_request_bindings(store: dict[str, Any]) -> dict[str, Any]:
     bindings = store.get("tendwire_turn_final_recovery_requests")
     return bindings if isinstance(bindings, dict) else {}
+def _inherited_recovery_audit(
+    store: dict[str, Any],
+    *,
+    failed_plan_token: str,
+    content_revision: str,
+    prior_generation: int,
+    expected_job_count: int,
+) -> dict[str, Any]:
+    audits = _recovery_audits(store)
+    request_bindings = _recovery_request_bindings(store)
+    candidate_keys = {
+        key
+        for key, binding in request_bindings.items()
+        if isinstance(binding, dict)
+        and binding.get("plan_token") == failed_plan_token
+    }
+    candidate_keys.update(
+        key
+        for key, audit in audits.items()
+        if isinstance(audit, dict)
+        and audit.get("plan_token") == failed_plan_token
+    )
+    if prior_generation == 1:
+        if candidate_keys:
+            return _recovery_error(
+                "recovery_state_invalid",
+                "first-generation failed plan has conflicting inherited recovery state",
+            )
+        return {
+            "ok": True,
+            "identity": None,
+            "retained_failed_job_count": 0,
+        }
+    if len(candidate_keys) != 1:
+        return _recovery_error(
+            "recovery_state_invalid",
+            "failed plan does not have one inherited recovery audit",
+        )
+
+    request_key = next(iter(candidate_keys))
+    audit = audits.get(request_key)
+    binding = request_bindings.get(request_key)
+    integer_fields = (
+        "generation",
+        "acknowledged_prefix_count",
+        "executable_job_count",
+        "retained_failed_job_count",
+        "prior_attempt_count",
+    )
+    if (
+        not isinstance(audit, dict)
+        or set(audit) != _TURN_FINAL_RECOVERY_AUDIT_KEYS
+        or not isinstance(binding, dict)
+        or set(binding) != {"failed_plan_token", "plan_token", "generation"}
+        or not _valid_recovery_plan_token(audit.get("failed_plan_token"))
+        or audit.get("failed_plan_token") == failed_plan_token
+        or audit.get("plan_token") != failed_plan_token
+        or audit.get("content_revision") != content_revision
+        or audit.get("state") != "active"
+        or any(
+            type(audit.get(field)) is not int or int(audit[field]) < 0
+            for field in integer_fields
+        )
+        or int(audit["generation"]) != prior_generation
+        or int(audit["generation"]) < 2
+        or int(audit["acknowledged_prefix_count"])
+        + int(audit["executable_job_count"])
+        != expected_job_count
+        or int(audit["retained_failed_job_count"]) <= 0
+        or binding.get("failed_plan_token") != audit.get("failed_plan_token")
+        or binding.get("plan_token") != failed_plan_token
+        or type(binding.get("generation")) is not int
+        or int(binding["generation"]) != prior_generation
+    ):
+        return _recovery_error(
+            "recovery_state_invalid",
+            "inherited recovery audit does not identify the failed plan generation",
+        )
+    retained_failed_job_count = int(audit["retained_failed_job_count"])
+    return {
+        "ok": True,
+        "identity": (
+            request_key,
+            str(audit["failed_plan_token"]),
+            failed_plan_token,
+            prior_generation,
+            retained_failed_job_count,
+        ),
+        "retained_failed_job_count": retained_failed_job_count,
+    }
+def _recovery_audit_eviction_key(
+    store: dict[str, Any],
+    *,
+    released_plan_token: str | None = None,
+) -> str | None:
+    audits = _recovery_audits(store)
+    request_bindings = _recovery_request_bindings(store)
+    protected_plan_tokens = {
+        str(entry["pending_plan_token"])
+        for entry in state.source_worker_entries(store).values()
+        if isinstance(entry, dict)
+        and _valid_recovery_plan_token(entry.get("pending_plan_token"))
+        and entry.get("pending_plan_token") != released_plan_token
+    }
+    for request_key, audit in audits.items():
+        audit_plan_token = (
+            audit.get("plan_token") if isinstance(audit, dict) else None
+        )
+        binding = request_bindings.get(request_key)
+        binding_plan_token = (
+            binding.get("plan_token")
+            if isinstance(binding, dict)
+            else None
+        )
+        if (
+            audit_plan_token not in protected_plan_tokens
+            and binding_plan_token not in protected_plan_tokens
+        ):
+            return request_key
+    return None
+
+
+
+
 
 
 def _valid_acknowledged_recovery_receipt(
@@ -739,6 +869,16 @@ def _turn_final_recovery_preflight(
             "pending plan coordinates are invalid",
         )
 
+    inherited = _inherited_recovery_audit(
+        store,
+        failed_plan_token=failed_plan_token,
+        content_revision=str(revision),
+        prior_generation=prior_generation,
+        expected_job_count=job_count,
+    )
+    if inherited.get("ok") is not True:
+        return inherited
+
     jobs = state.tendwire_turn_jobs(store)
     old_receipts: list[tuple[str, dict[str, Any]]] = []
     for job_key, receipt in jobs.items():
@@ -816,9 +956,26 @@ def _turn_final_recovery_preflight(
             "recovery_capacity_exceeded",
             "local receipt capacity cannot hold both immutable plan generations",
         )
-    failed_tail_count = sum(
+    audits = _recovery_audits(store)
+    if (
+        len(audits) >= _TURN_FINAL_RECOVERY_AUDIT_LIMIT
+        and _recovery_audit_eviction_key(
+            store,
+            released_plan_token=failed_plan_token,
+        )
+        is None
+    ):
+        return _recovery_error(
+            "recovery_capacity_exceeded",
+            "local recovery audit capacity is held by pending plans",
+        )
+    current_failed_tail_count = sum(
         receipt.get("substate") == "failed"
         for _job_key, receipt in old_receipts[len(prefix):]
+    )
+    retained_failed_job_count = (
+        int(inherited["retained_failed_job_count"])
+        + current_failed_tail_count
     )
     return {
         "ok": True,
@@ -830,7 +987,13 @@ def _turn_final_recovery_preflight(
         "prefix": prefix,
         "request_key": request_key,
         "prior_generation": prior_generation,
-        "failed_tail_count": failed_tail_count,
+        "current_failed_tail_count": current_failed_tail_count,
+        "inherited_retained_failed_job_count": int(
+            inherited["retained_failed_job_count"]
+        ),
+        "failed_tail_count": current_failed_tail_count,
+        "expected_retained_failed_job_count": retained_failed_job_count,
+        "inherited_audit_identity": inherited["identity"],
         "fingerprint": (
             entry_key,
             revision,
@@ -844,6 +1007,8 @@ def _turn_final_recovery_preflight(
                 )
                 for job_key, receipt in old_receipts
             ),
+            inherited["identity"],
+            retained_failed_job_count,
             len(jobs),
         ),
     }
@@ -1013,8 +1178,10 @@ def _clone_recovery_prefix(
     if request_key in audits:
         raise RuntimeError("recovery audit already exists")
     if len(audits) >= _TURN_FINAL_RECOVERY_AUDIT_LIMIT:
-        oldest = next(iter(audits))
-        audits.pop(oldest, None)
+        eviction_key = _recovery_audit_eviction_key(store)
+        if eviction_key is None:
+            raise RuntimeError("recovery audit capacity conflict")
+        audits.pop(eviction_key, None)
     audits[request_key] = {
         key: copy.deepcopy(response[key])
         for key in _TURN_FINAL_RECOVERY_RESPONSE_KEYS
@@ -1108,7 +1275,9 @@ def cmd_recover_turn_final(args: argparse.Namespace) -> int:
             acknowledged_prefix_count=len(current["prefix"]),
             expected_job_count=int(current["job_count"]),
             expected_generation=int(current["prior_generation"]) + 1,
-            retained_failed_job_count=int(current["failed_tail_count"]),
+            retained_failed_job_count=int(
+                current["expected_retained_failed_job_count"]
+            ),
         )
         if validation is not None:
             return _json(validation)
