@@ -2145,6 +2145,24 @@ def _tendwire_non_success(runtime: SyncRuntime, status: str) -> dict[str, Any]:
     }
 
 
+_TURN_SCHEMA_VERSION = 1
+
+
+def _unsupported_turn_schema_version(
+    runtime: SyncRuntime, received: Any
+) -> dict[str, Any]:
+    result = _tendwire_non_success(runtime, "unsupported_turn_schema_version")
+    result["required_turn_schema_version"] = _TURN_SCHEMA_VERSION
+    if isinstance(received, str):
+        safe_received: Any = compact_ws(received, 80)
+    elif received is None or isinstance(received, (bool, int, float)):
+        safe_received = received
+    else:
+        safe_received = None
+    result["received_turn_schema_version"] = safe_received
+    return result
+
+
 def _herdr_backend_explicitly_unhealthy(snapshot: dict[str, Any]) -> bool:
     backend_health = snapshot.get("backend_health")
     if not isinstance(backend_health, list):
@@ -2165,12 +2183,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     snapshot = runtime.tendwire.snapshot()
     if _herdr_backend_explicitly_unhealthy(snapshot):
         return _tendwire_non_success(runtime, "tendwire_herdr_unhealthy")
-    chat_id = config.telegram_chat_id(store)
     turns_payload = runtime.tendwire.turns()
     pending_payload = runtime.tendwire.pending()
     for name, payload in (("snapshot", snapshot), ("turns", turns_payload), ("pending", pending_payload)):
         if payload.get("ok") is False:
             return _tendwire_non_success(runtime, f"tendwire_{name}_failed")
+    turn_schema_version = turns_payload.get("schema_version")
+    if type(turn_schema_version) is not int or turn_schema_version != _TURN_SCHEMA_VERSION:
+        return _unsupported_turn_schema_version(runtime, turn_schema_version)
+    chat_id = config.telegram_chat_id(store)
     changed = False
     source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
     routing_repaired = _repair_space_mode_routing_state(store)

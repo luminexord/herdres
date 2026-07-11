@@ -10,7 +10,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 
 from . import config
 from .rendering import normalized_status
@@ -20,7 +20,6 @@ DELIVERED_TURN_LEDGER_LIMIT = 10000
 
 STABLE_WORKER_KEY_VERSION = 1
 STABLE_WORKER_KEY_RE = re.compile(r"^wsk1_[0-9a-f]{64}$")
-LEGACY_WORKER_KEY_RE = re.compile(r"^[0-9a-f]{24}$")
 
 
 def load_state(path: Path | None = None) -> dict[str, Any]:
@@ -280,15 +279,6 @@ def message_binding_stable_identity(binding: dict[str, Any]) -> tuple[str, int] 
     return stable_key, STABLE_WORKER_KEY_VERSION
 
 
-def _entry_legacy_identity_kind(entry: dict[str, Any]) -> str:
-    """Classify only states eligible for same-worker, one-time v1 migration."""
-    stable_key = entry.get("tendwire_stable_key")
-    version = entry.get("tendwire_stable_key_version")
-    if version is None and (stable_key is None or stable_key == ""):
-        return "absent"
-    if version is None and isinstance(stable_key, str) and LEGACY_WORKER_KEY_RE.fullmatch(stable_key):
-        return "legacy24"
-    return "invalid"
 
 
 def entry_is_quarantined(entry: dict[str, Any]) -> bool:
@@ -347,16 +337,6 @@ def _all_worker_entry_keys_by_worker(data: dict[str, Any], worker_id: str) -> li
     ]
 
 
-def _legacy_worker_entry_keys_by_worker(data: dict[str, Any], worker_id: str) -> list[str]:
-    """Return migration-only state; callers must also validate the current v1 worker."""
-    return [
-        key
-        for key in _all_worker_entry_keys_by_worker(data, worker_id)
-        if not entry_is_quarantined(source_worker_entries(data).get(key) or {})
-        and _entry_is_live(source_worker_entries(data).get(key) or {})
-        and _entry_legacy_identity_kind(source_worker_entries(data).get(key) or {})
-        in {"absent", "legacy24"}
-    ]
 
 
 def find_entry_key_by_worker(data: dict[str, Any], worker_id: str) -> str | None:
@@ -484,13 +464,481 @@ def conflicting_snapshot_worker_ids(workers: list[dict[str, Any]]) -> set[str]:
     return {worker_id for worker_id, count in claims.items() if count > 1}
 
 
-def _worker_matches_legacy_entry(worker: dict[str, Any], entry: dict[str, Any]) -> bool:
-    """Legacy migration has no authoritative handle, so retain the old sanity gate."""
+
+
+class PersistedStableKeyMigration(NamedTuple):
+    """One immutable decision from the missing-version migration preflight."""
+
+    stable_key: str
+    action: str
+    worker_ref: int | None
+    candidate_key: str | None
+    claimant_entry_keys: tuple[str, ...]
+    stale_entry_keys: tuple[str, ...]
+    compatible_binding_ids: tuple[str, ...]
+    quarantine_binding_ids: tuple[str, ...]
+    reason: str
+
+
+class PersistedStableKeyMigrationPlan(NamedTuple):
+    """Complete deterministic plan for all private missing-version claimants."""
+
+    migrations: tuple[PersistedStableKeyMigration, ...]
+    blocked_stable_keys: frozenset[str]
+
+
+def _persisted_pane_entries(
+    data: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    panes = data.get("panes")
+    if not isinstance(panes, dict):
+        return {}
+    return {
+        str(key): entry
+        for key, entry in panes.items()
+        if isinstance(entry, dict)
+    }
+
+
+def _persisted_missing_version_stable_key(entry: dict[str, Any]) -> str:
+    stable_key = entry.get("tendwire_stable_key")
+    if (
+        "tendwire_stable_key_version" not in entry
+        and isinstance(stable_key, str)
+        and STABLE_WORKER_KEY_RE.fullmatch(stable_key) is not None
+    ):
+        return stable_key
+    return ""
+
+
+def _migration_candidate_matches_worker(
+    entry: dict[str, Any], worker: dict[str, Any]
+) -> bool:
+    worker_id = compact_ws(worker.get("id"), 160)
+    space_id = compact_ws(worker.get("space_id"), 160)
+    fingerprint = compact_ws(worker.get("fingerprint"), 160)
+    agent = worker_agent(worker)
     return (
-        worker_agent(worker) == str(entry.get("agent") or "")
-        and compact_ws(worker.get("space_id"), 160)
-        == str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+        bool(worker_id and space_id and fingerprint and agent)
+        and normalized_status(worker.get("status")) not in {"closed", "failed"}
+        and entry.get("source") == "tendwire"
+        and entry.get("entry_type") == "worker"
+        and entry.get("tendwire_worker_id") == worker_id
+        and (
+            "worker_id" not in entry
+            or entry.get("worker_id") == worker_id
+        )
+        and entry.get("tendwire_space_id") == space_id
+        and (
+            "space_id" not in entry
+            or entry.get("space_id") == space_id
+        )
+        and entry.get("agent") == agent
+        and bool(str(entry.get("tendwire_fingerprint") or ""))
+        and _entry_is_live(entry)
+        and not entry_is_quarantined(entry)
     )
+
+
+def _migration_entry_owner(
+    entry: dict[str, Any],
+) -> tuple[str, str, str] | None:
+    owner = (
+        str(entry.get("tendwire_worker_id") or ""),
+        str(entry.get("tendwire_fingerprint") or ""),
+        str(entry.get("tendwire_space_id") or ""),
+    )
+    return owner if all(owner) else None
+
+
+def _migration_worker_owner(
+    worker: dict[str, Any],
+) -> tuple[str, str, str] | None:
+    owner = (
+        compact_ws(worker.get("id"), 160),
+        compact_ws(worker.get("fingerprint"), 160),
+        compact_ws(worker.get("space_id"), 160),
+    )
+    return owner if all(owner) else None
+
+
+def _migration_binding_owner(
+    binding: dict[str, Any],
+) -> tuple[str, str, str] | None:
+    owner = (
+        str(binding.get("worker_id") or ""),
+        str(binding.get("worker_fingerprint") or ""),
+        str(binding.get("space_id") or ""),
+    )
+    return owner if all(owner) else None
+
+
+def _migration_stale_owner_claim(
+    entry: dict[str, Any],
+) -> tuple[str, str, str, str, int] | None:
+    identity = entry_stable_identity(entry)
+    owner = _migration_entry_owner(entry)
+    if identity is None or owner is None:
+        return None
+    return owner[0], owner[1], owner[2], identity[0], identity[1]
+
+
+def _migration_binding_decisions(
+    data: dict[str, Any],
+    *,
+    stable_key: str,
+    entry: dict[str, Any],
+    stale_owner_claims: frozenset[
+        tuple[str, str, str, str, int]
+    ] = frozenset(),
+) -> tuple[tuple[str, ...], tuple[str, ...], bool]:
+    """Classify replies without ever treating a worker-id match as ownership."""
+    bindings = data.get("telegram_message_bindings")
+    if not isinstance(bindings, dict):
+        return (), (), False
+    worker_id = str(entry.get("tendwire_worker_id") or "")
+    fingerprint = str(entry.get("tendwire_fingerprint") or "")
+    space_id = str(entry.get("tendwire_space_id") or "")
+    topic_id = str(entry.get("topic_id") or "")
+    compatible: list[str] = []
+    quarantine: list[str] = []
+    conflicting_owner = False
+    for message_id in sorted(bindings, key=str):
+        binding = bindings.get(message_id)
+        if not isinstance(binding, dict):
+            continue
+        bound_worker = str(binding.get("worker_id") or "")
+        bound_fingerprint = str(binding.get("worker_fingerprint") or "")
+        bound_space = str(binding.get("space_id") or "")
+        bound_topic = str(binding.get("topic_id") or "")
+        raw_key_match = binding.get("stable_key") == stable_key
+        topic_match = bool(topic_id and bound_topic == topic_id)
+        exact_old_owner = (
+            bound_worker == worker_id
+            and bound_fingerprint == fingerprint
+            and bound_space == space_id
+        )
+        core_owner = bound_worker == worker_id and bound_space == space_id
+        related = raw_key_match or exact_old_owner
+        if not related:
+            continue
+        binding_identity = message_binding_stable_identity(binding)
+        if (
+            binding_identity is not None
+            and (
+                bound_worker,
+                bound_fingerprint,
+                bound_space,
+                binding_identity[0],
+                binding_identity[1],
+            )
+            in stale_owner_claims
+        ):
+            quarantine.append(str(message_id))
+            continue
+        has_stable_fields = (
+            "stable_key" in binding or "stable_key_version" in binding
+        )
+        if (
+            has_stable_fields
+            and message_binding_stable_identity(binding)
+            != (stable_key, STABLE_WORKER_KEY_VERSION)
+        ):
+            conflicting_owner = True
+            quarantine.append(str(message_id))
+            continue
+        if (
+            (raw_key_match or topic_match)
+            and (
+                not core_owner
+                or (
+                    bool(bound_fingerprint)
+                    and bound_fingerprint != fingerprint
+                )
+            )
+        ):
+            conflicting_owner = True
+            quarantine.append(str(message_id))
+            continue
+        if "routing_quarantined" in binding:
+            conflicting_owner = True
+            quarantine.append(str(message_id))
+            continue
+        identity_compatible = (
+            not has_stable_fields
+            or message_binding_stable_identity(binding)
+            == (stable_key, STABLE_WORKER_KEY_VERSION)
+        )
+        if exact_old_owner and topic_match and identity_compatible:
+            compatible.append(str(message_id))
+        else:
+            quarantine.append(str(message_id))
+    return tuple(compatible), tuple(dict.fromkeys(quarantine)), conflicting_owner
+
+
+def plan_persisted_stable_key_migrations(
+    data: dict[str, Any], workers: list[dict[str, Any]]
+) -> PersistedStableKeyMigrationPlan:
+    """Plan exact-key private adoption before any state mutation or reservation.
+
+    Source observations remain subject to the public exact-v1 classifier.  The
+    only private exception is a persisted exact ``wsk1_`` key whose version
+    field is absent; an absent key, legacy hash, explicit null, or malformed
+    version is never a candidate.
+    """
+    entries = _persisted_pane_entries(data)
+    candidates_by_key: dict[str, list[str]] = {}
+    for entry_key, entry in entries.items():
+        stable_key = _persisted_missing_version_stable_key(entry)
+        if stable_key:
+            candidates_by_key.setdefault(stable_key, []).append(entry_key)
+    workers_by_key: dict[str, list[dict[str, Any]]] = {}
+    for worker in workers:
+        identity = worker_stable_identity(worker)
+        if identity is not None:
+            workers_by_key.setdefault(identity[0], []).append(worker)
+
+    migrations: list[PersistedStableKeyMigration] = []
+    blocked: set[str] = set()
+    for stable_key in sorted(candidates_by_key):
+        candidate_keys = tuple(sorted(candidates_by_key[stable_key]))
+        claimants = sorted(
+            workers_by_key.get(stable_key, []),
+            key=canonical_worker_observation_key,
+        )
+        raw_same_key = tuple(
+            sorted(
+                entry_key
+                for entry_key, entry in entries.items()
+                if entry.get("tendwire_stable_key") == stable_key
+            )
+        )
+        exact_v1_owners = tuple(
+            entry_key
+            for entry_key in raw_same_key
+            if entry_stable_identity(entries.get(entry_key) or {})
+            == (stable_key, STABLE_WORKER_KEY_VERSION)
+        )
+        if not claimants:
+            migrations.append(
+                PersistedStableKeyMigration(
+                    stable_key,
+                    "wait",
+                    None,
+                    None,
+                    candidate_keys,
+                    (),
+                    (),
+                    (),
+                    "no_current_claimant",
+                )
+            )
+            continue
+
+        reason = ""
+        worker = claimants[0] if len(claimants) == 1 else None
+        candidate_key = candidate_keys[0] if len(candidate_keys) == 1 else None
+        candidate = entries.get(candidate_key) if candidate_key is not None else None
+        compatible_bindings: tuple[str, ...] = ()
+        quarantine_bindings: tuple[str, ...] = ()
+        terminal_topic_history: tuple[str, ...] = ()
+        if len(claimants) != 1:
+            reason = "multiple_current_claimants"
+        elif len(candidate_keys) != 1:
+            reason = "multiple_persisted_candidates"
+        elif exact_v1_owners:
+            reason = "existing_exact_v1_owner"
+        elif not isinstance(candidate, dict) or not _migration_candidate_matches_worker(
+            candidate, worker
+        ):
+            reason = "incompatible_persisted_candidate"
+        else:
+            topic_id = str(candidate.get("topic_id") or "")
+            terminal_topic_history = tuple(
+                sorted(
+                    entry_key
+                    for entry_key, entry in entries.items()
+                    if entry_key != candidate_key
+                    and not _entry_is_live(entry)
+                    and str(entry.get("topic_id") or "") == topic_id
+                )
+            )
+            topic_owners = tuple(
+                sorted(
+                    entry_key
+                    for entry_key, entry in entries.items()
+                    if _entry_is_live(entry)
+                    and str(entry.get("topic_id") or "") == topic_id
+                )
+            )
+            if not topic_id or topic_owners != (candidate_key,):
+                reason = "ambiguous_topic_owner"
+            else:
+                stale_owner_claims = frozenset(
+                    claim
+                    for entry_key in terminal_topic_history
+                    if (
+                        claim := _migration_stale_owner_claim(
+                            entries.get(entry_key) or {}
+                        )
+                    )
+                    is not None
+                )
+                (
+                    compatible_bindings,
+                    quarantine_bindings,
+                    conflicting_owner,
+                ) = _migration_binding_decisions(
+                    data,
+                    stable_key=stable_key,
+                    entry=candidate,
+                    stale_owner_claims=stale_owner_claims,
+                )
+                if conflicting_owner:
+                    reason = "conflicting_binding_owner"
+
+        if reason:
+            blocked.add(stable_key)
+            blocked_owner_tuples = {
+                owner
+                for entry_key in raw_same_key
+                if (
+                    owner := _migration_entry_owner(
+                        entries.get(entry_key) or {}
+                    )
+                )
+                is not None
+            }
+            blocked_owner_tuples.update(
+                owner
+                for claimant in claimants
+                if (owner := _migration_worker_owner(claimant)) is not None
+            )
+            planned_quarantines = set(quarantine_bindings)
+            bindings = data.get("telegram_message_bindings")
+            if isinstance(bindings, dict):
+                planned_quarantines.update(
+                    str(message_id)
+                    for message_id, binding in bindings.items()
+                    if isinstance(binding, dict)
+                    and (
+                        binding.get("stable_key") == stable_key
+                        or _migration_binding_owner(binding)
+                        in blocked_owner_tuples
+                    )
+                )
+            quarantine_bindings = tuple(sorted(planned_quarantines))
+            migrations.append(
+                PersistedStableKeyMigration(
+                    stable_key,
+                    "block",
+                    id(worker) if worker is not None else None,
+                    candidate_key,
+                    candidate_keys,
+                    (),
+                    (),
+                    quarantine_bindings,
+                    reason,
+                )
+            )
+            continue
+
+        stale_entries = tuple(
+            sorted(
+                {
+                    entry_key
+                    for entry_key in raw_same_key
+                    if entry_key != candidate_key
+                }
+                | set(terminal_topic_history)
+            )
+        )
+        migrations.append(
+            PersistedStableKeyMigration(
+                stable_key,
+                "adopt",
+                id(worker),
+                candidate_key,
+                candidate_keys,
+                stale_entries,
+                compatible_bindings,
+                quarantine_bindings,
+                "",
+            )
+        )
+    return PersistedStableKeyMigrationPlan(
+        tuple(migrations), frozenset(blocked)
+    )
+
+
+def _quarantine_private_migration_entry(
+    entry: dict[str, Any], *, reason: str
+) -> None:
+    entry["stable_key_quarantined"] = True
+    entry.setdefault("stable_key_quarantine_reason", reason)
+
+
+def apply_persisted_stable_key_migration_plan(
+    data: dict[str, Any],
+    workers: list[dict[str, Any]],
+    plan: PersistedStableKeyMigrationPlan,
+) -> Mapping[int, str]:
+    """Revalidate and atomically apply a previously computed private plan."""
+    if plan_persisted_stable_key_migrations(data, workers) != plan:
+        return MappingProxyType({})
+    entries = _persisted_pane_entries(data)
+    workers_by_ref = {id(worker): worker for worker in workers}
+    adopted: dict[int, str] = {}
+    bindings = data.get("telegram_message_bindings")
+    for migration in plan.migrations:
+        if migration.action == "wait":
+            continue
+        if migration.action == "block":
+            for entry_key in migration.claimant_entry_keys:
+                entry = entries.get(entry_key)
+                if entry is not None:
+                    _quarantine_private_migration_entry(
+                        entry, reason=migration.reason
+                    )
+            if isinstance(bindings, dict):
+                for message_id in migration.quarantine_binding_ids:
+                    binding = bindings.get(message_id)
+                    if isinstance(binding, dict):
+                        binding["routing_quarantined"] = True
+            continue
+        worker = workers_by_ref.get(migration.worker_ref)
+        entry = entries.get(migration.candidate_key or "")
+        if worker is None or entry is None:
+            return MappingProxyType({})
+        for entry_key in migration.stale_entry_keys:
+            stale = entries.get(entry_key)
+            if stale is not None:
+                _quarantine_private_migration_entry(
+                    stale, reason="stale_same_stable_key_claimant"
+                )
+        entry["tendwire_stable_key_version"] = STABLE_WORKER_KEY_VERSION
+        entry["tendwire_stable_identity_class"] = "current_v1"
+        entry["tendwire_fingerprint"] = compact_ws(
+            worker.get("fingerprint"), 160
+        )
+        if isinstance(bindings, dict):
+            for message_id in migration.compatible_binding_ids:
+                binding = bindings.get(message_id)
+                if not isinstance(binding, dict):
+                    continue
+                binding["worker_id"] = compact_ws(worker.get("id"), 160)
+                binding["worker_fingerprint"] = compact_ws(
+                    worker.get("fingerprint"), 160
+                )
+                binding["space_id"] = compact_ws(worker.get("space_id"), 160)
+                binding["stable_key"] = migration.stable_key
+                binding["stable_key_version"] = STABLE_WORKER_KEY_VERSION
+            for message_id in migration.quarantine_binding_ids:
+                binding = bindings.get(message_id)
+                if isinstance(binding, dict):
+                    binding["routing_quarantined"] = True
+        adopted[migration.worker_ref] = migration.candidate_key or ""
+    return MappingProxyType(adopted)
 
 
 def resolve_worker_entry_key(
@@ -499,7 +947,7 @@ def resolve_worker_entry_key(
     *,
     blocked_stable_keys: set[str] | None = None,
 ) -> str | None:
-    """Resolve a current v1 worker, allowing legacy state only as migration input."""
+    """Resolve a current v1 worker; private migration is planned separately."""
     worker_id = compact_ws(worker.get("id"), 160)
     identity = worker_stable_identity(worker)
     if identity is None:
@@ -524,15 +972,7 @@ def resolve_worker_entry_key(
             return None
         entry = source_worker_entries(data).get(worker_matches[0]) or {}
         return worker_matches[0] if entry_stable_identity(entry) == identity else None
-    if len(stable_matches) > 1:
-        return None
-    if len(stable_matches) == 1:
-        return stable_matches[0]
-    migration_matches = _legacy_worker_entry_keys_by_worker(data, worker_id)
-    if len(migration_matches) != 1:
-        return None
-    entry = source_worker_entries(data).get(migration_matches[0]) or {}
-    return migration_matches[0] if _worker_matches_legacy_entry(worker, entry) else None
+    return stable_matches[0] if len(stable_matches) == 1 else None
 
 def _resolve_worker_upsert_entry_key(
     data: dict[str, Any],
@@ -597,11 +1037,19 @@ def precompute_worker_entry_reservations(
     deterministically paired with exact-identity storage owners only to keep
     quarantine repeatable.
     """
+    migration_plan = plan_persisted_stable_key_migrations(data, workers)
+    effective_blocked_stable_keys = set(blocked_stable_keys or ())
+    effective_blocked_stable_keys.update(migration_plan.blocked_stable_keys)
+    if blocked_stable_keys is not None:
+        blocked_stable_keys.update(migration_plan.blocked_stable_keys)
+    apply_persisted_stable_key_migration_plan(
+        data, workers, migration_plan
+    )
     preliminary = {
         id(worker): _resolve_worker_upsert_entry_key(
             data,
             worker,
-            blocked_stable_keys=blocked_stable_keys,
+            blocked_stable_keys=effective_blocked_stable_keys,
             blocked_worker_ids=blocked_worker_ids,
         )
         for worker in workers
@@ -634,7 +1082,7 @@ def precompute_worker_entry_reservations(
             worker_id in (blocked_worker_ids or set())
             or (
                 identity is not None
-                and identity[0] in (blocked_stable_keys or set())
+                and identity[0] in effective_blocked_stable_keys
             )
         )
         candidates = [

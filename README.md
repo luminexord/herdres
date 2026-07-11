@@ -26,7 +26,26 @@ herdres sync
   -> Telegram topics/messages/pinned status
 ```
 
-Only `HERDRES_TENDWIRE_MODE=source` is supported.
+Only `HERDRES_TENDWIRE_MODE=source` is supported. Herdres obtains observations,
+turns, pending interactions, and connector work only through Tendwire's public
+source/command interfaces; it makes no direct Herdr API, process, or socket
+calls.
+
+Every source sync requires the top-level `schema_version` in Tendwire's
+`turns --json` response to be the exact integer `1`. A missing value, a boolean,
+a string such as `"1"`, a float, a container, or any other integer fails closed
+with `status=unsupported_turn_schema_version` and
+`required_turn_schema_version=1`. The check occurs before source-state,
+Telegram, cleanup, or connector-outbox mutation. Herdres neither coerces an
+incompatible value nor falls back to a lossy turn shape.
+
+Recovery uses this same source path. Tendwire's existing `turn.list` path
+refreshes structured turn content from a recovered persisted binding before it
+returns the durable public projection; Herdres does not refresh Herdr itself.
+When a later source sync receives the authoritative schema-v1 completed turn
+for a matching editable Working card, Herdres edits that card once into the
+final response and records the final binding and delivery ledger. Repeating the
+same sync performs no additional edit, send, or ledger update.
 
 ## Worker identity continuity
 
@@ -47,22 +66,37 @@ output, not on Herdres's format check. Herdres does not query Herdr to confirm a
 identity.
 
 With the same Tendwire installation key, moves within the same workspace/tab
-retain the handle and an existing worker topic. A cross-workspace move
-intentionally receives another handle. This reconciliation does not change the
-Telegram topic policy below: space topics remain the default and worker/pane
+retain the authoritative handle and an existing worker topic. A cross-workspace
+move intentionally receives another handle. This reconciliation does not change
+the Telegram topic policy below: space topics remain the default and worker/pane
 topics remain opt-in.
 
-Persisted entries with no identity, or with the legacy 24-character lowercase
-hexadecimal identity, are not independently routable. They are migration-only:
-when a compatible current observation supplies an exact valid-v1 identity,
-Herdres may attach it to one unambiguous, live legacy entry for the same worker.
-That additive, idempotent migration retains the Telegram topic, message
-bindings, and delivery ledgers, so it neither creates a duplicate topic nor
-replays delivered turns. Ambiguous or unsafe candidates are quarantined.
+Public observations always pass through the exact-v1 gate. A narrow private
+state migration exists only for a persisted exact-shaped `wsk1_` handle whose
+persisted version field is absent. An absent handle, a legacy 24-character
+handle, an explicit null, a malformed or explicit version, and a worker-id-only
+match are never adoption candidates.
+
+Herdres plans that private migration deterministically before mutation and
+revalidates the complete plan before applying it. Adoption requires exactly one
+current exact-v1 claimant and exactly one compatible, live, nonquarantined
+Tendwire worker entry that solely owns its live topic, with no existing exact-v1
+owner or conflicting reply binding. With no current claimant, the candidate is
+left unchanged to wait for a later observation. A safe adoption adds version
+`1`, refreshes the public observation fields, retargets only compatible owned
+bindings, and preserves the topic, message history, private state, and delivery
+ledger. Repeating it is a no-op.
+
+Multiple current claimants, multiple persisted candidates, incompatible state,
+ambiguous live topic ownership, an existing exact-v1 owner, or conflicting
+binding ownership blocks adoption. Herdres quarantines the affected claimants
+and related unsafe bindings rather than guessing; unrelated bindings are left
+unchanged. Ordering of current observations, persisted entries, and bindings
+does not change the decision.
 
 Before topic creation or selection, and before turn or reply routing, Herdres
-preflights current observations and persisted state. A missing, malformed,
-partial, or unknown identity, a fresh-snapshot collision, or a persisted
+also preflights current observations and persisted state. A missing, malformed,
+partial, or unknown public identity, a fresh-snapshot collision, or a persisted
 collision is quarantined. A quarantined claimant is not routable and cannot
 receive or select a topic; repeated faulty snapshots update the same claimant
 rather than creating duplicate state entries or topics. A reply binding resolves
@@ -159,9 +193,32 @@ it is stable, with no change to the public command path Herdres depends on.
 
 ## Rollback
 
+Before the first live source reconciliation of existing state, copy the private
+Herdres state and run the dry source check against that copy:
+
+```sh
+state_path="${HERDR_TELEGRAM_TOPICS_STATE:-$HOME/.local/share/herdres/state.json}"
+backup_path="${state_path}.pre-source-v1"
+cp -p -- "$state_path" "$backup_path"
+HERDR_TELEGRAM_TOPICS_STATE="$backup_path" \
+  HERDRES_TENDWIRE_MODE=source \
+  ./herdres.py tendwire source-smoke --with-outbox
+```
+
+Keep the copy private. The dry check must succeed with schema version `1` and
+`direct_herdr_calls=0` before a live sync; it does not save the copied Herdres
+state or send/edit Telegram messages. If verification fails, leave the live
+state untouched. Do not repair continuity by editing state, copying public
+handles, deleting individual key files, or rotating identity.
+
+For continuity recovery, stop all writers and restore the complete paired
+Herdres/Tendwire backup described in [INSTALL.md](INSTALL.md), then repeat the
+dry check against a copy before resuming writers. A Herdres state copy alone is
+not a substitute when Tendwire database or installation-key material changed.
+
 This branch is source-only: `HERDRES_TENDWIRE_MODE` must be `source`
 (`require_source_mode` rejects any other value — there is no
-`HERDRES_TENDWIRE_MODE=off`). To roll back, switch the checkout to a legacy
+`HERDRES_TENDWIRE_MODE=off`). To roll back code, switch the checkout to a legacy
 (non-tendwired) Herdres branch or release tag and reinstall from there:
 
 ```sh
@@ -170,13 +227,17 @@ git checkout <legacy-herdres-tag>
 ./install-user.sh   # or the legacy branch's installer
 ```
 
-Rolling back is a code/branch switch, not an environment-variable toggle.
+Rolling back code is a branch/release switch, not an environment-variable
+toggle, and does not replace paired state recovery.
 
 ## Checks
 
 ```sh
+python -m pytest -q tests/test_source_only.py tests/test_stable_worker_key.py
 HERDRES_TENDWIRE_MODE=source ./herdres.py doctor
 HERDRES_TENDWIRE_MODE=source ./herdres.py tendwire source-smoke --with-outbox
 ```
 
+The focused tests cover the schema-v1 preflight, deterministic private
+migration/quarantine, and recovered-final single-edit/no-replay behavior.
 `source-smoke` must report `direct_herdr_calls=0`.

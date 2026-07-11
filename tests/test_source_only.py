@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import builtins
+
 import json
 import hashlib
+import socket
+import subprocess
 from pathlib import Path
+
+import pytest
 
 import herdres
 import herdres_gateway
@@ -42,7 +48,8 @@ class FakeTendwire:
         stable_identities=True,
     ):
         self.commands = []
-        self._turns = turns if turns is not None else {"turns": []}
+        self._turns = dict(turns) if turns is not None else {"turns": []}
+        self._turns.setdefault("schema_version", 1)
         self._pending = pending if pending is not None else {"pending_interactions": []}
         raw_workers = workers if workers is not None else [
             {
@@ -294,6 +301,82 @@ def test_first_sync_bootstraps_current_turns_without_telegram_posts(monkeypatch)
     assert result["feed_sent"] == 0
     assert not any("Old final" in sent[1] for sent in telegram.sent)
     assert store["tendwired_bootstrap_complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "received"),
+    [
+        pytest.param(..., None, id="missing"),
+        pytest.param(True, True, id="bool-true"),
+        pytest.param(False, False, id="bool-false"),
+        pytest.param("1", "1", id="string"),
+        pytest.param("x" * 200, "x" * 80, id="bounded-string"),
+        pytest.param(1.0, 1.0, id="float"),
+        pytest.param([], None, id="list"),
+        pytest.param({}, None, id="mapping"),
+        pytest.param(2, 2, id="unknown"),
+    ],
+)
+def test_turn_schema_v1_preflight_fails_before_all_mutation(
+    monkeypatch, schema_version, received
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    store["continuity_sentinel"] = {"topic_id": "77", "pin_id": "55"}
+    before = json.loads(json.dumps(store))
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire()
+    tendwire._turns = {"turns": []}
+    if schema_version is not ...:
+        tendwire._turns["schema_version"] = schema_version
+
+    result = sync_once(
+        store, SyncRuntime(tendwire, telegram, with_outbox=False)
+    )
+
+    assert result == {
+        "ok": False,
+        "status": "unsupported_turn_schema_version",
+        "changed": False,
+        "created": 0,
+        "updated": 0,
+        "panes": 0,
+        "spaces": 0,
+        "icon_updated": 0,
+        "pinned_status_updated": 0,
+        "feed_sent": 0,
+        "sent": 0,
+        "routing_repaired": 0,
+        "message_bindings": 0,
+        "turn_updates": 0,
+        "topic_cleanup": {
+            "deleted": 0,
+            "failed": 0,
+            "pruned": 0,
+            "changed": False,
+        },
+        "tendwire_outbox": {
+            "enabled": False,
+            "polled": 0,
+            "delivered": 0,
+            "acked": 0,
+            "failed": 0,
+            "deferred": 0,
+            "changed": False,
+        },
+        "required_turn_schema_version": 1,
+        "received_turn_schema_version": received,
+    }
+    assert store == before
+    assert telegram.sent == []
+    assert telegram.edited == []
+    assert telegram.topics == []
+    assert telegram.renamed_topics == []
+    assert telegram.deleted_topics == []
+    assert telegram.pins == []
+    assert telegram.icon_edits == []
+    assert telegram.voice_notes == []
+    assert telegram.api_calls == []
 
 
 def test_sync_delivers_final_turn_once(monkeypatch):
@@ -1650,6 +1733,218 @@ def test_working_update_edits_existing_message(monkeypatch):
     assert len(telegram.sent) >= 1
     assert telegram.edited
     assert "second" in telegram.edited[-1][2]
+
+
+def test_recovered_final_promotes_existing_working_card_once_without_replay(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    store = _store()
+    store["telegram"]["account_baseline"] = {
+        "codex": "ChatGPT Pro",
+        "five_hour_remaining": 82,
+    }
+    worker_observation = _source_worker(
+        {
+            "id": "worker-1",
+            "name": "Alpha",
+            "status": "idle",
+            "space_id": "space-1",
+            "fingerprint": "fp-1",
+            "meta": {"agent": "codex"},
+        }
+    )
+    _worker_key, worker, _created = state.upsert_worker_entry(
+        store, worker_observation, topic_id="77"
+    )
+    _space_key, space, _created = state.upsert_space_entry(
+        store,
+        {
+            "id": "space-1",
+            "name": "Project",
+            "status": "active",
+            "fingerprint": "space-fp-1",
+        },
+        topic_id="77",
+    )
+    space.update(
+        {
+            "pinned_status_message_id": "55",
+            "pinned_status_hash": "pin-hash",
+            "pinned_status_pinned": True,
+            "last_topic_icon": "🦊",
+            "last_topic_icon_id": "icon-fox",
+        }
+    )
+    worker.update(
+        {
+            "last_stream_turn_id": "turn-recovered",
+            "last_stream_hash": "working-hash",
+            "last_stream_message_id": "555",
+            "last_stream_bot_kind": "manager",
+        }
+    )
+    state.bind_message_to_worker(
+        store,
+        "555",
+        worker,
+        topic_id="77",
+        kind="working",
+        turn_id="turn-recovered",
+        bot_kind="manager",
+    )
+    preserved = {
+        "space_topic": {
+            key: space[key]
+            for key in (
+                "topic_id",
+                "topic_name",
+                "pinned_status_message_id",
+                "pinned_status_hash",
+                "pinned_status_pinned",
+                "last_topic_icon",
+                "last_topic_icon_id",
+            )
+        },
+        "worker_topic_id": worker["topic_id"],
+        "account": dict(store["telegram"]["account_baseline"]),
+    }
+    final_payload = {
+        "schema_version": 1,
+        "turns": [
+            {
+                "id": "turn-recovered",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-1",
+                "space_id": "space-1",
+                "user_text": "Recover the missed response",
+                "assistant_final_text": "Recovered authoritative final",
+                "complete": True,
+            }
+        ],
+    }
+
+    class RecoveryTendwire(FakeTendwire):
+        def __init__(self):
+            super().__init__(
+                turns=final_payload,
+                workers=[worker_observation],
+                spaces=[
+                    {
+                        "id": "space-1",
+                        "name": "Project",
+                        "status": "active",
+                        "fingerprint": "space-fp-1",
+                    }
+                ],
+            )
+            self.calls = []
+
+        def snapshot(self):
+            self.calls.append("snapshot")
+            return super().snapshot()
+
+        def turns(self):
+            self.calls.append("turns")
+            return super().turns()
+
+        def pending(self):
+            self.calls.append("pending")
+            return super().pending()
+
+    tendwire = RecoveryTendwire()
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(tendwire, telegram, with_outbox=False)
+
+    direct_boundary_attempts = []
+
+    def reject_direct_boundary(*_args, **_kwargs):
+        direct_boundary_attempts.append("process_or_socket")
+        raise AssertionError("source sync must not access Herdr outside Tendwire")
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        private_roots = {
+            "herdr",
+            "herdr_turn_adapter",
+            "herdr_socket",
+            "herdr_cli",
+            "herdr_events",
+        }
+        if name.split(".", 1)[0] in private_roots or name.startswith(
+            "tendwire.backends"
+        ):
+            direct_boundary_attempts.append(f"import:{name[:80]}")
+            raise AssertionError("source sync must not import a direct Herdr client")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(subprocess, "run", reject_direct_boundary)
+    monkeypatch.setattr(subprocess, "Popen", reject_direct_boundary)
+    monkeypatch.setattr(socket, "socket", reject_direct_boundary)
+    monkeypatch.setattr(socket, "create_connection", reject_direct_boundary)
+
+    first = sync_once(store, runtime)
+    ledger_after_first = json.loads(
+        json.dumps(state.delivered_turns(store), sort_keys=True)
+    )
+    edits_after_first = list(telegram.edited)
+    sends_after_first = list(telegram.sent)
+    second = sync_once(store, runtime)
+    ledger_after_second = json.loads(
+        json.dumps(state.delivered_turns(store), sort_keys=True)
+    )
+    third = sync_once(store, runtime)
+
+    entry = next(iter(state.source_worker_entries(store).values()))
+    binding = state.find_message_binding(store, "555", topic_id="77")
+    ledger = state.delivered_turns(store)
+    assert first["feed_sent"] == 1
+    assert first["sent"] == 1
+    assert len(telegram.edited) == 1
+    assert telegram.edited[0][1] == "555"
+    assert "Recovered authoritative final" in telegram.edited[0][2]
+    assert telegram.sent == []
+    assert second["feed_sent"] == second["sent"] == second["turn_updates"] == 0
+    assert third["feed_sent"] == third["sent"] == third["turn_updates"] == 0
+    assert len(telegram.edited) == 1
+    assert telegram.edited == edits_after_first
+    assert telegram.sent == sends_after_first
+    assert ledger_after_second == ledger_after_first
+    assert ledger == ledger_after_first
+    assert len(ledger) == 1
+    assert list(ledger.values())[0]["turn_id"] == "turn-recovered"
+    assert binding is not None
+    assert binding["kind"] == "final"
+    assert binding["turn_id"] == "turn-recovered"
+    assert entry["last_turn_id"] == "turn-recovered"
+    assert entry["last_clean_message_id"] == "555"
+    assert entry["last_clean_message_ids"] == ["555"]
+    assert "last_stream_turn_id" not in entry
+    assert "last_stream_hash" not in entry
+    assert "last_stream_message_id" not in entry
+    assert "last_stream_bot_kind" not in entry
+    assert {
+        key: space[key]
+        for key in (
+            "topic_id",
+            "topic_name",
+            "pinned_status_message_id",
+            "pinned_status_hash",
+            "pinned_status_pinned",
+            "last_topic_icon",
+            "last_topic_icon_id",
+        )
+    } == preserved["space_topic"]
+    assert entry["topic_id"] == preserved["worker_topic_id"]
+    assert store["telegram"]["account_baseline"] == preserved["account"]
+    assert telegram.pins == []
+    assert telegram.icon_edits == []
+    assert tendwire.calls == ["snapshot", "turns", "pending"] * 3
+    assert tendwire.commands == []
+    assert direct_boundary_attempts == []
 
 
 def test_completed_turn_promotes_working_message_to_final(monkeypatch):

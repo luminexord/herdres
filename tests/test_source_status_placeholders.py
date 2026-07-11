@@ -7,7 +7,8 @@ from test_source_only import _source_worker
 
 class FakeTendwire:
     def __init__(self, turns=None, workers=None, spaces=None):
-        self._turns = turns if turns is not None else {"turns": []}
+        self._turns = dict(turns) if turns is not None else {"turns": []}
+        self._turns.setdefault("schema_version", 1)
         raw_workers = workers if workers is not None else [
             {
                 "id": "worker-live",
@@ -134,6 +135,7 @@ def test_repaired_same_turn_id_with_changed_final_edits_existing_final(monkeypat
     worker = next(iter(state.source_worker_entries(store).values()))
     first_message_id = worker["last_clean_message_id"]
     tendwire._turns = {
+        "schema_version": 1,
         "turns": [
             {
                 "id": "turn-reused",
@@ -180,6 +182,7 @@ def test_same_turn_id_with_new_user_prompt_sends_new_visible_final(monkeypatch):
     worker = next(iter(state.source_worker_entries(store).values()))
     first_message_id = worker["last_clean_message_id"]
     tendwire._turns = {
+        "schema_version": 1,
         "turns": [
             {
                 "id": "turn-reused",
