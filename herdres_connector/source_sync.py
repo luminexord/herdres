@@ -5,17 +5,46 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from . import accounts, config, speech, state
-from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token_for_entry
+from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
-from .rich_delivery import edit_feed_item, feed_item_requires_send_split, render_feed_item_html, send_feed_item, split_legacy_message_ids, turn_item_from_source
+from .rich_delivery import (
+    edit_feed_item,
+    edit_turn_delivery_part,
+    feed_item_requires_send_split,
+    prepare_turn_delivery_parts,
+    render_feed_item_html,
+    send_feed_item,
+    send_turn_delivery_part,
+    split_legacy_message_ids,
+    turn_item_from_source,
+)
 from .safe import compact_ws, html_escape, short_hash
-from .telegram_delivery import MESSAGE_TEXT_LIMIT, TOPIC_ICON_COLORS, TelegramClient, drain_outbox, topic_icon_catalog, topic_icon_id
+from .telegram_delivery import (
+    MESSAGE_TEXT_LIMIT,
+    TOPIC_ICON_COLORS,
+    RateLimited,
+    TelegramClient,
+    delete_turn_delivery_message,
+    drain_outbox,
+    topic_icon_catalog,
+    topic_icon_id,
+)
 from .tendwire_client import TendwireClient
 
 RENDER_VERSION = "telegram-rich-v26-clean"
+PRESENTATION_VERSION = "turn-present-v27"
+TURN_SCHEMA_VERSION = 2
+TURN_CONTENT_SCHEMA_VERSION = 1
+
+
+class _TurnContentError(RuntimeError):
+    def __init__(self, status: str, message: str, *, conflict: bool = False) -> None:
+        super().__init__(message)
+        self.status = status
+        self.conflict = conflict
 
 
 @dataclass
@@ -25,6 +54,8 @@ class SyncRuntime:
     dry_run: bool = False
     with_outbox: bool = True
     max_sends: int = 8
+    checkpoint: Callable[[], None] | None = None
+    after_provider_accept: Callable[[], None] | None = None
 
 
 def _workers(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -307,6 +338,421 @@ def _entry_for_turn(store: dict[str, Any], item: dict[str, Any]) -> tuple[str | 
 
 def _turn_id(item: dict[str, Any]) -> str:
     return compact_ws(item.get("id") or item.get("turn_id"), 200)
+
+
+_TURN_CONTENT_OUTCOME_KEY = "_herdres_content_outcome"
+_TURN_CONTENT_OUTCOME_LIMIT = 100
+_TURN_CONTENT_MATERIALIZED_KEY = "_herdres_content_materialized"
+
+
+def _strict_nonnegative_int(
+    value: Any,
+    field: str,
+    *,
+    status: str = "invalid_content_schema",
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _TurnContentError(status, f"invalid {field}")
+    return value
+
+
+def _validate_turn_field_descriptor(
+    item: dict[str, Any],
+    *,
+    field: str,
+    descriptor: dict[str, Any],
+) -> None:
+    availability = descriptor.get("availability")
+    inline = descriptor.get("inline")
+    char_length = _strict_nonnegative_int(
+        descriptor.get("char_length"), f"{field}.char_length"
+    )
+    byte_length = _strict_nonnegative_int(
+        descriptor.get("byte_length"), f"{field}.byte_length"
+    )
+    page_count = _strict_nonnegative_int(
+        descriptor.get("page_count"), f"{field}.page_count"
+    )
+    first_cursor = descriptor.get("first_cursor")
+    if type(inline) is not bool:
+        raise _TurnContentError(
+            "invalid_content_schema", f"invalid {field}.inline"
+        )
+    if availability == "absent":
+        if inline or char_length or byte_length or page_count or first_cursor is not None:
+            raise _TurnContentError(
+                "invalid_content_schema", f"inconsistent absent {field}"
+            )
+        if field in item:
+            raise _TurnContentError(
+                "invalid_content_schema", f"unexpected absent {field}"
+            )
+        return
+    if availability == "known_incomplete":
+        if inline or page_count or first_cursor is not None or field in item:
+            raise _TurnContentError(
+                "invalid_content_schema",
+                f"known-incomplete {field} must be non-inline and non-pageable",
+            )
+        return
+    if availability != "complete":
+        raise _TurnContentError(
+            "invalid_content_schema", f"invalid {field}.availability"
+        )
+    if inline:
+        value = item.get(field)
+        if not isinstance(value, str):
+            raise _TurnContentError(
+                "invalid_content_schema", f"missing inline {field}"
+            )
+        if (
+            len(value) != char_length
+            or len(value.encode("utf-8")) != byte_length
+            or page_count != 1
+            or first_cursor is not None
+        ):
+            raise _TurnContentError(
+                "invalid_content_schema", f"inline {field} metadata mismatch"
+            )
+        return
+    if (
+        field in item
+        or page_count <= 0
+        or not isinstance(first_cursor, str)
+        or not first_cursor.startswith("twcur1.")
+    ):
+        raise _TurnContentError(
+            "invalid_content_schema", f"non-inline {field} is not pageable"
+        )
+
+
+def _turn_local_outcome(
+    item: dict[str, Any], status: str
+) -> dict[str, str]:
+    outcome = {
+        "turn_id": compact_ws(
+            item.get("id") or item.get("turn_id") or "unidentified", 200
+        ),
+        "status": status,
+    }
+    revision = _content_revision(item)
+    if revision:
+        outcome["content_revision"] = revision
+    return outcome
+
+
+def _validate_turn_row(raw: dict[str, Any]) -> dict[str, Any]:
+    item = dict(raw)
+    content = item.get("content")
+    content_schema = (
+        content.get("schema_version") if isinstance(content, dict) else None
+    )
+    if (
+        type(content_schema) is not int
+        or content_schema != TURN_CONTENT_SCHEMA_VERSION
+    ):
+        raise _TurnContentError(
+            "unsupported_content_schema", "turn content schema v1 is required"
+        )
+    revision = content.get("content_revision")
+    fields = content.get("fields")
+    known_incomplete = content.get("known_incomplete")
+    if (
+        not isinstance(revision, str)
+        or not revision.startswith("twrev1.")
+        or not isinstance(fields, dict)
+    ):
+        raise _TurnContentError(
+            "invalid_content_schema", "invalid content revision or fields"
+        )
+    if type(known_incomplete) is not bool:
+        raise _TurnContentError(
+            "invalid_content_schema", "known_incomplete must be boolean"
+        )
+    incomplete_field = False
+    for field in ("user_text", "assistant_final_text"):
+        descriptor = fields.get(field)
+        if not isinstance(descriptor, dict):
+            raise _TurnContentError(
+                "invalid_content_schema", f"missing {field} descriptor"
+            )
+        _validate_turn_field_descriptor(item, field=field, descriptor=descriptor)
+        incomplete_field = (
+            incomplete_field
+            or descriptor.get("availability") == "known_incomplete"
+        )
+    if known_incomplete != incomplete_field:
+        raise _TurnContentError(
+            "invalid_content_schema", "known-incomplete summary mismatch"
+        )
+    if known_incomplete:
+        item[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
+            item, "content_known_incomplete"
+        )
+    return item
+
+
+def _validate_turns_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    schema = payload.get("schema_version")
+    if type(schema) is int and schema == 1:
+        # Direct-call Goal 01B compatibility. The production TendwireClient
+        # negotiates schema v2 and refuses daemon/CLI v1 responses.
+        return payload
+    if type(schema) is not int or schema != TURN_SCHEMA_VERSION:
+        raise _TurnContentError(
+            "upgrade_required", "Tendwire turn schema v2 is required"
+        )
+    rows = payload.get("turns")
+    if not isinstance(rows, list):
+        raise _TurnContentError(
+            "invalid_content_schema", "turns must be a list"
+        )
+    validated_rows: list[dict[str, Any]] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            # A row-level protocol defect is isolated just like a malformed
+            # descriptor; it cannot safely participate in delivery.
+            validated_rows.append(
+                {
+                    _TURN_CONTENT_OUTCOME_KEY: {
+                        "turn_id": "unidentified",
+                        "status": "invalid_content_schema",
+                    }
+                }
+            )
+            continue
+        try:
+            validated_rows.append(_validate_turn_row(raw))
+        except _TurnContentError as exc:
+            item = dict(raw)
+            item[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
+                item, exc.status
+            )
+            validated_rows.append(item)
+    validated = dict(payload)
+    validated["turns"] = validated_rows
+    return validated
+
+
+def _materialize_turn_field(
+    runtime: SyncRuntime,
+    item: dict[str, Any],
+    *,
+    content_revision: str,
+    field: str,
+    descriptor: dict[str, Any],
+) -> tuple[str, int]:
+    availability = descriptor["availability"]
+    if availability == "absent":
+        return "", 0
+    if availability == "known_incomplete":
+        raise _TurnContentError(
+            "content_known_incomplete", f"{field} is known incomplete"
+        )
+    if descriptor["inline"]:
+        return str(item[field]), 0
+
+    char_length = int(descriptor["char_length"])
+    byte_length = int(descriptor["byte_length"])
+    page_count = int(descriptor["page_count"])
+    turn_id = _turn_id(item)
+    cursor: str | None = str(descriptor["first_cursor"])
+    seen_cursors: set[str] = set()
+    seen_segments: set[str] = set()
+    chunks: list[str] = []
+    for expected_index in range(page_count):
+        if cursor is None or cursor in seen_cursors:
+            raise _TurnContentError(
+                "invalid_content_page", f"{field} cursor cycle or early end"
+            )
+        seen_cursors.add(cursor)
+        page = runtime.tendwire.turn_content_get(
+            turn_id, content_revision, field, cursor
+        )
+        if page.get("ok") is False:
+            status = str(page.get("status") or "content_fetch_failed")
+            raise _TurnContentError(
+                status,
+                str(page.get("error") or f"failed to fetch {field}"),
+                conflict=status
+                in {
+                    "content_revision_not_found",
+                    "revision_conflict",
+                    "stale_revision",
+                },
+            )
+        if (
+            type(page.get("schema_version")) is not int
+            or page.get("schema_version") != TURN_CONTENT_SCHEMA_VERSION
+            or page.get("turn_id") != turn_id
+            or page.get("content_revision") != content_revision
+            or page.get("field") != field
+            or page.get("availability") != "complete"
+        ):
+            conflict = page.get("content_revision") not in (
+                None,
+                content_revision,
+            )
+            raise _TurnContentError(
+                "invalid_content_page",
+                f"{field} page identity mismatch",
+                conflict=conflict,
+            )
+        index = _strict_nonnegative_int(
+            page.get("index"), "page.index", status="invalid_content_page"
+        )
+        count = _strict_nonnegative_int(
+            page.get("count"), "page.count", status="invalid_content_page"
+        )
+        if index != expected_index or count != page_count:
+            raise _TurnContentError(
+                "invalid_content_page", f"{field} page order/count mismatch"
+            )
+        text = page.get("text")
+        segment_id = page.get("segment_id")
+        if (
+            not isinstance(text, str)
+            or not isinstance(segment_id, str)
+            or not segment_id.startswith("twseg1.")
+            or segment_id in seen_segments
+        ):
+            raise _TurnContentError(
+                "invalid_content_page", f"{field} invalid or duplicate segment"
+            )
+        seen_segments.add(segment_id)
+        if (
+            _strict_nonnegative_int(
+                page.get("segment_char_length"),
+                "segment_char_length",
+                status="invalid_content_page",
+            )
+            != len(text)
+            or _strict_nonnegative_int(
+                page.get("segment_byte_length"),
+                "segment_byte_length",
+                status="invalid_content_page",
+            )
+            != len(text.encode("utf-8"))
+            or _strict_nonnegative_int(
+                page.get("total_char_length"),
+                "total_char_length",
+                status="invalid_content_page",
+            )
+            != char_length
+            or _strict_nonnegative_int(
+                page.get("total_byte_length"),
+                "total_byte_length",
+                status="invalid_content_page",
+            )
+            != byte_length
+        ):
+            raise _TurnContentError(
+                "invalid_content_page", f"{field} page length mismatch"
+            )
+        next_cursor = page.get("next_cursor")
+        if expected_index + 1 < page_count:
+            if (
+                not isinstance(next_cursor, str)
+                or not next_cursor.startswith("twcur1.")
+                or next_cursor in seen_cursors
+            ):
+                raise _TurnContentError(
+                    "invalid_content_page", f"{field} invalid next cursor"
+                )
+            cursor = next_cursor
+        else:
+            if next_cursor is not None:
+                raise _TurnContentError(
+                    "invalid_content_page",
+                    f"{field} final cursor must be null",
+                )
+            cursor = None
+        chunks.append(text)
+    value = "".join(chunks)
+    if (
+        len(value) != char_length
+        or len(value.encode("utf-8")) != byte_length
+    ):
+        raise _TurnContentError(
+            "invalid_content_page", f"{field} reconstructed length mismatch"
+        )
+    return value, page_count
+
+
+def _materialize_turn_item(
+    item: dict[str, Any], runtime: SyncRuntime
+) -> int:
+    if item.get(_TURN_CONTENT_MATERIALIZED_KEY) is True:
+        return 0
+    if item.get(_TURN_CONTENT_OUTCOME_KEY):
+        raise _TurnContentError(
+            str(item[_TURN_CONTENT_OUTCOME_KEY].get("status")),
+            "turn content is not eligible for materialization",
+        )
+    content = item.get("content")
+    if not isinstance(content, dict):
+        # Legacy direct-call fixtures carry their canonical inline values.
+        return 0
+    fields = content["fields"]
+    revision = str(content["content_revision"])
+    materialized = dict(item)
+    page_calls = 0
+    for field in ("user_text", "assistant_final_text"):
+        descriptor = fields[field]
+        value, fetched = _materialize_turn_field(
+            runtime,
+            item,
+            content_revision=revision,
+            field=field,
+            descriptor=descriptor,
+        )
+        page_calls += fetched
+        if descriptor["availability"] == "absent":
+            materialized.pop(field, None)
+        else:
+            materialized[field] = value
+    materialized[_TURN_CONTENT_MATERIALIZED_KEY] = True
+    item.clear()
+    item.update(materialized)
+    return page_calls
+
+
+def _turn_content_outcomes(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    outcomes = [
+        dict(item[_TURN_CONTENT_OUTCOME_KEY])
+        for item in _turns(payload)
+        if isinstance(item.get(_TURN_CONTENT_OUTCOME_KEY), dict)
+    ]
+    return {
+        "count": len(outcomes),
+        "truncated": len(outcomes) > _TURN_CONTENT_OUTCOME_LIMIT,
+        "items": outcomes[:_TURN_CONTENT_OUTCOME_LIMIT],
+    }
+
+
+def _turn_has_content_outcome(item: dict[str, Any]) -> bool:
+    return isinstance(item.get(_TURN_CONTENT_OUTCOME_KEY), dict)
+
+
+def _turn_has_complete_final(item: dict[str, Any]) -> bool:
+    content = item.get("content")
+    if not isinstance(content, dict):
+        return bool(item.get("complete")) or isinstance(
+            item.get("assistant_final_text"), str
+        )
+    fields = content.get("fields")
+    descriptor = (
+        fields.get("assistant_final_text")
+        if isinstance(fields, dict)
+        else None
+    )
+    return (
+        not _turn_has_content_outcome(item)
+        and isinstance(descriptor, dict)
+        and descriptor.get("availability") == "complete"
+    )
 
 
 def _turn_content_hash(item: dict[str, Any], kind: str) -> str:
@@ -1574,6 +2020,12 @@ def _repair_space_mode_routing_state(store: dict[str, Any]) -> int:
             continue
         worker_id = compact_ws(binding.get("worker_id"), 160)
         kind = str(binding.get("kind") or "")
+        if kind == "final" and binding.get("plan_token"):
+            # Keep the private delivery coordinate long enough for a replacement plan to
+            # converge/delete it, but quarantine it from reply routing immediately.
+            binding["routing_quarantined"] = True
+            repaired += 1
+            continue
         for entry in state.source_worker_entries(store).values():
             if _entry_worker_id(entry) == worker_id and _entry_space_id(entry) == space_id:
                 repaired += int(_clear_entry_message_reference(entry, str(message_id), kind))
@@ -1594,7 +2046,7 @@ def _backfill_message_bindings(store: dict[str, Any]) -> int:
         if not topic_id:
             continue
         stream_id = str(entry.get("last_stream_message_id") or "")
-        if stream_id:
+        if stream_id and state.find_message_binding(store, stream_id) is None:
             state.bind_message_to_worker(
                 store,
                 stream_id,
@@ -1608,6 +2060,8 @@ def _backfill_message_bindings(store: dict[str, Any]) -> int:
         if not isinstance(final_ids, list) or not final_ids:
             final_ids = [entry.get("last_clean_message_id")]
         for message_id in final_ids:
+            if state.find_message_binding(store, message_id) is not None:
+                continue
             state.bind_message_to_worker(
                 store,
                 message_id,
@@ -1765,6 +2219,158 @@ def _speak_reply(
     return target
 
 
+def _content_revision(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if not isinstance(content, dict):
+        return ""
+    revision = content.get("content_revision")
+    return revision if isinstance(revision, str) and revision.startswith("twrev1.") else ""
+
+
+def _stage_final_plan(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    runtime: SyncRuntime,
+) -> int:
+    revision = _content_revision(item)
+    if not revision:
+        return 0
+    if (
+        entry.get("last_turn_id") == _turn_id(item)
+        and entry.get("last_clean_content_revision") == revision
+    ):
+        return 0
+    if (
+        entry.get("pending_turn_id") == _turn_id(item)
+        and entry.get("pending_content_revision") == revision
+        and isinstance(entry.get("pending_plan_token"), str)
+        and str(entry.get("pending_plan_token")).startswith("twplan1.")
+    ):
+        pending_token = str(entry["pending_plan_token"])
+        pending_count = entry.get("pending_turn_part_count")
+        if isinstance(pending_count, bool) or not isinstance(pending_count, int) or pending_count <= 0:
+            raise _TurnContentError("invalid_pending_plan", "pending plan has invalid part count")
+        observed = runtime.tendwire.connector_prepare_begin(
+            turn_id=_turn_id(item),
+            content_revision=revision,
+            presentation_version=PRESENTATION_VERSION,
+            part_count=pending_count,
+        )
+        if observed.get("ok") is False or observed.get("plan_token") != pending_token:
+            raise _TurnContentError(
+                str(observed.get("status") or "prepare_failed"),
+                str(observed.get("error") or "pending plan reconciliation failed"),
+            )
+        page_calls = 0
+        if observed.get("state") == "completed":
+            receipts = [
+                (job_key, receipt)
+                for job_key, receipt in state.tendwire_turn_jobs(store).items()
+                if isinstance(receipt, dict) and receipt.get("plan_token") == pending_token
+            ]
+            for job_key, receipt in receipts:
+                if receipt.get("substate") in {"telegram_applied", "old_slot_retired"}:
+                    state.update_tendwire_turn_job(store, job_key, substate="acknowledged")
+                elif receipt.get("substate") != "acknowledged":
+                    raise _TurnContentError(
+                        "invalid_pending_plan",
+                        "completed plan lacks a durable Telegram outcome",
+                    )
+            if _maybe_complete_turn_plan(
+                store,
+                item,
+                entry,
+                plan_token=pending_token,
+                revision=revision,
+            ):
+                _checkpoint_turn_job(runtime)
+        return page_calls
+    page_calls = _materialize_turn_item(item, runtime)
+    feed_item = turn_item_from_source(item, entry)
+    parts = prepare_turn_delivery_parts(feed_item)
+    if not parts:
+        raise _TurnContentError("invalid_presentation_plan", "completed turn has no presentation parts")
+    if runtime.dry_run:
+        entry["pending_turn_id"] = _turn_id(item)
+        entry["pending_content_revision"] = revision
+        entry["pending_plan_token"] = "dry-run"
+        entry["pending_turn_part_count"] = len(parts)
+        entry["pending_turn_job_count"] = len(parts)
+        entry["pending_turn_user_hash"] = _turn_user_hash(item)
+        entry["pending_plan_generation"] = 1
+        return page_calls
+    begin = runtime.tendwire.connector_prepare_begin(
+        turn_id=_turn_id(item),
+        content_revision=revision,
+        presentation_version=PRESENTATION_VERSION,
+        part_count=len(parts),
+    )
+    if begin.get("ok") is False:
+        raise _TurnContentError(
+            str(begin.get("status") or "prepare_failed"),
+            str(begin.get("error") or "connector prepare begin failed"),
+            conflict=str(begin.get("status") or "") in {"revision_conflict", "stale_revision"},
+        )
+    plan_token = begin.get("plan_token")
+    if not isinstance(plan_token, str) or not plan_token.startswith("twplan1."):
+        raise _TurnContentError("invalid_prepare_response", "prepare begin omitted a public plan token")
+    state_name = str(begin.get("state") or "")
+    if state_name not in {"preparing", "active", "waiting_predecessor", "completed"}:
+        raise _TurnContentError("invalid_prepare_response", "prepare begin returned invalid state")
+    if state_name == "preparing":
+        for ordinal, part in enumerate(parts):
+            response = runtime.tendwire.connector_prepare_part(
+                plan_token=plan_token,
+                ordinal=ordinal,
+                spans=part["spans"],
+            )
+            if (
+                response.get("ok") is False
+                or response.get("plan_token") != plan_token
+                or response.get("ordinal") != ordinal
+            ):
+                raise _TurnContentError(
+                    str(response.get("status") or "prepare_failed"),
+                    str(response.get("error") or "connector prepare part failed"),
+                )
+        commit = runtime.tendwire.connector_prepare_commit(plan_token=plan_token)
+    else:
+        commit = begin
+    if commit.get("ok") is False or commit.get("plan_token") != plan_token:
+        raise _TurnContentError(
+            str(commit.get("status") or "prepare_failed"),
+            str(commit.get("error") or "connector prepare commit failed"),
+            conflict=str(commit.get("status") or "") in {"revision_conflict", "stale_revision"},
+        )
+    committed_state = str(commit.get("state") or state_name)
+    if committed_state not in {"active", "waiting_predecessor", "completed"}:
+        raise _TurnContentError("invalid_prepare_response", "prepare commit did not activate the plan")
+    job_count = commit.get("job_count")
+    if committed_state != "completed" and (
+        isinstance(job_count, bool) or not isinstance(job_count, int) or job_count < len(parts)
+    ):
+        raise _TurnContentError("invalid_prepare_response", "prepare commit returned invalid job count")
+    entry["pending_turn_id"] = _turn_id(item)
+    entry["pending_content_revision"] = revision
+    entry["pending_plan_token"] = plan_token
+    entry["pending_turn_part_count"] = len(parts)
+    entry["pending_turn_job_count"] = int(job_count or 0)
+    entry["pending_turn_user_hash"] = _turn_user_hash(item)
+    generation = commit.get("generation", begin.get("generation", 1))
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+    ):
+        raise _TurnContentError(
+            "invalid_prepare_response",
+            "prepare response returned an invalid plan generation",
+        )
+    entry["pending_plan_generation"] = generation
+    return page_calls
+
+
 def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
@@ -1893,16 +2499,23 @@ def _bootstrap_existing_turns(store: dict[str, Any], turns_payload: dict[str, An
         return 0
     skipped = 0
     for item in _turns(turns_payload):
+        if _turn_has_content_outcome(item):
+            continue
         _key, entry = _entry_for_turn(store, item)
         if entry is None:
             continue
         turn_id = _turn_id(item)
         if not turn_id:
             continue
-        if bool(item.get("complete")) or item.get("assistant_final_text"):
-            content_hash = _turn_content_hash(item, "final")
+        if _turn_has_complete_final(item):
+            revision = _content_revision(item)
+            content_hash = revision or _turn_content_hash(item, "final")
             identity = f"final:{turn_id}:{content_hash}"
-            state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
+            record = {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id}
+            if revision:
+                record["content_revision"] = revision
+                entry["last_clean_content_revision"] = revision
+            state.mark_delivered(store, identity, record)
             _set_final_delivery(entry, turn_id=turn_id, content_hash=content_hash, placeholder=True)
             skipped += 1
             continue
@@ -1934,11 +2547,12 @@ def _sync_turns(
     pending_payload: dict[str, Any],
     runtime: SyncRuntime,
     *,
+    relist_on_conflict: bool = True,
     chat_id: str,
     live_worker_ids: set[str] | None = None,
     yield_barrier: Any | None = None,
 ) -> dict[str, int]:
-    counts = {"feed_sent": 0, "sent": 0, "updated": 0}
+    counts = {"feed_sent": 0, "sent": 0, "updated": 0, "content_pages": 0}
     turns = _turns(turns_payload)
     if live_worker_ids is not None:
         # Retired-worker turns must not be delivered (same rule already applied
@@ -1955,17 +2569,19 @@ def _sync_turns(
     # Payload updated_at can be absent on current worker-derived turns, so do
     # not let an older command row with updated_at suppress the live turn.
     for item in turns:
+        if _turn_has_content_outcome(item):
+            continue
         _key, entry = _entry_for_turn(store, item)
         if entry is None:
             continue
         worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
         if not worker_key:
             continue
-        complete = bool(item.get("complete")) or bool(item.get("assistant_final_text"))
+        complete = _turn_has_complete_final(item)
         has_real_content = (
             bool(item.get("assistant_stream_text"))
             or bool(item.get("user_text"))
-            or (complete and bool(item.get("assistant_final_text")))
+            or complete
         )
         if not has_real_content:
             continue
@@ -1973,6 +2589,8 @@ def _sync_turns(
     # Pass 2: synthetic "Work is in progress." placeholders only fill workers
     # with no real turn at all — a placeholder must never outrank a real turn.
     for item in turns:
+        if _turn_has_content_outcome(item):
+            continue
         _key, entry = _entry_for_turn(store, item)
         if entry is None:
             continue
@@ -1986,6 +2604,8 @@ def _sync_turns(
     fold_state: dict[str, int] = {"issued": 0}
     turn_count = len(turns)
     for idx, item in enumerate(turns):
+        if _turn_has_content_outcome(item):
+            continue
         entry_key, entry = _entry_for_turn(store, item)
         if entry is None:
             continue
@@ -1993,27 +2613,40 @@ def _sync_turns(
         repaired_open_final = False
         worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
         latest_turn_id = latest_content_turn_by_worker.get(worker_key)
-        complete = bool(item.get("complete")) or bool(item.get("assistant_final_text"))
-        if complete and (item.get("assistant_final_text") or item.get("assistant_stream_text")):
+        complete = _turn_has_complete_final(item)
+        if complete:
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 delivered = False
-                counts["updated"] += int(_suppress_historical_final(store, item, _turn_content_hash(item, "final")))
+                content_hash = _content_revision(item) or _turn_content_hash(item, "final")
+                counts["updated"] += int(_suppress_historical_final(store, item, content_hash))
                 counts["updated"] += int(_fold_superseded_final(store, item, entry, runtime, chat_id=chat_id, fold_state=fold_state))
                 continue
             if worker_key in seen_final_workers:
                 continue
             seen_final_workers.add(worker_key)
-            delivered = _deliver_final(store, item, entry, runtime, chat_id=chat_id)
-            if delivered:
-                # Speak seam AFTER _deliver_final so it fires for every delivery branch (raw send,
-                # promote-working-to-final, replace-changed-final), not just the raw path — the flag
-                # is consumed here exactly once per delivered final. It may reload `store` off-lock
-                # (Phase 2), so it returns the entry to keep using this iteration.
-                entry = _speak_reply(
-                    store, item, entry, entry_key, runtime,
-                    chat_id=chat_id, thread_id=str(entry.get("topic_id") or ""),
-                    reply_to=str(entry.get("last_clean_message_id") or "") or None,
-                )
+            if _content_revision(item):
+                try:
+                    counts["content_pages"] += _stage_final_plan(
+                        store, item, entry, runtime
+                    )
+                except _TurnContentError as exc:
+                    if exc.conflict and relist_on_conflict:
+                        raise
+                    item[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
+                        item, exc.status
+                    )
+                    continue
+                delivered = False
+            else:
+                delivered = _deliver_final(store, item, entry, runtime, chat_id=chat_id)
+                if delivered:
+                    # Legacy inline direct-call compatibility; v2 finals are spoken only after the
+                    # complete ordered plan is acknowledged.
+                    entry = _speak_reply(
+                        store, item, entry, entry_key, runtime,
+                        chat_id=chat_id, thread_id=str(entry.get("topic_id") or ""),
+                        reply_to=str(entry.get("last_clean_message_id") or "") or None,
+                    )
         elif item.get("assistant_stream_text") or _turn_is_working_placeholder(item, entry):
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 continue
@@ -2044,6 +2677,707 @@ def _sync_turns(
         if yield_barrier is not None and delivered and p_idx + 1 < pending_count:
             yield_barrier()
     return counts
+
+
+def _after_provider_accept(runtime: SyncRuntime) -> None:
+    if runtime.after_provider_accept is not None:
+        runtime.after_provider_accept()
+
+def _checkpoint_turn_job(runtime: SyncRuntime) -> None:
+    if runtime.checkpoint is not None:
+        runtime.checkpoint()
+
+
+def _turn_item_by_revision(
+    turns_payload: dict[str, Any], revision: str
+) -> dict[str, Any] | None:
+    matches = [item for item in _turns(turns_payload) if _content_revision(item) == revision]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _slot_binding(
+    store: dict[str, Any],
+    *,
+    turn_id: str,
+    ordinal: int,
+    plan_token: str = "",
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for message_id, binding in _final_delivery_bindings(store, turn_id):
+        binding_ordinal = binding.get("part_ordinal")
+        if binding_ordinal is None:
+            ids = [
+                str(value)
+                for value in (binding.get("message_ids") or [])
+                if str(value or "")
+            ]
+            if ids:
+                binding_ordinal = ids.index(message_id) if message_id in ids else None
+        if binding_ordinal is None:
+            entry_ids = [
+                str(value)
+                for entry in state.source_entries(store).values()
+                if entry.get("last_turn_id") == turn_id
+                for value in (entry.get("last_clean_message_ids") or [])
+            ]
+            binding_ordinal = entry_ids.index(message_id) if message_id in entry_ids else 0
+        if binding_ordinal != ordinal:
+            continue
+        if plan_token and binding.get("plan_token") not in (None, "", plan_token):
+            continue
+        candidates.append((message_id, binding))
+    return candidates[-1] if candidates else (None, None)
+
+
+def _owning_bot_token(store: dict[str, Any], bot_kind: str) -> str | None:
+    if not bot_kind or bot_kind == MANAGER_BOT_KIND:
+        return None
+    token = managed_bot_token(_telegram_state(store), bot_kind)
+    if not token:
+        raise _TurnContentError(
+            "missing_message_owner_token",
+            f"cannot retire a message owned by unavailable bot kind {bot_kind}",
+        )
+    return token
+
+
+def _retire_local_message(
+    store: dict[str, Any], entry: dict[str, Any], message_id: str
+) -> None:
+    state.message_bindings(store).pop(str(message_id), None)
+    _clear_entry_message_reference(entry, str(message_id), "final")
+    if entry.get("last_stream_message_id") == str(message_id):
+        _clear_stream_delivery_keys(entry)
+
+
+def _current_upsert_candidate(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    ordinal: int,
+    replaces_plan_token: str,
+) -> tuple[str, str, str, str]:
+    turn_id = _turn_id(item)
+    if ordinal == 0:
+        working_id = str(entry.get("last_stream_message_id") or "")
+        if working_id and entry.get("last_stream_turn_id") == turn_id:
+            binding = state.find_message_binding(store, working_id)
+            return (
+                working_id,
+                str((binding or {}).get("bot_kind") or entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND),
+                str((binding or {}).get("topic_id") or entry.get("topic_id") or ""),
+                "working",
+            )
+    message_id, binding = _slot_binding(
+        store,
+        turn_id=turn_id,
+        ordinal=ordinal,
+        plan_token=replaces_plan_token,
+    )
+    if message_id and binding:
+        return (
+            message_id,
+            str(binding.get("bot_kind") or entry.get("last_clean_bot_kind") or MANAGER_BOT_KIND),
+            str(binding.get("topic_id") or ""),
+            "final",
+        )
+    return "", "", "", ""
+
+
+def _validate_turn_final_item(item: dict[str, Any]) -> dict[str, Any]:
+    key = item.get("key")
+    ref = item.get("ref")
+    payload = item.get("payload")
+    if not isinstance(key, str) or not key.startswith("turn-final:twplan1.") or not isinstance(ref, str) or not ref:
+        raise _TurnContentError("invalid_turn_final_job", "turn-final lease identity is invalid")
+    payload_schema = payload.get("schema_version") if isinstance(payload, dict) else None
+    if type(payload_schema) is not int or payload_schema != 1:
+        raise _TurnContentError("invalid_turn_final_job", "turn-final payload schema is invalid")
+    required = {
+        "plan_token",
+        "content_revision",
+        "presentation_version",
+        "operation",
+        "sequence_index",
+        "part_ordinal",
+        "part_count",
+        "spans",
+    }
+    if not required.issubset(payload):
+        raise _TurnContentError("invalid_turn_final_job", "turn-final payload is incomplete")
+    plan_token = payload.get("plan_token")
+    revision = payload.get("content_revision")
+    sequence = payload.get("sequence_index")
+    ordinal = payload.get("part_ordinal")
+    part_count = payload.get("part_count")
+    if (
+        not isinstance(plan_token, str)
+        or not plan_token.startswith("twplan1.")
+        or not isinstance(revision, str)
+        or not revision.startswith("twrev1.")
+        or payload.get("presentation_version") != PRESENTATION_VERSION
+        or payload.get("operation") not in {"upsert", "retire"}
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (sequence, ordinal))
+        or isinstance(part_count, bool)
+        or not isinstance(part_count, int)
+        or part_count <= 0
+        or key != f"turn-final:{plan_token}:{sequence:06d}"
+    ):
+        raise _TurnContentError("invalid_turn_final_job", "turn-final payload identity is inconsistent")
+    predecessor_job_key = payload.get("predecessor_job_key")
+    if predecessor_job_key is not None and (
+        not isinstance(predecessor_job_key, str)
+        or not predecessor_job_key.startswith("turn-final:twplan1.")
+        or predecessor_job_key == key
+    ):
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "turn-final predecessor receipt identity is invalid",
+        )
+    spans = payload.get("spans")
+    operation = payload.get("operation")
+    if (
+        not isinstance(spans, list)
+        or (operation == "upsert" and ordinal >= part_count)
+        or (operation == "retire" and (ordinal < part_count or spans))
+    ):
+        raise _TurnContentError("invalid_turn_final_job", "turn-final operation coordinates are invalid")
+    return payload
+
+
+def _maybe_complete_turn_plan(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    plan_token: str,
+    revision: str,
+) -> bool:
+    expected_jobs = entry.get("pending_turn_job_count")
+    if isinstance(expected_jobs, bool) or not isinstance(expected_jobs, int) or expected_jobs <= 0:
+        return False
+    receipts = [
+        receipt
+        for receipt in state.tendwire_turn_jobs(store).values()
+        if isinstance(receipt, dict) and receipt.get("plan_token") == plan_token
+    ]
+    if len(receipts) < expected_jobs or any(
+        receipt.get("substate") != "acknowledged" for receipt in receipts
+    ):
+        return False
+    part_count = int(entry.get("pending_turn_part_count") or 0)
+    bindings: list[tuple[int, str, dict[str, Any]]] = []
+    for message_id, binding in _final_delivery_bindings(store, _turn_id(item)):
+        if binding.get("plan_token") != plan_token:
+            continue
+        ordinal = binding.get("part_ordinal")
+        if isinstance(ordinal, int) and 0 <= ordinal < part_count:
+            bindings.append((ordinal, message_id, binding))
+    bindings.sort(key=lambda row: row[0])
+    if [ordinal for ordinal, _message_id, _binding in bindings] != list(range(part_count)):
+        return False
+    message_ids = [message_id for _ordinal, message_id, _binding in bindings]
+    bot_kind = str(bindings[0][2].get("bot_kind") or MANAGER_BOT_KIND)
+    identity = f"final:{_turn_id(item)}:{revision}"
+    state.mark_delivered(
+        store,
+        identity,
+        {"worker_id": entry.get("tendwire_worker_id"), "turn_id": _turn_id(item), "content_revision": revision},
+    )
+    _set_final_delivery(
+        entry,
+        turn_id=_turn_id(item),
+        content_hash=revision,
+        user_hash=str(entry.get("pending_turn_user_hash") or "")
+        or _turn_user_hash(item),
+        message_ids=message_ids,
+        bot_kind=bot_kind,
+        render_version=RENDER_VERSION,
+    )
+    entry["last_clean_content_revision"] = revision
+    entry["last_clean_plan_token"] = plan_token
+    for field in (
+        "pending_turn_id",
+        "pending_content_revision",
+        "pending_plan_token",
+        "pending_turn_part_count",
+        "pending_turn_job_count",
+        "pending_turn_user_hash",
+        "pending_plan_generation",
+        "pending_acknowledged_prefix_count",
+        "replaces_failed_plan_token",
+    ):
+        entry.pop(field, None)
+    _clear_stream_delivery_state(entry, _turn_id(item))
+    _record_delivery_success(entry, bot_kind)
+    return True
+
+
+def _fail_turn_final(
+    runtime: SyncRuntime,
+    ref: str,
+    reason: str,
+    result: dict[str, Any],
+    *,
+    uncertain: bool = False,
+) -> None:
+    response = runtime.tendwire.turn_final_fail(ref, reason)
+    result["failed"] += 1
+    result["changed"] = True
+    response_status = str(response.get("status") or "")
+    if response_status == "attempts_exhausted":
+        result["status"] = response_status
+    if uncertain:
+        result["uncertain"] += 1
+        result["status"] = "delivery_uncertain"
+    if response.get("ok") is False:
+        result["status"] = str(response.get("status") or "turn_final_fail_failed")
+
+
+def _telegram_result_is_transient(result: dict[str, Any]) -> bool:
+    if str(result.get("kind") or "") == "transient":
+        return True
+    error = str(result.get("error") or "").lower()
+    return any(marker in error for marker in ("rate limit", "too many requests", "retry after"))
+
+
+def _defer_turn_final(
+    runtime: SyncRuntime,
+    ref: str,
+    reason: str,
+    result: dict[str, Any],
+    store: dict[str, Any],
+    job_key: str,
+    *,
+    delay_seconds: int,
+) -> None:
+    receipt = state.find_tendwire_turn_job(store, job_key)
+    if receipt is not None and receipt.get("substate") == "reserved":
+        state.update_tendwire_turn_job(
+            store,
+            job_key,
+            substate="retryable",
+        )
+        _checkpoint_turn_job(runtime)
+    response = runtime.tendwire.turn_final_defer(
+        ref,
+        reason,
+        delay_seconds=max(1, int(delay_seconds)),
+    )
+    result["deferred"] += 1
+    result["changed"] = True
+    if response.get("ok") is False:
+        result["status"] = str(response.get("status") or "turn_final_defer_failed")
+
+
+def _drain_turn_final(
+    store: dict[str, Any],
+    turns_payload: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    max_operations: int,
+) -> dict[str, Any]:
+    result = {
+        "enabled": runtime.with_outbox,
+        "polled": 0,
+        "operations": 0,
+        "delivered": 0,
+        "acked": 0,
+        "failed": 0,
+        "deferred": 0,
+        "uncertain": 0,
+        "content_pages": 0,
+        "changed": False,
+    }
+    failed_job_key = ""
+    if not runtime.with_outbox or max_operations <= 0 or runtime.dry_run:
+        return result
+    for _iteration in range(max_operations + 100):
+        if result["operations"] >= max_operations:
+            break
+        poll = runtime.tendwire.turn_final_poll(limit=1)
+        if poll.get("ok") is False:
+            result["status"] = str(poll.get("status") or "turn_final_poll_failed")
+            result["changed"] = True
+            break
+        jobs = [job for job in poll.get("items", []) if isinstance(job, dict)]
+        if not jobs:
+            break
+        result["polled"] += 1
+        lease = jobs[0]
+        ref = str(lease.get("ref") or "")
+        try:
+            payload = _validate_turn_final_item(lease)
+        except _TurnContentError as exc:
+            _fail_turn_final(runtime, ref, f"{exc.status}: {exc}", result)
+            break
+        revision = str(payload["content_revision"])
+        plan_token = str(payload["plan_token"])
+        item = _turn_item_by_revision(turns_payload, revision)
+        if item is None:
+            _fail_turn_final(runtime, ref, "stale_or_unavailable_content_revision", result)
+            break
+        _entry_key, entry = _entry_for_turn(store, item)
+        if entry is None or entry.get("pending_plan_token") != plan_token:
+            _fail_turn_final(runtime, ref, "stale_or_unroutable_turn_plan", result)
+            break
+        job_key = str(lease["key"])
+        failed_job_key = job_key
+        operation = str(payload["operation"])
+        sequence = int(payload["sequence_index"])
+        ordinal = int(payload["part_ordinal"])
+        part_count = int(payload["part_count"])
+        replaces = str(payload.get("replaces_plan_token") or "")
+        predecessor_job_key = payload.get("predecessor_job_key")
+        if predecessor_job_key is not None:
+            try:
+                predecessor_receipt = state.find_tendwire_turn_job(
+                    store,
+                    predecessor_job_key,
+                )
+            except ValueError:
+                predecessor_receipt = None
+            if (
+                predecessor_receipt is None
+                or predecessor_receipt.get("substate") != "acknowledged"
+                or predecessor_receipt.get("content_revision") != revision
+                or predecessor_receipt.get("sequence_index")
+                != int(entry.get("pending_acknowledged_prefix_count") or 0) - 1
+                or predecessor_receipt.get("plan_token")
+                != entry.get("replaces_failed_plan_token")
+            ):
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    "invalid_recovery_predecessor_receipt",
+                    result,
+                )
+                break
+        candidate_id, candidate_bot, candidate_topic, candidate_kind = _current_upsert_candidate(
+            store,
+            item,
+            entry,
+            ordinal=ordinal,
+            replaces_plan_token=replaces,
+        ) if operation == "upsert" else ("", "", "", "")
+        if operation == "retire":
+            candidate_id, binding = _slot_binding(
+                store,
+                turn_id=_turn_id(item),
+                ordinal=ordinal,
+                plan_token=replaces,
+            )
+            candidate_bot = str((binding or {}).get("bot_kind") or MANAGER_BOT_KIND)
+            candidate_topic = str((binding or {}).get("topic_id") or "")
+            candidate_kind = "final"
+        desired_token, desired_bot = _delivery_bot(store, entry)
+        compatible = bool(
+            candidate_id
+            and candidate_bot == desired_bot
+            and candidate_topic == str(entry.get("topic_id") or "")
+        )
+        prior_for_reservation = candidate_id if operation == "retire" else ""
+        existing_receipt = state.find_tendwire_turn_job(store, job_key)
+        try:
+            receipt = state.reserve_tendwire_turn_job(
+                store,
+                job_key,
+                plan_token=plan_token,
+                content_revision=revision,
+                operation=operation,
+                sequence_index=sequence,
+                part_ordinal=ordinal,
+                part_count=part_count,
+                prior_message_id=prior_for_reservation,
+                bot_kind=desired_bot if operation == "upsert" else candidate_bot,
+            )
+            if existing_receipt is None:
+                _checkpoint_turn_job(runtime)
+        except (RuntimeError, ValueError) as exc:
+            _fail_turn_final(runtime, ref, f"receipt_reservation_failed: {exc}", result)
+            break
+        substate = str(receipt.get("substate") or "")
+        if substate == "retryable":
+            state.update_tendwire_turn_job(
+                store,
+                job_key,
+                substate="reserved",
+            )
+            _checkpoint_turn_job(runtime)
+            substate = "reserved"
+            existing_receipt = None
+        if substate == "reserved" and existing_receipt is not None:
+            _fail_turn_final(
+                runtime,
+                ref,
+                "delivery_uncertain: persisted reserved provider operation",
+                result,
+                uncertain=True,
+            )
+            break
+        if substate == "failed":
+            _fail_turn_final(
+                runtime,
+                ref,
+                "failed local receipt cannot be replayed",
+                result,
+            )
+            break
+        if substate in {"telegram_applied", "old_slot_retired", "acknowledged"}:
+            pass
+        elif operation == "retire":
+            if not candidate_id:
+                state.update_tendwire_turn_job(
+                    store,
+                    job_key,
+                    substate="telegram_applied",
+                    prior_message_id="already-missing",
+                    bot_kind=candidate_bot or MANAGER_BOT_KIND,
+                )
+                _checkpoint_turn_job(runtime)
+                substate = "telegram_applied"
+            else:
+                try:
+                    owner_token = _owning_bot_token(store, candidate_bot)
+                    result["operations"] += 1
+                    deleted = delete_turn_delivery_message(
+                        runtime.telegram,
+                        chat_id,
+                        candidate_id,
+                        api_token=owner_token,
+                    )
+                except RateLimited as exc:
+                    _defer_turn_final(runtime, ref, str(exc), result, store, job_key, delay_seconds=exc.retry_after)
+                    break
+                except _TurnContentError as exc:
+                    _fail_turn_final(runtime, ref, f"{exc.status}: {exc}", result)
+                    break
+                except Exception as exc:  # provider acceptance cannot be reconstructed
+                    _fail_turn_final(runtime, ref, f"delivery_uncertain: {exc}", result, uncertain=True)
+                    break
+                if not deleted.get("ok"):
+                    if _telegram_result_is_transient(deleted):
+                        _defer_turn_final(runtime, ref, str(deleted.get("error") or "transient Telegram failure"), result, store, job_key, delay_seconds=1)
+                    else:
+                        _fail_turn_final(runtime, ref, str(deleted.get("error") or "retire failed"), result)
+                    break
+                _after_provider_accept(runtime)
+                _retire_local_message(store, entry, candidate_id)
+                state.update_tendwire_turn_job(
+                    store,
+                    job_key,
+                    substate="telegram_applied",
+                    prior_message_id=candidate_id,
+                    bot_kind=candidate_bot or MANAGER_BOT_KIND,
+                )
+                _checkpoint_turn_job(runtime)
+                substate = "telegram_applied"
+        else:
+            try:
+                result["content_pages"] += _materialize_turn_item(
+                    item, runtime
+                )
+            except _TurnContentError as exc:
+                _fail_turn_final(
+                    runtime, ref, f"{exc.status}: {exc}", result
+                )
+                break
+            feed_item = turn_item_from_source(item, entry)
+            plans = prepare_turn_delivery_parts(feed_item)
+            if (
+                ordinal >= len(plans)
+                or part_count != len(plans)
+                or payload.get("spans") != plans[ordinal].get("spans")
+            ):
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    "presentation_plan_mismatch",
+                    result,
+                )
+                break
+            try:
+                result["operations"] += 1
+                if compatible:
+                    applied = edit_turn_delivery_part(
+                        runtime.telegram,
+                        chat_id,
+                        candidate_id,
+                        feed_item,
+                        plans[ordinal],
+                        telegram=_telegram_state(store),
+                        api_token=desired_token,
+                    )
+                else:
+                    applied = send_turn_delivery_part(
+                        runtime.telegram,
+                        chat_id,
+                        feed_item,
+                        plans[ordinal],
+                        telegram=_telegram_state(store),
+                        thread_id=str(entry.get("topic_id") or ""),
+                        notify=False,
+                        api_token=desired_token,
+                    )
+            except RateLimited as exc:
+                _defer_turn_final(runtime, ref, str(exc), result, store, job_key, delay_seconds=exc.retry_after)
+                break
+            except Exception as exc:  # accepted-send/no-receipt is explicitly uncertain
+                _fail_turn_final(runtime, ref, f"delivery_uncertain: {exc}", result, uncertain=True)
+                break
+            if not applied.get("ok"):
+                kind = str(applied.get("kind") or "")
+                if _telegram_result_is_transient(applied):
+                    _defer_turn_final(runtime, ref, str(applied.get("error") or "transient Telegram failure"), result, store, job_key, delay_seconds=1)
+                    break
+                retry_as_send = compatible and kind in {"not_found", "topic_not_found"}
+                if retry_as_send and kind == "not_found":
+                    _retire_local_message(store, entry, candidate_id)
+                    candidate_id = ""
+                    compatible = False
+                    _checkpoint_turn_job(runtime)
+                if retry_as_send and result["operations"] >= max_operations:
+                    _defer_turn_final(runtime, ref, "edit target unavailable; retry as send", result, store, job_key, delay_seconds=1)
+                    break
+                if retry_as_send:
+                    try:
+                        result["operations"] += 1
+                        applied = send_turn_delivery_part(
+                            runtime.telegram,
+                            chat_id,
+                            feed_item,
+                            plans[ordinal],
+                            telegram=_telegram_state(store),
+                            thread_id=str(entry.get("topic_id") or ""),
+                            notify=False,
+                            api_token=desired_token,
+                        )
+                        compatible = False
+                    except RateLimited as exc:
+                        _defer_turn_final(runtime, ref, str(exc), result, store, job_key, delay_seconds=exc.retry_after)
+                        break
+                    except Exception as exc:
+                        _fail_turn_final(runtime, ref, f"delivery_uncertain: {exc}", result, uncertain=True)
+                        break
+                if not applied.get("ok"):
+                    if _telegram_result_is_transient(applied):
+                        _defer_turn_final(runtime, ref, str(applied.get("error") or "transient Telegram failure"), result, store, job_key, delay_seconds=1)
+                    else:
+                        _fail_turn_final(
+                            runtime,
+                            ref,
+                            str(applied.get("error") or "Telegram upsert failed"),
+                            result,
+                        )
+                    break
+            message_id = str(applied.get("message_id") or candidate_id or "")
+            if not message_id or message_id == "0":
+                _fail_turn_final(runtime, ref, "delivery_uncertain: Telegram omitted message receipt", result, uncertain=True)
+                break
+            _after_provider_accept(runtime)
+            prior_id = candidate_id if candidate_id and not compatible and candidate_id != message_id else None
+            state.bind_message_to_worker(
+                store,
+                message_id,
+                entry,
+                topic_id=str(entry.get("topic_id") or ""),
+                kind="final",
+                turn_id=_turn_id(item),
+                bot_kind=desired_bot,
+                content_revision=revision,
+                plan_token=plan_token,
+                part_ordinal=ordinal,
+                part_count=part_count,
+                tendwire_job_key=job_key,
+            )
+            state.update_tendwire_turn_job(
+                store,
+                job_key,
+                substate="telegram_applied",
+                telegram_message_id=message_id,
+                prior_message_id=prior_id,
+                bot_kind=desired_bot,
+            )
+            if candidate_kind == "working" and message_id == candidate_id:
+                _clear_stream_delivery_state(entry, _turn_id(item))
+            _checkpoint_turn_job(runtime)
+            substate = "telegram_applied"
+        if operation == "upsert" and substate == "telegram_applied":
+            prior_id = str(receipt.get("prior_message_id") or "")
+            message_id = str(receipt.get("telegram_message_id") or "")
+            if prior_id and prior_id != message_id:
+                if result["operations"] >= max_operations:
+                    _defer_turn_final(runtime, ref, "physical operation budget exhausted", result, store, job_key, delay_seconds=1)
+                    break
+                prior_binding = state.find_message_binding(store, prior_id)
+                prior_bot = str((prior_binding or {}).get("bot_kind") or candidate_bot or MANAGER_BOT_KIND)
+                try:
+                    owner_token = _owning_bot_token(store, prior_bot)
+                    result["operations"] += 1
+                    retired = delete_turn_delivery_message(
+                        runtime.telegram,
+                        chat_id,
+                        prior_id,
+                        api_token=owner_token,
+                    )
+                except RateLimited as exc:
+                    _defer_turn_final(runtime, ref, str(exc), result, store, job_key, delay_seconds=exc.retry_after)
+                    break
+                except _TurnContentError as exc:
+                    _fail_turn_final(runtime, ref, f"{exc.status}: {exc}", result)
+                    break
+                except Exception as exc:
+                    _fail_turn_final(runtime, ref, f"delivery_uncertain: {exc}", result, uncertain=True)
+                    break
+                if not retired.get("ok"):
+                    if _telegram_result_is_transient(retired):
+                        _defer_turn_final(runtime, ref, str(retired.get("error") or "transient Telegram failure"), result, store, job_key, delay_seconds=1)
+                    else:
+                        _fail_turn_final(runtime, ref, str(retired.get("error") or "old slot retire failed"), result)
+                    break
+                _after_provider_accept(runtime)
+                _retire_local_message(store, entry, prior_id)
+                state.update_tendwire_turn_job(store, job_key, substate="old_slot_retired")
+                _checkpoint_turn_job(runtime)
+                substate = "old_slot_retired"
+        ack = runtime.tendwire.turn_final_ack(
+            ref,
+            {"outcome": "applied", "job_key": job_key},
+        )
+        if ack.get("ok") is False:
+            result["status"] = str(ack.get("status") or "turn_final_ack_failed")
+            result["changed"] = True
+            break
+        if substate != "acknowledged":
+            state.update_tendwire_turn_job(store, job_key, substate="acknowledged")
+            _checkpoint_turn_job(runtime)
+        result["delivered"] += 1
+        result["acked"] += 1
+        result["changed"] = True
+        if _maybe_complete_turn_plan(
+            store,
+            item,
+            entry,
+            plan_token=plan_token,
+            revision=revision,
+        ):
+            _checkpoint_turn_job(runtime)
+    if result.get("status") == "attempts_exhausted" and failed_job_key:
+        failed_receipt = state.find_tendwire_turn_job(store, failed_job_key)
+        if (
+            failed_receipt is not None
+            and failed_receipt.get("substate")
+            in {"reserved", "telegram_applied", "old_slot_retired"}
+        ):
+            state.update_tendwire_turn_job(
+                store,
+                failed_job_key,
+                substate="failed",
+            )
+            _checkpoint_turn_job(runtime)
+    return result
 
 
 def _sync_pinned(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
@@ -2133,6 +3467,18 @@ def _tendwire_non_success(runtime: SyncRuntime, status: str) -> dict[str, Any]:
         "message_bindings": 0,
         "turn_updates": 0,
         "topic_cleanup": {"deleted": 0, "failed": 0, "pruned": 0, "changed": False},
+        "content_pages": 0,
+        "tendwire_turn_final": {
+            "enabled": runtime.with_outbox,
+            "polled": 0,
+            "operations": 0,
+            "delivered": 0,
+            "acked": 0,
+            "failed": 0,
+            "deferred": 0,
+            "uncertain": 0,
+            "changed": False,
+        },
         "tendwire_outbox": {
             "enabled": runtime.with_outbox,
             "polled": 0,
@@ -2188,10 +3534,19 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     for name, payload in (("snapshot", snapshot), ("turns", turns_payload), ("pending", pending_payload)):
         if payload.get("ok") is False:
             return _tendwire_non_success(runtime, f"tendwire_{name}_failed")
-    turn_schema_version = turns_payload.get("schema_version")
-    if type(turn_schema_version) is not int or turn_schema_version != _TURN_SCHEMA_VERSION:
-        return _unsupported_turn_schema_version(runtime, turn_schema_version)
+    turn_schema = turns_payload.get("schema_version")
+    if (
+        type(turn_schema) is not int
+        or turn_schema not in {_TURN_SCHEMA_VERSION, TURN_SCHEMA_VERSION}
+    ):
+        return _unsupported_turn_schema_version(runtime, turn_schema)
     chat_id = config.telegram_chat_id(store)
+    try:
+        turns_payload = _validate_turns_payload(turns_payload)
+    except _TurnContentError as exc:
+        # The list envelope/schema is connector-wide. Descriptor defects are
+        # converted to bounded row-local outcomes by _validate_turns_payload.
+        return _tendwire_non_success(runtime, exc.status)
     changed = False
     source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
     routing_repaired = _repair_space_mode_routing_state(store)
@@ -2224,19 +3579,42 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         if config.offlock_interpane_yield_enabled() and not runtime.dry_run
         else None
     )
-    turn_counts = (
-        {"feed_sent": 0, "sent": 0, "updated": 0}
-        if bootstrapped
-        else _sync_turns(
-            store,
-            turns_payload,
-            pending_payload,
-            runtime,
-            chat_id=chat_id,
-            live_worker_ids=live_worker_ids,
-            yield_barrier=yield_barrier,
+    try:
+        turn_counts = (
+            {"feed_sent": 0, "sent": 0, "updated": 0, "content_pages": 0}
+            if bootstrapped
+            else _sync_turns(
+                store,
+                turns_payload,
+                pending_payload,
+                runtime,
+                chat_id=chat_id,
+                live_worker_ids=live_worker_ids,
+                yield_barrier=yield_barrier,
+            )
         )
-    )
+    except _TurnContentError as exc:
+        if not exc.conflict:
+            return _tendwire_non_success(runtime, exc.status)
+        relisted = runtime.tendwire.turns()
+        if relisted.get("ok") is False:
+            return _tendwire_non_success(
+                runtime, "tendwire_turns_relist_failed"
+            )
+        try:
+            turns_payload = _validate_turns_payload(relisted)
+            turn_counts = _sync_turns(
+                store,
+                turns_payload,
+                pending_payload,
+                runtime,
+                chat_id=chat_id,
+                live_worker_ids=live_worker_ids,
+                relist_on_conflict=False,
+                yield_barrier=yield_barrier,
+            )
+        except _TurnContentError as retry_exc:
+            return _tendwire_non_success(runtime, retry_exc.status)
     routing_repaired += _repair_space_mode_routing_state(store)
     snapshot_worker_ids = {compact_ws(worker.get("id"), 160) for worker in _workers(snapshot)}
     snapshot_worker_ids.discard("")
@@ -2259,11 +3637,38 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         pinned_changed = False
         topic_pinned_updated = 0
     changed = changed or pinned_changed or bool(topic_pinned_updated)
+    turn_final_result = {
+        "enabled": runtime.with_outbox,
+        "polled": 0,
+        "operations": 0,
+        "delivered": 0,
+        "acked": 0,
+        "failed": 0,
+        "deferred": 0,
+        "uncertain": 0,
+        "content_pages": 0,
+        "changed": False,
+    }
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
     if runtime.with_outbox:
         remaining = max(0, runtime.max_sends - int(turn_counts["sent"]))
-        outbox_result = drain_outbox(store, runtime.telegram, runtime.tendwire, chat_id=chat_id, max_sends=remaining, dry_run=runtime.dry_run)
-        changed = changed or bool(outbox_result.get("changed"))
+        turn_final_result = _drain_turn_final(
+            store,
+            turns_payload,
+            runtime,
+            chat_id=chat_id,
+            max_operations=remaining,
+        )
+        remaining = max(0, remaining - int(turn_final_result["operations"]))
+        outbox_result = drain_outbox(
+            store,
+            runtime.telegram,
+            runtime.tendwire,
+            chat_id=chat_id,
+            max_sends=remaining,
+            dry_run=runtime.dry_run,
+        )
+        changed = changed or bool(turn_final_result.get("changed")) or bool(outbox_result.get("changed"))
     return {
         "ok": True,
         "changed": changed,
@@ -2280,5 +3685,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "bootstrap_seen": bootstrapped,
         "message_bindings": message_bindings,
         "topic_cleanup": topic_cleanup,
+        "content_pages": int(turn_counts["content_pages"])
+        + int(turn_final_result.get("content_pages") or 0),
+        "turn_content_outcomes": _turn_content_outcomes(turns_payload),
+        "tendwire_turn_final": turn_final_result,
         "tendwire_outbox": outbox_result,
     }

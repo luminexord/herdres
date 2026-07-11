@@ -43,6 +43,20 @@ def sanitize_text(value: Any, limit: int = 4000) -> str:
     return text[:limit]
 
 
+def canonical_text(value: Any, *, field: str = "content") -> str:
+    """Return already-canonical turn content without changing a code point.
+
+    Tendwire owns canonical public sanitization.  Herdres may validate the
+    resulting value's type, but must not trim, normalize, redact again, or apply
+    the generic public-response size cap while planning Telegram presentation.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string")
+    return value
+
+
 def html_escape(value: Any, limit: int = 4000) -> str:
     return html.escape(sanitize_text(value, limit), quote=False)
 

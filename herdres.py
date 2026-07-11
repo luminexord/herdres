@@ -12,7 +12,7 @@ import argparse
 import copy
 import json
 import sys
-from typing import Any
+from typing import Any, Callable
 
 from herdres_connector import config, doctor, speech, state
 from herdres_connector.managed_bots import managed_bot_kind_for_username
@@ -26,18 +26,41 @@ SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the 
 
 
 def _json(data: dict[str, Any]) -> int:
-    print(json.dumps(public_prune(data), ensure_ascii=False, sort_keys=True))
+    output = public_prune(data)
+    if isinstance(output, dict):
+        for key in ("failed_plan_token", "plan_token"):
+            value = data.get(key)
+            if (
+                isinstance(value, str)
+                and value.startswith("twplan1.")
+                and 9 <= len(value) <= 264
+                and all(
+                    char.isascii() and (char.isalnum() or char in "_-")
+                    for char in value[8:]
+                )
+            ):
+                output[key] = value
+    print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     return 0 if data.get("ok", True) else 1
 
 
-def _runtime(*, dry_run: bool = False, with_outbox: bool = True) -> SyncRuntime:
+def _runtime(
+    *,
+    dry_run: bool = False,
+    with_outbox: bool = True,
+    checkpoint: Callable[[], None] | None = None,
+) -> SyncRuntime:
     token = config.telegram_token()
-    return SyncRuntime(
+    runtime = SyncRuntime(
         tendwire=TendwireClient(),
         telegram=TelegramClient(token=token, dry_run=dry_run),
         dry_run=dry_run,
         with_outbox=with_outbox,
     )
+    # SyncRuntime intentionally remains constructible by old callers. The source executor consumes
+    # this optional seam when it needs a durable receipt before acknowledging a Tendwire job.
+    runtime.checkpoint = checkpoint
+    return runtime
 
 
 def _send_text_from_payload(payload: dict[str, Any]) -> str:
@@ -417,7 +440,20 @@ def callback_reply(_payload: dict[str, Any]) -> dict[str, Any]:
 def _sync_pass() -> dict[str, Any]:
     with state.state_lock():
         store = state.load_state()
-        result = sync_once(store, _runtime(dry_run=False, with_outbox=True))
+
+        def checkpoint() -> None:
+            if not state.lock_held():
+                raise RuntimeError("state checkpoint requires the held state lock")
+            state.save_state(store)
+
+        result = sync_once(
+            store,
+            _runtime(
+                dry_run=False,
+                with_outbox=True,
+                checkpoint=checkpoint,
+            ),
+        )
         if result.get("changed"):
             state.save_state(store)
     return result
@@ -507,6 +543,590 @@ def cmd_source_smoke(args: argparse.Namespace) -> int:
     return _json(payload)
 
 
+_TURN_FINAL_RECOVERY_AUDIT_LIMIT = 100
+_TURN_FINAL_RECOVERY_RESPONSE_KEYS = {
+    "schema_version",
+    "ok",
+    "status",
+    "failed_plan_token",
+    "plan_token",
+    "generation",
+    "content_revision",
+    "state",
+    "acknowledged_prefix_count",
+    "executable_job_count",
+    "retained_failed_job_count",
+    "prior_attempt_count",
+    "idempotent_replay",
+}
+
+
+def _recovery_error(status: str, error: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": status,
+        "error": sanitize_text(error, 240),
+    }
+
+
+def _valid_recovery_plan_token(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value.startswith("twplan1.")
+        and 9 <= len(value) <= 264
+        and all(
+            char.isascii() and (char.isalnum() or char in "_-")
+            for char in value[8:]
+        )
+    )
+
+
+def _valid_recovery_request_id(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and 1 <= len(value) <= 128
+        and all(
+            char.isascii() and (char.isalnum() or char in "._:-")
+            for char in value
+        )
+    )
+
+
+def _recovery_audits(store: dict[str, Any]) -> dict[str, Any]:
+    audits = store.get("tendwire_turn_final_recoveries")
+    return audits if isinstance(audits, dict) else {}
+def _recovery_request_key(request_id: str) -> str:
+    return short_hash(
+        {"turn_final_recovery_request_id": request_id},
+        32,
+    )
+
+
+def _recovery_request_bindings(store: dict[str, Any]) -> dict[str, Any]:
+    bindings = store.get("tendwire_turn_final_recovery_requests")
+    return bindings if isinstance(bindings, dict) else {}
+
+
+def _valid_acknowledged_recovery_receipt(
+    job_key: str,
+    receipt: dict[str, Any],
+    *,
+    failed_plan_token: str,
+    content_revision: str,
+) -> bool:
+    sequence = receipt.get("sequence_index")
+    operation = receipt.get("operation")
+    ordinal = receipt.get("part_ordinal")
+    part_count = receipt.get("part_count")
+    message_id = receipt.get("telegram_message_id")
+    prior_message_id = receipt.get("prior_message_id")
+    checkpoint = receipt.get("checkpoint_sequence")
+    if (
+        type(sequence) is not int
+        or sequence < 0
+        or job_key
+        != f"turn-final:{failed_plan_token}:{sequence:06d}"
+        or receipt.get("plan_token") != failed_plan_token
+        or receipt.get("content_revision") != content_revision
+        or operation not in {"upsert", "retire"}
+        or type(ordinal) is not int
+        or ordinal < 0
+        or type(part_count) is not int
+        or part_count <= 0
+        or type(checkpoint) is not int
+        or checkpoint <= 0
+    ):
+        return False
+    if operation == "upsert":
+        return bool(
+            ordinal < part_count
+            and isinstance(message_id, str)
+            and message_id
+            and message_id != "0"
+            and len(message_id) <= 80
+            and (
+                prior_message_id in (None, "")
+                or (
+                    isinstance(prior_message_id, str)
+                    and 0 < len(prior_message_id) <= 80
+                )
+            )
+        )
+    return bool(
+        ordinal >= part_count
+        and isinstance(prior_message_id, str)
+        and 0 < len(prior_message_id) <= 80
+        and message_id in (None, "")
+    )
+
+
+def _turn_final_recovery_preflight(
+    store: dict[str, Any],
+    failed_plan_token: str,
+    request_id: str,
+) -> dict[str, Any]:
+    request_key = _recovery_request_key(request_id)
+    request_bindings = _recovery_request_bindings(store)
+    prior_binding = request_bindings.get(request_key)
+    prior_audit = _recovery_audits(store).get(request_key)
+    if prior_binding is not None:
+        if (
+            not isinstance(prior_binding, dict)
+            or prior_binding.get("failed_plan_token") != failed_plan_token
+            or not _valid_recovery_plan_token(
+                prior_binding.get("plan_token")
+            )
+            or not isinstance(prior_audit, dict)
+            or prior_audit.get("failed_plan_token") != failed_plan_token
+            or prior_audit.get("plan_token")
+            != prior_binding.get("plan_token")
+        ):
+            return _recovery_error(
+                "recovery_request_conflict",
+                "request_id is already bound or its replay detail expired",
+            )
+        return {
+            "ok": True,
+            "replay": True,
+            "audit": copy.deepcopy(prior_audit),
+        }
+    if prior_audit is not None:
+        return _recovery_error(
+            "recovery_request_conflict",
+            "recovery request detail lacks its durable request binding",
+        )
+    if len(request_bindings) >= state.TENDWIRE_TURN_JOB_LIMIT:
+        return _recovery_error(
+            "recovery_capacity_exceeded",
+            "local recovery request binding capacity is full",
+        )
+
+    matches = [
+        (key, entry)
+        for key, entry in state.source_worker_entries(store).items()
+        if entry.get("pending_plan_token") == failed_plan_token
+    ]
+    if len(matches) != 1:
+        return _recovery_error(
+            "recovery_plan_not_found",
+            "failed plan is not the unique pending Herdres plan",
+        )
+    entry_key, entry = matches[0]
+    if not state.worker_entry_is_uniquely_routable(store, entry_key, entry):
+        return _recovery_error(
+            "recovery_route_ambiguous",
+            "failed plan no longer has one uniquely routable worker",
+        )
+    revision = entry.get("pending_content_revision")
+    part_count = entry.get("pending_turn_part_count")
+    job_count = entry.get("pending_turn_job_count")
+    prior_generation = entry.get("pending_plan_generation", 1)
+    if (
+        not isinstance(revision, str)
+        or not revision.startswith("twrev1.")
+        or isinstance(part_count, bool)
+        or not isinstance(part_count, int)
+        or part_count <= 0
+        or isinstance(job_count, bool)
+        or not isinstance(job_count, int)
+        or job_count < part_count
+        or isinstance(prior_generation, bool)
+        or not isinstance(prior_generation, int)
+        or prior_generation < 1
+    ):
+        return _recovery_error(
+            "recovery_state_invalid",
+            "pending plan coordinates are invalid",
+        )
+
+    jobs = state.tendwire_turn_jobs(store)
+    old_receipts: list[tuple[str, dict[str, Any]]] = []
+    for job_key, receipt in jobs.items():
+        if not isinstance(receipt, dict) or receipt.get("plan_token") != failed_plan_token:
+            continue
+        if (
+            receipt.get("content_revision") != revision
+            or not isinstance(receipt.get("sequence_index"), int)
+            or isinstance(receipt.get("sequence_index"), bool)
+        ):
+            return _recovery_error(
+                "recovery_state_invalid",
+                "failed-plan receipt coordinates are invalid",
+            )
+        old_receipts.append((job_key, receipt))
+    old_receipts.sort(key=lambda item: int(item[1]["sequence_index"]))
+
+    prefix: list[tuple[str, dict[str, Any]]] = []
+    expected_sequence = 0
+    terminal_tail_seen = False
+    for job_key, receipt in old_receipts:
+        sequence = int(receipt["sequence_index"])
+        substate = receipt.get("substate")
+        if substate in {"telegram_applied", "old_slot_retired"}:
+            return _recovery_error(
+                "recovery_receipt_inflight",
+                "failed plan has a provider outcome awaiting durable ACK",
+            )
+        if substate == "reserved":
+            return _recovery_error(
+                "recovery_receipt_uncertain",
+                "failed plan has an unproven reserved provider operation",
+            )
+        if substate == "acknowledged":
+            if terminal_tail_seen or sequence != expected_sequence:
+                return _recovery_error(
+                    "recovery_state_invalid",
+                    "acknowledged receipts are not one contiguous prefix",
+                )
+            if not _valid_acknowledged_recovery_receipt(
+                job_key,
+                receipt,
+                failed_plan_token=failed_plan_token,
+                content_revision=str(revision),
+            ):
+                return _recovery_error(
+                    "recovery_state_invalid",
+                    "acknowledged prefix receipt is malformed",
+                )
+            prefix.append((job_key, receipt))
+            expected_sequence += 1
+            continue
+        if substate == "failed":
+            terminal_tail_seen = True
+            continue
+        return _recovery_error(
+            "recovery_state_invalid",
+            "failed plan contains an unknown receipt state",
+        )
+
+    bindings = state.message_bindings(store)
+    prefix_keys = {job_key for job_key, _receipt in prefix}
+    if any(
+        isinstance(binding, dict)
+        and binding.get("plan_token") == failed_plan_token
+        and binding.get("tendwire_job_key") not in prefix_keys
+        for binding in bindings.values()
+    ):
+        return _recovery_error(
+            "recovery_receipt_uncertain",
+            "failed plan has a binding without an acknowledged receipt",
+        )
+    if len(jobs) + job_count > state.TENDWIRE_TURN_JOB_LIMIT:
+        return _recovery_error(
+            "recovery_capacity_exceeded",
+            "local receipt capacity cannot hold both immutable plan generations",
+        )
+    failed_tail_count = sum(
+        receipt.get("substate") == "failed"
+        for _job_key, receipt in old_receipts[len(prefix):]
+    )
+    return {
+        "ok": True,
+        "replay": False,
+        "entry_key": entry_key,
+        "content_revision": revision,
+        "part_count": part_count,
+        "job_count": job_count,
+        "prefix": prefix,
+        "request_key": request_key,
+        "prior_generation": prior_generation,
+        "failed_tail_count": failed_tail_count,
+        "fingerprint": (
+            entry_key,
+            revision,
+            part_count,
+            job_count,
+            tuple(
+                (
+                    job_key,
+                    receipt.get("substate"),
+                    receipt.get("checkpoint_sequence"),
+                )
+                for job_key, receipt in old_receipts
+            ),
+            len(jobs),
+        ),
+    }
+
+
+def _validate_recovery_response(
+    response: dict[str, Any],
+    *,
+    failed_plan_token: str,
+    content_revision: str,
+    acknowledged_prefix_count: int,
+    expected_job_count: int,
+    expected_generation: int,
+    retained_failed_job_count: int,
+) -> dict[str, Any] | None:
+    if set(response) != _TURN_FINAL_RECOVERY_RESPONSE_KEYS:
+        return _recovery_error(
+            "recovery_state_uncertain",
+            "Tendwire recovery response shape is invalid",
+        )
+    plan_token = response.get("plan_token")
+    integer_fields = (
+        "generation",
+        "acknowledged_prefix_count",
+        "executable_job_count",
+        "retained_failed_job_count",
+        "prior_attempt_count",
+    )
+    if (
+        response.get("schema_version") != 1
+        or response.get("ok") is not True
+        or response.get("status") != "recovered"
+        or response.get("failed_plan_token") != failed_plan_token
+        or not _valid_recovery_plan_token(plan_token)
+        or plan_token == failed_plan_token
+        or response.get("content_revision") != content_revision
+        or response.get("state") != "active"
+        or type(response.get("idempotent_replay")) is not bool
+        or any(
+            type(response.get(field)) is not int or int(response[field]) < 0
+            for field in integer_fields
+        )
+        or int(response["generation"]) != expected_generation
+        or int(response["acknowledged_prefix_count"])
+        != acknowledged_prefix_count
+        or int(response["acknowledged_prefix_count"])
+        + int(response["executable_job_count"])
+        != expected_job_count
+        or int(response["retained_failed_job_count"])
+        != retained_failed_job_count
+    ):
+        return _recovery_error(
+            "recovery_state_uncertain",
+            "Tendwire recovery response failed local revalidation",
+        )
+    return None
+
+
+def _clone_recovery_prefix(
+    store: dict[str, Any],
+    *,
+    failed_plan_token: str,
+    plan_token: str,
+    entry_key: str,
+    prefix: list[tuple[str, dict[str, Any]]],
+    executable_job_count: int,
+    request_id: str,
+    response: dict[str, Any],
+) -> None:
+    key_map: dict[str, str] = {}
+    for old_key, receipt in prefix:
+        sequence = int(receipt["sequence_index"])
+        new_key = f"turn-final:{plan_token}:{sequence:06d}"
+        cloned = state.reserve_tendwire_turn_job(
+            store,
+            new_key,
+            plan_token=plan_token,
+            content_revision=str(receipt["content_revision"]),
+            operation=str(receipt["operation"]),
+            sequence_index=sequence,
+            part_ordinal=int(receipt["part_ordinal"]),
+            part_count=int(receipt["part_count"]),
+            telegram_message_id=str(receipt.get("telegram_message_id") or ""),
+            prior_message_id=str(receipt.get("prior_message_id") or ""),
+            bot_kind=str(receipt.get("bot_kind") or ""),
+        )
+        if cloned.get("operation") == "upsert":
+            state.update_tendwire_turn_job(
+                store,
+                new_key,
+                substate="telegram_applied",
+                telegram_message_id=str(receipt["telegram_message_id"]),
+                prior_message_id=(
+                    str(receipt["prior_message_id"])
+                    if receipt.get("prior_message_id")
+                    else None
+                ),
+                bot_kind=(
+                    str(receipt["bot_kind"])
+                    if receipt.get("bot_kind")
+                    else None
+                ),
+            )
+            if receipt.get("prior_message_id"):
+                state.update_tendwire_turn_job(
+                    store,
+                    new_key,
+                    substate="old_slot_retired",
+                )
+        else:
+            state.update_tendwire_turn_job(
+                store,
+                new_key,
+                substate="telegram_applied",
+                prior_message_id=str(receipt["prior_message_id"]),
+                bot_kind=(
+                    str(receipt["bot_kind"])
+                    if receipt.get("bot_kind")
+                    else None
+                ),
+            )
+        state.update_tendwire_turn_job(
+            store,
+            new_key,
+            substate="acknowledged",
+        )
+        key_map[old_key] = new_key
+
+    for binding in state.message_bindings(store).values():
+        if (
+            isinstance(binding, dict)
+            and binding.get("plan_token") == failed_plan_token
+            and binding.get("tendwire_job_key") in key_map
+        ):
+            binding["plan_token"] = plan_token
+            binding["tendwire_job_key"] = key_map[str(binding["tendwire_job_key"])]
+
+    entry = state.source_worker_entries(store).get(entry_key)
+    if entry is None or entry.get("pending_plan_token") != failed_plan_token:
+        raise RuntimeError("recovery entry changed before copied-state cutover")
+    entry["pending_plan_token"] = plan_token
+    entry["pending_turn_job_count"] = len(prefix) + executable_job_count
+    entry["pending_plan_generation"] = int(response["generation"])
+    entry["pending_acknowledged_prefix_count"] = len(prefix)
+    entry["replaces_failed_plan_token"] = failed_plan_token
+
+    request_key = _recovery_request_key(request_id)
+    request_bindings = _recovery_request_bindings(store)
+    if not request_bindings:
+        request_bindings = {}
+        store["tendwire_turn_final_recovery_requests"] = request_bindings
+    if (
+        request_key in request_bindings
+        or len(request_bindings) >= state.TENDWIRE_TURN_JOB_LIMIT
+    ):
+        raise RuntimeError("recovery request binding capacity conflict")
+    request_bindings[request_key] = {
+        "failed_plan_token": failed_plan_token,
+        "plan_token": plan_token,
+        "generation": int(response["generation"]),
+    }
+
+    audits = _recovery_audits(store)
+    if not audits:
+        audits = {}
+        store["tendwire_turn_final_recoveries"] = audits
+    if request_key in audits:
+        raise RuntimeError("recovery audit already exists")
+    if len(audits) >= _TURN_FINAL_RECOVERY_AUDIT_LIMIT:
+        oldest = next(iter(audits))
+        audits.pop(oldest, None)
+    audits[request_key] = {
+        key: copy.deepcopy(response[key])
+        for key in _TURN_FINAL_RECOVERY_RESPONSE_KEYS
+        if key
+        not in {"schema_version", "ok", "status", "idempotent_replay"}
+    }
+
+
+def cmd_recover_turn_final(args: argparse.Namespace) -> int:
+    config.load_env_file()
+    config.require_source_mode()
+    failed_plan_token = str(args.plan_token or "")
+    request_id = str(args.request_id or "")
+    if not _valid_recovery_plan_token(failed_plan_token) or not _valid_recovery_request_id(request_id):
+        return _json(
+            _recovery_error(
+                "invalid_recovery_request",
+                "plan token or request id is not a bounded public recovery coordinate",
+            )
+        )
+
+    with state.state_lock():
+        store = state.load_state()
+        before = _turn_final_recovery_preflight(
+            store,
+            failed_plan_token,
+            request_id,
+        )
+        if before.get("ok") is not True:
+            return _json(before)
+        client = TendwireClient()
+        response = client.connector_prepare_recover(
+            failed_plan_token=failed_plan_token,
+            request_id=request_id,
+        )
+        if response.get("ok") is not True:
+            return _json(response)
+
+        if before.get("replay") is True:
+            audit = before["audit"]
+            validation = _validate_recovery_response(
+                response,
+                failed_plan_token=failed_plan_token,
+                content_revision=str(audit["content_revision"]),
+                acknowledged_prefix_count=int(audit["acknowledged_prefix_count"]),
+                expected_job_count=int(audit["acknowledged_prefix_count"])
+                + int(audit["executable_job_count"]),
+                expected_generation=int(audit["generation"]),
+                retained_failed_job_count=int(
+                    audit["retained_failed_job_count"]
+                ),
+            )
+            immutable_mismatch = any(
+                response.get(key) != value
+                for key, value in audit.items()
+            )
+            if (
+                validation is not None
+                or immutable_mismatch
+                or response.get("idempotent_replay") is not True
+            ):
+                return _json(
+                    validation
+                    or _recovery_error(
+                        "recovery_state_uncertain",
+                        "idempotent Tendwire replay did not match the immutable audit",
+                    )
+                )
+            return _json(response)
+
+        current = _turn_final_recovery_preflight(
+            store,
+            failed_plan_token,
+            request_id,
+        )
+        if (
+            current.get("ok") is not True
+            or current.get("replay") is True
+            or current.get("fingerprint") != before.get("fingerprint")
+        ):
+            return _json(
+                _recovery_error(
+                    "recovery_state_uncertain",
+                    "Herdres state changed during recovery RPC",
+                )
+            )
+        validation = _validate_recovery_response(
+            response,
+            failed_plan_token=failed_plan_token,
+            content_revision=str(current["content_revision"]),
+            acknowledged_prefix_count=len(current["prefix"]),
+            expected_job_count=int(current["job_count"]),
+            expected_generation=int(current["prior_generation"]) + 1,
+            retained_failed_job_count=int(current["failed_tail_count"]),
+        )
+        if validation is not None:
+            return _json(validation)
+        candidate = copy.deepcopy(store)
+        _clone_recovery_prefix(
+            candidate,
+            failed_plan_token=failed_plan_token,
+            plan_token=str(response["plan_token"]),
+            entry_key=str(current["entry_key"]),
+            prefix=current["prefix"],
+            executable_job_count=int(response["executable_job_count"]),
+            request_id=request_id,
+            response=response,
+        )
+        state.save_state(candidate)
+    return _json(response)
+
+
 def cmd_outbox(args: argparse.Namespace) -> int:
     config.load_env_file()
     with state.state_lock():
@@ -540,6 +1160,10 @@ def build_parser() -> argparse.ArgumentParser:
     smoke = tendwire_sub.add_parser("source-smoke")
     smoke.add_argument("--with-outbox", action="store_true")
     smoke.set_defaults(func=cmd_source_smoke)
+    recover = tendwire_sub.add_parser("recover-turn-final")
+    recover.add_argument("--plan-token", required=True)
+    recover.add_argument("--request-id", required=True)
+    recover.set_defaults(func=cmd_recover_turn_final)
     outbox = tendwire_sub.add_parser("outbox")
     outbox.add_argument("--limit", type=int, default=3)
     outbox.add_argument("--dry-run", action="store_true")

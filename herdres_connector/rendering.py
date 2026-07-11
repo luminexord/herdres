@@ -5,13 +5,12 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
-from .safe import compact_ws, html_escape, sanitize_text
+from .safe import canonical_text, compact_ws, html_escape, sanitize_text
 
 
 ACTIVE_STATUSES = {"active", "busy", "in_progress", "pending", "running", "waiting", "working"}
 EXPANDABLE_SECTION_CHARS = 700
 FINAL_CHUNK_SOURCE_CHARS = 2400
-SPLIT_SOURCE_MAX_CHARS = 64000
 TELEGRAM_SAFE_HTML_CHARS = 3600
 PINNED_STATUS_DOTS = {
     "attention": "🔴",
@@ -267,37 +266,63 @@ def section_html(label: str, body_html: str, *, expandable: bool = False) -> str
     return f"<b>{title}</b>\n<blockquote{attr}>{body}</blockquote>"
 
 
-def split_text_chunks(value: Any, *, limit: int = FINAL_CHUNK_SOURCE_CHARS) -> list[str]:
-    text = sanitize_text(value, SPLIT_SOURCE_MAX_CHARS).strip()
+def _preferred_span_end(text: str, start: int, hard_end: int, limit: int) -> int:
+    """Choose a stable Markdown-friendly boundary without changing coverage."""
+    if hard_end >= len(text):
+        return len(text)
+    # Never split the two code points of CRLF when another in-boundary choice
+    # exists.  (A limit of one code point necessarily splits it.)
+    if hard_end > start + 1 and text[hard_end - 1 : hard_end + 1] == "\r\n":
+        hard_end -= 1
+    lower = start + max(1, limit // 2)
+    if lower >= hard_end:
+        return hard_end
+    # Prefer whole Markdown blocks, then line/list/fence boundaries, then a
+    # word boundary.  The separator belongs to the left span, so joining the
+    # returned half-open spans reproduces the source exactly.
+    for separator in ("\r\n\r\n", "\n\n", "\r\r"):
+        found = text.rfind(separator, lower, hard_end)
+        if found >= lower:
+            return found + len(separator)
+    line_ends = [
+        found + len(separator)
+        for separator in ("\r\n", "\n", "\r")
+        if (found := text.rfind(separator, lower, hard_end)) >= lower
+    ]
+    if line_ends:
+        return max(line_ends)
+    word_ends = [
+        found + 1
+        for separator in (" ", "\t")
+        if (found := text.rfind(separator, lower, hard_end)) >= lower
+    ]
+    return max(word_ends) if word_ends else hard_end
+
+
+def split_text_spans(value: Any, *, limit: int = FINAL_CHUNK_SOURCE_CHARS) -> list[tuple[int, int]]:
+    """Return deterministic, exact half-open code-point spans for ``value``."""
+    text = canonical_text(value)
+    size = int(limit)
+    if size <= 0:
+        raise ValueError("split limit must be positive")
     if not text:
         return []
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < len(text):
+        hard_end = min(len(text), start + size)
+        end = _preferred_span_end(text, start, hard_end, size)
+        if end <= start:
+            end = hard_end
+        spans.append((start, end))
+        start = end
+    return spans
 
-    def flush() -> None:
-        nonlocal current, current_len
-        body = "\n".join(current).strip()
-        if body:
-            chunks.append(body)
-        current = []
-        current_len = 0
 
-    for line in text.splitlines():
-        if len(line) > limit:
-            flush()
-            start = 0
-            while start < len(line):
-                chunks.append(line[start : start + limit].strip())
-                start += limit
-            continue
-        extra = len(line) + (1 if current else 0)
-        if current and current_len + extra > limit:
-            flush()
-        current.append(line)
-        current_len += extra
-    flush()
-    return chunks
+def split_text_chunks(value: Any, *, limit: int = FINAL_CHUNK_SOURCE_CHARS) -> list[str]:
+    """Split losslessly; unlike the legacy splitter this never caps or strips."""
+    text = canonical_text(value)
+    return [text[start:end] for start, end in split_text_spans(text, limit=limit)]
 
 
 def render_working_update(item: dict[str, Any], entry: dict[str, Any]) -> str:

@@ -151,6 +151,8 @@ class TelegramClient:
                 try:
                     result = self.api("sendMessage", payload).get("result") or {}
                     message_ids.append(str(result.get("message_id") or "0"))
+                except RateLimited:
+                    raise
                 except TelegramError as exc:
                     last_error = str(exc)
                     break
@@ -166,6 +168,8 @@ class TelegramClient:
             try:
                 result = self.api("sendMessage", payload).get("result") or {}
                 return {"ok": True, "message_id": str(result.get("message_id") or "0"), "format": fmt}
+            except RateLimited:
+                raise
             except TelegramError as exc:
                 last_error = str(exc)
         return {"ok": False, "error": sanitize_text(last_error, 300)}
@@ -239,18 +243,40 @@ class TelegramClient:
             try:
                 self.api("editMessageText", payload)
                 return {"ok": True, "message_id": str(message_id), "kind": "edited", "format": fmt}
+            except RateLimited:
+                raise
             except TelegramError as exc:
                 last_error = str(exc)
                 if "message is not modified" in last_error.lower():
                     return {"ok": True, "message_id": str(message_id), "kind": "unchanged", "format": fmt}
+                if "message to edit not found" in last_error.lower() or "message not found" in last_error.lower():
+                    return {
+                        "ok": False,
+                        "message_id": str(message_id),
+                        "kind": "not_found",
+                        "not_found": True,
+                        "error": sanitize_text(last_error, 300),
+                    }
+                if _topic_missing(last_error):
+                    return {
+                        "ok": False,
+                        "message_id": str(message_id),
+                        "kind": "topic_not_found",
+                        "topic_missing": True,
+                        "error": sanitize_text(last_error, 300),
+                    }
         return {"ok": False, "error": sanitize_text(last_error, 300)}
 
     def delete_message(self, chat_id: str, message_id: str | int) -> dict[str, Any]:
         try:
             self.api("deleteMessage", {"chat_id": chat_id, "message_id": str(message_id)})
             return {"ok": True}
+        except RateLimited:
+            raise
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
+
 
     def create_topic(self, chat_id: str, name: str, icon_color: int | None = None) -> dict[str, Any]:
         payload = {"chat_id": chat_id, "name": sanitize_text(name, 128)}
@@ -291,6 +317,25 @@ class TelegramClient:
             return {"ok": True}
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
+
+def delete_turn_delivery_message(
+    client: TelegramClient,
+    chat_id: str,
+    message_id: str | int,
+    *,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Delete one superseded turn slot; an already-missing slot is converged."""
+    target = client.with_token(str(api_token)) if api_token else client
+    result = target.delete_message(chat_id, message_id)
+    if result.get("ok"):
+        return {**result, "kind": "deleted"}
+    error = str(result.get("error") or "")
+    lowered = error.lower()
+    if "message to delete not found" in lowered or "message not found" in lowered:
+        return {"ok": True, "kind": "not_found", "message_id": str(message_id)}
+    return result
 
 
 # Telegram's fixed allowed createForumTopic colors.

@@ -17,6 +17,22 @@ from .rendering import normalized_status
 from .safe import compact_ws, short_hash
 
 DELIVERED_TURN_LEDGER_LIMIT = 10000
+TENDWIRE_TURN_JOB_LIMIT = 20001
+TENDWIRE_TURN_JOB_SUBSTATES = frozenset(
+    {
+        "reserved",
+        "retryable",
+        "telegram_applied",
+        "old_slot_retired",
+        "acknowledged",
+        "failed",
+    }
+)
+_TENDWIRE_TURN_JOB_TERMINAL_SUBSTATES = frozenset({"acknowledged", "failed"})
+_TENDWIRE_OPAQUE_TOKEN_RE = re.compile(r"^tw(?:plan|rev)1\.[A-Za-z0-9_-]{1,256}$")
+_TENDWIRE_TURN_JOB_KEY_RE = re.compile(
+    r"^turn-final:(twplan1\.[A-Za-z0-9_-]{1,256}):([0-9]+)$"
+)
 
 STABLE_WORKER_KEY_VERSION = 1
 STABLE_WORKER_KEY_RE = re.compile(r"^wsk1_[0-9a-f]{64}$")
@@ -1684,6 +1700,335 @@ def mark_delivered(data: dict[str, Any], identity: str, record: dict[str, Any]) 
     return True
 
 
+def tendwire_turn_jobs(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the private, stable-job-keyed multipart checkpoint ledger."""
+    jobs = data.get("tendwire_turn_jobs")
+    if not isinstance(jobs, dict):
+        jobs = {}
+        data["tendwire_turn_jobs"] = jobs
+    return jobs
+
+
+def _tendwire_opaque_token(value: Any, *, kind: str) -> str:
+    if not isinstance(value, str) or not _TENDWIRE_OPAQUE_TOKEN_RE.fullmatch(value):
+        raise ValueError(f"invalid {kind}")
+    prefix = "twplan1." if kind == "plan_token" else "twrev1."
+    if not value.startswith(prefix):
+        raise ValueError(f"invalid {kind}")
+    return value
+
+
+def _tendwire_job_key_parts(job_key: Any) -> tuple[str, int]:
+    if not isinstance(job_key, str):
+        raise ValueError("invalid tendwire job key")
+    match = _TENDWIRE_TURN_JOB_KEY_RE.fullmatch(job_key)
+    if match is None:
+        raise ValueError("invalid tendwire job key")
+    return match.group(1), int(match.group(2))
+
+
+def _tendwire_job_index(value: Any, *, field: str, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"invalid {field}")
+    if value < (1 if positive else 0):
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _tendwire_job_outcome_value(value: Any, *, field: str, limit: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > limit:
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _next_tendwire_turn_job_checkpoint(data: dict[str, Any]) -> int:
+    previous = data.get("tendwire_turn_job_checkpoint_sequence")
+    if isinstance(previous, bool) or not isinstance(previous, int) or previous < 0:
+        previous = 0
+    current = previous + 1
+    data["tendwire_turn_job_checkpoint_sequence"] = current
+    return current
+
+
+def find_tendwire_turn_job(
+    data: dict[str, Any], job_key: str
+) -> dict[str, Any] | None:
+    """Find a receipt by stable outbox key; transient lease refs are never accepted."""
+    _tendwire_job_key_parts(job_key)
+    receipt = tendwire_turn_jobs(data).get(job_key)
+    return receipt if isinstance(receipt, dict) else None
+
+
+def _active_tendwire_turn_job_references(
+    data: dict[str, Any],
+) -> tuple[set[str], set[str], set[str]]:
+    job_keys: set[str] = set()
+    plan_tokens: set[str] = set()
+    content_revisions: set[str] = set()
+    bindings = data.get("telegram_message_bindings")
+    if not isinstance(bindings, dict):
+        bindings = {}
+
+    active_bindings: list[dict[str, Any]] = []
+    for binding in bindings.values():
+        if not isinstance(binding, dict):
+            continue
+        if (
+            binding.get("active") is False
+            or binding.get("retired") is True
+            or binding.get("superseded") is True
+            or binding.get("folded") is True
+        ):
+            continue
+        active_bindings.append(binding)
+        job_key = binding.get("tendwire_job_key")
+        if isinstance(job_key, str):
+            job_keys.add(job_key)
+        plan_token = binding.get("plan_token")
+        if isinstance(plan_token, str) and plan_token:
+            plan_tokens.add(plan_token)
+        else:
+            content_revision = binding.get("content_revision")
+            if isinstance(content_revision, str) and content_revision:
+                content_revisions.add(content_revision)
+
+    for collection_name in ("panes", "spaces"):
+        collection = data.get(collection_name)
+        if not isinstance(collection, dict):
+            continue
+        for entry in collection.values():
+            if not isinstance(entry, dict):
+                continue
+            for field in (
+                "tendwire_job_key",
+                "active_turn_job_key",
+                "pending_turn_job_key",
+                "last_clean_job_key",
+            ):
+                value = entry.get(field)
+                if isinstance(value, str):
+                    job_keys.add(value)
+            for field in ("active_turn_job_keys", "pending_turn_job_keys"):
+                values = entry.get(field)
+                if isinstance(values, list):
+                    job_keys.update(value for value in values if isinstance(value, str))
+            entry_plan_tokens: set[str] = set()
+            for field in (
+                "last_clean_plan_token",
+                "active_plan_token",
+                "pending_plan_token",
+                "tendwire_plan_token",
+            ):
+                value = entry.get(field)
+                if isinstance(value, str) and value:
+                    entry_plan_tokens.add(value)
+            plan_tokens.update(entry_plan_tokens)
+            if not entry_plan_tokens:
+                for field in (
+                    "last_clean_content_revision",
+                    "active_content_revision",
+                    "pending_content_revision",
+                ):
+                    value = entry.get(field)
+                    if isinstance(value, str) and value:
+                        content_revisions.add(value)
+            message_ids: list[Any] = [entry.get("last_clean_message_id")]
+            stored_ids = entry.get("last_clean_message_ids")
+            if isinstance(stored_ids, list):
+                message_ids.extend(stored_ids)
+            for message_id in message_ids:
+                binding = bindings.get(str(message_id or ""))
+                if isinstance(binding, dict) and binding in active_bindings:
+                    job_key = binding.get("tendwire_job_key")
+                    if isinstance(job_key, str):
+                        job_keys.add(job_key)
+
+    return job_keys, plan_tokens, content_revisions
+
+
+def cleanup_tendwire_turn_jobs(
+    data: dict[str, Any], *, max_records: int = TENDWIRE_TURN_JOB_LIMIT
+) -> int:
+    """Remove only oldest terminal receipts not required by live delivery state."""
+    max_records = _tendwire_job_index(
+        max_records, field="max_records", positive=False
+    )
+    jobs = tendwire_turn_jobs(data)
+    excess = len(jobs) - max_records
+    if excess <= 0:
+        return 0
+    job_refs, plan_refs, revision_refs = _active_tendwire_turn_job_references(data)
+    removable: list[tuple[int, str]] = []
+    for job_key, receipt in jobs.items():
+        if not isinstance(receipt, dict):
+            continue
+        if receipt.get("substate") not in _TENDWIRE_TURN_JOB_TERMINAL_SUBSTATES:
+            continue
+        if (
+            job_key in job_refs
+            or receipt.get("plan_token") in plan_refs
+            or receipt.get("content_revision") in revision_refs
+        ):
+            continue
+        sequence = receipt.get("checkpoint_sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int):
+            sequence = 0
+        removable.append((sequence, job_key))
+    removable.sort(key=lambda item: (item[0], item[1]))
+    for _sequence, job_key in removable[:excess]:
+        jobs.pop(job_key, None)
+    return min(excess, len(removable))
+
+
+def reserve_tendwire_turn_job(
+    data: dict[str, Any],
+    job_key: str,
+    *,
+    plan_token: str,
+    content_revision: str,
+    operation: str,
+    sequence_index: int,
+    part_ordinal: int,
+    part_count: int,
+    telegram_message_id: str = "",
+    prior_message_id: str = "",
+    bot_kind: str = "",
+) -> dict[str, Any]:
+    """Reserve one immutable delivery intent, idempotently, by stable outbox key."""
+    key_plan_token, key_sequence = _tendwire_job_key_parts(job_key)
+    plan_token = _tendwire_opaque_token(plan_token, kind="plan_token")
+    content_revision = _tendwire_opaque_token(
+        content_revision, kind="content_revision"
+    )
+    if key_plan_token != plan_token:
+        raise ValueError("tendwire job key plan mismatch")
+    sequence_index = _tendwire_job_index(
+        sequence_index, field="sequence_index"
+    )
+    if key_sequence != sequence_index:
+        raise ValueError("tendwire job key sequence mismatch")
+    if operation not in {"upsert", "retire"}:
+        raise ValueError("invalid operation")
+    part_ordinal = _tendwire_job_index(part_ordinal, field="part_ordinal")
+    part_count = _tendwire_job_index(
+        part_count, field="part_count", positive=True
+    )
+    if operation == "upsert" and part_ordinal >= part_count:
+        raise ValueError("upsert ordinal outside part count")
+
+    optional_values = {
+        "telegram_message_id": (telegram_message_id, 80),
+        "prior_message_id": (prior_message_id, 80),
+        "bot_kind": (bot_kind, 40),
+    }
+    clean_optional: dict[str, str] = {}
+    for field, (value, limit) in optional_values.items():
+        if value:
+            clean_optional[field] = _tendwire_job_outcome_value(
+                value, field=field, limit=limit
+            )
+
+    immutable = {
+        "plan_token": plan_token,
+        "content_revision": content_revision,
+        "operation": operation,
+        "sequence_index": sequence_index,
+        "part_ordinal": part_ordinal,
+        "part_count": part_count,
+    }
+    jobs = tendwire_turn_jobs(data)
+    existing = jobs.get(job_key)
+    if existing is not None:
+        if not isinstance(existing, dict):
+            raise ValueError("invalid existing tendwire job receipt")
+        if any(existing.get(field) != value for field, value in immutable.items()):
+            raise ValueError("conflicting tendwire job reservation")
+        for field, value in clean_optional.items():
+            if existing.get(field) not in (None, "", value):
+                raise ValueError("conflicting tendwire job outcome")
+        return existing
+
+    cleanup_tendwire_turn_jobs(
+        data, max_records=TENDWIRE_TURN_JOB_LIMIT - 1
+    )
+    if len(jobs) >= TENDWIRE_TURN_JOB_LIMIT:
+        raise RuntimeError("tendwire turn job ledger is full")
+    receipt: dict[str, Any] = {
+        **immutable,
+        **clean_optional,
+        "substate": "reserved",
+        "checkpoint_sequence": _next_tendwire_turn_job_checkpoint(data),
+    }
+    jobs[job_key] = receipt
+    return receipt
+
+
+def update_tendwire_turn_job(
+    data: dict[str, Any],
+    job_key: str,
+    *,
+    substate: str,
+    telegram_message_id: str | None = None,
+    prior_message_id: str | None = None,
+    bot_kind: str | None = None,
+) -> dict[str, Any]:
+    """Advance a reserved intent through the durable Telegram/ACK substates."""
+    receipt = find_tendwire_turn_job(data, job_key)
+    if receipt is None:
+        raise KeyError(job_key)
+    if substate not in TENDWIRE_TURN_JOB_SUBSTATES:
+        raise ValueError("invalid tendwire job substate")
+    current = receipt.get("substate")
+    transitions = {
+        "reserved": {"reserved", "retryable", "telegram_applied", "failed"},
+        "retryable": {"retryable", "reserved", "failed"},
+        "telegram_applied": {
+            "telegram_applied",
+            "old_slot_retired",
+            "acknowledged",
+            "failed",
+        },
+        "old_slot_retired": {"old_slot_retired", "acknowledged", "failed"},
+        "acknowledged": {"acknowledged"},
+        "failed": {"failed"},
+    }
+    if current not in transitions or substate not in transitions[current]:
+        raise ValueError(f"invalid tendwire job transition {current!r} -> {substate!r}")
+
+    updates = {
+        "telegram_message_id": (telegram_message_id, 80),
+        "prior_message_id": (prior_message_id, 80),
+        "bot_kind": (bot_kind, 40),
+    }
+    for field, (value, limit) in updates.items():
+        if value is None:
+            continue
+        clean = _tendwire_job_outcome_value(value, field=field, limit=limit)
+        if receipt.get(field) not in (None, "", clean):
+            raise ValueError("conflicting tendwire job outcome")
+        receipt[field] = clean
+
+    if substate == "telegram_applied":
+        if receipt.get("operation") == "upsert" and not receipt.get(
+            "telegram_message_id"
+        ):
+            raise ValueError("upsert telegram outcome requires message id")
+        if receipt.get("operation") == "retire" and not receipt.get(
+            "prior_message_id"
+        ):
+            raise ValueError("retire telegram outcome requires prior message id")
+    if substate == "old_slot_retired":
+        if receipt.get("operation") != "upsert" or not receipt.get(
+            "prior_message_id"
+        ):
+            raise ValueError("old slot retirement requires an upsert prior message")
+
+    if substate != current or any(value is not None for value, _limit in updates.values()):
+        receipt["substate"] = substate
+        receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
+    return receipt
+
+
 def message_bindings(data: dict[str, Any]) -> dict[str, Any]:
     bindings = data.get("telegram_message_bindings")
     if not isinstance(bindings, dict):
@@ -1701,6 +2046,11 @@ def bind_message_to_worker(
     kind: str = "",
     turn_id: str = "",
     bot_kind: str = "",
+    content_revision: str = "",
+    plan_token: str = "",
+    part_ordinal: int | None = None,
+    part_count: int | None = None,
+    tendwire_job_key: str = "",
 ) -> None:
     message = str(message_id or "").strip()
     if not message or message == "0":
@@ -1715,6 +2065,40 @@ def bind_message_to_worker(
         "turn_id": str(turn_id or ""),
         "bot_kind": str(bot_kind or ""),
     }
+    delivery_values_present = bool(
+        content_revision
+        or plan_token
+        or tendwire_job_key
+        or part_ordinal is not None
+        or part_count is not None
+    )
+    if delivery_values_present:
+        content_revision = _tendwire_opaque_token(
+            content_revision, kind="content_revision"
+        )
+        plan_token = _tendwire_opaque_token(plan_token, kind="plan_token")
+        key_plan_token, _key_sequence = _tendwire_job_key_parts(
+            tendwire_job_key
+        )
+        if key_plan_token != plan_token:
+            raise ValueError("binding job key plan mismatch")
+        part_ordinal = _tendwire_job_index(
+            part_ordinal, field="part_ordinal"
+        )
+        part_count = _tendwire_job_index(
+            part_count, field="part_count", positive=True
+        )
+        if part_ordinal >= part_count:
+            raise ValueError("binding ordinal outside part count")
+        binding.update(
+            {
+                "content_revision": content_revision,
+                "plan_token": plan_token,
+                "part_ordinal": part_ordinal,
+                "part_count": part_count,
+                "tendwire_job_key": tendwire_job_key,
+            }
+        )
     identity = entry_stable_identity(entry)
     if identity is not None:
         binding["stable_key"] = identity[0]

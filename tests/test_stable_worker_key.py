@@ -2315,6 +2315,18 @@ def test_explicit_unhealthy_herdr_snapshot_preserves_authenticated_state_until_h
         "message_bindings": 0,
         "turn_updates": 0,
         "topic_cleanup": {"deleted": 0, "failed": 0, "pruned": 0, "changed": False},
+        "content_pages": 0,
+        "tendwire_turn_final": {
+            "enabled": False,
+            "polled": 0,
+            "operations": 0,
+            "delivered": 0,
+            "acked": 0,
+            "failed": 0,
+            "deferred": 0,
+            "uncertain": 0,
+            "changed": False,
+        },
         "tendwire_outbox": {
             "enabled": False,
             "polled": 0,

@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import fcntl
 import json
+from types import SimpleNamespace
 import threading
 from unittest.mock import patch
+
+import herdres
+import pytest
 
 from herdres_connector import config, state
 from herdres_connector.source_sync import SyncRuntime, _cleanup_topics, _sync_sources, sync_once
@@ -264,3 +268,422 @@ def test_sync_sources_create_cap(monkeypatch):
     # the other 3 workers have no topic yet (deferred to next tick)
     no_topic = [e for e in state.source_worker_entries(store).values() if not e.get("topic_id")]
     assert len(no_topic) == 3
+
+
+# --- durable multipart checkpoints -------------------------------------------
+
+_PLAN_A = "twplan1.plan_A"
+_PLAN_B = "twplan1.plan_B"
+_PLAN_C = "twplan1.plan_C"
+_PLAN_D = "twplan1.plan_D"
+_REV_A = "twrev1.revision_A"
+_REV_B = "twrev1.revision_B"
+_REV_C = "twrev1.revision_C"
+_REV_D = "twrev1.revision_D"
+
+
+def _turn_job_key(plan_token: str, sequence_index: int) -> str:
+    return f"turn-final:{plan_token}:{sequence_index:08d}"
+
+
+def _reserve_job(
+    store,
+    *,
+    plan_token=_PLAN_A,
+    content_revision=_REV_A,
+    sequence_index=0,
+    part_ordinal=0,
+    part_count=2,
+    operation="upsert",
+    prior_message_id="",
+):
+    return state.reserve_tendwire_turn_job(
+        store,
+        _turn_job_key(plan_token, sequence_index),
+        plan_token=plan_token,
+        content_revision=content_revision,
+        operation=operation,
+        sequence_index=sequence_index,
+        part_ordinal=part_ordinal,
+        part_count=part_count,
+        prior_message_id=prior_message_id,
+    )
+
+
+def _checkpointed_success(store, *, plan_token, content_revision, sequence_index):
+    receipt = _reserve_job(
+        store,
+        plan_token=plan_token,
+        content_revision=content_revision,
+        sequence_index=sequence_index,
+        part_ordinal=0,
+        part_count=1,
+    )
+    job_key = _turn_job_key(plan_token, sequence_index)
+    state.update_tendwire_turn_job(
+        store,
+        job_key,
+        substate="telegram_applied",
+        telegram_message_id=str(700 + sequence_index),
+        bot_kind="codex",
+    )
+    state.update_tendwire_turn_job(
+        store,
+        job_key,
+        substate="acknowledged",
+    )
+    return receipt
+
+
+def test_stable_job_key_resume_ignores_new_lease_ref_and_preserves_success(tmp_path):
+    store = _store()
+    job_key = _turn_job_key(_PLAN_A, 0)
+    original = _reserve_job(store)
+    state.update_tendwire_turn_job(
+        store,
+        job_key,
+        substate="telegram_applied",
+        telegram_message_id="901",
+        bot_kind="codex",
+    )
+    statepath = tmp_path / "state.json"
+    state.save_state(store, statepath)
+
+    restarted = state.load_state(statepath)
+    resumed = _reserve_job(restarted)
+    assert resumed is state.find_tendwire_turn_job(restarted, job_key)
+    assert resumed["substate"] == "telegram_applied"
+    assert resumed["telegram_message_id"] == "901"
+    assert len(state.tendwire_turn_jobs(restarted)) == 1
+    assert "lease_ref" not in resumed and "ref" not in resumed
+    with pytest.raises(ValueError):
+        state.find_tendwire_turn_job(restarted, "twref1.new-attempt")
+
+    # A retry carrying any new lease ref consults only the stable key. Since Telegram success
+    # survived restart, it may advance directly to acknowledged without another send intent.
+    state.update_tendwire_turn_job(
+        restarted,
+        job_key,
+        substate="acknowledged",
+    )
+    assert original["plan_token"] == resumed["plan_token"]
+    assert resumed["substate"] == "acknowledged"
+
+
+def test_job_substates_are_strict_and_checkpoint_old_slot_retirement():
+    store = _store()
+    job_key = _turn_job_key(_PLAN_A, 0)
+    receipt = _reserve_job(store, prior_message_id="501")
+    assert receipt["substate"] == "reserved"
+    state.update_tendwire_turn_job(
+        store,
+        job_key,
+        substate="telegram_applied",
+        telegram_message_id="901",
+        bot_kind="codex",
+    )
+    telegram_checkpoint = receipt["checkpoint_sequence"]
+    state.update_tendwire_turn_job(
+        store,
+        job_key,
+        substate="old_slot_retired",
+    )
+    assert receipt["substate"] == "old_slot_retired"
+    assert receipt["checkpoint_sequence"] > telegram_checkpoint
+    state.update_tendwire_turn_job(store, job_key, substate="acknowledged")
+    with pytest.raises(ValueError, match="invalid tendwire job transition"):
+        state.update_tendwire_turn_job(store, job_key, substate="reserved")
+
+    failed_key = _turn_job_key(_PLAN_B, 1)
+    failed = _reserve_job(
+        store,
+        plan_token=_PLAN_B,
+        content_revision=_REV_B,
+        sequence_index=1,
+        part_ordinal=0,
+        part_count=1,
+    )
+    state.update_tendwire_turn_job(store, failed_key, substate="failed")
+    assert failed["substate"] == "failed"
+    with pytest.raises(ValueError, match="invalid tendwire job transition"):
+        state.update_tendwire_turn_job(
+            store,
+            failed_key,
+            substate="telegram_applied",
+            telegram_message_id="999",
+        )
+    with pytest.raises(ValueError, match="conflicting tendwire job reservation"):
+        state.reserve_tendwire_turn_job(
+            store,
+            failed_key,
+            plan_token=_PLAN_B,
+            content_revision=_REV_B,
+            operation="retire",
+            sequence_index=1,
+            part_ordinal=1,
+            part_count=1,
+        )
+
+
+def test_sync_pass_checkpoint_persists_successful_prefix_before_ack(
+    tmp_path, monkeypatch
+):
+    _reset_lock_state()
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    store = _store()
+    first_key = _turn_job_key(_PLAN_A, 0)
+    second_key = _turn_job_key(_PLAN_A, 1)
+    _reserve_job(store, sequence_index=0, part_ordinal=0)
+    _reserve_job(store, sequence_index=1, part_ordinal=1)
+    state.save_state(store, statepath)
+    events = []
+
+    def runtime_factory(**kwargs):
+        return SimpleNamespace(checkpoint=kwargs["checkpoint"])
+
+    def interrupted_sync(current, runtime):
+        state.update_tendwire_turn_job(
+            current,
+            first_key,
+            substate="telegram_applied",
+            telegram_message_id="801",
+            bot_kind="codex",
+        )
+        runtime.checkpoint()
+        events.append("checkpoint")
+        on_disk = state.load_state(statepath)
+        assert on_disk["tendwire_turn_jobs"][first_key]["substate"] == "telegram_applied"
+        assert on_disk["tendwire_turn_jobs"][second_key]["substate"] == "reserved"
+        events.append("ack_attempt")
+        raise RuntimeError("simulated Tendwire ACK outage")
+
+    monkeypatch.setattr(herdres, "_runtime", runtime_factory)
+    monkeypatch.setattr(herdres, "sync_once", interrupted_sync)
+    with pytest.raises(RuntimeError, match="ACK outage"):
+        herdres._sync_pass()
+
+    assert events == ["checkpoint", "ack_attempt"]
+    restarted = state.load_state(statepath)
+    assert restarted["tendwire_turn_jobs"][first_key]["substate"] == "telegram_applied"
+    assert restarted["tendwire_turn_jobs"][first_key]["telegram_message_id"] == "801"
+    assert restarted["tendwire_turn_jobs"][second_key]["substate"] == "reserved"
+
+
+def test_runtime_exposes_optional_checkpoint_without_breaking_old_construction(
+    monkeypatch,
+):
+    checkpoint = lambda: None
+    monkeypatch.setattr(herdres.config, "telegram_token", lambda: "token")
+    monkeypatch.setattr(herdres, "TendwireClient", lambda: object())
+    monkeypatch.setattr(
+        herdres,
+        "TelegramClient",
+        lambda *, token, dry_run: SimpleNamespace(token=token, dry_run=dry_run),
+    )
+    runtime = herdres._runtime(
+        dry_run=False,
+        with_outbox=True,
+        checkpoint=checkpoint,
+    )
+    assert runtime.checkpoint is checkpoint
+    assert runtime.with_outbox is True
+
+
+def test_continuation_bindings_share_worker_topic_and_delivery_identity(monkeypatch):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    worker_key, worker, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+        topic_id="77",
+    )
+    for ordinal, message_id in enumerate(("901", "902")):
+        job_key = _turn_job_key(_PLAN_A, ordinal)
+        state.bind_message_to_worker(
+            store,
+            message_id,
+            worker,
+            topic_id="77",
+            kind="final",
+            turn_id="turn-1",
+            bot_kind="codex",
+            content_revision=_REV_A,
+            plan_token=_PLAN_A,
+            part_ordinal=ordinal,
+            part_count=2,
+            tendwire_job_key=job_key,
+        )
+
+    bindings = [state.find_message_binding(store, mid, topic_id="77") for mid in ("901", "902")]
+    assert all(binding is not None for binding in bindings)
+    assert {binding["worker_id"] for binding in bindings} == {"worker-1"}
+    assert {binding["topic_id"] for binding in bindings} == {"77"}
+    assert {binding["content_revision"] for binding in bindings} == {_REV_A}
+    assert {binding["plan_token"] for binding in bindings} == {_PLAN_A}
+    assert [binding["part_ordinal"] for binding in bindings] == [0, 1]
+    for message_id in ("901", "902"):
+        assert herdres._worker_entry_from_reply(
+            store,
+            {"reply_to_message_id": message_id, "topic_id": "77"},
+        ) == (worker_key, worker)
+
+
+def test_old_binding_callers_keep_exact_legacy_shape():
+    store = _store()
+    _key, worker, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+        topic_id="77",
+    )
+    state.bind_message_to_worker(
+        store,
+        "500",
+        worker,
+        topic_id="77",
+        kind="final",
+        turn_id="turn-legacy",
+        bot_kind="codex",
+    )
+    binding = state.message_bindings(store)["500"]
+    assert binding == {
+        "topic_id": "77",
+        "worker_id": "worker-1",
+        "worker_fingerprint": "fp-1",
+        "space_id": "space-1",
+        "kind": "final",
+        "turn_id": "turn-legacy",
+        "bot_kind": "codex",
+        "stable_key": worker["tendwire_stable_key"],
+        "stable_key_version": 1,
+    }
+
+
+def test_job_cleanup_removes_only_unreferenced_terminal_receipts():
+    store = _store()
+    _key, worker, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+        topic_id="77",
+    )
+    old = _checkpointed_success(
+        store,
+        plan_token=_PLAN_A,
+        content_revision=_REV_A,
+        sequence_index=0,
+    )
+    bound = _checkpointed_success(
+        store,
+        plan_token=_PLAN_B,
+        content_revision=_REV_B,
+        sequence_index=1,
+    )
+    entry_referenced = _checkpointed_success(
+        store,
+        plan_token=_PLAN_C,
+        content_revision=_REV_C,
+        sequence_index=2,
+    )
+    pending = _reserve_job(
+        store,
+        plan_token=_PLAN_D,
+        content_revision=_REV_D,
+        sequence_index=3,
+        part_ordinal=0,
+        part_count=1,
+    )
+    bound_key = _turn_job_key(_PLAN_B, 1)
+    state.bind_message_to_worker(
+        store,
+        bound["telegram_message_id"],
+        worker,
+        topic_id="77",
+        kind="final",
+        turn_id="turn-bound",
+        bot_kind="codex",
+        content_revision=_REV_B,
+        plan_token=_PLAN_B,
+        part_ordinal=0,
+        part_count=1,
+        tendwire_job_key=bound_key,
+    )
+    worker["last_clean_plan_token"] = _PLAN_C
+    worker["last_clean_content_revision"] = _REV_C
+
+    removed = state.cleanup_tendwire_turn_jobs(store, max_records=1)
+    jobs = state.tendwire_turn_jobs(store)
+    assert removed == 1
+    assert _turn_job_key(_PLAN_A, 0) not in jobs
+    assert jobs[bound_key] is bound
+    assert jobs[_turn_job_key(_PLAN_C, 2)] is entry_referenced
+    assert jobs[_turn_job_key(_PLAN_D, 3)] is pending
+    assert pending["substate"] == "reserved"
+    assert not any(
+        forbidden in receipt
+        for receipt in jobs.values()
+        for forbidden in ("text", "html", "payload", "lease_ref", "ref")
+    )
+
+
+def test_receipt_capacity_covers_maximum_old_and_replacement_plans():
+    store = _store()
+    old_plan = "twplan1.capacity_old"
+    old_revision = "twrev1.capacity_old"
+    new_plan = "twplan1.capacity_new"
+    new_revision = "twrev1.capacity_new"
+    maximum_parts = 10_000
+
+    for ordinal in range(maximum_parts):
+        _reserve_job(
+            store,
+            plan_token=old_plan,
+            content_revision=old_revision,
+            sequence_index=ordinal,
+            part_ordinal=ordinal,
+            part_count=maximum_parts,
+        )
+    _reserve_job(
+        store,
+        plan_token=new_plan,
+        content_revision=new_revision,
+        sequence_index=0,
+        part_ordinal=0,
+        part_count=1,
+    )
+    for sequence in range(1, maximum_parts):
+        _reserve_job(
+            store,
+            plan_token=new_plan,
+            content_revision=new_revision,
+            sequence_index=sequence,
+            part_ordinal=maximum_parts - sequence,
+            part_count=1,
+            operation="retire",
+        )
+
+    assert len(state.tendwire_turn_jobs(store)) == maximum_parts * 2
+    assert state.TENDWIRE_TURN_JOB_LIMIT >= maximum_parts * 2 + 1

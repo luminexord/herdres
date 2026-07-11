@@ -13,7 +13,7 @@ Telegram delivery dedup.
 **Requires [Tendwire](https://github.com/plotarmordev/tendwire)** — Herdres has
 no functionality without it. See [INSTALL.md](INSTALL.md) for setup order.
 
-## Runtime
+## Runtime and lossless turn delivery
 
 ```text
 Telegram topic input
@@ -31,21 +31,100 @@ turns, pending interactions, and connector work only through Tendwire's public
 source/command interfaces; it makes no direct Herdr API, process, or socket
 calls.
 
-Every source sync requires the top-level `schema_version` in Tendwire's
-`turns --json` response to be the exact integer `1`. A missing value, a boolean,
-a string such as `"1"`, a float, a container, or any other integer fails closed
-with `status=unsupported_turn_schema_version` and
-`required_turn_schema_version=1`. The check occurs before source-state,
-Telegram, cleanup, or connector-outbox mutation. Herdres neither coerces an
-incompatible value nor falls back to a lossy turn shape.
+### Turn content and paging contract
 
-Recovery uses this same source path. Tendwire's existing `turn.list` path
-refreshes structured turn content from a recovered persisted binding before it
-returns the durable public projection; Herdres does not refresh Herdr itself.
-When a later source sync receives the authoritative schema-v1 completed turn
-for a matching editable Working card, Herdres edits that card once into the
-final response and records the final binding and delivery ledger. Repeating the
-same sync performs no additional edit, send, or ledger update.
+Production source sync negotiates Tendwire's top-level `turn.list` schema as the
+exact integer `2`; a v1 response returns `upgrade_required`, while a missing or
+unsupported per-row content schema returns `unsupported_content_schema`.
+Schema-v2 rows carry content-schema-v1 descriptors for both `user_text` and
+`assistant_final_text`. Herdres validates every descriptor before any row can
+page: availability, inline placement, character and UTF-8 byte lengths, page
+count, first cursor, content revision, and the `known_incomplete` summary must
+agree. There is no coercion or lossy fallback.
+
+An invalid list envelope is a connector-wide failure (`tendwire_turns_failed`
+through source sync; a directly observed unsupported outer version is
+`unsupported_turn_schema_version`). A malformed descriptor is instead isolated
+to that turn as `invalid_content_schema`, and an explicitly incomplete field is
+isolated as `content_known_incomplete`. Neither row is paged, planned, or sent;
+unrelated working/final delivery, attention, status, and enabled account-pin
+updates continue.
+
+Paging is eligibility-only. Herdres first excludes an unchanged delivered
+revision, a historical row, a turn without a uniquely routable live owner, and
+a quarantined owner. Those rows perform zero content fetches, as does complete
+inline content. For an eligible non-inline field, Tendwire exposes immutable,
+linear content-schema-v1 pages of at most 49,152 UTF-8 bytes. Herdres follows
+the cursor chain once and verifies turn, revision, field, availability, page
+index/count, unique segment and cursor identities, exact per-segment and total
+character/byte lengths, and a null final cursor. A defective page becomes the
+turn-local `invalid_content_page` outcome before prepare or Telegram activity.
+
+After exact materialization, Herdres derives ordered multipart presentation
+ranges and submits only neutral field/start/end spans through Tendwire's
+`turn-final` prepare begin/part/commit contract; the prepare requests contain no
+turn text. Leased upserts are checked against the same local ranges and applied
+in part order, followed by any ordered old-slot retirement. Each stable
+`plan_token`/sequence receipt is reserved before a provider operation,
+checkpointed after Telegram apply and again after old-slot retirement, then
+ACKed to Tendwire and checkpointed as `acknowledged`. A lease retry therefore
+resumes from the durable substate rather than resending a proven operation.
+
+This is not a claim of perfect provider exactly-once delivery. If Telegram may
+have accepted an operation but raises before returning a receipt, or omits the
+message receipt, Herdres reports `delivery_uncertain` and fails closed instead
+of guessing or replaying.
+
+Goal 01B recovery continues through this same source boundary. Tendwire's
+existing `turn.list` path refreshes structured content from a recovered
+persisted binding before returning the durable public projection; Herdres does
+not refresh Herdr itself. When a later source sync receives the authoritative
+schema-v2 completed revision for a matching editable Working card, Herdres
+edits that card once into the final response and records the final binding and
+delivery ledger. Repeating the same sync performs no additional page fetch,
+prepare, edit, send, or ledger update.
+
+### Explicit failed-plan recovery
+
+An `attempts_exhausted` turn-final plan does not spin on later ordinary syncs.
+After investigating the provider outcome, an operator may request one explicit
+replacement generation:
+
+```sh
+herdres tendwire recover-turn-final \
+  --plan-token twplan1.<failed-plan> \
+  --request-id operator-2026.07.11:1
+```
+
+The plan token must be a bounded public `twplan1.` coordinate. The request ID
+must contain 1–128 ASCII characters from `[A-Za-z0-9._:-]`; it is the durable
+idempotency and audit key. Before the Tendwire RPC, Herdres requires exactly one
+pending failed plan on one uniquely routable, nonquarantined worker, valid
+revision/part/job coordinates, enough receipt capacity for both generations,
+and old receipts consisting only of one contiguous `acknowledged` prefix
+followed by failed tail receipts. A `reserved` receipt or a binding without an
+acknowledged receipt is `recovery_receipt_uncertain`; a
+`telegram_applied`/`old_slot_retired` receipt awaiting durable ACK is
+`recovery_receipt_inflight`.
+
+Other local preflight outcomes are `invalid_recovery_request`,
+`recovery_request_conflict`, `recovery_plan_not_found`,
+`recovery_route_ambiguous`, `recovery_state_invalid`, and
+`recovery_capacity_exceeded`. Typed Tendwire failures pass through unchanged.
+Any malformed, mismatched, or state-changing success response becomes
+`recovery_state_uncertain`; no copied-state cutover occurs.
+
+A successful response must name the same content revision, a different
+`twplan1.` token in a new generation, the exact acknowledged-prefix count, and
+an active executable suffix. Herdres leaves every old receipt immutable, clones
+the acknowledged prefix under the new token, retargets only that prefix's
+bindings, records the request-keyed recovery audit, and executes only the
+suffix. The JSON output includes both plan tokens, generation, prefix and
+executable counts, retained failed-job and prior-attempt counts, state, and
+`idempotent_replay`. Repeating the same request ID for the same failed plan
+returns the audited token with `idempotent_replay=true`; reusing it for another
+plan conflicts. The command is one-shot and never installs an automatic
+recovery loop.
 
 ## Worker identity continuity
 
@@ -205,7 +284,9 @@ HERDR_TELEGRAM_TOPICS_STATE="$backup_path" \
   ./herdres.py tendwire source-smoke --with-outbox
 ```
 
-Keep the copy private. The dry check must succeed with schema version `1` and
+Keep the copy private. A compatible pair uses Tendwire store schema `7`,
+top-level turn-list schema `2`, content-schema-v1 descriptors/pages, and the
+turn-final prepare/lease/ACK/recovery protocol. The dry check must succeed with
 `direct_herdr_calls=0` before a live sync; it does not save the copied Herdres
 state or send/edit Telegram messages. If verification fails, leave the live
 state untouched. Do not repair continuity by editing state, copying public
@@ -233,11 +314,18 @@ toggle, and does not replace paired state recovery.
 ## Checks
 
 ```sh
-python -m pytest -q tests/test_source_only.py tests/test_stable_worker_key.py
+python -m pytest -q \
+  tests/test_source_only.py \
+  tests/test_stable_worker_key.py \
+  tests/test_tendwire_client.py \
+  tests/test_turn_final_delivery.py \
+  tests/test_offlock_delivery.py
 HERDRES_TENDWIRE_MODE=source ./herdres.py doctor
 HERDRES_TENDWIRE_MODE=source ./herdres.py tendwire source-smoke --with-outbox
 ```
 
-The focused tests cover the schema-v1 preflight, deterministic private
-migration/quarantine, and recovered-final single-edit/no-replay behavior.
-`source-smoke` must report `direct_herdr_calls=0`.
+The focused tests cover Goal 01B continuity/quarantine and recovered-final
+single-edit behavior together with schema-v2 descriptor isolation, lazy exact
+paging, neutral multipart plans, durable checkpoint/ACK resumption, explicit
+uncertainty, and one-shot failed-plan recovery. `source-smoke` must run against
+a copied state file and report `direct_herdr_calls=0`.

@@ -314,10 +314,9 @@ def test_first_sync_bootstraps_current_turns_without_telegram_posts(monkeypatch)
         pytest.param(1.0, 1.0, id="float"),
         pytest.param([], None, id="list"),
         pytest.param({}, None, id="mapping"),
-        pytest.param(2, 2, id="unknown"),
     ],
 )
-def test_turn_schema_v1_preflight_fails_before_all_mutation(
+def test_invalid_turn_schema_preflight_fails_before_all_mutation(
     monkeypatch, schema_version, received
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
@@ -353,6 +352,18 @@ def test_turn_schema_v1_preflight_fails_before_all_mutation(
             "deleted": 0,
             "failed": 0,
             "pruned": 0,
+            "changed": False,
+        },
+        "content_pages": 0,
+        "tendwire_turn_final": {
+            "enabled": False,
+            "polled": 0,
+            "operations": 0,
+            "delivered": 0,
+            "acked": 0,
+            "failed": 0,
+            "deferred": 0,
+            "uncertain": 0,
             "changed": False,
         },
         "tendwire_outbox": {
@@ -1032,10 +1043,10 @@ def test_oversize_response_splits_losslessly_into_labeled_parts():
     assert combined.count("<b>✅ Response ") == total  # one marker per part
 
 
-def test_promote_to_final_uses_send_when_over_edit_cap_but_under_rich_cap(monkeypatch):
-    # A final whose rendered HTML is above the legacy edit cap (3900) but below
-    # the rich cap (14000) cannot be edited in place, so it is freshly sent --
-    # as ONE message (no split), since it still fits a single rich message.
+def test_promote_to_final_uses_bounded_sends_when_over_edit_cap(monkeypatch):
+    # A final above the one-operation fallback cap cannot edit the Working card.
+    # It is freshly sent as independently bounded parts so a rich capability
+    # fallback never hides additional untracked Telegram sends.
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
     telegram = FakeTelegram()
@@ -1067,13 +1078,13 @@ def test_promote_to_final_uses_send_when_over_edit_cap_but_under_rich_cap(monkey
 
     full_html_len = len(render_turn_item_html({"kind": "turn", "assistant_final_text": body}))
     assert full_html_len > 3900            # above legacy edit cap -> cannot edit
-    assert full_html_len <= MAX_RICH_HTML_CHARS  # below rich cap -> one message
+    assert full_html_len <= MAX_RICH_HTML_CHARS
 
     response_messages = [sent[1] for sent in telegram.sent if "<b>✅ Response" in sent[1]]
     assert result["feed_sent"] == 1
-    assert len(response_messages) == 1     # exactly one fresh send
-    assert "✅ Response 1/" not in response_messages[0]
-    assert tail in response_messages[0]
+    assert len(response_messages) > 1
+    assert response_messages[0].startswith("<b>✅ Response 1/")
+    assert any(tail in message for message in response_messages)
 
 
 def test_expandable_blockquote_has_delivery_fallbacks():

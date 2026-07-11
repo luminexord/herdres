@@ -15,9 +15,9 @@ import re
 from typing import Any
 
 from . import config
-from .rendering import html_to_plain, split_text_chunks, try_render_table, worker_label
-from .safe import sanitize_text
-from .telegram_delivery import RateLimited, TelegramClient, TelegramError
+from .rendering import html_to_plain, split_text_chunks, split_text_spans, try_render_table, worker_label
+from .safe import canonical_text, sanitize_text
+from .telegram_delivery import MESSAGE_TEXT_LIMIT, RateLimited, TelegramClient, TelegramError
 
 
 MAX_REPLY_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "64000"))
@@ -33,6 +33,10 @@ RICH_SINGLE_MESSAGE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SINGLE_MES
 RICH_SPLIT_CHUNK_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SPLIT_CHUNK_CHARS", "4000"))
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 WORKLOG_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_WORKLOG_MAX_CHARS", "1200"))
+RICH_FALLBACK_MAX_CHARS = MESSAGE_TEXT_LIMIT
+TURN_DELIVERY_PLAN_SCHEMA_VERSION = 1
+TURN_DELIVERY_FINAL_SOURCE_CHARS = min(RICH_SPLIT_CHUNK_CHARS, 900)
+TURN_DELIVERY_USER_SOURCE_CHARS = min(USER_PROMPT_MAX_CHARS, 900)
 PROMPT_PREVIEW_CHARS = 80
 USER_PROMPT_LABEL = "You"
 RESPONSE_LABEL = "Response"
@@ -406,35 +410,177 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
 
 
 def _turn_response_text(item: dict[str, Any]) -> str:
-    return sanitize_text(str(item.get("assistant_final_text") or ""), MAX_REPLY_CHARS).strip()
+    return canonical_text(item.get("assistant_final_text"), field="assistant_final_text")
 
 
-def _turn_item_delivery_parts(item: dict[str, Any], *, live: bool = False) -> list[dict[str, Any]]:
-    if live or str(item.get("kind") or "").lower() != "turn":
-        return [item]
-    final_text = _turn_response_text(item)
-    if not final_text:
-        return [item]
-    if len(render_turn_item_html(item)) <= min(RICH_SINGLE_MESSAGE_CHARS, MAX_RICH_HTML_CHARS):
-        return [item]
-    chunks = split_text_chunks(final_text, limit=RICH_SPLIT_CHUNK_CHARS)
-    if len(chunks) <= 1:
-        return [item]
-    total = len(chunks)
+def _canonical_turn_fields(item: dict[str, Any]) -> dict[str, str]:
+    return {
+        "user_text": canonical_text(item.get("user_text"), field="user_text"),
+        "assistant_final_text": _turn_response_text(item),
+    }
+
+
+def _full_turn_source_is_render_safe(fields: dict[str, str]) -> bool:
+    """Avoid the rich renderer's intentional per-block preview slices."""
+    user_text = fields["user_text"]
+    final_text = fields["assistant_final_text"]
+    if len(user_text) > USER_PROMPT_MAX_CHARS:
+        return False
+    if any(len(line) > 900 for line in user_text.splitlines()):
+        return False
+    if len(final_text) > 1600 or any(len(line) > 900 for line in final_text.splitlines()):
+        return False
+    # Heading titles and native table cells have tighter presentation limits.
+    if any(
+        (re.match(r"^\s{0,3}#{1,6}\s+\S", line) and len(_heading_title(line)) > 100)
+        or ("|" in line and len(line) > 160)
+        for line in final_text.splitlines()
+    ):
+        return False
+    return True
+
+
+def _planned_parts_for_limits(
+    fields: dict[str, str],
+    *,
+    user_limit: int,
+    final_limit: int,
+) -> list[dict[str, Any]]:
+    field_spans = {
+        "user_text": split_text_spans(fields["user_text"], limit=user_limit),
+        "assistant_final_text": split_text_spans(fields["assistant_final_text"], limit=final_limit),
+    }
+    part_count = max((len(spans) for spans in field_spans.values()), default=0)
     parts: list[dict[str, Any]] = []
-    for index, chunk in enumerate(chunks, start=1):
-        part = dict(item)
-        part["assistant_final_text"] = chunk
-        part["response_label"] = f"{RESPONSE_LABEL} {index}/{total}"
-        if index > 1:
-            part["user_text"] = ""
-            part["worklog_text"] = ""
-        parts.append(part)
+    for ordinal in range(part_count):
+        spans: list[dict[str, Any]] = []
+        # Stable schema order matches Tendwire's canonical turn field order.
+        for field in ("user_text", "assistant_final_text"):
+            if ordinal < len(field_spans[field]):
+                start, end = field_spans[field][ordinal]
+                spans.append({"field": field, "start_char": start, "end_char": end})
+        parts.append(
+            {
+                "schema_version": TURN_DELIVERY_PLAN_SCHEMA_VERSION,
+                "ordinal": ordinal,
+                "part_count": part_count,
+                "spans": spans,
+            }
+        )
     return parts
 
 
+def _materialize_turn_delivery_part(item: dict[str, Any], part: dict[str, Any]) -> dict[str, Any]:
+    if type(part.get("schema_version")) is not int or part["schema_version"] != TURN_DELIVERY_PLAN_SCHEMA_VERSION:
+        raise ValueError("unsupported turn delivery plan schema")
+    ordinal = part.get("ordinal")
+    part_count = part.get("part_count")
+    if type(ordinal) is not int or type(part_count) is not int or ordinal < 0 or part_count <= ordinal:
+        raise ValueError("invalid turn delivery part ordinal")
+
+    fields = _canonical_turn_fields(item)
+    fragments = {"user_text": [], "assistant_final_text": []}
+    spans = part.get("spans")
+    if not isinstance(spans, list) or not spans:
+        raise ValueError("turn delivery part spans must be a non-empty list")
+    seen_fields: set[str] = set()
+    for span in spans:
+        if not isinstance(span, dict):
+            raise ValueError("turn delivery span must be an object")
+        field = str(span.get("field") or "")
+        if field not in fragments:
+            raise ValueError(f"unsupported turn delivery field: {field}")
+        if field in seen_fields:
+            raise ValueError(f"duplicate turn delivery field span: {field}")
+        seen_fields.add(field)
+        start = span.get("start_char")
+        end = span.get("end_char")
+        if type(start) is not int or type(end) is not int:
+            raise ValueError("turn delivery span coordinates must be integers")
+        source = fields[field]
+        if start < 0 or end <= start or end > len(source):
+            raise ValueError("turn delivery span is outside canonical content")
+        fragments[field].append(source[start:end])
+    materialized = dict(item)
+    materialized["user_text"] = "".join(fragments["user_text"])
+    materialized["assistant_final_text"] = "".join(fragments["assistant_final_text"])
+    if part_count > 1 and materialized["assistant_final_text"]:
+        materialized["response_label"] = f"{RESPONSE_LABEL} {ordinal + 1}/{part_count}"
+    if ordinal > 0:
+        materialized["worklog_text"] = ""
+        materialized["assistant_stream_text"] = ""
+    return materialized
+
+
+def render_turn_delivery_part_html(item: dict[str, Any], part: dict[str, Any]) -> str:
+    """Render exactly one planned part; this surface never plans or sends siblings."""
+    return render_turn_item_html(_materialize_turn_delivery_part(item, part))
+
+
+def render_turn_delivery_part_plain_text(item: dict[str, Any], part: dict[str, Any]) -> str:
+    return html_to_plain(render_turn_delivery_part_html(item, part), limit=MAX_REPLY_CHARS)
+
+
+def _turn_delivery_part_is_bounded(item: dict[str, Any], part: dict[str, Any]) -> bool:
+    rich = render_turn_delivery_part_html(item, part)
+    fallback = html_to_plain(rich, limit=MAX_REPLY_CHARS)
+    return (
+        len(rich) <= min(RICH_SINGLE_MESSAGE_CHARS, MAX_RICH_HTML_CHARS)
+        and len(fallback) <= RICH_FALLBACK_MAX_CHARS
+    )
+
+
+def prepare_turn_delivery_parts(item: dict[str, Any], *, live: bool = False) -> list[dict[str, Any]]:
+    """Plan deterministic exact spans for bounded one-operation Telegram parts."""
+    if live or str(item.get("kind") or "").lower() != "turn":
+        return []
+    fields = _canonical_turn_fields(item)
+    if not fields["user_text"] and not fields["assistant_final_text"]:
+        return []
+
+    # Preserve the established one-message rendering for ordinary short turns.
+    full_spans = [
+        {"field": field, "start_char": 0, "end_char": len(text)}
+        for field, text in fields.items()
+        if text
+    ]
+    full_part = {
+        "schema_version": TURN_DELIVERY_PLAN_SCHEMA_VERSION,
+        "ordinal": 0,
+        "part_count": 1,
+        "spans": full_spans,
+    }
+    if _full_turn_source_is_render_safe(fields) and _turn_delivery_part_is_bounded(item, full_part):
+        return [full_part]
+
+    user_limit = max(1, TURN_DELIVERY_USER_SOURCE_CHARS)
+    final_limit = max(1, TURN_DELIVERY_FINAL_SOURCE_CHARS)
+    while True:
+        parts = _planned_parts_for_limits(
+            fields,
+            user_limit=user_limit,
+            final_limit=final_limit,
+        )
+        if all(_turn_delivery_part_is_bounded(item, part) for part in parts):
+            return parts
+        if user_limit == 1 and final_limit == 1:
+            raise ValueError("one code point cannot fit Telegram presentation limits")
+        user_limit = max(1, user_limit // 2)
+        final_limit = max(1, final_limit // 2)
+
+
+def _turn_item_delivery_parts(item: dict[str, Any], *, live: bool = False) -> list[dict[str, Any]]:
+    plans = prepare_turn_delivery_parts(item, live=live)
+    if not plans:
+        return [item]
+    return [_materialize_turn_delivery_part(item, part) for part in plans]
+
+
 def render_feed_item_delivery_html_parts(item: dict[str, Any], *, live: bool = False) -> list[str]:
-    return [render_feed_item_html(part, live=live) for part in _turn_item_delivery_parts(item, live=live)]
+    plans = prepare_turn_delivery_parts(item, live=live)
+    if not plans:
+        return [render_feed_item_html(item, live=live)]
+    return [render_turn_delivery_part_html(item, part) for part in plans]
 
 
 def feed_item_requires_send_split(item: dict[str, Any], *, live: bool = False) -> bool:
@@ -686,6 +832,60 @@ def edit_rich_message(
         return legacy
     mark_rich_supported(telegram)
     return {"ok": True, "format": "rich", "kind": "edited", "message_id": _telegram_message_id(response) or str(message_id)}
+
+
+def send_turn_delivery_part(
+    client: TelegramClient,
+    chat_id: str,
+    item: dict[str, Any],
+    part: dict[str, Any],
+    *,
+    telegram: dict[str, Any] | None,
+    thread_id: str | int | None,
+    notify: bool = False,
+    reply_to_message_id: str | int | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Execute one planned upsert as at most one Telegram message."""
+    if not _turn_delivery_part_is_bounded(item, part):
+        raise ValueError("turn delivery part exceeds Telegram presentation limits")
+    html_text = render_turn_delivery_part_html(item, part)
+    return send_rich_message(
+        client,
+        chat_id,
+        html_text,
+        telegram=telegram,
+        fallback_text=html_to_plain(html_text, limit=RICH_FALLBACK_MAX_CHARS),
+        thread_id=thread_id,
+        notify=notify,
+        reply_to_message_id=reply_to_message_id,
+        api_token=api_token,
+    )
+
+
+def edit_turn_delivery_part(
+    client: TelegramClient,
+    chat_id: str,
+    message_id: str | int,
+    item: dict[str, Any],
+    part: dict[str, Any],
+    *,
+    telegram: dict[str, Any] | None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Execute one planned edit without consulting or rendering sibling parts."""
+    if not _turn_delivery_part_is_bounded(item, part):
+        raise ValueError("turn delivery part exceeds Telegram presentation limits")
+    html_text = render_turn_delivery_part_html(item, part)
+    return edit_rich_message(
+        client,
+        chat_id,
+        message_id,
+        html_text,
+        telegram=telegram,
+        fallback_text=html_to_plain(html_text, limit=RICH_FALLBACK_MAX_CHARS),
+        api_token=api_token,
+    )
 
 
 def send_feed_item(
