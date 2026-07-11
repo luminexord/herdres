@@ -615,6 +615,7 @@ def _inherited_recovery_audit(
     store: dict[str, Any],
     *,
     failed_plan_token: str,
+    expected_predecessor_plan_token: str | None,
     content_revision: str,
     prior_generation: int,
     expected_job_count: int,
@@ -666,6 +667,22 @@ def _inherited_recovery_audit(
         or not isinstance(binding, dict)
         or set(binding) != {"failed_plan_token", "plan_token", "generation"}
         or not _valid_recovery_plan_token(audit.get("failed_plan_token"))
+        or (
+            prior_generation > 1
+            and not _valid_recovery_plan_token(
+                expected_predecessor_plan_token
+            )
+        )
+        or (
+            prior_generation > 1
+            and audit.get("failed_plan_token")
+            != expected_predecessor_plan_token
+        )
+        or (
+            prior_generation > 1
+            and binding.get("failed_plan_token")
+            != expected_predecessor_plan_token
+        )
         or audit.get("failed_plan_token") == failed_plan_token
         or audit.get("plan_token") != failed_plan_token
         or audit.get("content_revision") != content_revision
@@ -694,6 +711,7 @@ def _inherited_recovery_audit(
         "ok": True,
         "identity": (
             request_key,
+            expected_predecessor_plan_token,
             str(audit["failed_plan_token"]),
             failed_plan_token,
             prior_generation,
@@ -851,6 +869,7 @@ def _turn_final_recovery_preflight(
     part_count = entry.get("pending_turn_part_count")
     job_count = entry.get("pending_turn_job_count")
     prior_generation = entry.get("pending_plan_generation", 1)
+    predecessor_plan_token = entry.get("replaces_failed_plan_token")
     if (
         not isinstance(revision, str)
         or not revision.startswith("twrev1.")
@@ -863,6 +882,10 @@ def _turn_final_recovery_preflight(
         or isinstance(prior_generation, bool)
         or not isinstance(prior_generation, int)
         or prior_generation < 1
+        or (
+            prior_generation > 1
+            and not _valid_recovery_plan_token(predecessor_plan_token)
+        )
     ):
         return _recovery_error(
             "recovery_state_invalid",
@@ -872,6 +895,11 @@ def _turn_final_recovery_preflight(
     inherited = _inherited_recovery_audit(
         store,
         failed_plan_token=failed_plan_token,
+        expected_predecessor_plan_token=(
+            str(predecessor_plan_token)
+            if prior_generation > 1
+            else None
+        ),
         content_revision=str(revision),
         prior_generation=prior_generation,
         expected_job_count=job_count,
@@ -987,6 +1015,11 @@ def _turn_final_recovery_preflight(
         "prefix": prefix,
         "request_key": request_key,
         "prior_generation": prior_generation,
+        "expected_predecessor_plan_token": (
+            str(predecessor_plan_token)
+            if prior_generation > 1
+            else None
+        ),
         "current_failed_tail_count": current_failed_tail_count,
         "inherited_retained_failed_job_count": int(
             inherited["retained_failed_job_count"]

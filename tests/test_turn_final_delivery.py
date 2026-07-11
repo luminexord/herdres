@@ -1698,6 +1698,177 @@ def _recovery_response(
     }
     response.update(updates)
     return response
+def _second_generation_recovery_store():
+    store = _store()
+    worker = _manual_recovery_worker()
+    store["panes"]["worker"] = worker
+    response = _recovery_response()
+    herdres._clone_recovery_prefix(
+        store,
+        failed_plan_token="twplan1.failed",
+        plan_token="twplan1.replacement",
+        entry_key="worker",
+        prefix=[],
+        executable_job_count=1,
+        request_id="operator-generation-2",
+        response=response,
+    )
+    replacement_key = "turn-final:twplan1.replacement:000000"
+    state.reserve_tendwire_turn_job(
+        store,
+        replacement_key,
+        plan_token="twplan1.replacement",
+        content_revision="twrev1.recovery",
+        operation="upsert",
+        sequence_index=0,
+        part_ordinal=0,
+        part_count=1,
+        bot_kind="manager",
+    )
+    state.update_tendwire_turn_job(
+        store,
+        replacement_key,
+        substate="failed",
+    )
+    return store, worker
+
+
+def test_generation_one_recovery_does_not_require_inherited_state():
+    store = _store()
+    worker = _manual_recovery_worker()
+    store["panes"]["worker"] = worker
+    failed_key = "turn-final:twplan1.failed:000000"
+    state.reserve_tendwire_turn_job(
+        store,
+        failed_key,
+        plan_token="twplan1.failed",
+        content_revision="twrev1.recovery",
+        operation="upsert",
+        sequence_index=0,
+        part_ordinal=0,
+        part_count=1,
+        bot_kind="manager",
+    )
+    state.update_tendwire_turn_job(store, failed_key, substate="failed")
+
+    preflight = herdres._turn_final_recovery_preflight(
+        store,
+        "twplan1.failed",
+        "operator-generation-1",
+    )
+
+    assert preflight["ok"] is True
+    assert preflight["prior_generation"] == 1
+    assert preflight["expected_predecessor_plan_token"] is None
+    assert preflight["inherited_audit_identity"] is None
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_entry_predecessor",
+        "malformed_entry_predecessor",
+        "audit_predecessor",
+        "binding_predecessor",
+        "audit_and_binding_predecessor",
+    ],
+)
+def test_generation_three_predecessor_corruption_stops_before_rpc(
+    monkeypatch,
+    capsys,
+    corruption,
+):
+    store, worker = _second_generation_recovery_store()
+    request_key = herdres._recovery_request_key("operator-generation-2")
+    audit = store["tendwire_turn_final_recoveries"][request_key]
+    binding = store["tendwire_turn_final_recovery_requests"][request_key]
+    if corruption == "missing_entry_predecessor":
+        worker.pop("replaces_failed_plan_token")
+    elif corruption == "malformed_entry_predecessor":
+        worker["replaces_failed_plan_token"] = "not-a-plan-token"
+    elif corruption == "audit_predecessor":
+        audit["failed_plan_token"] = "twplan1.wrong_audit"
+    elif corruption == "binding_predecessor":
+        binding["failed_plan_token"] = "twplan1.wrong_binding"
+    else:
+        worker["replaces_failed_plan_token"] = "twplan1.real_generation1"
+        audit["failed_plan_token"] = "twplan1.wrong_generation1"
+        binding["failed_plan_token"] = "twplan1.wrong_generation1"
+    calls = []
+
+    class NeverCalled:
+        def connector_prepare_recover(self, **kwargs):
+            calls.append(kwargs)
+            raise AssertionError("invalid predecessor must stop before RPC")
+
+    monkeypatch.setattr(herdres.config, "load_env_file", lambda: None)
+    monkeypatch.setattr(herdres.config, "require_source_mode", lambda: None)
+    monkeypatch.setattr(herdres.state, "state_lock", lambda: nullcontext())
+    monkeypatch.setattr(herdres.state, "load_state", lambda: store)
+    monkeypatch.setattr(herdres, "TendwireClient", NeverCalled)
+
+    code = herdres.cmd_recover_turn_final(
+        SimpleNamespace(
+            plan_token="twplan1.replacement",
+            request_id=f"operator-predecessor-{corruption}",
+        )
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert code == 1
+    assert output["status"] == "recovery_state_invalid"
+    assert calls == []
+
+
+def test_predecessor_change_during_recovery_rpc_fails_revalidation(
+    monkeypatch,
+    capsys,
+):
+    store, worker = _second_generation_recovery_store()
+    saves = []
+    calls = []
+
+    class MutatingClient:
+        def connector_prepare_recover(self, **kwargs):
+            calls.append(kwargs)
+            worker["replaces_failed_plan_token"] = "twplan1.changed_generation1"
+            return _recovery_response(
+                failed_plan_token="twplan1.replacement",
+                plan_token="twplan1.generation3",
+                generation=3,
+                retained_failed_job_count=2,
+            )
+
+    monkeypatch.setattr(herdres.config, "load_env_file", lambda: None)
+    monkeypatch.setattr(herdres.config, "require_source_mode", lambda: None)
+    monkeypatch.setattr(herdres.state, "state_lock", lambda: nullcontext())
+    monkeypatch.setattr(herdres.state, "load_state", lambda: store)
+    monkeypatch.setattr(
+        herdres.state,
+        "save_state",
+        lambda candidate: saves.append(candidate),
+    )
+    monkeypatch.setattr(herdres, "TendwireClient", MutatingClient)
+
+    code = herdres.cmd_recover_turn_final(
+        SimpleNamespace(
+            plan_token="twplan1.replacement",
+            request_id="operator-predecessor-rpc-change",
+        )
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert code == 1
+    assert output["status"] == "recovery_state_uncertain"
+    assert calls == [
+        {
+            "failed_plan_token": "twplan1.replacement",
+            "request_id": "operator-predecessor-rpc-change",
+        }
+    ]
+    assert saves == []
+
+
 
 
 @pytest.mark.parametrize(
@@ -1842,7 +2013,9 @@ def test_inherited_recovery_audit_is_unique_and_revalidated_in_preflight():
     assert valid["current_failed_tail_count"] == 1
     assert valid["inherited_retained_failed_job_count"] == 1
     assert valid["expected_retained_failed_job_count"] == 2
-    assert valid["inherited_audit_identity"][2:] == (
+    assert valid["inherited_audit_identity"][1:] == (
+        "twplan1.failed",
+        "twplan1.failed",
         "twplan1.replacement",
         2,
         1,
