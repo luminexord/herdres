@@ -68,6 +68,9 @@ _LEGACY_REQUIRED_FIELDS = frozenset({"request", "created_at", "updated_at"})
 _COMMAND_REQUEST_FIELDS = frozenset(
     {"schema_version", "action", "request_id", "dry_run", "target", "instruction"}
 )
+_ANSWER_DECISION_REQUEST_FIELDS = frozenset(
+    {"schema_version", "action", "request_id", "dry_run", "target", "params"}
+)
 _COMMAND_TARGET_SHAPES = frozenset(
     {
         frozenset({"worker_id"}),
@@ -160,33 +163,72 @@ def _valid_child(value: Any, request_id: str) -> bool:
     return True
 
 
+def _valid_decision_selection(selection: Any) -> bool:
+    """A neutral decision selection (exactly one form): chosen option ref(s), or a single write-in
+    text — never a key sequence. Mirrors the same gate in tendwire_client (two independent validators
+    by design)."""
+    if not isinstance(selection, dict) or len(selection) != 1:
+        return False
+    if frozenset(selection) == {"option_refs"}:
+        refs = selection.get("option_refs")
+        return (
+            isinstance(refs, list)
+            and bool(refs)
+            and all(isinstance(ref, str) and bool(ref.strip()) for ref in refs)
+        )
+    if frozenset(selection) == {"text"}:
+        text = selection.get("text")
+        return isinstance(text, str) and bool(text)
+    return False
+
+
+def _valid_answer_decision_params(params: Any) -> bool:
+    return (
+        isinstance(params, dict)
+        and frozenset(params) == {"decision_ref", "selection"}
+        and isinstance(params.get("decision_ref"), str)
+        and bool(params["decision_ref"].strip())
+        and _valid_decision_selection(params.get("selection"))
+    )
+
+
 def _valid_command_request(request: Any) -> bool:
-    if (
-        not isinstance(request, dict)
-        or frozenset(request) != _COMMAND_REQUEST_FIELDS
-        or request.get("schema_version") != 1
-        or request.get("action") != "send_instruction"
-        or request.get("dry_run") is not False
-    ):
+    if not isinstance(request, dict):
+        return False
+    action = request.get("action")
+    if action == "send_instruction":
+        if frozenset(request) != _COMMAND_REQUEST_FIELDS:
+            return False
+    elif action == "answer_decision":
+        if frozenset(request) != _ANSWER_DECISION_REQUEST_FIELDS:
+            return False
+    else:
+        return False
+    if request.get("schema_version") != 1 or request.get("dry_run") is not False:
         return False
     try:
         validate_request_id(request.get("request_id"))
     except ValueError:
         return False
     target = request.get("target")
-    instruction = request.get("instruction")
-    return (
+    if not (
         isinstance(target, dict)
         and frozenset(target) in _COMMAND_TARGET_SHAPES
         and all(
             isinstance(value, str) and bool(value.strip())
             for value in target.values()
         )
-        and isinstance(instruction, dict)
-        and frozenset(instruction) == {"text"}
-        and isinstance(instruction.get("text"), str)
-        and bool(instruction["text"])
-    )
+    ):
+        return False
+    if action == "send_instruction":
+        instruction = request.get("instruction")
+        return (
+            isinstance(instruction, dict)
+            and frozenset(instruction) == {"text"}
+            and isinstance(instruction.get("text"), str)
+            and bool(instruction["text"])
+        )
+    return _valid_answer_decision_params(request.get("params"))
 
 
 def canonical_request_json(request: dict[str, Any]) -> str:

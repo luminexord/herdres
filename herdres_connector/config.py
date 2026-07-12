@@ -196,6 +196,16 @@ def ack_on_send(env: Any | None = None) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def remote_decisions_enabled(env: Any | None = None) -> bool:
+    """Whether a blocked Claude prompt (AskUserQuestion / ExitPlanMode) is surfaced into its topic
+    as a native reply keyboard the user can answer remotely (via Tendwire's answer_decision command).
+    Default on; HERDRES_REMOTE_DECISIONS=0 degrades to the plain attention notice. An empty value
+    (common in env files) keeps the default, matching the runtime-flag idiom used across this module."""
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_REMOTE_DECISIONS", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 
 def reap_closed_worker_topics(env: Any | None = None) -> bool:
     """Worker mode only: delete the Telegram topic of a worker that has durably FINISHED and left the

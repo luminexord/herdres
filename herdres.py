@@ -15,7 +15,7 @@ import sys
 import time
 from typing import Any, Callable
 
-from herdres_connector import config, doctor, speech, state
+from herdres_connector import config, decisions, doctor, speech, state
 from herdres_connector import ingress_requests
 from herdres_connector.ingress_identity import validate_request_id
 from herdres_connector.managed_bots import managed_bot_kind_for_username
@@ -26,6 +26,7 @@ from herdres_connector.tendwire_client import (
     TendwireClient,
     command_process_ambiguous,
     command_process_not_started,
+    _DECISION_REJECTION_STATUSES,
 )
 
 VERSION = "0.7.0rc4-tendwired-source-only"
@@ -302,6 +303,100 @@ def _command_request(entry: dict[str, Any], payload: dict[str, Any], text: str) 
     }
 
 
+def _decision_answer_request(
+    worker_id: str, request_id: Any, decision_ref: str, selection: dict[str, Any]
+) -> dict[str, Any]:
+    """Neutral answer_decision command: which pending prompt, and the semantic selection (chosen option
+    ref(s) or a write-in text), carried in ``params`` like the sibling pane actions. Tendwire resolves
+    worker_id -> pane, confirms the prompt is still on screen, owns the TUI calibration, and replays it.
+    request_id is the SAME HMAC-derived id as the inbound Telegram message, so the answer is durable and
+    idempotent through the ingress record."""
+    return {
+        "schema_version": 1,
+        "action": "answer_decision",
+        "request_id": validate_request_id(request_id),
+        "dry_run": False,
+        "target": {"worker_id": str(worker_id)},
+        "params": {"decision_ref": str(decision_ref), "selection": selection},
+    }
+
+
+def _decision_still_pending(worker_id: str, decision_ref: str) -> bool | None:
+    """Re-poll Tendwire and report whether ``decision_ref`` is still pending for ``worker_id``:
+    True (present), False (gone -> already answered / superseded), or None (couldn't reach Tendwire).
+    A neutral pending read — no Herdr access."""
+    try:
+        pending = TendwireClient().pending()
+    except Exception:  # noqa: BLE001 - an unreachable daemon is uncertainty, not "answered"
+        return None
+    if not isinstance(pending, dict):
+        return None
+    return decisions.decision_present(pending, worker_id, decision_ref)
+
+
+def _submit_decision_answer(
+    store: dict[str, Any],
+    record: dict[str, Any] | None,
+    request_id: str,
+    topic_id: str,
+    directive: dict[str, Any],
+) -> dict[str, Any]:
+    """Submit a resolved decision answer as an answer_decision command, reusing the durable ingress
+    record so it is idempotent under the message's request id. Freshness-guards a stale pane first
+    (Jerry #3), and — because the strict command reply carries no reply_markup — leaves the keyboard
+    for the sync loop to retract on success and keeps it on failure (Jerry #2)."""
+    worker_id = str(directive.get("worker_id") or "")
+    decision_ref = str(directive.get("decision_ref") or "")
+    selection = directive.get("selection")
+    success_reply = str(directive.get("success_reply") or "Sent your answer to Claude.")
+
+    if record is None:
+        # No durable request id (should not happen for real gateway traffic) -> refuse rather than
+        # submit un-idempotently; keep the decision active so a fresh tap can retry.
+        state.save_state(store)
+        return {"handled": True, "reply": "⚠️ Couldn't record that answer safely — tap again."}
+
+    freshness = _decision_still_pending(worker_id, decision_ref)
+    if freshness is False:
+        # Already answered at the workstation / superseded: don't key-drive a stale pane. Leave the
+        # active record in place — the strict command reply can't carry a keyboard removal, so the
+        # sync loop's auto-disable pass (which sees the decision has left pending) is what retracts the
+        # keyboard and then clears the record. Clearing it here would orphan the keyboard.
+        return _local_ingress_outcome(
+            store, record, reason="decision already answered",
+            reply="✅ That prompt was already answered — nothing more to send.",
+        )
+    if freshness is None:
+        return _local_ingress_outcome(
+            store, record, reason="decision freshness uncertain",
+            reply="⚠️ Couldn't reach Tendwire to confirm the prompt is still open — tap again.",
+        )
+
+    try:
+        request = _decision_answer_request(worker_id, request_id, decision_ref, selection)
+    except ValueError:
+        return _local_ingress_outcome(
+            store, record, reason="invalid decision answer", reply=SAFE_SEND_FAILURE_REPLY,
+        )
+    request_json = ingress_requests.canonical_request_json(request)
+    try:
+        attached = ingress_requests.attach_request_json(record, request_json, now=time.time())
+    except ValueError:
+        outcome = ingress_requests.quarantine_request(
+            record, "conflicting ingress request", now=time.time()
+        )
+        state.save_state(store)
+        return outcome
+    if attached:
+        state.save_state(store)
+    return _submit_ingress_command_record(
+        store,
+        record,
+        success_reply=success_reply,
+        rejected_reply="⚠️ Claude didn't accept that answer — tap again, or answer at the workstation.",
+    )
+
+
 def _success_reply(response: dict[str, Any]) -> str:
     if response.get("disposition") != "terminal_accepted":
         return ""
@@ -322,9 +417,17 @@ def _success_reply(response: dict[str, Any]) -> str:
 
 
 def _submit_ingress_command_record(
-    store: dict[str, Any], record: dict[str, Any]
+    store: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    success_reply: str | None = None,
+    rejected_reply: str | None = None,
 ) -> dict[str, Any]:
-    """Replay the durable bytes and reduce only authoritative dispositions."""
+    """Replay the durable bytes and reduce only authoritative dispositions.
+
+    ``success_reply`` / ``rejected_reply`` let a caller (e.g. a decision answer) override the terminal
+    replies while keeping the exact same durable/idempotent submit path. Defaults preserve the normal
+    send_instruction behaviour (ack-gated success text, safe-failure rejection)."""
 
     while True:
         now = time.time()
@@ -365,7 +468,10 @@ def _submit_ingress_command_record(
 
         disposition = response.get("disposition")
         if disposition == "terminal_accepted":
-            reply = _success_reply(response) if config.ack_on_send() else ""
+            if success_reply is not None:
+                reply = success_reply
+            else:
+                reply = _success_reply(response) if config.ack_on_send() else ""
             outcome = ingress_requests.mark_terminal(
                 record,
                 disposition,
@@ -379,7 +485,7 @@ def _submit_ingress_command_record(
                 record,
                 disposition,
                 now=transitioned_at,
-                reply=SAFE_SEND_FAILURE_REPLY,
+                reply=rejected_reply if rejected_reply is not None else SAFE_SEND_FAILURE_REPLY,
             )
             state.save_state(store)
             return outcome
@@ -401,6 +507,24 @@ def _submit_ingress_command_record(
         if transitioned_at >= record["deadline_at"]:
             outcome = ingress_requests.quarantine_request(
                 record, "request deadline reached", now=transitioned_at
+            )
+            state.save_state(store)
+            return outcome
+
+        if (
+            disposition == "no_receipt"
+            and str(response.get("status") or "") in _DECISION_REJECTION_STATUSES
+        ):
+            # A semantic answer_decision rejection (the decision left pending, the worker is unknown,
+            # the selection is invalid, or it is a multi-question prompt) comes back as no_receipt but
+            # is PERMANENT: replaying the identical bytes re-rejects forever. Terminalize with an
+            # explicit failure (checkpoint advances) instead of retry-looping the whole gateway for the
+            # retry horizon. The decision record is left active so the sync loop retracts the keyboard.
+            outcome = ingress_requests.quarantine_request(
+                record,
+                "decision rejected",
+                now=transitioned_at,
+                reply=rejected_reply if rejected_reply is not None else SAFE_SEND_FAILURE_REPLY,
             )
             state.save_state(store)
             return outcome
@@ -502,6 +626,30 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             state.save_state(store)
             return voice_reply
         text = _send_text_from_payload(payload)
+        # Remote decision answer: while a Claude prompt is pending in this topic, the pane is BLOCKED
+        # on it, so every PLAIN, untargeted message here answers it. A message that is a routing
+        # directive must fall through to normal handling instead of being captured as a write-in:
+        #   * an explicit `/send …` (documented queue-for-turn-boundary semantics), and
+        #   * an alias-targeted `@worker …` (incl. `@worker /send …`), which addresses a DIFFERENT
+        #     worker than this topic's blocked one.
+        # (Other slash commands already map to "" and are skipped by the `if text` guard.)
+        topic_id = str(payload.get("topic_id") or "")
+        raw_text = _raw_text_from_payload(payload)
+        _routing_alias, _ = _split_target_alias(raw_text)
+        if text and not raw_text.startswith("/send") and not _routing_alias:
+            directive = decisions.handle_decision_answer(store, topic_id, text)
+            if directive is not None:
+                if directive.get("action") == "submit":
+                    return _submit_decision_answer(
+                        store, record, ingress_request_id, topic_id, directive
+                    )
+                reply = str(directive.get("reply") or "")
+                if record is not None:
+                    return _local_ingress_outcome(
+                        store, record, reason="decision handled locally", reply=reply,
+                    )
+                state.save_state(store)
+                return {"handled": True, "reply": reply}
         voice_payload = speech.is_voice_payload(payload)
         alias_source = text if text else _clean_voice_caption(payload.get("caption") or payload.get("text") or "")
         alias, clean_text = _split_target_alias(alias_source)

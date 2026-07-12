@@ -37,6 +37,11 @@ _PUBLIC_PROTOCOL_TOKEN_KEYS = {
     "plan_token",
     "replaces_plan_token",
 }
+# send_instruction carries the free-text `instruction`; answer_decision carries the neutral decision
+# payload in `params` = {decision_ref, selection}. Both keep the same schema/request_id/target
+# discipline — Tendwire resolves the worker to its pane and, for answer_decision, owns the TUI
+# calibration and the "is the prompt still displayed" freshness check. The connector never encodes
+# key sequences, so this stays within source-mode neutrality.
 _COMMAND_REQUEST_FIELDS = {
     "schema_version",
     "action",
@@ -44,6 +49,14 @@ _COMMAND_REQUEST_FIELDS = {
     "dry_run",
     "target",
     "instruction",
+}
+_ANSWER_DECISION_REQUEST_FIELDS = {
+    "schema_version",
+    "action",
+    "request_id",
+    "dry_run",
+    "target",
+    "params",
 }
 _COMMAND_TARGET_SHAPES = {
     frozenset({"worker_id"}),
@@ -73,6 +86,23 @@ _COMMAND_ACCEPTED_RESULT_FIELDS = frozenset(
         "observed_turn_state",
     }
 )
+# answer_decision's accepted result (Tendwire's _decision_public_result): echoes the decision_ref and
+# reports observed_pending_state rather than a target turn state.
+_DECISION_ACCEPTED_RESULT_FIELDS = frozenset(
+    {
+        "target",
+        "decision",
+        "delivery_state",
+        "transport_state",
+        "observed_pending_state",
+    }
+)
+# The trailing four are answer_decision's typed fail-closed statuses (Tendwire maps them to a terminal
+# or no-receipt rejection depending on the pipeline stage); the connector must recognize them so a
+# rejected answer surfaces as an explicit failure instead of an uncertain-retry.
+_DECISION_REJECTION_STATUSES = frozenset(
+    {"decision_not_pending", "unknown_worker", "invalid_selection", "unsupported_decision"}
+)
 _COMMAND_TERMINAL_REJECTION_STATUSES = frozenset(
     {
         "rejected",
@@ -83,7 +113,7 @@ _COMMAND_TERMINAL_REJECTION_STATUSES = frozenset(
         "backend_failed",
         "duplicate_request",
     }
-)
+) | _DECISION_REJECTION_STATUSES
 _COMMAND_PRE_RECEIPT_STATUSES = frozenset(
     {
         "invalid_request",
@@ -96,7 +126,7 @@ _COMMAND_PRE_RECEIPT_STATUSES = frozenset(
         "ambiguous_backend_target",
         "backend_failed",
     }
-)
+) | _DECISION_REJECTION_STATUSES
 _COMMAND_DISPOSITIONS = frozenset(
     {
         "no_receipt",
@@ -166,17 +196,55 @@ def _request_state_uncertain(request: dict[str, Any] | None = None) -> dict[str,
     if isinstance(request, dict):
         if isinstance(request.get("request_id"), str):
             result["request_id"] = request["request_id"]
-        if request.get("action") == "send_instruction":
-            result["action"] = "send_instruction"
+        if request.get("action") in {"send_instruction", "answer_decision"}:
+            result["action"] = request["action"]
     return result
 
 
+def _valid_decision_selection(selection: Any) -> bool:
+    """A neutral decision selection (exactly one form): one or more chosen option refs, or a single
+    write-in text — never a key sequence. Refs are the ordinals Tendwire published for the prompt's
+    options; the connector maps a tapped button back to its ref and Tendwire owns the calibration."""
+    if not isinstance(selection, dict) or len(selection) != 1:
+        return False
+    if set(selection) == {"option_refs"}:
+        refs = selection.get("option_refs")
+        return (
+            isinstance(refs, list)
+            and bool(refs)
+            and all(isinstance(ref, str) and ref.strip() for ref in refs)
+        )
+    if set(selection) == {"text"}:
+        text = selection.get("text")
+        return isinstance(text, str) and bool(text)
+    return False
+
+
+def _valid_answer_decision_params(params: Any) -> bool:
+    return (
+        isinstance(params, dict)
+        and set(params) == {"decision_ref", "selection"}
+        and isinstance(params.get("decision_ref"), str)
+        and bool(params["decision_ref"].strip())
+        and _valid_decision_selection(params.get("selection"))
+    )
+
+
 def _exact_public_command_request(request: Any) -> dict[str, Any] | None:
-    if not isinstance(request, dict) or set(request) != _COMMAND_REQUEST_FIELDS:
+    if not isinstance(request, dict):
+        return None
+    action = request.get("action")
+    if action == "send_instruction":
+        if set(request) != _COMMAND_REQUEST_FIELDS:
+            return None
+    elif action == "answer_decision":
+        if set(request) != _ANSWER_DECISION_REQUEST_FIELDS:
+            return None
+    else:
         return None
     if type(request.get("schema_version")) is not int or request["schema_version"] != 1:
         return None
-    if request.get("action") != "send_instruction" or request.get("dry_run") is not False:
+    if request.get("dry_run") is not False:
         return None
     try:
         validate_request_id(request.get("request_id"))
@@ -187,13 +255,16 @@ def _exact_public_command_request(request: Any) -> dict[str, Any] | None:
         return None
     if any(not isinstance(value, str) or not value.strip() for value in target.values()):
         return None
-    instruction = request.get("instruction")
-    if (
-        not isinstance(instruction, dict)
-        or set(instruction) != {"text"}
-        or not isinstance(instruction.get("text"), str)
-        or not instruction["text"]
-    ):
+    if action == "send_instruction":
+        instruction = request.get("instruction")
+        if (
+            not isinstance(instruction, dict)
+            or set(instruction) != {"text"}
+            or not isinstance(instruction.get("text"), str)
+            or not instruction["text"]
+        ):
+            return None
+    elif not _valid_answer_decision_params(request.get("params")):
         return None
     return request
 
@@ -202,23 +273,39 @@ def _valid_accepted_command_result(
     value: Any,
     request: dict[str, Any],
 ) -> bool:
-    if not isinstance(value, dict) or set(value) != _COMMAND_ACCEPTED_RESULT_FIELDS:
+    # answer_decision's accepted result has its own shape (no target_state_at_send; a `decision`
+    # echo; observed_pending_state instead of observed_turn_state), so validate per action — a
+    # send_instruction-only check would silently downgrade every accepted remote answer to uncertain.
+    if not isinstance(value, dict):
+        return False
+    is_decision = request.get("action") == "answer_decision"
+    expected_fields = _DECISION_ACCEPTED_RESULT_FIELDS if is_decision else _COMMAND_ACCEPTED_RESULT_FIELDS
+    if set(value) != expected_fields:
         return False
     target = value.get("target")
     if not isinstance(target, dict) or set(target) != {"worker_id"}:
         return False
     worker_id = target.get("worker_id")
     requested_worker_id = request["target"].get("worker_id")
-    return (
+    if not (
         isinstance(worker_id, str)
         and bool(worker_id.strip())
-        and (
-            not isinstance(requested_worker_id, str)
-            or worker_id == requested_worker_id
-        )
+        and (not isinstance(requested_worker_id, str) or worker_id == requested_worker_id)
         and value.get("delivery_state") == "submitted"
         and value.get("transport_state") == "submitted"
-        and isinstance(value.get("target_state_at_send"), str)
+    ):
+        return False
+    if is_decision:
+        decision = value.get("decision")
+        expected_ref = (request.get("params") or {}).get("decision_ref")
+        return (
+            isinstance(decision, dict)
+            and set(decision) == {"decision_ref"}
+            and decision.get("decision_ref") == expected_ref
+            and value.get("observed_pending_state") == "pending_observation"
+        )
+    return (
+        isinstance(value.get("target_state_at_send"), str)
         and bool(value["target_state_at_send"].strip())
         and value.get("observed_turn_state") == "pending_observation"
     )
@@ -233,7 +320,7 @@ def _validated_command_response(
         or type(response.get("schema_version")) is not int
         or response["schema_version"] != 2
         or response.get("request_id") != request["request_id"]
-        or response.get("action") != "send_instruction"
+        or response.get("action") != request["action"]
         or response.get("dry_run") is not False
         or type(response.get("ok")) is not bool
         or not isinstance(response.get("status"), str)

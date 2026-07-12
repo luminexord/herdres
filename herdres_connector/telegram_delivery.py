@@ -125,6 +125,7 @@ class TelegramClient:
         thread_id: str | int | None = None,
         reply_to_message_id: str | int | None = None,
         notify: bool = False,
+        reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         base_payload: dict[str, Any] = {
             "chat_id": chat_id,
@@ -135,6 +136,10 @@ class TelegramClient:
             base_payload["message_thread_id"] = str(thread_id)
         if reply_to_message_id:
             base_payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
+        # reply_markup must be a JSON string in the urlencoded body (api() calls str() on each value,
+        # which would repr a dict). Attach it to the SINGLE message, or only the last split chunk so a
+        # reply keyboard / removal lands with the final delivered message.
+        reply_markup_json = json.dumps(reply_markup, separators=(",", ":")) if reply_markup is not None else None
         source = sanitize_text(html_text, MESSAGE_SOURCE_LIMIT)
         plain = html_to_plain(source, limit=MESSAGE_SOURCE_LIMIT)
         if len(source) > MESSAGE_TEXT_LIMIT and plain:
@@ -148,6 +153,8 @@ class TelegramClient:
                 payload["text"] = sanitize_text(text, MESSAGE_TEXT_LIMIT)
                 if index > 1:
                     payload.pop("reply_parameters", None)
+                if reply_markup_json is not None and index == total:
+                    payload["reply_markup"] = reply_markup_json
                 try:
                     result = self.api("sendMessage", payload).get("result") or {}
                     message_ids.append(str(result.get("message_id") or "0"))
@@ -165,6 +172,8 @@ class TelegramClient:
             payload["text"] = text
             if fmt != "plain":
                 payload["parse_mode"] = "HTML"
+            if reply_markup_json is not None:
+                payload["reply_markup"] = reply_markup_json
             try:
                 result = self.api("sendMessage", payload).get("result") or {}
                 return {"ok": True, "message_id": str(result.get("message_id") or "0"), "format": fmt}

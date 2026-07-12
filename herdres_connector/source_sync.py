@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from . import accounts, config, speech, state
+from . import accounts, config, decisions, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import (
@@ -2634,6 +2634,74 @@ def _bootstrap_existing_turns(
     return skipped
 
 
+def _decision_client(store: dict[str, Any], runtime: SyncRuntime, entry: dict[str, Any] | None):
+    api_token, bot_kind = _delivery_bot(store, entry) if entry else (None, "")
+    client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
+    return client, bot_kind
+
+
+def _deliver_decisions(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str, pending_payload: dict[str, Any]) -> int:
+    """Surface Tendwire-carried Claude prompts as native reply keyboards in the worker's topic, and
+    take the keyboard down when the prompt leaves the pending payload (answered remotely or at the
+    workstation). All input comes from ``pending_payload`` — the connector reads no Herdr snapshot and
+    no local file. A resolver failure degrades to a no-op (the plain attention notice still fires)."""
+    if not decisions.decisions_enabled():
+        return 0
+    # Close the round-trip race (a gateway process answering a decision during one of this pass's
+    # off-lock send windows clears its active record on disk): re-read the decisions bucket so the
+    # auto-disable pass below sees those clears and a later save_state can't resurrect an answered
+    # decision. Held-lock only — in tests / dry-run there is no cross-process writer to reconcile.
+    if not runtime.dry_run and state.lock_held():
+        decisions.reload_active_map(store)
+    entries = state.source_worker_entries(store)
+    try:
+        resolved = decisions.resolve_decisions(store, pending_payload)
+    except Exception:  # noqa: BLE001 - never let a decision failure break the sync loop
+        resolved = []
+    resolved_by_topic = {d.topic_id: d for d in resolved}
+    changed = 0
+    # 1) Post new / changed decisions (idempotent on decision_id + content_hash).
+    for d in resolved:
+        existing = decisions.get_active(store, d.topic_id)
+        if existing and existing.get("decision_id") == d.decision_id and existing.get("content_hash") == d.content_hash():
+            continue
+        entry = entries.get(d.entry_key)
+        html = decisions.render_decision_html(d)
+        keyboard = decisions.reply_keyboard(d)
+        message_id = "0"
+        bot_kind = ""
+        if not runtime.dry_run:
+            client, bot_kind = _decision_client(store, runtime, entry)
+            sent = client.send_message(chat_id, html, thread_id=d.topic_id, notify=True, reply_markup=keyboard)
+            if not sent.get("ok"):
+                if entry is not None:
+                    _record_delivery_error(entry, sent, bot_kind)
+                continue
+            message_id = str(sent.get("message_id") or "0")
+            if entry is not None:
+                _record_delivery_success(entry, bot_kind)
+                state.bind_message_to_worker(store, message_id, entry, topic_id=d.topic_id, kind="decision", turn_id=d.decision_id, bot_kind=bot_kind)
+        record = decisions.active_record_from(d, message_id)
+        record["bot_kind"] = bot_kind
+        decisions.set_active(store, d.topic_id, record)
+        changed += 1
+    # 2) Auto-disable: a topic whose active decision is no longer in the pending payload has been
+    #    answered (Tendwire presence-syncs the pending list) -> retract the keyboard.
+    for topic_id, record in decisions.active_items(store):
+        if not isinstance(record, dict):
+            decisions.clear_active(store, topic_id)
+            continue
+        if topic_id in resolved_by_topic:
+            continue
+        if not runtime.dry_run:
+            entry = entries.get(str(record.get("entry_key") or ""))
+            client, _ = _decision_client(store, runtime, entry)
+            client.send_message(chat_id, "✅ Answered.", thread_id=topic_id, reply_markup=decisions.remove_keyboard())
+        decisions.clear_active(store, topic_id)
+        changed += 1
+    return changed
+
+
 def _sync_turns(
     store: dict[str, Any],
     turns_payload: dict[str, Any],
@@ -2795,6 +2863,9 @@ def _sync_turns(
         # Same yield between delivered pending prompts (each is a send under the lock).
         if yield_barrier is not None and delivered and p_idx + 1 < pending_count:
             yield_barrier()
+    # Remote-answer: surface Tendwire-carried Claude prompts as reply keyboards and retract them when
+    # answered. Everything comes from the pending payload the loop already fetched.
+    counts["sent"] += _deliver_decisions(store, runtime, chat_id=chat_id, pending_payload=pending_payload)
     return counts
 
 
