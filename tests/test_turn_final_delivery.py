@@ -91,6 +91,13 @@ class TurnFinalTendwire:
         self.row = row
         self.emit_ready = emit_ready
         self.turn_schema_version = turn_schema_version
+        self.snapshot_worker_id = str(row["worker_id"])
+        self.snapshot_space_id = str(
+            row.get("space_id") or "space-1"
+        )
+        self.snapshot_worker_name = "Alpha"
+        self.snapshot_agent = "codex"
+        self.attach_plan_source = True
         self.snapshot_fingerprint = str(
             row.get("worker_fingerprint") or "fp-1"
         )
@@ -203,17 +210,17 @@ class TurnFinalTendwire:
             "workers": [
                 _source_worker(
                     {
-                        "id": "worker-1",
-                        "name": "Alpha",
+                        "id": self.snapshot_worker_id,
+                        "name": self.snapshot_worker_name,
                         "status": (
                             "idle"
                             if self.row.get("complete")
                             else "working"
                         ),
-                        "space_id": "space-1",
+                        "space_id": self.snapshot_space_id,
                         "fingerprint": self.snapshot_fingerprint,
                         "meta": {
-                            "agent": "codex",
+                            "agent": self.snapshot_agent,
                             "stable_key": self.snapshot_stable_key,
                             "stable_key_version": (
                                 self.snapshot_stable_key_version
@@ -224,7 +231,7 @@ class TurnFinalTendwire:
             ],
             "spaces": [
                 {
-                    "id": "space-1",
+                    "id": self.snapshot_space_id,
                     "name": "Project",
                     "status": "active",
                     "fingerprint": "space-fp-1",
@@ -500,7 +507,7 @@ class TurnFinalTendwire:
             "spans": deepcopy(spans),
             "replaces_plan_token": replaces or None,
         }
-        if plan.get("source") is not None:
+        if self.attach_plan_source and plan.get("source") is not None:
             payload["turn"] = deepcopy(plan["source"])
         return {
             "status": "queued",
@@ -3212,6 +3219,269 @@ def test_conflicting_job_attached_source_fails_before_second_page_or_send(
         for receipt in state.tendwire_turn_jobs(store).values()
     ) == 1
 
+
+
+@pytest.mark.parametrize("topic_mode", ["worker", "space"])
+def test_committed_root_follows_same_stable_owner_through_worker_space_and_account_churn_then_two_syncs_noop(
+    monkeypatch, topic_mode
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", topic_mode)
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    stable_key = _stable_key("worker-A", "fp-A")
+    row = _turn_row(
+        "turn-committed-churn",
+        "twrev1.committed_churn",
+        "same owner final",
+    )
+    row.update(
+        {
+            "worker_id": "worker-A",
+            "worker_fingerprint": "fp-A",
+            "space_id": "space-A",
+            "stable_key": stable_key,
+        }
+    )
+    tendwire = _ready_tendwire(row)
+    tendwire.snapshot_worker_id = "worker-A"
+    tendwire.snapshot_fingerprint = "fp-A"
+    tendwire.snapshot_space_id = "space-A"
+    tendwire.snapshot_worker_name = "Alpha A"
+    tendwire.commit_response_lost_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+    store["telegram"]["managed_bots"] = {
+        "claude": {"enabled": True, "token": "claude-token"}
+    }
+
+    first = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=10)
+    )
+
+    assert first["tendwire_turn_final"]["status"] == "timeout"
+    assert first["tendwire_turn_final"]["operations"] == 0
+    assert telegram.sent == []
+    original_entry_key, original_entry = (
+        state.find_worker_entry_by_stable_key(store, stable_key)
+    )
+    assert original_entry_key is not None
+    assert original_entry is not None
+    original_topic_id = str(original_entry["topic_id"])
+    final_identity = "twfinal1.committed_churn"
+    canonical_owner = {
+        "turn_id": row["id"],
+        "content_revision": row["content"]["content_revision"],
+        "stable_key": stable_key,
+        "stable_key_version": 1,
+    }
+    owners = store["tendwire_turn_final_source_owners"]
+    assert owners[final_identity] == canonical_owner
+    owners[final_identity].update(
+        {
+            "worker_id": "worker-A",
+            "space_id": "space-A",
+            "account_kind": "manager",
+            "diagnostic_source": "worker:worker-A",
+        }
+    )
+
+    tendwire.snapshot_worker_id = "worker-B"
+    tendwire.snapshot_fingerprint = "fp-B"
+    tendwire.snapshot_space_id = "space-B"
+    tendwire.snapshot_worker_name = "Claude B"
+    tendwire.snapshot_agent = "claude"
+    checkpoints = []
+    second = sync_once(
+        store,
+        _runtime(
+            tendwire,
+            telegram,
+            max_sends=10,
+            checkpoint=lambda: checkpoints.append(
+                {
+                    "store": deepcopy(store),
+                    "send_count": len(telegram.sent),
+                }
+            ),
+        ),
+    )
+
+    assert second["tendwire_turn_final"]["acked"] == 1
+    assert second["tendwire_turn_final"]["operations"] == 1
+    assert second["tendwire_turn_final"]["deferred"] == 0
+    assert second["tendwire_turn_final"]["failed"] == 0
+    assert len(telegram.sent) == 1
+    assert any(
+        checkpoint["send_count"] == 0
+        and checkpoint["store"].get(
+            "tendwire_turn_final_source_owners", {}
+        ).get(final_identity)
+        == canonical_owner
+        for checkpoint in checkpoints
+    )
+    current_entry_key, current_entry = (
+        state.find_worker_entry_by_stable_key(store, stable_key)
+    )
+    assert current_entry_key == original_entry_key
+    assert current_entry is original_entry
+    assert current_entry["tendwire_worker_id"] == "worker-B"
+    assert current_entry["tendwire_fingerprint"] == "fp-B"
+    assert current_entry["tendwire_space_id"] == "space-B"
+    assert state.entry_stable_identity(current_entry) == (
+        stable_key,
+        1,
+    )
+    current_topic_id = str(current_entry["topic_id"])
+    if topic_mode == "worker":
+        assert current_topic_id == original_topic_id
+    else:
+        _space_entry_key, space_entry = (
+            state.find_space_entry_by_id(store, "space-B")
+        )
+        assert space_entry is not None
+        assert current_topic_id == str(space_entry["topic_id"])
+    sent = telegram.sent[0]
+    assert sent[2]["thread_id"] == current_topic_id
+    assert sent[2]["token"] == "claude-token"
+    binding = state.find_message_binding(
+        store, sent[3], topic_id=current_topic_id
+    )
+    assert binding is not None
+    assert binding["worker_id"] == "worker-B"
+    assert binding["worker_fingerprint"] == "fp-B"
+    assert binding["space_id"] == "space-B"
+    assert binding["bot_kind"] == "claude"
+    assert "tendwire_turn_final_source_owners" not in store
+
+    stable_snapshot = {
+        "store": deepcopy(store),
+        "sent": deepcopy(telegram.sent),
+        "edited": deepcopy(telegram.edited),
+        "deleted": deepcopy(telegram.deleted_messages),
+        "api_calls": deepcopy(telegram.api_calls),
+        "topics": deepcopy(telegram.topics),
+        "pages": deepcopy(tendwire.page_calls),
+        "prepare": deepcopy(tendwire.prepare_calls),
+        "source_refs": deepcopy(tendwire.source_prepare_refs),
+        "plans": deepcopy(tendwire._plans),
+        "jobs": deepcopy(tendwire._jobs),
+        "ready_state": deepcopy(tendwire._ready_state),
+        "ready_ref": deepcopy(tendwire._ready_ref),
+        "acks": deepcopy(tendwire.ack_calls),
+        "fails": deepcopy(tendwire.fail_calls),
+        "defers": deepcopy(tendwire.defer_calls),
+    }
+    for _forced_index in range(2):
+        forced = sync_once(
+            store, _runtime(tendwire, telegram, max_sends=10)
+        )
+        final = forced["tendwire_turn_final"]
+        assert final["polled"] == 0
+        assert final["staged"] == 0
+        assert final["operations"] == 0
+        assert final["delivered"] == 0
+        assert final["acked"] == 0
+        assert final["failed"] == 0
+        assert final["deferred"] == 0
+        assert final["uncertain"] == 0
+        assert final["content_pages"] == 0
+        assert final["changed"] is False
+        assert forced["content_pages"] == 0
+        assert forced["sent"] == 0
+        assert forced["turn_updates"] == 0
+        assert store == stable_snapshot["store"]
+        assert telegram.sent == stable_snapshot["sent"]
+        assert telegram.edited == stable_snapshot["edited"]
+        assert telegram.deleted_messages == stable_snapshot["deleted"]
+        assert telegram.api_calls == stable_snapshot["api_calls"]
+        assert telegram.topics == stable_snapshot["topics"]
+        assert tendwire.page_calls == stable_snapshot["pages"]
+        assert tendwire.prepare_calls == stable_snapshot["prepare"]
+        assert tendwire.source_prepare_refs == stable_snapshot[
+            "source_refs"
+        ]
+        assert tendwire._plans == stable_snapshot["plans"]
+        assert tendwire._jobs == stable_snapshot["jobs"]
+        assert tendwire._ready_state == stable_snapshot["ready_state"]
+        assert tendwire._ready_ref == stable_snapshot["ready_ref"]
+        assert tendwire.ack_calls == stable_snapshot["acks"]
+        assert tendwire.fail_calls == stable_snapshot["fails"]
+        assert tendwire.defer_calls == stable_snapshot["defers"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("record", None),
+        ("delete_content_revision", None),
+        ("turn_id", "turn-other"),
+        ("content_revision", "twrev1.other"),
+        ("stable_key", "wsk1_" + ("e" * 64)),
+        ("stable_key_version", True),
+        ("stable_key_version", 2),
+    ],
+)
+def test_existing_final_source_owner_rejects_malformed_or_different_immutable_record_before_side_effects(
+    monkeypatch, mutation, value
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    row = _turn_row(
+        "turn-owner-collision",
+        "twrev1.owner_collision",
+        "must not cross immutable owner",
+    )
+    stable_key = row["stable_key"]
+    tendwire = _ready_tendwire(row)
+    tendwire.commit_response_lost_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+
+    first = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=10)
+    )
+
+    assert first["tendwire_turn_final"]["status"] == "timeout"
+    final_identity = "twfinal1.owner_collision"
+    owners = store["tendwire_turn_final_source_owners"]
+    assert final_identity in owners
+    if mutation == "record":
+        owners[final_identity] = value
+    elif mutation == "delete_content_revision":
+        owners[final_identity].pop("content_revision")
+    else:
+        owners[final_identity][mutation] = value
+    invalid_record = deepcopy(owners[final_identity])
+    pages_before = deepcopy(tendwire.page_calls)
+    prepare_before = deepcopy(tendwire.prepare_calls)
+    tendwire.snapshot_worker_id = "worker-B"
+    tendwire.snapshot_fingerprint = "fp-B"
+    tendwire.snapshot_space_id = "space-B"
+
+    rejected = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=10)
+    )
+
+    assert rejected["tendwire_turn_final"]["deferred"] == 1
+    assert rejected["tendwire_turn_final"]["operations"] == 0
+    assert rejected["tendwire_turn_final"]["acked"] == 0
+    assert rejected["tendwire_turn_final"]["failed"] == 0
+    assert tendwire.page_calls == pages_before
+    assert tendwire.prepare_calls == prepare_before
+    assert telegram.sent == []
+    assert owners[final_identity] == invalid_record
+    entry_key, entry = state.find_worker_entry_by_stable_key(
+        store, stable_key
+    )
+    assert entry_key is not None
+    assert entry is not None
+    assert entry["tendwire_worker_id"] == "worker-B"
+    assert entry["tendwire_fingerprint"] == "fp-B"
+    assert entry["tendwire_space_id"] == "space-B"
+
+
 def test_recycled_worker_id_cannot_retarget_old_stable_root(
     monkeypatch,
 ):
@@ -3222,6 +3492,8 @@ def test_recycled_worker_id_cannot_retarget_old_stable_root(
         "twrev1.recycled_root",
         "old owner content",
     )
+    stable_key_k1 = row["stable_key"]
+    stable_key_k2 = "wsk1_" + ("a" * 64)
     tendwire = TurnFinalTendwire(
         row,
         emit_ready=False,
@@ -3230,9 +3502,17 @@ def test_recycled_worker_id_cannot_retarget_old_stable_root(
     telegram = DeletingTelegram()
     store = _store()
     sync_once(store, _runtime(tendwire, telegram))
+    original_entry_key, original_entry = (
+        state.find_worker_entry_by_stable_key(
+            store, stable_key_k1
+        )
+    )
+    assert original_entry_key is not None
+    assert original_entry is not None
+    original_topic_id = str(original_entry["topic_id"])
     tendwire.emit_ready = True
     tendwire.snapshot_fingerprint = "fp-replacement"
-    tendwire.snapshot_stable_key = "wsk1_" + ("a" * 64)
+    tendwire.snapshot_stable_key = stable_key_k2
     before = deepcopy(store)
 
     result = sync_once(
@@ -3252,6 +3532,29 @@ def test_recycled_worker_id_cannot_retarget_old_stable_root(
     assert store.get("tendwire_turn_final_source_owners") is None
     assert telegram.sent == []
     assert telegram.edited == []
+    retained_k1 = state.source_worker_entries(store)[
+        original_entry_key
+    ]
+    assert state.entry_stable_identity(retained_k1) == (
+        stable_key_k1,
+        1,
+    )
+    assert retained_k1["topic_id"] == original_topic_id
+    k2_entries = [
+        (entry_key, entry)
+        for entry_key, entry in state.source_worker_entries(
+            store
+        ).items()
+        if state.entry_stable_identity(entry)
+        == (stable_key_k2, 1)
+    ]
+    assert len(k2_entries) == 1
+    assert k2_entries[0][0] != original_entry_key
+    assert (
+        state.entry_stable_identity(k2_entries[0][1])
+        != state.entry_stable_identity(retained_k1)
+    )
+    assert store.get("telegram_message_bindings") in (None, {})
 
 
 def test_applied_blank_token_restart_rejects_recycled_worker_owner(
@@ -3339,23 +3642,40 @@ def test_v2_turn_list_never_prepares_or_marks_final_without_outbox_ack(
     )
 
 
-def test_legacy_no_anchor_plan_can_finish_from_exact_v2_turn_row(
+def test_source_less_plan_recovers_exact_v2_root_by_stable_key_after_owner_churn(
     monkeypatch,
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
-    final = "legacy staged final"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    final = "source-less staged final"
+    stable_key = _stable_key("worker-A", "fp-A")
+    row = _turn_row(
+        "turn-source-less-plan",
+        "twrev1.source_less_plan",
+        final,
+    )
+    row.update(
+        {
+            "worker_id": "worker-A",
+            "worker_fingerprint": "fp-A",
+            "space_id": "space-A",
+            "stable_key": stable_key,
+        }
+    )
     tendwire = TurnFinalTendwire(
-        _turn_row(
-            "turn-legacy-plan",
-            "twrev1.legacy_plan",
-            final,
-        ),
+        row,
         turn_schema_version=2,
     )
+    tendwire.attach_plan_source = False
+    tendwire.snapshot_worker_id = "worker-B"
+    tendwire.snapshot_fingerprint = "fp-B"
+    tendwire.snapshot_space_id = "space-B"
+    tendwire.snapshot_worker_name = "Claude B"
+    tendwire.snapshot_agent = "claude"
     begun = tendwire.connector_prepare_begin(
-        turn_id="turn-legacy-plan",
-        content_revision="twrev1.legacy_plan",
+        turn_id=row["id"],
+        content_revision=row["content"]["content_revision"],
         presentation_version=PRESENTATION_VERSION,
         part_count=1,
     )
@@ -3373,16 +3693,49 @@ def test_legacy_no_anchor_plan_can_finish_from_exact_v2_turn_row(
     tendwire.connector_prepare_commit(
         plan_token=begun["plan_token"]
     )
+    assert tendwire._jobs
+    assert all(
+        "turn" not in job["payload"] for job in tendwire._jobs
+    )
     telegram = DeletingTelegram()
+    store = _store()
+    store["telegram"]["managed_bots"] = {
+        "claude": {"enabled": True, "token": "claude-token"}
+    }
 
     result = sync_once(
-        _store(), _runtime(tendwire, telegram)
+        store, _runtime(tendwire, telegram)
     )
 
     assert result["tendwire_turn_final"]["acked"] == 1
-    assert any(
-        final in message[1] for message in telegram.sent
+    assert result["tendwire_turn_final"]["operations"] == 1
+    assert result["tendwire_turn_final"]["deferred"] == 0
+    assert result["tendwire_turn_final"]["failed"] == 0
+    assert tendwire.defer_calls == []
+    assert tendwire.fail_calls == []
+    assert len(telegram.sent) == 1
+    assert final in telegram.sent[0][1]
+    entry_key, entry = state.find_worker_entry_by_stable_key(
+        store, stable_key
     )
+    assert entry_key is not None
+    assert entry is not None
+    assert entry["tendwire_worker_id"] == "worker-B"
+    assert entry["tendwire_fingerprint"] == "fp-B"
+    assert entry["tendwire_space_id"] == "space-B"
+    assert state.entry_stable_identity(entry) == (stable_key, 1)
+    assert telegram.sent[0][2]["thread_id"] == entry["topic_id"]
+    assert telegram.sent[0][2]["token"] == "claude-token"
+    binding = state.find_message_binding(
+        store,
+        telegram.sent[0][3],
+        topic_id=entry["topic_id"],
+    )
+    assert binding is not None
+    assert binding["worker_id"] == "worker-B"
+    assert binding["space_id"] == "space-B"
+    assert binding["bot_kind"] == "claude"
+    assert "tendwire_turn_final_source_owners" not in store
 
 
 def test_turn_final_lease_seconds_default_and_bounds():
@@ -3481,6 +3834,7 @@ def test_checkpoint_before_ack_loss_resumes_by_stable_key_without_resend(
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     tendwire = _ready_tendwire(
         _turn_row(
             "turn-ack-root",
@@ -3488,6 +3842,7 @@ def test_checkpoint_before_ack_loss_resumes_by_stable_key_without_resend(
             "checkpointed answer",
         )
     )
+    stable_key = tendwire.row["stable_key"]
     tendwire.ack_loss_once = True
     telegram = DeletingTelegram()
     store = _store()
@@ -3513,9 +3868,11 @@ def test_checkpoint_before_ack_loss_resumes_by_stable_key_without_resend(
         == "reserved"
         for snapshot in checkpoints
     )
-    entry = next(
-        iter(state.source_worker_entries(store).values())
+    original_entry_key, entry = (
+        state.find_worker_entry_by_stable_key(store, stable_key)
     )
+    assert original_entry_key is not None
+    assert entry is not None
     for field in (
         "pending_turn_id",
         "pending_content_revision",
@@ -3528,6 +3885,11 @@ def test_checkpoint_before_ack_loss_resumes_by_stable_key_without_resend(
         "replaces_failed_plan_token",
     ):
         entry.pop(field, None)
+    tendwire.snapshot_worker_id = "worker-B"
+    tendwire.snapshot_fingerprint = "fp-B"
+    tendwire.snapshot_space_id = "space-B"
+    tendwire.snapshot_worker_name = "Claude B"
+    tendwire.snapshot_agent = "claude"
     tendwire.turns = lambda: {
         "ok": True,
         "schema_version": 2,
@@ -3550,6 +3912,23 @@ def test_checkpoint_before_ack_loss_resumes_by_stable_key_without_resend(
         state.tendwire_turn_jobs(store)[receipt_key]["substate"]
         == "acknowledged"
     )
+    current_entry_key, current_entry = (
+        state.find_worker_entry_by_stable_key(store, stable_key)
+    )
+    assert current_entry_key == original_entry_key
+    assert current_entry is entry
+    assert current_entry["tendwire_worker_id"] == "worker-B"
+    assert current_entry["tendwire_fingerprint"] == "fp-B"
+    assert current_entry["tendwire_space_id"] == "space-B"
+    assert state.entry_stable_identity(current_entry) == (
+        stable_key,
+        1,
+    )
+    assert second["tendwire_turn_final"]["deferred"] == 0
+    assert second["tendwire_turn_final"]["failed"] == 0
+    assert tendwire.defer_calls == []
+    assert tendwire.fail_calls == []
+    assert "tendwire_turn_final_source_owners" not in store
 
 
 def test_commit_response_loss_resumes_from_job_attached_source_without_turn_list(

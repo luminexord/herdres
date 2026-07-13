@@ -3035,6 +3035,33 @@ def _turn_final_source_owners(
     return owners
 
 
+def _canonical_final_source_owner(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(record, Mapping):
+        return None
+    turn_id = record.get("turn_id")
+    content_revision = record.get("content_revision")
+    stable_key = record.get("stable_key")
+    stable_key_version = record.get("stable_key_version")
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id
+        or not isinstance(content_revision, str)
+        or not content_revision
+        or not state.valid_stable_worker_key_pair(
+            stable_key, stable_key_version
+        )
+    ):
+        return None
+    return {
+        "turn_id": turn_id,
+        "content_revision": content_revision,
+        "stable_key": stable_key,
+        "stable_key_version": stable_key_version,
+    }
+
+
 def _resolve_final_source_entry(
     store: dict[str, Any],
     item: dict[str, Any],
@@ -3051,11 +3078,6 @@ def _resolve_final_source_entry(
         or state.entry_stable_identity(worker_entry) != identity
         or not state.worker_entry_is_uniquely_routable(
             store, entry_key, worker_entry
-        )
-        or _entry_worker_id(worker_entry) != item.get("worker_id")
-        or (
-            item.get("space_id") is not None
-            and _entry_space_id(worker_entry) != item.get("space_id")
         )
     ):
         return None, None
@@ -3085,24 +3107,26 @@ def _bind_or_verify_final_source_owner(
         or not state.worker_entry_is_uniquely_routable(
             store, entry_key, entry
         )
-        or _entry_worker_id(entry) != payload.get("worker_id")
-        or _entry_space_id(entry) != (payload.get("space_id") or "")
     ):
         return False, False
     record = {
         "turn_id": payload["turn_id"],
-        "worker_id": payload["worker_id"],
-        "space_id": payload["space_id"],
         "content_revision": payload["content_revision"],
         "stable_key": identity[0],
         "stable_key_version": identity[1],
-        "account_kind": managed_bot_kind_for_entry(entry),
     }
     final_identity = str(payload["final_identity"])
     owners = _turn_final_source_owners(store)
-    existing = owners.get(final_identity)
-    if existing is not None:
-        return existing == record, False
+    if final_identity in owners:
+        existing = _canonical_final_source_owner(
+            owners[final_identity]
+        )
+        if existing is None or existing != record:
+            return False, False
+        if owners[final_identity] != record:
+            owners[final_identity] = record
+            return True, True
+        return True, False
     if not allow_bind:
         return False, False
     owners = _turn_final_source_owners(store, create=True)
