@@ -30,6 +30,27 @@ def client_runner(monkeypatch):
     return TendwireClient(), calls, responses
 
 
+def test_turn_final_lease_seconds_default_invalid_and_bounds():
+    lease_seconds = tendwire_client.config.tendwire_turn_final_lease_seconds
+
+    assert lease_seconds(env={}) == 900
+    assert lease_seconds(
+        env={"HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": ""}
+    ) == 900
+    assert lease_seconds(
+        env={"HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "invalid"}
+    ) == 900
+    assert lease_seconds(
+        env={"HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "120"}
+    ) == 120
+    assert lease_seconds(
+        env={"HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "59"}
+    ) == 60
+    assert lease_seconds(
+        env={"HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "3601"}
+    ) == 3600
+
+
 def test_turns_requests_and_requires_v2_content_schema(client_runner):
     client, calls, responses = client_runner
     responses.append(
@@ -223,6 +244,81 @@ def test_prepare_begin_part_commit_send_only_neutral_bounded_json(client_runner)
     assert b'"assistant_final_text"' in encoded  # coordinate enum only
     assert begin["plan_token"] == part["plan_token"] == commit["plan_token"]
 
+
+
+def test_prepare_source_ref_is_exact_and_optional_and_ack_prunes_provider_ids(client_runner):
+    client, calls, responses = client_runner
+    responses.extend(
+        [
+            {
+                "body": {
+                    "schema_version": 1,
+                    "ok": True,
+                    "plan_token": "twplan1.source",
+                    "state": "preparing",
+                }
+            },
+            {
+                "body": {
+                    "schema_version": 1,
+                    "ok": True,
+                    "plan_token": "twplan1.source",
+                    "state": "active",
+                    "job_count": 1,
+                }
+            },
+            {
+                "body": {
+                    "schema_version": 1,
+                    "ok": True,
+                    "status": "acknowledged",
+                }
+            },
+        ]
+    )
+    source_ref = "twref1.exact_live_source"
+
+    client.connector_prepare_begin(
+        turn_id="turn-source",
+        content_revision="twrev1.source",
+        presentation_version="turn-present-v27",
+        part_count=1,
+        source_ref=source_ref,
+    )
+    client.connector_prepare_commit(
+        plan_token="twplan1.source",
+        source_ref=source_ref,
+    )
+    client.turn_final_ack(
+        "twref1.part",
+        {
+            "outcome": "applied",
+            "message_id": "901",
+            "nested": {
+                "chat_id": "-100",
+                "topic_id": "77",
+                "job_key": "turn-final:twplan1.source:000000",
+            },
+        },
+    )
+
+    prepare_payloads = [
+        json.loads(calls[index][1]["input"].decode("utf-8"))
+        for index in (0, 1)
+    ]
+    assert prepare_payloads[0]["source_ref"] == source_ref
+    assert prepare_payloads[1]["source_ref"] == source_ref
+    assert json.loads(calls[2][0][-1]) == {
+        "outcome": "applied",
+        "nested": {
+            "job_key": "turn-final:twplan1.source:000000",
+        },
+    }
+    encoded = json.dumps(prepare_payloads).lower()
+    assert all(
+        forbidden not in encoded
+        for forbidden in ("telegram", "chat_id", "topic_id", "message_id")
+    )
 
 def test_prepare_part_rejects_content_or_non_range_fields_without_calling_cli(client_runner):
     client, calls, _responses = client_runner

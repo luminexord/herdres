@@ -1,4 +1,4 @@
-# Release checklist (Herdres Goal 05B / tendwired source-only RC)
+# Release checklist (Herdres Goal 05B + Goal 10 / tendwired source-only RC)
 
 Build release artifacts from a **clean git checkout only**. Never zip the working
 directory directly — it can contain `__pycache__/`, `*.pyc`, `.pytest_cache/`,
@@ -25,12 +25,14 @@ HERDR_TELEGRAM_TOPICS_STATE="$backup_path" \
   ./herdres.py tendwire source-smoke --with-outbox
 ```
 
-The check must succeed against a compatible Tendwire store-schema-v7 producer
-using turn-list schema `2`, content-schema-v1 descriptors/pages, and the
-turn-final prepare/lease/ACK/recovery protocol, with
-`direct_herdr_calls=0`. It must not save the copied Herdres state or send/edit
-Telegram messages. Keep both files private, and do not proceed to a live
-reconciliation if the dry result is non-success.
+The dry `source-smoke --with-outbox` check is only a snapshot, turn-list,
+pending, and public-safety preflight against the compatible store-schema-v11
+producer. It must report `direct_herdr_calls=0`, must not save the copied
+Herdres state or send/edit Telegram messages, and does not poll or page a
+`final_ready` root, prepare a plan, ACK connector work, or exercise recovery.
+Keep both files private, and do not proceed to a live reconciliation if the dry
+result is non-success. Never treat this smoke result as the Goal 10 delivery
+protocol gate.
 
 ## 2. Paired continuity, delivery, and recovery verification
 
@@ -56,6 +58,13 @@ python -m pytest -q \
 HERDRES_TENDWIRE_MODE=source ./herdres.py tendwire source-smoke --with-outbox
 ```
 
+The exact Herdres `tests/test_tendwire_client.py` and
+`tests/test_turn_final_delivery.py` suites in this block are the hermetic Goal
+10 client/final-delivery gate and must pass before any stateful sync. The listed
+Tendwire connector/store tests are the paired producer gate. The repeated
+`source-smoke --with-outbox` remains only the shallow preflight described
+above.
+
 The paired gate must establish all of the following:
 
 - Tendwire retains a 32-byte installation key, matching digest marker, and
@@ -68,10 +77,11 @@ The paired gate must establish all of the following:
 - Only a persisted, live, nonquarantined identity containing a full
   `wsk1_[0-9a-f]{64}` string plus exact integer version `1` is independently
   routable and authoritative.
-- Tendwire's SQLite store is schema version `7` and provides the turn-list-v2,
-  immutable content-page, ordered turn-final plan, lease/ACK, and explicit
-  replacement-generation records expected by this Herdres consumer. Do not
-  qualify either side in isolation.
+- Tendwire's SQLite store is schema version `11` and provides turn-list-v2
+  observational projections, immutable content pages, durable retained
+  `final_ready` roots, range-only turn-final plans, restart-stable ordered jobs,
+  leases/ACK/dead-letter state, and explicit replacement-generation records
+  expected by this Herdres consumer. Do not qualify either side in isolation.
 - Production Herdres requests and accepts only exact integer `2` in the
   top-level Tendwire turn-list response. A v1 producer returns
   `upgrade_required`; a missing or unsupported content schema returns
@@ -91,12 +101,37 @@ The paired gate must establish all of the following:
   exact identities, order, unique cursors/segments, character/byte lengths, and
   null termination are verified. A defective page is the turn-local
   `invalid_content_page` outcome before prepare or Telegram mutation.
-- Herdres materializes exact content before deriving ordered multipart ranges.
-  Prepare begin/part/commit sends only neutral field/start/end spans, never turn
-  text. Every leased span must match the local plan. Stable
-  plan-token/sequence receipts progress strictly through reservation, Telegram
+- A complete authoritative final creates a durable connector-neutral
+  `final_ready` materialization root as part of Tendwire persistence; it does
+  not wait for Herdres availability. The root payload has exact integer
+  `schema_version: 2` and carries the exact public opaque
+  `stable_key`/integer-`1` `stable_key_version` pair, binding retained work to
+  the accepted worker continuity identity. A schema-v1 root never routes by
+  reusable worker or space IDs alone, and no private checkpoint or Telegram
+  state crosses in the root. A schema-v2 turn-list final remains observational
+  only and never by itself marks the final delivered.
+- Herdres leases the root and materializes exact content before deriving
+  ordered multipart ranges. Prepare begin/part/commit sends only neutral
+  field/start/end spans, never turn text. Begin and commit bind the leased
+  `source_ref`; part requests carry only the plan token, ordinal, and ranges.
+  Every leased span must match the local plan.
+- `HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` defaults or falls back to 900
+  when unset, empty, or invalid, and clamps configured values to 60 through
+  3600 seconds. One root lease covers canonical paging, plan staging, and ACK.
+- Stable job-key receipts progress strictly through reservation, Telegram
   apply, optional old-slot retirement, Tendwire ACK, and `acknowledged`, with a
-  durable checkpoint after each provider-side transition and after ACK.
+  durable private checkpoint after every provider-side transition and after
+  ACK. The stable job key, not a transient lease ref, is restart identity.
+- An ordinary restart resumes proven work under a fresh ref without repeating
+  Telegram work and reconciles a committed pending plan after lost final-ACK
+  response or completed-plan observation, even without a turn-list row. Only a
+  Tendwire-confirmed `superseded` or `plan_not_found` pending plan clears before
+  a newer root; other unresolved states continue to block it.
+- Tendwire owns final-ready/dead-letter retention and the bounded, public-safe
+  connector inspect plus identity-specific retry surfaces. Herdres owns
+  Telegram formatting, private provider state, and local checkpoints. Retry
+  can return `not_retryable` or `stale_revision` and does not remove provider
+  acceptance ambiguity.
 - Public absent, legacy-24, malformed, partial, and explicitly invalid
   identities are not private adoption candidates. The only private exception
   is one persisted exact-shaped v1 handle whose version field is absent.

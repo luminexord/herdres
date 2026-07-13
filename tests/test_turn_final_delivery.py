@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import herdres
 import pytest
-from herdres_connector import state
+from herdres_connector import config, state
 from herdres_connector.source_sync import PRESENTATION_VERSION, SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import RateLimited, TelegramClient, TelegramError
 from test_source_only import FakeTelegram, _source_worker, _store
@@ -35,10 +36,18 @@ def _descriptor(value: str | None, *, inline: bool, page_count: int = 0, first_c
     }
 
 
+def _stable_key(worker_id: str, fingerprint: str = "fp-1") -> str:
+    material = f"{worker_id}\0{fingerprint}".encode()
+    return "wsk1_" + hashlib.sha256(material).hexdigest()
+
+
 def _turn_row(turn_id: str, revision: str, final: str | None, *, user: str | None = None, inline: bool = True):
     row = {
         "id": turn_id,
         "worker_id": "worker-1",
+        "worker_fingerprint": "fp-1",
+        "stable_key": _stable_key("worker-1"),
+        "stable_key_version": 1,
         "complete": final is not None,
         "content": {
             "schema_version": 1,
@@ -72,39 +81,163 @@ def _mark_known_incomplete(row, fragment):
 
 
 class TurnFinalTendwire:
-    def __init__(self, row):
+    def __init__(
+        self,
+        row,
+        *,
+        emit_ready=False,
+        turn_schema_version=1,
+    ):
         self.row = row
+        self.emit_ready = emit_ready
+        self.turn_schema_version = turn_schema_version
+        self.snapshot_fingerprint = str(
+            row.get("worker_fingerprint") or "fp-1"
+        )
+        self.snapshot_stable_key = str(row["stable_key"])
+        self.snapshot_stable_key_version = int(
+            row["stable_key_version"]
+        )
         self.pages = {}
         self.page_calls = []
         self.prepare_calls = []
         self.poll_calls = 0
+        self.poll_lease_seconds = []
         self.ack_calls = []
         self.fail_calls = []
         self.defer_calls = []
+        self.source_prepare_refs = []
         self._plans = {}
         self._plan_by_revision = {}
         self._jobs = []
         self._ref_counter = 0
         self._active_plan = ""
+        self._ready_state = {}
+        self._ready_ref = {}
         self.ack_loss_once = False
         self.ack_committed_response_lost_once = False
+        self.commit_response_lost_once = False
+        self.completed_observe_lost_once = False
+
+    def _ready_payload(self):
+        revision = self.row["content"]["content_revision"]
+        fields = {}
+        for field in ("user_text", "assistant_final_text"):
+            descriptor = deepcopy(
+                self.row["content"]["fields"][field]
+            )
+            if (
+                descriptor["availability"] == "complete"
+                and descriptor["inline"]
+            ):
+                value = self.row[field]
+                cursor = (
+                    f"twcur1.ready_{revision.split('.')[-1]}_{field}"
+                )
+                self.pages.setdefault(
+                    (revision, field, cursor),
+                    {
+                        "ok": True,
+                        "schema_version": 1,
+                        "turn_id": self.row["id"],
+                        "content_revision": revision,
+                        "field": field,
+                        "availability": "complete",
+                        "segment_id": (
+                            f"twseg1.ready_{revision.split('.')[-1]}_{field}"
+                        ),
+                        "index": 0,
+                        "count": 1,
+                        "text": value,
+                        "segment_char_length": len(value),
+                        "segment_byte_length": len(
+                            value.encode("utf-8")
+                        ),
+                        "total_char_length": len(value),
+                        "total_byte_length": len(
+                            value.encode("utf-8")
+                        ),
+                        "next_cursor": None,
+                    },
+                )
+                descriptor["inline"] = False
+                descriptor["page_count"] = 1
+                descriptor["first_cursor"] = cursor
+            fields[field] = descriptor
+        identity = (
+            "twfinal1."
+            + revision.removeprefix("twrev1.").replace(".", "_")
+        )
+        return {
+            "schema_version": 2,
+            "operation": "materialize",
+            "final_identity": identity,
+            "turn_id": self.row["id"],
+            "worker_id": self.row["worker_id"],
+            "stable_key": self.row["stable_key"],
+            "stable_key_version": self.row["stable_key_version"],
+            "space_id": self.row.get("space_id") or "space-1",
+            "content_revision": revision,
+            "content": {
+                "schema_version": 1,
+                "content_revision": revision,
+                "known_incomplete": self.row["content"][
+                    "known_incomplete"
+                ],
+                "fields": fields,
+            },
+        }
+
+    def _ready_lease_for_ref(self, ref):
+        revision = next(
+            revision
+            for revision, lease_ref in self._ready_ref.items()
+            if lease_ref == ref
+        )
+        assert self._ready_state[revision] == "leased"
+        return revision, self._ready_payload()
 
     def snapshot(self):
         return {
             "ok": True,
-            "workers": [_source_worker({
-                "id": "worker-1",
-                "name": "Alpha",
-                "status": "idle" if self.row.get("complete") else "working",
-                "space_id": "space-1",
-                "fingerprint": "fp-1",
-                "meta": {"agent": "codex"},
-            })],
-            "spaces": [{"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp-1"}],
+            "workers": [
+                _source_worker(
+                    {
+                        "id": "worker-1",
+                        "name": "Alpha",
+                        "status": (
+                            "idle"
+                            if self.row.get("complete")
+                            else "working"
+                        ),
+                        "space_id": "space-1",
+                        "fingerprint": self.snapshot_fingerprint,
+                        "meta": {
+                            "agent": "codex",
+                            "stable_key": self.snapshot_stable_key,
+                            "stable_key_version": (
+                                self.snapshot_stable_key_version
+                            ),
+                        },
+                    }
+                )
+            ],
+            "spaces": [
+                {
+                    "id": "space-1",
+                    "name": "Project",
+                    "status": "active",
+                    "fingerprint": "space-fp-1",
+                }
+            ],
         }
 
     def turns(self):
-        return {"ok": True, "schema_version": 2, "turns": [deepcopy(self.row)]}
+        return {
+            "ok": True,
+            "schema_version": self.turn_schema_version,
+            "turns": [deepcopy(self.row)],
+        }
 
     def pending(self):
         return {"ok": True, "pending_interactions": []}
@@ -112,15 +245,26 @@ class TurnFinalTendwire:
     def connector_poll(self, **_kwargs):
         return {"ok": True, "items": []}
 
-    def turn_content_get(self, turn_id, revision, field, cursor=None):
+    def turn_content_get(
+        self, turn_id, revision, field, cursor=None
+    ):
         self.page_calls.append((turn_id, revision, field, cursor))
         return deepcopy(self.pages[(revision, field, cursor)])
 
-    def install_pages(self, revision: str, field: str, value: str, cuts: tuple[int, ...]):
+    def install_pages(
+        self,
+        revision: str,
+        field: str,
+        value: str,
+        cuts: tuple[int, ...],
+    ):
         starts = (0, *cuts)
         ends = (*cuts, len(value))
         count = len(ends)
-        cursors = [f"twcur1.{revision.split('.')[-1]}_{field}_{index}" for index in range(count)]
+        cursors = [
+            f"twcur1.{revision.split('.')[-1]}_{field}_{index}"
+            for index in range(count)
+        ]
         for index, (start, end) in enumerate(zip(starts, ends)):
             text = value[start:end]
             self.pages[(revision, field, cursors[index])] = {
@@ -130,7 +274,9 @@ class TurnFinalTendwire:
                 "content_revision": revision,
                 "field": field,
                 "availability": "complete",
-                "segment_id": f"twseg1.{revision.split('.')[-1]}_{field}_{index}",
+                "segment_id": (
+                    f"twseg1.{revision.split('.')[-1]}_{field}_{index}"
+                ),
                 "index": index,
                 "count": count,
                 "text": text,
@@ -138,26 +284,63 @@ class TurnFinalTendwire:
                 "segment_byte_length": len(text.encode("utf-8")),
                 "total_char_length": len(value),
                 "total_byte_length": len(value.encode("utf-8")),
-                "next_cursor": cursors[index + 1] if index + 1 < count else None,
+                "next_cursor": (
+                    cursors[index + 1]
+                    if index + 1 < count
+                    else None
+                ),
             }
         descriptor = self.row["content"]["fields"][field]
-        descriptor.update({
-            "inline": False,
-            "page_count": count,
-            "first_cursor": cursors[0],
-            "char_length": len(value),
-            "byte_length": len(value.encode("utf-8")),
-        })
+        descriptor.update(
+            {
+                "inline": False,
+                "page_count": count,
+                "first_cursor": cursors[0],
+                "char_length": len(value),
+                "byte_length": len(value.encode("utf-8")),
+            }
+        )
         self.row.pop(field, None)
 
-    def connector_prepare_begin(self, *, turn_id, content_revision, presentation_version, part_count):
+    def connector_prepare_begin(
+        self,
+        *,
+        turn_id,
+        content_revision,
+        presentation_version,
+        part_count,
+        source_ref=None,
+    ):
         assert presentation_version == PRESENTATION_VERSION
-        assert "telegram" not in presentation_version and "herdres" not in presentation_version
-        self.prepare_calls.append(("begin", content_revision, part_count))
+        assert (
+            "telegram" not in presentation_version
+            and "herdres" not in presentation_version
+        )
+        self.prepare_calls.append(
+            ("begin", content_revision, part_count)
+        )
+        if source_ref is not None:
+            self.source_prepare_refs.append(("begin", source_ref))
+        source = None
+        if source_ref is not None:
+            source_revision, source = self._ready_lease_for_ref(
+                source_ref
+            )
+            assert source_revision == content_revision
+            assert source["turn_id"] == turn_id
         token = self._plan_by_revision.get(content_revision)
         if token:
             plan = self._plans[token]
-            return {"ok": True, "plan_token": token, "state": plan["state"], "part_count": part_count, "accepted_parts": len(plan["parts"])}
+            if source is not None:
+                plan["source"] = deepcopy(source)
+                plan["source_ref"] = source_ref
+            return {
+                "ok": True,
+                "plan_token": token,
+                "state": plan["state"],
+                "part_count": part_count,
+                "accepted_parts": len(plan["parts"]),
+            }
         token = f"twplan1.plan{len(self._plans) + 1}"
         self._plan_by_revision[content_revision] = token
         self._plans[token] = {
@@ -166,74 +349,241 @@ class TurnFinalTendwire:
             "revision": content_revision,
             "part_count": part_count,
             "parts": {},
-            "replaces": self._active_plan,
+            "replaces": (
+                self._active_plan
+                if self._active_plan
+                and self._plans[self._active_plan]["turn_id"]
+                == turn_id
+                else ""
+            ),
+            "source": deepcopy(source),
+            "source_ref": source_ref,
         }
-        return {"ok": True, "plan_token": token, "state": "preparing", "part_count": part_count, "accepted_parts": 0}
+        return {
+            "ok": True,
+            "plan_token": token,
+            "state": "preparing",
+            "part_count": part_count,
+            "accepted_parts": 0,
+        }
 
-    def connector_prepare_part(self, *, plan_token, ordinal, spans):
+    def connector_prepare_part(
+        self, *, plan_token, ordinal, spans
+    ):
         self.prepare_calls.append(("part", plan_token, ordinal))
         self._plans[plan_token]["parts"][ordinal] = deepcopy(spans)
-        return {"ok": True, "plan_token": plan_token, "ordinal": ordinal, "accepted_parts": len(self._plans[plan_token]["parts"])}
+        return {
+            "ok": True,
+            "plan_token": plan_token,
+            "ordinal": ordinal,
+            "accepted_parts": len(
+                self._plans[plan_token]["parts"]
+            ),
+        }
 
-    def connector_prepare_commit(self, *, plan_token):
+    def connector_prepare_commit(
+        self, *, plan_token, source_ref=None
+    ):
         self.prepare_calls.append(("commit", plan_token))
+        if source_ref is not None:
+            self.source_prepare_refs.append(("commit", source_ref))
         plan = self._plans[plan_token]
+        if source_ref is not None:
+            source_revision, source = self._ready_lease_for_ref(
+                source_ref
+            )
+            assert source_ref == plan["source_ref"]
+            assert source_revision == plan["revision"]
+            assert source == plan["source"]
         if plan["state"] != "preparing":
-            count = len([job for job in self._jobs if job["payload"]["plan_token"] == plan_token])
-            return {"ok": True, "plan_token": plan_token, "state": plan["state"], "job_count": count}
+            count = len(
+                [
+                    job
+                    for job in self._jobs
+                    if job["payload"]["plan_token"] == plan_token
+                ]
+            )
+            if (
+                source_ref is None
+                and plan["state"] == "completed"
+                and self.completed_observe_lost_once
+            ):
+                self.completed_observe_lost_once = False
+                return {
+                    "ok": False,
+                    "schema_version": 1,
+                    "status": "timeout",
+                }
+            return {
+                "ok": True,
+                "plan_token": plan_token,
+                "state": plan["state"],
+                "job_count": count,
+            }
         sequence = 0
         jobs = []
         for ordinal in range(plan["part_count"]):
-            jobs.append(self._job(plan_token, sequence, "upsert", ordinal, plan["part_count"], plan["parts"][ordinal], plan["replaces"]))
+            jobs.append(
+                self._job(
+                    plan_token,
+                    sequence,
+                    "upsert",
+                    ordinal,
+                    plan["part_count"],
+                    plan["parts"][ordinal],
+                    plan["replaces"],
+                )
+            )
             sequence += 1
         if plan["replaces"]:
-            old_count = self._plans[plan["replaces"]]["part_count"]
-            for ordinal in range(old_count - 1, plan["part_count"] - 1, -1):
-                jobs.append(self._job(plan_token, sequence, "retire", ordinal, plan["part_count"], [], plan["replaces"]))
+            old_count = self._plans[plan["replaces"]][
+                "part_count"
+            ]
+            for ordinal in range(
+                old_count - 1,
+                plan["part_count"] - 1,
+                -1,
+            ):
+                jobs.append(
+                    self._job(
+                        plan_token,
+                        sequence,
+                        "retire",
+                        ordinal,
+                        plan["part_count"],
+                        [],
+                        plan["replaces"],
+                    )
+                )
                 sequence += 1
         self._jobs.extend(jobs)
         plan["state"] = "active"
         self._active_plan = plan_token
-        return {"ok": True, "plan_token": plan_token, "state": "active", "job_count": len(jobs)}
+        if source_ref is not None:
+            self._ready_state[plan["revision"]] = "awaiting_ack"
+        result = {
+            "ok": True,
+            "plan_token": plan_token,
+            "state": "active",
+            "job_count": len(jobs),
+            "generation": 1,
+        }
+        if source_ref is not None and self.commit_response_lost_once:
+            self.commit_response_lost_once = False
+            return {
+                "ok": False,
+                "schema_version": 1,
+                "status": "timeout",
+            }
+        return result
 
-    def _job(self, token, sequence, operation, ordinal, part_count, spans, replaces):
+    def _job(
+        self,
+        token,
+        sequence,
+        operation,
+        ordinal,
+        part_count,
+        spans,
+        replaces,
+    ):
         plan = self._plans[token]
+        payload = {
+            "schema_version": 1,
+            "plan_token": token,
+            "content_revision": plan["revision"],
+            "presentation_version": PRESENTATION_VERSION,
+            "operation": operation,
+            "sequence_index": sequence,
+            "part_ordinal": ordinal,
+            "part_count": part_count,
+            "spans": deepcopy(spans),
+            "replaces_plan_token": replaces or None,
+        }
+        if plan.get("source") is not None:
+            payload["turn"] = deepcopy(plan["source"])
         return {
             "status": "queued",
             "key": f"turn-final:{token}:{sequence:06d}",
-            "payload": {
-                "schema_version": 1,
-                "plan_token": token,
-                "content_revision": plan["revision"],
-                "presentation_version": PRESENTATION_VERSION,
-                "operation": operation,
-                "sequence_index": sequence,
-                "part_ordinal": ordinal,
-                "part_count": part_count,
-                "spans": deepcopy(spans),
-                "replaces_plan_token": replaces or None,
-            },
+            "payload": payload,
         }
 
     def turn_final_poll(self, *, limit=1, lease_seconds=60):
-        assert limit == 1 and lease_seconds == 60
+        assert limit == 1
+        assert lease_seconds == config.tendwire_turn_final_lease_seconds()
         self.poll_calls += 1
+        self.poll_lease_seconds.append(lease_seconds)
         for job in self._jobs:
             if job["status"] != "queued":
                 continue
             token = job["payload"]["plan_token"]
             sequence = job["payload"]["sequence_index"]
-            prior = [candidate for candidate in self._jobs if candidate["payload"]["plan_token"] == token and candidate["payload"]["sequence_index"] < sequence]
-            if any(candidate["status"] != "delivered" for candidate in prior):
+            prior = [
+                candidate
+                for candidate in self._jobs
+                if candidate["payload"]["plan_token"] == token
+                and candidate["payload"]["sequence_index"]
+                < sequence
+            ]
+            if any(
+                candidate["status"] != "delivered"
+                for candidate in prior
+            ):
                 continue
             self._ref_counter += 1
             job["status"] = "leased"
             job["ref"] = f"twref1.lease{self._ref_counter}"
-            return {"ok": True, "schema_version": 1, "items": [{"ref": job["ref"], "key": job["key"], "attempt": self._ref_counter, "payload": deepcopy(job["payload"])}]}
+            return {
+                "ok": True,
+                "schema_version": 1,
+                "items": [
+                    {
+                        "ref": job["ref"],
+                        "key": job["key"],
+                        "attempt": self._ref_counter,
+                        "payload": deepcopy(job["payload"]),
+                    }
+                ],
+            }
+        if (
+            self.emit_ready
+            and self.row.get("complete")
+            and self.row["content"].get("known_incomplete") is False
+        ):
+            revision = self.row["content"]["content_revision"]
+            status = self._ready_state.setdefault(
+                revision, "queued"
+            )
+            if status == "queued":
+                self._ref_counter += 1
+                ref = f"twref1.ready{self._ref_counter}"
+                self._ready_state[revision] = "leased"
+                self._ready_ref[revision] = ref
+                ready = self._ready_payload()
+                return {
+                    "ok": True,
+                    "schema_version": 1,
+                    "items": [
+                        {
+                            "ref": ref,
+                            "key": (
+                                "turn-final:revision:"
+                                f"{ready['final_identity']}"
+                            ),
+                            "attempt": self._ref_counter,
+                            "payload": deepcopy(ready),
+                        }
+                    ],
+                }
         return {"ok": True, "schema_version": 1, "items": []}
 
     def _leased(self, ref):
-        return next(job for job in self._jobs if job.get("ref") == ref and job["status"] == "leased")
+        return next(
+            job
+            for job in self._jobs
+            if job.get("ref") == ref
+            and job["status"] == "leased"
+        )
 
     def turn_final_ack(self, ref, response=None):
         self.ack_calls.append((ref, deepcopy(response)))
@@ -241,32 +591,89 @@ class TurnFinalTendwire:
         if self.ack_loss_once:
             self.ack_loss_once = False
             job["status"] = "queued"
-            return {"ok": False, "schema_version": 1, "status": "timeout"}
+            return {
+                "ok": False,
+                "schema_version": 1,
+                "status": "timeout",
+            }
         job["status"] = "delivered"
         token = job["payload"]["plan_token"]
-        siblings = [candidate for candidate in self._jobs if candidate["payload"]["plan_token"] == token]
-        if all(candidate["status"] == "delivered" for candidate in siblings):
+        siblings = [
+            candidate
+            for candidate in self._jobs
+            if candidate["payload"]["plan_token"] == token
+        ]
+        if all(
+            candidate["status"] == "delivered"
+            for candidate in siblings
+        ):
             self._plans[token]["state"] = "completed"
+            revision = self._plans[token]["revision"]
+            if (
+                self._ready_state.get(revision)
+                == "awaiting_ack"
+            ):
+                self._ready_state[revision] = "delivered"
         if self.ack_committed_response_lost_once:
             self.ack_committed_response_lost_once = False
-            return {"ok": False, "schema_version": 1, "status": "timeout"}
-        return {"ok": True, "schema_version": 1, "status": "acknowledged"}
+            return {
+                "ok": False,
+                "schema_version": 1,
+                "status": "timeout",
+            }
+        return {
+            "ok": True,
+            "schema_version": 1,
+            "status": "acknowledged",
+        }
+
+    def _requeue_ref(self, ref):
+        for revision, lease_ref in self._ready_ref.items():
+            if (
+                lease_ref == ref
+                and self._ready_state.get(revision) == "leased"
+            ):
+                self._ready_state[revision] = "queued"
+            if lease_ref == ref:
+                return
+        self._leased(ref)["status"] = "queued"
 
     def turn_final_fail(self, ref, reason):
         self.fail_calls.append((ref, reason))
-        self._leased(ref)["status"] = "queued"
-        return {"ok": True, "schema_version": 1, "status": "retry_scheduled"}
+        self._requeue_ref(ref)
+        return {
+            "ok": True,
+            "schema_version": 1,
+            "status": "retry_scheduled",
+        }
 
     def turn_final_defer(self, ref, reason="", **_kwargs):
         self.defer_calls.append((ref, reason))
-        self._leased(ref)["status"] = "queued"
-        return {"ok": True, "schema_version": 1, "status": "deferred"}
+        self._requeue_ref(ref)
+        return {
+            "ok": True,
+            "schema_version": 1,
+            "status": "deferred",
+        }
 
 
 class MultiTurnFinalTendwire(TurnFinalTendwire):
     def __init__(self, rows):
         known_rows = list(rows)
-        super().__init__(known_rows[0])
+        for row in known_rows:
+            fingerprint = str(
+                row.get("worker_fingerprint")
+                or f"fp-{row['worker_id']}"
+            )
+            row["stable_key"] = _stable_key(
+                str(row["worker_id"]), fingerprint
+            )
+            row["stable_key_version"] = 1
+        super().__init__(
+            known_rows[0],
+            emit_ready=True,
+            turn_schema_version=2,
+        )
         self.rows = known_rows
         self.known_rows = known_rows
         self.attention_acked = []
@@ -287,8 +694,17 @@ class MultiTurnFinalTendwire(TurnFinalTendwire):
                         "name": worker_id,
                         "status": "idle" if row.get("complete") else "working",
                         "space_id": "space-1",
-                        "fingerprint": f"fp-{worker_id}",
-                        "meta": {"agent": row.get("agent", "codex")},
+                        "fingerprint": str(
+                            row.get("worker_fingerprint")
+                            or f"fp-{worker_id}"
+                        ),
+                        "meta": {
+                            "agent": row.get("agent", "codex"),
+                            "stable_key": row["stable_key"],
+                            "stable_key_version": (
+                                row["stable_key_version"]
+                            ),
+                        },
                     }
                 )
             )
@@ -319,6 +735,38 @@ class MultiTurnFinalTendwire(TurnFinalTendwire):
             self.install_pages(row["content"]["content_revision"], field, value, cuts)
         finally:
             self.row = previous
+
+    def turn_final_poll(self, *, limit=1, lease_seconds=60):
+        known_worker_ids = {
+            row["worker_id"] for row in self.known_rows
+        }
+        first_by_worker = {}
+        for row in self.rows:
+            worker_id = row["worker_id"]
+            if worker_id in first_by_worker:
+                continue
+            first_by_worker[worker_id] = row
+        candidate = next(
+            (
+                row
+                for worker_id, row in first_by_worker.items()
+                if worker_id in known_worker_ids
+                and row.get("complete")
+                and row["content"].get("known_incomplete") is False
+                and self._ready_state.get(
+                    row["content"]["content_revision"]
+                )
+                != "delivered"
+            ),
+            None,
+        )
+        self.emit_ready = candidate is not None
+        if candidate is not None:
+            self.row = candidate
+        return super().turn_final_poll(
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
 
     def enable_attention(self):
         self._attention_available = True
@@ -351,6 +799,180 @@ class MultiTurnFinalTendwire(TurnFinalTendwire):
 
     def connector_fail(self, _ref, _error, **_kwargs):
         return {"ok": True}
+
+
+def _ready_tendwire(row):
+    return TurnFinalTendwire(
+        row,
+        emit_ready=True,
+        turn_schema_version=2,
+    )
+
+
+class PlanRetentionTendwire(TurnFinalTendwire):
+    def __init__(self, row):
+        super().__init__(
+            row,
+            emit_ready=True,
+            turn_schema_version=2,
+        )
+        self.missing_plans = set()
+        self.plan_errors = set()
+        self.supersede_on_ready = ""
+
+    def connector_prepare_commit(
+        self, *, plan_token, source_ref=None
+    ):
+        if source_ref is None and plan_token in self.plan_errors:
+            return {
+                "ok": False,
+                "schema_version": 1,
+                "status": "timeout",
+            }
+        if source_ref is None and plan_token in self.missing_plans:
+            return {
+                "ok": False,
+                "schema_version": 1,
+                "status": "plan_not_found",
+            }
+        return super().connector_prepare_commit(
+            plan_token=plan_token,
+            source_ref=source_ref,
+        )
+
+    def turn_final_poll(self, *, limit=1, lease_seconds=60):
+        response = super().turn_final_poll(
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+        if self.supersede_on_ready and any(
+            isinstance(item, dict)
+            and isinstance(item.get("payload"), dict)
+            and item["payload"].get("operation")
+            == "materialize"
+            for item in response.get("items", [])
+        ):
+            self._plans[self.supersede_on_ready][
+                "state"
+            ] = "superseded"
+            self.supersede_on_ready = ""
+        return response
+
+
+class SlowPageTendwire(TurnFinalTendwire):
+    def __init__(self, row, *, page_seconds):
+        super().__init__(
+            row,
+            emit_ready=True,
+            turn_schema_version=2,
+        )
+        self.clock = 0
+        self.page_seconds = page_seconds
+        self.ready_deadline = 0
+        self.ready_lease_seconds = []
+
+    def turn_final_poll(self, *, limit=1, lease_seconds=60):
+        response = super().turn_final_poll(
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+        if any(
+            isinstance(item, dict)
+            and isinstance(item.get("payload"), dict)
+            and item["payload"].get("operation")
+            == "materialize"
+            for item in response.get("items", [])
+        ):
+            self.ready_lease_seconds.append(lease_seconds)
+            self.ready_deadline = self.clock + lease_seconds
+        return response
+
+    def turn_content_get(
+        self, turn_id, revision, field, cursor=None
+    ):
+        self.clock += self.page_seconds
+        return super().turn_content_get(
+            turn_id, revision, field, cursor
+        )
+
+    def _ready_lease_for_ref(self, ref):
+        assert self.clock < self.ready_deadline
+        return super()._ready_lease_for_ref(ref)
+
+
+class ReadyQueueTendwire(TurnFinalTendwire):
+    def __init__(self, rows):
+        self.rows = [deepcopy(row) for row in rows]
+        super().__init__(
+            self.rows[0],
+            emit_ready=True,
+            turn_schema_version=2,
+        )
+
+    def turns(self):
+        return {
+            "ok": True,
+            "schema_version": 2,
+            "turns": [],
+        }
+
+    def turn_final_poll(self, *, limit=1, lease_seconds=60):
+        for row in self.rows:
+            revision = row["content"]["content_revision"]
+            if self._ready_state.get(revision) != "delivered":
+                self.row = row
+                break
+        return super().turn_final_poll(
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+
+
+class MutatingReadyTendwire(TurnFinalTendwire):
+    def __init__(self, row, mutation):
+        super().__init__(
+            row,
+            emit_ready=True,
+            turn_schema_version=2,
+        )
+        self.mutation = mutation
+
+    def _ready_payload(self):
+        payload = super()._ready_payload()
+        self.mutation(payload)
+        return payload
+
+
+class ConflictingAttachedSourceTendwire(TurnFinalTendwire):
+    def __init__(self, row):
+        super().__init__(
+            row,
+            emit_ready=True,
+            turn_schema_version=2,
+        )
+        self.conflict_injected = False
+
+    def turn_final_poll(self, *, limit=1, lease_seconds=60):
+        response = super().turn_final_poll(
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+        if not self.conflict_injected:
+            for lease in response.get("items", []):
+                payload = lease.get("payload")
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("operation") == "upsert"
+                    and payload.get("sequence_index") == 1
+                    and isinstance(payload.get("turn"), dict)
+                ):
+                    payload["turn"] = deepcopy(payload["turn"])
+                    payload["turn"]["content"]["fields"][
+                        "assistant_final_text"
+                    ]["first_cursor"] = "twcur1.conflicting"
+                    self.conflict_injected = True
+                    break
+        return response
 
 
 class DeletingTelegram(FakeTelegram):
@@ -479,6 +1101,7 @@ def test_schema_incomplete_and_bad_page_refuse_before_any_telegram_activity(monk
     }
     incomplete_row.pop("assistant_final_text")
     incomplete = TurnFinalTendwire(incomplete_row)
+    incomplete.turn_schema_version = 2
     result = sync_once(_store(), _runtime(incomplete, telegram))
     assert result["ok"] is True
     assert result["turn_content_outcomes"] == {
@@ -713,7 +1336,7 @@ def test_revision_conflict_relists_and_never_mixes_page_generations(monkeypatch)
         listed += 1
         return {
             "ok": True,
-            "schema_version": 2,
+            "schema_version": 1,
             "turns": [deepcopy(old_row if listed == 1 else tendwire.row)],
         }
 
@@ -916,8 +1539,12 @@ def test_incomplete_row_isolated_while_working_final_pins_and_attention_continue
     tendwire.install_row_pages(final, "assistant_final_text", final_text, (7000,))
     tendwire.enable_attention()
     telegram = DeletingTelegram()
+    store = _store()
 
-    result = sync_once(_store(), _runtime(tendwire, telegram, max_sends=100))
+    result = sync_once(
+        store,
+        _runtime(tendwire, telegram, max_sends=100),
+    )
 
     assert result["ok"] is True
     assert result["content_pages"] == 2
@@ -939,7 +1566,27 @@ def test_incomplete_row_isolated_while_working_final_pins_and_attention_continue
     rendered = "\n".join(message[1] for message in telegram.sent)
     assert "Unrelated work continues" in rendered
     assert "ELIGIBLE_TAIL" in rendered
-    assert "account: active" in rendered
+    global_pin_id = str(
+        store["telegram"]["pinned_status_message_id"]
+    )
+    global_pin_html = next(
+        message[1]
+        for message in telegram.sent
+        if message[3] == global_pin_id
+    )
+    topic_entry = next(
+        entry
+        for entry in state.source_entries(store).values()
+        if entry.get("pinned_status_message_id")
+    )
+    topic_pin_id = str(topic_entry["pinned_status_message_id"])
+    topic_pin_html = next(
+        message[1]
+        for message in telegram.sent
+        if message[3] == topic_pin_id
+    )
+    assert "account: active" in global_pin_html
+    assert "account: active" in topic_pin_html
 
 
 def test_incomplete_revision_later_completes_once_then_forced_syncs_are_lazy(monkeypatch):
@@ -2277,3 +2924,1054 @@ def test_idempotent_replay_requires_every_immutable_audit_field(monkeypatch, cap
     assert code == 1
     assert output["status"] == "recovery_state_uncertain"
     assert saves == []
+
+
+def test_twenty_same_worker_ready_anchors_drain_in_order_and_forced_syncs_noop(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    rows = [
+        _turn_row(
+            f"turn-outage-{index:02d}",
+            f"twrev1.outage_{index:02d}",
+            f"outage final {index:02d}",
+        )
+        for index in range(20)
+    ]
+    tendwire = ReadyQueueTendwire(rows)
+    telegram = DeletingTelegram()
+    store = _store()
+
+    recovered = sync_once(
+        store,
+        _runtime(tendwire, telegram, max_sends=100),
+    )
+
+    assert recovered["tendwire_turn_final"]["staged"] == 20
+    assert recovered["tendwire_turn_final"]["acked"] == 20
+    assert recovered["tendwire_turn_final"]["operations"] == 20
+    assert len(telegram.sent) == 20
+    rendered = [message[1] for message in telegram.sent]
+    positions = [
+        next(
+            index
+            for index, html in enumerate(rendered)
+            if f"outage final {turn:02d}" in html
+        )
+        for turn in range(20)
+    ]
+    assert positions == list(range(20))
+    assert len(tendwire.source_prepare_refs) == 40
+    for index in range(0, 40, 2):
+        begin, commit = tendwire.source_prepare_refs[
+            index : index + 2
+        ]
+        assert begin[0] == "begin"
+        assert commit[0] == "commit"
+        assert begin[1] == commit[1]
+    assert all(
+        not ref.startswith("twref1.ready")
+        for ref, _response in tendwire.ack_calls
+    )
+    encoded_ack_responses = "\n".join(
+        str(response)
+        for _ref, response in tendwire.ack_calls
+    ).lower()
+    assert all(
+        forbidden not in encoded_ack_responses
+        for forbidden in (
+            "telegram",
+            "chat_id",
+            "topic_id",
+            "message_id",
+            "bot_token",
+        )
+    )
+
+    assert "tendwire_turn_final_source_owners" not in store
+
+    snapshot = {
+        "store": deepcopy(store),
+        "sent": deepcopy(telegram.sent),
+        "edited": deepcopy(telegram.edited),
+        "deleted": deepcopy(telegram.deleted_messages),
+        "pages": deepcopy(tendwire.page_calls),
+        "prepare": deepcopy(tendwire.prepare_calls),
+        "source_refs": deepcopy(tendwire.source_prepare_refs),
+        "plans": deepcopy(tendwire._plans),
+        "jobs": deepcopy(tendwire._jobs),
+        "ready_state": deepcopy(tendwire._ready_state),
+        "ready_ref": deepcopy(tendwire._ready_ref),
+        "acks": deepcopy(tendwire.ack_calls),
+        "fails": deepcopy(tendwire.fail_calls),
+        "defers": deepcopy(tendwire.defer_calls),
+    }
+    for _forced_index in range(2):
+        forced = sync_once(
+            store,
+            _runtime(tendwire, telegram, max_sends=100),
+        )
+        final = forced["tendwire_turn_final"]
+        assert final["polled"] == 0
+        assert final["staged"] == 0
+        assert final["operations"] == 0
+        assert final["delivered"] == 0
+        assert final["acked"] == 0
+        assert final["failed"] == 0
+        assert final["deferred"] == 0
+        assert final["uncertain"] == 0
+        assert final["content_pages"] == 0
+        assert final["changed"] is False
+        assert forced["content_pages"] == 0
+        assert forced["sent"] == 0
+        assert forced["turn_updates"] == 0
+        assert store == snapshot["store"]
+        assert telegram.sent == snapshot["sent"]
+        assert telegram.edited == snapshot["edited"]
+        assert telegram.deleted_messages == snapshot["deleted"]
+        assert tendwire.page_calls == snapshot["pages"]
+        assert tendwire.prepare_calls == snapshot["prepare"]
+        assert tendwire.source_prepare_refs == snapshot["source_refs"]
+        assert tendwire._plans == snapshot["plans"]
+        assert tendwire._jobs == snapshot["jobs"]
+        assert tendwire._ready_state == snapshot["ready_state"]
+        assert tendwire._ready_ref == snapshot["ready_ref"]
+        assert tendwire.ack_calls == snapshot["acks"]
+        assert tendwire.fail_calls == snapshot["fails"]
+        assert tendwire.defer_calls == snapshot["defers"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.pop("stable_key"),
+        lambda payload: payload.__setitem__(
+            "stable_key", "wsk1_not_hex"
+        ),
+        lambda payload: payload.__setitem__(
+            "stable_key_version", True
+        ),
+        lambda payload: payload.__setitem__(
+            "worker_id", "private worker id"
+        ),
+        lambda payload: payload["content"]["fields"][
+            "assistant_final_text"
+        ].__setitem__("inline", True),
+        lambda payload: payload["content"].__setitem__(
+            "assistant_final_text", "raw text"
+        ),
+        lambda payload: payload["content"]["fields"][
+            "assistant_final_text"
+        ].__setitem__("availability", "absent"),
+        lambda payload: payload["content"].__setitem__(
+            "content_revision", "twrev1.other"
+        ),
+    ],
+)
+def test_final_ready_public_identity_and_descriptors_fail_closed(
+    monkeypatch, mutation
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    tendwire = MutatingReadyTendwire(
+        _turn_row(
+            "turn-invalid-ready",
+            "twrev1.invalid_ready",
+            "must not send",
+        ),
+        mutation,
+    )
+    telegram = DeletingTelegram()
+
+    result = sync_once(
+        _store(), _runtime(tendwire, telegram)
+    )
+
+    assert (
+        result["tendwire_turn_final"]["status"]
+        == "invalid_turn_final_job"
+    )
+    assert result["tendwire_turn_final"]["failed"] == 1
+    assert tendwire.page_calls == []
+    assert tendwire.prepare_calls == []
+    assert tendwire.ack_calls == []
+    assert not any(
+        "must not send" in message[1]
+        for message in telegram.sent
+    )
+
+
+def test_legacy_v1_final_ready_defers_without_routing_or_attempt(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+
+    def legacy_v1(payload):
+        payload["schema_version"] = 1
+        payload.pop("stable_key")
+        payload.pop("stable_key_version")
+
+    tendwire = MutatingReadyTendwire(
+        _turn_row(
+            "turn-legacy-ready",
+            "twrev1.legacy_ready",
+            "legacy must not retarget",
+        ),
+        legacy_v1,
+    )
+    telegram = DeletingTelegram()
+    result = sync_once(
+        _store(), _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert result["tendwire_turn_final"]["deferred"] == 1
+    assert result["tendwire_turn_final"]["operations"] == 0
+    assert result["tendwire_turn_final"]["failed"] == 0
+    assert tendwire.defer_calls[-1][1] == "transient_delivery"
+    assert tendwire.page_calls == []
+    assert tendwire.prepare_calls == []
+    assert tendwire.ack_calls == []
+    assert tendwire.fail_calls == []
+    assert telegram.sent == []
+    assert telegram.edited == []
+
+
+def test_temporarily_unroutable_root_defers_before_pages_or_plan(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    tendwire = _ready_tendwire(
+        _turn_row(
+            "turn-unroutable-root",
+            "twrev1.unroutable_root",
+            "must stay durable",
+        )
+    )
+    tendwire.snapshot = lambda: {
+        "ok": True,
+        "workers": [],
+        "spaces": [],
+    }
+    telegram = DeletingTelegram()
+    store = _store()
+
+    result = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert result["tendwire_turn_final"]["deferred"] == 1
+    assert result["tendwire_turn_final"]["operations"] == 0
+    assert result["tendwire_turn_final"]["failed"] == 0
+    assert tendwire.defer_calls[-1][1] == "transient_delivery"
+    assert tendwire.page_calls == []
+    assert tendwire.prepare_calls == []
+    assert tendwire.ack_calls == []
+    assert tendwire.fail_calls == []
+    assert state.tendwire_turn_jobs(store) == {}
+    assert state.delivered_turns(store) == {}
+    assert telegram.sent == []
+    assert telegram.edited == []
+
+
+def test_conflicting_job_attached_source_fails_before_second_page_or_send(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
+    text = "cached immutable response\n\n" * 900
+    tendwire = ConflictingAttachedSourceTendwire(
+        _turn_row(
+            "turn-source-conflict",
+            "twrev1.source_conflict",
+            text,
+        )
+    )
+    telegram = DeletingTelegram()
+    store = _store()
+
+    result = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=100)
+    )
+
+    assert tendwire.conflict_injected is True
+    assert result["tendwire_turn_final"]["acked"] == 1
+    assert result["tendwire_turn_final"]["failed"] == 1
+    assert (
+        result["tendwire_turn_final"]["status"]
+        == "invalid_turn_final_job"
+    )
+    assert len(tendwire.page_calls) == 1
+    assert len(telegram.sent) == 1
+    assert tendwire.fail_calls[-1][1] == "invalid_turn_final_job"
+    assert sum(
+        receipt.get("substate") == "acknowledged"
+        for receipt in state.tendwire_turn_jobs(store).values()
+    ) == 1
+
+def test_recycled_worker_id_cannot_retarget_old_stable_root(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    row = _turn_row(
+        "turn-recycled-root",
+        "twrev1.recycled_root",
+        "old owner content",
+    )
+    tendwire = TurnFinalTendwire(
+        row,
+        emit_ready=False,
+        turn_schema_version=2,
+    )
+    telegram = DeletingTelegram()
+    store = _store()
+    sync_once(store, _runtime(tendwire, telegram))
+    tendwire.emit_ready = True
+    tendwire.snapshot_fingerprint = "fp-replacement"
+    tendwire.snapshot_stable_key = "wsk1_" + ("a" * 64)
+    before = deepcopy(store)
+
+    result = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert result["tendwire_turn_final"]["deferred"] == 1
+    assert result["tendwire_turn_final"]["operations"] == 0
+    assert result["tendwire_turn_final"]["failed"] == 0
+    assert tendwire.defer_calls[-1][1] == "transient_delivery"
+    assert tendwire.page_calls == []
+    assert tendwire.prepare_calls == []
+    assert tendwire.ack_calls == []
+    assert tendwire.fail_calls == []
+    assert state.delivered_turns(store) == {}
+    assert before.get("tendwire_turn_final_source_owners") is None
+    assert store.get("tendwire_turn_final_source_owners") is None
+    assert telegram.sent == []
+    assert telegram.edited == []
+
+
+def test_applied_blank_token_restart_rejects_recycled_worker_owner(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    row = _turn_row(
+        "turn-applied-recycled",
+        "twrev1.applied_recycled",
+        "send once to original owner",
+    )
+    tendwire = _ready_tendwire(row)
+    tendwire.ack_loss_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+    first = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    receipt = next(iter(state.tendwire_turn_jobs(store).values()))
+    assert first["tendwire_turn_final"]["status"] == "timeout"
+    assert receipt["substate"] == "telegram_applied"
+    original_sends = deepcopy(telegram.sent)
+    original_pages = deepcopy(tendwire.page_calls)
+    original_acks = deepcopy(tendwire.ack_calls)
+    entry = next(iter(state.source_worker_entries(store).values()))
+    for field in (
+        "pending_turn_id",
+        "pending_content_revision",
+        "pending_plan_token",
+        "pending_turn_part_count",
+        "pending_turn_job_count",
+        "pending_turn_user_hash",
+        "pending_plan_generation",
+        "pending_acknowledged_prefix_count",
+        "replaces_failed_plan_token",
+        "pending_final_identity",
+    ):
+        entry.pop(field, None)
+    tendwire.snapshot_fingerprint = "fp-replacement"
+    tendwire.snapshot_stable_key = "wsk1_" + ("b" * 64)
+
+    resumed = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert resumed["tendwire_turn_final"]["deferred"] == 1
+    assert resumed["tendwire_turn_final"]["operations"] == 0
+    assert resumed["tendwire_turn_final"]["acked"] == 0
+    assert resumed["tendwire_turn_final"]["failed"] == 0
+    assert tendwire.defer_calls[-1][1] == "transient_delivery"
+    assert telegram.sent == original_sends
+    assert tendwire.page_calls == original_pages
+    assert tendwire.ack_calls == original_acks
+    assert receipt["substate"] == "telegram_applied"
+
+
+def test_v2_turn_list_never_prepares_or_marks_final_without_outbox_ack(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    tendwire = TurnFinalTendwire(
+        _turn_row(
+            "turn-list-only",
+            "twrev1.list_only",
+            "historical list final",
+        ),
+        turn_schema_version=2,
+    )
+    telegram = DeletingTelegram()
+    store = _store()
+
+    result = sync_once(
+        store,
+        SyncRuntime(tendwire, telegram, with_outbox=False),
+    )
+
+    assert result["feed_sent"] == 0
+    assert tendwire.prepare_calls == []
+    assert state.delivered_turns(store) == {}
+    assert not any(
+        "historical list final" in message[1]
+        for message in telegram.sent
+    )
+
+
+def test_legacy_no_anchor_plan_can_finish_from_exact_v2_turn_row(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    final = "legacy staged final"
+    tendwire = TurnFinalTendwire(
+        _turn_row(
+            "turn-legacy-plan",
+            "twrev1.legacy_plan",
+            final,
+        ),
+        turn_schema_version=2,
+    )
+    begun = tendwire.connector_prepare_begin(
+        turn_id="turn-legacy-plan",
+        content_revision="twrev1.legacy_plan",
+        presentation_version=PRESENTATION_VERSION,
+        part_count=1,
+    )
+    tendwire.connector_prepare_part(
+        plan_token=begun["plan_token"],
+        ordinal=0,
+        spans=[
+            {
+                "field": "assistant_final_text",
+                "start_char": 0,
+                "end_char": len(final),
+            }
+        ],
+    )
+    tendwire.connector_prepare_commit(
+        plan_token=begun["plan_token"]
+    )
+    telegram = DeletingTelegram()
+
+    result = sync_once(
+        _store(), _runtime(tendwire, telegram)
+    )
+
+    assert result["tendwire_turn_final"]["acked"] == 1
+    assert any(
+        final in message[1] for message in telegram.sent
+    )
+
+
+def test_turn_final_lease_seconds_default_and_bounds():
+    assert config.tendwire_turn_final_lease_seconds(env={}) == 900
+    assert (
+        config.tendwire_turn_final_lease_seconds(
+            env={
+                "HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "120"
+            }
+        )
+        == 120
+    )
+    assert (
+        config.tendwire_turn_final_lease_seconds(
+            env={
+                "HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "59"
+            }
+        )
+        == 60
+    )
+    assert (
+        config.tendwire_turn_final_lease_seconds(
+            env={
+                "HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "3601"
+            }
+        )
+        == 3600
+    )
+    assert (
+        config.tendwire_turn_final_lease_seconds(
+            env={
+                "HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "invalid"
+            }
+        )
+        == 900
+    )
+
+
+def test_slow_final_materialization_stays_within_configured_root_lease(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS", "120"
+    )
+    tendwire = SlowPageTendwire(
+        _turn_row(
+            "turn-slow-pages",
+            "twrev1.slow_pages",
+            "slow canonical final",
+            user="slow canonical prompt",
+        ),
+        page_seconds=40,
+    )
+    telegram = DeletingTelegram()
+    store = _store()
+
+    delivered = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    page_calls = deepcopy(tendwire.page_calls)
+    prepare_calls = deepcopy(tendwire.prepare_calls)
+    ack_calls = deepcopy(tendwire.ack_calls)
+    forced = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert tendwire.clock == 80
+    assert 60 < tendwire.clock < 120
+    assert tendwire.ready_lease_seconds == [120]
+    assert set(tendwire.poll_lease_seconds) == {120}
+    assert [call[2] for call in page_calls] == [
+        "user_text",
+        "assistant_final_text",
+    ]
+    assert (
+        delivered["tendwire_turn_final"]["content_pages"] == 2
+    )
+    assert delivered["tendwire_turn_final"]["staged"] == 1
+    assert delivered["tendwire_turn_final"]["acked"] == 1
+    assert len(ack_calls) == 1
+    assert [
+        call[0] for call in tendwire.source_prepare_refs
+    ] == ["begin", "commit"]
+    assert forced["tendwire_turn_final"]["polled"] == 0
+    assert tendwire.page_calls == page_calls
+    assert tendwire.prepare_calls == prepare_calls
+    assert tendwire.ack_calls == ack_calls
+    assert tendwire.fail_calls == []
+    assert tendwire.defer_calls == []
+
+
+def test_checkpoint_before_ack_loss_resumes_by_stable_key_without_resend(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    tendwire = _ready_tendwire(
+        _turn_row(
+            "turn-ack-root",
+            "twrev1.ack_root",
+            "checkpointed answer",
+        )
+    )
+    tendwire.ack_loss_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+    checkpoints = []
+
+    first = sync_once(
+        store,
+        _runtime(
+            tendwire,
+            telegram,
+            max_sends=1,
+            checkpoint=lambda: checkpoints.append(
+                deepcopy(state.tendwire_turn_jobs(store))
+            ),
+        ),
+    )
+    sent_after_first = len(telegram.sent)
+    pages_after_first = deepcopy(tendwire.page_calls)
+    first_ref = tendwire.ack_calls[-1][0]
+    receipt_key = next(iter(state.tendwire_turn_jobs(store)))
+    assert any(
+        snapshot.get(receipt_key, {}).get("substate")
+        == "reserved"
+        for snapshot in checkpoints
+    )
+    entry = next(
+        iter(state.source_worker_entries(store).values())
+    )
+    for field in (
+        "pending_turn_id",
+        "pending_content_revision",
+        "pending_plan_token",
+        "pending_turn_part_count",
+        "pending_turn_job_count",
+        "pending_turn_user_hash",
+        "pending_plan_generation",
+        "pending_acknowledged_prefix_count",
+        "replaces_failed_plan_token",
+    ):
+        entry.pop(field, None)
+    tendwire.turns = lambda: {
+        "ok": True,
+        "schema_version": 2,
+        "turns": [],
+    }
+
+    second = sync_once(
+        store,
+        _runtime(tendwire, telegram, max_sends=1),
+    )
+
+    assert first["tendwire_turn_final"]["operations"] == 1
+    assert first["tendwire_turn_final"]["acked"] == 0
+    assert second["tendwire_turn_final"]["operations"] == 0
+    assert second["tendwire_turn_final"]["acked"] == 1
+    assert tendwire.ack_calls[-1][0] != first_ref
+    assert len(telegram.sent) == sent_after_first
+    assert tendwire.page_calls == pages_after_first
+    assert (
+        state.tendwire_turn_jobs(store)[receipt_key]["substate"]
+        == "acknowledged"
+    )
+
+
+def test_commit_response_loss_resumes_from_job_attached_source_without_turn_list(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    tendwire = _ready_tendwire(
+        _turn_row(
+            "turn-commit-loss",
+            "twrev1.commit_loss",
+            "exact source-backed answer",
+            user="source-backed prompt",
+        )
+    )
+    tendwire.commit_response_lost_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+
+    lost = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=10)
+    )
+    assert lost["tendwire_turn_final"]["status"] == "timeout"
+    assert lost["tendwire_turn_final"]["operations"] == 0
+    assert telegram.sent == []
+    assert [
+        call[0] for call in tendwire.source_prepare_refs[:2]
+    ] == ["begin", "commit"]
+    assert (
+        tendwire.source_prepare_refs[0][1]
+        == tendwire.source_prepare_refs[1][1]
+    )
+    tendwire.turns = lambda: {
+        "ok": True,
+        "schema_version": 2,
+        "turns": [],
+    }
+    entry = next(
+        iter(state.source_worker_entries(store).values())
+    )
+    for field in tuple(entry):
+        if field.startswith("pending_"):
+            entry.pop(field, None)
+
+    resumed = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=10)
+    )
+    sends = len(telegram.sent)
+    forced = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=10)
+    )
+
+    assert resumed["tendwire_turn_final"]["acked"] == 1
+    assert forced["tendwire_turn_final"]["polled"] == 0
+    assert len(telegram.sent) == sends == 1
+    assert all(
+        not ref.startswith("twref1.ready")
+        for ref, _response in tendwire.ack_calls
+    )
+
+
+def test_restart_reconciles_committed_last_part_ack_without_turn_list_or_resend(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    tendwire = _ready_tendwire(
+        _turn_row(
+            "turn-last-ack-crash",
+            "twrev1.last_ack_crash",
+            "provider accepted exactly once",
+        )
+    )
+    tendwire.ack_committed_response_lost_once = True
+    tendwire.completed_observe_lost_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+
+    interrupted = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    sends = len(telegram.sent)
+    receipt = next(
+        iter(state.tendwire_turn_jobs(store).values())
+    )
+    assert interrupted["tendwire_turn_final"]["status"] == "timeout"
+    assert receipt["substate"] == "telegram_applied"
+    tendwire.turns = lambda: {
+        "ok": True,
+        "schema_version": 2,
+        "turns": [],
+    }
+
+    resumed = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert resumed["tendwire_turn_final"]["polled"] == 0
+    assert len(telegram.sent) == sends == 1
+    assert receipt["substate"] == "acknowledged"
+    entry = next(
+        iter(state.source_worker_entries(store).values())
+    )
+    assert (
+        entry["last_clean_content_revision"]
+        == "twrev1.last_ack_crash"
+    )
+    assert "pending_plan_token" not in entry
+
+
+def test_committed_ack_response_loss_recovers_completed_plan_without_resend(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    tendwire = _ready_tendwire(
+        _turn_row(
+            "turn-committed-ack-root",
+            "twrev1.committed_ack_root",
+            "durably applied",
+        )
+    )
+    tendwire.ack_committed_response_lost_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+
+    first = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    sends = len(telegram.sent)
+    second = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert first["tendwire_turn_final"]["status"] == "timeout"
+    assert second["tendwire_turn_final"]["polled"] == 0
+    assert len(telegram.sent) == sends == 1
+    entry = next(
+        iter(state.source_worker_entries(store).values())
+    )
+    assert (
+        entry["last_clean_content_revision"]
+        == "twrev1.committed_ack_root"
+    )
+    assert "pending_plan_token" not in entry
+    assert (
+        next(iter(state.tendwire_turn_jobs(store).values()))[
+            "substate"
+        ]
+        == "acknowledged"
+    )
+
+
+@pytest.mark.parametrize(
+    "obsolete_state", ["superseded", "plan_not_found"]
+)
+def test_restart_clears_obsolete_pending_plan_and_delivers_newer_root(
+    monkeypatch, obsolete_state
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    turn_id = "turn-obsolete-restart"
+    tendwire = PlanRetentionTendwire(
+        _turn_row(
+            turn_id, "twrev1.r0", "last clean revision"
+        )
+    )
+    telegram = DeletingTelegram()
+    store = _store()
+
+    initial = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    assert initial["tendwire_turn_final"]["acked"] == 1
+    entry = next(
+        iter(state.source_worker_entries(store).values())
+    )
+    assert entry["last_clean_content_revision"] == "twrev1.r0"
+
+    tendwire.row = _turn_row(
+        turn_id, "twrev1.r1", "applied before restart"
+    )
+    tendwire.ack_committed_response_lost_once = True
+    tendwire.completed_observe_lost_once = True
+    interrupted = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    assert interrupted["tendwire_turn_final"]["status"] == "timeout"
+    pending_plan = entry["pending_plan_token"]
+    assert entry["pending_content_revision"] == "twrev1.r1"
+    assert entry["last_clean_content_revision"] == "twrev1.r0"
+    pending_receipt_key, pending_receipt = next(
+        (job_key, deepcopy(receipt))
+        for job_key, receipt in state.tendwire_turn_jobs(
+            store
+        ).items()
+        if receipt.get("plan_token") == pending_plan
+    )
+    assert pending_receipt["substate"] == "telegram_applied"
+    pending_bindings = deepcopy(
+        state.message_bindings(store)
+    )
+
+    tendwire.row = _turn_row(
+        turn_id,
+        "twrev1.r2",
+        "new authoritative revision",
+    )
+    if obsolete_state == "superseded":
+        tendwire.completed_observe_lost_once = True
+        tendwire.supersede_on_ready = pending_plan
+    else:
+        tendwire.missing_plans.add(pending_plan)
+    checkpoints = []
+    recovered = sync_once(
+        store,
+        _runtime(
+            tendwire,
+            telegram,
+            max_sends=1,
+            checkpoint=lambda: checkpoints.append(
+                deepcopy(store)
+            ),
+        ),
+    )
+
+    assert recovered["tendwire_turn_final"]["staged"] == 1
+    assert recovered["tendwire_turn_final"]["acked"] == 1
+    assert recovered["tendwire_turn_final"]["operations"] == 1
+    cleared_store = next(
+        snapshot
+        for snapshot in checkpoints
+        if "pending_plan_token"
+        not in next(
+            iter(
+                state.source_worker_entries(
+                    snapshot
+                ).values()
+            )
+        )
+    )
+    cleared_entry = next(
+        iter(state.source_worker_entries(cleared_store).values())
+    )
+    for field in (
+        "pending_turn_id",
+        "pending_content_revision",
+        "pending_plan_token",
+        "pending_turn_part_count",
+        "pending_turn_job_count",
+        "pending_turn_user_hash",
+        "pending_plan_generation",
+        "pending_acknowledged_prefix_count",
+        "replaces_failed_plan_token",
+    ):
+        assert field not in cleared_entry
+    assert (
+        cleared_entry["last_clean_content_revision"]
+        == "twrev1.r0"
+    )
+    assert (
+        state.tendwire_turn_jobs(cleared_store)[
+            pending_receipt_key
+        ]
+        == pending_receipt
+    )
+    assert (
+        state.message_bindings(cleared_store)
+        == pending_bindings
+    )
+    assert (
+        state.tendwire_turn_jobs(store)[pending_receipt_key]
+        == pending_receipt
+    )
+    assert entry["last_clean_content_revision"] == "twrev1.r2"
+    assert all(
+        not field.startswith("pending_turn_")
+        for field in entry
+    )
+
+
+@pytest.mark.parametrize(
+    "unresolved_state", ["failed", "unknown", "error"]
+)
+def test_newer_root_defers_while_pending_plan_is_not_strictly_obsolete(
+    monkeypatch, unresolved_state
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    turn_id = "turn-unresolved-restart"
+    tendwire = PlanRetentionTendwire(
+        _turn_row(
+            turn_id,
+            "twrev1.pending",
+            "pending revision",
+        )
+    )
+    tendwire.ack_committed_response_lost_once = True
+    tendwire.completed_observe_lost_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+    interrupted = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    assert interrupted["tendwire_turn_final"]["status"] == "timeout"
+    entry = next(
+        iter(state.source_worker_entries(store).values())
+    )
+    pending = {
+        field: entry[field]
+        for field in (
+            "pending_turn_id",
+            "pending_content_revision",
+            "pending_plan_token",
+            "pending_turn_part_count",
+            "pending_turn_job_count",
+            "pending_turn_user_hash",
+            "pending_plan_generation",
+        )
+    }
+    receipts = deepcopy(state.tendwire_turn_jobs(store))
+    pending_plan = pending["pending_plan_token"]
+    if unresolved_state == "error":
+        tendwire.plan_errors.add(pending_plan)
+    else:
+        tendwire._plans[pending_plan][
+            "state"
+        ] = unresolved_state
+    tendwire.row = _turn_row(
+        turn_id,
+        "twrev1.newer",
+        "must remain queued",
+    )
+    sends = deepcopy(telegram.sent)
+    edits = deepcopy(telegram.edited)
+    pages = deepcopy(tendwire.page_calls)
+
+    deferred = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert deferred["tendwire_turn_final"]["staged"] == 0
+    assert deferred["tendwire_turn_final"]["operations"] == 0
+    assert deferred["tendwire_turn_final"]["deferred"] == 1
+    assert tendwire.defer_calls[-1][1] == "predecessor_pending"
+    assert {field: entry[field] for field in pending} == pending
+    assert state.tendwire_turn_jobs(store) == receipts
+    assert telegram.sent == sends
+    assert telegram.edited == edits
+    assert tendwire.page_calls == pages
+
+class SensitiveProviderErrorTelegram(DeletingTelegram):
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+
+    def send_message(self, chat_id, html, **kwargs):
+        return {
+            "ok": False,
+            "kind": self.kind,
+            "error": (
+                "Telegram rejected message 12345 in topic "
+                "-100987654; bot token secret-987"
+            ),
+        }
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_reason", "call_log"),
+    [
+        ("permanent", "delivery_rejected", "fail_calls"),
+        ("transient", "transient_delivery", "defer_calls"),
+    ],
+)
+def test_provider_errors_use_backend_neutral_turn_final_reason_codes(
+    monkeypatch,
+    kind,
+    expected_reason,
+    call_log,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0"
+    )
+    tendwire = _ready_tendwire(
+        _turn_row(
+            "turn-private-error",
+            "twrev1.private_error",
+            "answer",
+        )
+    )
+    telegram = SensitiveProviderErrorTelegram(kind)
+
+    result = sync_once(
+        _store(),
+        _runtime(tendwire, telegram, max_sends=1),
+    )
+
+    captured = getattr(tendwire, call_log)
+    assert len(captured) == 1
+    reason = captured[0][1]
+    assert reason == expected_reason
+    assert all(
+        private not in reason.lower()
+        for private in (
+            "telegram",
+            "message",
+            "topic",
+            "bot",
+            "token",
+            "12345",
+            "-100987654",
+            "secret-987",
+        )
+    )
+    if kind == "permanent":
+        assert (
+            result["tendwire_turn_final"]["status"]
+            == "delivery_rejected"
+        )
+    else:
+        assert (
+            result["tendwire_turn_final"]["deferred"] == 1
+        )

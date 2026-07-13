@@ -60,6 +60,23 @@ def mode(env: Any | None = None) -> str:
     return str(source.get("HERDRES_TENDWIRE_MODE", "source") or "source").strip().lower()
 
 
+def tendwire_turn_final_lease_seconds(env: Any | None = None) -> int:
+    source = os.environ if env is None else env
+    try:
+        value = int(
+            str(
+                source.get(
+                    "HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS",
+                    "900",
+                )
+                or "900"
+            )
+        )
+    except (TypeError, ValueError):
+        return 900
+    return min(3600, max(60, value))
+
+
 def require_source_mode(env: Any | None = None) -> None:
     current = mode(env)
     if current != "source":

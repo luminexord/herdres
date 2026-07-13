@@ -331,18 +331,20 @@ class TendwireClient:
         content_revision: str,
         presentation_version: str,
         part_count: int,
+        source_ref: str | None = None,
     ) -> dict[str, Any]:
-        return self._connector_prepare(
-            {
-                "schema_version": CONNECTOR_PREPARE_SCHEMA_VERSION,
-                "action": "begin",
-                "name": TURN_FINAL_CONNECTOR,
-                "turn_id": str(turn_id),
-                "content_revision": str(content_revision),
-                "presentation_version": str(presentation_version),
-                "part_count": part_count,
-            }
-        )
+        request: dict[str, Any] = {
+            "schema_version": CONNECTOR_PREPARE_SCHEMA_VERSION,
+            "action": "begin",
+            "name": TURN_FINAL_CONNECTOR,
+            "turn_id": str(turn_id),
+            "content_revision": str(content_revision),
+            "presentation_version": str(presentation_version),
+            "part_count": part_count,
+        }
+        if source_ref is not None:
+            request["source_ref"] = str(source_ref)
+        return self._connector_prepare(request)
 
     def connector_prepare_part(
         self,
@@ -392,15 +394,18 @@ class TendwireClient:
             }
         )
 
-    def connector_prepare_commit(self, *, plan_token: str) -> dict[str, Any]:
-        return self._connector_prepare(
-            {
-                "schema_version": CONNECTOR_PREPARE_SCHEMA_VERSION,
-                "action": "commit",
-                "name": TURN_FINAL_CONNECTOR,
-                "plan_token": str(plan_token),
-            }
-        )
+    def connector_prepare_commit(
+        self, *, plan_token: str, source_ref: str | None = None
+    ) -> dict[str, Any]:
+        request = {
+            "schema_version": CONNECTOR_PREPARE_SCHEMA_VERSION,
+            "action": "commit",
+            "name": TURN_FINAL_CONNECTOR,
+            "plan_token": str(plan_token),
+        }
+        if source_ref is not None:
+            request["source_ref"] = str(source_ref)
+        return self._connector_prepare(request)
     def connector_prepare_recover(
         self,
         *,

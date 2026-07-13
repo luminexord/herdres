@@ -200,8 +200,14 @@ def run_real_herdr_text(args: list[str]) -> str:
     return proc.stdout
 
 
-def sanitize_text(value: str, max_chars: int = MAX_TEXT_CHARS) -> str:
-    text = str(value or "").replace("\x00", "")
+def sanitize_canonical_text(value: str) -> str:
+    """Sanitize lossless prompt/final content without applying a presentation bound."""
+    return str(value or "").replace("\x00", "")
+
+
+def sanitize_bounded_text(value: str, max_chars: int = MAX_TEXT_CHARS) -> str:
+    """Sanitize text for bounded transient/status fields."""
+    text = sanitize_canonical_text(value)
     if len(text) > max_chars:
         return text[: max_chars - 20].rstrip() + "\n[truncated]"
     return text
@@ -227,7 +233,7 @@ def add_stream_fields(
     source: str,
     updated_at: Any = "",
 ) -> dict[str, Any]:
-    stream_text = sanitize_text(str(text or "").strip())
+    stream_text = sanitize_bounded_text(str(text or "").strip())
     if not stream_text:
         return turn
     turn["assistant_stream_text"] = stream_text
@@ -396,7 +402,7 @@ def summarize_tool_use(name: Any, tool_input: Any) -> str:
     Handles claude tool_use input dicts and codex/devin arg dicts. A list value
     (e.g. a codex shell ``command: ["bash","-lc","..."]``) is joined to a string.
     """
-    label = sanitize_text(str(name or "tool").strip(), 40) or "tool"
+    label = sanitize_bounded_text(str(name or "tool").strip(), 40) or "tool"
     if not isinstance(tool_input, dict):
         return label
     for key in _TOOL_ARG_KEYS:
@@ -407,7 +413,7 @@ def summarize_tool_use(name: Any, tool_input: Any) -> str:
             brief = val.strip().splitlines()[0]
             if key in _TOOL_PATH_KEYS:
                 brief = brief.rstrip("/").rsplit("/", 1)[-1]
-            brief = sanitize_text(brief, WORKLOG_LINE_MAX_CHARS)
+            brief = sanitize_bounded_text(brief, WORKLOG_LINE_MAX_CHARS)
             return f"{label} {brief}".strip()
     return label
 
@@ -424,12 +430,12 @@ def _tool_call_worklog_line(name: Any, arguments: Any) -> str:
                 pass
     if isinstance(arguments, dict):
         return summarize_tool_use(name, arguments)
-    label = sanitize_text(str(name or "tool").strip(), 40) or "tool"
+    label = sanitize_bounded_text(str(name or "tool").strip(), 40) or "tool"
     if isinstance(arguments, list):
         joined = " ".join(str(c) for c in arguments if isinstance(c, (str, int, float))).strip()
-        return f"{label} {sanitize_text(joined.splitlines()[0], WORKLOG_LINE_MAX_CHARS)}".strip() if joined else label
+        return f"{label} {sanitize_bounded_text(joined.splitlines()[0], WORKLOG_LINE_MAX_CHARS)}".strip() if joined else label
     if isinstance(arguments, str) and arguments.strip():
-        return f"{label} {sanitize_text(arguments.strip().splitlines()[0], WORKLOG_LINE_MAX_CHARS)}".strip()
+        return f"{label} {sanitize_bounded_text(arguments.strip().splitlines()[0], WORKLOG_LINE_MAX_CHARS)}".strip()
     return label
 
 
@@ -461,7 +467,7 @@ def _accumulate_worklog(parts: list[str], raw_lines: list[str]) -> None:
     for ln in raw_lines:
         cleaned = _clean_worklog_line(ln)
         if cleaned:
-            parts.append(sanitize_text(cleaned, WORKLOG_LINE_MAX_CHARS))
+            parts.append(sanitize_bounded_text(cleaned, WORKLOG_LINE_MAX_CHARS))
     if len(parts) > WORKLOG_MAX_LINES:
         del parts[: len(parts) - WORKLOG_MAX_LINES]
 
@@ -488,7 +494,7 @@ def claude_worklog_lines(content: Any) -> list[str]:
     for ln in raw:
         cleaned = _clean_worklog_line(ln)  # strip control chars + redact secrets
         if cleaned:
-            lines.append(sanitize_text(cleaned, WORKLOG_LINE_MAX_CHARS))
+            lines.append(sanitize_bounded_text(cleaned, WORKLOG_LINE_MAX_CHARS))
     return lines
 
 
@@ -552,7 +558,7 @@ def claude_decision_turn_fields(tool: dict[str, Any]) -> dict[str, Any] | None:
                 ],
             }
         }
-        plan = sanitize_text(str(tool_input.get("plan") or "")).strip()
+        plan = sanitize_canonical_text(str(tool_input.get("plan") or "")).strip()
         if plan:
             fields["assistant_final_text"] = plan
         return fields
@@ -567,14 +573,14 @@ def claude_decision_turn_fields(tool: dict[str, Any]) -> dict[str, Any] | None:
             options: list[dict[str, str]] = []
             raw_opts = first.get("options") if isinstance(first.get("options"), list) else []
             for opt in raw_opts[:11]:
-                label = sanitize_text(str((opt.get("label") or opt.get("text") or opt.get("title") or "") if isinstance(opt, dict) else (opt or "")), 180).strip()
+                label = sanitize_bounded_text(str((opt.get("label") or opt.get("text") or opt.get("title") or "") if isinstance(opt, dict) else (opt or "")), 180).strip()
                 if label:
                     options.append({"id": str(len(options) + 1), "label": label, "send_text": label})
             if not options:
                 return None
             options.append({"id": "custom", "label": "✍️ Write a different answer", "send_text": ""})
-            header = sanitize_text(str(first.get("header") or ""), 80).strip()
-            question = sanitize_text(str(first.get("question") or "Choose an option."), 1200).strip() or "Choose an option."
+            header = sanitize_bounded_text(str(first.get("header") or ""), 80).strip()
+            question = sanitize_bounded_text(str(first.get("question") or "Choose an option."), 1200).strip() or "Choose an option."
             prompt = f"{header}: {question}" if header and header.lower() not in question.lower() else question
             fields = {
                 "pending_decision": {
@@ -597,7 +603,7 @@ def claude_decision_turn_fields(tool: dict[str, Any]) -> dict[str, Any] | None:
             opts: list[dict[str, str]] = []
             raw_opts = q.get("options") if isinstance(q.get("options"), list) else []
             for opt in raw_opts[:12]:
-                label = sanitize_text(str((opt.get("label") or opt.get("text") or opt.get("title") or "") if isinstance(opt, dict) else (opt or "")), 180).strip()
+                label = sanitize_bounded_text(str((opt.get("label") or opt.get("text") or opt.get("title") or "") if isinstance(opt, dict) else (opt or "")), 180).strip()
                 if label:
                     opts.append({"option_id": str(len(opts) + 1), "label": label, "value": label})
             if not opts:
@@ -605,7 +611,7 @@ def claude_decision_turn_fields(tool: dict[str, Any]) -> dict[str, Any] | None:
             norm_questions.append(
                 {
                     "question_id": f"q{qi}",
-                    "title": sanitize_text(str(q.get("question") or f"Question {qi}"), 500).strip() or f"Question {qi}",
+                    "title": sanitize_bounded_text(str(q.get("question") or f"Question {qi}"), 500).strip() or f"Question {qi}",
                     "type": "multi_choice" if bool(q.get("multiSelect")) else "single_choice",
                     "options": opts,
                 }
@@ -870,7 +876,7 @@ def extract_devin_turn_from_db(db_path: Path, pane_id: str, session_id: str) -> 
                 completed.append(_devin_turn(last_agent_text, timestamp))
             current_turn_id = str(node_id)
             current_started_at = timestamp
-            current_user_text = sanitize_text(content)
+            current_user_text = sanitize_canonical_text(content)
             last_agent_text = ""
             open_turn = True
             worklog_parts = []
@@ -878,7 +884,7 @@ def extract_devin_turn_from_db(db_path: Path, pane_id: str, session_id: str) -> 
 
         if role == "assistant" and open_turn:
             if content.strip():
-                last_agent_text = sanitize_text(content)
+                last_agent_text = sanitize_canonical_text(content)
             if tool_calls:
                 # Tool steps only (see extract_devin_turn): the message can become the
                 # final reply when closed by the next prompt, so don't dup it here.
@@ -1374,9 +1380,9 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 role = str(payload.get("role") or "")
                 text = content_text(payload.get("content")).strip()
                 if role == "user" and text and not is_internal_codex_user_text(text):
-                    current_user_text = sanitize_text(text)
+                    current_user_text = sanitize_canonical_text(text)
                 elif role == "assistant" and text:
-                    last_assistant_text = sanitize_text(text)
+                    last_assistant_text = sanitize_canonical_text(text)
                 continue
             # Tool calls between task_started and task_complete are the worklog. (codex
             # reasoning summaries are encrypted/empty, and the final reply is itself an
@@ -1392,7 +1398,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                     _accumulate_worklog(worklog_parts, [line])
                 continue
             if event.get("type") == "event_msg" and payload.get("type") == "task_complete":
-                final_text = sanitize_text(str(payload.get("last_agent_message") or "").strip())
+                final_text = sanitize_canonical_text(str(payload.get("last_agent_message") or "").strip())
                 if not final_text:
                     final_text = last_assistant_text
                 if final_text and current_user_text:
@@ -1499,7 +1505,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         # accumulated content (a pure-reasoning interrupt): the resulting turn EDITS the
                         # prompt message, which clears the "Working…" reasoning indicator (issue #3) —
                         # without it, a bare prompt message would keep "Working…" forever after an Esc.
-                        final_text = sanitize_text(latest_stream_text).strip() or "(interrupted)"
+                        final_text = sanitize_canonical_text(latest_stream_text).strip() or "(interrupted)"
                         turn = {
                             "available": True,
                             "pane_id": pane_id,
@@ -1533,7 +1539,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     # A real human prompt: it opens a new turn boundary. It also
                     # supersedes any prior API error (the owner has responded /
                     # is driving it forward), so don't keep warning about it.
-                    pending_user_text = sanitize_text(text)
+                    pending_user_text = sanitize_canonical_text(text)
                     pending_user_uuid = uuid
                     incomplete_user = True
                     pending_api_error = None
@@ -1565,8 +1571,8 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     # completion supersedes it (recovery).
                     pending_api_error = {
                         "id": str(event.get("uuid") or ""),
-                        "code": sanitize_text(str(event.get("error") or ""), 80),
-                        "text": sanitize_text(content_text(msg.get("content")).strip(), 600),
+                        "code": sanitize_bounded_text(str(event.get("error") or ""), 80),
+                        "text": sanitize_bounded_text(content_text(msg.get("content")).strip(), 600),
                         "at": event.get("timestamp"),
                     }
                     continue
@@ -1584,7 +1590,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         "started_at": None,
                         "completed_at": event.get("timestamp"),
                         "user_text": pending_user_text,
-                        "assistant_final_text": sanitize_text(text),
+                        "assistant_final_text": sanitize_canonical_text(text),
                         "_prompt_uuid": pending_user_uuid,
                     }
                     if WORKLOG_ENABLED and worklog_parts:
@@ -1613,7 +1619,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         if len(worklog_parts) > WORKLOG_MAX_LINES:
                             del worklog_parts[: len(worklog_parts) - WORKLOG_MAX_LINES]
                     if text and incomplete_user:
-                        latest_stream_text = sanitize_text(text)
+                        latest_stream_text = sanitize_canonical_text(text)
                         latest_stream_updated_at = event.get("timestamp") or ""
 
     if DECISIONS_ENABLED and incomplete_user:
@@ -1761,7 +1767,7 @@ def extract_devin_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 completed.append(_devin_turn(last_agent_text, timestamp))
             current_turn_id = str(step_id)
             current_started_at = timestamp
-            current_user_text = sanitize_text(msg)
+            current_user_text = sanitize_canonical_text(msg)
             last_agent_text = ""
             open_turn = True
             worklog_parts = []
@@ -1769,7 +1775,7 @@ def extract_devin_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
 
         if source == "agent" and open_turn:
             if msg.strip():
-                last_agent_text = sanitize_text(msg)
+                last_agent_text = sanitize_canonical_text(msg)
             if tool_calls:
                 # Tool-using step: record each tool call. The step's message is NOT added —
                 # it also becomes last_agent_text and, when the turn is closed by the next

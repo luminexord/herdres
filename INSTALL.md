@@ -32,8 +32,9 @@ copy a generated key value into configuration, examples, logs, or tickets.
 Treat these five items as one operational backup and restore unit:
 
 1. the Herdres state selected by `HERDR_TELEGRAM_TOPICS_STATE` (default
-   `~/.local/share/herdres/state.json`), which contains topic/message bindings
-   and delivery ledgers;
+   `~/.local/share/herdres/state.json`), which contains private Telegram
+   topic/message IDs, bot credentials and routing/ownership, final bindings,
+   and stable-job delivery checkpoints/receipts;
 2. the Tendwire database selected by `TENDWIRE_DB_PATH`;
 3. Tendwire's `installation.key`;
 4. Tendwire's `installation.key.sha256` marker; and
@@ -45,6 +46,15 @@ or an incomplete key/marker/sentinel triplet breaks the continuity contract.
 Once the sentinel records initialization, ordinary Tendwire key loading never
 rotates the identity or silently replaces missing key material; incomplete,
 mismatched, malformed, or unsafe state fails closed.
+
+An ordinary service restart must retain both the private Herdres state file and
+the Tendwire database unchanged. Herdres resumes from stable-job checkpoints
+under fresh transient lease refs, ACKs already-applied work without repeating
+the Telegram operation, and reconciles a completed pending plan when the final
+ACK response or completed-plan observation was lost. A pending plan confirmed
+as `superseded` or `plan_not_found` is cleared before its newer durable root is
+handled; every other unresolved state continues to block the newer root. Do
+not clear or edit either state store as part of a restart.
 
 An ordinary upgrade must retain this state set. Persisted Herdres workers with
 absent identity or a legacy 24-character lowercase hexadecimal identity are not
@@ -84,6 +94,14 @@ exact v1 shape but does not possess the HMAC key, cannot cryptographically
 authenticate an exact-format spoof, never reads raw pane identity, and never
 queries Herdr.
 
+Tendwire store schema v11 final-ready materialization roots use exact payload
+`schema_version: 2` and repeat that same public opaque `stable_key` plus exact
+integer `stable_key_version: 1` to bind retained work to worker continuity.
+Herdres never treats these public coordinates as private checkpoint data, and a
+schema-v1 root cannot be routed by reusable worker or space IDs alone. No
+Telegram routing, credentials, message state, or private checkpoint belongs in
+the root.
+
 ## Herdres itself
 
 This branch installs only:
@@ -98,7 +116,7 @@ This branch installs only:
 ./install-user.sh
 ```
 
-Required env:
+Core environment (the shown state path and final-root lease are defaults):
 
 ```sh
 HERDRES_TENDWIRE_MODE=source
@@ -106,8 +124,17 @@ HERDRES_SOURCE_TOPIC_MODE=space
 HERDRES_DELETE_DONE_COUNCIL_TOPICS=1
 TELEGRAM_BOT_TOKEN=...
 HERDRES_TELEGRAM_CHAT_ID=...
+HERDR_TELEGRAM_TOPICS_STATE=~/.local/share/herdres/state.json
 TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.db
+HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS=900
 ```
+
+The final-root lease covers canonical paging, range-only presentation-plan
+begin/part/commit staging, and ACK. It uses 900 seconds when unset, empty, or
+invalid and clamps configured values to 60 through 3600 seconds. Keep it long
+enough for the largest expected completed response. Tendwire owns durable
+final-ready roots, jobs, leases, ACK/dead-letter state, and retention; Herdres
+owns private Telegram provider state and stable-job checkpoints.
 
 Start only the source connector services:
 

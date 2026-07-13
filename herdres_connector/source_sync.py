@@ -2232,15 +2232,36 @@ def _stage_final_plan(
     item: dict[str, Any],
     entry: dict[str, Any],
     runtime: SyncRuntime,
-) -> int:
+    *,
+    source_ref: str | None = None,
+) -> tuple[bool, int]:
     revision = _content_revision(item)
     if not revision:
-        return 0
+        return False, 0
+
+    def _prepare_begin(part_count: int) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "turn_id": _turn_id(item),
+            "content_revision": revision,
+            "presentation_version": PRESENTATION_VERSION,
+            "part_count": part_count,
+        }
+        if source_ref is not None:
+            kwargs["source_ref"] = source_ref
+        return runtime.tendwire.connector_prepare_begin(**kwargs)
+
+    def _prepare_commit(plan_token: str) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"plan_token": plan_token}
+        if source_ref is not None:
+            kwargs["source_ref"] = source_ref
+        return runtime.tendwire.connector_prepare_commit(**kwargs)
+
     if (
-        entry.get("last_turn_id") == _turn_id(item)
+        source_ref is None
+        and entry.get("last_turn_id") == _turn_id(item)
         and entry.get("last_clean_content_revision") == revision
     ):
-        return 0
+        return False, 0
     if (
         entry.get("pending_turn_id") == _turn_id(item)
         and entry.get("pending_content_revision") == revision
@@ -2249,29 +2270,44 @@ def _stage_final_plan(
     ):
         pending_token = str(entry["pending_plan_token"])
         pending_count = entry.get("pending_turn_part_count")
-        if isinstance(pending_count, bool) or not isinstance(pending_count, int) or pending_count <= 0:
-            raise _TurnContentError("invalid_pending_plan", "pending plan has invalid part count")
-        observed = runtime.tendwire.connector_prepare_begin(
-            turn_id=_turn_id(item),
-            content_revision=revision,
-            presentation_version=PRESENTATION_VERSION,
-            part_count=pending_count,
-        )
+        if (
+            isinstance(pending_count, bool)
+            or not isinstance(pending_count, int)
+            or pending_count <= 0
+        ):
+            raise _TurnContentError(
+                "invalid_pending_plan", "pending plan has invalid part count"
+            )
+        observed = _prepare_begin(pending_count)
         if observed.get("ok") is False or observed.get("plan_token") != pending_token:
             raise _TurnContentError(
                 str(observed.get("status") or "prepare_failed"),
                 str(observed.get("error") or "pending plan reconciliation failed"),
             )
-        page_calls = 0
+        if source_ref is not None:
+            observed = _prepare_commit(pending_token)
+            if observed.get("ok") is False or observed.get("plan_token") != pending_token:
+                raise _TurnContentError(
+                    str(observed.get("status") or "prepare_failed"),
+                    str(observed.get("error") or "pending plan handoff failed"),
+                    conflict=str(observed.get("status") or "")
+                    in {"revision_conflict", "stale_revision", "stale_ref"},
+                )
         if observed.get("state") == "completed":
             receipts = [
                 (job_key, receipt)
                 for job_key, receipt in state.tendwire_turn_jobs(store).items()
-                if isinstance(receipt, dict) and receipt.get("plan_token") == pending_token
+                if isinstance(receipt, dict)
+                and receipt.get("plan_token") == pending_token
             ]
             for job_key, receipt in receipts:
-                if receipt.get("substate") in {"telegram_applied", "old_slot_retired"}:
-                    state.update_tendwire_turn_job(store, job_key, substate="acknowledged")
+                if receipt.get("substate") in {
+                    "telegram_applied",
+                    "old_slot_retired",
+                }:
+                    state.update_tendwire_turn_job(
+                        store, job_key, substate="acknowledged"
+                    )
                 elif receipt.get("substate") != "acknowledged":
                     raise _TurnContentError(
                         "invalid_pending_plan",
@@ -2285,12 +2321,16 @@ def _stage_final_plan(
                 revision=revision,
             ):
                 _checkpoint_turn_job(runtime)
-        return page_calls
+        return False, 0
+
     page_calls = _materialize_turn_item(item, runtime)
     feed_item = turn_item_from_source(item, entry)
     parts = prepare_turn_delivery_parts(feed_item)
     if not parts:
-        raise _TurnContentError("invalid_presentation_plan", "completed turn has no presentation parts")
+        raise _TurnContentError(
+            "invalid_presentation_plan",
+            "completed turn has no presentation parts",
+        )
     if runtime.dry_run:
         entry["pending_turn_id"] = _turn_id(item)
         entry["pending_content_revision"] = revision
@@ -2299,25 +2339,32 @@ def _stage_final_plan(
         entry["pending_turn_job_count"] = len(parts)
         entry["pending_turn_user_hash"] = _turn_user_hash(item)
         entry["pending_plan_generation"] = 1
-        return page_calls
-    begin = runtime.tendwire.connector_prepare_begin(
-        turn_id=_turn_id(item),
-        content_revision=revision,
-        presentation_version=PRESENTATION_VERSION,
-        part_count=len(parts),
-    )
+        return True, page_calls
+
+    begin = _prepare_begin(len(parts))
     if begin.get("ok") is False:
         raise _TurnContentError(
             str(begin.get("status") or "prepare_failed"),
             str(begin.get("error") or "connector prepare begin failed"),
-            conflict=str(begin.get("status") or "") in {"revision_conflict", "stale_revision"},
+            conflict=str(begin.get("status") or "")
+            in {"revision_conflict", "stale_revision", "stale_ref"},
         )
     plan_token = begin.get("plan_token")
     if not isinstance(plan_token, str) or not plan_token.startswith("twplan1."):
-        raise _TurnContentError("invalid_prepare_response", "prepare begin omitted a public plan token")
+        raise _TurnContentError(
+            "invalid_prepare_response",
+            "prepare begin omitted a public plan token",
+        )
     state_name = str(begin.get("state") or "")
-    if state_name not in {"preparing", "active", "waiting_predecessor", "completed"}:
-        raise _TurnContentError("invalid_prepare_response", "prepare begin returned invalid state")
+    if state_name not in {
+        "preparing",
+        "active",
+        "waiting_predecessor",
+        "completed",
+    }:
+        raise _TurnContentError(
+            "invalid_prepare_response", "prepare begin returned invalid state"
+        )
     if state_name == "preparing":
         for ordinal, part in enumerate(parts):
             response = runtime.tendwire.connector_prepare_part(
@@ -2334,29 +2381,34 @@ def _stage_final_plan(
                     str(response.get("status") or "prepare_failed"),
                     str(response.get("error") or "connector prepare part failed"),
                 )
-        commit = runtime.tendwire.connector_prepare_commit(plan_token=plan_token)
+        commit = _prepare_commit(plan_token)
+    elif source_ref is not None:
+        commit = _prepare_commit(plan_token)
     else:
         commit = begin
     if commit.get("ok") is False or commit.get("plan_token") != plan_token:
         raise _TurnContentError(
             str(commit.get("status") or "prepare_failed"),
             str(commit.get("error") or "connector prepare commit failed"),
-            conflict=str(commit.get("status") or "") in {"revision_conflict", "stale_revision"},
+            conflict=str(commit.get("status") or "")
+            in {"revision_conflict", "stale_revision", "stale_ref"},
         )
     committed_state = str(commit.get("state") or state_name)
     if committed_state not in {"active", "waiting_predecessor", "completed"}:
-        raise _TurnContentError("invalid_prepare_response", "prepare commit did not activate the plan")
+        raise _TurnContentError(
+            "invalid_prepare_response",
+            "prepare commit did not activate the plan",
+        )
     job_count = commit.get("job_count")
     if committed_state != "completed" and (
-        isinstance(job_count, bool) or not isinstance(job_count, int) or job_count < len(parts)
+        isinstance(job_count, bool)
+        or not isinstance(job_count, int)
+        or job_count < len(parts)
     ):
-        raise _TurnContentError("invalid_prepare_response", "prepare commit returned invalid job count")
-    entry["pending_turn_id"] = _turn_id(item)
-    entry["pending_content_revision"] = revision
-    entry["pending_plan_token"] = plan_token
-    entry["pending_turn_part_count"] = len(parts)
-    entry["pending_turn_job_count"] = int(job_count or 0)
-    entry["pending_turn_user_hash"] = _turn_user_hash(item)
+        raise _TurnContentError(
+            "invalid_prepare_response",
+            "prepare commit returned invalid job count",
+        )
     generation = commit.get("generation", begin.get("generation", 1))
     if (
         isinstance(generation, bool)
@@ -2367,8 +2419,17 @@ def _stage_final_plan(
             "invalid_prepare_response",
             "prepare response returned an invalid plan generation",
         )
+    entry["pending_turn_id"] = _turn_id(item)
+    entry["pending_content_revision"] = revision
+    entry["pending_plan_token"] = plan_token
+    entry["pending_turn_part_count"] = len(parts)
+    entry["pending_turn_job_count"] = int(job_count or 0)
+    entry["pending_turn_user_hash"] = _turn_user_hash(item)
     entry["pending_plan_generation"] = generation
-    return page_calls
+    final_identity = item.get(_TURN_FINAL_IDENTITY_KEY)
+    if isinstance(final_identity, str) and final_identity:
+        entry["pending_final_identity"] = final_identity
+    return True, page_calls
 
 
 def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
@@ -2488,7 +2549,13 @@ def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncR
     return False
 
 
-def _bootstrap_existing_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_payload: dict[str, Any]) -> int:
+def _bootstrap_existing_turns(
+    store: dict[str, Any],
+    turns_payload: dict[str, Any],
+    pending_payload: dict[str, Any],
+    *,
+    skip_v2_finals: bool = False,
+) -> int:
     """Record current Tendwire rows as seen on first deployment.
 
     The pre-slim source ledger used different identities. Without this bootstrap,
@@ -2508,6 +2575,8 @@ def _bootstrap_existing_turns(store: dict[str, Any], turns_payload: dict[str, An
         if not turn_id:
             continue
         if _turn_has_complete_final(item):
+            if skip_v2_finals and _content_revision(item):
+                continue
             revision = _content_revision(item)
             content_hash = revision or _turn_content_hash(item, "final")
             identity = f"final:{turn_id}:{content_hash}"
@@ -2551,6 +2620,7 @@ def _sync_turns(
     chat_id: str,
     live_worker_ids: set[str] | None = None,
     yield_barrier: Any | None = None,
+    list_finals_are_authoritative: bool = True,
 ) -> dict[str, int]:
     counts = {"feed_sent": 0, "sent": 0, "updated": 0, "content_pages": 0}
     turns = _turns(turns_payload)
@@ -2615,6 +2685,8 @@ def _sync_turns(
         latest_turn_id = latest_content_turn_by_worker.get(worker_key)
         complete = _turn_has_complete_final(item)
         if complete:
+            if not list_finals_are_authoritative and _content_revision(item):
+                continue
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 delivered = False
                 content_hash = _content_revision(item) or _turn_content_hash(item, "final")
@@ -2626,9 +2698,10 @@ def _sync_turns(
             seen_final_workers.add(worker_key)
             if _content_revision(item):
                 try:
-                    counts["content_pages"] += _stage_final_plan(
+                    _staged, page_calls = _stage_final_plan(
                         store, item, entry, runtime
                     )
+                    counts["content_pages"] += page_calls
                 except _TurnContentError as exc:
                     if exc.conflict and relist_on_conflict:
                         raise
@@ -2686,6 +2759,394 @@ def _after_provider_accept(runtime: SyncRuntime) -> None:
 def _checkpoint_turn_job(runtime: SyncRuntime) -> None:
     if runtime.checkpoint is not None:
         runtime.checkpoint()
+
+
+_PUBLIC_OPAQUE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+_PUBLIC_LABEL_CHARS = _PUBLIC_OPAQUE_CHARS | frozenset(".")
+
+
+def _strict_public_opaque(value: Any, prefix: str, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.startswith(prefix)
+        or not value[len(prefix) :]
+        or any(
+            char not in _PUBLIC_OPAQUE_CHARS
+            for char in value[len(prefix) :]
+        )
+        or len(value) > 200
+    ):
+        raise _TurnContentError(
+            "invalid_turn_final_job", f"invalid public {field}"
+        )
+    return value
+
+
+def _strict_public_label(
+    value: Any, field: str, *, prefix: str | None = None
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 200
+        or (prefix is not None and not value.startswith(prefix))
+        or any(char not in _PUBLIC_LABEL_CHARS for char in value)
+    ):
+        raise _TurnContentError(
+            "invalid_turn_final_job", f"invalid public {field}"
+        )
+    return value
+
+
+def _validate_ready_descriptor(
+    value: Any,
+    field: str,
+    *,
+    final_required: bool = False,
+) -> dict[str, Any]:
+    expected = {
+        "availability",
+        "inline",
+        "char_length",
+        "byte_length",
+        "page_count",
+        "first_cursor",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            f"invalid {field} descriptor shape",
+        )
+    availability = value.get("availability")
+    inline = value.get("inline")
+    char_length = value.get("char_length")
+    byte_length = value.get("byte_length")
+    page_count = value.get("page_count")
+    cursor = value.get("first_cursor")
+    if (
+        type(inline) is not bool
+        or inline
+        or any(
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 0
+            for number in (char_length, byte_length, page_count)
+        )
+        or byte_length < char_length
+    ):
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            f"invalid {field} descriptor values",
+        )
+    if availability == "absent":
+        if (
+            final_required
+            or char_length
+            or byte_length
+            or page_count
+            or cursor is not None
+        ):
+            raise _TurnContentError(
+                "invalid_turn_final_job",
+                f"inconsistent absent {field}",
+            )
+    elif availability == "complete":
+        if char_length == 0:
+            if byte_length or page_count or cursor is not None:
+                raise _TurnContentError(
+                    "invalid_turn_final_job",
+                    f"inconsistent empty {field}",
+                )
+        elif (
+            page_count <= 0
+            or not isinstance(cursor, str)
+            or not cursor.startswith("twcur1.")
+            or not cursor[7:]
+            or any(
+                char not in _PUBLIC_OPAQUE_CHARS for char in cursor[7:]
+            )
+        ):
+            raise _TurnContentError(
+                "invalid_turn_final_job",
+                f"unpageable complete {field}",
+            )
+    else:
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            f"invalid {field} availability",
+        )
+    return value
+
+
+def _validate_final_ready_payload(
+    payload: Any,
+    *,
+    delivery_key: str | None = None,
+) -> dict[str, Any]:
+    base_fields = {
+        "schema_version",
+        "operation",
+        "final_identity",
+        "turn_id",
+        "worker_id",
+        "space_id",
+        "content_revision",
+        "content",
+    }
+    schema = (
+        payload.get("schema_version")
+        if isinstance(payload, dict)
+        else None
+    )
+    expected = (
+        base_fields | {"stable_key", "stable_key_version"}
+        if type(schema) is int and schema == 2
+        else base_fields
+    )
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected
+        or type(schema) is not int
+        or schema not in {1, 2}
+        or payload.get("operation") != "materialize"
+    ):
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "final-ready payload shape is invalid",
+        )
+    if schema == 2 and not state.valid_stable_worker_key_pair(
+        payload.get("stable_key"),
+        payload.get("stable_key_version"),
+    ):
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "final-ready stable worker identity is invalid",
+        )
+    final_identity = _strict_public_opaque(
+        payload.get("final_identity"),
+        "twfinal1.",
+        "final identity",
+    )
+    if (
+        delivery_key is not None
+        and delivery_key != f"turn-final:revision:{final_identity}"
+    ):
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "final-ready delivery key is inconsistent",
+        )
+    _strict_public_label(
+        payload.get("turn_id"), "turn id", prefix="turn-"
+    )
+    _strict_public_label(payload.get("worker_id"), "worker id")
+    if payload.get("space_id") is not None:
+        _strict_public_label(payload.get("space_id"), "space id")
+    _strict_public_opaque(
+        payload.get("content_revision"),
+        "twrev1.",
+        "content revision",
+    )
+    content = payload.get("content")
+    if (
+        not isinstance(content, dict)
+        or set(content)
+        != {
+            "schema_version",
+            "content_revision",
+            "known_incomplete",
+            "fields",
+        }
+        or type(content.get("schema_version")) is not int
+        or content.get("schema_version") != TURN_CONTENT_SCHEMA_VERSION
+        or content.get("content_revision")
+        != payload["content_revision"]
+        or content.get("known_incomplete") is not False
+        or not isinstance(content.get("fields"), dict)
+        or set(content["fields"])
+        != {"user_text", "assistant_final_text"}
+    ):
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "final-ready content descriptor is invalid",
+        )
+    _validate_ready_descriptor(
+        content["fields"]["user_text"], "user_text"
+    )
+    _validate_ready_descriptor(
+        content["fields"]["assistant_final_text"],
+        "assistant_final_text",
+        final_required=True,
+    )
+    return payload
+
+
+_TURN_FINAL_SOURCE_OWNERS_KEY = "tendwire_turn_final_source_owners"
+_TURN_FINAL_IDENTITY_KEY = "_herdres_final_identity"
+
+
+def _public_turn_stable_identity(
+    item: dict[str, Any],
+) -> tuple[str, int] | None:
+    stable_key = item.get("stable_key")
+    stable_key_version = item.get("stable_key_version")
+    if stable_key is None and stable_key_version is None:
+        meta = item.get("meta")
+        if isinstance(meta, dict):
+            stable_key = meta.get("stable_key")
+            stable_key_version = meta.get("stable_key_version")
+    if not state.valid_stable_worker_key_pair(
+        stable_key, stable_key_version
+    ):
+        return None
+    return str(stable_key), int(stable_key_version)
+
+
+def _final_ready_row(payload: dict[str, Any]) -> dict[str, Any]:
+    row = {
+        "id": payload["turn_id"],
+        "worker_id": payload["worker_id"],
+        "space_id": payload["space_id"],
+        "complete": True,
+        _TURN_FINAL_IDENTITY_KEY: payload["final_identity"],
+        "content": {
+            **payload["content"],
+            "content_revision": payload["content_revision"],
+        },
+    }
+    identity = _public_turn_stable_identity(payload)
+    if identity is not None:
+        row["stable_key"] = identity[0]
+        row["stable_key_version"] = identity[1]
+    return _validate_turn_row(row)
+
+
+def _turn_final_source_owners(
+    store: dict[str, Any], *, create: bool = False
+) -> dict[str, Any]:
+    owners = store.get(_TURN_FINAL_SOURCE_OWNERS_KEY)
+    if isinstance(owners, dict):
+        return owners
+    if not create:
+        return {}
+    owners = {}
+    store[_TURN_FINAL_SOURCE_OWNERS_KEY] = owners
+    return owners
+
+
+def _resolve_final_source_entry(
+    store: dict[str, Any],
+    item: dict[str, Any],
+) -> tuple[str | None, dict[str, Any] | None]:
+    identity = _public_turn_stable_identity(item)
+    if identity is None:
+        return None, None
+    entry_key, worker_entry = state.find_worker_entry_by_stable_key(
+        store, identity[0]
+    )
+    if (
+        entry_key is None
+        or worker_entry is None
+        or state.entry_stable_identity(worker_entry) != identity
+        or not state.worker_entry_is_uniquely_routable(
+            store, entry_key, worker_entry
+        )
+        or _entry_worker_id(worker_entry) != item.get("worker_id")
+        or (
+            item.get("space_id") is not None
+            and _entry_space_id(worker_entry) != item.get("space_id")
+        )
+    ):
+        return None, None
+    if config.source_topic_mode() == "worker":
+        return entry_key, worker_entry
+    _space_key, space_entry = state.find_space_entry_by_id(
+        store, _entry_space_id(worker_entry)
+    )
+    if space_entry is None:
+        return None, None
+    return entry_key, _delivery_entry(space_entry, worker_entry)
+
+
+def _bind_or_verify_final_source_owner(
+    store: dict[str, Any],
+    payload: dict[str, Any],
+    entry_key: str | None,
+    entry: dict[str, Any],
+    *,
+    allow_bind: bool,
+) -> tuple[bool, bool]:
+    identity = _public_turn_stable_identity(payload)
+    if (
+        identity is None
+        or not entry_key
+        or state.entry_stable_identity(entry) != identity
+        or not state.worker_entry_is_uniquely_routable(
+            store, entry_key, entry
+        )
+        or _entry_worker_id(entry) != payload.get("worker_id")
+        or _entry_space_id(entry) != (payload.get("space_id") or "")
+    ):
+        return False, False
+    record = {
+        "turn_id": payload["turn_id"],
+        "worker_id": payload["worker_id"],
+        "space_id": payload["space_id"],
+        "content_revision": payload["content_revision"],
+        "stable_key": identity[0],
+        "stable_key_version": identity[1],
+        "account_kind": managed_bot_kind_for_entry(entry),
+    }
+    final_identity = str(payload["final_identity"])
+    owners = _turn_final_source_owners(store)
+    existing = owners.get(final_identity)
+    if existing is not None:
+        return existing == record, False
+    if not allow_bind:
+        return False, False
+    owners = _turn_final_source_owners(store, create=True)
+    owners[final_identity] = record
+    return True, True
+
+
+def _clear_final_source_owner(
+    store: dict[str, Any], final_identity: Any
+) -> None:
+    if not isinstance(final_identity, str) or not final_identity:
+        return
+    owners = store.get(_TURN_FINAL_SOURCE_OWNERS_KEY)
+    if not isinstance(owners, dict):
+        return
+    owners.pop(final_identity, None)
+    if not owners:
+        store.pop(_TURN_FINAL_SOURCE_OWNERS_KEY, None)
+
+
+def _materialize_final_ready(
+    payload: dict[str, Any],
+    runtime: SyncRuntime,
+) -> tuple[dict[str, Any], int]:
+    row = _final_ready_row(payload)
+    page_calls = _materialize_turn_item(row, runtime)
+    return row, page_calls
+
+
+def _materialize_legacy_plan_source(
+    turns_payload: dict[str, Any],
+    revision: str,
+    runtime: SyncRuntime,
+) -> tuple[dict[str, Any] | None, int]:
+    matches = [
+        item
+        for item in _turns(turns_payload)
+        if _content_revision(item) == revision
+    ]
+    if len(matches) != 1:
+        return None, 0
+    item = matches[0]
+    page_calls = _materialize_turn_item(item, runtime)
+    return item, page_calls
 
 
 def _turn_item_by_revision(
@@ -2788,13 +3249,26 @@ def _current_upsert_candidate(
 def _validate_turn_final_item(item: dict[str, Any]) -> dict[str, Any]:
     key = item.get("key")
     ref = item.get("ref")
+    if not isinstance(key, str):
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "turn-final delivery key is invalid",
+        )
+    _strict_public_opaque(ref, "twref1.", "lease ref")
     payload = item.get("payload")
-    if not isinstance(key, str) or not key.startswith("turn-final:twplan1.") or not isinstance(ref, str) or not ref:
-        raise _TurnContentError("invalid_turn_final_job", "turn-final lease identity is invalid")
-    payload_schema = payload.get("schema_version") if isinstance(payload, dict) else None
-    if type(payload_schema) is not int or payload_schema != 1:
-        raise _TurnContentError("invalid_turn_final_job", "turn-final payload schema is invalid")
+    if key.startswith("turn-final:revision:"):
+        return _validate_final_ready_payload(
+            payload, delivery_key=key
+        )
+    if not key.startswith("turn-final:twplan1.") or not isinstance(
+        payload, dict
+    ):
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "turn-final lease identity is invalid",
+        )
     required = {
+        "schema_version",
         "plan_token",
         "content_revision",
         "presentation_version",
@@ -2804,27 +3278,56 @@ def _validate_turn_final_item(item: dict[str, Any]) -> dict[str, Any]:
         "part_count",
         "spans",
     }
-    if not required.issubset(payload):
-        raise _TurnContentError("invalid_turn_final_job", "turn-final payload is incomplete")
-    plan_token = payload.get("plan_token")
-    revision = payload.get("content_revision")
+    if (
+        not required.issubset(payload)
+        or type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+    ):
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "turn-final payload is incomplete",
+        )
+    plan_token = _strict_public_opaque(
+        payload.get("plan_token"), "twplan1.", "plan token"
+    )
+    revision = _strict_public_opaque(
+        payload.get("content_revision"),
+        "twrev1.",
+        "content revision",
+    )
     sequence = payload.get("sequence_index")
     ordinal = payload.get("part_ordinal")
     part_count = payload.get("part_count")
     if (
-        not isinstance(plan_token, str)
-        or not plan_token.startswith("twplan1.")
-        or not isinstance(revision, str)
-        or not revision.startswith("twrev1.")
-        or payload.get("presentation_version") != PRESENTATION_VERSION
+        payload.get("presentation_version") != PRESENTATION_VERSION
         or payload.get("operation") not in {"upsert", "retire"}
-        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (sequence, ordinal))
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in (sequence, ordinal)
+        )
         or isinstance(part_count, bool)
         or not isinstance(part_count, int)
         or part_count <= 0
         or key != f"turn-final:{plan_token}:{sequence:06d}"
     ):
-        raise _TurnContentError("invalid_turn_final_job", "turn-final payload identity is inconsistent")
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "turn-final payload identity is inconsistent",
+        )
+    if "turn" in payload:
+        source = _validate_final_ready_payload(payload.get("turn"))
+        if source["content_revision"] != revision:
+            raise _TurnContentError(
+                "invalid_turn_final_job",
+                "turn-final plan and source revisions differ",
+            )
+    replaces = payload.get("replaces_plan_token")
+    if replaces is not None:
+        _strict_public_opaque(
+            replaces, "twplan1.", "replaced plan token"
+        )
     predecessor_job_key = payload.get("predecessor_job_key")
     if predecessor_job_key is not None and (
         not isinstance(predecessor_job_key, str)
@@ -2839,10 +3342,33 @@ def _validate_turn_final_item(item: dict[str, Any]) -> dict[str, Any]:
     operation = payload.get("operation")
     if (
         not isinstance(spans, list)
-        or (operation == "upsert" and ordinal >= part_count)
+        or (
+            operation == "upsert"
+            and (ordinal >= part_count or not spans)
+        )
         or (operation == "retire" and (ordinal < part_count or spans))
     ):
-        raise _TurnContentError("invalid_turn_final_job", "turn-final operation coordinates are invalid")
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "turn-final operation coordinates are invalid",
+        )
+    for span in spans:
+        if (
+            not isinstance(span, dict)
+            or set(span) != {"field", "start_char", "end_char"}
+            or span.get("field")
+            not in {"user_text", "assistant_final_text"}
+            or isinstance(span.get("start_char"), bool)
+            or not isinstance(span.get("start_char"), int)
+            or isinstance(span.get("end_char"), bool)
+            or not isinstance(span.get("end_char"), int)
+            or span["start_char"] < 0
+            or span["end_char"] <= span["start_char"]
+        ):
+            raise _TurnContentError(
+                "invalid_turn_final_job",
+                "turn-final span is invalid",
+            )
     return payload
 
 
@@ -2855,35 +3381,69 @@ def _maybe_complete_turn_plan(
     revision: str,
 ) -> bool:
     expected_jobs = entry.get("pending_turn_job_count")
-    if isinstance(expected_jobs, bool) or not isinstance(expected_jobs, int) or expected_jobs <= 0:
+    if (
+        isinstance(expected_jobs, bool)
+        or not isinstance(expected_jobs, int)
+        or expected_jobs <= 0
+    ):
         return False
     receipts = [
         receipt
         for receipt in state.tendwire_turn_jobs(store).values()
-        if isinstance(receipt, dict) and receipt.get("plan_token") == plan_token
+        if isinstance(receipt, dict)
+        and receipt.get("plan_token") == plan_token
     ]
     if len(receipts) < expected_jobs or any(
-        receipt.get("substate") != "acknowledged" for receipt in receipts
+        receipt.get("substate") != "acknowledged"
+        for receipt in receipts
     ):
         return False
-    part_count = int(entry.get("pending_turn_part_count") or 0)
-    bindings: list[tuple[int, str, dict[str, Any]]] = []
-    for message_id, binding in _final_delivery_bindings(store, _turn_id(item)):
-        if binding.get("plan_token") != plan_token:
+    part_count = entry.get("pending_turn_part_count")
+    if (
+        isinstance(part_count, bool)
+        or not isinstance(part_count, int)
+        or part_count <= 0
+    ):
+        return False
+    selected_bindings: dict[int, tuple[str, dict[str, Any]]] = {}
+    for message_id, binding in _final_delivery_bindings(
+        store, _turn_id(item)
+    ):
+        binding_plan = str(binding.get("plan_token") or "")
+        binding_revision = str(
+            binding.get("content_revision") or ""
+        )
+        if binding_plan != plan_token and binding_revision != revision:
             continue
         ordinal = binding.get("part_ordinal")
-        if isinstance(ordinal, int) and 0 <= ordinal < part_count:
-            bindings.append((ordinal, message_id, binding))
-    bindings.sort(key=lambda row: row[0])
-    if [ordinal for ordinal, _message_id, _binding in bindings] != list(range(part_count)):
+        if not isinstance(ordinal, int) or not 0 <= ordinal < part_count:
+            continue
+        existing = selected_bindings.get(ordinal)
+        if existing is None or binding_plan == plan_token:
+            selected_bindings[ordinal] = (message_id, binding)
+    bindings = [
+        (ordinal, *selected_bindings[ordinal])
+        for ordinal in sorted(selected_bindings)
+    ]
+    if [
+        ordinal for ordinal, _message_id, _binding in bindings
+    ] != list(range(part_count)):
         return False
-    message_ids = [message_id for _ordinal, message_id, _binding in bindings]
-    bot_kind = str(bindings[0][2].get("bot_kind") or MANAGER_BOT_KIND)
+    message_ids = [
+        message_id for _ordinal, message_id, _binding in bindings
+    ]
+    bot_kind = str(
+        bindings[0][2].get("bot_kind") or MANAGER_BOT_KIND
+    )
     identity = f"final:{_turn_id(item)}:{revision}"
     state.mark_delivered(
         store,
         identity,
-        {"worker_id": entry.get("tendwire_worker_id"), "turn_id": _turn_id(item), "content_revision": revision},
+        {
+            "worker_id": entry.get("tendwire_worker_id"),
+            "turn_id": _turn_id(item),
+            "content_revision": revision,
+        },
     )
     _set_final_delivery(
         entry,
@@ -2897,6 +3457,11 @@ def _maybe_complete_turn_plan(
     )
     entry["last_clean_content_revision"] = revision
     entry["last_clean_plan_token"] = plan_token
+    final_identity = (
+        entry.get("pending_final_identity")
+        or item.get(_TURN_FINAL_IDENTITY_KEY)
+    )
+    _clear_final_source_owner(store, final_identity)
     for field in (
         "pending_turn_id",
         "pending_content_revision",
@@ -2907,11 +3472,188 @@ def _maybe_complete_turn_plan(
         "pending_plan_generation",
         "pending_acknowledged_prefix_count",
         "replaces_failed_plan_token",
+        "pending_final_identity",
     ):
         entry.pop(field, None)
     _clear_stream_delivery_state(entry, _turn_id(item))
     _record_delivery_success(entry, bot_kind)
     return True
+
+
+def _reconcile_completed_turn_plans(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    pending_entry: dict[str, Any] | None = None,
+) -> int:
+    if not runtime.with_outbox or runtime.dry_run:
+        return 0
+    reconciled = 0
+    entries = (
+        (pending_entry,)
+        if pending_entry is not None
+        else state.source_worker_entries(store).values()
+    )
+    for entry in entries:
+        plan_token = entry.get("pending_plan_token")
+        revision = entry.get("pending_content_revision")
+        turn_id = entry.get("pending_turn_id")
+        part_count = entry.get("pending_turn_part_count")
+        if (
+            not isinstance(plan_token, str)
+            or not plan_token.startswith("twplan1.")
+            or not isinstance(revision, str)
+            or not revision.startswith("twrev1.")
+            or not isinstance(turn_id, str)
+            or not turn_id
+            or isinstance(part_count, bool)
+            or not isinstance(part_count, int)
+            or part_count <= 0
+        ):
+            continue
+        observed = runtime.tendwire.connector_prepare_commit(
+            plan_token=plan_token
+        )
+        observed_token = observed.get("plan_token")
+        plan_not_found = (
+            observed.get("ok") is False
+            and observed.get("status") == "plan_not_found"
+            and (observed_token is None or observed_token == plan_token)
+        )
+        superseded = (
+            observed.get("ok") is True
+            and observed_token == plan_token
+            and observed.get("state") == "superseded"
+        )
+        if plan_not_found or superseded:
+            _clear_final_source_owner(
+                store, entry.get("pending_final_identity")
+            )
+            for field in (
+                "pending_turn_id",
+                "pending_content_revision",
+                "pending_plan_token",
+                "pending_turn_part_count",
+                "pending_turn_job_count",
+                "pending_turn_user_hash",
+                "pending_plan_generation",
+                "pending_acknowledged_prefix_count",
+                "replaces_failed_plan_token",
+                "pending_final_identity",
+            ):
+                entry.pop(field, None)
+            reconciled += 1
+            _checkpoint_turn_job(runtime)
+            continue
+        if (
+            observed.get("ok") is not True
+            or observed_token != plan_token
+            or observed.get("state") != "completed"
+        ):
+            continue
+        job_count = observed.get("job_count")
+        if (
+            isinstance(job_count, bool)
+            or not isinstance(job_count, int)
+            or job_count <= 0
+        ):
+            continue
+        entry["pending_turn_job_count"] = job_count
+        advanced = False
+        for job_key, receipt in list(
+            state.tendwire_turn_jobs(store).items()
+        ):
+            if (
+                isinstance(receipt, dict)
+                and receipt.get("plan_token") == plan_token
+                and receipt.get("substate")
+                in {"telegram_applied", "old_slot_retired"}
+            ):
+                state.update_tendwire_turn_job(
+                    store, job_key, substate="acknowledged"
+                )
+                advanced = True
+        item = {
+            "id": turn_id,
+            "worker_id": _entry_worker_id(entry),
+            "space_id": _entry_space_id(entry),
+        }
+        if _maybe_complete_turn_plan(
+            store,
+            item,
+            entry,
+            plan_token=plan_token,
+            revision=revision,
+        ):
+            reconciled += 1
+            advanced = True
+        if advanced:
+            _checkpoint_turn_job(runtime)
+    return reconciled
+
+
+_TURN_FINAL_FAILURE_REASON_CODES = frozenset(
+    {
+        "content_fetch_failed",
+        "content_known_incomplete",
+        "content_revision_not_found",
+        "delivery_rejected",
+        "delivery_uncertain",
+        "invalid_content_page",
+        "invalid_content_schema",
+        "invalid_pending_plan",
+        "invalid_prepare_response",
+        "invalid_presentation_plan",
+        "invalid_recovery_predecessor_receipt",
+        "invalid_turn_final_job",
+        "missing_message_owner_token",
+        "prepare_failed",
+        "presentation_plan_mismatch",
+        "receipt_reservation_failed",
+        "revision_conflict",
+        "stale_or_unavailable_content_revision",
+        "stale_or_unroutable_turn_plan",
+        "stale_ref",
+        "stale_revision",
+        "timeout",
+        "unsupported_content_schema",
+        "unroutable_final_ready",
+        "upgrade_required",
+    }
+)
+_TURN_FINAL_DEFER_REASON_CODES = frozenset(
+    {
+        "operation_budget_exhausted",
+        "predecessor_pending",
+        "rate_limited",
+        "transient_delivery",
+    }
+)
+_TURN_FINAL_DEFER_REASON_ALIASES = {
+    "earlier presentation plan is still pending": "predecessor_pending",
+    "edit target unavailable; retry as send": "transient_delivery",
+    "physical operation budget exhausted": "operation_budget_exhausted",
+}
+
+
+def _turn_final_reason_code(
+    reason: str,
+    *,
+    uncertain: bool = False,
+    deferred: bool = False,
+) -> str:
+    if uncertain:
+        return "delivery_uncertain"
+    candidate = str(reason).split(":", 1)[0].strip()
+    if deferred:
+        if candidate in _TURN_FINAL_DEFER_REASON_CODES:
+            return candidate
+        return _TURN_FINAL_DEFER_REASON_ALIASES.get(
+            str(reason), "transient_delivery"
+        )
+    if candidate in _TURN_FINAL_FAILURE_REASON_CODES:
+        return candidate
+    return "delivery_rejected"
 
 
 def _fail_turn_final(
@@ -2922,9 +3664,13 @@ def _fail_turn_final(
     *,
     uncertain: bool = False,
 ) -> None:
-    response = runtime.tendwire.turn_final_fail(ref, reason)
+    reason_code = _turn_final_reason_code(
+        reason, uncertain=uncertain
+    )
+    response = runtime.tendwire.turn_final_fail(ref, reason_code)
     result["failed"] += 1
     result["changed"] = True
+    result["status"] = reason_code
     response_status = str(response.get("status") or "")
     if response_status == "attempts_exhausted":
         result["status"] = response_status
@@ -2932,7 +3678,9 @@ def _fail_turn_final(
         result["uncertain"] += 1
         result["status"] = "delivery_uncertain"
     if response.get("ok") is False:
-        result["status"] = str(response.get("status") or "turn_final_fail_failed")
+        result["status"] = str(
+            response.get("status") or "turn_final_fail_failed"
+        )
 
 
 def _telegram_result_is_transient(result: dict[str, Any]) -> bool:
@@ -2947,28 +3695,35 @@ def _defer_turn_final(
     ref: str,
     reason: str,
     result: dict[str, Any],
-    store: dict[str, Any],
-    job_key: str,
+    store: dict[str, Any] | None = None,
+    job_key: str = "",
     *,
     delay_seconds: int,
 ) -> None:
-    receipt = state.find_tendwire_turn_job(store, job_key)
-    if receipt is not None and receipt.get("substate") == "reserved":
-        state.update_tendwire_turn_job(
-            store,
-            job_key,
-            substate="retryable",
-        )
-        _checkpoint_turn_job(runtime)
+    if store is not None and job_key:
+        receipt = state.find_tendwire_turn_job(store, job_key)
+        if (
+            receipt is not None
+            and receipt.get("substate") == "reserved"
+        ):
+            state.update_tendwire_turn_job(
+                store,
+                job_key,
+                substate="retryable",
+            )
+            _checkpoint_turn_job(runtime)
+    reason_code = _turn_final_reason_code(reason, deferred=True)
     response = runtime.tendwire.turn_final_defer(
         ref,
-        reason,
+        reason_code,
         delay_seconds=max(1, int(delay_seconds)),
     )
     result["deferred"] += 1
     result["changed"] = True
     if response.get("ok") is False:
-        result["status"] = str(response.get("status") or "turn_final_defer_failed")
+        result["status"] = str(
+            response.get("status") or "turn_final_defer_failed"
+        )
 
 
 def _drain_turn_final(
@@ -2988,21 +3743,39 @@ def _drain_turn_final(
         "failed": 0,
         "deferred": 0,
         "uncertain": 0,
+        "staged": 0,
         "content_pages": 0,
         "changed": False,
     }
     failed_job_key = ""
-    if not runtime.with_outbox or max_operations <= 0 or runtime.dry_run:
+    if (
+        not runtime.with_outbox
+        or max_operations <= 0
+        or runtime.dry_run
+    ):
         return result
+    materialized_sources: dict[
+        str, tuple[dict[str, Any], dict[str, Any]]
+    ] = {}
+    lease_seconds = config.tendwire_turn_final_lease_seconds()
     for _iteration in range(max_operations + 100):
         if result["operations"] >= max_operations:
             break
-        poll = runtime.tendwire.turn_final_poll(limit=1)
+        poll = runtime.tendwire.turn_final_poll(
+            limit=1,
+            lease_seconds=lease_seconds,
+        )
         if poll.get("ok") is False:
-            result["status"] = str(poll.get("status") or "turn_final_poll_failed")
+            result["status"] = str(
+                poll.get("status") or "turn_final_poll_failed"
+            )
             result["changed"] = True
             break
-        jobs = [job for job in poll.get("items", []) if isinstance(job, dict)]
+        jobs = [
+            job
+            for job in poll.get("items", [])
+            if isinstance(job, dict)
+        ]
         if not jobs:
             break
         result["polled"] += 1
@@ -3011,18 +3784,131 @@ def _drain_turn_final(
         try:
             payload = _validate_turn_final_item(lease)
         except _TurnContentError as exc:
-            _fail_turn_final(runtime, ref, f"{exc.status}: {exc}", result)
+            _fail_turn_final(
+                runtime, ref, f"{exc.status}: {exc}", result
+            )
             break
+
+        if payload["operation"] == "materialize":
+            try:
+                item = _final_ready_row(payload)
+            except _TurnContentError as exc:
+                _fail_turn_final(
+                    runtime, ref, f"{exc.status}: {exc}", result
+                )
+                break
+            _entry_key, entry = _resolve_final_source_entry(
+                store, payload
+            )
+            if entry is None or not str(entry.get("topic_id") or ""):
+                owner_matches = False
+                owner_bound = False
+            else:
+                owner_matches, owner_bound = (
+                    _bind_or_verify_final_source_owner(
+                        store,
+                        payload,
+                        _entry_key,
+                        entry,
+                        allow_bind=True,
+                    )
+                )
+            if not owner_matches:
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "transient_delivery",
+                    result,
+                    delay_seconds=1,
+                )
+                break
+            if owner_bound:
+                _checkpoint_turn_job(runtime)
+            pending_plan = str(
+                entry.get("pending_plan_token") or ""
+            )
+            pending_revision = str(
+                entry.get("pending_content_revision") or ""
+            )
+            if (
+                pending_plan
+                and pending_revision
+                not in {"", payload["content_revision"]}
+            ):
+                _reconcile_completed_turn_plans(
+                    store,
+                    runtime,
+                    pending_entry=entry,
+                )
+                pending_plan = str(
+                    entry.get("pending_plan_token") or ""
+                )
+                pending_revision = str(
+                    entry.get("pending_content_revision") or ""
+                )
+            if (
+                pending_plan
+                and pending_revision
+                not in {"", payload["content_revision"]}
+            ):
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "predecessor_pending",
+                    result,
+                    delay_seconds=1,
+                )
+                break
+            try:
+                item, page_calls = _materialize_final_ready(
+                    payload, runtime
+                )
+            except _TurnContentError as exc:
+                _fail_turn_final(
+                    runtime, ref, f"{exc.status}: {exc}", result
+                )
+                break
+            result["content_pages"] += page_calls
+            source_identity = str(payload["final_identity"])
+            cached_source = materialized_sources.get(
+                source_identity
+            )
+            if (
+                cached_source is not None
+                and cached_source[0] != payload
+            ):
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    "invalid_turn_final_job",
+                    result,
+                )
+                break
+            try:
+                staged, staged_pages = _stage_final_plan(
+                    store,
+                    item,
+                    entry,
+                    runtime,
+                    source_ref=ref,
+                )
+            except _TurnContentError as exc:
+                _fail_turn_final(
+                    runtime, ref, f"{exc.status}: {exc}", result
+                )
+                break
+            result["content_pages"] += staged_pages
+            materialized_sources[source_identity] = (
+                payload,
+                item,
+            )
+            result["staged"] += int(staged)
+            result["changed"] = True
+            _checkpoint_turn_job(runtime)
+            continue
+
         revision = str(payload["content_revision"])
         plan_token = str(payload["plan_token"])
-        item = _turn_item_by_revision(turns_payload, revision)
-        if item is None:
-            _fail_turn_final(runtime, ref, "stale_or_unavailable_content_revision", result)
-            break
-        _entry_key, entry = _entry_for_turn(store, item)
-        if entry is None or entry.get("pending_plan_token") != plan_token:
-            _fail_turn_final(runtime, ref, "stale_or_unroutable_turn_plan", result)
-            break
         job_key = str(lease["key"])
         failed_job_key = job_key
         operation = str(payload["operation"])
@@ -3030,21 +3916,177 @@ def _drain_turn_final(
         ordinal = int(payload["part_ordinal"])
         part_count = int(payload["part_count"])
         replaces = str(payload.get("replaces_plan_token") or "")
-        predecessor_job_key = payload.get("predecessor_job_key")
+        existing_receipt = state.find_tendwire_turn_job(
+            store, job_key
+        )
+        durable_outcome = (
+            str((existing_receipt or {}).get("substate") or "")
+            in {
+                "telegram_applied",
+                "old_slot_retired",
+                "acknowledged",
+            }
+        )
+
+        source = payload.get("turn")
+        source_identity = ""
+        item: dict[str, Any] | None
+        if isinstance(source, dict):
+            source_identity = str(source["final_identity"])
+            cached_source = materialized_sources.get(
+                source_identity
+            )
+            if (
+                cached_source is not None
+                and cached_source[0] != source
+            ):
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    "invalid_turn_final_job",
+                    result,
+                )
+                break
+            if cached_source is not None:
+                item = cached_source[1]
+            else:
+                try:
+                    item = _final_ready_row(source)
+                except _TurnContentError as exc:
+                    _fail_turn_final(
+                        runtime,
+                        ref,
+                        f"{exc.status}: {exc}",
+                        result,
+                    )
+                    break
+                materialized_sources[source_identity] = (
+                    source,
+                    item,
+                )
+        else:
+            item = _turn_item_by_revision(
+                turns_payload, revision
+            )
+            if item is None:
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    "stale_or_unavailable_content_revision",
+                    result,
+                )
+                break
+
+        _entry_key, entry = _resolve_final_source_entry(
+            store, source if isinstance(source, dict) else item
+        )
+        pending_token = str(
+            (entry or {}).get("pending_plan_token") or ""
+        )
+        owner_matches = (
+            entry is not None
+            and bool(str(entry.get("topic_id") or ""))
+        )
+        owner_bound = False
+        if owner_matches and isinstance(source, dict):
+            owner_matches, owner_bound = (
+                _bind_or_verify_final_source_owner(
+                    store,
+                    source,
+                    _entry_key,
+                    entry,
+                    allow_bind=pending_token
+                    in {"", plan_token},
+                )
+            )
+        if not owner_matches:
+            _defer_turn_final(
+                runtime,
+                ref,
+                "transient_delivery",
+                result,
+                delay_seconds=1,
+            )
+            break
+        if owner_bound:
+            _checkpoint_turn_job(runtime)
+        if pending_token not in {"", plan_token}:
+            _fail_turn_final(
+                runtime,
+                ref,
+                "stale_or_unroutable_turn_plan",
+                result,
+            )
+            break
+        entry["pending_turn_id"] = _turn_id(item)
+        entry["pending_content_revision"] = revision
+        entry["pending_plan_token"] = plan_token
+        entry["pending_turn_part_count"] = part_count
+        if source_identity:
+            entry["pending_final_identity"] = source_identity
+        prior_expected = entry.get("pending_turn_job_count")
+        entry["pending_turn_job_count"] = max(
+            int(prior_expected)
+            if isinstance(prior_expected, int)
+            and not isinstance(prior_expected, bool)
+            else 0,
+            sequence + 1,
+            part_count,
+        )
+        if not entry.get("pending_turn_user_hash"):
+            entry["pending_turn_user_hash"] = _turn_user_hash(item)
+        if "pending_plan_generation" not in entry:
+            entry["pending_plan_generation"] = 1
+
+        advanced_prior = False
+        for prior_key, prior_receipt in list(
+            state.tendwire_turn_jobs(store).items()
+        ):
+            if (
+                isinstance(prior_receipt, dict)
+                and prior_receipt.get("plan_token") == plan_token
+                and isinstance(
+                    prior_receipt.get("sequence_index"), int
+                )
+                and prior_receipt["sequence_index"] < sequence
+                and prior_receipt.get("substate")
+                in {"telegram_applied", "old_slot_retired"}
+            ):
+                state.update_tendwire_turn_job(
+                    store,
+                    prior_key,
+                    substate="acknowledged",
+                )
+                advanced_prior = True
+        if advanced_prior:
+            _checkpoint_turn_job(runtime)
+
+        predecessor_job_key = payload.get(
+            "predecessor_job_key"
+        )
         if predecessor_job_key is not None:
             try:
-                predecessor_receipt = state.find_tendwire_turn_job(
-                    store,
-                    predecessor_job_key,
+                predecessor_receipt = (
+                    state.find_tendwire_turn_job(
+                        store, predecessor_job_key
+                    )
                 )
             except ValueError:
                 predecessor_receipt = None
             if (
                 predecessor_receipt is None
-                or predecessor_receipt.get("substate") != "acknowledged"
-                or predecessor_receipt.get("content_revision") != revision
+                or predecessor_receipt.get("substate")
+                != "acknowledged"
+                or predecessor_receipt.get("content_revision")
+                != revision
                 or predecessor_receipt.get("sequence_index")
-                != int(entry.get("pending_acknowledged_prefix_count") or 0) - 1
+                != int(
+                    entry.get(
+                        "pending_acknowledged_prefix_count"
+                    )
+                    or 0
+                )
+                - 1
                 or predecessor_receipt.get("plan_token")
                 != entry.get("replaces_failed_plan_token")
             ):
@@ -3055,31 +4097,77 @@ def _drain_turn_final(
                     result,
                 )
                 break
-        candidate_id, candidate_bot, candidate_topic, candidate_kind = _current_upsert_candidate(
-            store,
-            item,
-            entry,
-            ordinal=ordinal,
-            replaces_plan_token=replaces,
-        ) if operation == "upsert" else ("", "", "", "")
-        if operation == "retire":
+
+        feed_item: dict[str, Any] | None = None
+        plans: list[dict[str, Any]] = []
+        if operation == "upsert" and not durable_outcome:
+            try:
+                page_calls = _materialize_turn_item(
+                    item, runtime
+                )
+            except _TurnContentError as exc:
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    f"{exc.status}: {exc}",
+                    result,
+                )
+                break
+            result["content_pages"] += page_calls
+            feed_item = turn_item_from_source(item, entry)
+            plans = prepare_turn_delivery_parts(feed_item)
+            if (
+                ordinal >= len(plans)
+                or part_count != len(plans)
+                or payload.get("spans")
+                != plans[ordinal].get("spans")
+            ):
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    "presentation_plan_mismatch",
+                    result,
+                )
+                break
+
+        if operation == "upsert":
+            (
+                candidate_id,
+                candidate_bot,
+                candidate_topic,
+                candidate_kind,
+            ) = _current_upsert_candidate(
+                store,
+                item,
+                entry,
+                ordinal=ordinal,
+                replaces_plan_token=replaces,
+            )
+        else:
             candidate_id, binding = _slot_binding(
                 store,
                 turn_id=_turn_id(item),
                 ordinal=ordinal,
                 plan_token=replaces,
             )
-            candidate_bot = str((binding or {}).get("bot_kind") or MANAGER_BOT_KIND)
-            candidate_topic = str((binding or {}).get("topic_id") or "")
+            candidate_bot = str(
+                (binding or {}).get("bot_kind")
+                or MANAGER_BOT_KIND
+            )
+            candidate_topic = str(
+                (binding or {}).get("topic_id") or ""
+            )
             candidate_kind = "final"
         desired_token, desired_bot = _delivery_bot(store, entry)
         compatible = bool(
             candidate_id
             and candidate_bot == desired_bot
-            and candidate_topic == str(entry.get("topic_id") or "")
+            and candidate_topic
+            == str(entry.get("topic_id") or "")
         )
-        prior_for_reservation = candidate_id if operation == "retire" else ""
-        existing_receipt = state.find_tendwire_turn_job(store, job_key)
+        prior_for_reservation = (
+            candidate_id if operation == "retire" else ""
+        )
         try:
             receipt = state.reserve_tendwire_turn_job(
                 store,
@@ -3091,19 +4179,24 @@ def _drain_turn_final(
                 part_ordinal=ordinal,
                 part_count=part_count,
                 prior_message_id=prior_for_reservation,
-                bot_kind=desired_bot if operation == "upsert" else candidate_bot,
+                bot_kind=desired_bot
+                if operation == "upsert"
+                else candidate_bot,
             )
             if existing_receipt is None:
                 _checkpoint_turn_job(runtime)
         except (RuntimeError, ValueError) as exc:
-            _fail_turn_final(runtime, ref, f"receipt_reservation_failed: {exc}", result)
+            _fail_turn_final(
+                runtime,
+                ref,
+                f"receipt_reservation_failed: {exc}",
+                result,
+            )
             break
         substate = str(receipt.get("substate") or "")
         if substate == "retryable":
             state.update_tendwire_turn_job(
-                store,
-                job_key,
-                substate="reserved",
+                store, job_key, substate="reserved"
             )
             _checkpoint_turn_job(runtime)
             substate = "reserved"
@@ -3112,7 +4205,7 @@ def _drain_turn_final(
             _fail_turn_final(
                 runtime,
                 ref,
-                "delivery_uncertain: persisted reserved provider operation",
+                "delivery_uncertain",
                 result,
                 uncertain=True,
             )
@@ -3121,11 +4214,16 @@ def _drain_turn_final(
             _fail_turn_final(
                 runtime,
                 ref,
-                "failed local receipt cannot be replayed",
+                "delivery_rejected",
                 result,
             )
             break
-        if substate in {"telegram_applied", "old_slot_retired", "acknowledged"}:
+
+        if substate in {
+            "telegram_applied",
+            "old_slot_retired",
+            "acknowledged",
+        }:
             pass
         elif operation == "retire":
             if not candidate_id:
@@ -3134,13 +4232,16 @@ def _drain_turn_final(
                     job_key,
                     substate="telegram_applied",
                     prior_message_id="already-missing",
-                    bot_kind=candidate_bot or MANAGER_BOT_KIND,
+                    bot_kind=candidate_bot
+                    or MANAGER_BOT_KIND,
                 )
                 _checkpoint_turn_job(runtime)
                 substate = "telegram_applied"
             else:
                 try:
-                    owner_token = _owning_bot_token(store, candidate_bot)
+                    owner_token = _owning_bot_token(
+                        store, candidate_bot
+                    )
                     result["operations"] += 1
                     deleted = delete_turn_delivery_message(
                         runtime.telegram,
@@ -3149,55 +4250,74 @@ def _drain_turn_final(
                         api_token=owner_token,
                     )
                 except RateLimited as exc:
-                    _defer_turn_final(runtime, ref, str(exc), result, store, job_key, delay_seconds=exc.retry_after)
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "rate_limited",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=exc.retry_after,
+                    )
                     break
                 except _TurnContentError as exc:
-                    _fail_turn_final(runtime, ref, f"{exc.status}: {exc}", result)
+                    _fail_turn_final(
+                        runtime,
+                        ref,
+                        f"{exc.status}: {exc}",
+                        result,
+                    )
                     break
-                except Exception as exc:  # provider acceptance cannot be reconstructed
-                    _fail_turn_final(runtime, ref, f"delivery_uncertain: {exc}", result, uncertain=True)
+                except Exception:
+                    _fail_turn_final(
+                        runtime,
+                        ref,
+                        "delivery_uncertain",
+                        result,
+                        uncertain=True,
+                    )
                     break
                 if not deleted.get("ok"):
                     if _telegram_result_is_transient(deleted):
-                        _defer_turn_final(runtime, ref, str(deleted.get("error") or "transient Telegram failure"), result, store, job_key, delay_seconds=1)
+                        _defer_turn_final(
+                            runtime,
+                            ref,
+                            str(
+                                deleted.get("error")
+                                or "transient delivery"
+                            ),
+                            result,
+                            store,
+                            job_key,
+                            delay_seconds=1,
+                        )
                     else:
-                        _fail_turn_final(runtime, ref, str(deleted.get("error") or "retire failed"), result)
+                        _fail_turn_final(
+                            runtime,
+                            ref,
+                            str(
+                                deleted.get("error")
+                                or "retire failed"
+                            ),
+                            result,
+                        )
                     break
                 _after_provider_accept(runtime)
-                _retire_local_message(store, entry, candidate_id)
+                _retire_local_message(
+                    store, entry, candidate_id
+                )
                 state.update_tendwire_turn_job(
                     store,
                     job_key,
                     substate="telegram_applied",
                     prior_message_id=candidate_id,
-                    bot_kind=candidate_bot or MANAGER_BOT_KIND,
+                    bot_kind=candidate_bot
+                    or MANAGER_BOT_KIND,
                 )
                 _checkpoint_turn_job(runtime)
                 substate = "telegram_applied"
         else:
-            try:
-                result["content_pages"] += _materialize_turn_item(
-                    item, runtime
-                )
-            except _TurnContentError as exc:
-                _fail_turn_final(
-                    runtime, ref, f"{exc.status}: {exc}", result
-                )
-                break
-            feed_item = turn_item_from_source(item, entry)
-            plans = prepare_turn_delivery_parts(feed_item)
-            if (
-                ordinal >= len(plans)
-                or part_count != len(plans)
-                or payload.get("spans") != plans[ordinal].get("spans")
-            ):
-                _fail_turn_final(
-                    runtime,
-                    ref,
-                    "presentation_plan_mismatch",
-                    result,
-                )
-                break
+            assert feed_item is not None and plans
             try:
                 result["operations"] += 1
                 if compatible:
@@ -3217,29 +4337,72 @@ def _drain_turn_final(
                         feed_item,
                         plans[ordinal],
                         telegram=_telegram_state(store),
-                        thread_id=str(entry.get("topic_id") or ""),
+                        thread_id=str(
+                            entry.get("topic_id") or ""
+                        ),
                         notify=False,
                         api_token=desired_token,
                     )
             except RateLimited as exc:
-                _defer_turn_final(runtime, ref, str(exc), result, store, job_key, delay_seconds=exc.retry_after)
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "rate_limited",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=exc.retry_after,
+                )
                 break
-            except Exception as exc:  # accepted-send/no-receipt is explicitly uncertain
-                _fail_turn_final(runtime, ref, f"delivery_uncertain: {exc}", result, uncertain=True)
+            except Exception:
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    "delivery_uncertain",
+                    result,
+                    uncertain=True,
+                )
                 break
             if not applied.get("ok"):
                 kind = str(applied.get("kind") or "")
                 if _telegram_result_is_transient(applied):
-                    _defer_turn_final(runtime, ref, str(applied.get("error") or "transient Telegram failure"), result, store, job_key, delay_seconds=1)
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        str(
+                            applied.get("error")
+                            or "transient delivery"
+                        ),
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
                     break
-                retry_as_send = compatible and kind in {"not_found", "topic_not_found"}
+                retry_as_send = (
+                    compatible
+                    and kind in {"not_found", "topic_not_found"}
+                )
                 if retry_as_send and kind == "not_found":
-                    _retire_local_message(store, entry, candidate_id)
+                    _retire_local_message(
+                        store, entry, candidate_id
+                    )
                     candidate_id = ""
                     compatible = False
                     _checkpoint_turn_job(runtime)
-                if retry_as_send and result["operations"] >= max_operations:
-                    _defer_turn_final(runtime, ref, "edit target unavailable; retry as send", result, store, job_key, delay_seconds=1)
+                if (
+                    retry_as_send
+                    and result["operations"] >= max_operations
+                ):
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "operation_budget_exhausted",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
                     break
                 if retry_as_send:
                     try:
@@ -3250,34 +4413,80 @@ def _drain_turn_final(
                             feed_item,
                             plans[ordinal],
                             telegram=_telegram_state(store),
-                            thread_id=str(entry.get("topic_id") or ""),
+                            thread_id=str(
+                                entry.get("topic_id") or ""
+                            ),
                             notify=False,
                             api_token=desired_token,
                         )
                         compatible = False
                     except RateLimited as exc:
-                        _defer_turn_final(runtime, ref, str(exc), result, store, job_key, delay_seconds=exc.retry_after)
+                        _defer_turn_final(
+                            runtime,
+                            ref,
+                            "rate_limited",
+                            result,
+                            store,
+                            job_key,
+                            delay_seconds=exc.retry_after,
+                        )
                         break
-                    except Exception as exc:
-                        _fail_turn_final(runtime, ref, f"delivery_uncertain: {exc}", result, uncertain=True)
+                    except Exception:
+                        _fail_turn_final(
+                            runtime,
+                            ref,
+                            "delivery_uncertain",
+                            result,
+                            uncertain=True,
+                        )
                         break
                 if not applied.get("ok"):
                     if _telegram_result_is_transient(applied):
-                        _defer_turn_final(runtime, ref, str(applied.get("error") or "transient Telegram failure"), result, store, job_key, delay_seconds=1)
+                        _defer_turn_final(
+                            runtime,
+                            ref,
+                            str(
+                                applied.get("error")
+                                or "transient delivery"
+                            ),
+                            result,
+                            store,
+                            job_key,
+                            delay_seconds=1,
+                        )
                     else:
                         _fail_turn_final(
                             runtime,
                             ref,
-                            str(applied.get("error") or "Telegram upsert failed"),
+                            str(
+                                applied.get("error")
+                                or "delivery rejected"
+                            ),
                             result,
                         )
                     break
-            message_id = str(applied.get("message_id") or candidate_id or "")
+            message_id = str(
+                applied.get("message_id")
+                or candidate_id
+                or ""
+            )
             if not message_id or message_id == "0":
-                _fail_turn_final(runtime, ref, "delivery_uncertain: Telegram omitted message receipt", result, uncertain=True)
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    "delivery_uncertain",
+                    result,
+                    uncertain=True,
+                )
                 break
             _after_provider_accept(runtime)
-            prior_id = candidate_id if candidate_id and not compatible and candidate_id != message_id else None
+            prior_id = (
+                candidate_id
+                if candidate_id
+                and not compatible
+                and candidate_id != message_id
+                else None
+            )
             state.bind_message_to_worker(
                 store,
                 message_id,
@@ -3300,21 +4509,52 @@ def _drain_turn_final(
                 prior_message_id=prior_id,
                 bot_kind=desired_bot,
             )
-            if candidate_kind == "working" and message_id == candidate_id:
-                _clear_stream_delivery_state(entry, _turn_id(item))
+            if (
+                candidate_kind == "working"
+                and message_id == candidate_id
+            ):
+                _clear_stream_delivery_state(
+                    entry, _turn_id(item)
+                )
             _checkpoint_turn_job(runtime)
             substate = "telegram_applied"
-        if operation == "upsert" and substate == "telegram_applied":
-            prior_id = str(receipt.get("prior_message_id") or "")
-            message_id = str(receipt.get("telegram_message_id") or "")
+
+        receipt = state.find_tendwire_turn_job(store, job_key)
+        if (
+            operation == "upsert"
+            and substate == "telegram_applied"
+            and receipt is not None
+        ):
+            prior_id = str(
+                receipt.get("prior_message_id") or ""
+            )
+            message_id = str(
+                receipt.get("telegram_message_id") or ""
+            )
             if prior_id and prior_id != message_id:
                 if result["operations"] >= max_operations:
-                    _defer_turn_final(runtime, ref, "physical operation budget exhausted", result, store, job_key, delay_seconds=1)
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "operation_budget_exhausted",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
                     break
-                prior_binding = state.find_message_binding(store, prior_id)
-                prior_bot = str((prior_binding or {}).get("bot_kind") or candidate_bot or MANAGER_BOT_KIND)
+                prior_binding = state.find_message_binding(
+                    store, prior_id
+                )
+                prior_bot = str(
+                    (prior_binding or {}).get("bot_kind")
+                    or candidate_bot
+                    or MANAGER_BOT_KIND
+                )
                 try:
-                    owner_token = _owning_bot_token(store, prior_bot)
+                    owner_token = _owning_bot_token(
+                        store, prior_bot
+                    )
                     result["operations"] += 1
                     retired = delete_turn_delivery_message(
                         runtime.telegram,
@@ -3323,35 +4563,129 @@ def _drain_turn_final(
                         api_token=owner_token,
                     )
                 except RateLimited as exc:
-                    _defer_turn_final(runtime, ref, str(exc), result, store, job_key, delay_seconds=exc.retry_after)
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "rate_limited",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=exc.retry_after,
+                    )
                     break
                 except _TurnContentError as exc:
-                    _fail_turn_final(runtime, ref, f"{exc.status}: {exc}", result)
+                    _fail_turn_final(
+                        runtime,
+                        ref,
+                        f"{exc.status}: {exc}",
+                        result,
+                    )
                     break
-                except Exception as exc:
-                    _fail_turn_final(runtime, ref, f"delivery_uncertain: {exc}", result, uncertain=True)
+                except Exception:
+                    _fail_turn_final(
+                        runtime,
+                        ref,
+                        "delivery_uncertain",
+                        result,
+                        uncertain=True,
+                    )
                     break
                 if not retired.get("ok"):
                     if _telegram_result_is_transient(retired):
-                        _defer_turn_final(runtime, ref, str(retired.get("error") or "transient Telegram failure"), result, store, job_key, delay_seconds=1)
+                        _defer_turn_final(
+                            runtime,
+                            ref,
+                            str(
+                                retired.get("error")
+                                or "transient delivery"
+                            ),
+                            result,
+                            store,
+                            job_key,
+                            delay_seconds=1,
+                        )
                     else:
-                        _fail_turn_final(runtime, ref, str(retired.get("error") or "old slot retire failed"), result)
+                        _fail_turn_final(
+                            runtime,
+                            ref,
+                            str(
+                                retired.get("error")
+                                or "old slot retire failed"
+                            ),
+                            result,
+                        )
                     break
                 _after_provider_accept(runtime)
                 _retire_local_message(store, entry, prior_id)
-                state.update_tendwire_turn_job(store, job_key, substate="old_slot_retired")
+                state.update_tendwire_turn_job(
+                    store,
+                    job_key,
+                    substate="old_slot_retired",
+                )
                 _checkpoint_turn_job(runtime)
                 substate = "old_slot_retired"
+
         ack = runtime.tendwire.turn_final_ack(
             ref,
             {"outcome": "applied", "job_key": job_key},
         )
         if ack.get("ok") is False:
-            result["status"] = str(ack.get("status") or "turn_final_ack_failed")
+            observed = runtime.tendwire.connector_prepare_commit(
+                plan_token=plan_token
+            )
+            advanced = False
+            if (
+                observed.get("ok") is True
+                and observed.get("plan_token") == plan_token
+                and observed.get("state") == "completed"
+            ):
+                observed_count = observed.get("job_count")
+                if (
+                    isinstance(observed_count, int)
+                    and not isinstance(observed_count, bool)
+                    and observed_count > 0
+                ):
+                    entry[
+                        "pending_turn_job_count"
+                    ] = observed_count
+                for receipt_key, observed_receipt in list(
+                    state.tendwire_turn_jobs(store).items()
+                ):
+                    if (
+                        isinstance(observed_receipt, dict)
+                        and observed_receipt.get("plan_token")
+                        == plan_token
+                        and observed_receipt.get("substate")
+                        in {
+                            "telegram_applied",
+                            "old_slot_retired",
+                        }
+                    ):
+                        state.update_tendwire_turn_job(
+                            store,
+                            receipt_key,
+                            substate="acknowledged",
+                        )
+                        advanced = True
+                if _maybe_complete_turn_plan(
+                    store,
+                    item,
+                    entry,
+                    plan_token=plan_token,
+                    revision=revision,
+                ):
+                    advanced = True
+            if advanced:
+                _checkpoint_turn_job(runtime)
+            result["status"] = str(
+                ack.get("status") or "turn_final_ack_failed"
+            )
             result["changed"] = True
             break
         if substate != "acknowledged":
-            state.update_tendwire_turn_job(store, job_key, substate="acknowledged")
+            state.update_tendwire_turn_job(
+                store, job_key, substate="acknowledged"
+            )
             _checkpoint_turn_job(runtime)
         result["delivered"] += 1
         result["acked"] += 1
@@ -3364,12 +4698,23 @@ def _drain_turn_final(
             revision=revision,
         ):
             _checkpoint_turn_job(runtime)
-    if result.get("status") == "attempts_exhausted" and failed_job_key:
-        failed_receipt = state.find_tendwire_turn_job(store, failed_job_key)
+
+    if (
+        result.get("status") == "attempts_exhausted"
+        and failed_job_key
+    ):
+        failed_receipt = state.find_tendwire_turn_job(
+            store, failed_job_key
+        )
         if (
             failed_receipt is not None
             and failed_receipt.get("substate")
-            in {"reserved", "telegram_applied", "old_slot_retired"}
+            in {
+                "reserved",
+                "retryable",
+                "telegram_applied",
+                "old_slot_retired",
+            }
         ):
             state.update_tendwire_turn_job(
                 store,
@@ -3540,6 +4885,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         or turn_schema not in {_TURN_SCHEMA_VERSION, TURN_SCHEMA_VERSION}
     ):
         return _unsupported_turn_schema_version(runtime, turn_schema)
+    list_finals_are_authoritative = turn_schema != TURN_SCHEMA_VERSION
     chat_id = config.telegram_chat_id(store)
     try:
         turns_payload = _validate_turns_payload(turns_payload)
@@ -3551,13 +4897,21 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
     routing_repaired = _repair_space_mode_routing_state(store)
     message_bindings = _backfill_message_bindings(store)
-    bootstrapped = _bootstrap_existing_turns(store, turns_payload, pending_payload)
+    bootstrapped = _bootstrap_existing_turns(
+        store,
+        turns_payload,
+        pending_payload,
+        skip_v2_finals=not list_finals_are_authoritative,
+    )
     live_worker_ids = {
         compact_ws(worker.get("id"), 160)
         for worker in _workers(snapshot)
         if _worker_is_open(worker)
     }
     live_worker_ids.discard("")
+    reconciled_turn_plans = _reconcile_completed_turn_plans(
+        store, runtime
+    )
 
     def _yield_between_turns() -> None:
         # Inert unless actually holding the state lock (the shim wraps sync_once in state_lock();
@@ -3591,6 +4945,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 chat_id=chat_id,
                 live_worker_ids=live_worker_ids,
                 yield_barrier=yield_barrier,
+                list_finals_are_authoritative=list_finals_are_authoritative,
             )
         )
     except _TurnContentError as exc:
@@ -3603,6 +4958,10 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             )
         try:
             turns_payload = _validate_turns_payload(relisted)
+            relisted_schema = turns_payload.get("schema_version")
+            relisted_finals_are_authoritative = (
+                relisted_schema != TURN_SCHEMA_VERSION
+            )
             turn_counts = _sync_turns(
                 store,
                 turns_payload,
@@ -3612,6 +4971,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 live_worker_ids=live_worker_ids,
                 relist_on_conflict=False,
                 yield_barrier=yield_barrier,
+                list_finals_are_authoritative=relisted_finals_are_authoritative,
             )
         except _TurnContentError as retry_exc:
             return _tendwire_non_success(runtime, retry_exc.status)
@@ -3629,6 +4989,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         or bootstrapped
         or topic_cleanup.get("changed")
         or message_bindings
+        or reconciled_turn_plans
     )
     if config.pinned_status_enabled():
         pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
@@ -3646,6 +5007,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "failed": 0,
         "deferred": 0,
         "uncertain": 0,
+        "staged": 0,
         "content_pages": 0,
         "changed": False,
     }

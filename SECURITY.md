@@ -2,9 +2,34 @@
 
 The tendwired branch keeps direct Herdr access out of Herdres.
 
-Private state may contain Telegram topic/message ids and bot tokens. Public JSON
+Herdres private state may contain Telegram chat/topic/message IDs, bot tokens
+and routing/ownership, final message bindings, and stable-job checkpoints and
+receipts. Retain that state across restart and never publish it. Public JSON
 from Herdres commands is pruned so it does not expose tokens, socket paths, raw
-backend targets, command stdout/stderr, or Telegram ids.
+backend targets, command stdout/stderr, Telegram IDs, or private checkpoints.
+
+The connector boundary remains neutral. Herdres sends Tendwire only bounded
+canonical character ranges, Tendwire-issued stable public identities/tokens
+and job keys, leased `source_ref` values, and neutral outcome or reason codes.
+It never sends Telegram chat/topic/message IDs, bot tokens or routing, or
+provider error prose to Tendwire. Tendwire owns canonical content, durable
+final-ready roots, range validation, jobs, leases, ACK/dead-letter state, and
+retention; Herdres owns Telegram formatting and private provider state.
+
+Dead-letter inspection is bounded and public-safe, and retry selects one exact
+public `final_identity`; neither surface exposes Herdres's private checkpoint
+or Telegram routing. Provider acceptance without a recorded receipt remains
+ambiguous, so an explicit retry may duplicate a Telegram operation and must
+not be represented as provider-perfect exactly-once.
+
+The `final_ready` materialization-root payload uses exact integer
+`schema_version: 2` and carries an exact public opaque `stable_key` plus integer
+`stable_key_version: 1`. That pair binds retained work to the accepted worker
+continuity identity; it is protocol metadata, not a private checkpoint or
+secret. A schema-v1 root cannot authorize routing through reusable `worker_id`
+or `space_id` values alone. Canonical descriptors and the public identity pair
+may cross this boundary; Telegram routing, credentials, message state, and
+private checkpoints never do.
 
 ## Stable worker handle boundary
 

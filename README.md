@@ -5,10 +5,13 @@
 This branch is a tiny source-mode-only Telegram connector for Tendwire.
 
 Herdres does not observe or control Herdr directly here. Tendwire owns Herdr
-observation, worker bindings, turns, pending interactions, command routing,
-receipts, backend health, and connector outbox. Herdres owns Telegram polling,
-topics, message send/edit, compact working updates, final response display, and
-Telegram delivery dedup.
+observation, worker bindings, canonical turn content and revisions, durable
+final-ready roots and retention, pending interactions, command routing,
+backend health, range-only presentation staging, and ordered connector jobs,
+leases, ACK state, and dead-letter state. Herdres owns Telegram polling,
+topics, presentation planning and formatting, message send/edit, compact
+working updates, continuation messages, private provider state, local
+stable-job checkpoints, and Telegram delivery dedup.
 
 **Requires [Tendwire](https://github.com/plotarmordev/tendwire)** — Herdres has
 no functionality without it. See [INSTALL.md](INSTALL.md) for setup order.
@@ -41,6 +44,9 @@ Schema-v2 rows carry content-schema-v1 descriptors for both `user_text` and
 page: availability, inline placement, character and UTF-8 byte lengths, page
 count, first cursor, content revision, and the `known_incomplete` summary must
 agree. There is no coercion or lossy fallback.
+Completed finals in the schema-v2 list are observational source projections;
+their presence or absence never creates delivery work or proves delivery.
+Delivery begins only from Tendwire's durable connector work described below.
 
 An invalid list envelope is a connector-wide failure (`tendwire_turns_failed`
 through source sync; a directly observed unsupported outer version is
@@ -60,20 +66,50 @@ index/count, unique segment and cursor identities, exact per-segment and total
 character/byte lengths, and a null final cursor. A defective page becomes the
 turn-local `invalid_content_page` outcome before prepare or Telegram activity.
 
-After exact materialization, Herdres derives ordered multipart presentation
-ranges and submits only neutral field/start/end spans through Tendwire's
-`turn-final` prepare begin/part/commit contract; the prepare requests contain no
-turn text. Leased upserts are checked against the same local ranges and applied
-in part order, followed by any ordered old-slot retirement. Each stable
-`plan_token`/sequence receipt is reserved before a provider operation,
-checkpointed after Telegram apply and again after old-slot retirement, then
-ACKed to Tendwire and checkpointed as `acknowledged`. A lease retry therefore
-resumes from the durable substate rather than resending a proven operation.
+With Tendwire store schema v11, committing a complete authoritative final also
+creates a durable, connector-neutral `final_ready` materialization root. Its
+payload has exact integer `schema_version: 2` and carries the public opaque
+`stable_key` (`wsk1_` plus 64 lowercase hexadecimal characters) with exact
+integer `stable_key_version: 1`, binding retained work to the accepted worker
+continuity identity. A schema-v1 root never routes by reusable `worker_id` or
+`space_id` alone. Root creation and retention do not depend on Herdres being
+installed, running, or available. The root contains canonical content
+descriptors and the public identity pair, never a private checkpoint, Telegram
+routing, credentials, or message state.
 
-This is not a claim of perfect provider exactly-once delivery. If Telegram may
-have accepted an operation but raises before returning a receipt, or omits the
-message receipt, Herdres reports `delivery_uncertain` and fails closed instead
-of guessing or replaying.
+After leasing a `final_ready` root and materializing its exact canonical
+content, Herdres derives ordered multipart presentation ranges. Prepare
+begin/part/commit sends only neutral field/start/end spans, never turn text;
+the leased `source_ref` is bound on begin and commit, while part requests carry
+only the plan token, ordinal, and ranges. Tendwire validates complete,
+nonoverlapping coverage and commits stable ordered jobs. Leased upserts are
+checked against the same local ranges and applied in part order, followed by
+any ordered old-slot retirement. Each stable job-key receipt is reserved before
+a provider operation, checkpointed after Telegram apply and again after
+old-slot retirement, then ACKed to Tendwire and checkpointed as
+`acknowledged`. The stable job key, not a transient lease ref, is restart
+identity.
+
+`HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` covers the complete root operation,
+including canonical paging and prepare begin/part/commit staging as well as
+ACK. It defaults to 900 seconds; unset, empty, or invalid values use the same
+900-second fallback, and configured values are clamped to 60 through 3600
+seconds.
+
+An ordinary restart retains the private Herdres state and Tendwire database.
+Herdres resumes proven provider work under a fresh transient ref without
+resending it and reconciles a committed pending plan after a lost final ACK
+response or completed-plan observation, even if the turn list is empty. A
+pending plan is cleared before a newer root only when Tendwire confirms
+`superseded` or `plan_not_found`; every other unresolved state continues to
+block that newer root.
+
+Exactly-once applies only to acknowledged outcomes. Telegram Bot API sends
+have no caller idempotency key: if Telegram may have accepted an operation but
+the response, process, or message receipt is lost before Herdres durably
+records it, the outcome is inherently ambiguous. Herdres reports
+`delivery_uncertain` and fails closed instead of claiming provider-perfect
+exactly-once; an explicit retry may duplicate the provider operation.
 
 Goal 01B recovery continues through this same source boundary. Tendwire's
 existing `turn.list` path refreshes structured content from a recovered
@@ -83,6 +119,29 @@ schema-v2 completed revision for a matching editable Working card, Herdres
 edits that card once into the final response and records the final binding and
 delivery ledger. Repeating the same sync performs no additional page fetch,
 prepare, edit, send, or ledger update.
+
+### Inspecting and retrying dead-letter finals
+
+Inspect Tendwire's retained, connector-neutral dead-letter state with an
+explicit bounded limit from 1 through 100:
+
+```sh
+tendwire connector inspect --name turn-final --status dead_letter --limit 100 --db-path /path/to/tendwire.db
+```
+
+Retry one exact unresolved final by the public `final_identity` returned by
+inspection:
+
+```sh
+tendwire connector retry --name turn-final --final-identity 'twfinal1.<opaque>' --db-path /path/to/tendwire.db
+```
+
+Inspection is read-only and public-safe. Retry is identity-specific rather than
+a bulk replay and can return `not_retryable` or `stale_revision`. It does not
+erase provider ambiguity: retrying after an unrecorded Telegram acceptance may
+duplicate a message. Tendwire, not Herdres, owns final-ready/dead-letter
+retention. Never edit either database or the private Herdres state to force
+replay.
 
 ### Explicit failed-plan recovery
 
@@ -291,7 +350,7 @@ HERDR_TELEGRAM_TOPICS_STATE="$backup_path" \
   ./herdres.py tendwire source-smoke --with-outbox
 ```
 
-Keep the copy private. A compatible pair uses Tendwire store schema `7`,
+Keep the copy private. A compatible pair uses Tendwire store schema `11`,
 top-level turn-list schema `2`, content-schema-v1 descriptors/pages, and the
 turn-final prepare/lease/ACK/recovery protocol. The dry check must succeed with
 `direct_herdr_calls=0` before a live sync; it does not save the copied Herdres
