@@ -14,7 +14,14 @@ from herdres_connector import source_sync, speech, state
 from herdres_connector.source_sync import SyncRuntime
 from herdres_connector.telegram_delivery import TelegramClient
 
-from test_source_only import REQUEST_ID, FakeTelegram, FakeTendwire, _source_worker, _store
+from test_source_only import (
+    REQUEST_ID,
+    FakeTelegram,
+    FakeTendwire,
+    _accepted_command_response,
+    _source_worker,
+    _store,
+)
 
 
 # --- state ring --------------------------------------------------------------
@@ -303,7 +310,11 @@ def test_command_reply_sets_speak_next_reply_on_voice_reply(tmp_path, monkeypatc
     worker_key, _entry = _persist_worker(store, voice_reply_message_ids=["901"])
     state.save_state(store)
 
-    with patch.object(herdres.TendwireClient, "command", return_value={"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}):
+    with patch.object(
+        herdres.TendwireClient,
+        "command_json",
+        side_effect=lambda request_json: _accepted_command_response(json.loads(request_json)),
+    ):
         result = herdres.command_reply({
             "request_id": REQUEST_ID,
             "topic_id": "77", "user_id": "1", "text": "great, keep going",
@@ -322,7 +333,11 @@ def test_command_reply_no_flag_for_plain_message(tmp_path, monkeypatch):
     store = _store()
     worker_key, _entry = _persist_worker(store, voice_reply_message_ids=["901"])
     state.save_state(store)
-    with patch.object(herdres.TendwireClient, "command", return_value={"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}):
+    with patch.object(
+        herdres.TendwireClient,
+        "command_json",
+        side_effect=lambda request_json: _accepted_command_response(json.loads(request_json)),
+    ):
         herdres.command_reply(
             {
                 "request_id": REQUEST_ID,
@@ -355,11 +370,12 @@ def test_command_reply_arms_flag_and_strips_trigger(tmp_path, monkeypatch):
     state.save_state(store)
     sent = {}
 
-    def fake_command(self, request):
+    def fake_command_json(self, request_json):
+        request = json.loads(request_json)
         sent.update(request)
-        return {"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}
+        return _accepted_command_response(request)
 
-    with patch.object(herdres.TendwireClient, "command", fake_command):
+    with patch.object(herdres.TendwireClient, "command_json", fake_command_json):
         herdres.command_reply(
             {
                 "request_id": REQUEST_ID,
@@ -381,7 +397,7 @@ def test_command_reply_standalone_trigger_arms_without_submitting(tmp_path, monk
     store = _store()
     worker_key, _entry = _persist_worker(store)
     state.save_state(store)
-    with patch.object(herdres.TendwireClient, "command") as cmd:
+    with patch.object(herdres.TendwireClient, "command_json") as cmd:
         result = herdres.command_reply({"topic_id": "77", "user_id": "1", "text": "reply by voice"})
     cmd.assert_not_called()                                        # nothing submitted to the pane
     assert "spoken" in result["reply"]

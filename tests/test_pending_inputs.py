@@ -2,13 +2,20 @@
 pending (question + choices from the backend capture) and fails closed on stale/out-of-range/custom;
 non-numeric text and choice-less pendings pass through unchanged."""
 from __future__ import annotations
+import json
 
 from unittest.mock import patch
 
 import herdres
 from herdres_connector import state
 
-from test_source_only import REQUEST_ID, _source_worker, _store
+from test_source_only import (
+    REQUEST_ID,
+    REQUEST_ID_2,
+    _accepted_command_response,
+    _source_worker,
+    _store,
+)
 
 
 def _setup(tmp_path, monkeypatch):
@@ -48,18 +55,19 @@ _CHOICES_NO_VALUE = [
 ]
 
 
-def _reply(text, pending):
+def _reply(text, pending, *, request_id=REQUEST_ID):
     sent = {}
 
-    def fake_command(self, request):
+    def fake_command_json(self, request_json):
+        request = json.loads(request_json)
         sent.update(request)
-        return {"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}
+        return _accepted_command_response(request)
 
-    with patch.object(herdres.TendwireClient, "command", fake_command), \
+    with patch.object(herdres.TendwireClient, "command_json", fake_command_json), \
             patch.object(herdres.TendwireClient, "pending", lambda self: pending):
         result = herdres.command_reply(
             {
-                "request_id": REQUEST_ID,
+                "request_id": request_id,
                 "topic_id": "77",
                 "user_id": "1",
                 "text": text,
@@ -131,7 +139,7 @@ def test_revise_choice_detected_by_choice_id(tmp_path, monkeypatch):
     result, sent = _reply("2", _pending(plan_choices))
     assert "custom answer" in result["reply"]            # ExitPlanMode revise needs typed text
     assert not sent
-    result, sent = _reply("1", _pending(plan_choices))
+    result, sent = _reply("1", _pending(plan_choices), request_id=REQUEST_ID_2)
     assert sent["instruction"]["text"] == "1"            # approve sends the digit
 
 
@@ -141,8 +149,8 @@ def test_missing_request_id_never_submits_valid_text(tmp_path, monkeypatch):
 
     with patch.object(
         herdres.TendwireClient,
-        "command",
-        side_effect=lambda request: sent.append(request),
+        "command_json",
+        side_effect=lambda request_json: sent.append(request_json),
     ):
         result = herdres.command_reply(
             {"topic_id": "77", "user_id": "1", "text": "valid instruction"}

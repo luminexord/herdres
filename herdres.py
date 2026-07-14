@@ -16,12 +16,17 @@ import time
 from typing import Any, Callable
 
 from herdres_connector import config, doctor, speech, state
+from herdres_connector import ingress_requests
 from herdres_connector.ingress_identity import validate_request_id
 from herdres_connector.managed_bots import managed_bot_kind_for_username
 from herdres_connector.safe import compact_ws, public_prune, sanitize_text, short_hash
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient
-from herdres_connector.tendwire_client import TendwireClient
+from herdres_connector.tendwire_client import (
+    TendwireClient,
+    command_process_ambiguous,
+    command_process_not_started,
+)
 
 VERSION = "0.6.0-tendwired-source-only"
 SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the target again."
@@ -298,8 +303,7 @@ def _command_request(entry: dict[str, Any], payload: dict[str, Any], text: str) 
 
 
 def _success_reply(response: dict[str, Any]) -> str:
-    status = str(response.get("status") or "").strip().lower()
-    if status != "accepted" or response.get("ok") is not True:
+    if response.get("disposition") != "terminal_accepted":
         return ""
     result = response.get("result") if isinstance(response.get("result"), dict) else {}
     delivery = str(result.get("delivery_state") or "").strip().lower()
@@ -315,176 +319,186 @@ def _success_reply(response: dict[str, Any]) -> str:
     return "Sent to Tendwire worker."
 
 
-def _command_succeeded(response: dict[str, Any]) -> bool:
-    result = response.get("result") if isinstance(response.get("result"), dict) else {}
-    return (
-        response.get("ok") is True
-        and str(response.get("status") or "").strip().lower() == "accepted"
-        and str(result.get("delivery_state") or "").strip().lower()
-        != "duplicate_suppressed"
-    )
 
 
-_INGRESS_COMMAND_REQUESTS_KEY = "tendwire_ingress_command_requests"
-_TERMINAL_COMMAND_STATUSES = frozenset(
-    {
-        "accepted",
-        "rejected",
-        "not_found",
-        "ambiguous_target",
-        "stale_target",
-        "backend_unsupported",
-        "ambiguous_backend_target",
-        "backend_failed",
-        "duplicate_request",
-        "invalid_request",
-    }
-)
+def _submit_ingress_command_record(
+    store: dict[str, Any], record: dict[str, Any]
+) -> dict[str, Any]:
+    """Replay the durable bytes and reduce only authoritative dispositions."""
 
+    while True:
+        now = time.time()
+        if now >= record["deadline_at"]:
+            outcome = ingress_requests.quarantine_request(
+                record, "request deadline reached", now=now
+            )
+            state.save_state(store)
+            return outcome
 
-def _ingress_command_requests(store: dict[str, Any]) -> dict[str, Any]:
-    requests = store.get(_INGRESS_COMMAND_REQUESTS_KEY)
-    if not isinstance(requests, dict):
-        requests = {}
-        store[_INGRESS_COMMAND_REQUESTS_KEY] = requests
-    return requests
+        request_json = record.get("request_json")
+        if not isinstance(request_json, str):
+            outcome = ingress_requests.quarantine_request(
+                record, "missing durable request JSON", now=now
+            )
+            state.save_state(store)
+            return outcome
 
+        # Construct the child only after deadline/cache preflight. command_json
+        # sends these exact UTF-8 bytes rather than reserializing the request.
+        response = TendwireClient().command_json(request_json)
+        transitioned_at = time.time()
 
-def _prune_ingress_command_requests(store: dict[str, Any], now: float) -> bool:
-    cutoff = now - config.command_request_retention_seconds()
-    requests = _ingress_command_requests(store)
-    changed = False
-    for request_id, record in list(requests.items()):
-        if not isinstance(record, dict):
-            continue
-        terminal_at = record.get("terminal_at")
-        updated_at = record.get("updated_at")
-        created_at = record.get("created_at")
-        retained_at = (
-            terminal_at
-            if type(terminal_at) in {int, float}
-            else updated_at
-            if type(updated_at) in {int, float}
-            else created_at
+        if command_process_ambiguous(response) or command_process_not_started(
+            response
+        ):
+            if transitioned_at >= record["deadline_at"]:
+                outcome = ingress_requests.quarantine_request(
+                    record, "request deadline reached", now=transitioned_at
+                )
+                state.save_state(store)
+                return outcome
+            outcome = ingress_requests.mark_retryable(
+                record, None, now=transitioned_at
+            )
+            state.save_state(store)
+            return outcome
+
+        disposition = response.get("disposition")
+        if disposition == "terminal_accepted":
+            reply = _success_reply(response) if config.ack_on_send() else ""
+            outcome = ingress_requests.mark_terminal(
+                record,
+                disposition,
+                now=transitioned_at,
+                reply=reply,
+            )
+            state.save_state(store)
+            return outcome
+        if disposition == "terminal_rejected":
+            outcome = ingress_requests.mark_terminal(
+                record,
+                disposition,
+                now=transitioned_at,
+                reply=SAFE_SEND_FAILURE_REPLY,
+            )
+            state.save_state(store)
+            return outcome
+        if disposition == "terminal_uncertain":
+            outcome = ingress_requests.quarantine_request(
+                record,
+                "Tendwire reported terminal uncertainty",
+                now=transitioned_at,
+                disposition=disposition,
+            )
+            state.save_state(store)
+            return outcome
+        if disposition not in ingress_requests.RETRYABLE_DISPOSITIONS:
+            outcome = ingress_requests.quarantine_request(
+                record, "invalid Tendwire command result", now=transitioned_at
+            )
+            state.save_state(store)
+            return outcome
+        if transitioned_at >= record["deadline_at"]:
+            outcome = ingress_requests.quarantine_request(
+                record, "request deadline reached", now=transitioned_at
+            )
+            state.save_state(store)
+            return outcome
+
+        if (
+            disposition == "no_receipt"
+            and response.get("status") == "stale_target"
+        ):
+            # The only legal byte rewrite is a one-time removal of the stale
+            # worker fingerprint. Recheck the immutable deadline before both
+            # the durable rewrite and the second child start.
+            retry_at = time.time()
+            if retry_at >= record["deadline_at"]:
+                outcome = ingress_requests.quarantine_request(
+                    record, "request deadline reached", now=retry_at
+                )
+                state.save_state(store)
+                return outcome
+            refreshed = ingress_requests.stale_target_refresh_json(
+                record, now=retry_at
+            )
+            if refreshed is not None:
+                state.save_state(store)
+                continue
+
+        outcome = ingress_requests.mark_retryable(
+            record, disposition, now=transitioned_at
         )
-        if type(retained_at) in {int, float} and retained_at < cutoff:
-            requests.pop(request_id, None)
-            changed = True
-    return changed
-
-
-def _stored_ingress_command_request(
-    store: dict[str, Any], request_id: str
-) -> dict[str, Any] | None:
-    record = _ingress_command_requests(store).get(request_id)
-    request = record.get("request") if isinstance(record, dict) else None
-    if not isinstance(request, dict) or request.get("request_id") != request_id:
-        return None
-    return copy.deepcopy(request)
-
-
-def _remember_ingress_command_request(
-    store: dict[str, Any],
-    request: dict[str, Any],
-    *,
-    replace: bool = False,
-) -> dict[str, Any]:
-    request_id = validate_request_id(request.get("request_id"))
-    now = time.time()
-    _prune_ingress_command_requests(store, now)
-    requests = _ingress_command_requests(store)
-    current = requests.get(request_id)
-    if isinstance(current, dict) and not replace:
-        stored = current.get("request")
-        if isinstance(stored, dict):
-            return copy.deepcopy(stored)
-    created_at = (
-        current.get("created_at")
-        if isinstance(current, dict)
-        and type(current.get("created_at")) in {int, float}
-        else now
-    )
-    requests[request_id] = {
-        "request": copy.deepcopy(request),
-        "created_at": created_at,
-        "updated_at": now,
-    }
-    return copy.deepcopy(request)
-
-
-def _finish_ingress_command_request(
-    store: dict[str, Any],
-    request_id: str,
-    response: dict[str, Any],
-) -> None:
-    status = str(response.get("status") or "").strip().lower()
-    record = _ingress_command_requests(store).get(request_id)
-    if not isinstance(record, dict):
-        return
-    now = time.time()
-    record["updated_at"] = now
-    record["last_status"] = status
-    if status in _TERMINAL_COMMAND_STATUSES and "terminal_at" not in record:
-        record["terminal_at"] = now
-
-
-def _submit_ingress_command_request(
-    store: dict[str, Any], request: dict[str, Any]
-) -> dict[str, Any]:
-    client = TendwireClient()
-    response = client.command(request)
-    if (
-        str(response.get("status") or "") == "stale_target"
-        and isinstance(request.get("target"), dict)
-        and request["target"].get("worker_fingerprint")
-    ):
-        # Stale resolution is pre-reservation. Persist the sole allowed request
-        # refresh before its call so later uncertainty replays these exact bytes.
-        retry = copy.deepcopy(request)
-        retry["target"].pop("worker_fingerprint", None)
-        request = _remember_ingress_command_request(store, retry, replace=True)
         state.save_state(store)
-        response = client.command(request)
-    _finish_ingress_command_request(store, request["request_id"], response)
+        return outcome
+
+
+def _local_ingress_outcome(
+    store: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    reason: str,
+    reply: str = "",
+    handled: bool = True,
+) -> dict[str, Any]:
+    outcome = ingress_requests.quarantine_request(
+        record,
+        reason,
+        now=time.time(),
+        reply=reply,
+        handled=handled,
+    )
     state.save_state(store)
-    return response
+    return outcome
 
 
-def _command_response_payload(response: dict[str, Any]) -> dict[str, Any]:
-    if _command_succeeded(response):
-        return {
-            "handled": True,
-            "reply": _success_reply(response) if config.ack_on_send() else "",
-        }
-    return {
-        "handled": True,
-        "reply": SAFE_SEND_FAILURE_REPLY,
-        "status": response.get("status") or "failed",
-    }
 
 
 def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     with state.state_lock():
         store = state.load_state()
-        if _prune_ingress_command_requests(store, time.time()):
-            state.save_state(store)
+        now = time.time()
+        changed = ingress_requests.prune_requests(store, now=now)
+        record: dict[str, Any] | None = None
         try:
             ingress_request_id = validate_request_id(payload.get("request_id"))
         except ValueError:
             ingress_request_id = ""
         if ingress_request_id:
-            stored_request = _stored_ingress_command_request(
-                store, ingress_request_id
+            record, cached, prepared = ingress_requests.preflight_request(
+                store,
+                ingress_request_id,
+                now=now,
+                retry_horizon=config.command_retry_horizon_seconds(),
+                retention=config.command_request_retention_seconds(),
             )
-            if stored_request is not None:
-                return _command_response_payload(
-                    _submit_ingress_command_request(store, stored_request)
-                )
+            if changed or prepared:
+                # First-seen lifecycle bounds are durable before routing,
+                # speech preparation, or child-process construction.
+                state.save_state(store)
+            if cached is not None:
+                return cached
+            if isinstance(record.get("request_json"), str):
+                return _submit_ingress_command_record(store, record)
+        elif changed:
+            state.save_state(store)
         _key, entry = state.find_entry_by_thread(store, str(payload.get("topic_id") or ""))
         if entry is None:
+            if record is not None:
+                return _local_ingress_outcome(
+                    store, record, reason="message is not routed", handled=False
+                )
             return {"handled": False}
         voice_reply = _voice_mode_reply(store, entry, payload)
         if voice_reply is not None:
+            if record is not None:
+                return _local_ingress_outcome(
+                    store,
+                    record,
+                    reason="voice mode handled locally",
+                    reply=str(voice_reply.get("reply") or ""),
+                    handled=voice_reply.get("handled") is not False,
+                )
             state.save_state(store)
             return voice_reply
         text = _send_text_from_payload(payload)
@@ -503,6 +517,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     entry = kind_entry
                     text = clean_text
                 else:
+                    if record is not None:
+                        return _local_ingress_outcome(
+                            store,
+                            record,
+                            reason="unknown target alias",
+                            reply=SAFE_SEND_FAILURE_REPLY,
+                        )
                     return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "unknown_target_alias"}
         else:
             _reply_key, reply_entry = _worker_entry_from_reply(store, payload)
@@ -513,6 +534,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 payload.get("reply_to_message_id"),
                 topic_id=payload.get("topic_id"),
             ):
+                if record is not None:
+                    return _local_ingress_outcome(
+                        store,
+                        record,
+                        reason="ambiguous reply target",
+                        reply=SAFE_SEND_FAILURE_REPLY,
+                    )
                 return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "ambiguous_reply_target"}
             else:
                 target_bot_kind = str(payload.get("target_bot_kind") or "").strip().lower()
@@ -521,6 +549,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     if kind_entry is not None:
                         entry = kind_entry
                     else:
+                        if record is not None:
+                            return _local_ingress_outcome(
+                                store,
+                                record,
+                                reason="unknown target bot",
+                                reply=SAFE_SEND_FAILURE_REPLY,
+                            )
                         return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": "unknown_target_bot"}
         voice_text = _voice_submission_text(payload, clean_text if alias else "")
         if voice_text:
@@ -532,18 +567,43 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             entry["speak_next_reply"] = True
             text = speech.strip_speech_reply_trigger(text)
             if not text:
+                reply = "🎙️ Got it — the next reply will be spoken."
+                if record is not None:
+                    return _local_ingress_outcome(
+                        store,
+                        record,
+                        reason="voice reply armed locally",
+                        reply=reply,
+                    )
                 state.save_state(store)
-                return {"handled": True, "reply": "🎙️ Got it — the next reply will be spoken."}
+                return {"handled": True, "reply": reply}
         if not text:
-            if voice_payload:
-                return {"handled": True, "reply": _voice_unavailable_reply(payload)}
-            return {"handled": True, "reply": "Send a message in this topic or use /send <instruction>."}
+            reply = (
+                _voice_unavailable_reply(payload)
+                if voice_payload
+                else "Send a message in this topic or use /send <instruction>."
+            )
+            if record is not None:
+                return _local_ingress_outcome(
+                    store,
+                    record,
+                    reason="empty command handled locally",
+                    reply=reply,
+                )
+            return {"handled": True, "reply": reply}
         # A bare number answering a live captured prompt: validate against the pending's choices and
         # fail closed on stale/out-of-range/custom, else send the digit (the picker's native input).
         number_reply = _pending_number_reply(entry, text)
         if number_reply is not None:
             mapped, error_reply = number_reply
             if error_reply:
+                if record is not None:
+                    return _local_ingress_outcome(
+                        store,
+                        record,
+                        reason="pending answer rejected locally",
+                        reply=error_reply,
+                    )
                 return {"handled": True, "reply": error_reply}
             text = mapped
         # Reply-to-voice auto-mode (#4): replying to one of this pane's voice notes speaks the next
@@ -555,19 +615,40 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             request = _command_request(entry, payload, text)
         except ValueError:
+            if record is not None:
+                return _local_ingress_outcome(
+                    store,
+                    record,
+                    reason="invalid command request",
+                    reply=SAFE_SEND_FAILURE_REPLY,
+                )
             return {
                 "handled": True,
                 "reply": SAFE_SEND_FAILURE_REPLY,
                 "status": "invalid_request",
             }
-        request = _remember_ingress_command_request(store, request)
-        # The exact public request is durable before the child may mutate. This
-        # cache is scheduling evidence only: every replay still asks Tendwire's
-        # authoritative receipt machine for the outcome.
-        state.save_state(store)
-        return _command_response_payload(
-            _submit_ingress_command_request(store, request)
-        )
+        if record is None:
+            return {
+                "handled": True,
+                "reply": SAFE_SEND_FAILURE_REPLY,
+                "status": "invalid_request",
+            }
+        request_json = ingress_requests.canonical_request_json(request)
+        try:
+            attached = ingress_requests.attach_request_json(
+                record, request_json, now=time.time()
+            )
+        except ValueError:
+            outcome = ingress_requests.quarantine_request(
+                record, "conflicting ingress request", now=time.time()
+            )
+            state.save_state(store)
+            return outcome
+        if attached:
+            # Exact canonical bytes are fsynced before Tendwire can observe the
+            # request, and every retry reads only this stored string.
+            state.save_state(store)
+        return _submit_ingress_command_record(store, record)
 
 
 def callback_reply(_payload: dict[str, Any]) -> dict[str, Any]:

@@ -25,6 +25,8 @@ def _command_request() -> dict[str, object]:
         },
         "instruction": {"text": "perform the public instruction"},
     }
+
+
 def _accepted_result() -> dict[str, object]:
     return {
         "target": {"worker_id": "worker-public"},
@@ -38,16 +40,27 @@ def _accepted_result() -> dict[str, object]:
 def _command_response(
     *,
     status: str = "accepted",
+    disposition: str | None = None,
     ok: bool = True,
     result: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    if disposition is None:
+        if status == "accepted":
+            disposition = "terminal_accepted"
+        elif status == "pending":
+            disposition = "in_progress"
+        elif status == "request_state_uncertain":
+            disposition = "terminal_uncertain"
+        else:
+            disposition = "terminal_rejected"
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "action": "send_instruction",
         "request_id": REQUEST_ID,
         "ok": ok,
         "dry_run": False,
         "status": status,
+        "disposition": disposition,
         "result": _accepted_result() if status == "accepted" and result is None else result,
         "error": None
         if ok
@@ -68,14 +81,33 @@ def client_runner(monkeypatch):
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
         response = responses.pop(0)
+        body = response["body"]
+        returncode = response.get("returncode")
+        if returncode is None:
+            returncode = (
+                1
+                if body.get("action") == "send_instruction"
+                and body.get("ok") is False
+                else 0
+            )
         return SimpleNamespace(
-            returncode=response.get("returncode", 0),
-            stdout=json.dumps(response["body"], ensure_ascii=False).encode("utf-8"),
+            returncode=returncode,
+            stdout=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             stderr=response.get("stderr", "").encode("utf-8"),
         )
 
     monkeypatch.setattr(tendwire_client.subprocess, "run", fake_run)
     return TendwireClient(), calls, responses
+
+
+def _assert_private_process_ambiguity(result):
+    assert tendwire_client.command_process_ambiguous(result) is True
+    assert tendwire_client.command_process_not_started(result) is False
+    assert all(not key.startswith("_process") for key in result)
+    assert "_process" not in json.dumps(result, sort_keys=True)
+    serialized = json.loads(json.dumps(result, sort_keys=True))
+    assert serialized == dict(result)
+    assert tendwire_client.command_process_ambiguous(serialized) is False
 
 
 def test_command_serializes_only_exact_allowlisted_public_request(client_runner):
@@ -88,6 +120,11 @@ def test_command_serializes_only_exact_allowlisted_public_request(client_runner)
     assert len(calls) == 1
     sent = json.loads(calls[0][1]["input"].decode("utf-8"))
     assert sent == _command_request()
+    assert calls[0][1]["input"] == json.dumps(
+        _command_request(),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
     encoded = json.dumps(sent, sort_keys=True)
     assert all(
         forbidden not in encoded
@@ -102,6 +139,41 @@ def test_command_serializes_only_exact_allowlisted_public_request(client_runner)
             "private-route-sentinel",
         )
     )
+
+
+def test_command_json_repeats_verbatim_utf8_input_bytes(client_runner):
+    client, calls, responses = client_runner
+    responses.extend([{"body": _command_response()}, {"body": _command_response()}])
+    request_json = json.dumps(
+        _command_request(),
+        ensure_ascii=False,
+        indent=2,
+    ).replace(
+        '"perform the public instruction"',
+        '"perform the public instruction \u2603"',
+    )
+    expected = request_json.encode("utf-8")
+
+    first = client.command_json(request_json)
+    second = client.command_json(request_json)
+
+    assert first["disposition"] == second["disposition"] == "terminal_accepted"
+    assert len(calls) == 2
+    assert calls[0][1]["input"] == calls[1][1]["input"] == expected
+    assert json.loads(expected)["instruction"]["text"].endswith(" \u2603")
+
+
+@pytest.mark.parametrize("request_json", ["not-json", "[]", "{}", "\ud800"])
+def test_command_json_rejects_invalid_input_without_spawning(
+    client_runner,
+    request_json,
+):
+    client, calls, _responses = client_runner
+
+    result = client.command_json(request_json)
+
+    assert result["status"] == "invalid_request"
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -146,11 +218,52 @@ def test_command_timeout_after_process_start_is_uncertain(monkeypatch):
     assert result["request_id"] == REQUEST_ID
     assert len(calls) == 1
     assert "before delivery" not in result["error"].lower()
+    _assert_private_process_ambiguity(result)
 
 
-def test_command_nonzero_exit_with_correlated_success_is_uncertain(client_runner):
+@pytest.mark.parametrize(
+    ("returncode", "body"),
+    [
+        pytest.param(
+            0,
+            _command_response(
+                status="stale_target",
+                ok=False,
+                result={"candidates": []},
+            ),
+            id="exit-zero-with-rejection",
+        ),
+        pytest.param(1, _command_response(), id="exit-one-with-success"),
+        pytest.param(
+            2,
+            _command_response(
+                status="backend_unavailable",
+                ok=False,
+                result=None,
+            ),
+            id="exit-outside-contract-with-rejection",
+        ),
+        pytest.param(9, _command_response(), id="exit-outside-contract-with-success"),
+        pytest.param(False, _command_response(), id="boolean-false-is-not-exit-zero"),
+        pytest.param(
+            True,
+            _command_response(
+                status="backend_unavailable",
+                disposition="no_receipt",
+                ok=False,
+                result=None,
+            ),
+            id="boolean-true-is-not-exit-one",
+        ),
+    ],
+)
+def test_command_rejects_inconsistent_exit_body_matrix(
+    client_runner,
+    returncode,
+    body,
+):
     client, _calls, responses = client_runner
-    responses.append({"returncode": 9, "body": _command_response()})
+    responses.append({"returncode": returncode, "body": body})
 
     result = client.command(_command_request())
 
@@ -159,6 +272,7 @@ def test_command_nonzero_exit_with_correlated_success_is_uncertain(client_runner
     assert result["request_id"] == REQUEST_ID
     assert result["action"] == "send_instruction"
     assert "result" not in result
+    _assert_private_process_ambiguity(result)
 
 
 def test_command_spawn_failure_remains_definite_and_single_attempt(monkeypatch):
@@ -176,6 +290,10 @@ def test_command_spawn_failure_remains_definite_and_single_attempt(monkeypatch):
     assert result["ok"] is False
     assert result["status"] == "subprocess_failed"
     assert len(calls) == 1
+    assert tendwire_client.command_process_ambiguous(result) is False
+    assert tendwire_client.command_process_not_started(result) is True
+    assert all(not key.startswith("_process") for key in result)
+    assert "_process" not in json.dumps(result, sort_keys=True)
 
 
 @pytest.mark.parametrize(
@@ -195,7 +313,13 @@ def test_command_spawn_failure_remains_definite_and_single_attempt(monkeypatch):
         json.dumps(
             {
                 **_command_response(),
-                "schema_version": 2,
+                "schema_version": 1,
+            }
+        ).encode("utf-8"),
+        json.dumps(
+            {
+                **_command_response(),
+                "request_id": "hri1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             }
         ).encode("utf-8"),
     ],
@@ -208,7 +332,7 @@ def test_command_malformed_or_uncorrelated_child_result_is_uncertain(
 
     def fake_run(*args, **kwargs):
         calls.append((args, kwargs))
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+        return SimpleNamespace(returncode=1, stdout=stdout, stderr=b"")
 
     monkeypatch.setattr(tendwire_client.subprocess, "run", fake_run)
 
@@ -218,6 +342,7 @@ def test_command_malformed_or_uncorrelated_child_result_is_uncertain(
     assert result["status"] == "request_state_uncertain"
     assert result["request_id"] == REQUEST_ID
     assert len(calls) == 1
+    _assert_private_process_ambiguity(result)
 
 
 def test_command_rejects_unknown_legacy_status_as_uncertain(client_runner):
@@ -237,39 +362,134 @@ def test_command_rejects_unknown_legacy_status_as_uncertain(client_runner):
     assert result["ok"] is False
     assert result["status"] == "request_state_uncertain"
     assert result["request_id"] == REQUEST_ID
+    _assert_private_process_ambiguity(result)
+
+
 @pytest.mark.parametrize(
-    "status",
+    "mutate",
     [
-        "rejected",
-        "not_found",
-        "ambiguous_target",
-        "stale_target",
-        "backend_unsupported",
-        "ambiguous_backend_target",
-        "backend_failed",
-        "duplicate_request",
-        "invalid_request",
-        "backend_unavailable",
-        "request_state_uncertain",
-        "pending",
+        lambda body: body.update({"chat_id": "-100-private"}),
+        lambda body: body.update({"_process_returncode": 0}),
+        lambda body: body.update({"_process_ambiguity": "forged"}),
+        lambda body: body.pop("disposition"),
+        lambda body: body.update({"disposition": "unknown"}),
+        lambda body: body.update({"schema_version": 1}),
+        lambda body: body.update({"request_id": "hri1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}),
+        lambda body: body.update({"dry_run": True}),
+        lambda body: body["error"]["details"].update({"private_fingerprint": "private"})
+        if isinstance(body.get("error"), dict)
+        else None,
     ],
 )
-def test_command_accepts_only_recognized_false_statuses(client_runner, status):
+def test_command_validates_exact_raw_schema_before_public_pruning(
+    client_runner,
+    mutate,
+):
+    client, _calls, responses = client_runner
+    body = _command_response(
+        status="stale_target",
+        disposition="no_receipt",
+        ok=False,
+        result={"candidates": []},
+    )
+    body["error"]["details"] = {}
+    mutate(body)
+    responses.append({"returncode": 1, "body": body})
+
+    result = client.command(_command_request())
+
+    assert result["ok"] is False
+    assert result["status"] == "request_state_uncertain"
+    assert result["request_id"] == REQUEST_ID
+    assert "private" not in json.dumps(result, sort_keys=True)
+    _assert_private_process_ambiguity(result)
+
+
+def test_command_preserves_correlated_stale_target_on_exit_one(client_runner):
     client, _calls, responses = client_runner
     responses.append(
         {
+            "returncode": 1,
             "body": _command_response(
-                status=status,
+                status="stale_target",
+                disposition="no_receipt",
                 ok=False,
                 result={"candidates": []},
-            )
+            ),
         }
     )
 
     result = client.command(_command_request())
 
     assert result["ok"] is False
-    assert result["status"] == status
+    assert result["status"] == "stale_target"
+    assert result["disposition"] == "no_receipt"
+    assert result["request_id"] == REQUEST_ID
+    assert result["result"] == {"candidates": []}
+    assert tendwire_client.command_process_ambiguous(result) is False
+    assert tendwire_client.command_process_not_started(result) is False
+    assert "_process" not in json.dumps(result, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    ("status", "disposition"),
+    [
+        *[
+            (status, "terminal_rejected")
+            for status in (
+                "rejected",
+                "not_found",
+                "ambiguous_target",
+                "stale_target",
+                "backend_unsupported",
+                "ambiguous_backend_target",
+                "backend_failed",
+                "duplicate_request",
+                "invalid_request",
+                "backend_unavailable",
+            )
+        ],
+        *[
+            (status, "no_receipt")
+            for status in (
+                "rejected",
+                "not_found",
+                "ambiguous_target",
+                "stale_target",
+                "backend_unsupported",
+                "ambiguous_backend_target",
+                "backend_failed",
+                "invalid_request",
+                "backend_unavailable",
+            )
+        ],
+        ("request_state_uncertain", "terminal_uncertain"),
+        ("pending", "in_progress"),
+    ],
+)
+def test_command_accepts_every_recognized_false_tuple(
+    client_runner,
+    status,
+    disposition,
+):
+    client, _calls, responses = client_runner
+    responses.append(
+        {
+            "returncode": 1,
+            "body": _command_response(
+                status=status,
+                disposition=disposition,
+                ok=False,
+                result={"candidates": []},
+            ),
+        }
+    )
+
+    result = client.command(_command_request())
+
+    assert result["ok"] is False
+    assert (result["status"], result["disposition"]) == (status, disposition)
+    assert tendwire_client.command_process_ambiguous(result) is False
 
 
 @pytest.mark.parametrize(
@@ -287,6 +507,70 @@ def test_command_accepts_only_recognized_false_statuses(client_runner, status):
             ok=False,
             result=None,
         ),
+        {
+            **_command_response(
+                status="stale_target",
+                ok=False,
+                result={"candidates": []},
+            ),
+            "error": None,
+        },
+        {
+            **_command_response(
+                status="stale_target",
+                ok=False,
+                result={"candidates": []},
+            ),
+            "error": {
+                "code": "rejected",
+                "message": "mismatched error code",
+            },
+        },
+        _command_response(
+            status="accepted",
+            disposition="no_receipt",
+            ok=True,
+            result=_accepted_result(),
+        ),
+        _command_response(
+            status="rejected",
+            disposition="terminal_accepted",
+            ok=False,
+            result={"candidates": []},
+        ),
+        _command_response(
+            status="pending",
+            disposition="no_receipt",
+            ok=False,
+            result=None,
+        ),
+        _command_response(
+            status="request_state_uncertain",
+            disposition="terminal_rejected",
+            ok=False,
+            result=None,
+        ),
+        _command_response(
+            status="duplicate_request",
+            disposition="no_receipt",
+            ok=False,
+            result=None,
+        ),
+        _command_response(
+            status="backend_unavailable",
+            disposition="in_progress",
+            ok=False,
+            result=None,
+        ),
+        {
+            **_command_response(
+                status="stale_target",
+                disposition="no_receipt",
+                ok=False,
+                result={"candidates": []},
+            ),
+            "error": {"code": "stale_target", "message": ""},
+        },
         _command_response(status="accepted", ok=True, result={}),
         _command_response(
             status="accepted",
@@ -318,6 +602,7 @@ def test_command_rejects_inconsistent_status_or_accepted_result_as_uncertain(
     assert result["ok"] is False
     assert result["status"] == "request_state_uncertain"
     assert result["request_id"] == REQUEST_ID
+    _assert_private_process_ambiguity(result)
 
 
 def test_command_invalid_utf8_after_process_start_is_uncertain(monkeypatch):
@@ -326,7 +611,7 @@ def test_command_invalid_utf8_after_process_start_is_uncertain(monkeypatch):
         tendwire_client.subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=0,
+            returncode=1,
             stdout=b"\xff",
             stderr=b"",
         ),
@@ -337,6 +622,7 @@ def test_command_invalid_utf8_after_process_start_is_uncertain(monkeypatch):
     assert result["ok"] is False
     assert result["status"] == "request_state_uncertain"
     assert result["request_id"] == REQUEST_ID
+    _assert_private_process_ambiguity(result)
 
 
 def test_tendwire_child_env_strips_private_ingress_and_keeps_tendwire_overrides(

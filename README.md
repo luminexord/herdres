@@ -59,44 +59,104 @@ the polling position and the opaque request ID. Every distinct update receives
 a different ID even when its content is identical, and Herdres does not
 suppress commands by comparing their content.
 
-The gateway derives the opaque ID before private route resolution. Before its
-first call to Tendwire, Herdres records the exact public command request under
-that ID; each private-state write fsyncs the temporary file before atomic
-replacement and fsyncs the parent directory afterward. On redelivery, an
-ID-only probe checks this durable record before current topic, route,
-transcription, or worker-state lookup and replays the recorded request. The
-sole stale-target refresh is pre-reservation: on `stale_target` for a target
-with a worker fingerprint, Herdres removes only that fingerprint, durably
-persists the revised exact request, and retries with the same request ID.
+The gateway derives the opaque ID before private route resolution and creates a
+durable schema-v2 lifecycle shell before routing, transcription, or child
+creation. Its `created_at`, `deadline_at`, and `retain_until` are fixed from
+that first-seen instant. Before Tendwire can observe a command, Herdres
+canonicalizes the exact schema-v1 public request, stores that JSON string, and
+fsyncs the temporary state file, atomic replacement, and parent directory. The
+Tendwire child receives those stored UTF-8 bytes verbatim; an ID-only
+redelivery probe consults the record before current topic, route,
+transcription, or worker-state lookup. The only permitted byte change is one
+`stale_target` response with disposition `no_receipt`: when the recorded target
+contains `worker_fingerprint`, Herdres removes only that field, durably stores
+the second exact byte string, and retries once under the same request ID.
 
-`HERDRES_COMMAND_RETRY_HORIZON_SECONDS` is the retry horizon, not the exact
-record-retention duration. Unset, empty, or invalid values use `86400` seconds;
-configured values clamp to `60` through `604800`. Exact records are retained
-for the effective retry horizon plus `86400` seconds: `172800` by default,
-`86460` at the minimum, and at most `691200`. A record is pruned only when its
-terminal timestamp, or otherwise its last-update/creation timestamp, is
-strictly older than that retention cutoff; equality remains retained. This
-bounds every terminal class and abandoned pending, unavailable, or uncertain
-nonterminal work, rather than retaining uncertainty forever.
+`HERDRES_COMMAND_RETRY_HORIZON_SECONDS` fixes `deadline_at` to first-seen time
+plus the effective horizon. Unset, empty, or invalid values use `86400`
+seconds; configured values clamp to `60` through `604800`. Neither redelivery,
+retry, `updated_at`, a terminal transition, nor a later configuration change
+moves that deadline. Equality is expired: before creating another client, and
+again after every retryable result, `now >= deadline_at` quarantines
+(dead-letters) the local ingress record.
 
-If the Tendwire result may have been lost after request start, Herdres reports
-`request_state_uncertain`. The gateway sends no Telegram acknowledgement or
-failure reply, does not advance or save the stable polling offset, stops that
-poll batch, and waits for Telegram redelivery. While the exact record remains
-inside the bounded retention window, redelivery carries the same ID and replays
-the stored public request so Tendwire's receipt authority, not Herdres content
-or current routing, decides the outcome.
+`retain_until` is independently fixed at first-seen time plus the effective
+horizon and a `86400`-second safety margin: `172800` by default, `86460` at
+the minimum, and `691200` at the maximum. Valid records are pruned only when
+`now > retain_until`; equality remains cached. `updated_at`, `terminal_at`,
+and `quarantined_at` describe transitions but never slide retention. Pair the
+services so `TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS` is at least the Herdres
+horizon and `TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS` is at least the
+Herdres first-seen retention bound. Tendwire's defaults (`604800` retry,
+`2592000` receipt age, and newest `4096` bounded inactive receipts per host)
+cover Herdres's full range; Tendwire also enforces a `691200`-second receipt-age
+floor and an age strictly greater than its own retry horizon.
 
-Only the exact public command fields cross into Tendwire: schema/action,
-the opaque request ID, `dry_run`, a public worker/space/name target, and the
-instruction text. Raw Telegram receiver, update, chat, topic, message, reply,
-and user IDs, bot tokens, and private routes/backend targets never do. The
-Tendwire child environment preserves public Tendwire overrides but strips
-Telegram variables and private ingress, gateway, managed-bot, state, and
-request-key settings, including explicit binary-selector variables. Back up
-and restore the request-ID key with the private Herdres state and Tendwire
-continuity set; replacing the key changes every derived ID and can turn a
-redelivery into a different mutation.
+Terminal accepted/rejected results and every quarantine store one exact,
+sanitized child outcome. Tendwire rejection, terminal uncertainty, deadline
+expiry, and unsafe/corrupt command evidence use the fixed public reply
+`Could not send safely. Refresh status and choose the target again.` and the
+child `checkpoint: "advance"`. The gateway sends that reply, advances and
+saves the stable polling offset, and continues with later Telegram updates.
+Redelivery or restart returns the cached outcome before private routing and
+without constructing a Tendwire client. This bounded terminalization is
+separate from Tendwire's connector-final dead-letter queue.
+
+Herdres sends an exact schema-v1 `send_instruction` object containing only
+`schema_version`, `action`, `request_id`, `dry_run`, `target`, and
+`instruction`; `dry_run` is false, `instruction` contains only nonempty
+`text`, and `target` is exactly one of `{worker_id}`,
+`{worker_id, worker_fingerprint}`, `{space_id}`, `{name}`, or
+`{name, space_id}`, with nonempty string values. Tendwire's general request-ID
+grammar is `[A-Za-z0-9._-]{1,128}`; Herdres emits and locally requires its
+narrower canonical 48-character `hri1_…` form. Raw Telegram receiver, update,
+chat, topic, message, reply, and user IDs, bot tokens, private routes, and
+backend targets never cross. The child environment preserves public Tendwire
+overrides but strips Telegram variables and private ingress, gateway,
+managed-bot, state, request-key, and binary-selector settings.
+
+For a non-dry-run ingress send, Herdres accepts only an exact schema-v2 Tendwire
+response with the ten fields `schema_version`, `action`, `request_id`, `ok`,
+`dry_run`, `status`, `disposition`, `result`, `error`, and `warnings`; action,
+request ID, and `dry_run: false` must correlate, warnings must be strings, and
+the complete value must survive public pruning unchanged. It then validates the
+whole disposition tuple:
+
+- `terminal_accepted` requires `ok: true`, status `accepted`, a null error, and
+  an exact result containing only `target`, `delivery_state`,
+  `transport_state`, `target_state_at_send`, and `observed_turn_state`. The
+  target contains only the correlated `worker_id`, delivery and transport are
+  `submitted`, target state is nonempty, and observed turn state is
+  `pending_observation`.
+- Every nonaccepted tuple requires `ok: false` and an error whose code equals
+  status and whose message is nonempty.
+- `in_progress` permits only status `pending`.
+- `terminal_uncertain` permits only status `request_state_uncertain`.
+- `terminal_rejected` permits `rejected`, `not_found`, `ambiguous_target`,
+  `stale_target`, `backend_unavailable`, `backend_unsupported`,
+  `ambiguous_backend_target`, `backend_failed`, `duplicate_request`, or
+  `invalid_request`.
+- `no_receipt` permits the same rejection-status set except
+  `duplicate_request`.
+
+The process exit is part of the envelope: exit `0` must pair with `ok: true`
+and exit `1` with `ok: false`. Exit `2`, a mismatched pair, timeout,
+invalid UTF-8/JSON, wrong shape/correlation, or other unproven post-start loss
+becomes private process ambiguity. Herdres does not forge a schema-v2
+disposition from it or expose process markers, stdout, or stderr; it keeps the
+durable record retryable with no reply and retains the gateway checkpoint until
+the fixed deadline. A definite spawn failure follows the same bounded retry
+path. At the deadline, or for an authoritative `terminal_uncertain`,
+quarantine caches the fixed safe outcome and advances the queue.
+
+`status` alone never decides retry or finality. In particular,
+`backend_unavailable` with `no_receipt` retries with no reply, while the same
+status with `terminal_rejected` caches the fixed failure and advances.
+`stale_target` refreshes a fingerprint only when paired with `no_receipt`;
+otherwise its disposition is authoritative. Back up and restore the request-ID
+key with private Herdres state and the Tendwire continuity set; replacing the
+key changes every derived ID and can turn a redelivery into a different
+mutation.
 
 ### Turn content and paging contract
 

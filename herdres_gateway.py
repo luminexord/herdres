@@ -17,8 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from herdres_connector import config, speech, state
-from herdres_connector.ingress_identity import derive_telegram_request_id, load_request_id_key
+from herdres_connector import config, ingress_requests, speech, state
+from herdres_connector.ingress_identity import derive_telegram_request_id, load_request_id_key, validate_request_id
 from herdres_connector.managed_bots import MANAGER_BOT_KIND, managed_bot_kind_for_key, managed_bot_kind_for_username, managed_bot_tokens
 from herdres_connector.safe import sanitize_text
 from herdres_connector.telegram_delivery import TelegramClient
@@ -31,36 +31,28 @@ WORKER_RECONCILE_SECONDS = float(os.getenv("HERDRES_GATEWAY_WORKER_RECONCILE_SEC
 MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,64})")
 CHECKPOINT_ADVANCE = "advance"
 CHECKPOINT_RETRY = "retry"
-_RETRY_COMMAND_STATUSES = frozenset(
+_CHILD_SCHEMA_VERSION = 1
+_CHILD_RESPONSE_FIELDS = frozenset(
     {
-        "request_state_uncertain",
-        "command_transport_unavailable",
-        "subprocess_failed",
-        "backend_unavailable",
-        "pending",
-        "nonzero_exit",
-        "timeout",
+        "schema_version",
+        "handled",
+        "request_id",
+        "checkpoint",
+        "disposition",
+        "reply",
     }
 )
-_TERMINAL_COMMAND_STATUSES = frozenset(
+_COMMAND_DISPOSITIONS = frozenset(
     {
-        "accepted",
-        "rejected",
-        "not_found",
-        "ambiguous_target",
-        "stale_target",
-        "backend_unsupported",
-        "ambiguous_backend_target",
-        "backend_failed",
-        "duplicate_request",
-        "invalid_request",
-        "missing_space",
-        "voice_mode",
-        "unknown_target_alias",
-        "ambiguous_reply_target",
-        "unknown_target_bot",
+        "no_receipt",
+        "in_progress",
+        "terminal_accepted",
+        "terminal_rejected",
+        "terminal_uncertain",
     }
 )
+_RETRY_DISPOSITIONS = frozenset({"no_receipt", "in_progress"})
+_CHILD_REPLY_LIMIT = 160
 
 
 def log(message: str) -> None:
@@ -309,7 +301,60 @@ def _script_path() -> str:
     return os.getenv("HERDR_TELEGRAM_TOPICS_SCRIPT", str(Path.home() / ".local/bin/herdres"))
 
 
+def _private_retry_child_result(request_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": _CHILD_SCHEMA_VERSION,
+        "handled": True,
+        "request_id": request_id,
+        "checkpoint": CHECKPOINT_RETRY,
+        "disposition": None,
+        "reply": "",
+    }
+
+
+def _validated_child_response(
+    value: Any,
+    *,
+    request_id: str,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _CHILD_RESPONSE_FIELDS
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != _CHILD_SCHEMA_VERSION
+        or type(value.get("handled")) is not bool
+        or value.get("request_id") != request_id
+        or value.get("checkpoint") not in {CHECKPOINT_RETRY, CHECKPOINT_ADVANCE}
+        or (
+            value.get("disposition") is not None
+            and value.get("disposition") not in _COMMAND_DISPOSITIONS
+        )
+        or not isinstance(value.get("reply"), str)
+        or sanitize_text(value["reply"], _CHILD_REPLY_LIMIT) != value["reply"]
+    ):
+        return None
+    checkpoint = value["checkpoint"]
+    disposition = value["disposition"]
+    if checkpoint == CHECKPOINT_RETRY:
+        if disposition not in _RETRY_DISPOSITIONS and disposition is not None:
+            return None
+        if value["reply"]:
+            return None
+        return value
+    if disposition in _RETRY_DISPOSITIONS:
+        return None
+    if value["handled"] is False and (
+        disposition is not None or value["reply"]
+    ):
+        return None
+    return value
+
+
 def run_herdres_command(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        request_id = validate_request_id(payload.get("request_id"))
+    except ValueError:
+        return _private_retry_child_result("")
     try:
         proc = subprocess.run(
             [_script_path(), "command"],
@@ -318,40 +363,55 @@ def run_herdres_command(payload: dict[str, Any]) -> dict[str, Any]:
             timeout=COMMAND_TIMEOUT,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        return {"handled": True, "status": "request_state_uncertain", "reply": ""}
-    except Exception:  # noqa: BLE001 - no child receipt exists, so retain the update for retry
-        return {"handled": True, "status": "command_transport_unavailable", "reply": ""}
+    except Exception:  # noqa: BLE001 - any child-start/result loss is private ambiguity
+        # Once process creation is attempted, the parent cannot prove whether
+        # the child durably called Tendwire. Keep this evidence private and
+        # retry only through the same durable request ID.
+        return _private_retry_child_result(request_id)
     if proc.returncode != 0:
-        return {"handled": True, "status": "request_state_uncertain", "reply": ""}
+        return _private_retry_child_result(request_id)
     try:
-        stdout = proc.stdout.decode("utf-8")
-        data = json.loads(stdout or "{}")
+        data = json.loads(proc.stdout.decode("utf-8") or "{}")
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return {"handled": True, "status": "request_state_uncertain", "reply": ""}
-    if not isinstance(data, dict) or type(data.get("handled")) is not bool:
-        return {"handled": True, "status": "request_state_uncertain", "reply": ""}
-    if "status" in data and (
-        not isinstance(data.get("status"), str) or not data["status"].strip()
-    ):
-        return {"handled": True, "status": "request_state_uncertain", "reply": ""}
-    return data
+        return _private_retry_child_result(request_id)
+    validated = _validated_child_response(data, request_id=request_id)
+    return validated if validated is not None else _private_retry_child_result(request_id)
 
 
-def _checkpoint_for_command_result(result: dict[str, Any]) -> str:
-    if type(result.get("handled")) is not bool:
-        return CHECKPOINT_RETRY
-    raw_status = result.get("status")
-    if raw_status is None:
-        return CHECKPOINT_ADVANCE
-    if not isinstance(raw_status, str) or not raw_status.strip():
-        return CHECKPOINT_RETRY
-    status = raw_status.strip().lower()
-    if status in _RETRY_COMMAND_STATUSES:
-        return CHECKPOINT_RETRY
-    if status in _TERMINAL_COMMAND_STATUSES:
-        return CHECKPOINT_ADVANCE
-    return CHECKPOINT_RETRY
+def _checkpoint_for_command_result(
+    result: dict[str, Any],
+    *,
+    request_id: str,
+) -> str:
+    validated = _validated_child_response(result, request_id=request_id)
+    return (
+        str(validated["checkpoint"])
+        if validated is not None
+        else CHECKPOINT_RETRY
+    )
+
+
+def _preflight_ingress_request(
+    request_id: str,
+    *,
+    now: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    timestamp = time.time() if now is None else float(now)
+    retry_horizon = config.command_retry_horizon_seconds()
+    retention = config.command_request_retention_seconds()
+    with state.state_lock():
+        store = state.load_state()
+        changed = ingress_requests.prune_requests(store, now=timestamp)
+        record, outcome, preflight_changed = ingress_requests.preflight_request(
+            store,
+            request_id,
+            now=timestamp,
+            retry_horizon=retry_horizon,
+            retention=retention,
+        )
+        if changed or preflight_changed:
+            state.save_state(store)
+    return record, outcome
 
 
 def handle_message(
@@ -363,9 +423,6 @@ def handle_message(
     request_id_key: bytes,
     bot_key: str | None = None,
 ) -> str:
-    store = state.load_state()
-    if _delete_topic_icon_service_message(message, store, token):
-        return CHECKPOINT_ADVANCE
     chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
     try:
         request_id = derive_telegram_request_id(
@@ -378,29 +435,55 @@ def handle_message(
     except ValueError:
         _drop(message, "invalid_ingress_identity")
         return CHECKPOINT_ADVANCE
-    payload = _payload_for_message(message, store, bot_key=bot_key)
-    if payload is None:
-        command_payload = {"request_id": request_id}
+
+    # The immutable first-seen/deadline/retention shell is fsynced before
+    # routing, voice transcription, or child-process creation. A terminal or
+    # expired redelivery is answered from its cached local outcome and never
+    # creates a child that could call Tendwire.
+    record, cached_outcome = _preflight_ingress_request(request_id)
+    if cached_outcome is not None:
+        result = cached_outcome
     else:
-        payload["request_id"] = request_id
-        command_payload = speech.pretranscribe_voice_payload(
-            payload,
-            bot_token=token,
-        )
-    result = run_herdres_command(command_payload)
-    checkpoint = _checkpoint_for_command_result(result)
+        store = state.load_state()
+        if _delete_topic_icon_service_message(message, store, token):
+            command_payload = {"request_id": request_id}
+        elif isinstance(record.get("request_json"), str):
+            command_payload = {"request_id": request_id}
+        else:
+            payload = _payload_for_message(message, store, bot_key=bot_key)
+            if payload is None:
+                command_payload = {"request_id": request_id}
+            else:
+                payload["request_id"] = request_id
+                command_payload = speech.pretranscribe_voice_payload(
+                    payload,
+                    bot_token=token,
+                )
+        result = run_herdres_command(command_payload)
+    checkpoint = _checkpoint_for_command_result(
+        result,
+        request_id=request_id,
+    )
     if checkpoint == CHECKPOINT_RETRY:
         return checkpoint
-    reply = sanitize_text(result.get("reply"), 3500).strip()
-    if reply:
-        TelegramClient(token=token).send_message(
+    reply = result["reply"].strip()
+    if not reply:
+        return CHECKPOINT_ADVANCE
+    try:
+        sent = TelegramClient(token=token).send_message(
             str(chat.get("id") or ""),
             reply,
-            thread_id=_message_thread_id(message, store),
+            thread_id=_message_thread_id(message, state.load_state()),
             reply_to_message_id=str(message.get("message_id") or ""),
             notify=True,
         )
-    return CHECKPOINT_ADVANCE
+    except Exception:  # noqa: BLE001 - retain the update for safe cached redelivery
+        return CHECKPOINT_RETRY
+    return (
+        CHECKPOINT_ADVANCE
+        if isinstance(sent, dict) and sent.get("ok") is True
+        else CHECKPOINT_RETRY
+    )
 
 
 def handle_update(

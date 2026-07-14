@@ -44,10 +44,10 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
         return {"version": 2, "enabled": True, "telegram": {}, "panes": {}, "spaces": {}}
     try:
         data = json.loads(state_file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {"version": 2, "enabled": True, "telegram": {}, "panes": {}, "spaces": {}}
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("Herdres state file is corrupt") from exc
     if not isinstance(data, dict):
-        return {"version": 2, "enabled": True, "telegram": {}, "panes": {}, "spaces": {}}
+        raise RuntimeError("Herdres state file is corrupt")
     data.setdefault("version", 2)
     data.setdefault("enabled", True)
     data.setdefault("telegram", {})

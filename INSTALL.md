@@ -19,6 +19,13 @@ for the `tendwired.service` daemon setup. Herdres finds Tendwire via the
 `tendwire` binary on `PATH`, or falls back to `TENDWIRE_SOURCE_DIR`
 (default `~/tendwire/src`) and runs it as `python -m tendwire.cli`.
 
+This is a paired command protocol, not a best-effort JSON integration. Herdres
+sends schema-v1 requests and requires an exact, correlated schema-v2 response.
+For a non-dry-run command, Tendwire CLI exit `0` must carry `ok: true`; exit
+`1` must carry `ok: false`. Exit `2`, malformed output, or any exit/body
+mismatch is private unproven process ambiguity and is not converted into a
+forged disposition.
+
 ## Continuity data and upgrades
 
 ### Herdres ingress request-ID key
@@ -86,12 +93,18 @@ mismatched, malformed, or unsafe state fails closed.
 
 An ordinary service restart must retain the private Herdres state file,
 Herdres request-ID key, stable polling-offset files, and Tendwire database
-unchanged. Herdres checks a redelivered opaque request ID against durable
-ingress records before resolving the current private route, so token, routing,
-or worker-state churn cannot replace an existing exact public request while it
-is retained. Herdres also resumes stable-job checkpoints under fresh transient
-lease refs, ACKs already-applied work without repeating the Telegram operation,
-and reconciles a completed pending plan when the final ACK response or
+unchanged. Before private route reconstruction, Herdres returns any cached
+terminal or quarantined child outcome for a redelivered request ID. A retained
+retryable record replays only its stored exact UTF-8 request bytes; token,
+routing, transcription, or worker-state churn cannot rebuild or replace them.
+The sole exception is the one persisted removal of `worker_fingerprint` after
+`stale_target` with disposition `no_receipt`. Terminal and quarantine cache
+survives restart and route loss, bypasses Tendwire client construction, sends
+the same sanitized reply, and advances the polling offset.
+
+Herdres also resumes stable-job checkpoints under fresh transient lease refs,
+ACKs already-applied work without repeating the Telegram operation, and
+reconciles a completed pending plan when the final ACK response or
 completed-plan observation was lost. A pending plan confirmed as `superseded`
 or `plan_not_found` is cleared before its newer durable root is handled; every
 other unresolved state continues to block the newer root. Do not clear or edit
@@ -172,15 +185,36 @@ TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.db
 HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS=900
 ```
 
-`HERDRES_COMMAND_RETRY_HORIZON_SECONDS` controls the retry horizon, not direct
-record retention. Unset, empty, or invalid values use `86400` seconds;
-configured values clamp to `60` through `604800`. Exact public ingress records
-are retained for the effective horizon plus `86400` seconds: `172800` by
-default, `86460` at the minimum, and no more than `691200`. Pruning uses a
-strictly-older-than cutoff (a record exactly at the cutoff remains) and applies
-to every terminal record plus abandoned pending, unavailable, and uncertain
-records by their last terminal/update/creation timestamp. The gateway service
-reads this variable from `~/.config/herdres/herdres.env`.
+`HERDRES_COMMAND_RETRY_HORIZON_SECONDS` fixes the retry deadline from the
+record's first-seen time; it does not configure a sliding idle timeout. Unset,
+empty, or invalid values use `86400` seconds, and configured values clamp to
+`60` through `604800`. `updated_at`, retry, redelivery, terminalization, and a
+later configuration change do not move the stored deadline. Equality expires
+the request before another Tendwire client is created.
+
+The local `retain_until` is also immutable: first-seen time plus the effective
+horizon and a `86400`-second margin (`172800` by default, `86460` minimum,
+`691200` maximum). A valid record remains through equality and is pruned only
+after that instant, regardless of its update or terminal timestamps. Configure
+the paired Tendwire service with
+`TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS >= HERDRES_COMMAND_RETRY_HORIZON_SECONDS`
+and
+`TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS >= HERDRES_COMMAND_RETRY_HORIZON_SECONDS + 86400`.
+Tendwire's `604800` retry, `2592000` receipt-age, and `4096` newest inactive
+receipt defaults satisfy this; its receipt age has a `691200`-second floor and
+must be strictly greater than its own retry horizon. The gateway reads the
+Herdres variable from `~/.config/herdres/herdres.env`.
+
+During the horizon, `no_receipt` and `in_progress` dispositions retain the
+Telegram update for same-ID retry. `terminal_accepted` and
+`terminal_rejected` advance. `terminal_uncertain`, deadline equality,
+corrupt/conflicting durable evidence, or an unrecoverable local command
+decision is quarantined (locally dead-lettered), caches the fixed sanitized
+failure `Could not send safely. Refresh status and choose the target again.`,
+and advances so later updates are not blocked. The cached outcome is reused
+after redelivery or restart without another Tendwire call. A
+`backend_unavailable` status follows `no_receipt` or `terminal_rejected`;
+status text alone is never retry authority.
 
 The final-root lease covers canonical paging, range-only presentation-plan
 begin/part/commit staging, and ACK. It uses 900 seconds when unset, empty, or

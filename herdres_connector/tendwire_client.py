@@ -54,6 +54,7 @@ _COMMAND_RESPONSE_FIELDS = {
     "ok",
     "dry_run",
     "status",
+    "disposition",
     "result",
     "error",
     "warnings",
@@ -73,6 +74,7 @@ _COMMAND_TERMINAL_REJECTION_STATUSES = frozenset(
         "not_found",
         "ambiguous_target",
         "stale_target",
+        "backend_unavailable",
         "backend_unsupported",
         "ambiguous_backend_target",
         "backend_failed",
@@ -80,11 +82,16 @@ _COMMAND_TERMINAL_REJECTION_STATUSES = frozenset(
         "invalid_request",
     }
 )
-_COMMAND_RETRY_STATUSES = frozenset(
+_COMMAND_PRE_RECEIPT_STATUSES = (
+    _COMMAND_TERMINAL_REJECTION_STATUSES - {"duplicate_request"}
+)
+_COMMAND_DISPOSITIONS = frozenset(
     {
-        "backend_unavailable",
-        "request_state_uncertain",
-        "pending",
+        "no_receipt",
+        "in_progress",
+        "terminal_accepted",
+        "terminal_rejected",
+        "terminal_uncertain",
     }
 )
 _PRIVATE_INGRESS_ENV_KEYS = frozenset(
@@ -98,6 +105,33 @@ _PRIVATE_INGRESS_ENV_KEYS = frozenset(
     }
 )
 _PROCESS_NOT_STARTED = object()
+_PROCESS_AMBIGUITY = object()
+
+
+class _CommandProcessResult(dict[str, Any]):
+    """A JSON-safe command result with identity-only private process evidence."""
+
+    __slots__ = (
+        "_process_ambiguity",
+        "_process_not_started",
+        "_process_returncode",
+    )
+
+
+def command_process_ambiguous(result: Any) -> bool:
+    """Return whether a command result carries private post-start ambiguity."""
+    return (
+        isinstance(result, _CommandProcessResult)
+        and getattr(result, "_process_ambiguity", None) is _PROCESS_AMBIGUITY
+    )
+
+
+def command_process_not_started(result: Any) -> bool:
+    """Return whether a command result carries definite process-spawn failure."""
+    return (
+        isinstance(result, _CommandProcessResult)
+        and getattr(result, "_process_not_started", None) is _PROCESS_NOT_STARTED
+    )
 
 
 def _invalid_command_request() -> dict[str, Any]:
@@ -109,11 +143,14 @@ def _invalid_command_request() -> dict[str, Any]:
 
 
 def _request_state_uncertain(request: dict[str, Any] | None = None) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "ok": False,
-        "status": "request_state_uncertain",
-        "error": "Tendwire command result was lost after request start",
-    }
+    result = _CommandProcessResult(
+        {
+            "ok": False,
+            "status": "request_state_uncertain",
+            "error": "Tendwire command result was lost after request start",
+        }
+    )
+    result._process_ambiguity = _PROCESS_AMBIGUITY
     if isinstance(request, dict):
         if isinstance(request.get("request_id"), str):
             result["request_id"] = request["request_id"]
@@ -182,13 +219,14 @@ def _validated_command_response(
     if (
         set(response) != _COMMAND_RESPONSE_FIELDS
         or type(response.get("schema_version")) is not int
-        or response["schema_version"] != 1
+        or response["schema_version"] != 2
         or response.get("request_id") != request["request_id"]
         or response.get("action") != "send_instruction"
         or response.get("dry_run") is not False
         or type(response.get("ok")) is not bool
         or not isinstance(response.get("status"), str)
         or not response["status"]
+        or response.get("disposition") not in _COMMAND_DISPOSITIONS
         or (
             response.get("result") is not None
             and not isinstance(response.get("result"), dict)
@@ -199,27 +237,44 @@ def _validated_command_response(
         )
         or not isinstance(response.get("warnings"), list)
         or any(not isinstance(item, str) for item in response["warnings"])
+        or public_prune(response) != response
     ):
         return None
+
     status = response["status"]
-    if status == "accepted":
+    disposition = response["disposition"]
+    if disposition == "terminal_accepted":
         if (
-            response["ok"] is not True
+            status != "accepted"
+            or response["ok"] is not True
             or response.get("error") is not None
             or not _valid_accepted_command_result(response.get("result"), request)
         ):
             return None
         return response
-    if status not in _COMMAND_TERMINAL_REJECTION_STATUSES | _COMMAND_RETRY_STATUSES:
-        return None
+
     error = response.get("error")
     if (
         response["ok"] is not False
         or not isinstance(error, dict)
         or error.get("code") != status
+        or not isinstance(error.get("message"), str)
+        or not error["message"]
     ):
         return None
-    return response
+    if disposition == "in_progress":
+        return response if status == "pending" else None
+    if disposition == "terminal_uncertain":
+        return response if status == "request_state_uncertain" else None
+    if disposition == "terminal_rejected":
+        return (
+            response
+            if status in _COMMAND_TERMINAL_REJECTION_STATUSES
+            else None
+        )
+    if disposition == "no_receipt":
+        return response if status in _COMMAND_PRE_RECEIPT_STATUSES else None
+    return None
 
 
 def _is_private_ingress_env_key(key: str) -> bool:
@@ -319,12 +374,15 @@ class TendwireClient:
         args: list[str],
         *,
         input_json: dict[str, Any] | None = None,
+        input_bytes: bytes | None = None,
         timeout: float | None = None,
         protocol: bool = False,
         preserve_page_text: bool = False,
         post_start_uncertain: bool = False,
     ) -> dict[str, Any]:
-        stdin = None
+        if input_json is not None and input_bytes is not None:
+            raise ValueError("input_json and input_bytes are mutually exclusive")
+        stdin = input_bytes
         if input_json is not None:
             stdin = json.dumps(input_json, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         try:
@@ -347,14 +405,14 @@ class TendwireClient:
                 "error": sanitize_text(str(exc), 300),
             }
             if post_start_uncertain:
-                failure["_process_not_started"] = _PROCESS_NOT_STARTED
+                process_failure = _CommandProcessResult(failure)
+                process_failure._process_not_started = _PROCESS_NOT_STARTED
+                return process_failure
             return failure
         except Exception as exc:  # noqa: BLE001
             if post_start_uncertain:
                 return _request_state_uncertain(input_json)
             return {"ok": False, "status": "subprocess_failed", "error": sanitize_text(str(exc), 300)}
-        if post_start_uncertain and proc.returncode != 0:
-            return _request_state_uncertain(input_json)
         try:
             if preserve_page_text or post_start_uncertain:
                 stdout = proc.stdout.decode("utf-8")
@@ -376,6 +434,10 @@ class TendwireClient:
             if post_start_uncertain:
                 return _request_state_uncertain(input_json)
             return {"ok": False, "status": "non_object_json", "error": "Tendwire returned non-object JSON"}
+        if post_start_uncertain:
+            process_result = _CommandProcessResult(data)
+            process_result._process_returncode = proc.returncode
+            return process_result
 
         page_text: str | None = None
         prune_source = data
@@ -471,35 +533,58 @@ class TendwireClient:
     def doctor(self) -> dict[str, Any]:
         return self.call(["doctor", "--json"], timeout=10)
 
-    def command(self, request: dict[str, Any]) -> dict[str, Any]:
+    def command_json(self, request_json: str) -> dict[str, Any]:
+        if not isinstance(request_json, str):
+            return _invalid_command_request()
+        try:
+            request = json.loads(request_json)
+            request_bytes = request_json.encode("utf-8")
+        except (json.JSONDecodeError, TypeError, ValueError, UnicodeError):
+            return _invalid_command_request()
         public_request = _exact_public_command_request(request)
         if public_request is None:
             return _invalid_command_request()
         result = self.call(
             ["command", "--json"],
-            input_json=public_request,
+            input_bytes=request_bytes,
             timeout=60,
             post_start_uncertain=True,
         )
         status = result.get("status")
-        process_not_started = result.pop("_process_not_started", None)
         if (
             status == "subprocess_failed"
-            and process_not_started is _PROCESS_NOT_STARTED
+            and command_process_not_started(result)
         ):
             return result
-        if status == "request_state_uncertain" and set(result) != _COMMAND_RESPONSE_FIELDS:
-            if (
-                result.get("ok") is False
-                and result.get("request_id") == public_request["request_id"]
-                and result.get("action") == "send_instruction"
-            ):
-                return result
+        process_returncode = getattr(result, "_process_returncode", None)
+        if command_process_ambiguous(result):
             return _request_state_uncertain(public_request)
         validated = _validated_command_response(result, public_request)
         if validated is None:
             return _request_state_uncertain(public_request)
-        return validated
+        if type(process_returncode) is int and (
+            (
+                process_returncode == 0
+                and validated["ok"] is True
+            )
+            or (
+                process_returncode == 1
+                and validated["ok"] is False
+            )
+        ):
+            return public_prune(validated)
+        return _request_state_uncertain(public_request)
+
+    def command(self, request: dict[str, Any]) -> dict[str, Any]:
+        try:
+            request_json = json.dumps(
+                request,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        except (TypeError, ValueError):
+            return _invalid_command_request()
+        return self.command_json(request_json)
 
     def connector_poll(self, *, name: str = "attention", limit: int = 3, lease_seconds: int = 60) -> dict[str, Any]:
         return self.call(

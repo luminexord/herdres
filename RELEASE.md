@@ -88,27 +88,46 @@ The paired gate must establish all of the following:
 - Manager and managed-bot polling offsets are keyed to stable receiving-bot
   kinds, not token-derived runtime keys; a current legacy managed-bot offset
   migrates to the stable path, so token rotation preserves polling position.
-- Before command start, Herdres persists the exact public request by fsyncing
-  the temporary state file, atomically replacing the state path, and fsyncing
-  its parent directory. On redelivery, ID lookup precedes private route lookup,
-  and an ID-only probe replays the exact record after routing, transcription,
-  or worker-state churn. The only pre-reservation stale-target refresh drops a
-  worker fingerprint, durably persists the revision, and retries with the same
-  ID.
-- `HERDRES_COMMAND_RETRY_HORIZON_SECONDS` uses/falls back to `86400` seconds
-  when unset, empty, or invalid and clamps configured values to `60` through
-  `604800`. Exact-record retention is the effective horizon plus `86400`:
-  default `172800`, minimum `86460`, maximum `691200`. The strict cutoff
-  retains equality and prunes every older terminal record plus abandoned
-  pending, unavailable, or uncertain work by terminal/update/creation time.
-- A post-start lost or malformed result is `request_state_uncertain`. The
-  gateway emits no Telegram acknowledgement or failure reply, does not advance
-  or save the stable polling offset, stops the batch, and relies on same-ID
-  replay while the bounded record remains.
-- Only the exact allowlisted public command object reaches Tendwire; no raw
-  Telegram receiver/update/chat/topic/message/reply/user ID, bot token, or
-  private/backend route crosses that boundary. The Tendwire child environment
-  retains public Tendwire overrides while stripping Telegram and private
+- On first sight of an update, before routing or child creation, Herdres
+  persists immutable `created_at`, `deadline_at`, and `retain_until` bounds.
+  It then persists canonical schema-v1 request JSON before command start.
+  Every retry sends those exact UTF-8 bytes. The sole rewrite is one
+  `stale_target` + `no_receipt` removal of `worker_fingerprint`, durably stored
+  before the same-ID retry.
+- The paired CLI returns the exact ten-field schema-v2 response. Herdres checks
+  action/request/dry-run correlation, public pruning, and each complete
+  disposition tuple: accepted/`terminal_accepted`, pending/`in_progress`,
+  request-state-uncertain/`terminal_uncertain`, and the allowed rejection
+  statuses paired with either `terminal_rejected` or `no_receipt`.
+- CLI exit `0` pairs only with `ok: true`, and exit `1` only with `ok: false`.
+  Exit `2`, malformed/non-UTF-8 output, timeout, wrong schema/shape/correlation,
+  or any exit/body mismatch remains private process ambiguity. No schema-v2
+  disposition or private process/stdout/stderr detail is forged from it.
+- Disposition, never status alone, controls lifecycle. In particular,
+  `backend_unavailable` + `no_receipt` retains the checkpoint for retry, while
+  `backend_unavailable` + `terminal_rejected` caches failure and advances.
+- The retry deadline is first-seen plus the effective `60..604800` horizon
+  (`86400` default/fallback), does not slide with `updated_at`, retry,
+  redelivery, or configuration changes, and expires at equality. Before client
+  creation and after a retryable response, deadline expiry quarantines instead
+  of starting another child.
+- `retain_until` is first-seen plus the horizon and `86400`: `172800` default,
+  `86460` minimum, `691200` maximum. It is immutable and pruning is strictly
+  after it. The paired Tendwire retry horizon is at least the Herdres horizon,
+  and Tendwire receipt age is at least the Herdres retention bound. Tendwire's
+  `604800`/`2592000`/`4096` defaults satisfy the pair.
+- `terminal_accepted` and `terminal_rejected` cache an exact sanitized child
+  outcome. `terminal_uncertain`, deadline expiry, and unsafe/corrupt evidence
+  are quarantined (locally dead-lettered) with the fixed reply `Could not send
+  safely. Refresh status and choose the target again.` and checkpoint
+  `advance`. The gateway replies, saves the advanced offset, and processes
+  later updates. Restart/redelivery returns terminal or quarantine cache before
+  route resolution and never constructs another Tendwire client.
+- Only the exact allowlisted public command object reaches Tendwire; its
+  request ID satisfies `[A-Za-z0-9._-]{1,128}` and Herdres uses the narrower
+  `hri1_…` form. No raw Telegram receiver/update/chat/topic/message/reply/user
+  ID, bot token, or private/backend route crosses. The Tendwire child
+  environment retains public overrides while stripping Telegram and private
   ingress, gateway, managed-bot, state, request-key, and binary-selector
   variables.
 - The Herdres state, Herdres request-ID key, Tendwire database, and Tendwire

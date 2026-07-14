@@ -14,7 +14,7 @@ import pytest
 
 import herdres
 import herdres_gateway
-from herdres_connector import source_sync, state
+from herdres_connector import ingress_requests, source_sync, state
 from herdres_connector.managed_bots import managed_bot_kind_for_key, managed_bot_tokens
 from herdres_connector.rendering import render_status_overview
 from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_feed_item_delivery_html_parts, render_turn_item_html, turn_item_from_source
@@ -41,6 +41,24 @@ REQUEST_ID_2 = derive_telegram_request_id(
 )
 
 
+def _gateway_child(
+    request_id,
+    *,
+    checkpoint=herdres_gateway.CHECKPOINT_ADVANCE,
+    disposition=None,
+    reply="",
+    handled=True,
+):
+    return {
+        "schema_version": 1,
+        "handled": handled,
+        "request_id": request_id,
+        "checkpoint": checkpoint,
+        "disposition": disposition,
+        "reply": reply,
+    }
+
+
 def _source_worker(worker, *, stable_identity=True):
     """Return a test worker with a deterministic valid identity by default."""
     result = dict(worker)
@@ -55,6 +73,43 @@ def _source_worker(worker, *, stable_identity=True):
         meta["stable_key_version"] = 1
     result["meta"] = meta
     return result
+
+
+def _accepted_command_response(request):
+    worker_id = str(request.get("target", {}).get("worker_id") or "worker-1")
+    return {
+        "schema_version": 2,
+        "action": "send_instruction",
+        "request_id": request["request_id"],
+        "ok": True,
+        "dry_run": False,
+        "status": "accepted",
+        "disposition": "terminal_accepted",
+        "result": {
+            "target": {"worker_id": worker_id},
+            "delivery_state": "submitted",
+            "transport_state": "submitted",
+            "target_state_at_send": "idle",
+            "observed_turn_state": "pending_observation",
+        },
+        "error": None,
+        "warnings": [],
+    }
+def _failed_command_response(request, *, status, disposition):
+    return {
+        "schema_version": 2,
+        "action": "send_instruction",
+        "request_id": request["request_id"],
+        "ok": False,
+        "dry_run": False,
+        "status": status,
+        "disposition": disposition,
+        "result": None,
+        "error": {"code": status, "message": "public command failure"},
+        "warnings": [],
+    }
+
+
 
 
 class FakeTendwire:
@@ -112,7 +167,12 @@ class FakeTendwire:
 
     def command(self, request):
         self.commands.append(request)
-        return {"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}
+        return _accepted_command_response(request)
+
+    def command_json(self, request_json):
+        request = json.loads(request_json)
+        self.commands.append(request)
+        return _accepted_command_response(request)
 
 
 class FakeTelegram:
@@ -597,8 +657,16 @@ def test_per_agent_bot_reply_targets_original_worker_once(tmp_path, monkeypatch)
     assert result["feed_sent"] == 2
     assert any(call[0] == "sendRichMessage" and call[2] == "claude-token" for call in telegram.api_calls)
     assert any(call[0] == "sendRichMessage" and call[2] == "codex-token" for call in telegram.api_calls)
-    assert claude_reply == {"handled": True, "reply": "Sent to Tendwire worker."}
-    assert codex_reply == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert claude_reply == _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_accepted",
+        reply="Sent to Tendwire worker.",
+    )
+    assert codex_reply == _gateway_child(
+        REQUEST_ID_2,
+        disposition="terminal_accepted",
+        reply="Sent to Tendwire worker.",
+    )
     assert [command["target"] for command in fake.commands] == [
         {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"},
         {"worker_id": "worker-codex", "worker_fingerprint": "fp-codex"},
@@ -2140,7 +2208,11 @@ def test_command_reply_preserves_prederived_request_id_and_strips_private_ingres
         }
     )
 
-    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert result == _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_accepted",
+        reply="Sent to Tendwire worker.",
+    )
     request = fake.commands[0]
     assert request["target"] == {"worker_id": "worker-1", "worker_fingerprint": "fp-1"}
     assert request["request_id"] == REQUEST_ID
@@ -2169,7 +2241,7 @@ def test_command_reply_preserves_prederived_request_id_and_strips_private_ingres
 
 
 
-def test_stale_target_refresh_reuses_same_request_id(tmp_path, monkeypatch):
+def test_stale_target_no_receipt_refresh_reuses_same_request_id(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
     state.upsert_worker_entry(
@@ -2194,15 +2266,16 @@ def test_stale_target_refresh_reuses_same_request_id(tmp_path, monkeypatch):
     )
     state.save_state(store)
     calls = []
-    responses = [
-        {"ok": False, "status": "stale_target"},
-        {"ok": True, "status": "accepted", "result": {}},
-    ]
 
     class Client:
-        def command(self, request):
-            calls.append(json.loads(json.dumps(request)))
-            return responses.pop(0)
+        def command_json(self, request_json):
+            request = json.loads(request_json)
+            calls.append(request)
+            if len(calls) == 1:
+                return _failed_command_response(
+                    request, status="stale_target", disposition="no_receipt"
+                )
+            return _accepted_command_response(request)
 
     monkeypatch.setattr(herdres, "TendwireClient", Client)
 
@@ -2216,7 +2289,11 @@ def test_stale_target_refresh_reuses_same_request_id(tmp_path, monkeypatch):
         }
     )
 
-    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert result == _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_accepted",
+        reply="Sent to Tendwire worker.",
+    )
     assert len(calls) == 2
     assert calls[0]["request_id"] == calls[1]["request_id"] == REQUEST_ID
     assert calls[0]["target"] == {
@@ -2229,7 +2306,7 @@ def test_stale_target_refresh_reuses_same_request_id(tmp_path, monkeypatch):
     }
 
 
-def test_uncertain_redelivery_reuses_durable_exact_request_across_state_churn(
+def test_no_receipt_redelivery_reuses_durable_exact_request_across_state_churn(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
@@ -2249,16 +2326,19 @@ def test_uncertain_redelivery_reuses_durable_exact_request_across_state_churn(
         topic_id="77",
     )
     state.save_state(store)
-    calls = []
-    responses = [
-        {"ok": False, "status": "request_state_uncertain"},
-        {"ok": True, "status": "accepted", "result": {}},
-    ]
+    request_bytes = []
 
     class Client:
-        def command(self, request):
-            calls.append(json.loads(json.dumps(request)))
-            return responses.pop(0)
+        def command_json(self, request_json):
+            request_bytes.append(request_json)
+            request = json.loads(request_json)
+            if len(request_bytes) == 1:
+                return _failed_command_response(
+                    request,
+                    status="backend_unavailable",
+                    disposition="no_receipt",
+                )
+            return _accepted_command_response(request)
 
     monkeypatch.setattr(herdres, "TendwireClient", Client)
     first = herdres.command_reply(
@@ -2282,100 +2362,28 @@ def test_uncertain_redelivery_reuses_durable_exact_request_across_state_churn(
         }
     )
 
-    assert first["status"] == "request_state_uncertain"
-    assert replay == {"handled": True, "reply": "Sent to Tendwire worker."}
-    assert len(calls) == 2
-    assert calls[0] == calls[1]
-    assert calls[0]["request_id"] == REQUEST_ID
-    assert calls[0]["instruction"] == {"text": "original instruction"}
-    assert calls[0]["target"] == {
+    assert first == _gateway_child(
+        REQUEST_ID,
+        checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+        disposition="no_receipt",
+    )
+    assert replay == _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_accepted",
+        reply="Sent to Tendwire worker.",
+    )
+    assert len(request_bytes) == 2
+    assert request_bytes[0] == request_bytes[1]
+    request = json.loads(request_bytes[0])
+    assert request["instruction"] == {"text": "original instruction"}
+    assert request["target"] == {
         "worker_id": "worker-1",
         "worker_fingerprint": "fp-original",
     }
 
 
-def test_ingress_request_cache_bounds_every_record_only_after_retention_margin(
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        herdres.config,
-        "command_request_retention_seconds",
-        lambda env=None: 120,
-    )
-    store = {
-        herdres._INGRESS_COMMAND_REQUESTS_KEY: {
-            "old-terminal": {"terminal_at": 79.0},
-            "boundary-terminal": {"terminal_at": 80.0},
-            "margin-terminal": {"terminal_at": 100.0},
-            "within-horizon-terminal": {"terminal_at": 150.0},
-            "old-uncertain": {"created_at": 1.0, "updated_at": 79.0},
-            "boundary-uncertain": {"created_at": 1.0, "updated_at": 80.0},
-            "margin-uncertain": {"created_at": 1.0, "updated_at": 100.0},
-            "within-horizon-uncertain": {
-                "created_at": 1.0,
-                "updated_at": 150.0,
-            },
-        }
-    }
-
-    changed = herdres._prune_ingress_command_requests(store, 200.0)
-
-    assert changed is True
-    records = store[herdres._INGRESS_COMMAND_REQUESTS_KEY]
-    assert "old-terminal" not in records
-    assert "old-uncertain" not in records
-    assert set(records) == {
-        "boundary-terminal",
-        "margin-terminal",
-        "within-horizon-terminal",
-        "boundary-uncertain",
-        "margin-uncertain",
-        "within-horizon-uncertain",
-    }
-    assert (
-        herdres.config.command_request_retention_seconds(
-            env={"HERDRES_COMMAND_RETRY_HORIZON_SECONDS": "60"}
-        )
-        > herdres.config.command_retry_horizon_seconds(
-            env={"HERDRES_COMMAND_RETRY_HORIZON_SECONDS": "60"}
-        )
-    )
 
 
-def test_ingress_request_timestamps_track_uncertain_and_terminal_transitions(
-    monkeypatch,
-):
-    times = iter((100.0, 101.0, 102.0))
-    monkeypatch.setattr(herdres.time, "time", lambda: next(times))
-    monkeypatch.setattr(
-        herdres.config,
-        "command_request_retention_seconds",
-        lambda: 120,
-    )
-    store = {}
-    request = {"request_id": REQUEST_ID}
-
-    herdres._remember_ingress_command_request(store, request)
-    herdres._finish_ingress_command_request(
-        store,
-        REQUEST_ID,
-        {"ok": False, "status": "request_state_uncertain"},
-    )
-    record = store[herdres._INGRESS_COMMAND_REQUESTS_KEY][REQUEST_ID]
-    assert record["created_at"] == 100.0
-    assert record["updated_at"] == 101.0
-    assert record["last_status"] == "request_state_uncertain"
-    assert "terminal_at" not in record
-
-    herdres._finish_ingress_command_request(
-        store,
-        REQUEST_ID,
-        {"ok": True, "status": "accepted"},
-    )
-    assert record["created_at"] == 100.0
-    assert record["updated_at"] == 102.0
-    assert record["terminal_at"] == 102.0
-    assert record["last_status"] == "accepted"
 
 
 def test_save_state_fsyncs_file_before_replace_and_directory_after(
@@ -2415,14 +2423,12 @@ def test_legacy_duplicate_instruction_is_truthful_non_success():
         "result": {"delivery_state": "duplicate_suppressed"},
     }
 
-    assert herdres._command_succeeded(response) is False
     assert herdres._success_reply(response) == ""
     mislabeled = {
         "ok": True,
         "status": "accepted",
         "result": {"delivery_state": "duplicate_suppressed"},
     }
-    assert herdres._command_succeeded(mislabeled) is False
     assert herdres._success_reply(mislabeled) == ""
 
 
@@ -2729,7 +2735,11 @@ def test_command_reply_to_agent_message_targets_original_worker(tmp_path, monkey
         }
     )
 
-    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert result == _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_accepted",
+        reply="Sent to Tendwire worker.",
+    )
     request = fake.commands[0]
     assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
     assert request["instruction"] == {"text": "reply to claude"}
@@ -2766,7 +2776,11 @@ def test_command_reply_at_alias_targets_worker_in_space(tmp_path, monkeypatch):
         }
     )
 
-    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert result == _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_accepted",
+        reply="Sent to Tendwire worker.",
+    )
     request = fake.commands[0]
     assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
     assert request["instruction"] == {"text": "hello there"}
@@ -2804,7 +2818,11 @@ def test_command_reply_target_bot_kind_targets_worker_in_space(tmp_path, monkeyp
         }
     )
 
-    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert result == _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_accepted",
+        reply="Sent to Tendwire worker.",
+    )
     request = fake.commands[0]
     assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
     assert request["instruction"] == {"text": "hello from child bot"}
@@ -2846,7 +2864,11 @@ def test_command_reply_voice_transcript_targets_worker_in_space(tmp_path, monkey
         }
     )
 
-    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert result == _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_accepted",
+        reply="Sent to Tendwire worker.",
+    )
     request = fake.commands[0]
     assert request["target"] == {"worker_id": "worker-kimi", "worker_fingerprint": "fp-kimi"}
     assert request["instruction"] == {"text": "check the worker status"}
@@ -3102,7 +3124,10 @@ def test_gateway_pretranscribes_voice_before_command(monkeypatch, tmp_path):
 
     def fake_command(payload):
         seen.update(payload)
-        return {"handled": True, "reply": ""}
+        return _gateway_child(
+            payload["request_id"],
+            disposition="terminal_accepted",
+        )
 
     monkeypatch.setattr(herdres_gateway.speech, "pretranscribe_voice_payload", fake_pretranscribe)
     monkeypatch.setattr(herdres_gateway, "run_herdres_command", fake_command)
@@ -3151,7 +3176,20 @@ def test_gateway_same_update_retries_byte_identical_and_distinct_update_differs(
     )
     state.save_state(store)
     requests = []
-    fake = FakeTendwire()
+
+    class RetryThenAccept(FakeTendwire):
+        def command_json(self, request_json):
+            request = json.loads(request_json)
+            self.commands.append(request)
+            if len(self.commands) == 1:
+                return {
+                    "ok": False,
+                    "status": "backend_unavailable",
+                    "disposition": "no_receipt",
+                }
+            return _accepted_command_response(request)
+
+    fake = RetryThenAccept()
 
     class ClientFactory:
         def __call__(self):
@@ -3176,16 +3214,22 @@ def test_gateway_same_update_retries_byte_identical_and_distinct_update_differs(
     first = {"update_id": 44, "message": message}
     distinct = {"update_id": 45, "message": dict(message)}
 
-    for update in (first, first, distinct):
-        assert (
-            herdres_gateway.handle_update(
-                update,
-                "receiver-token",
-                receiver_id="manager",
-                request_id_key=REQUEST_ID_KEY,
-            )
-            == herdres_gateway.CHECKPOINT_ADVANCE
+    checkpoints = [
+        herdres_gateway.handle_update(
+            update,
+            "receiver-token",
+            receiver_id="manager",
+            request_id_key=REQUEST_ID_KEY,
         )
+        for update in (first, first, first, distinct)
+    ]
+
+    assert checkpoints == [
+        herdres_gateway.CHECKPOINT_RETRY,
+        herdres_gateway.CHECKPOINT_ADVANCE,
+        herdres_gateway.CHECKPOINT_ADVANCE,
+        herdres_gateway.CHECKPOINT_ADVANCE,
+    ]
 
     assert len(requests) == 3
     assert requests[0] == requests[1]
@@ -3245,19 +3289,18 @@ def test_gateway_replays_cached_request_after_route_disappears(
     state.save_state(store)
     tendwire_calls = []
     child_payloads = []
-    responses = [
-        {"ok": False, "status": "request_state_uncertain"},
-        {
-            "ok": True,
-            "status": "accepted",
-            "result": {"delivery_state": "submitted"},
-        },
-    ]
 
     class Client:
-        def command(self, request):
-            tendwire_calls.append(json.loads(json.dumps(request)))
-            return responses.pop(0)
+        def command_json(self, request_json):
+            request = json.loads(request_json)
+            tendwire_calls.append(request)
+            if len(tendwire_calls) == 1:
+                return {
+                    "ok": False,
+                    "status": "backend_unavailable",
+                    "disposition": "no_receipt",
+                }
+            return _accepted_command_response(request)
 
     def run_child(payload):
         child_payloads.append(json.loads(json.dumps(payload)))
@@ -3301,7 +3344,7 @@ def test_gateway_replays_cached_request_after_route_disappears(
     }
 
 
-def test_gateway_unknown_message_probes_request_cache_then_advances_without_mutation(
+def test_gateway_unknown_message_caches_local_advance_without_tendwire_mutation(
     tmp_path,
     monkeypatch,
 ):
@@ -3337,42 +3380,180 @@ def test_gateway_unknown_message_probes_request_cache_then_advances_without_muta
 
     assert checkpoint == herdres_gateway.CHECKPOINT_ADVANCE
     assert set(child_payloads[0]) == {"request_id"}
-    assert state.load_state() == before
+    after = state.load_state()
+    records = after.pop(ingress_requests.RECORDS_KEY)
+    assert after == before
+    record = records[child_payloads[0]["request_id"]]
+    assert record["state"] == "quarantined"
+    assert record["request_json"] is None
+    assert record["outcome"] == _gateway_child(
+        child_payloads[0]["request_id"],
+        handled=False,
+    )
 
 
 @pytest.mark.parametrize(
     ("result", "checkpoint"),
     [
-        ({"handled": True}, herdres_gateway.CHECKPOINT_ADVANCE),
-        ({"handled": False}, herdres_gateway.CHECKPOINT_ADVANCE),
+        (_gateway_child(REQUEST_ID), herdres_gateway.CHECKPOINT_ADVANCE),
         (
-            {"handled": True, "status": "accepted"},
+            _gateway_child(REQUEST_ID, handled=False),
             herdres_gateway.CHECKPOINT_ADVANCE,
         ),
         (
-            {"handled": True, "status": "not_found"},
+            _gateway_child(REQUEST_ID, disposition="terminal_accepted"),
             herdres_gateway.CHECKPOINT_ADVANCE,
         ),
         (
-            {"handled": True, "status": "request_state_uncertain"},
+            _gateway_child(REQUEST_ID, disposition="terminal_rejected"),
+            herdres_gateway.CHECKPOINT_ADVANCE,
+        ),
+        (
+            _gateway_child(REQUEST_ID, disposition="terminal_uncertain"),
+            herdres_gateway.CHECKPOINT_ADVANCE,
+        ),
+        (
+            _gateway_child(
+                REQUEST_ID,
+                checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+                disposition=None,
+            ),
             herdres_gateway.CHECKPOINT_RETRY,
         ),
         (
-            {"handled": True, "status": "future_terminal_status"},
+            _gateway_child(
+                REQUEST_ID,
+                checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+                disposition="no_receipt",
+            ),
             herdres_gateway.CHECKPOINT_RETRY,
         ),
         (
-            {"handled": True, "status": 7},
+            _gateway_child(
+                REQUEST_ID,
+                checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+                disposition="in_progress",
+            ),
             herdres_gateway.CHECKPOINT_RETRY,
         ),
         (
-            {"status": "accepted"},
+            _gateway_child(
+                REQUEST_ID,
+                checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+                disposition="terminal_uncertain",
+            ),
+            herdres_gateway.CHECKPOINT_RETRY,
+        ),
+        (
+            _gateway_child(
+                REQUEST_ID,
+                checkpoint=herdres_gateway.CHECKPOINT_ADVANCE,
+                disposition="no_receipt",
+            ),
+            herdres_gateway.CHECKPOINT_RETRY,
+        ),
+        (
+            {
+                **_gateway_child(
+                    REQUEST_ID,
+                    checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+                ),
+                "reply": "must not acknowledge",
+            },
+            herdres_gateway.CHECKPOINT_RETRY,
+        ),
+        (
+            {"schema_version": 1, "request_id": REQUEST_ID},
             herdres_gateway.CHECKPOINT_RETRY,
         ),
     ],
 )
-def test_gateway_command_checkpoint_status_matrix(result, checkpoint):
-    assert herdres_gateway._checkpoint_for_command_result(result) == checkpoint
+def test_gateway_command_checkpoint_disposition_matrix(result, checkpoint):
+    assert (
+        herdres_gateway._checkpoint_for_command_result(
+            result,
+            request_id=REQUEST_ID,
+        )
+        == checkpoint
+    )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "mutate"),
+    [
+        (1, lambda body: None),
+        (2, lambda body: None),
+        (0, lambda body: body.update({"request_id": REQUEST_ID_2})),
+        (0, lambda body: body.update({"extra": "not allowed"})),
+        (
+            0,
+            lambda body: body.update(
+                {
+                    "checkpoint": herdres_gateway.CHECKPOINT_RETRY,
+                    "disposition": "terminal_uncertain",
+                }
+            ),
+        ),
+    ],
+)
+def test_gateway_child_exit_shape_and_correlation_fail_closed(
+    monkeypatch,
+    returncode,
+    mutate,
+):
+    body = _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_accepted",
+        reply="accepted",
+    )
+    mutate(body)
+    completed = type(
+        "Completed",
+        (),
+        {
+            "returncode": returncode,
+            "stdout": json.dumps(body).encode(),
+            "stderr": b"private child details",
+        },
+    )()
+    monkeypatch.setattr(
+        herdres_gateway.subprocess,
+        "run",
+        lambda *_args, **_kwargs: completed,
+    )
+
+    assert herdres_gateway.run_herdres_command(
+        {"request_id": REQUEST_ID}
+    ) == _gateway_child(
+        REQUEST_ID,
+        checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+    )
+
+
+def test_gateway_accepts_exact_correlated_child_envelope(monkeypatch):
+    expected = _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_rejected",
+        reply="Could not send safely.",
+    )
+    completed = type(
+        "Completed",
+        (),
+        {
+            "returncode": 0,
+            "stdout": json.dumps(expected).encode(),
+            "stderr": b"",
+        },
+    )()
+    monkeypatch.setattr(
+        herdres_gateway.subprocess,
+        "run",
+        lambda *_args, **_kwargs: completed,
+    )
+
+    assert herdres_gateway.run_herdres_command(
+        {"request_id": REQUEST_ID}
+    ) == expected
 
 
 def test_gateway_invalid_utf8_child_output_is_uncertain(monkeypatch):
@@ -3389,11 +3570,463 @@ def test_gateway_invalid_utf8_child_output_is_uncertain(monkeypatch):
 
     result = herdres_gateway.run_herdres_command({"request_id": REQUEST_ID})
 
-    assert result["status"] == "request_state_uncertain"
+    assert result == _gateway_child(
+        REQUEST_ID,
+        checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+    )
     assert (
-        herdres_gateway._checkpoint_for_command_result(result)
+        herdres_gateway._checkpoint_for_command_result(
+            result,
+            request_id=REQUEST_ID,
+        )
         == herdres_gateway.CHECKPOINT_RETRY
     )
+
+
+def test_gateway_fsyncs_first_seen_shell_before_route_or_child(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE",
+        str(tmp_path / "state.json"),
+    )
+    monkeypatch.setenv("HERDRES_COMMAND_RETRY_HORIZON_SECONDS", "60")
+    state.save_state(_store())
+    monkeypatch.setattr(herdres_gateway.time, "time", lambda: 100.0)
+    request_id = derive_telegram_request_id(
+        REQUEST_ID_KEY,
+        receiver_id="manager",
+        update_id=44,
+        chat_id=-100,
+        message_id=10,
+    )
+    observations = []
+
+    def inspect_route(_message, _store, *, bot_key=None):
+        record = state.load_state()[ingress_requests.RECORDS_KEY][request_id]
+        observations.append(("route", record.copy()))
+        return None
+
+    def inspect_child(payload):
+        record = state.load_state()[ingress_requests.RECORDS_KEY][request_id]
+        observations.append(("child", record.copy()))
+        assert payload == {"request_id": request_id}
+        return _gateway_child(
+            request_id,
+            checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+        )
+
+    monkeypatch.setattr(
+        herdres_gateway,
+        "_payload_for_message",
+        inspect_route,
+    )
+    monkeypatch.setattr(
+        herdres_gateway,
+        "run_herdres_command",
+        inspect_child,
+    )
+
+    checkpoint = herdres_gateway.handle_update(
+        {
+            "update_id": 44,
+            "message": {
+                "chat": {"id": -100},
+                "message_id": 10,
+                "from": {"id": 1, "is_bot": False},
+                "text": "one command",
+            },
+        },
+        "receiver-token",
+        receiver_id="manager",
+        request_id_key=REQUEST_ID_KEY,
+    )
+
+    assert checkpoint == herdres_gateway.CHECKPOINT_RETRY
+    assert [kind for kind, _record in observations] == ["route", "child"]
+    for _kind, record in observations:
+        assert record["schema_version"] == 2
+        assert record["request_id"] == request_id
+        assert record["created_at"] == 100.0
+        assert record["updated_at"] == 100.0
+        assert record["deadline_at"] == 160.0
+        assert record["retain_until"] == 86_560.0
+        assert record["state"] == "resolving"
+        assert record["request_json"] is None
+
+
+def test_gateway_restart_uses_equality_quarantine_and_advances_without_child(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE",
+        str(tmp_path / "state.json"),
+    )
+    monkeypatch.setenv("HERDRES_COMMAND_RETRY_HORIZON_SECONDS", "60")
+    state.save_state(_store())
+    request_id = derive_telegram_request_id(
+        REQUEST_ID_KEY,
+        receiver_id="manager",
+        update_id=44,
+        chat_id=-100,
+        message_id=10,
+    )
+    _record, first_outcome = herdres_gateway._preflight_ingress_request(
+        request_id,
+        now=100.0,
+    )
+    record, equality_outcome = herdres_gateway._preflight_ingress_request(
+        request_id,
+        now=160.0,
+    )
+    assert first_outcome is None
+    assert equality_outcome == _gateway_child(
+        request_id,
+        disposition=None,
+        reply=ingress_requests.QUARANTINE_REPLY,
+    )
+    assert record["state"] == "quarantined"
+    assert record["created_at"] == 100.0
+    assert record["deadline_at"] == 160.0
+    assert record["retain_until"] == 86_560.0
+    assert record["updated_at"] == record["quarantined_at"] == 160.0
+
+    update = {
+        "update_id": 44,
+        "message": {
+            "chat": {"id": -100},
+            "message_id": 10,
+            "from": {"id": 1, "is_bot": False},
+            "text": "one command",
+        },
+    }
+    child_calls = []
+    saved_offsets = []
+
+    class Telegram:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, *_args, **_kwargs):
+            return {"ok": True, "message_id": "1"}
+
+    monkeypatch.setattr(herdres_gateway.time, "time", lambda: 161.0)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "run_herdres_command",
+        lambda payload: child_calls.append(payload),
+    )
+    monkeypatch.setattr(herdres_gateway, "TelegramClient", Telegram)
+    monkeypatch.setattr(herdres_gateway, "_read_offset", lambda _key: 44)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "get_updates",
+        lambda _token, _offset, *, timeout_seconds: [update],
+    )
+    monkeypatch.setattr(
+        herdres_gateway,
+        "_save_offset",
+        lambda offset, key: saved_offsets.append((offset, key)),
+    )
+
+    herdres_gateway._poll_once(
+        "manager",
+        "receiver-token",
+        timeout_seconds=0,
+        request_id_key=REQUEST_ID_KEY,
+    )
+
+    assert child_calls == []
+    assert saved_offsets == [(45, "manager")]
+    restarted = state.load_state()[ingress_requests.RECORDS_KEY][request_id]
+    assert restarted["state"] == "quarantined"
+    assert restarted["updated_at"] == 160.0
+    assert restarted["outcome"] == equality_outcome
+
+
+def test_gateway_corrupt_existing_record_is_preserved_global_barrier(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE",
+        str(tmp_path / "state.json"),
+    )
+    request_id = derive_telegram_request_id(
+        REQUEST_ID_KEY,
+        receiver_id="manager",
+        update_id=44,
+        chat_id=-100,
+        message_id=10,
+    )
+    corrupt_record = {
+        "created_at": -100_000.0,
+        "request_json": '{"private":"untrusted"}',
+    }
+    store = _store()
+    store[ingress_requests.RECORDS_KEY] = {request_id: corrupt_record}
+    state.save_state(store)
+    state_path = tmp_path / "state.json"
+    original = state_path.read_bytes()
+    child_calls = []
+    reply_attempts = []
+
+    class Telegram:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, *_args, **_kwargs):
+            reply_attempts.append(self.token)
+            return {"ok": True, "message_id": "1"}
+
+    monkeypatch.setattr(herdres_gateway.time, "time", lambda: 101.0)
+    monkeypatch.setattr(herdres_gateway, "TelegramClient", Telegram)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "run_herdres_command",
+        lambda payload: child_calls.append(payload),
+    )
+
+    update = {
+        "update_id": 44,
+        "message": {
+            "chat": {"id": -100},
+            "message_id": 10,
+            "from": {"id": 1, "is_bot": False},
+            "text": "must not reconstruct",
+        },
+    }
+    for _attempt in range(2):
+        with pytest.raises(
+            RuntimeError, match="^ingress request record store is corrupt$"
+        ):
+            herdres_gateway.handle_update(
+                update,
+                "receiver-token",
+                receiver_id="manager",
+                request_id_key=REQUEST_ID_KEY,
+            )
+
+    assert child_calls == []
+    assert reply_attempts == []
+    assert state_path.read_bytes() == original
+    assert (
+        state.load_state()[ingress_requests.RECORDS_KEY][request_id]
+        == corrupt_record
+    )
+
+
+def test_gateway_terminal_uncertain_update_advances_then_processes_next(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE",
+        str(tmp_path / "state.json"),
+    )
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "0")
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+        topic_id="77",
+    )
+    state.save_state(store)
+    command_requests = []
+    saved_offsets = []
+
+    class Client:
+        def command_json(self, request_json):
+            request = json.loads(request_json)
+            command_requests.append(request)
+            if len(command_requests) == 1:
+                return {
+                    "ok": False,
+                    "status": "request_state_uncertain",
+                    "disposition": "terminal_uncertain",
+                }
+            return _accepted_command_response(request)
+
+    class Telegram:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, *_args, **_kwargs):
+            return {"ok": True, "message_id": "1"}
+
+    def run_child(payload):
+        return herdres.command_reply(payload)
+
+    updates = [
+        {
+            "update_id": update_id,
+            "message": {
+                "chat": {"id": -100, "is_forum": True},
+                "message_thread_id": 77,
+                "message_id": message_id,
+                "from": {"id": 1, "is_bot": False},
+                "text": text,
+            },
+        }
+        for update_id, message_id, text in (
+            (44, 10, "first command"),
+            (45, 11, "second command"),
+        )
+    ]
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+    monkeypatch.setattr(herdres_gateway, "run_herdres_command", run_child)
+    monkeypatch.setattr(herdres_gateway, "TelegramClient", Telegram)
+    monkeypatch.setattr(herdres_gateway, "_read_offset", lambda _key: 44)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "get_updates",
+        lambda _token, _offset, *, timeout_seconds: updates,
+    )
+    monkeypatch.setattr(
+        herdres_gateway,
+        "_save_offset",
+        lambda offset, key: saved_offsets.append((offset, key)),
+    )
+
+    herdres_gateway._poll_once(
+        "manager",
+        "receiver-token",
+        timeout_seconds=0,
+        request_id_key=REQUEST_ID_KEY,
+    )
+
+    assert len(command_requests) == 2
+    assert command_requests[0]["request_id"] != command_requests[1]["request_id"]
+    assert saved_offsets == [(45, "manager"), (46, "manager")]
+    records = state.load_state()[ingress_requests.RECORDS_KEY]
+    first = records[command_requests[0]["request_id"]]
+    second = records[command_requests[1]["request_id"]]
+    assert first["state"] == "quarantined"
+    assert first["last_disposition"] == "terminal_uncertain"
+    assert first["outcome"]["checkpoint"] == herdres_gateway.CHECKPOINT_ADVANCE
+    assert second["state"] == "terminal"
+    assert second["last_disposition"] == "terminal_accepted"
+
+
+@pytest.mark.parametrize("delivery_failure", ["explicit", "raised"])
+def test_gateway_terminal_reply_failure_retains_offset_and_redelivers_cached_outcome(
+    monkeypatch,
+    tmp_path,
+    delivery_failure,
+):
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE",
+        str(tmp_path / "state.json"),
+    )
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+        topic_id="77",
+    )
+    state.save_state(store)
+    backend_requests = []
+    reply_attempts = []
+    saved_offsets = []
+
+    class Client:
+        def command_json(self, request_json):
+            request = json.loads(request_json)
+            backend_requests.append(request)
+            return _accepted_command_response(request)
+
+    class Telegram:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, chat_id, reply, **kwargs):
+            reply_attempts.append((chat_id, reply, kwargs))
+            if len(reply_attempts) == 1:
+                if delivery_failure == "raised":
+                    raise RuntimeError("private Telegram delivery failure")
+                return {"ok": False, "error": "private Telegram delivery failure"}
+            return {"ok": True, "message_id": "1"}
+
+    update = {
+        "update_id": 44,
+        "message": {
+            "chat": {"id": -100, "is_forum": True},
+            "message_thread_id": 77,
+            "message_id": 10,
+            "from": {"id": 1, "is_bot": False},
+            "text": "one command",
+        },
+    }
+
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "run_herdres_command",
+        lambda payload: herdres.command_reply(payload),
+    )
+    monkeypatch.setattr(herdres_gateway, "TelegramClient", Telegram)
+    monkeypatch.setattr(herdres_gateway, "_read_offset", lambda _key: 44)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "get_updates",
+        lambda _token, _offset, *, timeout_seconds: [update],
+    )
+    monkeypatch.setattr(
+        herdres_gateway,
+        "_save_offset",
+        lambda offset, key: saved_offsets.append((offset, key)),
+    )
+
+    herdres_gateway._poll_once(
+        "manager",
+        "receiver-token",
+        timeout_seconds=0,
+        request_id_key=REQUEST_ID_KEY,
+    )
+
+    assert saved_offsets == []
+    assert len(backend_requests) == 1
+    request_id = backend_requests[0]["request_id"]
+    cached = state.load_state()[ingress_requests.RECORDS_KEY][request_id]
+    assert cached["state"] == "terminal"
+    assert cached["outcome"]["reply"] == "Sent to Tendwire worker."
+
+    class ForbiddenClient:
+        def __init__(self):
+            raise AssertionError("cached terminal reply must bypass Tendwire")
+
+    monkeypatch.setattr(herdres, "TendwireClient", ForbiddenClient)
+    herdres_gateway._poll_once(
+        "manager",
+        "receiver-token",
+        timeout_seconds=0,
+        request_id_key=REQUEST_ID_KEY,
+    )
+
+    assert len(backend_requests) == 1
+    assert len(reply_attempts) == 2
+    assert reply_attempts[0][1] == reply_attempts[1][1] == cached["outcome"]["reply"]
+    assert saved_offsets == [(45, "manager")]
 
 
 def test_gateway_uncertain_result_is_not_acknowledged(monkeypatch, tmp_path):
@@ -3427,11 +4060,10 @@ def test_gateway_uncertain_result_is_not_acknowledged(monkeypatch, tmp_path):
     monkeypatch.setattr(
         herdres_gateway,
         "run_herdres_command",
-        lambda _payload: {
-            "handled": True,
-            "status": "request_state_uncertain",
-            "reply": "must not acknowledge",
-        },
+        lambda payload: _gateway_child(
+            payload["request_id"],
+            checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+        ),
     )
 
     checkpoint = herdres_gateway.handle_update(
