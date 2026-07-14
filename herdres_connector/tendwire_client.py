@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config
+from .ingress_identity import validate_request_id
 from .safe import FORBIDDEN_PUBLIC_KEYS, PRUNE_TEXT_LIMIT, public_prune, sanitize_text
 
 
@@ -31,6 +32,206 @@ _PUBLIC_PROTOCOL_TOKEN_KEYS = {
     "plan_token",
     "replaces_plan_token",
 }
+_COMMAND_REQUEST_FIELDS = {
+    "schema_version",
+    "action",
+    "request_id",
+    "dry_run",
+    "target",
+    "instruction",
+}
+_COMMAND_TARGET_SHAPES = {
+    frozenset({"worker_id"}),
+    frozenset({"worker_id", "worker_fingerprint"}),
+    frozenset({"space_id"}),
+    frozenset({"name"}),
+    frozenset({"name", "space_id"}),
+}
+_COMMAND_RESPONSE_FIELDS = {
+    "schema_version",
+    "action",
+    "request_id",
+    "ok",
+    "dry_run",
+    "status",
+    "result",
+    "error",
+    "warnings",
+}
+_COMMAND_ACCEPTED_RESULT_FIELDS = frozenset(
+    {
+        "target",
+        "delivery_state",
+        "transport_state",
+        "target_state_at_send",
+        "observed_turn_state",
+    }
+)
+_COMMAND_TERMINAL_REJECTION_STATUSES = frozenset(
+    {
+        "rejected",
+        "not_found",
+        "ambiguous_target",
+        "stale_target",
+        "backend_unsupported",
+        "ambiguous_backend_target",
+        "backend_failed",
+        "duplicate_request",
+        "invalid_request",
+    }
+)
+_COMMAND_RETRY_STATUSES = frozenset(
+    {
+        "backend_unavailable",
+        "request_state_uncertain",
+        "pending",
+    }
+)
+_PRIVATE_INGRESS_ENV_KEYS = frozenset(
+    {
+        "BOT_TOKEN",
+        "HERDRES_ENV_FILE",
+        "HERDRES_OUTBOUND_BOT_TOKEN",
+        "TELEGRAM_BOT_TOKEN",
+        "HERDRES_TENDWIRE_BIN",
+        "TENDWIRE_BIN",
+    }
+)
+_PROCESS_NOT_STARTED = object()
+
+
+def _invalid_command_request() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "invalid_request",
+        "error": "Herdres command request is not an exact public command object",
+    }
+
+
+def _request_state_uncertain(request: dict[str, Any] | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": False,
+        "status": "request_state_uncertain",
+        "error": "Tendwire command result was lost after request start",
+    }
+    if isinstance(request, dict):
+        if isinstance(request.get("request_id"), str):
+            result["request_id"] = request["request_id"]
+        if request.get("action") == "send_instruction":
+            result["action"] = "send_instruction"
+    return result
+
+
+def _exact_public_command_request(request: Any) -> dict[str, Any] | None:
+    if not isinstance(request, dict) or set(request) != _COMMAND_REQUEST_FIELDS:
+        return None
+    if type(request.get("schema_version")) is not int or request["schema_version"] != 1:
+        return None
+    if request.get("action") != "send_instruction" or request.get("dry_run") is not False:
+        return None
+    try:
+        validate_request_id(request.get("request_id"))
+    except ValueError:
+        return None
+    target = request.get("target")
+    if not isinstance(target, dict) or frozenset(target) not in _COMMAND_TARGET_SHAPES:
+        return None
+    if any(not isinstance(value, str) or not value.strip() for value in target.values()):
+        return None
+    instruction = request.get("instruction")
+    if (
+        not isinstance(instruction, dict)
+        or set(instruction) != {"text"}
+        or not isinstance(instruction.get("text"), str)
+        or not instruction["text"]
+    ):
+        return None
+    return request
+
+
+def _valid_accepted_command_result(
+    value: Any,
+    request: dict[str, Any],
+) -> bool:
+    if not isinstance(value, dict) or set(value) != _COMMAND_ACCEPTED_RESULT_FIELDS:
+        return False
+    target = value.get("target")
+    if not isinstance(target, dict) or set(target) != {"worker_id"}:
+        return False
+    worker_id = target.get("worker_id")
+    requested_worker_id = request["target"].get("worker_id")
+    return (
+        isinstance(worker_id, str)
+        and bool(worker_id.strip())
+        and (
+            not isinstance(requested_worker_id, str)
+            or worker_id == requested_worker_id
+        )
+        and value.get("delivery_state") == "submitted"
+        and value.get("transport_state") == "submitted"
+        and isinstance(value.get("target_state_at_send"), str)
+        and bool(value["target_state_at_send"].strip())
+        and value.get("observed_turn_state") == "pending_observation"
+    )
+
+
+def _validated_command_response(
+    response: dict[str, Any],
+    request: dict[str, Any],
+) -> dict[str, Any] | None:
+    if (
+        set(response) != _COMMAND_RESPONSE_FIELDS
+        or type(response.get("schema_version")) is not int
+        or response["schema_version"] != 1
+        or response.get("request_id") != request["request_id"]
+        or response.get("action") != "send_instruction"
+        or response.get("dry_run") is not False
+        or type(response.get("ok")) is not bool
+        or not isinstance(response.get("status"), str)
+        or not response["status"]
+        or (
+            response.get("result") is not None
+            and not isinstance(response.get("result"), dict)
+        )
+        or (
+            response.get("error") is not None
+            and not isinstance(response.get("error"), dict)
+        )
+        or not isinstance(response.get("warnings"), list)
+        or any(not isinstance(item, str) for item in response["warnings"])
+    ):
+        return None
+    status = response["status"]
+    if status == "accepted":
+        if (
+            response["ok"] is not True
+            or response.get("error") is not None
+            or not _valid_accepted_command_result(response.get("result"), request)
+        ):
+            return None
+        return response
+    if status not in _COMMAND_TERMINAL_REJECTION_STATUSES | _COMMAND_RETRY_STATUSES:
+        return None
+    error = response.get("error")
+    if (
+        response["ok"] is not False
+        or not isinstance(error, dict)
+        or error.get("code") != status
+    ):
+        return None
+    return response
+
+
+def _is_private_ingress_env_key(key: str) -> bool:
+    upper = str(key).upper()
+    return (
+        upper in _PRIVATE_INGRESS_ENV_KEYS
+        or "TELEGRAM" in upper
+        or upper.startswith("HERDRES_GATEWAY_")
+        or upper.startswith("HERDRES_MANAGED_BOT_")
+        or upper.startswith("HERDRES_PRIVATE_INGRESS_")
+        or upper.startswith("HERDRES_REQUEST_ID_")
+    )
 
 
 def _protocol_prune(value: Any) -> Any:
@@ -79,7 +280,7 @@ class TendwireClient:
             return None, {}
         parts = shlex.split(os.path.expandvars(os.path.expanduser(explicit)))
         overrides: dict[str, str] = {}
-        if parts and parts[0] == "env":
+        if parts and Path(parts[0]).name == "env":
             parts = parts[1:]
             while parts and "=" in parts[0] and not parts[0].startswith("-"):
                 key, value = parts.pop(0).split("=", 1)
@@ -100,6 +301,11 @@ class TendwireClient:
         env = os.environ.copy()
         _explicit, overrides = self._explicit_parts()
         env.update(overrides)
+        env = {
+            key: value
+            for key, value in env.items()
+            if not _is_private_ingress_env_key(key)
+        }
         source = Path(os.getenv("TENDWIRE_SOURCE_DIR", str(Path.home() / "tendwire" / "src"))).expanduser()
         if source.exists():
             current = env.get("PYTHONPATH", "")
@@ -116,6 +322,7 @@ class TendwireClient:
         timeout: float | None = None,
         protocol: bool = False,
         preserve_page_text: bool = False,
+        post_start_uncertain: bool = False,
     ) -> dict[str, Any]:
         stdin = None
         if input_json is not None:
@@ -130,20 +337,44 @@ class TendwireClient:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            if post_start_uncertain:
+                return _request_state_uncertain(input_json)
             return {"ok": False, "status": "timeout", "error": f"tendwire {' '.join(args[:2])} timed out after {exc.timeout}s"}
+        except OSError as exc:
+            failure = {
+                "ok": False,
+                "status": "subprocess_failed",
+                "error": sanitize_text(str(exc), 300),
+            }
+            if post_start_uncertain:
+                failure["_process_not_started"] = _PROCESS_NOT_STARTED
+            return failure
         except Exception as exc:  # noqa: BLE001
+            if post_start_uncertain:
+                return _request_state_uncertain(input_json)
             return {"ok": False, "status": "subprocess_failed", "error": sanitize_text(str(exc), 300)}
+        if post_start_uncertain and proc.returncode != 0:
+            return _request_state_uncertain(input_json)
         try:
-            stdout = proc.stdout.decode("utf-8") if preserve_page_text else proc.stdout.decode("utf-8", "replace")
+            if preserve_page_text or post_start_uncertain:
+                stdout = proc.stdout.decode("utf-8")
+            else:
+                stdout = proc.stdout.decode("utf-8", "replace")
         except UnicodeDecodeError:
+            if post_start_uncertain:
+                return _request_state_uncertain(input_json)
             return {"ok": False, "status": "invalid_utf8_stdout", "error": "Tendwire returned invalid UTF-8"}
         stderr = proc.stderr.decode("utf-8", "replace")
         try:
             data = json.loads(stdout or "{}")
         except json.JSONDecodeError:
+            if post_start_uncertain:
+                return _request_state_uncertain(input_json)
             detail = sanitize_text(stderr or stdout or "non-json Tendwire response", 300)
             return {"ok": False, "status": "non_json_stdout", "error": detail}
         if not isinstance(data, dict):
+            if post_start_uncertain:
+                return _request_state_uncertain(input_json)
             return {"ok": False, "status": "non_object_json", "error": "Tendwire returned non-object JSON"}
 
         page_text: str | None = None
@@ -241,7 +472,34 @@ class TendwireClient:
         return self.call(["doctor", "--json"], timeout=10)
 
     def command(self, request: dict[str, Any]) -> dict[str, Any]:
-        return self.call(["command", "--json"], input_json=request, timeout=60)
+        public_request = _exact_public_command_request(request)
+        if public_request is None:
+            return _invalid_command_request()
+        result = self.call(
+            ["command", "--json"],
+            input_json=public_request,
+            timeout=60,
+            post_start_uncertain=True,
+        )
+        status = result.get("status")
+        process_not_started = result.pop("_process_not_started", None)
+        if (
+            status == "subprocess_failed"
+            and process_not_started is _PROCESS_NOT_STARTED
+        ):
+            return result
+        if status == "request_state_uncertain" and set(result) != _COMMAND_RESPONSE_FIELDS:
+            if (
+                result.get("ok") is False
+                and result.get("request_id") == public_request["request_id"]
+                and result.get("action") == "send_instruction"
+            ):
+                return result
+            return _request_state_uncertain(public_request)
+        validated = _validated_command_response(result, public_request)
+        if validated is None:
+            return _request_state_uncertain(public_request)
+        return validated
 
     def connector_poll(self, *, name: str = "attention", limit: int = 3, lease_seconds: int = 60) -> dict[str, Any]:
         return self.call(

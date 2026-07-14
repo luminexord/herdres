@@ -18,8 +18,9 @@ from pathlib import Path
 from typing import Any
 
 from herdres_connector import config, speech, state
+from herdres_connector.ingress_identity import derive_telegram_request_id, load_request_id_key
 from herdres_connector.managed_bots import MANAGER_BOT_KIND, managed_bot_kind_for_key, managed_bot_kind_for_username, managed_bot_tokens
-from herdres_connector.safe import sanitize_text, short_hash
+from herdres_connector.safe import sanitize_text
 from herdres_connector.telegram_delivery import TelegramClient
 
 LONG_POLL_SECONDS = int(os.getenv("HERDRES_GATEWAY_LONG_POLL_SECONDS", "50"))
@@ -28,7 +29,38 @@ ERROR_BACKOFF = float(os.getenv("HERDRES_GATEWAY_NETWORK_ERROR_BACKOFF", "1.0"))
 COMMAND_TIMEOUT = int(os.getenv("HERDRES_GATEWAY_COMMAND_TIMEOUT", "90"))
 WORKER_RECONCILE_SECONDS = float(os.getenv("HERDRES_GATEWAY_WORKER_RECONCILE_SECONDS", "1.0"))
 MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,64})")
-PROCESSED_LOCK = threading.Lock()
+CHECKPOINT_ADVANCE = "advance"
+CHECKPOINT_RETRY = "retry"
+_RETRY_COMMAND_STATUSES = frozenset(
+    {
+        "request_state_uncertain",
+        "command_transport_unavailable",
+        "subprocess_failed",
+        "backend_unavailable",
+        "pending",
+        "nonzero_exit",
+        "timeout",
+    }
+)
+_TERMINAL_COMMAND_STATUSES = frozenset(
+    {
+        "accepted",
+        "rejected",
+        "not_found",
+        "ambiguous_target",
+        "stale_target",
+        "backend_unsupported",
+        "ambiguous_backend_target",
+        "backend_failed",
+        "duplicate_request",
+        "invalid_request",
+        "missing_space",
+        "voice_mode",
+        "unknown_target_alias",
+        "ambiguous_reply_target",
+        "unknown_target_bot",
+    }
+)
 
 
 def log(message: str) -> None:
@@ -36,20 +68,74 @@ def log(message: str) -> None:
     print(f"[{stamp}] [herdres-gateway] {message}", flush=True)
 
 
-def _offset_path_for(key: str = MANAGER_BOT_KIND) -> Path:
+def _legacy_offset_path_for(key: str = MANAGER_BOT_KIND) -> Path:
     if key == MANAGER_BOT_KIND:
         return config.offset_path()
-    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in str(key or "managed"))
+    safe = "".join(
+        char if char.isalnum() or char in {"-", "_"} else "_"
+        for char in str(key or "managed")
+    )
     base = config.offset_path()
     return base.with_name(f"{base.name}.{safe}")
 
 
+def _offset_path_for(key: str = MANAGER_BOT_KIND) -> Path:
+    receiver_kind = managed_bot_kind_for_key(key) or str(key or MANAGER_BOT_KIND)
+    return _legacy_offset_path_for(receiver_kind)
+
+
+def _read_offset_checkpoint(path: Path) -> int:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError("offset checkpoint could not be read") from exc
+    if not raw or re.fullmatch(r"[0-9]+", raw) is None:
+        raise RuntimeError("offset checkpoint is corrupt")
+    return int(raw)
+
+
+def _legacy_offset_paths_for_managed_kind(key: str) -> list[Path]:
+    receiver_kind = managed_bot_kind_for_key(key)
+    if not receiver_kind:
+        return []
+    base = config.offset_path()
+    prefix = f"{base.name}.managed-{receiver_kind}-"
+    try:
+        candidates = sorted(
+            (candidate for candidate in base.parent.iterdir() if candidate.name.startswith(prefix)),
+            key=lambda candidate: candidate.name,
+        )
+    except FileNotFoundError:
+        return []
+    valid_name = re.compile(
+        rf"^{re.escape(prefix)}[0-9a-f]{{12}}$"
+    )
+    if any(valid_name.fullmatch(candidate.name) is None for candidate in candidates):
+        raise RuntimeError(
+            f"legacy offset evidence is ambiguous for managed kind {receiver_kind}"
+        )
+    return candidates
+
+
+def _migrate_legacy_managed_offsets(key: str) -> int | None:
+    legacy_paths = _legacy_offset_paths_for_managed_kind(key)
+    if not legacy_paths:
+        return None
+    checkpoints = [_read_offset_checkpoint(legacy) for legacy in legacy_paths]
+    checkpoint = min(checkpoints)
+    _save_offset(checkpoint, key)
+    for legacy in legacy_paths:
+        legacy.unlink()
+    return checkpoint
+
+
+
+
 def _read_offset(key: str = MANAGER_BOT_KIND) -> int | None:
     path = _offset_path_for(key)
-    try:
-        return int(path.read_text(encoding="utf-8").strip() or "0")
-    except Exception:
-        return None
+    if path.exists() or path.is_symlink():
+        return _read_offset_checkpoint(path)
+    return _migrate_legacy_managed_offsets(key)
 
 
 def _load_offset(key: str = MANAGER_BOT_KIND) -> int:
@@ -62,31 +148,6 @@ def _save_offset(offset: int, key: str = MANAGER_BOT_KIND) -> None:
     path.write_text(str(int(offset)), encoding="utf-8")
 
 
-def _processed() -> set[str]:
-    path = config.processed_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return set()
-    if not isinstance(data, list):
-        return set()
-    return {str(item) for item in data[-2000:]}
-
-
-def _mark_processed(key: str) -> None:
-    path = config.processed_path()
-    seen = list(_processed())
-    seen.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(list(dict.fromkeys(seen))[-2000:]), encoding="utf-8")
-
-
-def _reserve_processed(key: str) -> bool:
-    with PROCESSED_LOCK:
-        if key in _processed():
-            return False
-        _mark_processed(key)
-        return True
 
 
 def _api(token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -258,43 +319,113 @@ def run_herdres_command(payload: dict[str, Any]) -> dict[str, Any]:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return {"handled": True, "reply": "Herdres command timed out before delivery."}
-    except Exception as exc:  # noqa: BLE001
-        return {"handled": True, "reply": f"Herdres command failed: {sanitize_text(str(exc), 160)}"}
+        return {"handled": True, "status": "request_state_uncertain", "reply": ""}
+    except Exception:  # noqa: BLE001 - no child receipt exists, so retain the update for retry
+        return {"handled": True, "status": "command_transport_unavailable", "reply": ""}
+    if proc.returncode != 0:
+        return {"handled": True, "status": "request_state_uncertain", "reply": ""}
     try:
-        data = json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
-    except json.JSONDecodeError:
-        return {"handled": True, "reply": "Herdres returned an unreadable command result."}
-    return data if isinstance(data, dict) else {"handled": True}
+        stdout = proc.stdout.decode("utf-8")
+        data = json.loads(stdout or "{}")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"handled": True, "status": "request_state_uncertain", "reply": ""}
+    if not isinstance(data, dict) or type(data.get("handled")) is not bool:
+        return {"handled": True, "status": "request_state_uncertain", "reply": ""}
+    if "status" in data and (
+        not isinstance(data.get("status"), str) or not data["status"].strip()
+    ):
+        return {"handled": True, "status": "request_state_uncertain", "reply": ""}
+    return data
 
 
-def handle_message(message: dict[str, Any], token: str, *, bot_key: str | None = None) -> None:
+def _checkpoint_for_command_result(result: dict[str, Any]) -> str:
+    if type(result.get("handled")) is not bool:
+        return CHECKPOINT_RETRY
+    raw_status = result.get("status")
+    if raw_status is None:
+        return CHECKPOINT_ADVANCE
+    if not isinstance(raw_status, str) or not raw_status.strip():
+        return CHECKPOINT_RETRY
+    status = raw_status.strip().lower()
+    if status in _RETRY_COMMAND_STATUSES:
+        return CHECKPOINT_RETRY
+    if status in _TERMINAL_COMMAND_STATUSES:
+        return CHECKPOINT_ADVANCE
+    return CHECKPOINT_RETRY
+
+
+def handle_message(
+    message: dict[str, Any],
+    token: str,
+    *,
+    update_id: int,
+    receiver_id: str,
+    request_id_key: bytes,
+    bot_key: str | None = None,
+) -> str:
     store = state.load_state()
     if _delete_topic_icon_service_message(message, store, token):
-        return
+        return CHECKPOINT_ADVANCE
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    try:
+        request_id = derive_telegram_request_id(
+            request_id_key,
+            receiver_id=receiver_id,
+            update_id=update_id,
+            chat_id=chat.get("id"),
+            message_id=message.get("message_id"),
+        )
+    except ValueError:
+        _drop(message, "invalid_ingress_identity")
+        return CHECKPOINT_ADVANCE
     payload = _payload_for_message(message, store, bot_key=bot_key)
     if payload is None:
-        return
-    key = short_hash({"message": payload.get("message_id"), "topic": payload.get("topic_id"), "text": payload.get("text") or payload.get("caption")}, 24)
-    if not _reserve_processed(key):
-        return
-    payload = speech.pretranscribe_voice_payload(payload, bot_token=token)
-    result = run_herdres_command(payload)
+        command_payload = {"request_id": request_id}
+    else:
+        payload["request_id"] = request_id
+        command_payload = speech.pretranscribe_voice_payload(
+            payload,
+            bot_token=token,
+        )
+    result = run_herdres_command(command_payload)
+    checkpoint = _checkpoint_for_command_result(result)
+    if checkpoint == CHECKPOINT_RETRY:
+        return checkpoint
     reply = sanitize_text(result.get("reply"), 3500).strip()
     if reply:
         TelegramClient(token=token).send_message(
-            str(payload["chat_id"]),
+            str(chat.get("id") or ""),
             reply,
-            thread_id=str(payload["topic_id"]),
-            reply_to_message_id=str(payload["message_id"]),
+            thread_id=_message_thread_id(message, store),
+            reply_to_message_id=str(message.get("message_id") or ""),
             notify=True,
         )
+    return CHECKPOINT_ADVANCE
 
 
-def handle_update(update: dict[str, Any], token: str, *, bot_key: str | None = None) -> None:
+def handle_update(
+    update: dict[str, Any],
+    token: str,
+    *,
+    receiver_id: str,
+    request_id_key: bytes,
+    bot_key: str | None = None,
+) -> str:
     message = update.get("message") if isinstance(update.get("message"), dict) else None
-    if message is not None:
-        handle_message(message, token, bot_key=bot_key)
+    if message is None:
+        return CHECKPOINT_ADVANCE
+    update_id = update.get("update_id")
+    if type(update_id) is not int or update_id < 0:
+        _drop(message, "invalid_update_id")
+        return CHECKPOINT_ADVANCE
+    return handle_message(
+        message,
+        token,
+        update_id=update_id,
+        receiver_id=receiver_id,
+        request_id_key=request_id_key,
+        bot_key=bot_key,
+    )
 
 
 def _drain_backlog(key: str, token: str) -> int | None:
@@ -310,27 +441,62 @@ def _drain_backlog(key: str, token: str) -> int | None:
     return offset
 
 
-def _poll_once(key: str, token: str, *, timeout_seconds: int) -> None:
+def _receiver_id_for_key(key: str) -> str:
+    return managed_bot_kind_for_key(key) or key
+
+
+def _poll_once(
+    key: str,
+    token: str,
+    *,
+    timeout_seconds: int,
+    request_id_key: bytes,
+) -> None:
     offset = _read_offset(key)
     if offset is None:
         offset = _drain_backlog(key, token)
         if offset is not None:
             return
     for update in get_updates(token, offset, timeout_seconds=timeout_seconds):
-        update_id = int(update.get("update_id") or 0)
+        raw_update_id = update.get("update_id")
+        if type(raw_update_id) is not int or raw_update_id < 0:
+            log(f"invalid update id for {key}; offset retained")
+            break
+        update_id = raw_update_id
         try:
-            handle_update(update, token, bot_key=key)
-        except Exception as exc:  # noqa: BLE001 - skip poison updates instead of re-fetching them forever
+            checkpoint = handle_update(
+                update,
+                token,
+                receiver_id=_receiver_id_for_key(key),
+                request_id_key=request_id_key,
+                bot_key=key,
+            )
+        except Exception as exc:  # noqa: BLE001 - redelivery keeps the same opaque request identity
             log(f"update {update_id} failed for {key}: {type(exc).__name__}: {sanitize_text(str(exc), 200)}")
+            break
+        if checkpoint != CHECKPOINT_ADVANCE:
+            log(f"update {update_id} retained for {key}: {checkpoint}")
+            break
         if offset is None or update_id >= offset:
             offset = update_id + 1
             _save_offset(offset, key)
 
 
-def _poll_worker(key: str, token: str, timeout_seconds: int, stop_event: threading.Event) -> None:
+def _poll_worker(
+    key: str,
+    token: str,
+    timeout_seconds: int,
+    request_id_key: bytes,
+    stop_event: threading.Event,
+) -> None:
     while not stop_event.is_set():
         try:
-            _poll_once(key, token, timeout_seconds=timeout_seconds)
+            _poll_once(
+                key,
+                token,
+                timeout_seconds=timeout_seconds,
+                request_id_key=request_id_key,
+            )
         except Exception as exc:  # noqa: BLE001 - a dead poll thread silently drops inbound messages
             log(f"poll error for {key}: {type(exc).__name__}: {sanitize_text(str(exc), 200)}")
             time.sleep(ERROR_BACKOFF)
@@ -344,7 +510,11 @@ def _poll_specs(store: dict[str, Any], manager_token: str) -> list[tuple[str, st
     return specs
 
 
-def _reconcile_workers(workers: dict[str, dict[str, Any]], specs: list[tuple[str, str, int]]) -> None:
+def _reconcile_workers(
+    workers: dict[str, dict[str, Any]],
+    specs: list[tuple[str, str, int]],
+    request_id_key: bytes,
+) -> None:
     desired = {key: (token, timeout) for key, token, timeout in specs}
     for key, worker in list(workers.items()):
         if key in desired and worker.get("token") == desired[key][0] and worker.get("timeout") == desired[key][1]:
@@ -360,7 +530,7 @@ def _reconcile_workers(workers: dict[str, dict[str, Any]], specs: list[tuple[str
         stop = threading.Event()
         thread = threading.Thread(
             target=_poll_worker,
-            args=(key, token, timeout_seconds, stop),
+            args=(key, token, timeout_seconds, request_id_key, stop),
             name=f"herdres-gateway-{key}",
             daemon=True,
         )
@@ -376,12 +546,21 @@ def run() -> int:
     if not token:
         log("Telegram bot token is not configured")
         return 1
+    try:
+        request_id_key = load_request_id_key()
+    except RuntimeError:
+        log("Herdres request identity key is missing or unsafe")
+        return 1
     workers: dict[str, dict[str, Any]] = {}
     log("started")
     while True:
         try:
             store = state.load_state()
-            _reconcile_workers(workers, _poll_specs(store, token))
+            _reconcile_workers(
+                workers,
+                _poll_specs(store, token),
+                request_id_key,
+            )
             time.sleep(WORKER_RECONCILE_SECONDS)
         except KeyboardInterrupt:
             return 0

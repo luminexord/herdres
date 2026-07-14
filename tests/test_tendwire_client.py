@@ -10,6 +10,54 @@ from herdres_connector import tendwire_client
 from herdres_connector.tendwire_client import TendwireClient
 
 
+REQUEST_ID = "hri1_SIodGeqCeIvApzpEvIaEM-L07UzUMgUFyeltRQxPpqU"
+
+
+def _command_request() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "request_id": REQUEST_ID,
+        "dry_run": False,
+        "target": {
+            "worker_id": "worker-public",
+            "worker_fingerprint": "fingerprint-public",
+        },
+        "instruction": {"text": "perform the public instruction"},
+    }
+def _accepted_result() -> dict[str, object]:
+    return {
+        "target": {"worker_id": "worker-public"},
+        "delivery_state": "submitted",
+        "transport_state": "submitted",
+        "target_state_at_send": "working",
+        "observed_turn_state": "pending_observation",
+    }
+
+
+def _command_response(
+    *,
+    status: str = "accepted",
+    ok: bool = True,
+    result: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "request_id": REQUEST_ID,
+        "ok": ok,
+        "dry_run": False,
+        "status": status,
+        "result": _accepted_result() if status == "accepted" and result is None else result,
+        "error": None
+        if ok
+        else {"code": status, "message": f"{status} response"},
+        "warnings": [],
+    }
+
+
+
+
 @pytest.fixture
 def client_runner(monkeypatch):
     calls = []
@@ -28,6 +76,334 @@ def client_runner(monkeypatch):
 
     monkeypatch.setattr(tendwire_client.subprocess, "run", fake_run)
     return TendwireClient(), calls, responses
+
+
+def test_command_serializes_only_exact_allowlisted_public_request(client_runner):
+    client, calls, responses = client_runner
+    responses.append({"body": _command_response()})
+
+    result = client.command(_command_request())
+
+    assert result["status"] == "accepted"
+    assert len(calls) == 1
+    sent = json.loads(calls[0][1]["input"].decode("utf-8"))
+    assert sent == _command_request()
+    encoded = json.dumps(sent, sort_keys=True)
+    assert all(
+        forbidden not in encoded
+        for forbidden in (
+            "chat_id",
+            "topic_id",
+            "message_id",
+            "reply_to_message_id",
+            "update_id",
+            "bot_token",
+            "backend_target",
+            "private-route-sentinel",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda request: request.update({"chat_id": "-100-private"}),
+        lambda request: request["target"].update(
+            {"backend_target": "private-route-sentinel"}
+        ),
+        lambda request: request["instruction"].update({"message_id": "901"}),
+        lambda request: request.update({"params": {"origin": "telegram"}}),
+    ],
+)
+def test_command_rejects_nonallowlisted_fields_without_serializing(
+    client_runner, mutate
+):
+    client, calls, _responses = client_runner
+    request = _command_request()
+    mutate(request)
+
+    result = client.command(request)
+
+    assert result["ok"] is False
+    assert result["status"] == "invalid_request"
+    assert calls == []
+
+
+def test_command_timeout_after_process_start_is_uncertain(monkeypatch):
+    calls = []
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "tw")
+
+    def timeout(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise tendwire_client.subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(tendwire_client.subprocess, "run", timeout)
+
+    result = TendwireClient().command(_command_request())
+
+    assert result["ok"] is False
+    assert result["status"] == "request_state_uncertain"
+    assert result["request_id"] == REQUEST_ID
+    assert len(calls) == 1
+    assert "before delivery" not in result["error"].lower()
+
+
+def test_command_nonzero_exit_with_correlated_success_is_uncertain(client_runner):
+    client, _calls, responses = client_runner
+    responses.append({"returncode": 9, "body": _command_response()})
+
+    result = client.command(_command_request())
+
+    assert result["ok"] is False
+    assert result["status"] == "request_state_uncertain"
+    assert result["request_id"] == REQUEST_ID
+    assert result["action"] == "send_instruction"
+    assert "result" not in result
+
+
+def test_command_spawn_failure_remains_definite_and_single_attempt(monkeypatch):
+    calls = []
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "missing-tendwire")
+
+    def missing(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise FileNotFoundError("missing executable")
+
+    monkeypatch.setattr(tendwire_client.subprocess, "run", missing)
+
+    result = TendwireClient().command(_command_request())
+
+    assert result["ok"] is False
+    assert result["status"] == "subprocess_failed"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b"not-json",
+        b"[]",
+        b"{}",
+        json.dumps(
+            {
+                "ok": True,
+                "status": "accepted",
+                "action": "send_instruction",
+                "request_id": "hri1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            }
+        ).encode("utf-8"),
+        json.dumps(
+            {
+                **_command_response(),
+                "schema_version": 2,
+            }
+        ).encode("utf-8"),
+    ],
+)
+def test_command_malformed_or_uncorrelated_child_result_is_uncertain(
+    monkeypatch, stdout
+):
+    calls = []
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "tw")
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(tendwire_client.subprocess, "run", fake_run)
+
+    result = TendwireClient().command(_command_request())
+
+    assert result["ok"] is False
+    assert result["status"] == "request_state_uncertain"
+    assert result["request_id"] == REQUEST_ID
+    assert len(calls) == 1
+
+
+def test_command_rejects_unknown_legacy_status_as_uncertain(client_runner):
+    client, _calls, responses = client_runner
+    responses.append(
+        {
+            "body": _command_response(
+                status="duplicate_instruction",
+                ok=True,
+                result={"delivery_state": "duplicate_suppressed"},
+            )
+        }
+    )
+
+    result = client.command(_command_request())
+
+    assert result["ok"] is False
+    assert result["status"] == "request_state_uncertain"
+    assert result["request_id"] == REQUEST_ID
+@pytest.mark.parametrize(
+    "status",
+    [
+        "rejected",
+        "not_found",
+        "ambiguous_target",
+        "stale_target",
+        "backend_unsupported",
+        "ambiguous_backend_target",
+        "backend_failed",
+        "duplicate_request",
+        "invalid_request",
+        "backend_unavailable",
+        "request_state_uncertain",
+        "pending",
+    ],
+)
+def test_command_accepts_only_recognized_false_statuses(client_runner, status):
+    client, _calls, responses = client_runner
+    responses.append(
+        {
+            "body": _command_response(
+                status=status,
+                ok=False,
+                result={"candidates": []},
+            )
+        }
+    )
+
+    result = client.command(_command_request())
+
+    assert result["ok"] is False
+    assert result["status"] == status
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _command_response(status="accepted", ok=False, result=_accepted_result()),
+        _command_response(status="rejected", ok=True, result={"candidates": []}),
+        _command_response(
+            status="request_state_uncertain",
+            ok=True,
+            result={"candidates": []},
+        ),
+        _command_response(
+            status="subprocess_failed",
+            ok=False,
+            result=None,
+        ),
+        _command_response(status="accepted", ok=True, result={}),
+        _command_response(
+            status="accepted",
+            ok=True,
+            result={
+                **_accepted_result(),
+                "delivery_state": "queued",
+            },
+        ),
+        _command_response(
+            status="accepted",
+            ok=True,
+            result={
+                **_accepted_result(),
+                "target": {"worker_id": "wrong-worker"},
+            },
+        ),
+    ],
+)
+def test_command_rejects_inconsistent_status_or_accepted_result_as_uncertain(
+    client_runner,
+    body,
+):
+    client, _calls, responses = client_runner
+    responses.append({"body": body})
+
+    result = client.command(_command_request())
+
+    assert result["ok"] is False
+    assert result["status"] == "request_state_uncertain"
+    assert result["request_id"] == REQUEST_ID
+
+
+def test_command_invalid_utf8_after_process_start_is_uncertain(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "tw")
+    monkeypatch.setattr(
+        tendwire_client.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=b"\xff",
+            stderr=b"",
+        ),
+    )
+
+    result = TendwireClient().command(_command_request())
+
+    assert result["ok"] is False
+    assert result["status"] == "request_state_uncertain"
+    assert result["request_id"] == REQUEST_ID
+
+
+def test_tendwire_child_env_strips_private_ingress_and_keeps_tendwire_overrides(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_BIN",
+        "env TELEGRAM_BOT_TOKEN=explicit-secret TENDWIRE_HOST_ID=host-public tw",
+    )
+    private = {
+        "HERDRES_OUTBOUND_BOT_TOKEN": "outbound-secret",
+        "BOT_TOKEN": "generic-secret",
+        "HERDRES_TELEGRAM_CHAT_ID": "-100-private",
+        "HERDR_TELEGRAM_TOPICS_STATE": "/private/herdres-state.json",
+        "HERDRES_MANAGED_BOT_CODEX_TOKEN": "managed-secret",
+        "HERDRES_REQUEST_ID_KEY_PATH": "/private/request-id.key",
+        "HERDRES_GATEWAY_COMMAND_TIMEOUT": "123",
+    }
+    for key, value in private.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("TENDWIRE_DB_PATH", "/public/tendwire.db")
+
+    child_env = TendwireClient()._env()
+
+    assert child_env["TENDWIRE_HOST_ID"] == "host-public"
+    assert child_env["TENDWIRE_DB_PATH"] == "/public/tendwire.db"
+    assert "TELEGRAM_BOT_TOKEN" not in child_env
+    assert all(key not in child_env for key in private)
+    assert "HERDRES_TENDWIRE_BIN" not in child_env
+    assert "TENDWIRE_BIN" not in child_env
+    assert all(
+        "secret" not in value and "/private/" not in value
+        for value in child_env.values()
+    )
+
+
+def test_path_qualified_env_wrapper_cannot_reintroduce_private_secret(monkeypatch):
+    calls = []
+    secret = "path-wrapper-private-secret"
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_BIN",
+        f"/usr/bin/env TELEGRAM_BOT_TOKEN={secret} "
+        "TENDWIRE_HOST_ID=host-public tw",
+    )
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(_command_response()).encode("utf-8"),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(tendwire_client.subprocess, "run", fake_run)
+
+    result = TendwireClient().command(_command_request())
+
+    assert result["status"] == "accepted"
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert argv == ["tw", "command", "--json"]
+    assert kwargs["env"]["TENDWIRE_HOST_ID"] == "host-public"
+    assert "TELEGRAM_BOT_TOKEN" not in kwargs["env"]
+    assert secret not in json.dumps(argv)
+    assert all(secret not in value for value in kwargs["env"].values())
+
+
 
 
 def test_turn_final_lease_seconds_default_invalid_and_bounds():

@@ -103,6 +103,123 @@ fi
 [ -f "$HOME/.config/herdres/herdres.env" ] || \
     install -Dm600 .env.example "$HOME/.config/herdres/herdres.env"
 
+# Request IDs must survive connector restarts and Telegram redelivery without
+# depending on a bot token. Install the dedicated raw key once, fully written
+# before its final pathname becomes visible, and never repair or replace an
+# existing identity.
+REQUEST_ID_KEY_PATH="${HERDRES_REQUEST_ID_KEY_PATH:-$HOME/.local/share/herdres/request-id.key}"
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "python3 is required to initialize the Herdres request identity key." >&2
+    exit 1
+fi
+python3 - "$REQUEST_ID_KEY_PATH" <<'KEYPY'
+import os
+import secrets
+import stat
+import sys
+import tempfile
+
+KEY_BYTES = 32
+
+
+def fail(message):
+    raise SystemExit(f"Cannot initialize Herdres request identity key: {message}")
+
+
+requested_path = sys.argv[1]
+path = os.path.expanduser(requested_path)
+if not requested_path or not os.path.isabs(path):
+    fail("HERDRES_REQUEST_ID_KEY_PATH must expand to a nonempty absolute path")
+parent = os.path.dirname(path)
+
+
+def safe_key_metadata(metadata):
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+        and metadata.st_size == KEY_BYTES
+    )
+
+
+def validate_existing():
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        fail(str(exc))
+    if not safe_key_metadata(before):
+        fail("existing path must be an owner-owned regular file with mode 0600")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            value = os.read(descriptor, KEY_BYTES + 1)
+            after = os.lstat(path)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        fail(str(exc))
+    if (
+        not safe_key_metadata(opened)
+        or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+        or not safe_key_metadata(after)
+        or len(value) != KEY_BYTES
+    ):
+        fail("existing key is malformed or was replaced while being checked")
+
+
+os.makedirs(parent, mode=0o700, exist_ok=True)
+parent_metadata = os.lstat(parent)
+if not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_uid != os.geteuid():
+    fail("parent must be an owner-owned directory, not a symlink")
+os.chmod(parent, 0o700, follow_symlinks=False)
+
+try:
+    os.lstat(path)
+except FileNotFoundError:
+    old_umask = os.umask(0o077)
+    temporary = ""
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=".request-id.key.", dir=parent)
+        try:
+            os.fchmod(descriptor, 0o600)
+            value = secrets.token_bytes(KEY_BYTES)
+            offset = 0
+            while offset < len(value):
+                offset += os.write(descriptor, value[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        directory_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        os.umask(old_umask)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+else:
+    pass
+
+validate_existing()
+KEYPY
+
 mkdir -p "$HOME/.config/systemd/user" "$HOME/.local/share/herdres"
 cp systemd/user/herdres.service systemd/user/herdres-gateway.service "$HOME/.config/systemd/user/"
 rm -f "$HOME/.config/systemd/user/herdres.timer"

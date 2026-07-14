@@ -12,6 +12,7 @@ DEFAULT_STATE_PATH = HOME / ".local/share/herdres/state.json"
 DEFAULT_OFFSET_PATH = HOME / ".local/share/herdres/gateway.offset"
 DEFAULT_PROCESSED_PATH = HOME / ".local/share/herdres/gateway_processed_messages.json"
 DEFAULT_TENDWIRE_DB_PATH = HOME / ".local/share/tendwire/tendwire.db"
+DEFAULT_REQUEST_ID_KEY_PATH = HOME / ".local/share/herdres/request-id.key"
 DEFAULT_HERDRES_ENV_PATH = HOME / ".config/herdres/herdres.env"
 DEFAULT_GENERAL_THREAD_ID = "1"
 SOURCE_SERVICES = ("tendwired.service", "herdres-gateway.service", "herdres.service")
@@ -55,6 +56,21 @@ def tendwire_db_path(env: Any | None = None) -> Path:
     return Path(source.get("HERDRES_TENDWIRE_DB_PATH", source.get("TENDWIRE_DB_PATH", DEFAULT_TENDWIRE_DB_PATH))).expanduser()
 
 
+def request_id_key_path(env: Any | None = None) -> Path:
+    source = os.environ if env is None else env
+    configured = source.get("HERDRES_REQUEST_ID_KEY_PATH")
+    key_path = Path(
+        DEFAULT_REQUEST_ID_KEY_PATH
+        if configured is None or configured == ""
+        else configured
+    ).expanduser()
+    if not key_path.is_absolute():
+        raise ValueError(
+            "HERDRES_REQUEST_ID_KEY_PATH must expand to a nonempty absolute path"
+        )
+    return key_path
+
+
 def mode(env: Any | None = None) -> str:
     source = os.environ if env is None else env
     return str(source.get("HERDRES_TENDWIRE_MODE", "source") or "source").strip().lower()
@@ -75,6 +91,27 @@ def tendwire_turn_final_lease_seconds(env: Any | None = None) -> int:
     except (TypeError, ValueError):
         return 900
     return min(3600, max(60, value))
+
+
+def command_retry_horizon_seconds(env: Any | None = None) -> int:
+    source = os.environ if env is None else env
+    try:
+        value = int(
+            str(
+                source.get(
+                    "HERDRES_COMMAND_RETRY_HORIZON_SECONDS",
+                    "86400",
+                )
+                or "86400"
+            )
+        )
+    except (TypeError, ValueError):
+        return 86400
+    return min(604800, max(60, value))
+
+
+def command_request_retention_seconds(env: Any | None = None) -> int:
+    return command_retry_horizon_seconds(env) + 86_400
 
 
 def require_source_mode(env: Any | None = None) -> None:

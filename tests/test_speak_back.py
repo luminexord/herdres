@@ -14,7 +14,7 @@ from herdres_connector import source_sync, speech, state
 from herdres_connector.source_sync import SyncRuntime
 from herdres_connector.telegram_delivery import TelegramClient
 
-from test_source_only import FakeTelegram, FakeTendwire, _source_worker, _store
+from test_source_only import REQUEST_ID, FakeTelegram, FakeTendwire, _source_worker, _store
 
 
 # --- state ring --------------------------------------------------------------
@@ -305,6 +305,7 @@ def test_command_reply_sets_speak_next_reply_on_voice_reply(tmp_path, monkeypatc
 
     with patch.object(herdres.TendwireClient, "command", return_value={"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}):
         result = herdres.command_reply({
+            "request_id": REQUEST_ID,
             "topic_id": "77", "user_id": "1", "text": "great, keep going",
             "reply_to_message_id": "901",   # replying to the pane's voice note 901
         })
@@ -322,7 +323,15 @@ def test_command_reply_no_flag_for_plain_message(tmp_path, monkeypatch):
     worker_key, _entry = _persist_worker(store, voice_reply_message_ids=["901"])
     state.save_state(store)
     with patch.object(herdres.TendwireClient, "command", return_value={"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}):
-        herdres.command_reply({"topic_id": "77", "user_id": "1", "text": "hello", "reply_to_message_id": "555"})
+        herdres.command_reply(
+            {
+                "request_id": REQUEST_ID,
+                "topic_id": "77",
+                "user_id": "1",
+                "text": "hello",
+                "reply_to_message_id": "555",
+            }
+        )
     saved = state.load_state(statepath)
     assert saved["panes"][worker_key].get("speak_next_reply") is None
 
@@ -351,8 +360,14 @@ def test_command_reply_arms_flag_and_strips_trigger(tmp_path, monkeypatch):
         return {"ok": True, "status": "accepted", "result": {"delivery_state": "submitted"}}
 
     with patch.object(herdres.TendwireClient, "command", fake_command):
-        herdres.command_reply({"topic_id": "77", "user_id": "1",
-                               "text": "Summarize the file? Reply by voice"})
+        herdres.command_reply(
+            {
+                "request_id": REQUEST_ID,
+                "topic_id": "77",
+                "user_id": "1",
+                "text": "Summarize the file? Reply by voice",
+            }
+        )
     assert sent["instruction"]["text"] == "Summarize the file"     # phrase never reaches the agent
     saved = state.load_state(statepath)
     assert saved["panes"][worker_key].get("speak_next_reply") is True  # bridge owns the voice

@@ -12,9 +12,11 @@ import argparse
 import copy
 import json
 import sys
+import time
 from typing import Any, Callable
 
 from herdres_connector import config, doctor, speech, state
+from herdres_connector.ingress_identity import validate_request_id
 from herdres_connector.managed_bots import managed_bot_kind_for_username
 from herdres_connector.safe import compact_ws, public_prune, sanitize_text, short_hash
 from herdres_connector.source_sync import SyncRuntime, sync_once
@@ -224,16 +226,6 @@ def _managed_bot_kind_for_alias(store: dict[str, Any], alias: str) -> str:
     return managed_bot_kind_for_username(telegram, alias)
 
 
-def _request_id(entry: dict[str, Any], payload: dict[str, Any], text: str) -> str:
-    material = {
-        "message": payload.get("message_id"),
-        "reply": payload.get("reply_to_message_id"),
-        "text": text,
-        "worker": entry.get("active_worker_id") or entry.get("tendwire_worker_id"),
-        "space": entry.get("tendwire_space_id") or entry.get("space_id"),
-    }
-    target = entry.get("active_worker_id") or entry.get("tendwire_worker_id") or entry.get("tendwire_space_id") or "space"
-    return f"herdres:{target}:{short_hash(material, 20)}"
 
 
 def _target_for_entry(entry: dict[str, Any]) -> dict[str, str]:
@@ -298,20 +290,21 @@ def _command_request(entry: dict[str, Any], payload: dict[str, Any], text: str) 
     return {
         "schema_version": 1,
         "action": "send_instruction",
-        "request_id": _request_id(entry, payload, text),
+        "request_id": validate_request_id(payload.get("request_id")),
         "dry_run": False,
         "target": _target_for_entry(entry),
         "instruction": {"text": text},
-        "params": {"origin": "telegram", "telegram_origin": "topic"},
     }
 
 
 def _success_reply(response: dict[str, Any]) -> str:
     status = str(response.get("status") or "").strip().lower()
+    if status != "accepted" or response.get("ok") is not True:
+        return ""
     result = response.get("result") if isinstance(response.get("result"), dict) else {}
     delivery = str(result.get("delivery_state") or "").strip().lower()
-    if status == "duplicate_instruction" or delivery == "duplicate_suppressed":
-        return "Already sent to Tendwire worker."
+    if delivery == "duplicate_suppressed":
+        return ""
     if delivery == "queued":
         return "Queued for Tendwire worker."
     if (
@@ -319,21 +312,174 @@ def _success_reply(response: dict[str, Any]) -> str:
         and str(result.get("target_state_at_send") or "").strip().lower() == "working"
     ):
         return "Submitted to busy Tendwire worker."
-    if status in {"accepted", "submitted", "sent", "ok", "success"}:
-        return "Sent to Tendwire worker."
-    return ""
+    return "Sent to Tendwire worker."
 
 
 def _command_succeeded(response: dict[str, Any]) -> bool:
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    return (
+        response.get("ok") is True
+        and str(response.get("status") or "").strip().lower() == "accepted"
+        and str(result.get("delivery_state") or "").strip().lower()
+        != "duplicate_suppressed"
+    )
+
+
+_INGRESS_COMMAND_REQUESTS_KEY = "tendwire_ingress_command_requests"
+_TERMINAL_COMMAND_STATUSES = frozenset(
+    {
+        "accepted",
+        "rejected",
+        "not_found",
+        "ambiguous_target",
+        "stale_target",
+        "backend_unsupported",
+        "ambiguous_backend_target",
+        "backend_failed",
+        "duplicate_request",
+        "invalid_request",
+    }
+)
+
+
+def _ingress_command_requests(store: dict[str, Any]) -> dict[str, Any]:
+    requests = store.get(_INGRESS_COMMAND_REQUESTS_KEY)
+    if not isinstance(requests, dict):
+        requests = {}
+        store[_INGRESS_COMMAND_REQUESTS_KEY] = requests
+    return requests
+
+
+def _prune_ingress_command_requests(store: dict[str, Any], now: float) -> bool:
+    cutoff = now - config.command_request_retention_seconds()
+    requests = _ingress_command_requests(store)
+    changed = False
+    for request_id, record in list(requests.items()):
+        if not isinstance(record, dict):
+            continue
+        terminal_at = record.get("terminal_at")
+        updated_at = record.get("updated_at")
+        created_at = record.get("created_at")
+        retained_at = (
+            terminal_at
+            if type(terminal_at) in {int, float}
+            else updated_at
+            if type(updated_at) in {int, float}
+            else created_at
+        )
+        if type(retained_at) in {int, float} and retained_at < cutoff:
+            requests.pop(request_id, None)
+            changed = True
+    return changed
+
+
+def _stored_ingress_command_request(
+    store: dict[str, Any], request_id: str
+) -> dict[str, Any] | None:
+    record = _ingress_command_requests(store).get(request_id)
+    request = record.get("request") if isinstance(record, dict) else None
+    if not isinstance(request, dict) or request.get("request_id") != request_id:
+        return None
+    return copy.deepcopy(request)
+
+
+def _remember_ingress_command_request(
+    store: dict[str, Any],
+    request: dict[str, Any],
+    *,
+    replace: bool = False,
+) -> dict[str, Any]:
+    request_id = validate_request_id(request.get("request_id"))
+    now = time.time()
+    _prune_ingress_command_requests(store, now)
+    requests = _ingress_command_requests(store)
+    current = requests.get(request_id)
+    if isinstance(current, dict) and not replace:
+        stored = current.get("request")
+        if isinstance(stored, dict):
+            return copy.deepcopy(stored)
+    created_at = (
+        current.get("created_at")
+        if isinstance(current, dict)
+        and type(current.get("created_at")) in {int, float}
+        else now
+    )
+    requests[request_id] = {
+        "request": copy.deepcopy(request),
+        "created_at": created_at,
+        "updated_at": now,
+    }
+    return copy.deepcopy(request)
+
+
+def _finish_ingress_command_request(
+    store: dict[str, Any],
+    request_id: str,
+    response: dict[str, Any],
+) -> None:
     status = str(response.get("status") or "").strip().lower()
-    if status in {"accepted", "duplicate_instruction", "queued", "sent", "submitted", "ok", "success"}:
-        return True
-    return bool(response.get("ok") is True and not status)
+    record = _ingress_command_requests(store).get(request_id)
+    if not isinstance(record, dict):
+        return
+    now = time.time()
+    record["updated_at"] = now
+    record["last_status"] = status
+    if status in _TERMINAL_COMMAND_STATUSES and "terminal_at" not in record:
+        record["terminal_at"] = now
+
+
+def _submit_ingress_command_request(
+    store: dict[str, Any], request: dict[str, Any]
+) -> dict[str, Any]:
+    client = TendwireClient()
+    response = client.command(request)
+    if (
+        str(response.get("status") or "") == "stale_target"
+        and isinstance(request.get("target"), dict)
+        and request["target"].get("worker_fingerprint")
+    ):
+        # Stale resolution is pre-reservation. Persist the sole allowed request
+        # refresh before its call so later uncertainty replays these exact bytes.
+        retry = copy.deepcopy(request)
+        retry["target"].pop("worker_fingerprint", None)
+        request = _remember_ingress_command_request(store, retry, replace=True)
+        state.save_state(store)
+        response = client.command(request)
+    _finish_ingress_command_request(store, request["request_id"], response)
+    state.save_state(store)
+    return response
+
+
+def _command_response_payload(response: dict[str, Any]) -> dict[str, Any]:
+    if _command_succeeded(response):
+        return {
+            "handled": True,
+            "reply": _success_reply(response) if config.ack_on_send() else "",
+        }
+    return {
+        "handled": True,
+        "reply": SAFE_SEND_FAILURE_REPLY,
+        "status": response.get("status") or "failed",
+    }
 
 
 def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     with state.state_lock():
         store = state.load_state()
+        if _prune_ingress_command_requests(store, time.time()):
+            state.save_state(store)
+        try:
+            ingress_request_id = validate_request_id(payload.get("request_id"))
+        except ValueError:
+            ingress_request_id = ""
+        if ingress_request_id:
+            stored_request = _stored_ingress_command_request(
+                store, ingress_request_id
+            )
+            if stored_request is not None:
+                return _command_response_payload(
+                    _submit_ingress_command_request(store, stored_request)
+                )
         _key, entry = state.find_entry_by_thread(store, str(payload.get("topic_id") or ""))
         if entry is None:
             return {"handled": False}
@@ -406,31 +552,22 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             entry, payload.get("reply_to_message_id")
         ):
             entry["speak_next_reply"] = True
-        request = _command_request(entry, payload, text)
-        client = TendwireClient()
-        response = client.command(request)
-        if (
-            str(response.get("status") or "") == "stale_target"
-            and isinstance(request.get("target"), dict)
-            and request["target"].get("worker_fingerprint")
-        ):
-            # Worker fingerprints churn with status/summary, so a cached
-            # fingerprint can be seconds stale. Retry once pinned by id only.
-            retry = json.loads(json.dumps(request))
-            retry["target"].pop("worker_fingerprint", None)
-            retry["request_id"] = f"{request['request_id']}-r2"
-            response = client.command(retry)
-        ledger = store.setdefault("tendwire_command_submissions", {})
-        identity = short_hash({"request": request["request_id"], "worker": entry.get("tendwire_worker_id")}, 20)
-        ledger[identity] = {
-            "worker_id": entry.get("active_worker_id") or entry.get("tendwire_worker_id"),
-            "space_id": entry.get("tendwire_space_id") or entry.get("space_id"),
-            "status": response.get("status") or "unknown",
-        }
+        try:
+            request = _command_request(entry, payload, text)
+        except ValueError:
+            return {
+                "handled": True,
+                "reply": SAFE_SEND_FAILURE_REPLY,
+                "status": "invalid_request",
+            }
+        request = _remember_ingress_command_request(store, request)
+        # The exact public request is durable before the child may mutate. This
+        # cache is scheduling evidence only: every replay still asks Tendwire's
+        # authoritative receipt machine for the outcome.
         state.save_state(store)
-        if _command_succeeded(response):
-            return {"handled": True, "reply": _success_reply(response) if config.ack_on_send() else ""}
-        return {"handled": True, "reply": SAFE_SEND_FAILURE_REPLY, "status": response.get("status") or "failed"}
+        return _command_response_payload(
+            _submit_ingress_command_request(store, request)
+        )
 
 
 def callback_reply(_payload: dict[str, Any]) -> dict[str, Any]:

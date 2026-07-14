@@ -8,7 +8,7 @@ from unittest.mock import patch
 import herdres
 from herdres_connector import state
 
-from test_source_only import _source_worker, _store
+from test_source_only import REQUEST_ID, _source_worker, _store
 
 
 def _setup(tmp_path, monkeypatch):
@@ -57,7 +57,14 @@ def _reply(text, pending):
 
     with patch.object(herdres.TendwireClient, "command", fake_command), \
             patch.object(herdres.TendwireClient, "pending", lambda self: pending):
-        result = herdres.command_reply({"topic_id": "77", "user_id": "1", "text": text})
+        result = herdres.command_reply(
+            {
+                "request_id": REQUEST_ID,
+                "topic_id": "77",
+                "user_id": "1",
+                "text": text,
+            }
+        )
     return result, sent
 
 
@@ -126,3 +133,20 @@ def test_revise_choice_detected_by_choice_id(tmp_path, monkeypatch):
     assert not sent
     result, sent = _reply("1", _pending(plan_choices))
     assert sent["instruction"]["text"] == "1"            # approve sends the digit
+
+
+def test_missing_request_id_never_submits_valid_text(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    sent = []
+
+    with patch.object(
+        herdres.TendwireClient,
+        "command",
+        side_effect=lambda request: sent.append(request),
+    ):
+        result = herdres.command_reply(
+            {"topic_id": "77", "user_id": "1", "text": "valid instruction"}
+        )
+
+    assert result["status"] == "invalid_request"
+    assert sent == []

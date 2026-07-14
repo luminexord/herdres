@@ -4,6 +4,8 @@ import builtins
 
 import json
 import hashlib
+import os
+import stat
 import socket
 import subprocess
 from pathlib import Path
@@ -19,6 +21,24 @@ from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_feed_ite
 from herdres_connector.safe import public_prune
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient, drain_outbox
+from herdres_connector.ingress_identity import derive_telegram_request_id
+
+
+REQUEST_ID_KEY = bytes(range(32))
+REQUEST_ID = derive_telegram_request_id(
+    REQUEST_ID_KEY,
+    receiver_id="manager",
+    update_id=100,
+    chat_id=-100,
+    message_id=9001,
+)
+REQUEST_ID_2 = derive_telegram_request_id(
+    REQUEST_ID_KEY,
+    receiver_id="manager",
+    update_id=101,
+    chat_id=-100,
+    message_id=9002,
+)
 
 
 def _source_worker(worker, *, stable_identity=True):
@@ -558,6 +578,7 @@ def test_per_agent_bot_reply_targets_original_worker_once(tmp_path, monkeypatch)
             "chat_id": "-100",
             "topic_id": "77",
             "message_id": "9001",
+            "request_id": REQUEST_ID,
             "reply_to_message_id": claude_message_id,
             "text": "/send reply to claude",
         }
@@ -567,6 +588,7 @@ def test_per_agent_bot_reply_targets_original_worker_once(tmp_path, monkeypatch)
             "chat_id": "-100",
             "topic_id": "77",
             "message_id": "9002",
+            "request_id": REQUEST_ID_2,
             "reply_to_message_id": codex_message_id,
             "text": "/send reply to codex",
         }
@@ -2083,7 +2105,7 @@ def test_open_working_turn_repairs_stale_final_markers_then_finalizes(monkeypatc
     assert any(key.startswith("final:turn-1:") for key in store["tendwire_source_delivered_turns"])
 
 
-def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path, monkeypatch):
+def test_command_reply_preserves_prederived_request_id_and_strips_private_ingress(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
     state.upsert_worker_entry(store, _source_worker({"id": "worker-1", "name": "Alpha", "status": "idle", "space_id": "space-1", "fingerprint": "fp-1"}), )
@@ -2108,7 +2130,12 @@ def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path,
             "chat_id": "-100",
             "topic_id": "77",
             "message_id": "12345",
+            "request_id": REQUEST_ID,
             "reply_to_message_id": "12344",
+            "update_id": "raw-update-sentinel",
+            "user_id": "raw-user-sentinel",
+            "bot_token": "raw-bot-sentinel",
+            "backend_target": "private-route-sentinel",
             "text": "/send hello",
         }
     )
@@ -2116,10 +2143,287 @@ def test_command_reply_uses_hashed_request_id_without_raw_telegram_ids(tmp_path,
     assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
     request = fake.commands[0]
     assert request["target"] == {"worker_id": "worker-1", "worker_fingerprint": "fp-1"}
+    assert request["request_id"] == REQUEST_ID
+    assert set(request) == {
+        "schema_version",
+        "action",
+        "request_id",
+        "dry_run",
+        "target",
+        "instruction",
+    }
     encoded = json.dumps(request, sort_keys=True)
-    assert "12345" not in encoded
-    assert "-100" not in encoded
-    assert "topic_id" not in encoded
+    assert all(
+        forbidden not in encoded
+        for forbidden in (
+            "12345",
+            "12344",
+            "-100",
+            "topic_id",
+            "raw-update-sentinel",
+            "raw-user-sentinel",
+            "raw-bot-sentinel",
+            "private-route-sentinel",
+        )
+    )
+
+
+
+def test_stale_target_refresh_reuses_same_request_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-stale",
+            }
+        ),
+    )
+    _space_key, entry, _created = state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    assert state.cache_space_active_worker(
+        entry, state.find_worker_entry_by_id(store, "worker-1")[1]
+    )
+    state.save_state(store)
+    calls = []
+    responses = [
+        {"ok": False, "status": "stale_target"},
+        {"ok": True, "status": "accepted", "result": {}},
+    ]
+
+    class Client:
+        def command(self, request):
+            calls.append(json.loads(json.dumps(request)))
+            return responses.pop(0)
+
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+
+    result = herdres.command_reply(
+        {
+            "request_id": REQUEST_ID,
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "12345",
+            "text": "/send same intention",
+        }
+    )
+
+    assert result == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert len(calls) == 2
+    assert calls[0]["request_id"] == calls[1]["request_id"] == REQUEST_ID
+    assert calls[0]["target"] == {
+        "worker_id": "worker-1",
+        "worker_fingerprint": "fp-stale",
+    }
+    assert calls[1]["target"] == {"worker_id": "worker-1"}
+    assert {key: value for key, value in calls[0].items() if key != "target"} == {
+        key: value for key, value in calls[1].items() if key != "target"
+    }
+
+
+def test_uncertain_redelivery_reuses_durable_exact_request_across_state_churn(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-original",
+            }
+        ),
+        topic_id="77",
+    )
+    state.save_state(store)
+    calls = []
+    responses = [
+        {"ok": False, "status": "request_state_uncertain"},
+        {"ok": True, "status": "accepted", "result": {}},
+    ]
+
+    class Client:
+        def command(self, request):
+            calls.append(json.loads(json.dumps(request)))
+            return responses.pop(0)
+
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+    first = herdres.command_reply(
+        {
+            "request_id": REQUEST_ID,
+            "topic_id": "77",
+            "message_id": "9001",
+            "text": "/send original instruction",
+        }
+    )
+    changed = state.load_state()
+    changed["panes"] = {}
+    state.save_state(changed)
+
+    replay = herdres.command_reply(
+        {
+            "request_id": REQUEST_ID,
+            "topic_id": "route-is-now-gone",
+            "message_id": "changed-private-coordinate",
+            "text": "/send a retranscription must not replace the request",
+        }
+    )
+
+    assert first["status"] == "request_state_uncertain"
+    assert replay == {"handled": True, "reply": "Sent to Tendwire worker."}
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert calls[0]["request_id"] == REQUEST_ID
+    assert calls[0]["instruction"] == {"text": "original instruction"}
+    assert calls[0]["target"] == {
+        "worker_id": "worker-1",
+        "worker_fingerprint": "fp-original",
+    }
+
+
+def test_ingress_request_cache_bounds_every_record_only_after_retention_margin(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        herdres.config,
+        "command_request_retention_seconds",
+        lambda env=None: 120,
+    )
+    store = {
+        herdres._INGRESS_COMMAND_REQUESTS_KEY: {
+            "old-terminal": {"terminal_at": 79.0},
+            "boundary-terminal": {"terminal_at": 80.0},
+            "margin-terminal": {"terminal_at": 100.0},
+            "within-horizon-terminal": {"terminal_at": 150.0},
+            "old-uncertain": {"created_at": 1.0, "updated_at": 79.0},
+            "boundary-uncertain": {"created_at": 1.0, "updated_at": 80.0},
+            "margin-uncertain": {"created_at": 1.0, "updated_at": 100.0},
+            "within-horizon-uncertain": {
+                "created_at": 1.0,
+                "updated_at": 150.0,
+            },
+        }
+    }
+
+    changed = herdres._prune_ingress_command_requests(store, 200.0)
+
+    assert changed is True
+    records = store[herdres._INGRESS_COMMAND_REQUESTS_KEY]
+    assert "old-terminal" not in records
+    assert "old-uncertain" not in records
+    assert set(records) == {
+        "boundary-terminal",
+        "margin-terminal",
+        "within-horizon-terminal",
+        "boundary-uncertain",
+        "margin-uncertain",
+        "within-horizon-uncertain",
+    }
+    assert (
+        herdres.config.command_request_retention_seconds(
+            env={"HERDRES_COMMAND_RETRY_HORIZON_SECONDS": "60"}
+        )
+        > herdres.config.command_retry_horizon_seconds(
+            env={"HERDRES_COMMAND_RETRY_HORIZON_SECONDS": "60"}
+        )
+    )
+
+
+def test_ingress_request_timestamps_track_uncertain_and_terminal_transitions(
+    monkeypatch,
+):
+    times = iter((100.0, 101.0, 102.0))
+    monkeypatch.setattr(herdres.time, "time", lambda: next(times))
+    monkeypatch.setattr(
+        herdres.config,
+        "command_request_retention_seconds",
+        lambda: 120,
+    )
+    store = {}
+    request = {"request_id": REQUEST_ID}
+
+    herdres._remember_ingress_command_request(store, request)
+    herdres._finish_ingress_command_request(
+        store,
+        REQUEST_ID,
+        {"ok": False, "status": "request_state_uncertain"},
+    )
+    record = store[herdres._INGRESS_COMMAND_REQUESTS_KEY][REQUEST_ID]
+    assert record["created_at"] == 100.0
+    assert record["updated_at"] == 101.0
+    assert record["last_status"] == "request_state_uncertain"
+    assert "terminal_at" not in record
+
+    herdres._finish_ingress_command_request(
+        store,
+        REQUEST_ID,
+        {"ok": True, "status": "accepted"},
+    )
+    assert record["created_at"] == 100.0
+    assert record["updated_at"] == 102.0
+    assert record["terminal_at"] == 102.0
+    assert record["last_status"] == "accepted"
+
+
+def test_save_state_fsyncs_file_before_replace_and_directory_after(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(descriptor):
+        kind = "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+        calls.append(f"fsync:{kind}")
+        real_fsync(descriptor)
+
+    def tracking_replace(source, destination):
+        calls.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(state.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(state.os, "replace", tracking_replace)
+    state_path = tmp_path / "nested" / "state.json"
+
+    state.save_state({"version": 2, "value": "durable"}, state_path)
+
+    assert calls == ["fsync:file", "replace", "fsync:directory"]
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "value": "durable",
+        "version": 2,
+    }
+
+
+def test_legacy_duplicate_instruction_is_truthful_non_success():
+    response = {
+        "ok": True,
+        "status": "duplicate_instruction",
+        "result": {"delivery_state": "duplicate_suppressed"},
+    }
+
+    assert herdres._command_succeeded(response) is False
+    assert herdres._success_reply(response) == ""
+    mislabeled = {
+        "ok": True,
+        "status": "accepted",
+        "result": {"delivery_state": "duplicate_suppressed"},
+    }
+    assert herdres._command_succeeded(mislabeled) is False
+    assert herdres._success_reply(mislabeled) == ""
 
 
 def test_invalid_snapshot_clears_stale_space_route_and_blocks_unbound_send_and_reply(
@@ -2419,6 +2723,7 @@ def test_command_reply_to_agent_message_targets_original_worker(tmp_path, monkey
             "chat_id": "-100",
             "topic_id": "77",
             "message_id": "999",
+            "request_id": REQUEST_ID,
             "reply_to_message_id": "555",
             "text": "/send reply to claude",
         }
@@ -2456,6 +2761,7 @@ def test_command_reply_at_alias_targets_worker_in_space(tmp_path, monkeypatch):
             "chat_id": "-100",
             "topic_id": "77",
             "message_id": "999",
+            "request_id": REQUEST_ID,
             "text": "/send @claude hello there",
         }
     )
@@ -2492,6 +2798,7 @@ def test_command_reply_target_bot_kind_targets_worker_in_space(tmp_path, monkeyp
             "chat_id": "-100",
             "topic_id": "77",
             "message_id": "999",
+            "request_id": REQUEST_ID,
             "target_bot_kind": "claude",
             "text": "hello from child bot",
         }
@@ -2529,6 +2836,7 @@ def test_command_reply_voice_transcript_targets_worker_in_space(tmp_path, monkey
             "chat_id": "-100",
             "topic_id": "77",
             "message_id": "999",
+            "request_id": REQUEST_ID,
             "target_bot_kind": "kimi",
             "text": "",
             "caption": "",
@@ -2798,21 +3106,404 @@ def test_gateway_pretranscribes_voice_before_command(monkeypatch, tmp_path):
 
     monkeypatch.setattr(herdres_gateway.speech, "pretranscribe_voice_payload", fake_pretranscribe)
     monkeypatch.setattr(herdres_gateway, "run_herdres_command", fake_command)
-    monkeypatch.setattr(herdres_gateway, "_reserve_processed", lambda _key: True)
 
-    herdres_gateway.handle_message(
+    checkpoint = herdres_gateway.handle_message(
         {
-            "chat": {"id": "-100", "is_forum": True},
+            "chat": {"id": -100, "is_forum": True},
             "message_thread_id": 77,
             "message_id": 10,
             "from": {"id": "1", "is_bot": False},
             "voice": {"file_id": "voice-file", "file_size": 42},
         },
         "receiver-token",
+        update_id=44,
+        receiver_id="manager",
+        request_id_key=REQUEST_ID_KEY,
     )
 
     assert seen["_speech_pretranscribed"] is True
     assert seen["_speech_transcript"] == "from voice"
+    assert checkpoint == herdres_gateway.CHECKPOINT_ADVANCE
+
+
+def test_gateway_same_update_retries_byte_identical_and_distinct_update_differs(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "0")
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+    )
+    state.upsert_space_entry(
+        store,
+        {"id": "space-1", "name": "Project", "status": "active", "fingerprint": "space-fp"},
+        topic_id="77",
+    )
+    state.save_state(store)
+    requests = []
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    def fake_command(payload):
+        result = herdres.command_reply(payload)
+        requests.append(
+            json.dumps(fake.commands[-1], sort_keys=True, separators=(",", ":"))
+        )
+        return result
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    monkeypatch.setattr(herdres_gateway, "run_herdres_command", fake_command)
+    message = {
+        "chat": {"id": -100, "is_forum": True},
+        "message_thread_id": 77,
+        "message_id": 10,
+        "from": {"id": 1, "is_bot": False},
+        "text": "identical text",
+    }
+    first = {"update_id": 44, "message": message}
+    distinct = {"update_id": 45, "message": dict(message)}
+
+    for update in (first, first, distinct):
+        assert (
+            herdres_gateway.handle_update(
+                update,
+                "receiver-token",
+                receiver_id="manager",
+                request_id_key=REQUEST_ID_KEY,
+            )
+            == herdres_gateway.CHECKPOINT_ADVANCE
+        )
+
+    assert len(requests) == 3
+    assert requests[0] == requests[1]
+    first_payload = json.loads(requests[0])
+    retry_payload = json.loads(requests[1])
+    distinct_payload = json.loads(requests[2])
+    assert first_payload["request_id"] == retry_payload["request_id"]
+    assert first_payload["request_id"] != distinct_payload["request_id"]
+
+
+def test_gateway_managed_receiver_identity_is_stable_across_token_rotation():
+    old_key = "managed-codex-0123456789ab"
+    rotated_key = "managed-codex-fedcba987654"
+    old_receiver = herdres_gateway._receiver_id_for_key(old_key)
+    rotated_receiver = herdres_gateway._receiver_id_for_key(rotated_key)
+
+    assert old_receiver == rotated_receiver == "codex"
+    assert derive_telegram_request_id(
+        REQUEST_ID_KEY,
+        receiver_id=old_receiver,
+        update_id=44,
+        chat_id=-100,
+        message_id=10,
+    ) == derive_telegram_request_id(
+        REQUEST_ID_KEY,
+        receiver_id=rotated_receiver,
+        update_id=44,
+        chat_id=-100,
+        message_id=10,
+    )
+
+
+def test_gateway_replays_cached_request_after_route_disappears(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE",
+        str(tmp_path / "state.json"),
+    )
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "0")
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-original",
+            }
+        ),
+        topic_id="77",
+    )
+    state.save_state(store)
+    tendwire_calls = []
+    child_payloads = []
+    responses = [
+        {"ok": False, "status": "request_state_uncertain"},
+        {
+            "ok": True,
+            "status": "accepted",
+            "result": {"delivery_state": "submitted"},
+        },
+    ]
+
+    class Client:
+        def command(self, request):
+            tendwire_calls.append(json.loads(json.dumps(request)))
+            return responses.pop(0)
+
+    def run_child(payload):
+        child_payloads.append(json.loads(json.dumps(payload)))
+        return herdres.command_reply(payload)
+
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+    monkeypatch.setattr(herdres_gateway, "run_herdres_command", run_child)
+    update = {
+        "update_id": 44,
+        "message": {
+            "chat": {"id": -100, "is_forum": True},
+            "message_thread_id": 77,
+            "message_id": 10,
+            "from": {"id": 1, "is_bot": False},
+            "text": "original command",
+        },
+    }
+
+    first = herdres_gateway.handle_update(
+        update,
+        "receiver-token",
+        receiver_id="manager",
+        request_id_key=REQUEST_ID_KEY,
+    )
+    changed = state.load_state()
+    changed["panes"] = {}
+    state.save_state(changed)
+    replay = herdres_gateway.handle_update(
+        update,
+        "receiver-token",
+        receiver_id="manager",
+        request_id_key=REQUEST_ID_KEY,
+    )
+
+    assert first == herdres_gateway.CHECKPOINT_RETRY
+    assert replay == herdres_gateway.CHECKPOINT_ADVANCE
+    assert len(tendwire_calls) == 2
+    assert tendwire_calls[0] == tendwire_calls[1]
+    assert child_payloads[1] == {
+        "request_id": child_payloads[0]["request_id"],
+    }
+
+
+def test_gateway_unknown_message_probes_request_cache_then_advances_without_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE",
+        str(tmp_path / "state.json"),
+    )
+    store = _store()
+    state.save_state(store)
+    before = state.load_state()
+    child_payloads = []
+
+    def run_child(payload):
+        child_payloads.append(dict(payload))
+        return herdres.command_reply(payload)
+
+    monkeypatch.setattr(herdres_gateway, "run_herdres_command", run_child)
+    checkpoint = herdres_gateway.handle_update(
+        {
+            "update_id": 45,
+            "message": {
+                "chat": {"id": -100, "is_forum": True},
+                "message_thread_id": 999,
+                "message_id": 11,
+                "from": {"id": 1, "is_bot": False},
+                "text": "not routed",
+            },
+        },
+        "receiver-token",
+        receiver_id="manager",
+        request_id_key=REQUEST_ID_KEY,
+    )
+
+    assert checkpoint == herdres_gateway.CHECKPOINT_ADVANCE
+    assert set(child_payloads[0]) == {"request_id"}
+    assert state.load_state() == before
+
+
+@pytest.mark.parametrize(
+    ("result", "checkpoint"),
+    [
+        ({"handled": True}, herdres_gateway.CHECKPOINT_ADVANCE),
+        ({"handled": False}, herdres_gateway.CHECKPOINT_ADVANCE),
+        (
+            {"handled": True, "status": "accepted"},
+            herdres_gateway.CHECKPOINT_ADVANCE,
+        ),
+        (
+            {"handled": True, "status": "not_found"},
+            herdres_gateway.CHECKPOINT_ADVANCE,
+        ),
+        (
+            {"handled": True, "status": "request_state_uncertain"},
+            herdres_gateway.CHECKPOINT_RETRY,
+        ),
+        (
+            {"handled": True, "status": "future_terminal_status"},
+            herdres_gateway.CHECKPOINT_RETRY,
+        ),
+        (
+            {"handled": True, "status": 7},
+            herdres_gateway.CHECKPOINT_RETRY,
+        ),
+        (
+            {"status": "accepted"},
+            herdres_gateway.CHECKPOINT_RETRY,
+        ),
+    ],
+)
+def test_gateway_command_checkpoint_status_matrix(result, checkpoint):
+    assert herdres_gateway._checkpoint_for_command_result(result) == checkpoint
+
+
+def test_gateway_invalid_utf8_child_output_is_uncertain(monkeypatch):
+    completed = type(
+        "Completed",
+        (),
+        {"returncode": 0, "stdout": b"\xff", "stderr": b""},
+    )()
+    monkeypatch.setattr(
+        herdres_gateway.subprocess,
+        "run",
+        lambda *_args, **_kwargs: completed,
+    )
+
+    result = herdres_gateway.run_herdres_command({"request_id": REQUEST_ID})
+
+    assert result["status"] == "request_state_uncertain"
+    assert (
+        herdres_gateway._checkpoint_for_command_result(result)
+        == herdres_gateway.CHECKPOINT_RETRY
+    )
+
+
+def test_gateway_uncertain_result_is_not_acknowledged(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+        topic_id="77",
+    )
+    state.save_state(store)
+    replies = []
+
+    class Telegram:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, *_args, **_kwargs):
+            replies.append(self.token)
+
+    monkeypatch.setattr(herdres_gateway, "TelegramClient", Telegram)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "run_herdres_command",
+        lambda _payload: {
+            "handled": True,
+            "status": "request_state_uncertain",
+            "reply": "must not acknowledge",
+        },
+    )
+
+    checkpoint = herdres_gateway.handle_update(
+        {
+            "update_id": 44,
+            "message": {
+                "chat": {"id": -100},
+                "message_thread_id": 77,
+                "message_id": 10,
+                "from": {"id": 1, "is_bot": False},
+                "text": "one command",
+            },
+        },
+        "receiver-token",
+        receiver_id="manager",
+        request_id_key=REQUEST_ID_KEY,
+    )
+
+    assert checkpoint == herdres_gateway.CHECKPOINT_RETRY
+    assert replies == []
+
+
+def test_gateway_poll_checkpoints_only_terminal_updates(monkeypatch):
+    updates = [
+        {"update_id": 44, "message": {}},
+        {"update_id": 45, "message": {}},
+    ]
+    saved = []
+    handled = []
+    monkeypatch.setattr(herdres_gateway, "_read_offset", lambda _key: 44)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "get_updates",
+        lambda _token, _offset, *, timeout_seconds: updates,
+    )
+    monkeypatch.setattr(
+        herdres_gateway,
+        "_save_offset",
+        lambda offset, key: saved.append((offset, key)),
+    )
+
+    def uncertain(update, *_args, **_kwargs):
+        handled.append(update["update_id"])
+        return herdres_gateway.CHECKPOINT_RETRY
+
+    monkeypatch.setattr(herdres_gateway, "handle_update", uncertain)
+    herdres_gateway._poll_once(
+        "manager",
+        "token",
+        timeout_seconds=0,
+        request_id_key=REQUEST_ID_KEY,
+    )
+    assert handled == [44]
+    assert saved == []
+
+    handled.clear()
+    monkeypatch.setattr(
+        herdres_gateway,
+        "handle_update",
+        lambda update, *_args, **_kwargs: (
+            handled.append(update["update_id"])
+            or herdres_gateway.CHECKPOINT_ADVANCE
+        ),
+    )
+    herdres_gateway._poll_once(
+        "manager",
+        "token",
+        timeout_seconds=0,
+        request_id_key=REQUEST_ID_KEY,
+    )
+    assert handled == [44, 45]
+    assert saved == [(45, "manager"), (46, "manager")]
 
 
 def test_gateway_manager_skips_reply_owned_by_child_bot(monkeypatch):
@@ -2842,12 +3533,113 @@ def test_gateway_manager_skips_reply_owned_by_child_bot(monkeypatch):
     assert payload is None
 
 
-def test_gateway_offset_path_is_per_managed_bot():
-    manager_path = herdres_gateway._offset_path_for("manager")
-    child_path = herdres_gateway._offset_path_for("managed-codex-token")
+def test_gateway_offset_is_stable_across_rotation_and_migrates_oldest_legacy(
+    tmp_path,
+    monkeypatch,
+):
+    base = tmp_path / "gateway.offset"
+    monkeypatch.setattr(herdres_gateway.config, "offset_path", lambda: base)
+    oldest_key = "managed-codex-0123456789ab"
+    newer_key = "managed-codex-111111111111"
+    rotated_key = "managed-codex-fedcba987654"
+    oldest_legacy = herdres_gateway._legacy_offset_path_for(oldest_key)
+    newer_legacy = herdres_gateway._legacy_offset_path_for(newer_key)
+    oldest_legacy.write_text("44", encoding="utf-8")
+    newer_legacy.write_text("51", encoding="utf-8")
+    seen_offsets = []
 
-    assert child_path != manager_path
-    assert str(child_path).endswith("gateway.offset.managed-codex-token")
+    def get_updates(_token, offset, *, timeout_seconds):
+        assert timeout_seconds == 0
+        seen_offsets.append(offset)
+        return []
+
+    monkeypatch.setattr(herdres_gateway, "get_updates", get_updates)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "_drain_backlog",
+        lambda *_args: pytest.fail("retained legacy offset must not drain backlog"),
+    )
+
+    stable_path = herdres_gateway._offset_path_for(rotated_key)
+    herdres_gateway._poll_once(
+        rotated_key,
+        "rotated-token",
+        timeout_seconds=0,
+        request_id_key=REQUEST_ID_KEY,
+    )
+
+    assert seen_offsets == [44]
+    assert stable_path.name == "gateway.offset.codex"
+    assert stable_path.read_text(encoding="utf-8") == "44"
+    assert not oldest_legacy.exists()
+    assert not newer_legacy.exists()
+
+    herdres_gateway._save_offset(45, rotated_key)
+    assert herdres_gateway._read_offset(rotated_key) == 45
+
+
+@pytest.mark.parametrize(
+    ("legacy_suffix", "contents"),
+    [
+        ("managed-codex-0123456789ab", "not-an-offset"),
+        ("managed-codex-not-a-token-digest", "44"),
+    ],
+)
+def test_gateway_invalid_legacy_offset_evidence_never_drains_backlog(
+    tmp_path,
+    monkeypatch,
+    legacy_suffix,
+    contents,
+):
+    base = tmp_path / "gateway.offset"
+    monkeypatch.setattr(herdres_gateway.config, "offset_path", lambda: base)
+    evidence = base.with_name(f"{base.name}.{legacy_suffix}")
+    evidence.write_text(contents, encoding="utf-8")
+    drains = []
+    monkeypatch.setattr(
+        herdres_gateway,
+        "_drain_backlog",
+        lambda *args: drains.append(args),
+    )
+
+    with pytest.raises(RuntimeError, match="offset"):
+        herdres_gateway._poll_once(
+            "managed-codex-fedcba987654",
+            "rotated-token",
+            timeout_seconds=0,
+            request_id_key=REQUEST_ID_KEY,
+        )
+
+    assert drains == []
+    assert not herdres_gateway._offset_path_for(
+        "managed-codex-fedcba987654"
+    ).exists()
+
+
+def test_gateway_first_start_without_offset_evidence_still_drains_backlog(
+    tmp_path,
+    monkeypatch,
+):
+    base = tmp_path / "gateway.offset"
+    monkeypatch.setattr(herdres_gateway.config, "offset_path", lambda: base)
+    drains = []
+
+    def drain(key, token):
+        drains.append((key, token))
+        return 90
+
+    monkeypatch.setattr(herdres_gateway, "_drain_backlog", drain)
+
+    herdres_gateway._poll_once(
+        "managed-codex-fedcba987654",
+        "current-token",
+        timeout_seconds=0,
+        request_id_key=REQUEST_ID_KEY,
+    )
+
+    assert drains == [
+        ("managed-codex-fedcba987654", "current-token"),
+    ]
 
 
 def test_runtime_has_no_direct_herdr_pane_api_names():

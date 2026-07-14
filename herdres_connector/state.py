@@ -60,8 +60,28 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
     state_file = path or config.state_path()
     state_file.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_file.with_suffix(state_file.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, state_file)
+    payload = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, state_file)
+        directory_fd = os.open(
+            state_file.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # Off-lock delivery (issue #122): sync_once holds state_lock() across the whole source-mode delivery

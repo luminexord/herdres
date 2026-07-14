@@ -34,6 +34,70 @@ turns, pending interactions, and connector work only through Tendwire's public
 source/command interfaces; it makes no direct Herdr API, process, or socket
 calls.
 
+### Inbound command identity and redelivery
+
+`install-user.sh` initializes one private 32-byte request-ID key at the path
+selected by `HERDRES_REQUEST_ID_KEY_PATH`. Unset or empty selects
+`~/.local/share/herdres/request-id.key`; a configured value is expanded for
+`~` and must then be a nonempty absolute path. The installer creates or
+tightens the owner-owned parent directory to mode `0700`, creates the
+owner-owned regular key file atomically with mode `0600`, and preserves an
+existing valid key instead of rotating it. The gateway only loads this
+installed file; a missing, malformed, symlinked, incorrectly owned or
+permissioned, or concurrently replaced key fails startup closed. Never put
+the raw key in an environment file, command line, log, ticket, or repository.
+
+For each received Telegram message, Herdres emits a canonical `hri1_` request
+ID containing an unpadded URL-safe base64 HMAC-SHA256 digest. The MAC is scoped
+only to the stable receiving-bot identity plus Telegram `update_id`, `chat_id`,
+and `message_id`, under a versioned Herdres domain. Bot tokens, message text,
+topic/reply metadata, and the resolved Tendwire target are not inputs. Manager
+and managed-bot polling offsets are likewise keyed by the stable receiving-bot
+kind, not token-derived runtime keys; a current legacy token-keyed managed-bot
+offset is migrated to that stable path. Token rotation therefore preserves both
+the polling position and the opaque request ID. Every distinct update receives
+a different ID even when its content is identical, and Herdres does not
+suppress commands by comparing their content.
+
+The gateway derives the opaque ID before private route resolution. Before its
+first call to Tendwire, Herdres records the exact public command request under
+that ID; each private-state write fsyncs the temporary file before atomic
+replacement and fsyncs the parent directory afterward. On redelivery, an
+ID-only probe checks this durable record before current topic, route,
+transcription, or worker-state lookup and replays the recorded request. The
+sole stale-target refresh is pre-reservation: on `stale_target` for a target
+with a worker fingerprint, Herdres removes only that fingerprint, durably
+persists the revised exact request, and retries with the same request ID.
+
+`HERDRES_COMMAND_RETRY_HORIZON_SECONDS` is the retry horizon, not the exact
+record-retention duration. Unset, empty, or invalid values use `86400` seconds;
+configured values clamp to `60` through `604800`. Exact records are retained
+for the effective retry horizon plus `86400` seconds: `172800` by default,
+`86460` at the minimum, and at most `691200`. A record is pruned only when its
+terminal timestamp, or otherwise its last-update/creation timestamp, is
+strictly older than that retention cutoff; equality remains retained. This
+bounds every terminal class and abandoned pending, unavailable, or uncertain
+nonterminal work, rather than retaining uncertainty forever.
+
+If the Tendwire result may have been lost after request start, Herdres reports
+`request_state_uncertain`. The gateway sends no Telegram acknowledgement or
+failure reply, does not advance or save the stable polling offset, stops that
+poll batch, and waits for Telegram redelivery. While the exact record remains
+inside the bounded retention window, redelivery carries the same ID and replays
+the stored public request so Tendwire's receipt authority, not Herdres content
+or current routing, decides the outcome.
+
+Only the exact public command fields cross into Tendwire: schema/action,
+the opaque request ID, `dry_run`, a public worker/space/name target, and the
+instruction text. Raw Telegram receiver, update, chat, topic, message, reply,
+and user IDs, bot tokens, and private routes/backend targets never do. The
+Tendwire child environment preserves public Tendwire overrides but strips
+Telegram variables and private ingress, gateway, managed-bot, state, and
+request-key settings, including explicit binary-selector variables. Back up
+and restore the request-ID key with the private Herdres state and Tendwire
+continuity set; replacing the key changes every derived ID and can turn a
+redelivery into a different mutation.
+
 ### Turn content and paging contract
 
 Production source sync negotiates Tendwire's top-level `turn.list` schema as the
@@ -66,7 +130,7 @@ index/count, unique segment and cursor identities, exact per-segment and total
 character/byte lengths, and a null final cursor. A defective page becomes the
 turn-local `invalid_content_page` outcome before prepare or Telegram activity.
 
-With Tendwire store schema v11, committing a complete authoritative final also
+With Tendwire store schema v12, committing a complete authoritative final also
 creates a durable, connector-neutral `final_ready` materialization root. Its
 payload has exact integer `schema_version: 2` and carries the public opaque
 `stable_key` (`wsk1_` plus 64 lowercase hexadecimal characters) with exact
@@ -350,7 +414,7 @@ HERDR_TELEGRAM_TOPICS_STATE="$backup_path" \
   ./herdres.py tendwire source-smoke --with-outbox
 ```
 
-Keep the copy private. A compatible pair uses Tendwire store schema `11`,
+Keep the copy private. A compatible pair uses Tendwire store schema `12`,
 top-level turn-list schema `2`, content-schema-v1 descriptors/pages, and the
 turn-final prepare/lease/ACK/recovery protocol. The dry check must succeed with
 `direct_herdr_calls=0` before a live sync; it does not save the copied Herdres
@@ -361,7 +425,7 @@ handles, deleting individual key files, or rotating identity.
 For continuity recovery, stop all writers and restore the complete paired
 Herdres/Tendwire backup described in [INSTALL.md](INSTALL.md), then repeat the
 dry check against a copy before resuming writers. A Herdres state copy alone is
-not a substitute when Tendwire database or installation-key material changed.
+not a substitute when either continuity key or the Tendwire database changed.
 
 This branch is source-only: `HERDRES_TENDWIRE_MODE` must be `source`
 (`require_source_mode` rejects any other value — there is no
@@ -382,6 +446,7 @@ toggle, and does not replace paired state recovery.
 ```sh
 python -m pytest -q \
   tests/test_source_only.py \
+  tests/test_command_ingress_idempotency.py \
   tests/test_stable_worker_key.py \
   tests/test_tendwire_client.py \
   tests/test_turn_final_delivery.py \
@@ -391,7 +456,8 @@ HERDRES_TENDWIRE_MODE=source ./herdres.py tendwire source-smoke --with-outbox
 ```
 
 The focused tests cover Goal 01B continuity/quarantine and recovered-final
-single-edit behavior together with schema-v2 descriptor isolation, lazy exact
-paging, neutral multipart plans, durable checkpoint/ACK resumption, explicit
-uncertainty, and one-shot failed-plan recovery. `source-smoke` must run against
-a copied state file and report `direct_herdr_calls=0`.
+single-edit behavior, Goal 11 stable ingress identity and exact-request
+redelivery, schema-v2 descriptor isolation, lazy exact paging, neutral
+multipart plans, durable checkpoint/ACK resumption, explicit uncertainty, and
+one-shot failed-plan recovery. `source-smoke` must run against a copied state
+file and report `direct_herdr_calls=0`.
