@@ -3920,16 +3920,26 @@ def test_gateway_terminal_uncertain_update_advances_then_processes_next(
 
 
 @pytest.mark.parametrize("delivery_failure", ["explicit", "raised"])
-def test_gateway_terminal_reply_failure_retains_offset_and_redelivers_cached_outcome(
+@pytest.mark.parametrize(
+    ("command_outcome", "record_state"),
+    [
+        ("terminal", "terminal"),
+        ("quarantine", "quarantined"),
+    ],
+)
+def test_gateway_terminal_notification_failure_advances_and_redelivery_is_cached(
     monkeypatch,
     tmp_path,
     delivery_failure,
+    command_outcome,
+    record_state,
 ):
     monkeypatch.setenv(
         "HERDR_TELEGRAM_TOPICS_STATE",
         str(tmp_path / "state.json"),
     )
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "1")
     store = _store()
     state.upsert_worker_entry(
         store,
@@ -3953,7 +3963,13 @@ def test_gateway_terminal_reply_failure_retains_offset_and_redelivers_cached_out
         def command_json(self, request_json):
             request = json.loads(request_json)
             backend_requests.append(request)
-            return _accepted_command_response(request)
+            if command_outcome == "terminal":
+                return _accepted_command_response(request)
+            return _failed_command_response(
+                request,
+                status="request_state_uncertain",
+                disposition="terminal_uncertain",
+            )
 
     class Telegram:
         def __init__(self, token):
@@ -3961,22 +3977,30 @@ def test_gateway_terminal_reply_failure_retains_offset_and_redelivers_cached_out
 
         def send_message(self, chat_id, reply, **kwargs):
             reply_attempts.append((chat_id, reply, kwargs))
-            if len(reply_attempts) == 1:
-                if delivery_failure == "raised":
-                    raise RuntimeError("private Telegram delivery failure")
-                return {"ok": False, "error": "private Telegram delivery failure"}
-            return {"ok": True, "message_id": "1"}
+            if delivery_failure == "raised":
+                raise RuntimeError("private permanent Telegram delivery failure")
+            return {"ok": False, "error": "private permanent Telegram delivery failure"}
 
-    update = {
-        "update_id": 44,
-        "message": {
-            "chat": {"id": -100, "is_forum": True},
-            "message_thread_id": 77,
-            "message_id": 10,
-            "from": {"id": 1, "is_bot": False},
-            "text": "one command",
+    updates = [
+        {
+            "update_id": 44,
+            "message": {
+                "chat": {"id": -100, "is_forum": True},
+                "message_thread_id": 77,
+                "message_id": 10,
+                "from": {"id": 1, "is_bot": False},
+                "text": "one command",
+            },
         },
-    }
+        {
+            "update_id": 45,
+            "edited_message": {
+                "chat": {"id": -100},
+                "message_id": 11,
+                "text": "next update",
+            },
+        },
+    ]
 
     monkeypatch.setattr(herdres, "TendwireClient", Client)
     monkeypatch.setattr(
@@ -3989,7 +4013,7 @@ def test_gateway_terminal_reply_failure_retains_offset_and_redelivers_cached_out
     monkeypatch.setattr(
         herdres_gateway,
         "get_updates",
-        lambda _token, _offset, *, timeout_seconds: [update],
+        lambda _token, _offset, *, timeout_seconds: updates,
     )
     monkeypatch.setattr(
         herdres_gateway,
@@ -3997,36 +4021,28 @@ def test_gateway_terminal_reply_failure_retains_offset_and_redelivers_cached_out
         lambda offset, key: saved_offsets.append((offset, key)),
     )
 
-    herdres_gateway._poll_once(
-        "manager",
-        "receiver-token",
-        timeout_seconds=0,
-        request_id_key=REQUEST_ID_KEY,
-    )
+    for _delivery in range(2):
+        herdres_gateway._poll_once(
+            "manager",
+            "receiver-token",
+            timeout_seconds=0,
+            request_id_key=REQUEST_ID_KEY,
+        )
 
-    assert saved_offsets == []
+    assert saved_offsets == [
+        (45, "manager"),
+        (46, "manager"),
+        (45, "manager"),
+        (46, "manager"),
+    ]
     assert len(backend_requests) == 1
     request_id = backend_requests[0]["request_id"]
     cached = state.load_state()[ingress_requests.RECORDS_KEY][request_id]
-    assert cached["state"] == "terminal"
-    assert cached["outcome"]["reply"] == "Sent to Tendwire worker."
-
-    class ForbiddenClient:
-        def __init__(self):
-            raise AssertionError("cached terminal reply must bypass Tendwire")
-
-    monkeypatch.setattr(herdres, "TendwireClient", ForbiddenClient)
-    herdres_gateway._poll_once(
-        "manager",
-        "receiver-token",
-        timeout_seconds=0,
-        request_id_key=REQUEST_ID_KEY,
-    )
-
-    assert len(backend_requests) == 1
+    assert cached["state"] == record_state
+    assert cached["outcome"]["checkpoint"] == herdres_gateway.CHECKPOINT_ADVANCE
+    assert cached["outcome"]["reply"]
     assert len(reply_attempts) == 2
-    assert reply_attempts[0][1] == reply_attempts[1][1] == cached["outcome"]["reply"]
-    assert saved_offsets == [(45, "manager")]
+    assert {attempt[1] for attempt in reply_attempts} == {cached["outcome"]["reply"]}
 
 
 def test_gateway_uncertain_result_is_not_acknowledged(monkeypatch, tmp_path):

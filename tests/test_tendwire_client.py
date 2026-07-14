@@ -438,15 +438,12 @@ def test_command_preserves_correlated_stale_target_on_exit_one(client_runner):
             (status, "terminal_rejected")
             for status in (
                 "rejected",
-                "not_found",
-                "ambiguous_target",
                 "stale_target",
+                "backend_unavailable",
                 "backend_unsupported",
                 "ambiguous_backend_target",
                 "backend_failed",
                 "duplicate_request",
-                "invalid_request",
-                "backend_unavailable",
             )
         ],
         *[
@@ -544,6 +541,15 @@ def test_command_accepts_every_recognized_false_tuple(
             ok=False,
             result=None,
         ),
+        *[
+            _command_response(
+                status=status,
+                disposition="terminal_rejected",
+                ok=False,
+                result=None,
+            )
+            for status in ("not_found", "ambiguous_target", "invalid_request")
+        ],
         _command_response(
             status="request_state_uncertain",
             disposition="terminal_rejected",

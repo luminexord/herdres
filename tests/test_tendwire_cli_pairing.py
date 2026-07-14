@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -172,3 +173,127 @@ def test_herdres_client_preserves_real_exit_one_rejection_without_retry(
     assert tendwire_client.command_process_not_started(result) is False
     assert all(not key.startswith("_process") for key in result)
     assert "_process" not in json.dumps(result, sort_keys=True)
+
+
+def test_herdres_live_tuple_matrix_matches_paired_tendwire_producer(
+    monkeypatch,
+):
+    source = _paired_tendwire_source()
+    env = os.environ.copy()
+    current_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        str(source)
+        if not current_pythonpath
+        else f"{source}{os.pathsep}{current_pythonpath}"
+    )
+    producer = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import json
+from tendwire.core.commands import CommandEnvelope, VALID_DISPOSITIONS, VALID_STATUSES
+
+request_id = "hri1_SIodGeqCeIvApzpEvIaEM-L07UzUMgUFyeltRQxPpqU"
+accepted_result = {
+    "target": {"worker_id": "worker-public"},
+    "delivery_state": "submitted",
+    "transport_state": "submitted",
+    "target_state_at_send": "working",
+    "observed_turn_state": "pending_observation",
+}
+accepted = []
+for ok in (False, True):
+    for status in sorted(VALID_STATUSES):
+        for disposition in sorted(VALID_DISPOSITIONS):
+            try:
+                envelope = CommandEnvelope(
+                    schema_version=2,
+                    action="send_instruction",
+                    request_id=request_id,
+                    ok=ok,
+                    dry_run=False,
+                    status=status,
+                    disposition=disposition,
+                    result=accepted_result if ok else None,
+                    error=None
+                    if ok
+                    else {"code": status, "message": "paired failure"},
+                    warnings=[],
+                )
+            except (TypeError, ValueError):
+                continue
+            accepted.append({
+                "tuple": [ok, status, disposition],
+                "body": envelope.to_dict(),
+            })
+print(json.dumps({
+    "statuses": sorted(VALID_STATUSES),
+    "dispositions": sorted(VALID_DISPOSITIONS),
+    "accepted": accepted,
+}))
+""",
+        ],
+        capture_output=True,
+        check=False,
+        env=env,
+        timeout=20,
+    )
+    assert producer.returncode == 0, producer.stderr.decode("utf-8", "replace")
+    matrix = json.loads(producer.stdout.decode("utf-8"))
+    producer_accepted = {
+        tuple(item["tuple"]): item["body"]
+        for item in matrix["accepted"]
+    }
+
+    current_body = {}
+
+    def fake_run(*_args, **_kwargs):
+        return SimpleNamespace(
+            returncode=0 if current_body["ok"] else 1,
+            stdout=json.dumps(current_body, separators=(",", ":")).encode("utf-8"),
+            stderr=b"",
+        )
+
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "tw")
+    monkeypatch.setattr(tendwire_client.subprocess, "run", fake_run)
+    request = _command_request(dry_run=False)
+    accepted_result = {
+        "target": {"worker_id": "worker-public"},
+        "delivery_state": "submitted",
+        "transport_state": "submitted",
+        "target_state_at_send": "working",
+        "observed_turn_state": "pending_observation",
+    }
+    client = TendwireClient()
+
+    for ok in (False, True):
+        for status in matrix["statuses"]:
+            for disposition in matrix["dispositions"]:
+                key = (ok, status, disposition)
+                producer_body = producer_accepted.get(key)
+                current_body = producer_body or {
+                    "schema_version": 2,
+                    "action": "send_instruction",
+                    "request_id": REQUEST_ID,
+                    "ok": ok,
+                    "dry_run": False,
+                    "status": status,
+                    "disposition": disposition,
+                    "result": accepted_result if ok else None,
+                    "error": None
+                    if ok
+                    else {"code": status, "message": "paired failure"},
+                    "warnings": [],
+                }
+                result = client.command(request)
+                allowed = producer_body is not None
+                if allowed:
+                    assert result == producer_body
+                    assert tendwire_client.command_process_ambiguous(result) is False
+                else:
+                    assert result["status"] == "request_state_uncertain"
+                    assert result.get("disposition") is None
+                    assert result.get("result") is None
+                    assert tendwire_client.command_process_ambiguous(result) is True
+                    assert "_process" not in json.dumps(result, sort_keys=True)

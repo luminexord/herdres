@@ -71,6 +71,18 @@ _COMMAND_ACCEPTED_RESULT_FIELDS = frozenset(
 _COMMAND_TERMINAL_REJECTION_STATUSES = frozenset(
     {
         "rejected",
+        "stale_target",
+        "backend_unavailable",
+        "backend_unsupported",
+        "ambiguous_backend_target",
+        "backend_failed",
+        "duplicate_request",
+    }
+)
+_COMMAND_PRE_RECEIPT_STATUSES = frozenset(
+    {
+        "invalid_request",
+        "rejected",
         "not_found",
         "ambiguous_target",
         "stale_target",
@@ -78,12 +90,7 @@ _COMMAND_TERMINAL_REJECTION_STATUSES = frozenset(
         "backend_unsupported",
         "ambiguous_backend_target",
         "backend_failed",
-        "duplicate_request",
-        "invalid_request",
     }
-)
-_COMMAND_PRE_RECEIPT_STATUSES = (
-    _COMMAND_TERMINAL_REJECTION_STATUSES - {"duplicate_request"}
 )
 _COMMAND_DISPOSITIONS = frozenset(
     {
@@ -257,7 +264,7 @@ def _validated_command_response(
     if (
         response["ok"] is not False
         or not isinstance(error, dict)
-        or error.get("code") != status
+        or (error.get("code") is not None and error.get("code") != status)
         or not isinstance(error.get("message"), str)
         or not error["message"]
     ):

@@ -470,20 +470,16 @@ def handle_message(
     if not reply:
         return CHECKPOINT_ADVANCE
     try:
-        sent = TelegramClient(token=token).send_message(
+        TelegramClient(token=token).send_message(
             str(chat.get("id") or ""),
             reply,
             thread_id=_message_thread_id(message, state.load_state()),
             reply_to_message_id=str(message.get("message_id") or ""),
             notify=True,
         )
-    except Exception:  # noqa: BLE001 - retain the update for safe cached redelivery
-        return CHECKPOINT_RETRY
-    return (
-        CHECKPOINT_ADVANCE
-        if isinstance(sent, dict) and sent.get("ok") is True
-        else CHECKPOINT_RETRY
-    )
+    except Exception:  # noqa: BLE001 - notification is best-effort after terminalization
+        return CHECKPOINT_ADVANCE
+    return CHECKPOINT_ADVANCE
 
 
 def handle_update(
