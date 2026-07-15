@@ -778,7 +778,15 @@ def test_turns_requests_and_requires_v2_content_schema(client_runner):
     result = client.turns()
 
     assert result["schema_version"] == 2
-    assert calls[0][0] == ["tw", "turns", "--schema-version", "2", "--json"]
+    assert calls[0][0] == [
+        "tw",
+        "turns",
+        "--schema-version",
+        "2",
+        "--limit",
+        "250",
+        "--json",
+    ]
     assert calls[0][1]["input"] is None
 
     responses.extend(
@@ -796,6 +804,58 @@ def test_turns_requests_and_requires_v2_content_schema(client_runner):
     assert missing_content["ok"] is False
     assert missing_content["status"] == "unsupported_content_schema"
     assert missing_content["supported_content_schema_version"] == 1
+
+
+def test_turns_follows_bounded_list_cursors(client_runner):
+    client, calls, responses = client_runner
+
+    def row(turn_id):
+        return {
+            "id": turn_id,
+            "content": {
+                "schema_version": 1,
+                "content_revision": f"twrev1.{turn_id}",
+                "fields": {},
+            },
+        }
+
+    responses.extend(
+        [
+            {
+                "body": {
+                    "schema_version": 2,
+                    "turns": [row("first")],
+                    "has_more": True,
+                    "next_cursor": "twlist1.public",
+                }
+            },
+            {
+                "body": {
+                    "schema_version": 2,
+                    "turns": [row("second")],
+                    "has_more": False,
+                    "next_cursor": None,
+                }
+            },
+        ]
+    )
+
+    result = client.turns()
+
+    assert [item["id"] for item in result["turns"]] == ["first", "second"]
+    assert result["has_more"] is False
+    assert result["next_cursor"] is None
+    assert calls[1][0] == [
+        "tw",
+        "turns",
+        "--schema-version",
+        "2",
+        "--limit",
+        "250",
+        "--json",
+        "--cursor",
+        "twlist1.public",
+    ]
 
 
 def test_turns_preserves_typed_upgrade_error_from_cli(client_runner):

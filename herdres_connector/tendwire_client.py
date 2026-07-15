@@ -23,6 +23,8 @@ class TendwireError(RuntimeError):
 
 TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
+TURN_LIST_PAGE_LIMIT = 250
+TURN_LIST_MAX_PAGES = 256
 CONNECTOR_PREPARE_SCHEMA_VERSION = 1
 TURN_FINAL_CONNECTOR = "turn-final"
 CONNECTOR_PREPARE_MAX_SPANS = 256
@@ -465,39 +467,84 @@ class TendwireClient:
         return self.call(["snapshot", "--json"])
 
     def turns(self) -> dict[str, Any]:
-        result = self.call(["turns", "--schema-version", str(TURN_SCHEMA_VERSION), "--json"])
-        if result.get("ok") is False:
-            return result
-        received = result.get("schema_version")
-        if type(received) is not int or received != TURN_SCHEMA_VERSION:
-            return _schema_error(
-                "upgrade_required",
-                "Tendwire turn.list schema v2 is required",
-                received=received,
-                required_key="required_turn_schema_version",
-                required_version=TURN_SCHEMA_VERSION,
-            )
-        turns = result.get("turns")
-        if not isinstance(turns, list):
-            return _schema_error(
-                "unsupported_content_schema",
-                "Tendwire turn.list v2 must contain a turns list",
-                received=None,
-                required_key="supported_content_schema_version",
-                required_version=TURN_CONTENT_SCHEMA_VERSION,
-            )
-        for row in turns:
-            content = row.get("content") if isinstance(row, dict) else None
-            content_schema = content.get("schema_version") if isinstance(content, dict) else None
-            if type(content_schema) is not int or content_schema != TURN_CONTENT_SCHEMA_VERSION:
+        merged: dict[str, Any] | None = None
+        all_turns: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _page_index in range(TURN_LIST_MAX_PAGES):
+            args = [
+                "turns",
+                "--schema-version",
+                str(TURN_SCHEMA_VERSION),
+                "--limit",
+                str(TURN_LIST_PAGE_LIMIT),
+                "--json",
+            ]
+            if cursor is not None:
+                args.extend(("--cursor", cursor))
+            result = self.call(args)
+            if result.get("ok") is False:
+                return result
+            received = result.get("schema_version")
+            if type(received) is not int or received != TURN_SCHEMA_VERSION:
+                return _schema_error(
+                    "upgrade_required",
+                    "Tendwire turn.list schema v2 is required",
+                    received=received,
+                    required_key="required_turn_schema_version",
+                    required_version=TURN_SCHEMA_VERSION,
+                )
+            turns = result.get("turns")
+            if not isinstance(turns, list):
                 return _schema_error(
                     "unsupported_content_schema",
-                    "Every Tendwire turn.list v2 row requires content schema v1",
-                    received=content_schema,
+                    "Tendwire turn.list v2 must contain a turns list",
+                    received=None,
                     required_key="supported_content_schema_version",
                     required_version=TURN_CONTENT_SCHEMA_VERSION,
                 )
-        return result
+            for row in turns:
+                content = row.get("content") if isinstance(row, dict) else None
+                content_schema = content.get("schema_version") if isinstance(content, dict) else None
+                if type(content_schema) is not int or content_schema != TURN_CONTENT_SCHEMA_VERSION:
+                    return _schema_error(
+                        "unsupported_content_schema",
+                        "Every Tendwire turn.list v2 row requires content schema v1",
+                        received=content_schema,
+                        required_key="supported_content_schema_version",
+                        required_version=TURN_CONTENT_SCHEMA_VERSION,
+                    )
+            if merged is None:
+                merged = dict(result)
+            all_turns.extend(row for row in turns if isinstance(row, dict))
+            next_cursor = result.get("next_cursor")
+            has_more = result.get("has_more") is True
+            if next_cursor is None and not has_more:
+                merged["turns"] = all_turns
+                merged["next_cursor"] = None
+                merged["has_more"] = False
+                return merged
+            if (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or next_cursor in seen_cursors
+            ):
+                return _schema_error(
+                    "unsupported_content_schema",
+                    "Tendwire turn.list pagination is invalid",
+                    received=None,
+                    required_key="supported_content_schema_version",
+                    required_version=TURN_CONTENT_SCHEMA_VERSION,
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return _schema_error(
+            "unsupported_content_schema",
+            "Tendwire turn.list pagination exceeds the supported bound",
+            received=None,
+            required_key="supported_content_schema_version",
+            required_version=TURN_CONTENT_SCHEMA_VERSION,
+        )
 
     def turn_content_get(
         self,
