@@ -8,6 +8,7 @@ from herdres_connector.rendering import split_text_chunks, split_text_spans
 from herdres_connector.rich_delivery import (
     MAX_RICH_HTML_CHARS,
     RICH_FALLBACK_MAX_CHARS,
+    RICH_MULTIPART_MAX_BYTES,
     TELEGRAM_RICH_BLOCK_LIMIT,
     TELEGRAM_RICH_TEXT_LIMIT,
     prepare_turn_delivery_parts,
@@ -257,9 +258,34 @@ def test_rich_planner_uses_current_32768_character_transport_bound():
         for part in rich_parts
     )
     assert all(
+        len(render_turn_delivery_part_html(item, part).encode("utf-8"))
+        <= RICH_MULTIPART_MAX_BYTES
+        for part in rich_parts
+    )
+    assert all(
         len(render_turn_delivery_part_plain_text(item, part))
         <= RICH_FALLBACK_MAX_CHARS
         for part in plain_parts
+    )
+
+
+def test_two_part_rich_plan_keeps_provider_display_margin_without_content_loss():
+    final = (("- delivery item " + ("x" * 110) + "\n") * 280)[:35_579]
+    item = {
+        "kind": "turn",
+        "user_text": "continue",
+        "assistant_final_text": final,
+    }
+
+    parts = prepare_turn_delivery_parts(item)
+
+    assert len(parts) == 2
+    assert _reconstruct(item, parts, "user_text") == item["user_text"]
+    assert _reconstruct(item, parts, "assistant_final_text") == final
+    assert all(
+        len(render_turn_delivery_part_html(item, part).encode("utf-8"))
+        <= RICH_MULTIPART_MAX_BYTES
+        for part in parts
     )
 
 

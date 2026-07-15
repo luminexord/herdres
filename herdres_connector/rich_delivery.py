@@ -33,9 +33,11 @@ MAX_RICH_HTML_CHARS = min(
 # as too large -- not before. (The split itself stays lossless.)
 RICH_SINGLE_MESSAGE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SINGLE_MESSAGE_CHARS", str(MAX_RICH_HTML_CHARS)))
 # Source-text chunk size used when a response DOES need splitting. Bigger chunks
-# => fewer parts; kept well under the per-message cap so each rendered part
-# (plus the You/Working sections on part 1) stays rich rather than falling back.
-RICH_SPLIT_CHUNK_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SPLIT_CHUNK_CHARS", "30000"))
+# => fewer parts. Multipart cards keep an operational margin below Telegram's
+# nominal ceiling because provider acceptance does not guarantee every client
+# will display a boundary-sized rich message.
+RICH_SPLIT_CHUNK_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SPLIT_CHUNK_CHARS", "24000"))
+RICH_MULTIPART_MAX_BYTES = 28 * 1024
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 WORKLOG_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_WORKLOG_MAX_CHARS", "1200"))
 RICH_FALLBACK_MAX_CHARS = MESSAGE_TEXT_LIMIT
@@ -49,7 +51,7 @@ WORKING_LABEL = "Working"
 YOU_ICON = "💬"
 WORKING_ICON = "⚙️"
 RESPONSE_ICON = "✅"
-RICH_RENDER_VERSION = 26
+RICH_RENDER_VERSION = 27
 RICH_BAD_REQUEST_LIMIT = 3
 
 FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
@@ -563,6 +565,7 @@ def _turn_delivery_part_is_bounded(
     part: dict[str, Any],
     *,
     rich_transport: bool,
+    multipart: bool = False,
 ) -> bool:
     rendered = render_turn_delivery_part_html(item, part)
     plain = html_to_plain(rendered, limit=MAX_REPLY_CHARS)
@@ -570,6 +573,10 @@ def _turn_delivery_part_is_bounded(
         return len(plain) <= RICH_FALLBACK_MAX_CHARS
     return (
         len(rendered) <= min(RICH_SINGLE_MESSAGE_CHARS, MAX_RICH_HTML_CHARS)
+        and (
+            not multipart
+            or len(rendered.encode("utf-8")) <= RICH_MULTIPART_MAX_BYTES
+        )
         and len(plain) <= TELEGRAM_RICH_TEXT_LIMIT
         and len(_RICH_BLOCK_START_RE.findall(rendered)) <= TELEGRAM_RICH_BLOCK_LIMIT
     )
@@ -620,7 +627,10 @@ def prepare_turn_delivery_parts(
         )
         if all(
             _turn_delivery_part_is_bounded(
-                item, part, rich_transport=rich_transport
+                item,
+                part,
+                rich_transport=rich_transport,
+                multipart=True,
             )
             for part in parts
         ):

@@ -1,4 +1,4 @@
-# Release checklist (Herdres 0.7.0rc2 / Tendwire 0.1.0rc1)
+# Release checklist (Herdres 0.7.0rc3 / Tendwire 0.1.0rc1)
 
 ## 0. RC pairing and low-minute gate
 
@@ -217,10 +217,13 @@ The paired gate must establish all of the following:
   field/start/end spans, never turn text. Begin and commit bind the leased
   `source_ref`; part requests carry only the plan token, ordinal, and ranges.
   Every leased span must match the local plan.
-- Rich plans enforce Telegram's 32,768-character and 500-block limits and no
-  longer use the obsolete 900-character source-span ceiling. Plain-message
-  fallback keeps an independent 4,096-safe plan. Successful topic creation is
-  checkpointed immediately so a later sync failure cannot create a duplicate.
+- Rich plans retain Telegram's 32,768-character and 500-block limits for
+  complete single-card messages. Multipart plans default to 24,000-character
+  source chunks and a 28 KiB rendered UTF-8 ceiling, avoiding fragile
+  boundary-sized cards without returning to the obsolete small-span behavior.
+  Plain-message fallback keeps an independent 4,096-safe plan. Successful topic
+  creation is checkpointed immediately so a later sync failure cannot create a
+  duplicate.
 - `HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` defaults or falls back to 900
   when unset, empty, or invalid, and clamps configured values to 60 through
   3600 seconds. One root lease covers canonical paging, plan staging, and ACK.

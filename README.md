@@ -2,7 +2,7 @@
 
 # Herdres
 
-The current release-candidate pairing is Herdres `0.7.0rc2` with Tendwire `0.1.0rc1`
+The current release-candidate pairing is Herdres `0.7.0rc3` with Tendwire `0.1.0rc1`
 on Python 3.13. To conserve GitHub Actions minutes,
 the automatic gate lives in Tendwire as one cancellable job. Paired and live
 proofs are explicit local release-owner operations; Herdres does not start a
@@ -220,12 +220,16 @@ old-slot retirement, then ACKed to Tendwire and checkpointed as
 `acknowledged`. The stable job key, not a transient lease ref, is restart
 identity.
 
-Rich-message plans use Telegram's current 32,768-character text ceiling and
-500-block ceiling. They split only when the rendered rich message would exceed
-one of those limits. Ordinary `sendMessage` fallback plans retain their
-separate 4,096-safe bound; a rich plan is never silently truncated into that
-smaller transport. The presentation version binds the selected transport and
-ranges so a stale smaller plan cannot be replayed as the current layout.
+Rich-message plans retain Telegram's current 32,768-character text ceiling and
+500-block ceiling for complete single-card messages. Once multipart delivery is
+required, source chunks default to 24,000 characters and each rendered card is
+also held below a 28 KiB UTF-8 operational ceiling. This margin avoids
+provider-accepted boundary messages that some Telegram clients fail to display,
+without returning to small 4K-era chunks. Ordinary `sendMessage` fallback plans
+retain their separate 4,096-safe bound; a rich plan is never silently truncated
+into that smaller transport. The presentation version binds the selected
+transport and ranges so an older boundary-sized plan cannot be replayed as the
+current layout.
 
 `HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` covers the complete root operation,
 including canonical paging and prepare begin/part/commit staging as well as

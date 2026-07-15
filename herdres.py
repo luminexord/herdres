@@ -28,7 +28,7 @@ from herdres_connector.tendwire_client import (
     command_process_not_started,
 )
 
-VERSION = "0.7.0rc2-tendwired-source-only"
+VERSION = "0.7.0rc3-tendwired-source-only"
 SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the target again."
 
 

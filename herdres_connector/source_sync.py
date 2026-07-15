@@ -35,8 +35,8 @@ from .telegram_delivery import (
 )
 from .tendwire_client import TendwireClient
 
-RENDER_VERSION = "telegram-rich-v26-clean"
-PRESENTATION_VERSION = "turn-present-v28"
+RENDER_VERSION = "telegram-rich-v27-multipart-margin"
+PRESENTATION_VERSION = "turn-present-v29"
 TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
 
