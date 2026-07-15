@@ -2080,7 +2080,15 @@ def _backfill_message_bindings(store: dict[str, Any]) -> int:
     return len(set(state.message_bindings(store)) - before)
 
 
-def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
+def _deliver_working(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    reuse_previous_working: bool = False,
+) -> bool:
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
         return False
@@ -2100,7 +2108,14 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
     stored_bot_kind = str(entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND)
-    if entry.get("last_stream_message_id") and entry.get("last_stream_turn_id") == turn_id and stored_bot_kind == bot_kind:
+    if (
+        entry.get("last_stream_message_id")
+        and stored_bot_kind == bot_kind
+        and (
+            entry.get("last_stream_turn_id") == turn_id
+            or reuse_previous_working
+        )
+    ):
         sent = edit_feed_item(
             runtime.telegram,
             chat_id,
@@ -2643,6 +2658,7 @@ def _sync_turns(
             if compact_ws(item.get("worker_id"), 160) in live_worker_ids
         ]
     latest_content_turn_by_worker: dict[str, str] = {}
+    placeholder_turn_ids_by_worker: dict[str, set[str]] = {}
     # Pass 1: real content only (user prompt, stream, or a completed final).
     # Tendwire store output is already ordered by per-worker observed recency.
     # Payload updated_at can be absent on current worker-derived turns, so do
@@ -2674,7 +2690,13 @@ def _sync_turns(
         if entry is None:
             continue
         worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
-        if not worker_key or worker_key in latest_content_turn_by_worker:
+        if not worker_key:
+            continue
+        if _turn_is_working_placeholder(item, entry):
+            placeholder_turn_ids_by_worker.setdefault(worker_key, set()).add(
+                _turn_id(item)
+            )
+        if worker_key in latest_content_turn_by_worker:
             continue
         if _turn_is_working_placeholder(item, entry):
             latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
@@ -2736,7 +2758,22 @@ def _sync_turns(
                 continue
             seen_working_workers.add(worker_key)
             repaired_open_final = _clear_open_turn_final_delivery_state(store, entry, _turn_id(item))
-            delivered = _deliver_working(store, item, entry, runtime, chat_id=chat_id)
+            previous_stream_turn_id = str(entry.get("last_stream_turn_id") or "")
+            reuse_previous_working = bool(
+                item.get("assistant_stream_text")
+                and previous_stream_turn_id
+                and previous_stream_turn_id != _turn_id(item)
+                and previous_stream_turn_id
+                in placeholder_turn_ids_by_worker.get(worker_key, set())
+            )
+            delivered = _deliver_working(
+                store,
+                item,
+                entry,
+                runtime,
+                chat_id=chat_id,
+                reuse_previous_working=reuse_previous_working,
+            )
         else:
             delivered = False
         counts["feed_sent"] += int(delivered)

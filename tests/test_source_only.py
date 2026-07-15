@@ -4406,6 +4406,110 @@ def test_placeholder_turn_never_outranks_real_turn_for_same_worker(monkeypatch):
     assert "Work is in progress." not in working_cards[0]
 
 
+def test_later_structured_turn_reuses_placeholder_working_card_and_final(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    worker = {
+        "id": "worker-1",
+        "name": "codex",
+        "status": "working",
+        "space_id": "space-1",
+        "fingerprint": "fp-1",
+    }
+    spaces = [
+        {
+            "id": "space-1",
+            "name": "Project",
+            "status": "active",
+            "fingerprint": "space-fp",
+        }
+    ]
+    placeholder = {
+        "id": "turn-placeholder",
+        "worker_id": "worker-1",
+        "space_id": "space-1",
+        "user_text": "how should I promote this?",
+        "complete": False,
+        "has_open_turn": True,
+    }
+
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns={"turns": [placeholder]}, workers=[worker], spaces=spaces),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+    working_cards = [
+        item for item in telegram.sent if "Work is in progress." in item[1]
+    ]
+    assert len(working_cards) == 1
+    working_message_id = str(working_cards[0][3])
+
+    structured = {
+        "id": "turn-structured",
+        "worker_id": "worker-1",
+        "space_id": "space-1",
+        "source_turn_id": "turnsrc-structured",
+        "user_text": "how should I promote this?",
+        "assistant_stream_text": "checking the marketplace rules",
+        "complete": False,
+        "has_open_turn": True,
+    }
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                turns={"turns": [structured, placeholder]},
+                workers=[worker],
+                spaces=spaces,
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert len(
+        [item for item in telegram.sent if "Working" in item[1]]
+    ) == 1
+    assert telegram.edited[-1][1] == working_message_id
+    assert "checking the marketplace rules" in telegram.edited[-1][2]
+    entry = next(
+        item
+        for item in state.source_worker_entries(store).values()
+        if item.get("tendwire_worker_id") == "worker-1"
+    )
+    assert entry["last_stream_turn_id"] == "turn-structured"
+    assert str(entry["last_stream_message_id"]) == working_message_id
+    binding = state.find_message_binding(store, working_message_id)
+    assert binding is not None
+    assert binding["turn_id"] == "turn-structured"
+
+    final = {
+        **structured,
+        "assistant_stream_text": None,
+        "assistant_final_text": "Use one combined Herdres plugin.",
+        "complete": True,
+        "has_open_turn": False,
+    }
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns={"turns": [final]}, workers=[worker], spaces=spaces),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert len(
+        [item for item in telegram.sent if "Working" in item[1]]
+    ) == 1
+    assert telegram.edited[-1][1] == working_message_id
+    assert "Use one combined Herdres plugin." in telegram.edited[-1][2]
+
+
 def test_retired_worker_turns_are_not_delivered(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()

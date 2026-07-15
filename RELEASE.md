@@ -1,4 +1,4 @@
-# Release checklist (Herdres 0.7.0rc1 / Tendwire 0.1.0rc1)
+# Release checklist (Herdres 0.7.0rc2 / Tendwire 0.1.0rc1)
 
 ## 0. RC pairing and low-minute gate
 

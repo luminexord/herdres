@@ -2,7 +2,7 @@
 
 # Herdres
 
-The current release-candidate pairing is Herdres `0.7.0rc1` with Tendwire `0.1.0rc1`
+The current release-candidate pairing is Herdres `0.7.0rc2` with Tendwire `0.1.0rc1`
 on Python 3.13. To conserve GitHub Actions minutes,
 the automatic gate lives in Tendwire as one cancellable job. Paired and live
 proofs are explicit local release-owner operations; Herdres does not start a
