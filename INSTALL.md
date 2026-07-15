@@ -148,7 +148,7 @@ exact v1 shape but does not possess the HMAC key, cannot cryptographically
 authenticate an exact-format spoof, never reads raw pane identity, and never
 queries Herdr.
 
-Tendwire store schema v12 final-ready materialization roots use exact payload
+Tendwire store schema v14 final-ready materialization roots use exact payload
 `schema_version: 2` and repeat that same public opaque `stable_key` plus exact
 integer `stable_key_version: 1` to bind retained work to worker continuity.
 Herdres never treats these public coordinates as private checkpoint data, and a

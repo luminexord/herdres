@@ -2,8 +2,8 @@
 
 # Herdres
 
-The current release-candidate pairing is Tendwire `0.1.0rc1` on Python 3.13
-with this reviewed Herdres source contract. To conserve GitHub Actions minutes,
+The current release-candidate pairing is Herdres `0.7.0rc1` with Tendwire `0.1.0rc1`
+on Python 3.13. To conserve GitHub Actions minutes,
 the automatic gate lives in Tendwire as one cancellable job. Paired and live
 proofs are explicit local release-owner operations; Herdres does not start a
 second automatic workflow.
@@ -196,7 +196,7 @@ index/count, unique segment and cursor identities, exact per-segment and total
 character/byte lengths, and a null final cursor. A defective page becomes the
 turn-local `invalid_content_page` outcome before prepare or Telegram activity.
 
-With Tendwire store schema v12, committing a complete authoritative final also
+With Tendwire store schema v14, committing a complete authoritative final also
 creates a durable, connector-neutral `final_ready` materialization root. Its
 payload has exact integer `schema_version: 2` and carries the public opaque
 `stable_key` (`wsk1_` plus 64 lowercase hexadecimal characters) with exact
@@ -492,7 +492,7 @@ HERDR_TELEGRAM_TOPICS_STATE="$backup_path" \
   ./herdres.py tendwire source-smoke --with-outbox
 ```
 
-Keep the copy private. A compatible pair uses Tendwire store schema `12`,
+Keep the copy private. A compatible pair uses Tendwire store schema `14`,
 top-level turn-list schema `2`, content-schema-v1 descriptors/pages, and the
 turn-final prepare/lease/ACK/recovery protocol. The dry check must succeed with
 `direct_herdr_calls=0` before a live sync; it does not save the copied Herdres

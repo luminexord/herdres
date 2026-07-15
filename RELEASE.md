@@ -1,9 +1,9 @@
-# Release checklist (Herdres paired 0.1.0rc1)
+# Release checklist (Herdres 0.7.0rc1 / Tendwire 0.1.0rc1)
 
 ## 0. RC pairing and low-minute gate
 
-This candidate supports Python 3.13 and pairs with Tendwire `0.1.0rc1` commit
-`04d8300` or a reviewed Goal 12 descendant. Routine automatic CI runs once in
+This candidate supports Python 3.13 and pairs with Tendwire `0.1.0rc1` or a
+reviewed descendant preserving its public contract. Routine automatic CI runs once in
 Tendwire. Herdres deliberately has no duplicate automatic workflow consuming
 another repository's GitHub Actions minutes.
 
@@ -61,7 +61,7 @@ HERDR_TELEGRAM_TOPICS_STATE="$backup_path" \
 ```
 
 The dry `source-smoke --with-outbox` check is only a snapshot, turn-list,
-pending, and public-safety preflight against the compatible store-schema-v12
+pending, and public-safety preflight against the compatible store-schema-v14
 producer. It must report `direct_herdr_calls=0`, must not save the copied
 Herdres state or send/edit Telegram messages, and does not poll or page a
 `final_ready` root, prepare a plan, ACK connector work, or exercise recovery.
@@ -179,7 +179,7 @@ The paired gate must establish all of the following:
 - Only a persisted, live, nonquarantined identity containing a full
   `wsk1_[0-9a-f]{64}` string plus exact integer version `1` is independently
   routable and authoritative.
-- Tendwire's SQLite store is schema version `12` and provides turn-list-v2
+- Tendwire's SQLite store is schema version `14` and provides turn-list-v2
   observational projections, immutable content pages, durable retained
   `final_ready` roots, range-only turn-final plans, restart-stable ordered jobs,
   leases/ACK/dead-letter state, and explicit replacement-generation records

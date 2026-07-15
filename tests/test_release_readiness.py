@@ -54,6 +54,9 @@ def test_install_docs_agree_with_shipped_units():
 def test_rc_docs_use_explicit_low_minute_paired_gate() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     release = (REPO_ROOT / "RELEASE.md").read_text(encoding="utf-8")
+    launcher = (REPO_ROOT / "herdres.py").read_text(encoding="utf-8")
+    assert 'VERSION = "0.7.0rc1-tendwired-source-only"' in launcher
+    assert "Herdres `0.7.0rc1`" in readme
     assert "Tendwire `0.1.0rc1`" in readme
     assert "Python 3.13" in readme
     assert "Herdres deliberately has no duplicate automatic workflow" in release
