@@ -23,7 +23,9 @@ class TendwireError(RuntimeError):
 
 TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
-TURN_LIST_PAGE_LIMIT = 250
+# Keep each daemon response comfortably inside Tendwire's fixed 10-second
+# content-request deadline on stores with substantial retained turn history.
+TURN_LIST_PAGE_LIMIT = 50
 TURN_LIST_MAX_PAGES = 256
 CONNECTOR_PREPARE_SCHEMA_VERSION = 1
 TURN_FINAL_CONNECTOR = "turn-final"
