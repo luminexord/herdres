@@ -18,7 +18,7 @@ REQUEST_ID = "hri1_SIodGeqCeIvApzpEvIaEM-L07UzUMgUFyeltRQxPpqU"
 
 
 def _paired_tendwire_source() -> Path:
-    default = Path(__file__).resolve().parents[2] / "tendwire-goal11" / "src"
+    default = Path(__file__).resolve().parents[2] / "tendwire-goal12" / "src"
     source = Path(
         os.environ.get("HERDRES_PAIRED_TENDWIRE_SOURCE_DIR", str(default))
     )

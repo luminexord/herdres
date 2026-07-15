@@ -51,6 +51,16 @@ def test_install_docs_agree_with_shipped_units():
         assert "enable --now herdres.timer" not in doc
 
 
+def test_rc_docs_use_explicit_low_minute_paired_gate() -> None:
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    release = (REPO_ROOT / "RELEASE.md").read_text(encoding="utf-8")
+    assert "Tendwire `0.1.0rc1`" in readme
+    assert "Python 3.13" in readme
+    assert "Herdres deliberately has no duplicate automatic workflow" in release
+    assert "HERDRES_PAIRED_TENDWIRE_SOURCE_DIR=/absolute/tendwire/src" in release
+    assert "Never restart Herdr" in release
+
+
 def test_doctor_checks_exactly_the_source_services(monkeypatch):
     checked: list[str] = []
 

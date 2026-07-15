@@ -2,6 +2,12 @@
 
 # Herdres
 
+The current release-candidate pairing is Tendwire `0.1.0rc1` on Python 3.13
+with this reviewed Herdres source contract. To conserve GitHub Actions minutes,
+the automatic gate lives in Tendwire as one cancellable job. Paired and live
+proofs are explicit local release-owner operations; Herdres does not start a
+second automatic workflow.
+
 This branch is a tiny source-mode-only Telegram connector for Tendwire.
 
 Herdres does not observe or control Herdr directly here. Tendwire owns Herdr

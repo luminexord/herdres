@@ -1,4 +1,39 @@
-# Release checklist (Herdres Goal 05B + Goal 10 + Goal 11 / tendwired source-only RC)
+# Release checklist (Herdres paired 0.1.0rc1)
+
+## 0. RC pairing and low-minute gate
+
+This candidate supports Python 3.13 and pairs with Tendwire `0.1.0rc1` commit
+`04d8300` or a reviewed Goal 12 descendant. Routine automatic CI runs once in
+Tendwire. Herdres deliberately has no duplicate automatic workflow consuming
+another repository's GitHub Actions minutes.
+
+Before tagging or deployment, run the complete local pair from clean checkouts:
+
+```sh
+# Tendwire checkout
+python3 scripts/release_artifacts.py source
+python3 -m compileall -q src tests scripts
+python3 -m pytest -q
+python3 scripts/herdr_smoke.py --fixture-dir tests/fixtures/herdr/live_smoke/ok
+python3 -m build
+python3 scripts/release_artifacts.py artifacts dist
+
+# Herdres checkout; bind pairing explicitly to avoid a skipped test
+HERDRES_PAIRED_TENDWIRE_SOURCE_DIR=/absolute/tendwire/src \
+  python3 -m pytest -q
+python3 -m compileall -q herdres.py herdres_gateway.py herdres_connector tests
+```
+
+The paired run must execute rather than skip `tests/test_tendwire_cli_pairing.py`
+and must retain `direct_herdr_calls=0`, exact turn/pending/command schemas,
+stable-owner migration, neutral outbox behavior, and the two forced no-op sync
+proof. Record both commits and the Tendwire wheel/sdist digests.
+
+Deployment remains separately owner-authorized. Back up Tendwire's complete
+database/identity family and Herdres state/request-ID key while all writers are
+stopped. Install Tendwire first, then Herdres and gateway. Never restart Herdr.
+If migration, source smoke, or delivery validation fails, stop writers and
+restore the complete paired backup and prior installed artifacts before retry.
 
 Build release artifacts from a **clean git checkout only**. Never zip the working
 directory directly — it can contain `__pycache__/`, `*.pyc`, `.pytest_cache/`,
