@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -663,6 +664,41 @@ def test_tendwire_child_env_strips_private_ingress_and_keeps_tendwire_overrides(
         "secret" not in value and "/private/" not in value
         for value in child_env.values()
     )
+
+
+def test_explicit_tendwire_binary_does_not_inject_source_checkout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "dirty-source"
+    source.mkdir()
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "/installed/bin/tendwire")
+    monkeypatch.setenv("TENDWIRE_SOURCE_DIR", str(source))
+    monkeypatch.setenv("PYTHONPATH", "/existing/runtime")
+
+    child_env = TendwireClient()._env()
+
+    assert child_env["PYTHONPATH"] == "/existing/runtime"
+    assert str(source) not in child_env["PYTHONPATH"].split(os.pathsep)
+
+
+def test_implicit_development_client_retains_source_checkout_fallback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.delenv("HERDRES_TENDWIRE_BIN", raising=False)
+    monkeypatch.delenv("TENDWIRE_BIN", raising=False)
+    monkeypatch.setenv("TENDWIRE_SOURCE_DIR", str(source))
+    monkeypatch.setenv("PYTHONPATH", "/existing/runtime")
+
+    child_env = TendwireClient()._env()
+
+    assert child_env["PYTHONPATH"].split(os.pathsep) == [
+        str(source),
+        "/existing/runtime",
+    ]
 
 
 def test_path_qualified_env_wrapper_cannot_reintroduce_private_secret(monkeypatch):

@@ -361,7 +361,7 @@ class TendwireClient:
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
-        _explicit, overrides = self._explicit_parts()
+        explicit, overrides = self._explicit_parts()
         env.update(overrides)
         env = {
             key: value
@@ -369,7 +369,7 @@ class TendwireClient:
             if not _is_private_ingress_env_key(key)
         }
         source = Path(os.getenv("TENDWIRE_SOURCE_DIR", str(Path.home() / "tendwire" / "src"))).expanduser()
-        if source.exists():
+        if explicit is None and source.exists():
             current = env.get("PYTHONPATH", "")
             env["PYTHONPATH"] = str(source) if not current else f"{source}{os.pathsep}{current}"
         env.setdefault("TENDWIRE_DB_PATH", str(config.tendwire_db_path()))
