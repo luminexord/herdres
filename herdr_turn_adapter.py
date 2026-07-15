@@ -774,7 +774,7 @@ def devin_resolve_session_id(pane: dict[str, Any]) -> str:
                                 valid.append(sid)
                     # FAIL CLOSED on an ambiguous cwd. A single working directory shared
                     # by more than one live Devin session — e.g. one GLM seat per space
-                    # all rooted at /home/smith — cannot be attributed to a specific
+                    # all rooted at the user home directory and cannot be attributed to a specific
                     # pane by cwd alone. Returning the newest (the old behavior) made
                     # ONE pane's turn resolve for EVERY same-cwd pane, broadcasting it to
                     # every space's topic. Resolve only when exactly one session matches;
