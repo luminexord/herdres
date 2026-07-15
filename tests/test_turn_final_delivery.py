@@ -1175,8 +1175,9 @@ def test_paged_checkpoint_before_ack_loss_resumes_without_fetch_or_resend(monkey
     assert first["tendwire_turn_final"]["operations"] == 1
     assert first["tendwire_turn_final"]["acked"] == 0
     assert receipt["substate"] == "acknowledged"
-    receipt_key = next(iter(checkpoints[0]))
-    assert checkpoints[0][receipt_key]["substate"] == "reserved"
+    receipt_checkpoint = next(checkpoint for checkpoint in checkpoints if checkpoint)
+    receipt_key = next(iter(receipt_checkpoint))
+    assert receipt_checkpoint[receipt_key]["substate"] == "reserved"
     assert any(
         snapshot[receipt_key]["substate"] == "telegram_applied"
         for snapshot in checkpoints[1:]
@@ -1251,14 +1252,14 @@ def test_revision_growth_shrink_and_wrong_owner_converge_without_surplus(monkeyp
     store = _store()
     store["telegram"]["managed_bots"] = {"claude": {"enabled": True, "token": "claude-token"}}
     telegram = DeletingTelegram()
-    first_text = "A paragraph.\n\n" * 180
+    first_text = "A paragraph.\n\n" * 2_500
     tendwire = TurnFinalTendwire(_turn_row("turn-revise", "twrev1.r1", first_text))
     sync_once(store, _runtime(tendwire, telegram, max_sends=100))
     entry = next(iter(state.source_worker_entries(store).values()))
     first_count = len(entry["last_clean_message_ids"])
     assert first_count > 1
 
-    growth = "B changed.\n\n" * 600
+    growth = "B changed.\n\n" * 7_000
     tendwire.row = _turn_row("turn-revise", "twrev1.r2", growth)
     grow_result = sync_once(store, _runtime(tendwire, telegram, max_sends=100))
     grown_ids = list(entry["last_clean_message_ids"])

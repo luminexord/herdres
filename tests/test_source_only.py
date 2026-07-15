@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import copy
 
 import json
 import hashlib
@@ -746,6 +747,52 @@ def test_sync_creates_one_topic_per_space_not_per_worker(monkeypatch):
     assert all(sent[2]["thread_id"] == "77" for sent in telegram.sent if sent[1].startswith("<b>Project"))
 
 
+def test_topic_creation_checkpoints_provider_identity_before_later_sync_work(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    source = {
+        "id": "space-1",
+        "name": "Project",
+        "status": "active",
+        "fingerprint": "space-fp",
+    }
+    _key, entry, _created = state.upsert_space_entry(store, source)
+    checkpoints = []
+    runtime = SyncRuntime(
+        FakeTendwire(),
+        telegram,
+        with_outbox=False,
+        checkpoint=lambda: checkpoints.append(copy.deepcopy(store)),
+    )
+
+    needed, created = source_sync._ensure_topic(
+        store,
+        source,
+        entry,
+        runtime,
+        chat_id="-100",
+    )
+
+    assert needed is True and created is True
+    assert telegram.topics == ["Project"]
+    assert len(checkpoints) == 1
+    persisted_entry = next(iter(state.source_space_entries(checkpoints[0]).values()))
+    assert persisted_entry["topic_id"] == entry["topic_id"]
+
+    restored = checkpoints[0]
+    restored_entry = next(iter(state.source_space_entries(restored).values()))
+    needed, created = source_sync._ensure_topic(
+        restored,
+        source,
+        restored_entry,
+        runtime,
+        chat_id="-100",
+    )
+    assert needed is False and created is False
+    assert telegram.topics == ["Project"]
+
+
 def test_worker_topic_mode_creates_one_topic_per_worker(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
@@ -994,7 +1041,7 @@ def test_oversize_rich_response_falls_back_without_raw_markdown_or_truncation(mo
             {
                 "id": "turn-huge",
                 "worker_id": "worker-1",
-                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 450 + tail,
+                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 1_100 + tail,
                 "complete": True,
             }
         ]
@@ -1119,7 +1166,7 @@ def test_oversize_response_splits_losslessly_into_labeled_parts():
     # A response too large for one rich message still splits, losslessly, into
     # labeled "Response i/N" parts -- each under the per-message cap.
     tail = "TAIL_MARKER_LOSSLESS"
-    text = "## **Long**\n\n" + ("- keep **rich** sections\n" * 700) + tail
+    text = "## **Long**\n\n" + ("- keep **rich** sections\n" * 1_100) + tail
     parts = render_feed_item_delivery_html_parts({"kind": "turn", "assistant_final_text": text})
 
     assert len(render_turn_item_html({"kind": "turn", "assistant_final_text": text})) > MAX_RICH_HTML_CHARS
@@ -1133,10 +1180,8 @@ def test_oversize_response_splits_losslessly_into_labeled_parts():
     assert combined.count("<b>✅ Response ") == total  # one marker per part
 
 
-def test_promote_to_final_uses_bounded_sends_when_over_edit_cap(monkeypatch):
-    # A final above the one-operation fallback cap cannot edit the Working card.
-    # It is freshly sent as independently bounded parts so a rich capability
-    # fallback never hides additional untracked Telegram sends.
+def test_promote_to_final_uses_one_rich_send_above_plain_edit_cap(monkeypatch):
+    # A final above the ordinary-message cap can still use one rich message.
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
     telegram = FakeTelegram()
@@ -1172,8 +1217,8 @@ def test_promote_to_final_uses_bounded_sends_when_over_edit_cap(monkeypatch):
 
     response_messages = [sent[1] for sent in telegram.sent if "<b>✅ Response" in sent[1]]
     assert result["feed_sent"] == 1
-    assert len(response_messages) > 1
-    assert response_messages[0].startswith("<b>✅ Response 1/")
+    assert len(response_messages) == 1
+    assert response_messages[0].startswith("<b>✅ Response</b>")
     assert any(tail in message for message in response_messages)
 
 

@@ -8,6 +8,8 @@ from herdres_connector.rendering import split_text_chunks, split_text_spans
 from herdres_connector.rich_delivery import (
     MAX_RICH_HTML_CHARS,
     RICH_FALLBACK_MAX_CHARS,
+    TELEGRAM_RICH_BLOCK_LIMIT,
+    TELEGRAM_RICH_TEXT_LIMIT,
     prepare_turn_delivery_parts,
     render_turn_delivery_part_html,
     render_turn_delivery_part_plain_text,
@@ -15,7 +17,7 @@ from herdres_connector.rich_delivery import (
     send_turn_delivery_part,
 )
 from herdres_connector.safe import canonical_text
-from herdres_connector.telegram_delivery import TelegramClient
+from herdres_connector.telegram_delivery import TelegramClient, TelegramError
 
 
 def _reconstruct(item: dict[str, Any], parts: list[dict[str, Any]], field: str) -> str:
@@ -108,7 +110,6 @@ def test_canonical_validation_and_prompt_only_plan_never_trim_or_cap():
     assert _reconstruct(item, parts, "user_text") == prompt
     assert all(
         len(render_turn_delivery_part_html(item, part)) <= MAX_RICH_HTML_CHARS
-        and len(render_turn_delivery_part_plain_text(item, part)) <= RICH_FALLBACK_MAX_CHARS
         for part in parts
     )
 
@@ -121,7 +122,8 @@ def test_every_planned_render_and_fallback_is_bounded():
         rich = render_turn_delivery_part_html(item, part)
         fallback = render_turn_delivery_part_plain_text(item, part)
         assert len(rich) <= MAX_RICH_HTML_CHARS
-        assert len(fallback) <= RICH_FALLBACK_MAX_CHARS
+        assert len(fallback) <= TELEGRAM_RICH_TEXT_LIMIT
+        assert rich.count("<li>") <= TELEGRAM_RICH_BLOCK_LIMIT
 
     assert render_turn_delivery_part_html(item, parts[0]).startswith(
         f"<b>✅ Response 1/{len(parts)}</b><br><br>"
@@ -135,7 +137,6 @@ def test_long_markdown_list_word_is_split_before_inner_renderer_can_slice_it():
     parts = prepare_turn_delivery_parts(item)
     rendered = "".join(render_turn_delivery_part_html(item, part) for part in parts)
 
-    assert len(parts) > 1
     assert _reconstruct(item, parts, "assistant_final_text") == item["assistant_final_text"]
     assert rendered.count("x") == 1_500
     assert "TAIL" in rendered
@@ -213,9 +214,10 @@ def test_one_part_executor_never_activates_telegram_hidden_split():
         assert len(rich_client.calls) == before + 1
         assert rich_client.calls[-1][0] == "sendRichMessage"
 
+    fallback_parts = prepare_turn_delivery_parts(item, rich_transport=False)
     fallback_client = RecordingTelegram()
     fallback_state = None
-    for part in parts:
+    for part in fallback_parts:
         before = len(fallback_client.calls)
         result = send_turn_delivery_part(
             fallback_client,
@@ -231,3 +233,62 @@ def test_one_part_executor_never_activates_telegram_hidden_split():
         assert method == "sendMessage"
         assert len(payload["text"]) <= RICH_FALLBACK_MAX_CHARS
         assert result.get("message_ids") is None
+
+
+def test_rich_planner_uses_current_32768_character_transport_bound():
+    item = {
+        "kind": "turn",
+        "user_text": "u" * 18_000,
+        "assistant_final_text": "f" * 15_799,
+    }
+
+    rich_parts = prepare_turn_delivery_parts(item)
+    plain_parts = prepare_turn_delivery_parts(item, rich_transport=False)
+
+    assert len(rich_parts) == 2
+    assert len(plain_parts) > len(rich_parts)
+    assert _reconstruct(item, rich_parts, "user_text") == item["user_text"]
+    assert (
+        _reconstruct(item, rich_parts, "assistant_final_text")
+        == item["assistant_final_text"]
+    )
+    assert all(
+        len(render_turn_delivery_part_html(item, part)) <= TELEGRAM_RICH_TEXT_LIMIT
+        for part in rich_parts
+    )
+    assert all(
+        len(render_turn_delivery_part_plain_text(item, part))
+        <= RICH_FALLBACK_MAX_CHARS
+        for part in plain_parts
+    )
+
+
+def test_large_rich_part_never_falls_back_to_hidden_plain_siblings():
+    class UnsupportedRichTelegram(RecordingTelegram):
+        def api(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((method, payload))
+            if method == "sendRichMessage":
+                raise TelegramError("method not found")
+            return {"ok": True, "result": {"message_id": len(self.calls)}}
+
+    item = {
+        "kind": "turn",
+        "user_text": "",
+        "assistant_final_text": "x" * 20_000,
+    }
+    part = prepare_turn_delivery_parts(item)[0]
+    client = UnsupportedRichTelegram()
+    telegram = {"rich_messages": {"supported": "yes"}}
+
+    result = send_turn_delivery_part(
+        client,
+        "-100",
+        item,
+        part,
+        telegram=telegram,
+        thread_id="7",
+    )
+
+    assert result["ok"] is False
+    assert result["kind"] == "presentation_transport_changed"
+    assert [method for method, _payload in client.calls] == ["sendRichMessage"]

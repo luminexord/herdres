@@ -16,6 +16,7 @@ from .rich_delivery import (
     feed_item_requires_send_split,
     prepare_turn_delivery_parts,
     render_feed_item_html,
+    rich_message_send_enabled,
     send_feed_item,
     send_turn_delivery_part,
     split_legacy_message_ids,
@@ -35,7 +36,7 @@ from .telegram_delivery import (
 from .tendwire_client import TendwireClient
 
 RENDER_VERSION = "telegram-rich-v26-clean"
-PRESENTATION_VERSION = "turn-present-v27"
+PRESENTATION_VERSION = "turn-present-v28"
 TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
 
@@ -1246,6 +1247,11 @@ def _ensure_topic(
     created = runtime.telegram.create_topic(chat_id, topic_name, icon_color=topic_color_for_name(topic_name))
     if created.get("ok") and created.get("topic_id"):
         entry["topic_id"] = str(created["topic_id"])
+        # Topic creation has no provider idempotency key. Persist the returned
+        # identity before any later turn validation can abort this sync pass,
+        # otherwise the next pass can create a duplicate topic.
+        if runtime.checkpoint is not None:
+            runtime.checkpoint()
         return True, True
     entry["last_topic_error"] = compact_ws(created.get("error"), 240)
     return False, False
@@ -2325,7 +2331,10 @@ def _stage_final_plan(
 
     page_calls = _materialize_turn_item(item, runtime)
     feed_item = turn_item_from_source(item, entry)
-    parts = prepare_turn_delivery_parts(feed_item)
+    parts = prepare_turn_delivery_parts(
+        feed_item,
+        rich_transport=rich_message_send_enabled(_telegram_state(store)),
+    )
     if not parts:
         raise _TurnContentError(
             "invalid_presentation_plan",
@@ -4139,7 +4148,10 @@ def _drain_turn_final(
                 break
             result["content_pages"] += page_calls
             feed_item = turn_item_from_source(item, entry)
-            plans = prepare_turn_delivery_parts(feed_item)
+            plans = prepare_turn_delivery_parts(
+                feed_item,
+                rich_transport=rich_message_send_enabled(_telegram_state(store)),
+            )
             if (
                 ordinal >= len(plans)
                 or part_count != len(plans)

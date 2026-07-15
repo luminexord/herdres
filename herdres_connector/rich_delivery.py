@@ -17,11 +17,16 @@ from typing import Any
 from . import config
 from .rendering import html_to_plain, split_text_chunks, split_text_spans, try_render_table, worker_label
 from .safe import canonical_text, sanitize_text
-from .telegram_delivery import MESSAGE_TEXT_LIMIT, RateLimited, TelegramClient, TelegramError
+from .telegram_delivery import MESSAGE_TEXT_LIMIT, SPLIT_TEXT_LIMIT, RateLimited, TelegramClient, TelegramError
 
 
 MAX_REPLY_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "64000"))
-MAX_RICH_HTML_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS", "14000"))
+TELEGRAM_RICH_TEXT_LIMIT = 32768
+TELEGRAM_RICH_BLOCK_LIMIT = 500
+MAX_RICH_HTML_CHARS = min(
+    TELEGRAM_RICH_TEXT_LIMIT,
+    int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS", str(TELEGRAM_RICH_TEXT_LIMIT))),
+)
 # A turn is sent as ONE rich message when its full rendered HTML fits this; it is
 # only split into "Response i/N" parts when it cannot fit a single message.
 # Default = MAX_RICH_HTML_CHARS so a response splits iff Telegram would reject it
@@ -30,13 +35,13 @@ RICH_SINGLE_MESSAGE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SINGLE_MES
 # Source-text chunk size used when a response DOES need splitting. Bigger chunks
 # => fewer parts; kept well under the per-message cap so each rendered part
 # (plus the You/Working sections on part 1) stays rich rather than falling back.
-RICH_SPLIT_CHUNK_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SPLIT_CHUNK_CHARS", "4000"))
+RICH_SPLIT_CHUNK_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_SPLIT_CHUNK_CHARS", "30000"))
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 WORKLOG_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_WORKLOG_MAX_CHARS", "1200"))
 RICH_FALLBACK_MAX_CHARS = MESSAGE_TEXT_LIMIT
 TURN_DELIVERY_PLAN_SCHEMA_VERSION = 1
-TURN_DELIVERY_FINAL_SOURCE_CHARS = min(RICH_SPLIT_CHUNK_CHARS, 900)
-TURN_DELIVERY_USER_SOURCE_CHARS = min(USER_PROMPT_MAX_CHARS, 900)
+TURN_DELIVERY_RICH_SOURCE_CHARS = min(RICH_SPLIT_CHUNK_CHARS, MAX_RICH_HTML_CHARS)
+TURN_DELIVERY_PLAIN_SOURCE_CHARS = min(SPLIT_TEXT_LIMIT, MESSAGE_TEXT_LIMIT)
 PROMPT_PREVIEW_CHARS = 80
 USER_PROMPT_LABEL = "You"
 RESPONSE_LABEL = "Response"
@@ -56,7 +61,7 @@ def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
     return html.escape(sanitize_text(str(value or ""), max_chars), quote=False)
 
 
-def _rich_inline(value: Any, max_chars: int = 900) -> str:
+def _rich_inline(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
     text = _html_text(value, max_chars)
     code_spans: list[str] = []
 
@@ -76,7 +81,7 @@ def _rich_inline(value: Any, max_chars: int = 900) -> str:
 
 
 def _rich_paragraph(value: Any) -> str:
-    clean = _rich_inline(value, 1600).strip()
+    clean = _rich_inline(value, MAX_REPLY_CHARS).strip()
     return f"<p>{clean}</p>" if clean else ""
 
 
@@ -132,7 +137,10 @@ def _rich_details_quote_html(
 
 
 def render_user_prompt_quote_html(user_text: str, collapse_chars: int = 0) -> str:
-    body = "<br>".join(_rich_inline(line, 900) for line in sanitize_text(user_text, USER_PROMPT_MAX_CHARS).splitlines())
+    body = "<br>".join(
+        _rich_inline(line, MAX_REPLY_CHARS)
+        for line in sanitize_text(user_text, MAX_REPLY_CHARS).splitlines()
+    )
     body = body.strip()
     if not body:
         return ""
@@ -236,13 +244,17 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                 parts.append("<blockquote>mermaid diagram - see full text outside Telegram</blockquote>")
             else:
                 class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
-                parts.append(f"<pre><code{class_attr}>{_html_text(chr(10).join(code_lines), 3000)}</code></pre>")
+                parts.append(
+                    f"<pre><code{class_attr}>{_html_text(chr(10).join(code_lines), MAX_REPLY_CHARS)}</code></pre>"
+                )
             previous_blank = False
             continue
         # Pipe table (row + `---|---` delimiter): render as a native <table> (the rich path turns it
         # into a PageBlockTable). Cells use _rich_inline so bold/code/links inside cells render. Must
         # precede the paragraph fallthrough, which would otherwise emit raw `| a | b |` / `|---|`.
-        table = try_render_table(lines, idx, cell_html=lambda c: _rich_inline(c, 160))
+        table = try_render_table(
+            lines, idx, cell_html=lambda c: _rich_inline(c, MAX_REPLY_CHARS)
+        )
         if table is not None:
             parts.append(table[0])
             idx = table[1]
@@ -254,7 +266,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             # so a multi-section response stays compact -- every <h3> adds a big
             # native margin in Telegram's rich renderer.
             tag = "h3" if not seen_heading else "h4"
-            parts.append(f"<{tag}>{_html_text(title, 100)}</{tag}>")
+            parts.append(f"<{tag}>{_html_text(title, MAX_REPLY_CHARS)}</{tag}>")
             seen_heading = True
             previous_blank = False
             idx += 1
@@ -268,7 +280,14 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                     break
                 items.append(parsed)
                 idx += 1
-            parts.append("<ul>\n" + "\n".join(f"<li>{_rich_inline(item, 900)}</li>" for item in items) + "\n</ul>")
+            parts.append(
+                "<ul>\n"
+                + "\n".join(
+                    f"<li>{_rich_inline(item, MAX_REPLY_CHARS)}</li>"
+                    for item in items
+                )
+                + "\n</ul>"
+            )
             previous_blank = False
             continue
         numbered = _numbered_text(line)
@@ -281,7 +300,14 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                 _number, text = parsed_numbered
                 items.append(text)
                 idx += 1
-            parts.append("<ol>\n" + "\n".join(f"<li>{_rich_inline(item, 900)}</li>" for item in items) + "\n</ol>")
+            parts.append(
+                "<ol>\n"
+                + "\n".join(
+                    f"<li>{_rich_inline(item, MAX_REPLY_CHARS)}</li>"
+                    for item in items
+                )
+                + "\n</ol>"
+            )
             previous_blank = False
             continue
         if stripped.startswith(">"):
@@ -289,7 +315,13 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             while idx < len(lines) and str(lines[idx] or "").strip().startswith(">"):
                 quote_lines.append(re.sub(r"^\s*>\s?", "", str(lines[idx]).rstrip()))
                 idx += 1
-            parts.append("<blockquote>" + "<br>".join(_rich_inline(quote, 900) for quote in quote_lines) + "</blockquote>")
+            parts.append(
+                "<blockquote>"
+                + "<br>".join(
+                    _rich_inline(quote, MAX_REPLY_CHARS) for quote in quote_lines
+                )
+                + "</blockquote>"
+            )
             previous_blank = False
             continue
         paragraph = [stripped]
@@ -521,16 +553,34 @@ def render_turn_delivery_part_plain_text(item: dict[str, Any], part: dict[str, A
     return html_to_plain(render_turn_delivery_part_html(item, part), limit=MAX_REPLY_CHARS)
 
 
-def _turn_delivery_part_is_bounded(item: dict[str, Any], part: dict[str, Any]) -> bool:
-    rich = render_turn_delivery_part_html(item, part)
-    fallback = html_to_plain(rich, limit=MAX_REPLY_CHARS)
+_RICH_BLOCK_START_RE = re.compile(
+    r"<(?:p|h[1-6]|pre|ul|ol|li|tr|blockquote|details|footer|table)\b"
+)
+
+
+def _turn_delivery_part_is_bounded(
+    item: dict[str, Any],
+    part: dict[str, Any],
+    *,
+    rich_transport: bool,
+) -> bool:
+    rendered = render_turn_delivery_part_html(item, part)
+    plain = html_to_plain(rendered, limit=MAX_REPLY_CHARS)
+    if not rich_transport:
+        return len(plain) <= RICH_FALLBACK_MAX_CHARS
     return (
-        len(rich) <= min(RICH_SINGLE_MESSAGE_CHARS, MAX_RICH_HTML_CHARS)
-        and len(fallback) <= RICH_FALLBACK_MAX_CHARS
+        len(rendered) <= min(RICH_SINGLE_MESSAGE_CHARS, MAX_RICH_HTML_CHARS)
+        and len(plain) <= TELEGRAM_RICH_TEXT_LIMIT
+        and len(_RICH_BLOCK_START_RE.findall(rendered)) <= TELEGRAM_RICH_BLOCK_LIMIT
     )
 
 
-def prepare_turn_delivery_parts(item: dict[str, Any], *, live: bool = False) -> list[dict[str, Any]]:
+def prepare_turn_delivery_parts(
+    item: dict[str, Any],
+    *,
+    live: bool = False,
+    rich_transport: bool = True,
+) -> list[dict[str, Any]]:
     """Plan deterministic exact spans for bounded one-operation Telegram parts."""
     if live or str(item.get("kind") or "").lower() != "turn":
         return []
@@ -550,18 +600,30 @@ def prepare_turn_delivery_parts(item: dict[str, Any], *, live: bool = False) -> 
         "part_count": 1,
         "spans": full_spans,
     }
-    if _full_turn_source_is_render_safe(fields) and _turn_delivery_part_is_bounded(item, full_part):
+    if _full_turn_source_is_render_safe(fields) and _turn_delivery_part_is_bounded(
+        item, full_part, rich_transport=rich_transport
+    ):
         return [full_part]
 
-    user_limit = max(1, TURN_DELIVERY_USER_SOURCE_CHARS)
-    final_limit = max(1, TURN_DELIVERY_FINAL_SOURCE_CHARS)
+    source_limit = (
+        TURN_DELIVERY_RICH_SOURCE_CHARS
+        if rich_transport
+        else TURN_DELIVERY_PLAIN_SOURCE_CHARS
+    )
+    user_limit = max(1, source_limit)
+    final_limit = max(1, source_limit)
     while True:
         parts = _planned_parts_for_limits(
             fields,
             user_limit=user_limit,
             final_limit=final_limit,
         )
-        if all(_turn_delivery_part_is_bounded(item, part) for part in parts):
+        if all(
+            _turn_delivery_part_is_bounded(
+                item, part, rich_transport=rich_transport
+            )
+            for part in parts
+        ):
             return parts
         if user_limit == 1 and final_limit == 1:
             raise ValueError("one code point cannot fit Telegram presentation limits")
@@ -710,7 +772,17 @@ def _fallback_send(
     thread_id: str | int | None,
     notify: bool,
     reply_to_message_id: str | int | None,
+    require_single_operation: bool = False,
 ) -> dict[str, Any]:
+    if require_single_operation:
+        plain = html_to_plain(fallback, limit=MAX_REPLY_CHARS)
+        if len(plain) > RICH_FALLBACK_MAX_CHARS:
+            return {
+                "ok": False,
+                "format": "plain",
+                "kind": "presentation_transport_changed",
+                "error": "presentation transport changed",
+            }
     return client.send_message(
         chat_id,
         fallback,
@@ -731,12 +803,21 @@ def send_rich_message(
     notify: bool = False,
     reply_to_message_id: str | int | None = None,
     api_token: str | None = None,
+    require_single_operation: bool = False,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
     rendered_fallback = sanitize_text(html_to_plain(html_text, limit=MAX_REPLY_CHARS), MAX_REPLY_CHARS)
     fallback = rendered_fallback or fallback_text or sanitize_text(str(html_text or ""), MAX_REPLY_CHARS)
     if not rich_message_send_enabled(telegram):
-        return _fallback_send(target, chat_id, fallback, thread_id=thread_id, notify=notify, reply_to_message_id=reply_to_message_id)
+        return _fallback_send(
+            target,
+            chat_id,
+            fallback,
+            thread_id=thread_id,
+            notify=notify,
+            reply_to_message_id=reply_to_message_id,
+            require_single_operation=require_single_operation,
+        )
     if len(html_text) > MAX_RICH_HTML_CHARS:
         fallback_result = _fallback_send(
             target,
@@ -745,6 +826,7 @@ def send_rich_message(
             thread_id=thread_id,
             notify=notify,
             reply_to_message_id=reply_to_message_id,
+            require_single_operation=require_single_operation,
         )
         fallback_result["fallback_reason"] = "rich_too_large"
         return fallback_result
@@ -776,7 +858,15 @@ def send_rich_message(
             note_rich_bad_request(telegram, str(exc))
         elif api_token and kind == "bot_access":
             return {"ok": False, "format": "rich", "kind": kind, "error": str(exc)}
-        fallback_result = _fallback_send(target, chat_id, fallback, thread_id=thread_id, notify=notify, reply_to_message_id=reply_to_message_id)
+        fallback_result = _fallback_send(
+            target,
+            chat_id,
+            fallback,
+            thread_id=thread_id,
+            notify=notify,
+            reply_to_message_id=reply_to_message_id,
+            require_single_operation=require_single_operation,
+        )
         fallback_result["fallback_reason"] = kind
         return fallback_result
     mark_rich_supported(telegram)
@@ -792,13 +882,32 @@ def edit_rich_message(
     telegram: dict[str, Any] | None,
     fallback_text: str = "",
     api_token: str | None = None,
+    require_single_operation: bool = False,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
     rendered_fallback = sanitize_text(html_to_plain(html_text, limit=MAX_REPLY_CHARS), MAX_REPLY_CHARS)
     fallback = rendered_fallback or fallback_text or sanitize_text(str(html_text or ""), MAX_REPLY_CHARS)
+    if require_single_operation and len(html_to_plain(fallback, limit=MAX_REPLY_CHARS)) > RICH_FALLBACK_MAX_CHARS:
+        fallback_allowed = False
+    else:
+        fallback_allowed = True
     if not rich_message_send_enabled(telegram):
+        if not fallback_allowed:
+            return {
+                "ok": False,
+                "format": "plain",
+                "kind": "presentation_transport_changed",
+                "error": "presentation transport changed",
+            }
         return target.edit_message(chat_id, message_id, fallback)
     if len(html_text) > MAX_RICH_HTML_CHARS:
+        if not fallback_allowed:
+            return {
+                "ok": False,
+                "format": "plain",
+                "kind": "presentation_transport_changed",
+                "error": "presentation transport changed",
+            }
         legacy = target.edit_message(chat_id, message_id, fallback)
         legacy["fallback_reason"] = "rich_too_large"
         return legacy
@@ -827,6 +936,13 @@ def edit_rich_message(
             mark_rich_disabled(telegram, str(exc))
         elif kind == "bad_request":
             note_rich_bad_request(telegram, str(exc))
+        if not fallback_allowed:
+            return {
+                "ok": False,
+                "format": "plain",
+                "kind": "presentation_transport_changed",
+                "error": "presentation transport changed",
+            }
         legacy = target.edit_message(chat_id, message_id, fallback)
         legacy["fallback_reason"] = kind
         return legacy
@@ -847,7 +963,11 @@ def send_turn_delivery_part(
     api_token: str | None = None,
 ) -> dict[str, Any]:
     """Execute one planned upsert as at most one Telegram message."""
-    if not _turn_delivery_part_is_bounded(item, part):
+    if not _turn_delivery_part_is_bounded(
+        item,
+        part,
+        rich_transport=rich_message_send_enabled(telegram),
+    ):
         raise ValueError("turn delivery part exceeds Telegram presentation limits")
     html_text = render_turn_delivery_part_html(item, part)
     return send_rich_message(
@@ -860,6 +980,7 @@ def send_turn_delivery_part(
         notify=notify,
         reply_to_message_id=reply_to_message_id,
         api_token=api_token,
+        require_single_operation=True,
     )
 
 
@@ -874,7 +995,11 @@ def edit_turn_delivery_part(
     api_token: str | None = None,
 ) -> dict[str, Any]:
     """Execute one planned edit without consulting or rendering sibling parts."""
-    if not _turn_delivery_part_is_bounded(item, part):
+    if not _turn_delivery_part_is_bounded(
+        item,
+        part,
+        rich_transport=rich_message_send_enabled(telegram),
+    ):
         raise ValueError("turn delivery part exceeds Telegram presentation limits")
     html_text = render_turn_delivery_part_html(item, part)
     return edit_rich_message(
@@ -885,6 +1010,7 @@ def edit_turn_delivery_part(
         telegram=telegram,
         fallback_text=html_to_plain(html_text, limit=RICH_FALLBACK_MAX_CHARS),
         api_token=api_token,
+        require_single_operation=True,
     )
 
 

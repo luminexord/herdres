@@ -220,6 +220,13 @@ old-slot retirement, then ACKed to Tendwire and checkpointed as
 `acknowledged`. The stable job key, not a transient lease ref, is restart
 identity.
 
+Rich-message plans use Telegram's current 32,768-character text ceiling and
+500-block ceiling. They split only when the rendered rich message would exceed
+one of those limits. Ordinary `sendMessage` fallback plans retain their
+separate 4,096-safe bound; a rich plan is never silently truncated into that
+smaller transport. The presentation version binds the selected transport and
+ranges so a stale smaller plan cannot be replayed as the current layout.
+
 `HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` covers the complete root operation,
 including canonical paging and prepare begin/part/commit staging as well as
 ACK. It defaults to 900 seconds; unset, empty, or invalid values use the same
@@ -397,6 +404,11 @@ Use worker/pane topics only when explicitly wanted:
 ```sh
 HERDRES_SOURCE_TOPIC_MODE=worker
 ```
+
+After Telegram accepts a topic creation, Herdres checkpoints the returned
+topic identity immediately, before turn parsing, paging, or delivery. A later
+turn-local failure therefore cannot make the next sync create the same topic
+again.
 
 Finished council/gitmoot/gm worker topics are deleted automatically when
 `HERDRES_DELETE_DONE_COUNCIL_TOPICS=1`.
