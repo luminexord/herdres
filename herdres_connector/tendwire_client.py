@@ -37,13 +37,20 @@ _PUBLIC_PROTOCOL_TOKEN_KEYS = {
     "plan_token",
     "replaces_plan_token",
 }
-_COMMAND_REQUEST_FIELDS = {
+_SEND_COMMAND_REQUEST_FIELDS = {
     "schema_version",
     "action",
     "request_id",
     "dry_run",
     "target",
     "instruction",
+}
+_DECISION_COMMAND_REQUEST_FIELDS = {
+    "schema_version",
+    "action",
+    "request_id",
+    "target",
+    "params",
 }
 _COMMAND_TARGET_SHAPES = {
     frozenset({"worker_id"}),
@@ -106,6 +113,14 @@ _COMMAND_DISPOSITIONS = frozenset(
         "terminal_uncertain",
     }
 )
+_DECISION_FAILURE_STATUSES = frozenset(
+    {
+        "decision_not_pending",
+        "invalid_selection",
+        "unsupported_decision",
+        "unknown_worker",
+    }
+)
 _PRIVATE_INGRESS_ENV_KEYS = frozenset(
     {
         "BOT_TOKEN",
@@ -166,13 +181,13 @@ def _request_state_uncertain(request: dict[str, Any] | None = None) -> dict[str,
     if isinstance(request, dict):
         if isinstance(request.get("request_id"), str):
             result["request_id"] = request["request_id"]
-        if request.get("action") == "send_instruction":
-            result["action"] = "send_instruction"
+        if request.get("action") in {"send_instruction", "answer_decision"}:
+            result["action"] = request["action"]
     return result
 
 
-def _exact_public_command_request(request: Any) -> dict[str, Any] | None:
-    if not isinstance(request, dict) or set(request) != _COMMAND_REQUEST_FIELDS:
+def _exact_send_command_request(request: Any) -> dict[str, Any] | None:
+    if not isinstance(request, dict) or set(request) != _SEND_COMMAND_REQUEST_FIELDS:
         return None
     if type(request.get("schema_version")) is not int or request["schema_version"] != 1:
         return None
@@ -196,6 +211,57 @@ def _exact_public_command_request(request: Any) -> dict[str, Any] | None:
     ):
         return None
     return request
+
+
+def _exact_decision_command_request(request: Any) -> dict[str, Any] | None:
+    if not isinstance(request, dict) or set(request) != _DECISION_COMMAND_REQUEST_FIELDS:
+        return None
+    if type(request.get("schema_version")) is not int or request["schema_version"] != 1:
+        return None
+    if request.get("action") != "answer_decision":
+        return None
+    try:
+        validate_request_id(request.get("request_id"))
+    except ValueError:
+        return None
+    target = request.get("target")
+    if (
+        not isinstance(target, dict)
+        or set(target) != {"worker_id"}
+        or not isinstance(target.get("worker_id"), str)
+        or not target["worker_id"].strip()
+    ):
+        return None
+    params = request.get("params")
+    if not isinstance(params, dict) or set(params) != {"decision_ref", "selection"}:
+        return None
+    if not isinstance(params.get("decision_ref"), str) or not params["decision_ref"].strip():
+        return None
+    selection = params.get("selection")
+    if not isinstance(selection, dict):
+        return None
+    if set(selection) == {"text"}:
+        return (
+            request
+            if isinstance(selection.get("text"), str) and bool(selection["text"].strip())
+            else None
+        )
+    if set(selection) != {"option_refs"} or not isinstance(selection.get("option_refs"), list):
+        return None
+    refs = selection["option_refs"]
+    if any(not isinstance(value, str) or not value.strip() for value in refs):
+        return None
+    if len(set(refs)) != len(refs):
+        return None
+    return request
+
+
+def _exact_public_command_request(request: Any) -> dict[str, Any] | None:
+    if not isinstance(request, dict):
+        return None
+    if request.get("action") == "answer_decision":
+        return _exact_decision_command_request(request)
+    return _exact_send_command_request(request)
 
 
 def _valid_accepted_command_result(
@@ -287,6 +353,30 @@ def _validated_command_response(
     if disposition == "no_receipt":
         return response if status in _COMMAND_PRE_RECEIPT_STATUSES else None
     return None
+
+
+def _validated_decision_response(
+    response: dict[str, Any],
+    request: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate only the response fields promised by the parallel Tendwire contract.
+
+    Correlation fields are checked when Tendwire includes them, while ``ok`` and
+    ``status`` remain the required cross-version core.
+    """
+
+    if public_prune(response) != response or type(response.get("ok")) is not bool:
+        return None
+    status = response.get("status")
+    if not isinstance(status, str) or not status:
+        return None
+    if "request_id" in response and response.get("request_id") != request["request_id"]:
+        return None
+    if "action" in response and response.get("action") != "answer_decision":
+        return None
+    if response["ok"] is True:
+        return response if status == "accepted" else None
+    return response if status in _DECISION_FAILURE_STATUSES else None
 
 
 def _is_private_ingress_env_key(key: str) -> bool:
@@ -616,7 +706,11 @@ class TendwireClient:
         process_returncode = getattr(result, "_process_returncode", None)
         if command_process_ambiguous(result):
             return _request_state_uncertain(public_request)
-        validated = _validated_command_response(result, public_request)
+        validated = (
+            _validated_decision_response(result, public_request)
+            if public_request.get("action") == "answer_decision"
+            else _validated_command_response(result, public_request)
+        )
         if validated is None:
             return _request_state_uncertain(public_request)
         if type(process_returncode) is int and (

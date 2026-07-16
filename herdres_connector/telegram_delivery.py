@@ -125,6 +125,7 @@ class TelegramClient:
         thread_id: str | int | None = None,
         reply_to_message_id: str | int | None = None,
         notify: bool = False,
+        reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         base_payload: dict[str, Any] = {
             "chat_id": chat_id,
@@ -135,6 +136,8 @@ class TelegramClient:
             base_payload["message_thread_id"] = str(thread_id)
         if reply_to_message_id:
             base_payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
+        if reply_markup is not None:
+            base_payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False, separators=(",", ":"))
         source = sanitize_text(html_text, MESSAGE_SOURCE_LIMIT)
         plain = html_to_plain(source, limit=MESSAGE_SOURCE_LIMIT)
         if len(source) > MESSAGE_TEXT_LIMIT and plain:
@@ -148,6 +151,10 @@ class TelegramClient:
                 payload["text"] = sanitize_text(text, MESSAGE_TEXT_LIMIT)
                 if index > 1:
                     payload.pop("reply_parameters", None)
+                if index < total:
+                    # The keyboard belongs to the complete message, not an
+                    # arbitrary leading fragment of a long split send.
+                    payload.pop("reply_markup", None)
                 try:
                     result = self.api("sendMessage", payload).get("result") or {}
                     message_ids.append(str(result.get("message_id") or "0"))
@@ -157,7 +164,17 @@ class TelegramClient:
                     last_error = str(exc)
                     break
             if len(message_ids) == total:
-                return {"ok": True, "message_id": message_ids[0] if message_ids else "0", "message_ids": message_ids, "format": "plain-split"}
+                result = {
+                    "ok": True,
+                    "message_id": message_ids[0] if message_ids else "0",
+                    "message_ids": message_ids,
+                    "format": "plain-split",
+                }
+                if reply_markup is not None:
+                    result["reply_markup_message_id"] = (
+                        message_ids[-1] if message_ids else "0"
+                    )
+                return result
             return {"ok": False, "error": sanitize_text(last_error, 300)}
         last_error = ""
         for fmt, text in self._html_variants(html_text):
@@ -266,6 +283,52 @@ class TelegramClient:
                         "error": sanitize_text(last_error, 300),
                     }
         return {"ok": False, "error": sanitize_text(last_error, 300)}
+
+    def edit_message_reply_markup(
+        self,
+        chat_id: str,
+        message_id: str | int,
+        reply_markup: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            self.api(
+                "editMessageReplyMarkup",
+                {
+                    "chat_id": chat_id,
+                    "message_id": str(message_id),
+                    "reply_markup": json.dumps(reply_markup, ensure_ascii=False, separators=(",", ":")),
+                },
+            )
+            return {"ok": True, "message_id": str(message_id)}
+        except RateLimited:
+            raise
+        except TelegramError as exc:
+            error = sanitize_text(str(exc), 300)
+            if "message is not modified" in error.lower():
+                return {"ok": True, "message_id": str(message_id), "kind": "unchanged"}
+            return {"ok": False, "message_id": str(message_id), "error": error}
+
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: str = "",
+        *,
+        show_alert: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "callback_query_id": str(callback_query_id),
+            "show_alert": "true" if show_alert else "false",
+        }
+        clean = sanitize_text(text, 180).strip()
+        if clean:
+            payload["text"] = clean
+        try:
+            self.api("answerCallbackQuery", payload)
+            return {"ok": True}
+        except RateLimited:
+            raise
+        except TelegramError as exc:
+            return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
     def delete_message(self, chat_id: str, message_id: str | int) -> dict[str, Any]:
         try:
