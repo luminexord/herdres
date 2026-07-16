@@ -134,7 +134,7 @@ def test_multi_question_input_remains_a_read_only_pending_interaction() -> None:
 
 
 @pytest.mark.parametrize("multi_select", [False, True])
-def test_eleven_options_remain_remotely_answerable(multi_select: bool) -> None:
+def test_nine_options_remain_remotely_answerable(multi_select: bool) -> None:
     tool = _ask_user_question(
         {
             "questions": [
@@ -142,7 +142,7 @@ def test_eleven_options_remain_remotely_answerable(multi_select: bool) -> None:
                     "header": "Target",
                     "question": "Choose targets",
                     "multiSelect": multi_select,
-                    "options": _options(11),
+                    "options": _options(9),
                 }
             ]
         }
@@ -151,17 +151,17 @@ def test_eleven_options_remain_remotely_answerable(multi_select: bool) -> None:
     decision = adapter.claude_decision_turn_fields(tool)["pending_decision"]
 
     assert decision["mode"] == ("multi" if multi_select else "buttons")
-    assert [option["id"] for option in decision["options"][:11]] == [
-        str(index) for index in range(1, 12)
+    assert [option["id"] for option in decision["options"][:9]] == [
+        str(index) for index in range(1, 10)
     ]
-    assert len(decision["options"]) == (11 if multi_select else 12)
+    assert len(decision["options"]) == (9 if multi_select else 10)
     assert ("custom" in {option["id"] for option in decision["options"]}) is (
         not multi_select
     )
 
 
 @pytest.mark.parametrize("multi_select", [False, True])
-def test_twelve_options_fail_closed_to_read_only_without_truncation(
+def test_ten_options_fail_closed_to_read_only_without_truncation(
     multi_select: bool,
 ) -> None:
     tool = _ask_user_question(
@@ -171,7 +171,7 @@ def test_twelve_options_fail_closed_to_read_only_without_truncation(
                     "header": "Target",
                     "question": "Choose targets",
                     "multiSelect": multi_select,
-                    "options": _options(12),
+                    "options": _options(10),
                 }
             ]
         }
@@ -185,4 +185,4 @@ def test_twelve_options_fail_closed_to_read_only_without_truncation(
     assert interaction["questions"][0]["type"] == (
         "multi_choice" if multi_select else "single_choice"
     )
-    assert len(interaction["questions"][0]["options"]) == 12
+    assert len(interaction["questions"][0]["options"]) == 10

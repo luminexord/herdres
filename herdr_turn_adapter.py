@@ -584,15 +584,19 @@ def claude_decision_turn_fields(tool: dict[str, Any]) -> dict[str, Any] | None:
             first.get("options") if isinstance(first.get("options"), list) else []
         )
         single_question = len(questions) == 1
+        # Bound 9: option selection is digit-driven in the pane (absolute digit jump for
+        # single, absolute digit TOGGLE for multi — live-verified on Claude Code 2.1.211),
+        # and ordinals >= 10 would need two keystrokes with ambiguous TUI buffering. More
+        # options than that falls through to the read-only form rather than truncating.
         single = (
             single_question
             and not bool(first.get("multiSelect"))
-            and len(first_options) <= 11
+            and len(first_options) <= 9
         )
         multi = (
             single_question
             and bool(first.get("multiSelect"))
-            and len(first_options) <= 11
+            and len(first_options) <= 9
         )
         if single or multi:
             options: list[dict[str, str]] = []
