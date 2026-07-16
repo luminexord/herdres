@@ -402,6 +402,9 @@ def _answer_request(
         "schema_version": 1,
         "action": "answer_decision",
         "request_id": validate_request_id(request_id),
+        # Explicit, like send_instruction: Tendwire's mutating actions default to
+        # dry-run, so a live answer must say so rather than rely on a flipped default.
+        "dry_run": False,
         "target": {"worker_id": str(record.get("worker_id") or "")},
         "params": {
             "decision_ref": str(record.get("decision_id") or ""),

@@ -49,6 +49,7 @@ _DECISION_COMMAND_REQUEST_FIELDS = {
     "schema_version",
     "action",
     "request_id",
+    "dry_run",
     "target",
     "params",
 }
@@ -218,7 +219,7 @@ def _exact_decision_command_request(request: Any) -> dict[str, Any] | None:
         return None
     if type(request.get("schema_version")) is not int or request["schema_version"] != 1:
         return None
-    if request.get("action") != "answer_decision":
+    if request.get("action") != "answer_decision" or request.get("dry_run") is not False:
         return None
     try:
         validate_request_id(request.get("request_id"))
@@ -374,9 +375,15 @@ def _validated_decision_response(
         return None
     if "action" in response and response.get("action") != "answer_decision":
         return None
+    disposition = response.get("disposition") if "disposition" in response else None
     if response["ok"] is True:
-        return response if status == "accepted" else None
-    return response if status in _DECISION_FAILURE_STATUSES else None
+        if status != "accepted":
+            return None
+        # Mirror the paired producer exactly: an accepted decision is always terminal.
+        return response if disposition in (None, "terminal_accepted") else None
+    if status not in _DECISION_FAILURE_STATUSES:
+        return None
+    return response if disposition in (None, "no_receipt", "terminal_rejected") else None
 
 
 def _is_private_ingress_env_key(key: str) -> bool:
