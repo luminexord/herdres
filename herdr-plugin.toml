@@ -2,7 +2,7 @@ id = "luminexord.herdres"
 name = "Herdres"
 version = "0.7.0rc4"
 min_herdr_version = "0.7.0"
-description = "Telegram interface for Tendwire-managed Herdr coding agents"
+description = "Telegram interface for monitoring and messaging Herdr coding agents"
 platforms = ["linux"]
 
 [[actions]]

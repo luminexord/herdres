@@ -1,11 +1,10 @@
 # Release checklist (Herdres 0.7.0rc4 / Tendwire 0.1.0rc5)
 
-## 0. RC pairing and low-minute gate
+## 0. RC pairing and release gate
 
 This candidate supports Python 3.13 and pairs with Tendwire `0.1.0rc5` or a
-reviewed descendant preserving its public contract. Routine automatic CI runs once in
-Tendwire. Herdres deliberately has no duplicate automatic workflow consuming
-another repository's GitHub Actions minutes.
+reviewed descendant preserving its public contract. Run the complete paired
+gate from clean checkouts before tagging or deployment.
 
 Before tagging or deployment, run the complete local pair from clean checkouts:
 
