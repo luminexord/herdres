@@ -202,31 +202,40 @@ accepted_result = {
     "target_state_at_send": "working",
     "observed_turn_state": "pending_observation",
 }
+decision_result = {
+    "target": {"worker_id": "worker-public"},
+    "decision": {"decision_ref": "decision-public"},
+    "delivery_state": "submitted",
+    "transport_state": "submitted",
+    "observed_pending_state": "pending_observation",
+}
 accepted = []
-for ok in (False, True):
-    for status in sorted(VALID_STATUSES):
-        for disposition in sorted(VALID_DISPOSITIONS):
-            try:
-                envelope = CommandEnvelope(
-                    schema_version=2,
-                    action="send_instruction",
-                    request_id=request_id,
-                    ok=ok,
-                    dry_run=False,
-                    status=status,
-                    disposition=disposition,
-                    result=accepted_result if ok else None,
-                    error=None
-                    if ok
-                    else {"code": status, "message": "paired failure"},
-                    warnings=[],
-                )
-            except (TypeError, ValueError):
-                continue
-            accepted.append({
-                "tuple": [ok, status, disposition],
-                "body": envelope.to_dict(),
-            })
+for action in ("send_instruction", "answer_decision"):
+    ok_result = accepted_result if action == "send_instruction" else decision_result
+    for ok in (False, True):
+        for status in sorted(VALID_STATUSES):
+            for disposition in sorted(VALID_DISPOSITIONS):
+                try:
+                    envelope = CommandEnvelope(
+                        schema_version=2,
+                        action=action,
+                        request_id=request_id,
+                        ok=ok,
+                        dry_run=False,
+                        status=status,
+                        disposition=disposition,
+                        result=ok_result if ok else None,
+                        error=None
+                        if ok
+                        else {"code": status, "message": "paired failure"},
+                        warnings=[],
+                    )
+                except (TypeError, ValueError):
+                    continue
+                accepted.append({
+                    "tuple": [action, ok, status, disposition],
+                    "body": envelope.to_dict(),
+                })
 print(json.dumps({
     "statuses": sorted(VALID_STATUSES),
     "dispositions": sorted(VALID_DISPOSITIONS),
@@ -244,6 +253,12 @@ print(json.dumps({
     producer_accepted = {
         tuple(item["tuple"]): item["body"]
         for item in matrix["accepted"]
+    }
+    decision_statuses = {
+        "decision_not_pending",
+        "unknown_worker",
+        "invalid_selection",
+        "unsupported_decision",
     }
 
     current_body = {}
@@ -267,33 +282,57 @@ print(json.dumps({
     }
     client = TendwireClient()
 
-    for ok in (False, True):
-        for status in matrix["statuses"]:
-            for disposition in matrix["dispositions"]:
-                key = (ok, status, disposition)
-                producer_body = producer_accepted.get(key)
-                current_body = producer_body or {
-                    "schema_version": 2,
-                    "action": "send_instruction",
-                    "request_id": REQUEST_ID,
-                    "ok": ok,
-                    "dry_run": False,
-                    "status": status,
-                    "disposition": disposition,
-                    "result": accepted_result if ok else None,
-                    "error": None
-                    if ok
-                    else {"code": status, "message": "paired failure"},
-                    "warnings": [],
-                }
-                result = client.command(request)
-                allowed = producer_body is not None
-                if allowed:
-                    assert result == producer_body
-                    assert tendwire_client.command_process_ambiguous(result) is False
-                else:
-                    assert result["status"] == "request_state_uncertain"
-                    assert result.get("disposition") is None
-                    assert result.get("result") is None
-                    assert tendwire_client.command_process_ambiguous(result) is True
+    decision_request = {
+        "schema_version": 1,
+        "action": "answer_decision",
+        "request_id": REQUEST_ID,
+        "dry_run": False,
+        "target": {"worker_id": "worker-public"},
+        "params": {
+            "decision_ref": "decision-public",
+            "selection": {"option_refs": ["1"]},
+        },
+    }
+    for action, driven in (("send_instruction", request), ("answer_decision", decision_request)):
+        for ok in (False, True):
+            for status in matrix["statuses"]:
+                for disposition in matrix["dispositions"]:
+                    key = (action, ok, status, disposition)
+                    producer_body = producer_accepted.get(key)
+                    current_body = producer_body or {
+                        "schema_version": 2,
+                        "action": action,
+                        "request_id": REQUEST_ID,
+                        "ok": ok,
+                        "dry_run": False,
+                        "status": status,
+                        "disposition": disposition,
+                        "result": accepted_result if ok else None,
+                        "error": None
+                        if ok
+                        else {"code": status, "message": "paired failure"},
+                        "warnings": [],
+                    }
+                    result = client.command(driven)
+                    if action == "send_instruction":
+                        # The send path fails closed on the decision-only statuses the
+                        # paired Tendwire can now construct but never semantically emits
+                        # for a send: they surface as request_state_uncertain.
+                        allowed = producer_body is not None and status not in decision_statuses
+                    else:
+                        # The decision path accepts exactly ok+accepted or a typed
+                        # decision failure; every other producer-constructible envelope
+                        # fails closed.
+                        allowed = producer_body is not None and (
+                            (ok and status == "accepted")
+                            or (not ok and status in decision_statuses)
+                        )
+                    if allowed:
+                        assert result == producer_body
+                        assert tendwire_client.command_process_ambiguous(result) is False
+                    else:
+                        assert result["status"] == "request_state_uncertain"
+                        assert result.get("disposition") is None
+                        assert result.get("result") is None
+                        assert tendwire_client.command_process_ambiguous(result) is True
                     assert "_process" not in json.dumps(result, sort_keys=True)

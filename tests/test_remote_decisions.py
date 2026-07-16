@@ -317,6 +317,7 @@ def test_submit_shape_uses_valid_derived_request_id() -> None:
         "schema_version": 1,
         "action": "answer_decision",
         "request_id": request["request_id"],
+        "dry_run": False,
         "target": {"worker_id": "worker-1"},
         "params": {
             "decision_ref": "decision-1",
@@ -586,6 +587,7 @@ def test_tendwire_client_accepts_answer_decision_contract(monkeypatch) -> None:
         "schema_version": 1,
         "action": "answer_decision",
         "request_id": _request_id(),
+        "dry_run": False,
         "target": {"worker_id": "worker-1"},
         "params": {
             "decision_ref": "decision-1",
