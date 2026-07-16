@@ -1579,31 +1579,35 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                 content = msg.get("content")
                 text = content_text(content).strip()
                 if text and msg.get("stop_reason") == "end_turn" and pending_user_uuid:
-                    turn = {
-                        "available": True,
-                        "pane_id": pane_id,
-                        "agent": "claude",
-                        "agent_session_id": session_id,
-                        "turn_id": str(event.get("uuid") or ""),
-                        "complete": True,
-                        "complete_reason": "done",
-                        "started_at": None,
-                        "completed_at": event.get("timestamp"),
-                        "user_text": pending_user_text,
-                        "assistant_final_text": sanitize_canonical_text(text),
-                        "_prompt_uuid": pending_user_uuid,
-                    }
-                    if WORKLOG_ENABLED and worklog_parts:
-                        worklog = _join_worklog(worklog_parts)
-                        if worklog:
-                            turn["worklog_text"] = worklog
-                    # Coalesce consecutive end_turns under the same prompt (the
-                    # last non-empty assistant message wins) rather than emitting
-                    # a duplicate turn for the same prompt.
-                    if completed and completed[-1].get("_prompt_uuid") == pending_user_uuid:
-                        completed[-1] = turn
-                    else:
-                        completed.append(turn)
+                    # A real prompt owns the turn identity from its first open
+                    # projection through completion. Internal automation user
+                    # records still delimit parsing, but must not materialize a
+                    # public final with an empty user prompt.
+                    if pending_user_text:
+                        turn = {
+                            "available": True,
+                            "pane_id": pane_id,
+                            "agent": "claude",
+                            "agent_session_id": session_id,
+                            "turn_id": pending_user_uuid,
+                            "complete": True,
+                            "complete_reason": "done",
+                            "started_at": None,
+                            "completed_at": event.get("timestamp"),
+                            "user_text": pending_user_text,
+                            "assistant_final_text": sanitize_canonical_text(text),
+                            "_prompt_uuid": pending_user_uuid,
+                        }
+                        if WORKLOG_ENABLED and worklog_parts:
+                            worklog = _join_worklog(worklog_parts)
+                            if worklog:
+                                turn["worklog_text"] = worklog
+                        # Coalesce consecutive end_turns under the same prompt
+                        # rather than emitting a duplicate turn.
+                        if completed and completed[-1].get("_prompt_uuid") == pending_user_uuid:
+                            completed[-1] = turn
+                        else:
+                            completed.append(turn)
                     consumed_user_uuid = pending_user_uuid
                     incomplete_user = False
                     pending_api_error = None  # a real completion supersedes any prior API error

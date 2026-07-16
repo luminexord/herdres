@@ -209,3 +209,75 @@ def test_internal_prompt_and_worklog_private_values_remain_safe(tmp_path):
     assert "hunter2" not in cleaned
     assert "\u200b" not in cleaned
     assert "***" in cleaned
+
+
+def _append_claude_event(path: Path, event: dict) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
+def _claude_user(uuid: str, text: str) -> dict:
+    return {
+        "type": "user",
+        "uuid": uuid,
+        "timestamp": "2026-07-16T00:00:00Z",
+        "message": {"content": text},
+    }
+
+
+def _claude_assistant(uuid: str, text: str, *, final: bool) -> dict:
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "timestamp": "2026-07-16T00:00:01Z",
+        "message": {
+            "model": "claude-test",
+            "stop_reason": "end_turn" if final else None,
+            "content": [{"type": "text", "text": text}],
+        },
+    }
+
+
+def test_claude_prompt_identity_is_stable_from_working_through_final(tmp_path):
+    transcript = tmp_path / "claude.jsonl"
+    _append_claude_event(transcript, _claude_user("prompt-1", "Please inspect this."))
+    _append_claude_event(transcript, _claude_assistant("assistant-stream", "Inspecting now.", final=False))
+
+    working = adapter.extract_claude_turn(transcript, "pane-1", "session-1")
+
+    assert working["turn_id"] == "prompt-1"
+    assert working["user_text"] == "Please inspect this."
+    assert working["assistant_stream_text"] == "Inspecting now."
+    assert working["complete"] is False
+
+    _append_claude_event(transcript, _claude_assistant("assistant-final", "Inspection complete.", final=True))
+    final = adapter.extract_claude_turn(transcript, "pane-1", "session-1")
+
+    assert final["turn_id"] == working["turn_id"] == "prompt-1"
+    assert final["user_text"] == working["user_text"]
+    assert final["assistant_final_text"] == "Inspection complete."
+    assert final["complete"] is True
+
+
+def test_claude_internal_automation_final_does_not_replace_real_turn(tmp_path):
+    transcript = tmp_path / "claude-internal.jsonl"
+    _append_claude_event(transcript, _claude_user("prompt-1", "Please inspect this."))
+    _append_claude_event(transcript, _claude_assistant("assistant-final", "Inspection complete.", final=True))
+    _append_claude_event(
+        transcript,
+        _claude_user("internal-1", "<task-notification>private automation</task-notification>"),
+    )
+    _append_claude_event(
+        transcript,
+        _claude_assistant("internal-final", "Internal automation result.", final=True),
+    )
+
+    turn = adapter.extract_claude_turn(transcript, "pane-1", "session-1")
+    encoded = json.dumps(turn)
+
+    assert turn["turn_id"] == "prompt-1"
+    assert turn["user_text"] == "Please inspect this."
+    assert turn["assistant_final_text"] == "Inspection complete."
+    assert len(turn["recent_turns"]) == 1
+    assert "private automation" not in encoded
+    assert "Internal automation result" not in encoded
