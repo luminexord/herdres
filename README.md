@@ -22,6 +22,23 @@ stable-job checkpoints, and Telegram delivery dedup.
 **Requires [Tendwire](https://github.com/plotarmordev/tendwire)** — Herdres has
 no functionality without it. See [INSTALL.md](INSTALL.md) for setup order.
 
+## Herdr plugin
+
+Herdres is listed as a community Herdr plugin. Install its source checkout and
+local actions with:
+
+```sh
+herdr plugin install luminexord/herdres
+herdr plugin action invoke luminexord.herdres.init-config
+herdr plugin action invoke luminexord.herdres.doctor
+```
+
+The first action creates a private `herdres.env` template in Herdr's managed
+plugin configuration directory; it never overwrites an existing file. The
+plugin does not send Telegram messages or start services during installation.
+After configuring credentials, follow [INSTALL.md](INSTALL.md) to install and
+start the persistent Tendwire, Herdres, and gateway user services.
+
 ## Runtime and lossless turn delivery
 
 ```text

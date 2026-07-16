@@ -1,0 +1,18 @@
+id = "luminexord.herdres"
+name = "Herdres"
+version = "0.7.0rc4"
+min_herdr_version = "0.7.0"
+description = "Telegram interface for Tendwire-managed Herdr coding agents"
+platforms = ["linux"]
+
+[[actions]]
+id = "init-config"
+title = "Initialize Herdres config"
+description = "Create a private plugin configuration template if none exists"
+command = ["python3", "scripts/herdr_plugin.py", "init-config"]
+
+[[actions]]
+id = "doctor"
+title = "Check Herdres"
+description = "Check the paired Tendwire, Herdres, and gateway services"
+command = ["python3", "scripts/herdr_plugin.py", "doctor"]

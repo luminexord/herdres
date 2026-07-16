@@ -8,7 +8,12 @@ and assert no private/pseudo pane identifiers leak into source-mode state.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
+import subprocess
+import sys
+import tomllib
 from pathlib import Path
 
 from herdres_connector import config, doctor, state
@@ -144,3 +149,42 @@ def test_runtime_imports_no_herdr_backend_client_and_reports_zero_direct_calls()
         assert needle not in text, f"herdres runtime must not reference {needle}"
     # No subprocess invocation of a bare `herdr` binary (herdres/tendwire/systemctl are fine).
     assert not re.search(r"""[\[(]\s*["']herdr["']""", text), "herdres runtime must not spawn a bare herdr binary"
+
+
+def test_herdr_plugin_manifest_has_safe_non_delivery_actions() -> None:
+    manifest = tomllib.loads(
+        (REPO_ROOT / "herdr-plugin.toml").read_text(encoding="utf-8")
+    )
+
+    assert manifest["id"] == "luminexord.herdres"
+    assert manifest["version"] == "0.7.0rc4"
+    assert manifest["min_herdr_version"] == "0.7.0"
+    assert manifest["platforms"] == ["linux"]
+    actions = {item["id"]: item for item in manifest["actions"]}
+    assert set(actions) == {"init-config", "doctor"}
+    assert all(
+        item["command"][:2] == ["python3", "scripts/herdr_plugin.py"]
+        for item in actions.values()
+    )
+    serialized = json.dumps(manifest, sort_keys=True)
+    assert "/home/" not in serialized
+    assert "token" not in serialized.lower()
+
+
+def test_herdr_plugin_init_config_is_private_and_non_overwriting(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    env = os.environ.copy()
+    env["HERDR_PLUGIN_CONFIG_DIR"] = str(config_dir)
+    env.pop("HERDRES_ENV_FILE", None)
+    command = [sys.executable, str(REPO_ROOT / "scripts/herdr_plugin.py"), "init-config"]
+
+    first = subprocess.run(command, env=env, capture_output=True, text=True, check=False)
+    assert first.returncode == 0
+    config_path = config_dir / "herdres.env"
+    original = config_path.read_bytes()
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+    config_path.write_bytes(original + b"\nHERDRES_TEST_SENTINEL=keep\n")
+    second = subprocess.run(command, env=env, capture_output=True, text=True, check=False)
+    assert second.returncode == 0
+    assert config_path.read_bytes().endswith(b"HERDRES_TEST_SENTINEL=keep\n")
