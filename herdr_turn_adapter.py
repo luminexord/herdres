@@ -580,34 +580,54 @@ def claude_decision_turn_fields(tool: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(questions, list) or not questions:
             return None
         first = questions[0] if isinstance(questions[0], dict) else {}
-        single = len(questions) == 1 and not bool(first.get("multiSelect"))
-        if single:
+        first_options = (
+            first.get("options") if isinstance(first.get("options"), list) else []
+        )
+        single_question = len(questions) == 1
+        single = (
+            single_question
+            and not bool(first.get("multiSelect"))
+            and len(first_options) <= 11
+        )
+        multi = (
+            single_question
+            and bool(first.get("multiSelect"))
+            and len(first_options) <= 11
+        )
+        if single or multi:
             options: list[dict[str, str]] = []
-            raw_opts = first.get("options") if isinstance(first.get("options"), list) else []
-            for opt in raw_opts[:11]:
+            for opt in first_options:
                 label = sanitize_bounded_text(str((opt.get("label") or opt.get("text") or opt.get("title") or "") if isinstance(opt, dict) else (opt or "")), 180).strip()
                 if label:
-                    options.append({"id": str(len(options) + 1), "label": label, "send_text": label})
+                    option = {"id": str(len(options) + 1), "label": label}
+                    if single:
+                        option["send_text"] = label
+                    options.append(option)
             if not options:
                 return None
-            options.append({"id": "custom", "label": "✍️ Write a different answer", "send_text": ""})
+            if single:
+                options.append({"id": "custom", "label": "✍️ Write a different answer", "send_text": ""})
             header = sanitize_bounded_text(str(first.get("header") or ""), 80).strip()
             question = sanitize_bounded_text(str(first.get("question") or "Choose an option."), 1200).strip() or "Choose an option."
             prompt = f"{header}: {question}" if header and header.lower() not in question.lower() else question
+            decision: dict[str, Any] = {
+                "decision_id": tool_id,
+                "prompt": prompt,
+                "mode": "buttons" if single else "multi",
+                "options": options,
+            }
+            if multi:
+                decision["multi_select"] = True
             fields = {
-                "pending_decision": {
-                    "decision_id": tool_id,
-                    "prompt": prompt,
-                    "mode": "buttons",
-                    "options": options,
-                }
+                "pending_decision": decision
             }
             # The hook's PreToolUse payload carries only the structured tool_input, not the
             # assistant's surrounding prose, so there is no preamble to attach here; the question
             # text itself is the card body.
             return fields
 
-        # Multi-question or multi-select -> read-only structured form (owner answers in the pane).
+        # Multi-question and oversized single-question forms stay read-only. Never
+        # truncate a choice set that remote key-driving could answer incorrectly.
         norm_questions: list[dict[str, Any]] = []
         for qi, q in enumerate(questions[:12], start=1):
             if not isinstance(q, dict):

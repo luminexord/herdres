@@ -254,12 +254,13 @@ print(json.dumps({
         tuple(item["tuple"]): item["body"]
         for item in matrix["accepted"]
     }
-    decision_statuses = {
+    decision_failure_statuses = {
         "decision_not_pending",
         "unknown_worker",
         "invalid_selection",
         "unsupported_decision",
     }
+    decision_only_statuses = decision_failure_statuses | {"answer_in_progress"}
 
     current_body = {}
 
@@ -318,14 +319,30 @@ print(json.dumps({
                         # The send path fails closed on the decision-only statuses the
                         # paired Tendwire can now construct but never semantically emits
                         # for a send: they surface as request_state_uncertain.
-                        allowed = producer_body is not None and status not in decision_statuses
+                        allowed = (
+                            producer_body is not None
+                            and status not in decision_only_statuses
+                        )
                     else:
-                        # The decision path accepts exactly ok+accepted or a typed
-                        # decision failure; every other producer-constructible envelope
-                        # fails closed.
+                        # The decision path accepts only the exact accepted tuple, a
+                        # typed failure tuple, or the retry-by-user in-progress tuple.
+                        # Every other producer-constructible envelope fails closed.
                         allowed = producer_body is not None and (
-                            (ok and status == "accepted")
-                            or (not ok and status in decision_statuses)
+                            (
+                                ok
+                                and status == "accepted"
+                                and disposition == "terminal_accepted"
+                            )
+                            or (
+                                not ok
+                                and status in decision_failure_statuses
+                                and disposition in {"no_receipt", "terminal_rejected"}
+                            )
+                            or (
+                                not ok
+                                and status == "answer_in_progress"
+                                and disposition in {"no_receipt", "in_progress"}
+                            )
                         )
                     if allowed:
                         assert result == producer_body
@@ -336,3 +353,110 @@ print(json.dumps({
                         assert result.get("result") is None
                         assert tendwire_client.command_process_ambiguous(result) is True
                     assert "_process" not in json.dumps(result, sort_keys=True)
+
+
+def _decision_request() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "action": "answer_decision",
+        "request_id": REQUEST_ID,
+        "dry_run": False,
+        "target": {"worker_id": "worker-public"},
+        "params": {
+            "decision_ref": "decision-public",
+            "selection": {"option_refs": ["1"]},
+        },
+    }
+
+
+def _decision_envelope(
+    *,
+    ok: bool,
+    status: str,
+    disposition: str,
+    result: dict[str, object] | None,
+) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "action": "answer_decision",
+        "request_id": REQUEST_ID,
+        "ok": ok,
+        "dry_run": False,
+        "status": status,
+        "disposition": disposition,
+        "result": result,
+        "error": None
+        if ok
+        else {"code": status, "message": "paired decision failure"},
+        "warnings": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"ok": True, "status": "accepted"},
+        _decision_envelope(
+            ok=True,
+            status="accepted",
+            disposition="terminal_accepted",
+            result={
+                "target": {"worker_id": "worker-public"},
+                "delivery_state": "submitted",
+                "transport_state": "submitted",
+                "target_state_at_send": "working",
+                "observed_turn_state": "pending_observation",
+            },
+        ),
+    ],
+    ids=["bare-accepted", "send-instruction-result"],
+)
+def test_decision_response_rejects_non_envelope_and_wrong_result_shape(
+    monkeypatch,
+    body,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "tw")
+    monkeypatch.setattr(
+        tendwire_client.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(body, separators=(",", ":")).encode("utf-8"),
+            stderr=b"",
+        ),
+    )
+
+    result = TendwireClient().command(_decision_request())
+
+    assert result["status"] == "request_state_uncertain"
+    assert result.get("disposition") is None
+    assert result.get("result") is None
+    assert tendwire_client.command_process_ambiguous(result) is True
+
+
+@pytest.mark.parametrize("disposition", ["no_receipt", "in_progress"])
+def test_decision_response_accepts_answer_in_progress_verbatim(
+    monkeypatch,
+    disposition,
+):
+    body = _decision_envelope(
+        ok=False,
+        status="answer_in_progress",
+        disposition=disposition,
+        result=None,
+    )
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "tw")
+    monkeypatch.setattr(
+        tendwire_client.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout=json.dumps(body, separators=(",", ":")).encode("utf-8"),
+            stderr=b"",
+        ),
+    )
+
+    result = TendwireClient().command(_decision_request())
+
+    assert result == body
+    assert tendwire_client.command_process_ambiguous(result) is False

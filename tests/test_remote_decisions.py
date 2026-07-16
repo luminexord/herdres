@@ -153,12 +153,45 @@ class FakeTelegram:
 
 class FakeTendwire:
     def __init__(self, response: dict | None = None) -> None:
-        self.response = response or {"ok": True, "status": "accepted"}
+        self.response = dict(response or {"ok": True, "status": "accepted"})
         self.commands: list[dict] = []
 
     def command(self, request):
         self.commands.append(request)
-        return dict(self.response)
+        ok = self.response.get("ok") is True
+        status = str(self.response.get("status") or "accepted")
+        if ok:
+            disposition = "terminal_accepted"
+            result = {
+                "target": {"worker_id": request["target"]["worker_id"]},
+                "decision": {
+                    "decision_ref": request["params"]["decision_ref"],
+                },
+                "delivery_state": "submitted",
+                "transport_state": "submitted",
+                "observed_pending_state": "pending_observation",
+            }
+            error = None
+        else:
+            disposition = (
+                "in_progress"
+                if status == "answer_in_progress"
+                else "terminal_rejected"
+            )
+            result = None
+            error = {"code": status, "message": "paired decision failure"}
+        return {
+            "schema_version": 2,
+            "action": "answer_decision",
+            "request_id": request["request_id"],
+            "ok": ok,
+            "dry_run": False,
+            "status": status,
+            "disposition": disposition,
+            "result": result,
+            "error": error,
+            "warnings": [],
+        }
 
     def command_json(self, request_json):
         request = json.loads(request_json)
@@ -352,6 +385,38 @@ def test_failed_submit_keeps_record_and_reports_explicit_error() -> None:
     assert "Could not answer" in telegram.sent[-1]["html"]
     assert "invalid_selection" in telegram.sent[-1]["html"]
     assert telegram.markup_edits == []
+
+
+def test_answer_in_progress_keeps_record_and_keyboard_with_transient_reply() -> None:
+    store = _store()
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire({"ok": False, "status": "answer_in_progress"})
+    record = _post(store, telegram, _pending())
+
+    result = decisions.handle_callback(
+        store,
+        callback_data=_button(record, "1"),
+        topic_id="77",
+        chat_id="-100",
+        request_id=_request_id(),
+        telegram=telegram,
+        tendwire=tendwire,
+    )
+
+    expected = "That prompt is being answered right now — try again in a moment."
+    assert result == {
+        "handled": True,
+        "changed": False,
+        "toast": expected,
+        "reply": expected,
+        "status": "answer_in_progress",
+    }
+    assert store["decisions"]["active"]["77"] is record
+    assert len(tendwire.commands) == 1
+    assert len(telegram.sent) == 2
+    assert telegram.sent[-1]["html"] == expected
+    assert telegram.markup_edits == []
+    assert telegram.edited == []
 
 
 def test_decision_not_pending_retracts_with_honest_note() -> None:
