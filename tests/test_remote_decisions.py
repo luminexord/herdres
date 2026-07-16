@@ -602,10 +602,22 @@ def test_tendwire_client_accepts_answer_decision_contract(monkeypatch) -> None:
             returncode=0,
             stdout=json.dumps(
                 {
+                    "schema_version": 2,
                     "ok": True,
                     "status": "accepted",
                     "action": "answer_decision",
                     "request_id": request["request_id"],
+                    "dry_run": False,
+                    "disposition": "terminal_accepted",
+                    "result": {
+                        "target": {"worker_id": "worker-1"},
+                        "decision": {"decision_ref": "decision-1"},
+                        "delivery_state": "submitted",
+                        "transport_state": "submitted",
+                        "observed_pending_state": "pending_observation",
+                    },
+                    "error": None,
+                    "warnings": [],
                 }
             ).encode(),
             stderr=b"",
@@ -618,6 +630,35 @@ def test_tendwire_client_accepts_answer_decision_contract(monkeypatch) -> None:
     assert result["ok"] is True
     assert result["status"] == "accepted"
     assert json.loads(calls[0][1]["input"].decode()) == request
+
+
+def test_tendwire_client_rejects_unbound_decision_response(monkeypatch) -> None:
+    request = {
+        "schema_version": 1,
+        "action": "answer_decision",
+        "request_id": _request_id(),
+        "dry_run": False,
+        "target": {"worker_id": "worker-1"},
+        "params": {
+            "decision_ref": "decision-1",
+            "selection": {"option_refs": ["1"]},
+        },
+    }
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "tw")
+    monkeypatch.setattr(
+        tendwire_client.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=b'{"ok":true,"status":"accepted"}',
+            stderr=b"",
+        ),
+    )
+
+    result = tendwire_client.TendwireClient().command(request)
+
+    assert result["status"] == "request_state_uncertain"
+    assert tendwire_client.command_process_ambiguous(result) is True
 
 
 def test_send_message_attaches_markup_only_to_final_split_and_helpers_use_api() -> None:

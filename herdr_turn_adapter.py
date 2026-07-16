@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -73,6 +74,17 @@ PLAN_REVISE_SEND_TEXT = os.getenv("HERDRES_PLAN_REVISE_SEND_TEXT", "")
 # contains it while pending. Cleared by the hook on PostToolUse/SessionEnd; TTL bounds an
 # abandoned file (missed clear / crash).
 PENDING_DECISION_TTL_SECONDS = int(os.getenv("HERDRES_PENDING_TTL_SECONDS", "3600"))
+
+# Kimi Code 0.26+ stores authoritative session events below a workspace-scoped
+# directory. Resolution is deliberately bounded and requires a unique live Kimi
+# pane for the workspace; mutable newest-file selection across workspaces is not
+# allowed.
+KIMI_WORKSPACE_MAX_ENTRIES = 4096
+KIMI_SESSION_MAX_ENTRIES = 256
+KIMI_STATE_MAX_BYTES = 64 * 1024
+_KIMI_SESSION_RE = re.compile(
+    r"^session_([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$"
+)
 
 # Redact obvious secrets before a tool arg / interim line reaches Telegram: KEY=value or
 # "Header: value" for auth-ish keys, and URL embedded credentials. Best-effort, not a
@@ -1827,6 +1839,281 @@ def extract_devin_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
     }
 
 
+def kimi_code_home() -> Path:
+    return Path(
+        os.getenv("KIMI_CODE_HOME", str(Path.home() / ".kimi-code"))
+    ).expanduser()
+
+
+def _kimi_workspace_suffix(cwd: str) -> str:
+    normalized = os.path.realpath(cwd)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+
+
+def _kimi_regular_file(path: Path, root: Path, *, max_bytes: int | None = None) -> bool:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+        size = resolved.stat().st_size
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return max_bytes is None or size <= max_bytes
+
+
+def _kimi_bounded_entries(path: Path, limit: int) -> list[Path] | None:
+    entries: list[Path] = []
+    try:
+        with os.scandir(path) as iterator:
+            for item in iterator:
+                if len(entries) >= limit:
+                    return None
+                entries.append(Path(item.path))
+    except OSError:
+        return None
+    return entries
+
+
+def _kimi_session_path_for_pane(pane: dict[str, Any]) -> tuple[Path, str] | None:
+    cwd = str(pane.get("foreground_cwd") or pane.get("cwd") or "").strip()
+    if not cwd:
+        return None
+    try:
+        canonical_cwd = str(Path(cwd).resolve(strict=True))
+        root = (kimi_code_home() / "sessions").resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    workspace_entries = _kimi_bounded_entries(root, KIMI_WORKSPACE_MAX_ENTRIES)
+    if workspace_entries is None:
+        return None
+    suffix = "_" + _kimi_workspace_suffix(canonical_cwd)
+    workspaces = [
+        item
+        for item in workspace_entries
+        if item.name.startswith("wd_")
+        and item.name.endswith(suffix)
+        and not item.is_symlink()
+        and item.is_dir()
+    ]
+    if len(workspaces) != 1:
+        return None
+    workspace = workspaces[0].resolve(strict=True)
+    try:
+        workspace.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    session_entries = _kimi_bounded_entries(workspace, KIMI_SESSION_MAX_ENTRIES)
+    if session_entries is None:
+        return None
+
+    candidates: list[tuple[int, Path, str]] = []
+    for session_dir in session_entries:
+        match = _KIMI_SESSION_RE.fullmatch(session_dir.name)
+        if match is None or session_dir.is_symlink() or not session_dir.is_dir():
+            continue
+        try:
+            resolved_session = session_dir.resolve(strict=True)
+            resolved_session.relative_to(workspace)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        state_path = resolved_session / "state.json"
+        wire_path = resolved_session / "agents" / "main" / "wire.jsonl"
+        if not _kimi_regular_file(state_path, root, max_bytes=KIMI_STATE_MAX_BYTES):
+            continue
+        if not _kimi_regular_file(wire_path, root):
+            continue
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                continue
+            state_cwd = str(Path(str(state.get("workDir") or "")).resolve(strict=True))
+            wire_mtime = wire_path.stat().st_mtime_ns
+        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if state_cwd != canonical_cwd:
+            continue
+        candidates.append((wire_mtime, wire_path, match.group(1)))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[2]), reverse=True)
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return None
+    return candidates[0][1], candidates[0][2]
+
+
+def _kimi_is_turn_start(raw: str) -> bool:
+    try:
+        event = json.loads(raw)
+    except Exception:
+        return False
+    origin = event.get("origin") if isinstance(event.get("origin"), dict) else {}
+    return event.get("type") == "turn.prompt" and origin.get("kind") == "user"
+
+
+def _kimi_is_turn_end(raw: str) -> bool:
+    try:
+        record = json.loads(raw)
+    except Exception:
+        return False
+    event = record.get("event") if isinstance(record.get("event"), dict) else {}
+    return (
+        record.get("type") == "context.append_loop_event"
+        and event.get("type") == "step.end"
+        and event.get("finishReason") == "end_turn"
+    )
+
+
+def _kimi_timestamp(value: Any) -> str | None:
+    if type(value) not in (int, float) or not float(value) >= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _kimi_progress_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = _redact_secrets(_strip_control(value)).strip()
+    return sanitize_bounded_text(cleaned)
+
+
+def extract_kimi_turn(path: Path, pane_id: str, session_id: str) -> dict[str, Any]:
+    completed: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    step_text: dict[str, list[str]] = {}
+    progress = ""
+
+    with open_jsonl_tail(path, _kimi_is_turn_start, _kimi_is_turn_end) as handle:
+        for raw in handle:
+            try:
+                record = json.loads(raw)
+            except Exception:
+                continue
+            record_type = str(record.get("type") or "")
+            origin = record.get("origin") if isinstance(record.get("origin"), dict) else {}
+            if record_type == "turn.prompt" and origin.get("kind") == "user":
+                prompt = sanitize_canonical_text(content_text(record.get("input")))
+                started_at = _kimi_timestamp(record.get("time"))
+                if not prompt.strip() or started_at is None:
+                    current = None
+                    step_text = {}
+                    progress = ""
+                    continue
+                prompt_time = record.get("time")
+                current = {
+                    "available": True,
+                    "pane_id": pane_id,
+                    "agent": "kimi",
+                    "agent_session_id": session_id,
+                    "turn_id": f"{session_id}:{prompt_time}",
+                    "complete": False,
+                    "started_at": started_at,
+                    "user_text": prompt,
+                    "assistant_final_text": "",
+                }
+                step_text = {}
+                progress = ""
+                continue
+            if current is None:
+                continue
+            if record_type == "turn.steer" and origin.get("kind") == "user":
+                steering = sanitize_canonical_text(content_text(record.get("input")))
+                if steering.strip():
+                    current["user_text"] = str(current["user_text"]) + "\n\n" + steering
+                continue
+            if record_type != "context.append_loop_event":
+                continue
+            event = record.get("event") if isinstance(record.get("event"), dict) else {}
+            event_type = str(event.get("type") or "")
+            step = str(event.get("step") or "")
+            if event_type == "content.part":
+                part = event.get("part") if isinstance(event.get("part"), dict) else {}
+                if part.get("type") == "text" and isinstance(part.get("text"), str):
+                    text = sanitize_canonical_text(part["text"])
+                    step_text.setdefault(step, []).append(text)
+                    if text:
+                        progress = "".join(step_text[step])
+                elif part.get("type") == "think":
+                    candidate = _kimi_progress_text(part.get("think"))
+                    if candidate:
+                        progress = candidate
+                continue
+            if event_type == "tool.call":
+                description = event.get("description") or event.get("name")
+                candidate = _kimi_progress_text(description)
+                if candidate:
+                    progress = candidate
+                continue
+            if event_type != "step.end" or event.get("finishReason") != "end_turn":
+                continue
+            final_text = sanitize_canonical_text("".join(step_text.get(step, [])))
+            if not final_text.strip():
+                continue
+            final = dict(current)
+            final["complete"] = True
+            final["complete_reason"] = "done"
+            final["completed_at"] = _kimi_timestamp(record.get("time"))
+            final["assistant_final_text"] = final_text
+            if progress:
+                final["worklog_text"] = progress
+            completed.append(final)
+            current = None
+            step_text = {}
+            progress = ""
+
+    recent = completed[-RECENT_TURNS:]
+    if current is not None:
+        if recent:
+            latest = dict(recent[-1])
+            latest["recent_turns"] = recent
+            latest["has_open_turn"] = True
+            latest["open_turn_id"] = current["turn_id"]
+            latest["open_user_text"] = current["user_text"]
+            return add_stream_fields(latest, progress, "kimi")
+        current["recent_turns"] = []
+        return add_stream_fields(current, progress, "kimi")
+    if recent:
+        latest = dict(recent[-1])
+        latest["recent_turns"] = recent
+        return latest
+    return {
+        "available": True,
+        "pane_id": pane_id,
+        "agent": "kimi",
+        "agent_session_id": session_id,
+        "complete": False,
+        "reason": "no_completed_turn",
+    }
+
+
+def infer_kimi_turn_from_workspace(pane: dict[str, Any], pane_id: str) -> dict[str, Any]:
+    cwd = str(pane.get("foreground_cwd") or pane.get("cwd") or "").strip()
+    if not cwd:
+        return unavailable("kimi_workspace_unavailable", pane_id=pane_id, agent="kimi")
+    try:
+        listing = cached_pane_list_json()
+    except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired, OSError):
+        return unavailable("herdr_list_failed", pane_id=pane_id, agent="kimi")
+    panes = listing.get("result", {}).get("panes")
+    peers = [
+        item
+        for item in panes
+        if isinstance(item, dict)
+        and str(item.get("agent") or "").lower() == "kimi"
+        and str(item.get("foreground_cwd") or item.get("cwd") or "") == cwd
+    ] if isinstance(panes, list) else []
+    if len(peers) != 1 or str(peers[0].get("pane_id") or "") != pane_id:
+        return unavailable("ambiguous_kimi_workspace", pane_id=pane_id, agent="kimi")
+    resolved = _kimi_session_path_for_pane(pane)
+    if resolved is None:
+        return unavailable("kimi_session_not_found", pane_id=pane_id, agent="kimi")
+    path, session_id = resolved
+    return result_turn(extract_kimi_turn(path, pane_id, session_id))
+
+
 def pane_from_list(pane_id: str) -> dict[str, Any] | None:
     try:
         data = cached_pane_list_json()
@@ -1854,6 +2141,8 @@ def pane_turn(pane_id: str) -> dict[str, Any]:
     # 529), so trusting it here would read a dead session and stop delivery.
     if agent == "claude":
         return infer_claude_turn_from_visible_pane(pane, pane_id)
+    if agent == "kimi":
+        return infer_kimi_turn_from_workspace(pane, pane_id)
     session = pane.get("agent_session") if isinstance(pane.get("agent_session"), dict) else {}
     session_id = str(session.get("value") or "")
     if not session_id:

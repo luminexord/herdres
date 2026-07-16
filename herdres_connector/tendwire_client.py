@@ -81,6 +81,15 @@ _COMMAND_ACCEPTED_RESULT_FIELDS = frozenset(
         "observed_turn_state",
     }
 )
+_DECISION_ACCEPTED_RESULT_FIELDS = frozenset(
+    {
+        "target",
+        "decision",
+        "delivery_state",
+        "transport_state",
+        "observed_pending_state",
+    }
+)
 _COMMAND_TERMINAL_REJECTION_STATUSES = frozenset(
     {
         "rejected",
@@ -360,30 +369,58 @@ def _validated_decision_response(
     response: dict[str, Any],
     request: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Validate only the response fields promised by the parallel Tendwire contract.
-
-    Correlation fields are checked when Tendwire includes them, while ``ok`` and
-    ``status`` remain the required cross-version core.
-    """
-
-    if public_prune(response) != response or type(response.get("ok")) is not bool:
+    if (
+        set(response) != _COMMAND_RESPONSE_FIELDS
+        or type(response.get("schema_version")) is not int
+        or response["schema_version"] != 2
+        or response.get("request_id") != request["request_id"]
+        or response.get("action") != "answer_decision"
+        or response.get("dry_run") is not False
+        or type(response.get("ok")) is not bool
+        or not isinstance(response.get("status"), str)
+        or not response["status"]
+        or response.get("disposition") not in _COMMAND_DISPOSITIONS
+        or not isinstance(response.get("warnings"), list)
+        or any(not isinstance(item, str) for item in response["warnings"])
+        or public_prune(response) != response
+    ):
         return None
-    status = response.get("status")
-    if not isinstance(status, str) or not status:
-        return None
-    if "request_id" in response and response.get("request_id") != request["request_id"]:
-        return None
-    if "action" in response and response.get("action") != "answer_decision":
-        return None
-    disposition = response.get("disposition") if "disposition" in response else None
+    status = response["status"]
+    disposition = response["disposition"]
     if response["ok"] is True:
-        if status != "accepted":
+        result = response.get("result")
+        target = result.get("target") if isinstance(result, dict) else None
+        decision = result.get("decision") if isinstance(result, dict) else None
+        if (
+            status != "accepted"
+            or disposition != "terminal_accepted"
+            or response.get("error") is not None
+            or not isinstance(result, dict)
+            or set(result) != _DECISION_ACCEPTED_RESULT_FIELDS
+            or not isinstance(target, dict)
+            or set(target) != {"worker_id"}
+            or target.get("worker_id") != request["target"]["worker_id"]
+            or not isinstance(decision, dict)
+            or set(decision) != {"decision_ref"}
+            or decision.get("decision_ref") != request["params"]["decision_ref"]
+            or result.get("delivery_state") != "submitted"
+            or result.get("transport_state") != "submitted"
+            or result.get("observed_pending_state") != "pending_observation"
+        ):
             return None
-        # Mirror the paired producer exactly: an accepted decision is always terminal.
-        return response if disposition in (None, "terminal_accepted") else None
-    if status not in _DECISION_FAILURE_STATUSES:
+        return response
+    error = response.get("error")
+    if (
+        status not in _DECISION_FAILURE_STATUSES
+        or disposition not in {"no_receipt", "terminal_rejected"}
+        or response.get("result") is not None
+        or not isinstance(error, dict)
+        or error.get("code") != status
+        or not isinstance(error.get("message"), str)
+        or not error["message"]
+    ):
         return None
-    return response if disposition in (None, "no_receipt", "terminal_rejected") else None
+    return response
 
 
 def _is_private_ingress_env_key(key: str) -> bool:
