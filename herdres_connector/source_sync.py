@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from . import accounts, config, speech, state
+from . import accounts, config, decisions, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import (
@@ -4868,6 +4868,49 @@ def _sync_topic_pinned_statuses(store: dict[str, Any], runtime: SyncRuntime, *, 
     return updated
 
 
+def _deliver_decisions(
+    store: dict[str, Any],
+    pending_payload: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    yield_barrier: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Reconcile decision keyboards without ever endangering the sync pass.
+
+    Callback mutations and the normal source shim both hold ``state_lock``.
+    The late barrier commits our preceding source work, briefly lets a queued
+    callback save its decision bucket, and reloads the whole store before this
+    step.  Therefore the shim's final save cannot clobber a callback that used
+    the lock; only an out-of-contract writer that bypasses the shared lock can
+    race the whole-file state save.
+    """
+
+    if not config.remote_decisions_enabled():
+        return {"enabled": False, "changed": False, "posted": 0, "retracted": 0}
+    if not decisions.needs_sync(store, pending_payload):
+        return {"enabled": True, "changed": False, "posted": 0, "retracted": 0}
+    try:
+        if yield_barrier is not None:
+            yield_barrier()
+        return decisions.sync_decisions(
+            store,
+            pending_payload,
+            runtime.telegram,
+            chat_id=chat_id,
+            dry_run=runtime.dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001 - decisions are additive to the core sync loop
+        return {
+            "enabled": True,
+            "changed": False,
+            "posted": 0,
+            "retracted": 0,
+            "status": "failed",
+            "error": compact_ws(exc, 240),
+        }
+
+
 def _tendwire_non_success(runtime: SyncRuntime, status: str) -> dict[str, Any]:
     return {
         "ok": False,
@@ -5048,6 +5091,13 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             )
         except _TurnContentError as retry_exc:
             return _tendwire_non_success(runtime, retry_exc.status)
+    decision_result = _deliver_decisions(
+        store,
+        pending_payload,
+        runtime,
+        chat_id=chat_id,
+        yield_barrier=yield_barrier,
+    )
     routing_repaired += _repair_space_mode_routing_state(store)
     snapshot_worker_ids = {compact_ws(worker.get("id"), 160) for worker in _workers(snapshot)}
     snapshot_worker_ids.discard("")
@@ -5063,6 +5113,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         or topic_cleanup.get("changed")
         or message_bindings
         or reconciled_turn_plans
+        or decision_result.get("changed")
     )
     if config.pinned_status_enabled():
         pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
@@ -5123,6 +5174,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "content_pages": int(turn_counts["content_pages"])
         + int(turn_final_result.get("content_pages") or 0),
         "turn_content_outcomes": _turn_content_outcomes(turns_payload),
+        "remote_decisions": decision_result,
         "tendwire_turn_final": turn_final_result,
         "tendwire_outbox": outbox_result,
     }

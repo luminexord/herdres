@@ -17,11 +17,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from herdres_connector import config, ingress_requests, speech, state
+from herdres_connector import config, decisions, ingress_requests, speech, state
 from herdres_connector.ingress_identity import derive_telegram_request_id, load_request_id_key, validate_request_id
 from herdres_connector.managed_bots import MANAGER_BOT_KIND, managed_bot_kind_for_key, managed_bot_kind_for_username, managed_bot_tokens
 from herdres_connector.safe import sanitize_text
 from herdres_connector.telegram_delivery import TelegramClient
+from herdres_connector.tendwire_client import TendwireClient
 
 LONG_POLL_SECONDS = int(os.getenv("HERDRES_GATEWAY_LONG_POLL_SECONDS", "50"))
 CHILD_POLL_SECONDS = int(os.getenv("HERDRES_GATEWAY_CHILD_POLL_SECONDS", "0"))
@@ -482,6 +483,76 @@ def handle_message(
     return CHECKPOINT_ADVANCE
 
 
+def handle_callback_query(
+    query: dict[str, Any],
+    token: str,
+    *,
+    update_id: int,
+    receiver_id: str,
+    request_id_key: bytes,
+) -> str:
+    """Handle one inline decision callback and always dismiss its spinner."""
+
+    callback_id = str(query.get("id") or "")
+    telegram = TelegramClient(token=token)
+    toast = "Unknown action."
+    checkpoint = CHECKPOINT_ADVANCE
+    try:
+        message = query.get("message") if isinstance(query.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        user = query.get("from") if isinstance(query.get("from"), dict) else {}
+        with state.state_lock():
+            store = state.load_state()
+            configured_chat = config.telegram_chat_id(store)
+            if configured_chat and str(chat.get("id") or "") != configured_chat:
+                toast = "This button is not available here."
+            elif not _owner_allowed(
+                store,
+                str(user.get("id") or ""),
+                bool(user.get("is_bot")),
+            ):
+                toast = "You are not allowed to answer this prompt."
+            elif not config.remote_decisions_enabled():
+                toast = "Remote decisions are disabled."
+            else:
+                data = str(query.get("data") or "")
+                if data.startswith(decisions.CALLBACK_PREFIX):
+                    request_id = derive_telegram_request_id(
+                        request_id_key,
+                        receiver_id=receiver_id,
+                        update_id=update_id,
+                        chat_id=chat.get("id"),
+                        message_id=message.get("message_id"),
+                    )
+                    result = decisions.handle_callback(
+                        store,
+                        callback_data=data,
+                        topic_id=_message_thread_id(message, store),
+                        chat_id=str(chat.get("id") or ""),
+                        request_id=request_id,
+                        telegram=telegram,
+                        tendwire=TendwireClient(),
+                    )
+                    toast = sanitize_text(result.get("toast") or "Done.", 180)
+                    if result.get("changed"):
+                        state.save_state(store)
+                else:
+                    toast = "Unknown action."
+    except Exception as exc:  # noqa: BLE001 - preserve the update across uncertain local failure
+        toast = "Could not process that choice."
+        # Retain the update on unexpected state/transport loss. A submit retry
+        # reuses the same derived request ID, so Tendwire can deduplicate it.
+        checkpoint = CHECKPOINT_RETRY
+        log(f"callback failed: {type(exc).__name__}: {sanitize_text(str(exc), 160)}")
+    finally:
+        if callback_id:
+            try:
+                telegram.answer_callback_query(callback_id, toast)
+            except Exception as exc:  # noqa: BLE001 - answering the toast is best effort
+                log(f"answerCallbackQuery failed: {sanitize_text(str(exc), 160)}")
+    return checkpoint
+
+
 def handle_update(
     update: dict[str, Any],
     token: str,
@@ -490,12 +561,25 @@ def handle_update(
     request_id_key: bytes,
     bot_key: str | None = None,
 ) -> str:
-    message = update.get("message") if isinstance(update.get("message"), dict) else None
-    if message is None:
-        return CHECKPOINT_ADVANCE
     update_id = update.get("update_id")
     if type(update_id) is not int or update_id < 0:
-        _drop(message, "invalid_update_id")
+        log("drop update: invalid_update_id")
+        return CHECKPOINT_ADVANCE
+    callback_query = (
+        update.get("callback_query")
+        if isinstance(update.get("callback_query"), dict)
+        else None
+    )
+    if callback_query is not None:
+        return handle_callback_query(
+            callback_query,
+            token,
+            update_id=update_id,
+            receiver_id=receiver_id,
+            request_id_key=request_id_key,
+        )
+    message = update.get("message") if isinstance(update.get("message"), dict) else None
+    if message is None:
         return CHECKPOINT_ADVANCE
     return handle_message(
         message,

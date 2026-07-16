@@ -196,6 +196,17 @@ def ack_on_send(env: Any | None = None) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def remote_decisions_enabled(env: Any | None = None) -> bool:
+    """Whether structured Claude prompts get remote inline controls.
+
+    Default on.  An empty value deliberately means the default rather than an
+    accidental opt-out, matching the connector's other default-on flags.
+    """
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_REMOTE_DECISIONS", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 
 def reap_closed_worker_topics(env: Any | None = None) -> bool:
     """Worker mode only: delete the Telegram topic of a worker that has durably FINISHED and left the

@@ -15,7 +15,7 @@ import sys
 import time
 from typing import Any, Callable
 
-from herdres_connector import config, doctor, speech, state
+from herdres_connector import config, decisions, doctor, speech, state
 from herdres_connector import ingress_requests
 from herdres_connector.ingress_identity import validate_request_id
 from herdres_connector.managed_bots import managed_bot_kind_for_username
@@ -482,6 +482,42 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 return _submit_ingress_command_record(store, record)
         elif changed:
             state.save_state(store)
+        # A write-in is deliberately two-step: only a prior inline-button tap
+        # arms plain text. Slash commands (especially /send) bypass this branch
+        # unchanged and retain their normal Tendwire instruction semantics.
+        plain_text = str(payload.get("text") or "").strip()
+        decision_record = decisions.active_decision(
+            store, str(payload.get("topic_id") or "")
+        )
+        if (
+            config.remote_decisions_enabled()
+            and plain_text
+            and not plain_text.startswith("/")
+            and isinstance(decision_record, dict)
+            and decision_record.get("await_freeform") is True
+        ):
+            if record is None or not ingress_request_id:
+                return {
+                    "handled": True,
+                    "reply": SAFE_SEND_FAILURE_REPLY,
+                    "status": "invalid_request",
+                }
+            decision_result = decisions.handle_freeform(
+                store,
+                topic_id=str(payload.get("topic_id") or ""),
+                text=plain_text,
+                request_id=ingress_request_id,
+                telegram=TelegramClient(token=config.telegram_token()),
+                tendwire=TendwireClient(),
+                chat_id=config.telegram_chat_id(store),
+            )
+            if decision_result.get("handled"):
+                return _local_ingress_outcome(
+                    store,
+                    record,
+                    reason=f"decision write-in {decision_result.get('status') or 'handled'}",
+                    reply=str(decision_result.get("reply") or ""),
+                )
         _key, entry = state.find_entry_by_thread(store, str(payload.get("topic_id") or ""))
         if entry is None:
             if record is not None:
