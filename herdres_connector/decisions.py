@@ -24,6 +24,9 @@ SUBMIT_TOKEN = "__submit__"
 SUPPORTED_KINDS = frozenset({"single", "multi", "plan"})
 RESERVED_OPTION_REFS = frozenset({CUSTOM_TOKEN, SUBMIT_TOKEN})
 CALLBACK_DATA_LIMIT = 64
+ANSWER_IN_PROGRESS_REPLY = (
+    "That prompt is being answered right now — try again in a moment."
+)
 
 
 def _ref56(decision_id: str) -> str:
@@ -445,6 +448,22 @@ def _submit(
             "status": "accepted",
         }
     status = str(result.get("status") or "answer_failed")
+    if status == "answer_in_progress":
+        if callback:
+            _send_failure(
+                telegram,
+                chat_id,
+                topic_id,
+                record,
+                ANSWER_IN_PROGRESS_REPLY,
+            )
+        return {
+            "handled": True,
+            "changed": False,
+            "toast": ANSWER_IN_PROGRESS_REPLY,
+            "reply": ANSWER_IN_PROGRESS_REPLY,
+            "status": status,
+        }
     if status == "decision_not_pending":
         note = "⚠️ That prompt is no longer pending (answered at the desk?)"
         _retract(telegram, chat_id, topic_id, record, note)

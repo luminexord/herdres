@@ -131,6 +131,7 @@ _DECISION_FAILURE_STATUSES = frozenset(
         "unknown_worker",
     }
 )
+_DECISION_IN_PROGRESS_STATUS = "answer_in_progress"
 _PRIVATE_INGRESS_ENV_KEYS = frozenset(
     {
         "BOT_TOKEN",
@@ -399,7 +400,9 @@ def _validated_decision_response(
             or set(result) != _DECISION_ACCEPTED_RESULT_FIELDS
             or not isinstance(target, dict)
             or set(target) != {"worker_id"}
-            or target.get("worker_id") != request["target"]["worker_id"]
+            or not isinstance(target.get("worker_id"), str)
+            or not target["worker_id"].strip()
+            or target["worker_id"] != request["target"]["worker_id"]
             or not isinstance(decision, dict)
             or set(decision) != {"decision_ref"}
             or decision.get("decision_ref") != request["params"]["decision_ref"]
@@ -411,16 +414,21 @@ def _validated_decision_response(
         return response
     error = response.get("error")
     if (
-        status not in _DECISION_FAILURE_STATUSES
-        or disposition not in {"no_receipt", "terminal_rejected"}
-        or response.get("result") is not None
+        response.get("result") is not None
         or not isinstance(error, dict)
         or error.get("code") != status
         or not isinstance(error.get("message"), str)
         or not error["message"]
     ):
         return None
-    return response
+    if status == _DECISION_IN_PROGRESS_STATUS:
+        return response if disposition in {"no_receipt", "in_progress"} else None
+    if (
+        status in _DECISION_FAILURE_STATUSES
+        and disposition in {"no_receipt", "terminal_rejected"}
+    ):
+        return response
+    return None
 
 
 def _is_private_ingress_env_key(key: str) -> bool:
