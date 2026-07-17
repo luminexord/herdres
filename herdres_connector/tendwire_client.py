@@ -402,12 +402,13 @@ def _validated_decision_response(
             or set(target) != {"worker_id"}
             or not isinstance(target.get("worker_id"), str)
             or not target["worker_id"].strip()
+            or target["worker_id"] != request["target"]["worker_id"]
             or not isinstance(decision, dict)
             or set(decision) != {"decision_ref"}
             or decision.get("decision_ref") != request["params"]["decision_ref"]
             or result.get("delivery_state") != "submitted"
             or result.get("transport_state") != "submitted"
-            or not isinstance(result.get("observed_pending_state"), str)
+            or result.get("observed_pending_state") != "pending_observation"
         ):
             return None
         return response

@@ -80,6 +80,57 @@ def _run_paired_cli(
     return completed, body
 
 
+def test_nine_choice_single_adapter_shape_is_accepted_by_paired_tendwire(
+    tmp_path,
+):
+    source = _paired_tendwire_source()
+    env = _paired_env(tmp_path, source)
+    turn = {
+        "pending_decision": {
+            "decision_id": "toolu_nine",
+            "kind": "AskUserQuestion",
+            "prompt": "Choose one",
+            "mode": "buttons",
+            "multi_select": False,
+            "options": [
+                {"id": str(index), "label": f"Option {index}"}
+                for index in range(1, 10)
+            ]
+            + [
+                {
+                    "id": "custom",
+                    "label": "Write a different answer",
+                }
+            ],
+        }
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json,sys;"
+                "from tendwire.backends.herdr_turns import "
+                "_pending_observation_from_turn;"
+                "o=_pending_observation_from_turn(json.load(sys.stdin));"
+                "print(json.dumps({'kind':o.kind,"
+                "'option_count':len(o.decision_options)}))"
+            ),
+        ],
+        input=json.dumps(turn, separators=(",", ":")).encode("utf-8"),
+        capture_output=True,
+        check=False,
+        env=env,
+        timeout=20,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+    assert json.loads(completed.stdout.decode("utf-8")) == {
+        "kind": "open_prompt",
+        "option_count": 9,
+    }
+
+
 def test_real_tendwire_cli_exit_code_matches_command_ok(tmp_path):
     source = _paired_tendwire_source()
     env = _paired_env(tmp_path, source)
@@ -460,3 +511,47 @@ def test_decision_response_accepts_answer_in_progress_verbatim(
 
     assert result == body
     assert tendwire_client.command_process_ambiguous(result) is False
+
+
+@pytest.mark.parametrize(
+    "result_update",
+    [
+        {"target": {"worker_id": "wrong-worker"}},
+        {"observed_pending_state": "not-pending"},
+    ],
+    ids=["wrong-worker", "wrong-pending-state"],
+)
+def test_decision_response_rejects_unbound_accepted_result(
+    monkeypatch,
+    result_update,
+):
+    body = _decision_envelope(
+        ok=True,
+        status="accepted",
+        disposition="terminal_accepted",
+        result={
+            "target": {"worker_id": "worker-public"},
+            "decision": {"decision_ref": "decision-public"},
+            "delivery_state": "submitted",
+            "transport_state": "submitted",
+            "observed_pending_state": "pending_observation",
+            **result_update,
+        },
+    )
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "tw")
+    monkeypatch.setattr(
+        tendwire_client.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(body, separators=(",", ":")).encode("utf-8"),
+            stderr=b"",
+        ),
+    )
+
+    result = TendwireClient().command(_decision_request())
+
+    assert result["status"] == "request_state_uncertain"
+    assert result.get("disposition") is None
+    assert result.get("result") is None
+    assert tendwire_client.command_process_ambiguous(result) is True
