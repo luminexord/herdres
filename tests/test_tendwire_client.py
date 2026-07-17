@@ -784,7 +784,7 @@ def test_turns_requests_and_requires_v2_content_schema(client_runner):
         "--schema-version",
         "2",
         "--limit",
-        "100",
+        "250",
         "--json",
     ]
     assert calls[0][1]["input"] is None
@@ -851,7 +851,7 @@ def test_turns_follows_bounded_list_cursors(client_runner):
         "--schema-version",
         "2",
         "--limit",
-        "100",
+        "250",
         "--json",
         "--cursor",
         "twlist1.public",

@@ -23,10 +23,10 @@ class TendwireError(RuntimeError):
 
 TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
-# Use Tendwire's documented default page size. The daemon still enforces its
-# fixed response-byte budget, while halving subprocess round trips compared
-# with the former 50-row page on retained-history stores.
-TURN_LIST_PAGE_LIMIT = 100
+# Use Tendwire's documented maximum row limit. The daemon still enforces its
+# fixed response-byte budget, while minimizing subprocess round trips on
+# retained-history stores.
+TURN_LIST_PAGE_LIMIT = 250
 TURN_LIST_MAX_PAGES = 256
 CONNECTOR_PREPARE_SCHEMA_VERSION = 1
 TURN_FINAL_CONNECTOR = "turn-final"
