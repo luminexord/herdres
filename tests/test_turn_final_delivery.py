@@ -3184,6 +3184,60 @@ def test_temporarily_unroutable_root_defers_before_pages_or_plan(
     assert telegram.edited == []
 
 
+def test_prepare_exception_defers_source_root_then_retries_once(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+
+    class PrepareFailsOnce(TurnFinalTendwire):
+        def __init__(self, row):
+            super().__init__(
+                row,
+                emit_ready=True,
+                turn_schema_version=2,
+            )
+            self.prepare_failure_armed = True
+
+        def connector_prepare_begin(self, **kwargs):
+            if self.prepare_failure_armed:
+                self.prepare_failure_armed = False
+                raise RuntimeError("transient prepare transport failure")
+            return super().connector_prepare_begin(**kwargs)
+
+    tendwire = PrepareFailsOnce(
+        _turn_row(
+            "turn-prepare-retry",
+            "twrev1.prepare_retry",
+            "deliver exactly once after retry",
+        )
+    )
+    tendwire.turns = lambda: {
+        "ok": True,
+        "schema_version": 2,
+        "turns": [],
+    }
+    telegram = DeletingTelegram()
+    store = _store()
+
+    first = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    assert first["tendwire_turn_final"]["deferred"] == 1
+    assert first["tendwire_turn_final"]["operations"] == 0
+    assert tendwire.defer_calls[-1][1] == "transient_delivery"
+    assert telegram.sent == []
+    assert telegram.edited == []
+
+    second = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    assert second["tendwire_turn_final"]["delivered"] == 1
+    assert second["tendwire_turn_final"]["acked"] == 1
+    assert second["tendwire_turn_final"]["operations"] == 1
+    assert len(telegram.sent) + len(telegram.edited) == 1
+
+
 def test_conflicting_job_attached_source_fails_before_second_page_or_send(
     monkeypatch,
 ):

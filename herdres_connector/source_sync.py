@@ -3938,6 +3938,17 @@ def _drain_turn_final(
                     runtime, ref, f"{exc.status}: {exc}", result
                 )
                 break
+            except Exception:
+                # No provider operation has started. Release the source root
+                # instead of leaving a silent loop failure leased until expiry.
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "transient_delivery",
+                    result,
+                    delay_seconds=1,
+                )
+                break
             result["content_pages"] += page_calls
             source_identity = str(payload["final_identity"])
             cached_source = materialized_sources.get(
@@ -3965,6 +3976,17 @@ def _drain_turn_final(
             except _TurnContentError as exc:
                 _fail_turn_final(
                     runtime, ref, f"{exc.status}: {exc}", result
+                )
+                break
+            except Exception:
+                # Plan preparation is idempotent and still precedes Telegram.
+                # A transport/process failure is therefore safe to retry.
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "transient_delivery",
+                    result,
+                    delay_seconds=1,
                 )
                 break
             result["content_pages"] += staged_pages
