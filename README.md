@@ -46,7 +46,7 @@ Telegram topic input
   -> tendwire command --json
 
 herdres sync
-  -> tendwire snapshot/turns/pending/connector
+  -> tendwire snapshot/turn.delta/pending/connector
   -> Telegram topics/messages/pinned status
 ```
 
@@ -54,6 +54,39 @@ Only `HERDRES_TENDWIRE_MODE=source` is supported. Herdres obtains observations,
 turns, pending interactions, and connector work only through Tendwire's public
 source/command interfaces; it makes no direct Herdr API, process, or socket
 calls.
+
+### Low-latency turn synchronization
+
+After one bounded, cursor-resumable bootstrap, Herdres persists Tendwire's
+`twdelta1.*` watermark and local schema-v2 turn projection under the single
+`tendwire_delta_sync` state key. Normal syncs read one bounded `turn.delta`
+page, so an unchanged pass does not traverse retained turn history or fetch
+canonical content. Each continuation cursor is saved only after its page has
+been applied; the watermark advances only after the final page of the frozen
+batch is applied and fsynced through the existing atomic state writer.
+
+Timeouts, EOF, and malformed frames never trigger a second turn observation.
+An invalid or expired watermark starts one fresh bounded bootstrap, resuming
+the same cursor after ambiguity. Only Tendwire's explicit unsupported-method
+outcome activates legacy full polling. Oversized or repeatedly failing
+bootstraps also degrade to full polling and expose the reason in sync/doctor
+health instead of crashing the loop.
+
+The change feed is observation-only. Working rows may update local cards, but
+completed rows still require the existing `turn_final` outbox before Telegram
+delivery. Descriptor-only rows never synthesize content; Goal 05 paging remains
+the canonical rendering path. A bounded full reconciliation runs hourly by
+default as a safety net. Configure the page/repair behavior with:
+
+```text
+HERDRES_TENDWIRE_TIMEOUT_SECONDS=30
+HERDRES_TENDWIRE_DELTA_LIMIT=100
+HERDRES_TENDWIRE_FULL_RECONCILE_SECONDS=3600
+HERDRES_TENDWIRE_FORCE_FULL_RECONCILE=0
+```
+
+Set the reconciliation interval to `0` to disable scheduled full traversal;
+set the force flag for an explicit reconciliation pass.
 
 ### Inbound command identity and redelivery
 

@@ -929,6 +929,18 @@ def _working_delivery_item(item: dict[str, Any]) -> dict[str, Any]:
 def _turn_is_working_placeholder(item: dict[str, Any], entry: dict[str, Any]) -> bool:
     if item.get("assistant_stream_text") or item.get("assistant_final_text"):
         return False
+    content = item.get("content")
+    fields = content.get("fields") if isinstance(content, dict) else None
+    if isinstance(fields, dict) and any(
+        isinstance(descriptor, dict)
+        and descriptor.get("availability") == "complete"
+        and descriptor.get("inline") is False
+        for descriptor in fields.values()
+    ):
+        # A bounded delta can intentionally carry descriptors only. Treating
+        # that as an empty turn would fabricate a Working card and bypass the
+        # canonical Goal 05 content path.
+        return False
     if bool(item.get("complete")):
         return False
     if not _turn_id(item):
@@ -3845,6 +3857,7 @@ def _drain_turn_final(
     *,
     chat_id: str,
     max_operations: int,
+    turn_projection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = {
         "enabled": runtime.with_outbox,
@@ -4109,6 +4122,14 @@ def _drain_turn_final(
             item = _turn_item_by_revision(
                 turns_payload, revision
             )
+            if item is None and isinstance(turn_projection, Mapping):
+                matches = [
+                    candidate
+                    for candidate in turn_projection.values()
+                    if isinstance(candidate, dict)
+                    and _content_revision(candidate) == revision
+                ]
+                item = matches[0] if len(matches) == 1 else None
             if item is None:
                 _fail_turn_final(
                     runtime,
@@ -5056,12 +5077,498 @@ def _herdr_backend_explicitly_unhealthy(snapshot: dict[str, Any]) -> bool:
     return False
 
 
+_DELTA_STATE_KEY = "tendwire_delta_sync"
+_DELTA_SCHEMA_VERSION = 1
+_DELTA_PROJECTION_SCHEMA_VERSION = 2
+_DELTA_TRANSPORT_STATUS = "transport_ambiguous"
+_DELTA_WATERMARK_RECOVERY = frozenset(
+    {"invalid_watermark", "expired_watermark"}
+)
+_DELTA_TERMINAL_FALLBACK = frozenset(
+    {
+        "bootstrap_too_large",
+        "cross_host_watermark",
+        "incompatible_schema",
+        "invalid_cursor",
+        "expired_cursor",
+    }
+)
+
+
+def _new_delta_state(*, reason: str, now: float) -> dict[str, Any]:
+    return {
+        "schema_version": _DELTA_SCHEMA_VERSION,
+        "projection_schema_version": _DELTA_PROJECTION_SCHEMA_VERSION,
+        "status": "bootstrapping",
+        "watermark": None,
+        "pending_cursor": None,
+        "projection": {},
+        "bootstrap_state": {
+            "reason": reason,
+            "attempt": 1,
+            "pages_applied": 0,
+            "started_at": now,
+        },
+        "failure_count": 0,
+        "last_full_reconcile_at": now,
+    }
+
+
+def _delta_state(store: dict[str, Any], *, now: float) -> dict[str, Any]:
+    current = store.get(_DELTA_STATE_KEY)
+    if not isinstance(current, dict):
+        current = _new_delta_state(reason="first_activation", now=now)
+        store[_DELTA_STATE_KEY] = current
+        return current
+    if (
+        current.get("schema_version") != _DELTA_SCHEMA_VERSION
+        or current.get("projection_schema_version")
+        != _DELTA_PROJECTION_SCHEMA_VERSION
+        or not isinstance(current.get("projection"), dict)
+    ):
+        current = _new_delta_state(reason="invalid_local_state", now=now)
+        store[_DELTA_STATE_KEY] = current
+    return current
+
+
+def _delta_health(delta: dict[str, Any] | None, *, now: float | None = None) -> dict[str, Any]:
+    if not isinstance(delta, dict):
+        return {"state": "fallback", "watermark_age_seconds": None, "last_batch": {}}
+    clock = time.time() if now is None else now
+    updated_at = delta.get("watermark_updated_at")
+    age: int | None = None
+    if isinstance(updated_at, (int, float)) and not isinstance(updated_at, bool):
+        age = max(0, int(clock - float(updated_at)))
+    raw_batch = delta.get("last_batch")
+    batch: dict[str, Any] = {}
+    if isinstance(raw_batch, dict):
+        for key in (
+            "mode",
+            "changes_returned",
+            "upserts",
+            "removals",
+            "journal_rows_scanned",
+            "projection_rows_read",
+            "duration_ms",
+        ):
+            value = raw_batch.get(key)
+            if isinstance(value, str) and key == "mode":
+                batch[key] = compact_ws(value, 24)
+            elif isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                batch[key] = value
+    state_name = str(delta.get("status") or "bootstrapping")
+    result: dict[str, Any] = {
+        "state": state_name
+        if state_name in {"active", "fallback", "bootstrapping"}
+        else "bootstrapping",
+        "watermark_age_seconds": age,
+        "last_batch": batch,
+    }
+    health_flag = delta.get("health_flag")
+    if isinstance(health_flag, str) and health_flag:
+        result["health_flag"] = compact_ws(health_flag, 80)
+    return result
+
+
+def _delta_full_reconcile_due(delta: dict[str, Any], *, now: float) -> bool:
+    if delta.get("status") != "active" or delta.get("pending_cursor"):
+        return False
+    if config.tendwire_force_full_reconcile():
+        return True
+    interval = config.tendwire_full_reconcile_seconds()
+    if interval <= 0:
+        return False
+    try:
+        last_at = float(delta.get("last_full_reconcile_at") or 0)
+    except (TypeError, ValueError):
+        last_at = 0
+    return now - last_at >= interval
+
+
+def _delta_error_code(payload: dict[str, Any]) -> str:
+    status = str(payload.get("status") or "").strip().lower()
+    error = payload.get("error")
+    if not status and isinstance(error, dict):
+        status = str(error.get("code") or "").strip().lower()
+    return status
+
+
+def _validate_delta_page(
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    if (
+        payload.get("schema_version") != _DELTA_SCHEMA_VERSION
+        or payload.get("projection_schema_version")
+        != _DELTA_PROJECTION_SCHEMA_VERSION
+        or payload.get("mode") not in {"bootstrap", "changes"}
+        or type(payload.get("has_more")) is not bool
+        or not isinstance(payload.get("changes"), list)
+        or not isinstance(payload.get("host_id"), str)
+        or not payload.get("host_id")
+    ):
+        raise _TurnContentError(
+            "delta_protocol_ambiguous",
+            "Tendwire turn.delta returned a malformed envelope",
+        )
+    has_more = payload["has_more"]
+    next_cursor = payload.get("next_cursor")
+    checkpoint = payload.get("checkpoint")
+    if has_more:
+        if (
+            not isinstance(next_cursor, str)
+            or not next_cursor.startswith("twdeltac1.")
+            or checkpoint is not None
+        ):
+            raise _TurnContentError(
+                "delta_protocol_ambiguous",
+                "Tendwire turn.delta returned invalid continuation state",
+            )
+    elif (
+        next_cursor is not None
+        or not isinstance(checkpoint, str)
+        or not checkpoint.startswith("twdelta1.")
+    ):
+        raise _TurnContentError(
+            "delta_protocol_ambiguous",
+            "Tendwire turn.delta returned invalid checkpoint state",
+        )
+    upserts: list[dict[str, Any]] = []
+    removals: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_change in payload["changes"]:
+        if not isinstance(raw_change, dict):
+            raise _TurnContentError(
+                "delta_protocol_ambiguous",
+                "Tendwire turn.delta returned a malformed change",
+            )
+        op = raw_change.get("op")
+        change_turn_id = raw_change.get("turn_id")
+        if (
+            not isinstance(change_turn_id, str)
+            or not change_turn_id
+            or change_turn_id in seen
+        ):
+            raise _TurnContentError(
+                "delta_protocol_ambiguous",
+                "Tendwire turn.delta returned an invalid turn identity",
+            )
+        seen.add(change_turn_id)
+        if op == "upsert":
+            raw_turn = raw_change.get("turn")
+            if not isinstance(raw_turn, dict):
+                raise _TurnContentError(
+                    "delta_protocol_ambiguous",
+                    "Tendwire turn.delta upsert omitted its projection",
+                )
+            turn = _validate_turn_row(raw_turn)
+            if _turn_id(turn) != change_turn_id:
+                raise _TurnContentError(
+                    "delta_protocol_ambiguous",
+                    "Tendwire turn.delta projection identity mismatched",
+                )
+            upserts.append(turn)
+        elif op == "remove":
+            if not isinstance(raw_change.get("removed_at"), str):
+                raise _TurnContentError(
+                    "delta_protocol_ambiguous",
+                    "Tendwire turn.delta removal omitted its timestamp",
+                )
+            removals.append(raw_change)
+        else:
+            raise _TurnContentError(
+                "delta_protocol_ambiguous",
+                "Tendwire turn.delta returned an unsupported operation",
+            )
+    aggregate: dict[str, int] = {}
+    raw_aggregate = payload.get("aggregate")
+    if isinstance(raw_aggregate, dict):
+        for key in (
+            "journal_rows_scanned",
+            "projection_rows_read",
+            "changes_returned",
+            "duration_ms",
+        ):
+            value = raw_aggregate.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                aggregate[key] = value
+    aggregate.setdefault("changes_returned", len(upserts) + len(removals))
+    return upserts, removals, aggregate
+
+
+def _clear_removed_turn_state(store: dict[str, Any], turn_id: str) -> bool:
+    changed = False
+    for bucket_name in ("panes", "spaces"):
+        bucket = store.get(bucket_name)
+        if not isinstance(bucket, dict):
+            continue
+        for entry in bucket.values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("last_stream_turn_id") == turn_id:
+                changed = _clear_stream_delivery_keys(entry) or changed
+            if entry.get("last_turn_id") == turn_id:
+                changed = _clear_final_delivery_keys(entry) or changed
+    bindings = state.message_bindings(store)
+    for message_id, binding in list(bindings.items()):
+        if isinstance(binding, dict) and str(binding.get("turn_id") or "") == turn_id:
+            bindings.pop(message_id, None)
+            changed = True
+    return changed
+
+
+def _clear_projection_stale_cards(store: dict[str, Any], projection: dict[str, Any]) -> int:
+    cleared = 0
+    known = set(projection)
+    candidates: set[str] = set()
+    for bucket_name in ("panes", "spaces"):
+        bucket = store.get(bucket_name)
+        if not isinstance(bucket, dict):
+            continue
+        for entry in bucket.values():
+            if not isinstance(entry, dict):
+                continue
+            for key in ("last_stream_turn_id", "last_turn_id"):
+                value = entry.get(key)
+                if isinstance(value, str) and value and value not in known:
+                    candidates.add(value)
+    for turn_id in candidates:
+        cleared += int(_clear_removed_turn_state(store, turn_id))
+    return cleared
+
+
+def _set_delta_fallback(delta: dict[str, Any], reason: str) -> None:
+    delta["status"] = "fallback"
+    delta["pending_cursor"] = None
+    delta["bootstrap_state"] = None
+    delta["health_flag"] = f"turn_delta_{compact_ws(reason, 48)}"
+
+
+def _begin_delta_rebootstrap(delta: dict[str, Any], *, reason: str, now: float) -> None:
+    previous = delta.get("bootstrap_state")
+    attempt = (
+        int(previous.get("attempt") or 0) + 1
+        if isinstance(previous, dict)
+        else 1
+    )
+    delta.update(
+        {
+            "status": "bootstrapping",
+            "watermark": None,
+            "pending_cursor": None,
+            "projection": {},
+            "bootstrap_state": {
+                "reason": reason,
+                "attempt": attempt,
+                "pages_applied": 0,
+                "started_at": now,
+            },
+            "failure_count": 0,
+            "health_flag": f"turn_delta_{reason}",
+        }
+    )
+
+
+def _observe_turn_delta(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    now: float,
+) -> dict[str, Any]:
+    def transition(result: dict[str, Any]) -> dict[str, Any]:
+        if runtime.checkpoint is not None:
+            runtime.checkpoint()
+        return result
+
+    delta = _delta_state(store, now=now)
+    if delta.get("status") == "fallback":
+        return {"kind": "full", "delta": delta, "reason": "fallback"}
+    if _delta_full_reconcile_due(delta, now=now):
+        return {"kind": "full", "delta": delta, "reason": "reconcile"}
+    cursor = delta.get("pending_cursor")
+    watermark = delta.get("watermark")
+    if not isinstance(cursor, str) or not cursor:
+        cursor = None
+    if not isinstance(watermark, str) or not watermark:
+        watermark = None
+    page = runtime.tendwire.turn_delta(
+        cursor=cursor,
+        watermark=None if cursor is not None else watermark,
+        limit=config.tendwire_delta_limit(),
+    )
+    if page.get("ok") is False:
+        status = _delta_error_code(page) or "delta_failed"
+        delta["last_error_at"] = now
+        if status == "unsupported_method":
+            _set_delta_fallback(delta, "unsupported")
+            return transition(
+                {"kind": "full", "delta": delta, "reason": "unsupported"}
+            )
+        if status == _DELTA_TRANSPORT_STATUS:
+            delta["health_flag"] = "turn_delta_transport_ambiguous"
+            return transition(
+                {"kind": "empty", "delta": delta, "reason": status}
+            )
+        if status in _DELTA_WATERMARK_RECOVERY and cursor is None and watermark is not None:
+            _begin_delta_rebootstrap(delta, reason=status, now=now)
+            return transition(
+                {"kind": "empty", "delta": delta, "reason": status}
+            )
+        if status in _DELTA_TERMINAL_FALLBACK or (
+            status in _DELTA_WATERMARK_RECOVERY
+            and delta.get("status") == "bootstrapping"
+        ):
+            _set_delta_fallback(delta, status)
+            return transition(
+                {"kind": "full", "delta": delta, "reason": status}
+            )
+        failure_count = int(delta.get("failure_count") or 0) + 1
+        delta["failure_count"] = failure_count
+        delta["health_flag"] = f"turn_delta_{compact_ws(status, 48)}"
+        if failure_count >= 2:
+            _set_delta_fallback(delta, f"repeated_{status}")
+            return transition(
+                {"kind": "full", "delta": delta, "reason": status}
+            )
+        return transition(
+            {"kind": "empty", "delta": delta, "reason": status}
+        )
+    try:
+        upserts, removals, aggregate = _validate_delta_page(page)
+    except _TurnContentError:
+        delta["last_error_at"] = now
+        delta["health_flag"] = "turn_delta_transport_ambiguous"
+        return transition(
+            {
+                "kind": "empty",
+                "delta": delta,
+                "reason": "delta_protocol_ambiguous",
+            }
+        )
+    expected_mode = "bootstrap" if watermark is None and delta.get("status") == "bootstrapping" else "changes"
+    if page.get("mode") != expected_mode:
+        delta["last_error_at"] = now
+        delta["health_flag"] = "turn_delta_transport_ambiguous"
+        return transition(
+            {
+                "kind": "empty",
+                "delta": delta,
+                "reason": "delta_protocol_ambiguous",
+            }
+        )
+    projection = delta["projection"]
+    removed_ids: list[str] = []
+    for row in upserts:
+        projection[_turn_id(row)] = row
+    for removal in removals:
+        turn_id = str(removal["turn_id"])
+        projection.pop(turn_id, None)
+        removed_ids.append(turn_id)
+    delta["failure_count"] = 0
+    delta.pop("last_error_at", None)
+    delta["last_batch"] = {
+        "mode": str(page["mode"]),
+        **aggregate,
+        "upserts": len(upserts),
+        "removals": len(removals),
+    }
+    return {
+        "kind": "delta",
+        "delta": delta,
+        "page": page,
+        "upserts": upserts,
+        "removed_ids": removed_ids,
+    }
+
+
+def _finish_delta_page(
+    store: dict[str, Any],
+    observation: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    now: float,
+) -> int:
+    delta = observation["delta"]
+    page = observation["page"]
+    changed = 0
+    for turn_id in observation["removed_ids"]:
+        changed += int(_clear_removed_turn_state(store, turn_id))
+    bootstrap = delta.get("bootstrap_state")
+    if isinstance(bootstrap, dict):
+        bootstrap["pages_applied"] = int(bootstrap.get("pages_applied") or 0) + 1
+    if page["has_more"]:
+        delta["pending_cursor"] = page["next_cursor"]
+    else:
+        delta["watermark"] = page["checkpoint"]
+        delta["pending_cursor"] = None
+        delta["status"] = "active"
+        delta["bootstrap_state"] = None
+        delta["watermark_updated_at"] = now
+        delta["last_full_reconcile_at"] = (
+            now if page["mode"] == "bootstrap" else delta.get("last_full_reconcile_at", now)
+        )
+        delta.pop("health_flag", None)
+        if page["mode"] == "bootstrap":
+            changed += _clear_projection_stale_cards(store, delta["projection"])
+    if runtime.checkpoint is not None:
+        runtime.checkpoint()
+    return changed
+
+
+def _apply_full_reconciliation(
+    store: dict[str, Any],
+    delta: dict[str, Any],
+    turns_payload: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    now: float,
+) -> int:
+    projection = {_turn_id(row): row for row in _turns(turns_payload) if _turn_id(row)}
+    delta["projection"] = projection
+    delta["last_full_reconcile_at"] = now
+    delta["last_batch"] = {
+        "mode": "full_reconcile",
+        "changes_returned": len(projection),
+        "upserts": len(projection),
+        "removals": 0,
+    }
+    changed = _clear_projection_stale_cards(store, projection)
+    if runtime.checkpoint is not None:
+        runtime.checkpoint()
+    return changed
+
+
 def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     config.require_source_mode()
+    observed_at = time.time()
+    delta_observation: dict[str, Any] | None = None
+    delta: dict[str, Any] | None = None
     snapshot = runtime.tendwire.snapshot()
     if _herdr_backend_explicitly_unhealthy(snapshot):
         return _tendwire_non_success(runtime, "tendwire_herdr_unhealthy")
-    turns_payload = runtime.tendwire.turns()
+    if hasattr(runtime.tendwire, "turn_delta"):
+        delta_observation = _observe_turn_delta(
+            store,
+            runtime,
+            now=observed_at,
+        )
+        delta = delta_observation["delta"]
+        if delta_observation["kind"] == "full":
+            turns_payload = runtime.tendwire.turns()
+        elif delta_observation["kind"] == "delta":
+            turns_payload = {
+                "schema_version": TURN_SCHEMA_VERSION,
+                "turns": delta_observation["upserts"],
+            }
+        else:
+            turns_payload = {
+                "schema_version": TURN_SCHEMA_VERSION,
+                "turns": [],
+            }
+    else:
+        # Compatibility for embedders and old test doubles. The production
+        # TendwireClient always exposes turn_delta; only its explicit
+        # unsupported-method outcome activates the durable fallback lane.
+        turns_payload = runtime.tendwire.turns()
     pending_payload = runtime.tendwire.pending()
     for name, payload in (("snapshot", snapshot), ("turns", turns_payload), ("pending", pending_payload)):
         if payload.get("ok") is False:
@@ -5121,12 +5628,19 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         else None
     )
     try:
+        feed_turns_payload = (
+            {"schema_version": TURN_SCHEMA_VERSION, "turns": []}
+            if delta_observation is not None
+            and delta_observation.get("kind") == "delta"
+            and delta_observation.get("page", {}).get("mode") == "bootstrap"
+            else turns_payload
+        )
         turn_counts = (
             {"feed_sent": 0, "sent": 0, "updated": 0, "content_pages": 0}
             if bootstrapped
             else _sync_turns(
                 store,
-                turns_payload,
+                feed_turns_payload,
                 pending_payload,
                 runtime,
                 chat_id=chat_id,
@@ -5193,6 +5707,28 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         pinned_changed = False
         topic_pinned_updated = 0
     changed = changed or pinned_changed or bool(topic_pinned_updated)
+    delta_card_updates = 0
+    if delta_observation is not None:
+        if delta_observation["kind"] == "delta":
+            delta_card_updates = _finish_delta_page(
+                store,
+                delta_observation,
+                runtime,
+                now=observed_at,
+            )
+        elif delta_observation["kind"] == "full":
+            delta_card_updates = _apply_full_reconciliation(
+                store,
+                delta_observation["delta"],
+                turns_payload,
+                runtime,
+                now=observed_at,
+            )
+        elif runtime.checkpoint is not None:
+            # Persist bootstrapping/fallback health transitions without ever
+            # issuing a second turn observation in this pass.
+            runtime.checkpoint()
+        changed = True
     turn_final_result = {
         "enabled": runtime.with_outbox,
         "polled": 0,
@@ -5215,6 +5751,12 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             runtime,
             chat_id=chat_id,
             max_operations=remaining,
+            turn_projection=(
+                delta.get("projection")
+                if isinstance(delta, dict)
+                and isinstance(delta.get("projection"), dict)
+                else None
+            ),
         )
         remaining = max(0, remaining - int(turn_final_result["operations"]))
         outbox_result = drain_outbox(
@@ -5239,6 +5781,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "sent": turn_counts["sent"],
         "routing_repaired": routing_repaired,
         "turn_updates": turn_counts["updated"],
+        **(
+            {"tendwire_delta_sync": _delta_health(delta, now=observed_at)}
+            if delta is not None
+            else {}
+        ),
         "bootstrap_seen": bootstrapped,
         "message_bindings": message_bindings,
         "topic_cleanup": topic_cleanup,

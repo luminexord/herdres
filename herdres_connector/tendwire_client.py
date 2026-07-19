@@ -28,6 +28,8 @@ TURN_CONTENT_SCHEMA_VERSION = 1
 # retained-history stores.
 TURN_LIST_PAGE_LIMIT = 250
 TURN_LIST_MAX_PAGES = 256
+TURN_DELTA_SCHEMA_VERSION = 1
+TURN_DELTA_PROJECTION_SCHEMA_VERSION = 2
 CONNECTOR_PREPARE_SCHEMA_VERSION = 1
 TURN_FINAL_CONNECTOR = "turn-final"
 CONNECTOR_PREPARE_MAX_SPANS = 256
@@ -482,7 +484,12 @@ def _schema_error(
 
 @dataclass(frozen=True)
 class TendwireClient:
-    timeout: float = 30.0
+    timeout: float | None = None
+
+    def _timeout_seconds(self) -> float:
+        if self.timeout is not None:
+            return max(1.0, float(self.timeout))
+        return config.tendwire_timeout_seconds()
 
     def _explicit_parts(self) -> tuple[list[str] | None, dict[str, str]]:
         explicit = os.getenv("HERDRES_TENDWIRE_BIN") or os.getenv("TENDWIRE_BIN")
@@ -533,6 +540,7 @@ class TendwireClient:
         timeout: float | None = None,
         protocol: bool = False,
         preserve_page_text: bool = False,
+        strict_stdout: bool = False,
         post_start_uncertain: bool = False,
     ) -> dict[str, Any]:
         if input_json is not None and input_bytes is not None:
@@ -546,7 +554,7 @@ class TendwireClient:
                 input=stdin,
                 capture_output=True,
                 env=self._env(),
-                timeout=timeout or self.timeout,
+                timeout=timeout if timeout is not None else self._timeout_seconds(),
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
@@ -569,7 +577,7 @@ class TendwireClient:
                 return _request_state_uncertain(input_json)
             return {"ok": False, "status": "subprocess_failed", "error": sanitize_text(str(exc), 300)}
         try:
-            if preserve_page_text or post_start_uncertain:
+            if preserve_page_text or strict_stdout or post_start_uncertain:
                 stdout = proc.stdout.decode("utf-8")
             else:
                 stdout = proc.stdout.decode("utf-8", "replace")
@@ -691,6 +699,72 @@ class TendwireClient:
             required_key="supported_content_schema_version",
             required_version=TURN_CONTENT_SCHEMA_VERSION,
         )
+
+    def turn_delta(
+        self,
+        *,
+        watermark: str | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Read exactly one bounded turn-change page.
+
+        This method deliberately never retries. Once the child process starts,
+        timeout, EOF, invalid UTF-8, and malformed output are transport
+        ambiguity rather than permission to observe the source a second time.
+        """
+        if watermark is not None and cursor is not None:
+            raise ValueError("watermark and cursor are mutually exclusive")
+        page_limit = config.tendwire_delta_limit() if limit is None else int(limit)
+        if not 1 <= page_limit <= 500:
+            raise ValueError("turn delta limit must be between 1 and 500")
+        args = [
+            "turn",
+            "delta",
+            "--json",
+            "--limit",
+            str(page_limit),
+        ]
+        # The shipped Goal 13 Tendwire CLI fixes projection schema v2 for this
+        # subcommand; unlike turn.list it does not accept --schema-version.
+        if watermark is not None:
+            args.extend(("--watermark", str(watermark)))
+        elif cursor is not None:
+            args.extend(("--cursor", str(cursor)))
+        result = self.call(args, protocol=True, strict_stdout=True)
+        error = result.get("error")
+        error_code = (
+            str(error.get("code") or "").strip().lower()
+            if isinstance(error, dict)
+            else ""
+        )
+        status = str(result.get("status") or "").strip().lower()
+        if status in {"unsupported_method", "unknown_method"} or error_code in {
+            "unsupported_method",
+            "unknown_method",
+        }:
+            return {
+                "ok": False,
+                "status": "unsupported_method",
+                "schema_version": TURN_DELTA_SCHEMA_VERSION,
+                "projection_schema_version": TURN_DELTA_PROJECTION_SCHEMA_VERSION,
+            }
+        if status in {
+            "timeout",
+            "subprocess_failed",
+            "invalid_utf8_stdout",
+            "non_json_stdout",
+            "non_object_json",
+            "daemon_timeout",
+            "daemon_protocol_error",
+        }:
+            return {
+                "ok": False,
+                "status": "transport_ambiguous",
+                "transport_status": status,
+                "error": sanitize_text(result.get("error") or status, 300),
+            }
+        return result
 
     def turn_content_get(
         self,

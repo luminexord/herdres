@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import config, state
 from .safe import sanitize_text
 from .tendwire_client import TendwireClient
 
@@ -52,11 +53,67 @@ def tendwire_backend(client: TendwireClient | None = None) -> dict[str, Any]:
     return {"ok": bool(ok), "status": "healthy" if ok else "unhealthy"}
 
 
+def tendwire_delta_feed() -> dict[str, Any]:
+    try:
+        store = state.load_state()
+    except RuntimeError as exc:
+        return {
+            "ok": False,
+            "state": "fallback",
+            "watermark_age_seconds": None,
+            "last_batch": {},
+            "health_flag": sanitize_text(str(exc), 80),
+        }
+    delta = store.get("tendwire_delta_sync")
+    if not isinstance(delta, dict):
+        return {
+            "ok": True,
+            "state": "bootstrapping",
+            "watermark_age_seconds": None,
+            "last_batch": {},
+        }
+    status = str(delta.get("status") or "bootstrapping")
+    if status not in {"active", "fallback", "bootstrapping"}:
+        status = "bootstrapping"
+    updated_at = delta.get("watermark_updated_at")
+    age: int | None = None
+    if isinstance(updated_at, (int, float)) and not isinstance(updated_at, bool):
+        age = max(0, int(time.time() - float(updated_at)))
+    raw_batch = delta.get("last_batch")
+    batch: dict[str, Any] = {}
+    if isinstance(raw_batch, dict):
+        for key in (
+            "mode",
+            "changes_returned",
+            "upserts",
+            "removals",
+            "journal_rows_scanned",
+            "projection_rows_read",
+            "duration_ms",
+        ):
+            value = raw_batch.get(key)
+            if key == "mode" and isinstance(value, str):
+                batch[key] = sanitize_text(value, 24)
+            elif isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                batch[key] = value
+    result: dict[str, Any] = {
+        "ok": True,
+        "state": status,
+        "watermark_age_seconds": age,
+        "last_batch": batch,
+    }
+    flag = delta.get("health_flag")
+    if isinstance(flag, str) and flag:
+        result["health_flag"] = sanitize_text(flag, 80)
+    return result
+
+
 def run_doctor(client: TendwireClient | None = None) -> dict[str, Any]:
     checks = {
         "source_services": source_services(),
         "legacy_topic_timer": legacy_timer(),
         "sqlite_integrity": sqlite_integrity(),
         "tendwire_backend": tendwire_backend(client),
+        "tendwire_delta_feed": tendwire_delta_feed(),
     }
     return {"ok": all(item.get("ok") for item in checks.values()), "checks": checks}
