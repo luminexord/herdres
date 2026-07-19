@@ -3794,7 +3794,7 @@ def test_source_less_plan_recovers_exact_v2_root_by_stable_key_after_owner_churn
 
 
 def test_turn_final_lease_seconds_default_and_bounds():
-    assert config.tendwire_turn_final_lease_seconds(env={}) == 900
+    assert config.tendwire_turn_final_lease_seconds(env={}) == 60
     assert (
         config.tendwire_turn_final_lease_seconds(
             env={
@@ -3825,7 +3825,7 @@ def test_turn_final_lease_seconds_default_and_bounds():
                 "HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "invalid"
             }
         )
-        == 900
+        == 60
     )
 
 

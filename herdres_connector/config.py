@@ -83,13 +83,13 @@ def tendwire_turn_final_lease_seconds(env: Any | None = None) -> int:
             str(
                 source.get(
                     "HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS",
-                    "900",
+                    "60",
                 )
-                or "900"
+                or "60"
             )
         )
     except (TypeError, ValueError):
-        return 900
+        return 60
     return min(3600, max(60, value))
 
 

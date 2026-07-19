@@ -223,9 +223,10 @@ The paired gate must establish all of the following:
   Plain-message fallback keeps an independent 4,096-safe plan. Successful topic
   creation is checkpointed immediately so a later sync failure cannot create a
   duplicate.
-- `HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` defaults or falls back to 900
-  when unset, empty, or invalid, and clamps configured values to 60 through
-  3600 seconds. One root lease covers canonical paging, plan staging, and ACK.
+- `HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` defaults or falls back to 60 when
+  unset, empty, or invalid, and clamps configured values to 60 through 3600
+  seconds. This bounds recovery after an ambiguous connector poll response;
+  durable checkpoints preserve restart-safe plan and provider progress.
 - Stable job-key receipts progress strictly through reservation, Telegram
   apply, optional old-slot retirement, Tendwire ACK, and `acknowledged`, with a
   durable private checkpoint after every provider-side transition and after

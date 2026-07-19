@@ -737,13 +737,13 @@ def test_path_qualified_env_wrapper_cannot_reintroduce_private_secret(monkeypatc
 def test_turn_final_lease_seconds_default_invalid_and_bounds():
     lease_seconds = tendwire_client.config.tendwire_turn_final_lease_seconds
 
-    assert lease_seconds(env={}) == 900
+    assert lease_seconds(env={}) == 60
     assert lease_seconds(
         env={"HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": ""}
-    ) == 900
+    ) == 60
     assert lease_seconds(
         env={"HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "invalid"}
-    ) == 900
+    ) == 60
     assert lease_seconds(
         env={"HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "120"}
     ) == 120
@@ -753,6 +753,30 @@ def test_turn_final_lease_seconds_default_invalid_and_bounds():
     assert lease_seconds(
         env={"HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS": "3601"}
     ) == 3600
+
+
+def test_turn_final_poll_uses_connector_process_timeout(client_runner):
+    client, calls, responses = client_runner
+    responses.append(
+        {
+            "body": {
+                "schema_version": 1,
+                "ok": True,
+                "status": "ok",
+                "items": [],
+            }
+        }
+    )
+
+    result = client.turn_final_poll(limit=1, lease_seconds=60)
+
+    assert result["ok"] is True
+    assert len(calls) == 1
+    assert (
+        calls[0][1]["timeout"]
+        == tendwire_client.CONNECTOR_PROCESS_TIMEOUT_SECONDS
+        == 20
+    )
 
 
 def test_turns_requests_and_requires_v2_content_schema(client_runner):

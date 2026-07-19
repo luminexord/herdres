@@ -246,11 +246,11 @@ into that smaller transport. The presentation version binds the selected
 transport and ranges so an older boundary-sized plan cannot be replayed as the
 current layout.
 
-`HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` covers the complete root operation,
-including canonical paging and prepare begin/part/commit staging as well as
-ACK. It defaults to 900 seconds; unset, empty, or invalid values use the same
-900-second fallback, and configured values are clamped to 60 through 3600
-seconds.
+`HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` bounds recovery after a connector
+poll response is lost. It defaults to 60 seconds; unset, empty, or invalid
+values use the same 60-second fallback, and configured values are clamped to 60
+through 3600 seconds. Durable plan and job checkpoints make expiry and restart
+recovery idempotent without repeating a proven Telegram operation.
 
 An ordinary restart retains the private Herdres state and Tendwire database.
 Herdres resumes proven provider work under a fresh transient ref without

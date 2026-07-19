@@ -32,6 +32,7 @@ CONNECTOR_PREPARE_SCHEMA_VERSION = 1
 TURN_FINAL_CONNECTOR = "turn-final"
 CONNECTOR_PREPARE_MAX_SPANS = 256
 CONNECTOR_PREPARE_MAX_REQUEST_BYTES = 64 * 1024
+CONNECTOR_PROCESS_TIMEOUT_SECONDS = 20
 _PUBLIC_PROTOCOL_TOKEN_KEYS = {
     "failed_plan_token",
     "plan_token",
@@ -803,7 +804,7 @@ class TendwireClient:
                 "--lease-seconds",
                 str(lease_seconds),
             ],
-            timeout=10,
+            timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS,
         )
 
     def connector_ack(self, ref: str, response: dict[str, Any] | None = None, *, name: str = "attention") -> dict[str, Any]:
@@ -819,7 +820,10 @@ class TendwireClient:
         ]
         if response is not None:
             args.extend(["--response-json", json.dumps(public_prune(response), separators=(",", ":"))])
-        return self.call(args, timeout=10)
+        return self.call(
+            args,
+            timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS,
+        )
 
     def connector_fail(self, ref: str, error: str, *, name: str = "attention") -> dict[str, Any]:
         return self.call(
@@ -835,7 +839,7 @@ class TendwireClient:
                 "--error",
                 sanitize_text(error, 240),
             ],
-            timeout=10,
+            timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS,
         )
 
     @staticmethod
@@ -865,7 +869,7 @@ class TendwireClient:
         result = self.call(
             ["connector", "prepare", "--name", TURN_FINAL_CONNECTOR, "--json"],
             input_json=request,
-            timeout=10,
+            timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS,
             protocol=True,
         )
         return self._validate_protocol_schema(result)
@@ -1009,7 +1013,7 @@ class TendwireClient:
                 "--lease-seconds",
                 str(lease_seconds),
             ],
-            timeout=10,
+            timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS,
             protocol=True,
         )
         return self._validate_protocol_schema(result)
@@ -1023,7 +1027,13 @@ class TendwireClient:
                     json.dumps(_protocol_prune(response), separators=(",", ":"), ensure_ascii=False),
                 ]
             )
-        return self._validate_protocol_schema(self.call(args, timeout=10, protocol=True))
+        return self._validate_protocol_schema(
+            self.call(
+                args,
+                timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS,
+                protocol=True,
+            )
+        )
 
     def turn_final_fail(self, ref: str, reason: str) -> dict[str, Any]:
         result = self.call(
@@ -1037,7 +1047,7 @@ class TendwireClient:
                 "--reason",
                 sanitize_text(reason, 240),
             ],
-            timeout=10,
+            timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS,
             protocol=True,
         )
         return self._validate_protocol_schema(result)
@@ -1064,4 +1074,10 @@ class TendwireClient:
             args.extend(["--available-at", str(available_at)])
         if delay_seconds is not None:
             args.extend(["--delay-seconds", str(delay_seconds)])
-        return self._validate_protocol_schema(self.call(args, timeout=10, protocol=True))
+        return self._validate_protocol_schema(
+            self.call(
+                args,
+                timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS,
+                protocol=True,
+            )
+        )
