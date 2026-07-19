@@ -79,14 +79,15 @@ the canonical rendering path. A bounded full reconciliation runs hourly by
 default as a safety net. Configure the page/repair behavior with:
 
 ```text
-HERDRES_TENDWIRE_TIMEOUT_SECONDS=30
+HERDRES_TENDWIRE_TIMEOUT_SECONDS=60
 HERDRES_TENDWIRE_DELTA_LIMIT=100
 HERDRES_TENDWIRE_FULL_RECONCILE_SECONDS=3600
 HERDRES_TENDWIRE_FORCE_FULL_RECONCILE=0
 ```
 
-Set the reconciliation interval to `0` to disable scheduled full traversal;
-set the force flag for an explicit reconciliation pass.
+Zero, negative, or invalid reconciliation intervals use the hourly default so
+the retained projection stays bounded. Set the force flag for an explicit
+reconciliation pass.
 
 ### Inbound command identity and redelivery
 
@@ -177,11 +178,12 @@ the complete value must survive public pruning unchanged. It then validates the
 whole disposition tuple:
 
 - `terminal_accepted` requires `ok: true`, status `accepted`, a null error, and
-  an exact result containing only `target`, `delivery_state`,
-  `transport_state`, `target_state_at_send`, and `observed_turn_state`. The
+  a result containing `target`, `delivery_state`, `transport_state`,
+  `target_state_at_send`, and `observed_turn_state`, plus an optional nonempty
+  public `turn_id`. The
   target contains only the correlated `worker_id`, delivery and transport are
   `submitted`, target state is nonempty, and observed turn state is
-  `pending_observation`.
+  `pending_observation`, `observed`, or `complete`.
 - Every nonaccepted tuple requires `ok: false` and an error whose code equals
   status and whose message is nonempty.
 - `in_progress` permits only status `pending`.

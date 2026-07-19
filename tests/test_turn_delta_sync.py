@@ -5,10 +5,10 @@ import time
 
 import pytest
 
-from herdres_connector import doctor
+from herdres_connector import config, doctor, state
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from test_source_only import FakeTelegram, FakeTendwire, _store
-from test_turn_final_delivery import TurnFinalTendwire, _turn_row
+from test_turn_final_delivery import TurnFinalTendwire, _stable_key, _turn_row
 
 
 HOST = "host-public"
@@ -238,6 +238,79 @@ def test_batch_watermark_advances_only_on_final_applied_page():
     assert second["status"] == "active"
 
 
+def test_multi_page_bootstrap_marks_every_page_before_redelivery_guard_completes(
+    monkeypatch,
+):
+    first_row = _turn_row(
+        "turn-bootstrap-first",
+        "twrev1.bootstrap_first",
+        None,
+        user="first historical prompt",
+    )
+    first_row["assistant_stream_text"] = "first historical progress"
+    second_row = _turn_row(
+        "turn-bootstrap-second",
+        "twrev1.bootstrap_second",
+        None,
+        user="second historical prompt",
+    )
+    second_row.update(
+        {
+            "worker_id": "worker-2",
+            "worker_fingerprint": "fp-2",
+            "stable_key": _stable_key("worker-2", "fp-2"),
+            "assistant_stream_text": "second historical progress",
+        }
+    )
+    workers = [
+        {
+            "id": "worker-1",
+            "name": "Alpha",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "fp-1",
+        },
+        {
+            "id": "worker-2",
+            "name": "Beta",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "fp-2",
+        },
+    ]
+    tendwire = DeltaTendwire(
+        [
+            _page(
+                [_upsert(first_row)],
+                more=True,
+                cursor="twdeltac1.bootstrap_next",
+                checkpoint=None,
+            ),
+            _page([_upsert(second_row)], checkpoint="twdelta1.bootstrap_done"),
+        ],
+        turns={"schema_version": 1, "turns": [second_row, first_row]},
+        workers=workers,
+    )
+    store = _store()
+    store.pop("tendwired_bootstrap_complete")
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(tendwire, telegram, with_outbox=False)
+
+    sync_once(store, runtime)
+    assert "tendwired_bootstrap_complete" not in store
+    assert store["tendwired_bootstrap_seen"] == 1
+
+    sync_once(store, runtime)
+    assert store["tendwired_bootstrap_complete"] is True
+    assert store["tendwired_bootstrap_seen"] == 2
+
+    monkeypatch.setenv("HERDRES_TENDWIRE_FORCE_FULL_RECONCILE", "1")
+    sync_once(store, runtime)
+
+    assert tendwire.turn_calls == 1
+    assert telegram.sent == []
+
+
 def test_transport_ambiguity_never_bootstraps_or_traverses():
     tendwire = DeltaTendwire(
         [{"ok": False, "status": "transport_ambiguous"}]
@@ -355,6 +428,15 @@ def test_explicit_full_reconcile_uses_bounded_full_lane_without_delta(monkeypatc
     assert result["tendwire_delta_sync"]["last_batch"]["mode"] == "full_reconcile"
 
 
+def test_zero_full_reconcile_interval_retains_hourly_projection_bound():
+    assert (
+        config.tendwire_full_reconcile_seconds(
+            {"HERDRES_TENDWIRE_FULL_RECONCILE_SECONDS": "0"}
+        )
+        == 3600
+    )
+
+
 def test_remove_clears_local_card_state_without_deleting_telegram_history():
     row = _turn_row("turn-remove", "twrev1.remove", None, user="prompt")
     tendwire = DeltaTendwire(
@@ -400,7 +482,65 @@ def test_remove_clears_local_card_state_without_deleting_telegram_history():
     assert telegram.api_calls == []
 
 
-def test_descriptor_only_upsert_does_not_fabricate_or_fetch_content():
+def test_remove_follows_superseding_turn_instead_of_orphaning_card():
+    row = _turn_row("turn-old", "twrev1.old", None, user="prompt")
+    tendwire = DeltaTendwire(
+        [
+            _page(
+                [
+                    {
+                        "op": "remove",
+                        "turn_id": row["id"],
+                        "removed_at": "2030-01-01T00:00:00Z",
+                        "superseded_by_turn_id": "turn-successor",
+                    }
+                ],
+                mode="changes",
+                checkpoint="twdelta1.superseded",
+            )
+        ]
+    )
+    store = _store()
+    store["tendwire_delta_sync"] = _active_delta(row)
+    entry = {
+        "tendwire_worker_id": "worker-1",
+        "last_stream_turn_id": row["id"],
+        "last_stream_hash": "old",
+        "last_stream_message_id": "901",
+        "last_turn_id": row["id"],
+        "last_clean_hash": "old-final",
+        "last_clean_message_id": "902",
+    }
+    store["panes"]["worker-1"] = entry
+    state.bind_message_to_worker(
+        store,
+        "901",
+        entry,
+        topic_id="77",
+        kind="working",
+        turn_id=row["id"],
+    )
+    state.bind_message_to_worker(
+        store,
+        "902",
+        entry,
+        topic_id="77",
+        kind="final",
+        turn_id=row["id"],
+    )
+
+    sync_once(
+        store,
+        SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
+    )
+
+    assert entry["last_stream_turn_id"] == "turn-successor"
+    assert entry["last_turn_id"] == "turn-successor"
+    assert state.message_bindings(store)["901"]["turn_id"] == "turn-successor"
+    assert state.message_bindings(store)["902"]["turn_id"] == "turn-successor"
+
+
+def test_paginated_prompt_descriptor_allows_working_without_content_fetch():
     row = _turn_row(
         "turn-descriptor",
         "twrev1.descriptor",
@@ -414,19 +554,91 @@ def test_descriptor_only_upsert_does_not_fabricate_or_fetch_content():
             "first_cursor": "twcur1.descriptor_user",
         }
     )
-    tendwire = DeltaTendwire([_page([_upsert(row)])])
+    tendwire = DeltaTendwire(
+        [_page([_upsert(row)], mode="changes")]
+    )
     telegram = FakeTelegram()
+    store = _store()
+    store["tendwire_delta_sync"] = _active_delta()
 
     result = sync_once(
-        _store(),
+        store,
         SyncRuntime(tendwire, telegram, with_outbox=False),
     )
 
-    assert result["feed_sent"] == 0
+    assert result["feed_sent"] == 1
     assert result["content_pages"] == 0
     assert tendwire.content_calls == 0
-    assert telegram.sent == []
+    assert len(telegram.sent) == 1
+    assert "Work is in progress." in telegram.sent[0][1]
     assert telegram.edited == []
+
+
+def test_changes_page_crash_replay_uses_durable_card_identity_without_resend():
+    row = _turn_row(
+        "turn-crash-replay",
+        "twrev1.crash_replay",
+        None,
+        user="prompt",
+    )
+    row["assistant_stream_text"] = "durable progress"
+    page = _page(
+        [_upsert(row)],
+        mode="changes",
+        checkpoint="twdelta1.after_delivery",
+    )
+    telegram = FakeTelegram()
+    base = _store()
+    sync_once(
+        base,
+        SyncRuntime(
+            DeltaTendwire(
+                [_page([], mode="changes", checkpoint="twdelta1.warm")]
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+    base["tendwire_delta_sync"] = _active_delta()
+    persisted = deepcopy(base)
+    first_store = deepcopy(base)
+
+    def crash_after_delivery_checkpoint():
+        persisted.clear()
+        persisted.update(deepcopy(first_store))
+        assert (
+            persisted["tendwire_delta_sync"]["watermark"]
+            == "twdelta1.current"
+        )
+        raise RuntimeError("crash before cursor save")
+
+    with pytest.raises(RuntimeError, match="crash before cursor save"):
+        sync_once(
+            first_store,
+            SyncRuntime(
+                DeltaTendwire([page]),
+                telegram,
+                with_outbox=False,
+                checkpoint=crash_after_delivery_checkpoint,
+            ),
+        )
+
+    assert len(telegram.sent) == 1
+    restarted = deepcopy(persisted)
+    sync_once(
+        restarted,
+        SyncRuntime(
+            DeltaTendwire([page]),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert len(telegram.sent) == 1
+    assert (
+        restarted["tendwire_delta_sync"]["watermark"]
+        == "twdelta1.after_delivery"
+    )
 
 
 def test_complete_delta_upsert_delivers_once_only_through_turn_final_outbox():
