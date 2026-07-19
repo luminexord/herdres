@@ -56,6 +56,47 @@ def tendwire_db_path(env: Any | None = None) -> Path:
     return Path(source.get("HERDRES_TENDWIRE_DB_PATH", source.get("TENDWIRE_DB_PATH", DEFAULT_TENDWIRE_DB_PATH))).expanduser()
 
 
+def tendwire_timeout_seconds(env: Any | None = None) -> float:
+    source = os.environ if env is None else env
+    try:
+        value = float(str(source.get("HERDRES_TENDWIRE_TIMEOUT_SECONDS", "30") or "30"))
+    except (TypeError, ValueError):
+        return 30.0
+    return min(300.0, max(1.0, value))
+
+
+def tendwire_delta_limit(env: Any | None = None) -> int:
+    source = os.environ if env is None else env
+    try:
+        value = int(str(source.get("HERDRES_TENDWIRE_DELTA_LIMIT", "100") or "100"))
+    except (TypeError, ValueError):
+        return 100
+    return min(500, max(1, value))
+
+
+def tendwire_full_reconcile_seconds(env: Any | None = None) -> int:
+    source = os.environ if env is None else env
+    try:
+        value = int(
+            str(
+                source.get(
+                    "HERDRES_TENDWIRE_FULL_RECONCILE_SECONDS",
+                    "3600",
+                )
+                or "3600"
+            )
+        )
+    except (TypeError, ValueError):
+        return 3600
+    return min(604800, max(0, value))
+
+
+def tendwire_force_full_reconcile(env: Any | None = None) -> bool:
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_TENDWIRE_FORCE_FULL_RECONCILE", "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def request_id_key_path(env: Any | None = None) -> Path:
     source = os.environ if env is None else env
     configured = source.get("HERDRES_REQUEST_ID_KEY_PATH")

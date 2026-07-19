@@ -111,6 +111,82 @@ def _assert_private_process_ambiguity(result):
     assert tendwire_client.command_process_ambiguous(serialized) is False
 
 
+def test_turn_delta_uses_one_bounded_cli_call_and_configured_timeout(
+    client_runner, monkeypatch
+):
+    client, calls, responses = client_runner
+    monkeypatch.setenv("HERDRES_TENDWIRE_TIMEOUT_SECONDS", "17.5")
+    responses.append(
+        {
+            "body": {
+                "schema_version": 1,
+                "projection_schema_version": 2,
+                "host_id": "host-public",
+                "mode": "changes",
+                "changes": [],
+                "has_more": False,
+                "next_cursor": None,
+                "checkpoint": "twdelta1.next",
+                "aggregate": {"changes_returned": 0},
+            }
+        }
+    )
+
+    result = client.turn_delta(watermark="twdelta1.current", limit=23)
+
+    assert result["checkpoint"] == "twdelta1.next"
+    assert len(calls) == 1
+    assert calls[0][0] == [
+        "tw",
+        "turn",
+        "delta",
+        "--json",
+        "--limit",
+        "23",
+        "--watermark",
+        "twdelta1.current",
+    ]
+    assert calls[0][1]["timeout"] == 17.5
+
+
+def test_turn_delta_normalizes_only_explicit_unknown_method_to_unsupported(
+    client_runner,
+):
+    client, calls, responses = client_runner
+    responses.append(
+        {
+            "returncode": 1,
+            "body": {
+                "schema_version": 1,
+                "ok": False,
+                "error": {"code": "unknown_method", "message": "unknown method"},
+            },
+        }
+    )
+
+    result = client.turn_delta()
+
+    assert result["status"] == "unsupported_method"
+    assert len(calls) == 1
+
+
+def test_turn_delta_timeout_is_transport_ambiguous_and_never_retried(monkeypatch):
+    calls = []
+    monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "tw")
+
+    def timeout(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise tendwire_client.subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(tendwire_client.subprocess, "run", timeout)
+
+    result = TendwireClient(timeout=4).turn_delta()
+
+    assert result["status"] == "transport_ambiguous"
+    assert result["transport_status"] == "timeout"
+    assert len(calls) == 1
+
+
 def test_command_serializes_only_exact_allowlisted_public_request(client_runner):
     client, calls, responses = client_runner
     responses.append({"body": _command_response()})
