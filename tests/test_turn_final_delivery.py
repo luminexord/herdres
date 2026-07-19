@@ -1086,6 +1086,70 @@ def test_paged_20k_final_edits_working_then_sends_ordered_bound_parts(monkeypatc
         assert herdres._worker_entry_from_reply(store, {"reply_to_message_id": message_id, "topic_id": "77"})[1] is not None
 
 
+def test_final_edits_exact_command_predecessor_working_card(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+
+    class PredecessorTendwire(TurnFinalTendwire):
+        predecessor_turn_id = ""
+
+        def _ready_payload(self):
+            payload = super()._ready_payload()
+            if self.predecessor_turn_id:
+                payload["working_predecessor_turn_id"] = (
+                    self.predecessor_turn_id
+                )
+            return payload
+
+    working_turn_id = "turn-command-working"
+    working = _turn_row(
+        working_turn_id,
+        "twrev1.command_working",
+        None,
+    )
+    working["assistant_stream_text"] = "Working exactly here"
+    tendwire = PredecessorTendwire(
+        working,
+        emit_ready=True,
+        turn_schema_version=2,
+    )
+    telegram = DeletingTelegram()
+    store = _store()
+
+    sync_once(store, _runtime(tendwire, telegram, max_sends=1))
+    entry = next(iter(state.source_worker_entries(store).values()))
+    working_id = entry["last_stream_message_id"]
+    sends_before_final = len(telegram.sent)
+
+    final = _turn_row(
+        "turn-canonical-source",
+        "twrev1.canonical_source",
+        "exact canonical response",
+        user="exact command prompt",
+    )
+    tendwire.row = final
+    tendwire.predecessor_turn_id = working_turn_id
+
+    result = sync_once(
+        store,
+        _runtime(tendwire, telegram, max_sends=10),
+    )
+
+    assert result["tendwire_turn_final"]["acked"] == 1
+    assert len(telegram.sent) == sends_before_final
+    assert any(edit[1] == working_id for edit in telegram.edited)
+    binding = state.find_message_binding(
+        store,
+        working_id,
+        topic_id="77",
+    )
+    assert binding is not None
+    assert binding["kind"] == "final"
+    assert binding["turn_id"] == "turn-canonical-source"
+
+
 def test_schema_incomplete_and_bad_page_refuse_before_any_telegram_activity(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")

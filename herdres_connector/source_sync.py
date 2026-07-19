@@ -2952,6 +2952,13 @@ def _validate_final_ready_payload(
         else base_fields
     )
     if (
+        type(schema) is int
+        and schema == 2
+        and isinstance(payload, dict)
+        and "working_predecessor_turn_id" in payload
+    ):
+        expected.add("working_predecessor_turn_id")
+    if (
         not isinstance(payload, dict)
         or set(payload) != expected
         or type(schema) is not int
@@ -2970,6 +2977,18 @@ def _validate_final_ready_payload(
             "invalid_turn_final_job",
             "final-ready stable worker identity is invalid",
         )
+    predecessor = payload.get("working_predecessor_turn_id")
+    if predecessor is not None:
+        _strict_public_label(
+            predecessor,
+            "working predecessor turn id",
+            prefix="turn-",
+        )
+        if predecessor == payload.get("turn_id"):
+            raise _TurnContentError(
+                "invalid_turn_final_job",
+                "working predecessor must differ from final turn",
+            )
     final_identity = _strict_public_opaque(
         payload.get("final_identity"),
         "twfinal1.",
@@ -3030,6 +3049,9 @@ def _validate_final_ready_payload(
 
 _TURN_FINAL_SOURCE_OWNERS_KEY = "tendwire_turn_final_source_owners"
 _TURN_FINAL_IDENTITY_KEY = "_herdres_final_identity"
+_TURN_FINAL_WORKING_PREDECESSOR_KEY = (
+    "_herdres_working_predecessor_turn_id"
+)
 
 
 def _public_turn_stable_identity(
@@ -3065,7 +3087,11 @@ def _final_ready_row(payload: dict[str, Any]) -> dict[str, Any]:
     if identity is not None:
         row["stable_key"] = identity[0]
         row["stable_key_version"] = identity[1]
-    return _validate_turn_row(row)
+    validated = _validate_turn_row(row)
+    predecessor = payload.get("working_predecessor_turn_id")
+    if isinstance(predecessor, str):
+        validated[_TURN_FINAL_WORKING_PREDECESSOR_KEY] = predecessor
+    return validated
 
 
 def _turn_final_source_owners(
@@ -3292,7 +3318,21 @@ def _current_upsert_candidate(
     turn_id = _turn_id(item)
     if ordinal == 0:
         working_id = str(entry.get("last_stream_message_id") or "")
-        if working_id and entry.get("last_stream_turn_id") == turn_id:
+        predecessor_turn_id = str(
+            item.get(_TURN_FINAL_WORKING_PREDECESSOR_KEY)
+            or entry.get("pending_working_predecessor_turn_id")
+            or ""
+        )
+        stream_turn_id = str(
+            entry.get("last_stream_turn_id") or ""
+        )
+        if working_id and (
+            stream_turn_id == turn_id
+            or (
+                predecessor_turn_id
+                and stream_turn_id == predecessor_turn_id
+            )
+        ):
             binding = state.find_message_binding(store, working_id)
             return (
                 working_id,
@@ -3543,6 +3583,7 @@ def _maybe_complete_turn_plan(
         "pending_acknowledged_prefix_count",
         "replaces_failed_plan_token",
         "pending_final_identity",
+        "pending_working_predecessor_turn_id",
     ):
         entry.pop(field, None)
     _clear_stream_delivery_state(entry, _turn_id(item))
@@ -3610,6 +3651,7 @@ def _reconcile_completed_turn_plans(
                 "pending_acknowledged_prefix_count",
                 "replaces_failed_plan_token",
                 "pending_final_identity",
+                "pending_working_predecessor_turn_id",
             ):
                 entry.pop(field, None)
             reconciled += 1
@@ -3990,6 +4032,13 @@ def _drain_turn_final(
                 )
                 break
             result["content_pages"] += staged_pages
+            predecessor_turn_id = str(
+                payload.get("working_predecessor_turn_id") or ""
+            )
+            if predecessor_turn_id:
+                entry["pending_working_predecessor_turn_id"] = (
+                    predecessor_turn_id
+                )
             materialized_sources[source_identity] = (
                 payload,
                 item,
