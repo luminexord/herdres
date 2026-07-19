@@ -935,11 +935,13 @@ def _turn_is_working_placeholder(item: dict[str, Any], entry: dict[str, Any]) ->
         isinstance(descriptor, dict)
         and descriptor.get("availability") == "complete"
         and descriptor.get("inline") is False
-        for descriptor in fields.values()
+        for field, descriptor in fields.items()
+        if field in {"assistant_stream_text", "assistant_final_text"}
     ):
-        # A bounded delta can intentionally carry descriptors only. Treating
-        # that as an empty turn would fabricate a Working card and bypass the
-        # canonical Goal 05 content path.
+        # A bounded delta can intentionally carry assistant-output descriptors
+        # only. Treating that as empty would fabricate a Working card and
+        # bypass the canonical Goal 05 content path. A paged user prompt does
+        # not block the independent Working placeholder.
         return False
     if bool(item.get("complete")):
         return False
@@ -2591,6 +2593,7 @@ def _bootstrap_existing_turns(
     pending_payload: dict[str, Any],
     *,
     skip_v2_finals: bool = False,
+    complete: bool = True,
 ) -> int:
     """Record current Tendwire rows as seen on first deployment.
 
@@ -2641,8 +2644,14 @@ def _bootstrap_existing_turns(
             {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id},
         )
         skipped += 1
-    store["tendwired_bootstrap_complete"] = True
-    store["tendwired_bootstrap_seen"] = skipped
+    previous_seen = store.get("tendwired_bootstrap_seen")
+    store["tendwired_bootstrap_seen"] = (
+        int(previous_seen)
+        if isinstance(previous_seen, int) and not isinstance(previous_seen, bool)
+        else 0
+    ) + skipped
+    if complete:
+        store["tendwired_bootstrap_complete"] = True
     return skipped
 
 
@@ -2657,6 +2666,7 @@ def _sync_turns(
     live_worker_ids: set[str] | None = None,
     yield_barrier: Any | None = None,
     list_finals_are_authoritative: bool = True,
+    checkpoint_after_delivery: bool = False,
 ) -> dict[str, int]:
     counts = {"feed_sent": 0, "sent": 0, "updated": 0, "content_pages": 0}
     turns = _turns(turns_payload)
@@ -2791,6 +2801,14 @@ def _sync_turns(
         counts["feed_sent"] += int(delivered)
         counts["sent"] += int(delivered)
         counts["updated"] += int((not delivered and before != entry) or (repaired_open_final and not delivered))
+        if (
+            delivered
+            and checkpoint_after_delivery
+            and runtime.checkpoint is not None
+        ):
+            # Persist the Telegram identity/ledger before the delta cursor or
+            # watermark. A replay can then reapply the page without resending.
+            runtime.checkpoint()
         # Only turns that changed the store did a Telegram send (the slow part). After such a turn,
         # yield the state lock so a queued inbound command can interleave instead of stalling behind
         # the rest of the loop. The barrier commits `store` under the lock, releases briefly, then
@@ -2804,6 +2822,12 @@ def _sync_turns(
         delivered = _deliver_pending(store, item, runtime, chat_id=chat_id)
         counts["feed_sent"] += int(delivered)
         counts["sent"] += int(delivered)
+        if (
+            delivered
+            and checkpoint_after_delivery
+            and runtime.checkpoint is not None
+        ):
+            runtime.checkpoint()
         # Same yield between delivered pending prompts (each is a send under the lock).
         if yield_barrier is not None and delivered and p_idx + 1 < pending_count:
             yield_barrier()
@@ -5273,6 +5297,16 @@ def _validate_delta_page(
                     "delta_protocol_ambiguous",
                     "Tendwire turn.delta removal omitted its timestamp",
                 )
+            successor = raw_change.get("superseded_by_turn_id")
+            if successor is not None and (
+                not isinstance(successor, str)
+                or not successor
+                or successor == change_turn_id
+            ):
+                raise _TurnContentError(
+                    "delta_protocol_ambiguous",
+                    "Tendwire turn.delta removal has an invalid successor",
+                )
             removals.append(raw_change)
         else:
             raise _TurnContentError(
@@ -5312,6 +5346,36 @@ def _clear_removed_turn_state(store: dict[str, Any], turn_id: str) -> bool:
     for message_id, binding in list(bindings.items()):
         if isinstance(binding, dict) and str(binding.get("turn_id") or "") == turn_id:
             bindings.pop(message_id, None)
+            changed = True
+    return changed
+
+
+def _follow_removed_turn_successor(
+    store: dict[str, Any],
+    turn_id: str,
+    successor_turn_id: str,
+) -> bool:
+    """Retarget local card identity when Tendwire supplies a successor."""
+    changed = False
+    for bucket_name in ("panes", "spaces"):
+        bucket = store.get(bucket_name)
+        if not isinstance(bucket, dict):
+            continue
+        for entry in bucket.values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("last_stream_turn_id") == turn_id:
+                entry["last_stream_turn_id"] = successor_turn_id
+                changed = True
+            if entry.get("last_turn_id") == turn_id:
+                entry["last_turn_id"] = successor_turn_id
+                changed = True
+    for binding in state.message_bindings(store).values():
+        if (
+            isinstance(binding, dict)
+            and str(binding.get("turn_id") or "") == turn_id
+        ):
+            binding["turn_id"] = successor_turn_id
             changed = True
     return changed
 
@@ -5456,13 +5520,11 @@ def _observe_turn_delta(
             }
         )
     projection = delta["projection"]
-    removed_ids: list[str] = []
     for row in upserts:
         projection[_turn_id(row)] = row
     for removal in removals:
         turn_id = str(removal["turn_id"])
         projection.pop(turn_id, None)
-        removed_ids.append(turn_id)
     delta["failure_count"] = 0
     delta.pop("last_error_at", None)
     delta["last_batch"] = {
@@ -5476,7 +5538,7 @@ def _observe_turn_delta(
         "delta": delta,
         "page": page,
         "upserts": upserts,
-        "removed_ids": removed_ids,
+        "removals": removals,
     }
 
 
@@ -5490,8 +5552,15 @@ def _finish_delta_page(
     delta = observation["delta"]
     page = observation["page"]
     changed = 0
-    for turn_id in observation["removed_ids"]:
-        changed += int(_clear_removed_turn_state(store, turn_id))
+    for removal in observation["removals"]:
+        turn_id = str(removal["turn_id"])
+        successor = removal.get("superseded_by_turn_id")
+        if isinstance(successor, str) and successor:
+            changed += int(
+                _follow_removed_turn_successor(store, turn_id, successor)
+            )
+        else:
+            changed += int(_clear_removed_turn_state(store, turn_id))
     bootstrap = delta.get("bootstrap_state")
     if isinstance(bootstrap, dict):
         bootstrap["pages_applied"] = int(bootstrap.get("pages_applied") or 0) + 1
@@ -5591,11 +5660,24 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
     routing_repaired = _repair_space_mode_routing_state(store)
     message_bindings = _backfill_message_bindings(store)
+    bootstrap_complete = True
+    if delta_observation is not None:
+        bootstrap_complete = (
+            delta_observation.get("kind") == "full"
+            or (
+                delta_observation.get("kind") == "delta"
+                and (
+                    delta_observation.get("page", {}).get("mode") == "changes"
+                    or delta_observation.get("page", {}).get("has_more") is False
+                )
+            )
+        )
     bootstrapped = _bootstrap_existing_turns(
         store,
         turns_payload,
         pending_payload,
         skip_v2_finals=not list_finals_are_authoritative,
+        complete=bootstrap_complete,
     )
     live_worker_ids = {
         compact_ws(worker.get("id"), 160)
@@ -5647,6 +5729,12 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 live_worker_ids=live_worker_ids,
                 yield_barrier=yield_barrier,
                 list_finals_are_authoritative=list_finals_are_authoritative,
+                checkpoint_after_delivery=(
+                    delta_observation is not None
+                    and delta_observation.get("kind") == "delta"
+                    and delta_observation.get("page", {}).get("mode")
+                    == "changes"
+                ),
             )
         )
     except _TurnContentError as exc:
@@ -5673,6 +5761,12 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 relist_on_conflict=False,
                 yield_barrier=yield_barrier,
                 list_finals_are_authoritative=relisted_finals_are_authoritative,
+                checkpoint_after_delivery=(
+                    delta_observation is not None
+                    and delta_observation.get("kind") == "delta"
+                    and delta_observation.get("page", {}).get("mode")
+                    == "changes"
+                ),
             )
         except _TurnContentError as retry_exc:
             return _tendwire_non_success(runtime, retry_exc.status)

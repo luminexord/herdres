@@ -170,6 +170,32 @@ def test_turn_delta_normalizes_only_explicit_unknown_method_to_unsupported(
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    "error_code",
+    ["invalid_watermark", "expired_watermark", "bootstrap_too_large"],
+)
+def test_turn_delta_recovers_explicit_outcome_from_nested_error_code(
+    client_runner,
+    error_code,
+):
+    client, calls, responses = client_runner
+    responses.append(
+        {
+            "returncode": 1,
+            "body": {
+                "schema_version": 1,
+                "ok": False,
+                "error": {"code": error_code, "message": "explicit outcome"},
+            },
+        }
+    )
+
+    result = client.turn_delta(watermark="twdelta1.current")
+
+    assert result["status"] == error_code
+    assert len(calls) == 1
+
+
 def test_turn_delta_timeout_is_transport_ambiguous_and_never_retried(monkeypatch):
     calls = []
     monkeypatch.setenv("HERDRES_TENDWIRE_BIN", "tw")
@@ -216,6 +242,28 @@ def test_command_serializes_only_exact_allowlisted_public_request(client_runner)
             "private-route-sentinel",
         )
     )
+
+
+@pytest.mark.parametrize(
+    "observed_turn_state",
+    ["pending_observation", "observed", "complete"],
+)
+def test_command_accepts_v17_envelope_with_optional_turn_id(
+    client_runner,
+    observed_turn_state,
+):
+    client, _calls, responses = client_runner
+    accepted = _accepted_result()
+    accepted["turn_id"] = "turn-public"
+    accepted["observed_turn_state"] = observed_turn_state
+    responses.append({"body": _command_response(result=accepted)})
+
+    result = client.command(_command_request())
+
+    assert result["ok"] is True
+    assert result["status"] == "accepted"
+    assert result["result"]["turn_id"] == "turn-public"
+    assert result["result"]["observed_turn_state"] == observed_turn_state
 
 
 def test_command_json_repeats_verbatim_utf8_input_bytes(client_runner):
@@ -1031,6 +1079,26 @@ def test_turn_content_get_uses_exact_bounded_cli_and_preserves_page_text(client_
         "twcur1.public",
     ]
     assert calls[0][1]["input"] is None
+
+
+def test_turn_content_get_uses_configured_timeout_with_sixty_second_default(
+    client_runner,
+    monkeypatch,
+):
+    client, calls, responses = client_runner
+    page = {"schema_version": 1, "text": "exact"}
+    monkeypatch.delenv("HERDRES_TENDWIRE_TIMEOUT_SECONDS", raising=False)
+    responses.append({"body": page})
+
+    client.turn_content_get("turn-1", "twrev1.public", "user_text")
+
+    assert calls[-1][1]["timeout"] == 60.0
+
+    monkeypatch.setenv("HERDRES_TENDWIRE_TIMEOUT_SECONDS", "81.5")
+    responses.append({"body": page})
+    client.turn_content_get("turn-1", "twrev1.public", "user_text")
+
+    assert calls[-1][1]["timeout"] == 81.5
 
 
 def test_turn_content_get_omits_null_cursor_and_rejects_schema(client_runner):

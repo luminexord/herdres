@@ -84,6 +84,10 @@ _COMMAND_ACCEPTED_RESULT_FIELDS = frozenset(
         "observed_turn_state",
     }
 )
+_COMMAND_ACCEPTED_OPTIONAL_RESULT_FIELDS = frozenset({"turn_id"})
+_COMMAND_ACCEPTED_OBSERVED_TURN_STATES = frozenset(
+    {"pending_observation", "observed", "complete"}
+)
 _DECISION_ACCEPTED_RESULT_FIELDS = frozenset(
     {
         "target",
@@ -282,7 +286,19 @@ def _valid_accepted_command_result(
     value: Any,
     request: dict[str, Any],
 ) -> bool:
-    if not isinstance(value, dict) or set(value) != _COMMAND_ACCEPTED_RESULT_FIELDS:
+    if not isinstance(value, dict):
+        return False
+    fields = set(value)
+    if fields not in {
+        _COMMAND_ACCEPTED_RESULT_FIELDS,
+        _COMMAND_ACCEPTED_RESULT_FIELDS
+        | _COMMAND_ACCEPTED_OPTIONAL_RESULT_FIELDS,
+    }:
+        return False
+    turn_id = value.get("turn_id")
+    if "turn_id" in value and (
+        not isinstance(turn_id, str) or not turn_id.strip()
+    ):
         return False
     target = value.get("target")
     if not isinstance(target, dict) or set(target) != {"worker_id"}:
@@ -300,7 +316,8 @@ def _valid_accepted_command_result(
         and value.get("transport_state") == "submitted"
         and isinstance(value.get("target_state_at_send"), str)
         and bool(value["target_state_at_send"].strip())
-        and value.get("observed_turn_state") == "pending_observation"
+        and value.get("observed_turn_state")
+        in _COMMAND_ACCEPTED_OBSERVED_TURN_STATES
     )
 
 
@@ -739,6 +756,11 @@ class TendwireClient:
             else ""
         )
         status = str(result.get("status") or "").strip().lower()
+        if error_code and status in {"", "nonzero_exit"}:
+            # Nonzero CLI exits synthesize nonzero_exit in call(). The public
+            # nested error code remains the authoritative explicit outcome.
+            result["status"] = error_code
+            status = error_code
         if status in {"unsupported_method", "unknown_method"} or error_code in {
             "unsupported_method",
             "unknown_method",
@@ -787,7 +809,7 @@ class TendwireClient:
         ]
         if cursor is not None:
             args.extend(["--cursor", str(cursor)])
-        result = self.call(args, timeout=10, protocol=True, preserve_page_text=True)
+        result = self.call(args, protocol=True, preserve_page_text=True)
         if result.get("ok") is False:
             return result
         received = result.get("schema_version")

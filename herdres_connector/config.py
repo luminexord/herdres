@@ -59,9 +59,9 @@ def tendwire_db_path(env: Any | None = None) -> Path:
 def tendwire_timeout_seconds(env: Any | None = None) -> float:
     source = os.environ if env is None else env
     try:
-        value = float(str(source.get("HERDRES_TENDWIRE_TIMEOUT_SECONDS", "30") or "30"))
+        value = float(str(source.get("HERDRES_TENDWIRE_TIMEOUT_SECONDS", "60") or "60"))
     except (TypeError, ValueError):
-        return 30.0
+        return 60.0
     return min(300.0, max(1.0, value))
 
 
@@ -88,7 +88,12 @@ def tendwire_full_reconcile_seconds(env: Any | None = None) -> int:
         )
     except (TypeError, ValueError):
         return 3600
-    return min(604800, max(0, value))
+    # A disabled safety reconciliation leaves the retained delta projection
+    # unbounded. Treat non-positive values as invalid and retain the hourly
+    # safety net instead.
+    if value <= 0:
+        return 3600
+    return min(604800, value)
 
 
 def tendwire_force_full_reconcile(env: Any | None = None) -> bool:
