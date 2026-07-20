@@ -99,12 +99,17 @@ until explicitly enabled. Lane mode stores accepted updates in
 item and stable receiving-bot cursor commit in one transaction; the old offset
 file remains a best-effort, atomic rollback mirror.
 
-Message lanes are keyed by receiving-bot kind and Telegram topic. General,
-unroutable messages, slash commands, and callback queries share that receiver's
-control lane. Each lane is strict FIFO with at most one leased head, while up to
+Message lanes are keyed by receiving-bot kind and Telegram topic. A topic uses
+that key immediately even before its state entry resolves, so resolution cannot
+reorder its first messages. General-topic chatter, owner slash commands, and
+callback queries use three separate receiver-wide lanes; owner commands retain
+their own FIFO without queueing behind conversation. Each lane is strict FIFO
+with at most one leased head, while up to
 `HERDRES_INBOUND_DISPATCH_WORKERS` lanes run concurrently (default `8`). A
 retry delays only its lane using exponential backoff based on
 `HERDRES_INBOUND_LANE_BACKOFF_SECONDS` (default `2`, capped at five minutes).
+The dispatcher renews a claimed lease across the full pipeline, including
+unbounded voice pretranscription, command execution, and acknowledgement.
 Expired leases are reclaimed after a crash and replay the same request ID;
 terminal ingress records complete without a second Tendwire submission.
 
@@ -234,6 +239,13 @@ durable record retryable with no reply and retains the gateway checkpoint until
 the fixed deadline. A definite spawn failure follows the same bounded retry
 path. At the deadline, or for an authoritative `terminal_uncertain`,
 quarantine caches the fixed safe outcome and advances the queue.
+
+A `SIGKILL` during `command_json` is intentionally recovered by replay, not by
+a local `submitting` marker: Herdres cannot prove whether the remote mutation
+happened. The retry uses the same request ID and the exact fsynced request bytes,
+and Tendwire's durable request receipt deduplicates those bytes before applying
+the mutation. This Tendwire receipt is the double-submit protection for the
+mid-RPC crash window.
 
 `status` alone never decides retry or finality. In particular,
 `backend_unavailable` with `no_receipt` retries with no reply, while the same

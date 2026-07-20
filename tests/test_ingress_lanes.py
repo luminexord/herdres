@@ -12,7 +12,7 @@ import pytest
 
 import herdres
 import herdres_gateway
-from herdres_connector import config, ingress_requests, state
+from herdres_connector import config, ingress_requests, speech, state
 from herdres_connector.ingress_identity import derive_telegram_request_id
 from herdres_connector.ingress_lanes import IngressLaneSpool, lane_key
 
@@ -138,6 +138,71 @@ def test_busy_lane_does_not_delay_another_agent_under_five_seconds(
         dispatcher.stop()
 
 
+def test_lease_heartbeat_covers_slow_voice_pretranscription(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    _configured_state(state_path)
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    update = _update(3, 77, "")
+    message = update["message"]
+    assert isinstance(message, dict)
+    message.pop("text")
+    message["voice"] = {
+        "file_id": "slow-voice",
+        "file_unique_id": "slow-voice-unique",
+        "mime_type": "audio/ogg",
+        "file_size": 1024,
+        "duration": 3,
+    }
+    _enqueue(spool, update, "77")
+    pretranscription_started = threading.Event()
+    pretranscriptions: list[str] = []
+    submits: list[str] = []
+
+    def slow_pretranscribe(payload, *, bot_token):
+        pretranscriptions.append(bot_token)
+        pretranscription_started.set()
+        time.sleep(0.45)
+        return {
+            **payload,
+            "_speech_pretranscribed": True,
+            "_speech_transcript": "slow voice instruction",
+        }
+
+    class Client:
+        def command_json(self, request_json):
+            submits.append(request_json)
+            return _accepted_command_response(json.loads(request_json))
+
+    monkeypatch.setattr(speech, "pretranscribe_voice_payload", slow_pretranscribe)
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "run_herdres_command",
+        lambda payload: herdres.command_reply(payload),
+    )
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        spool,
+        REQUEST_ID_KEY,
+        workers=2,
+        backoff_seconds=0.01,
+        lease_seconds=0.12,
+    )
+    dispatcher.update_specs([("manager", "token", 0)])
+    dispatcher.start()
+    try:
+        assert pretranscription_started.wait(1.0)
+        _wait_for(lambda: spool.rows()[0]["state"] == "done")
+    finally:
+        dispatcher.stop()
+
+    assert pretranscriptions == ["token"]
+    assert len(submits) == 1
+
+
 def test_same_lane_fifo_including_ack_while_other_lane_interleaves(
     tmp_path, monkeypatch
 ) -> None:
@@ -188,7 +253,7 @@ def test_same_lane_fifo_including_ack_while_other_lane_interleaves(
     assert events.index("start-A2") < events.index("ack-A2")
 
 
-def test_owner_commands_share_the_ordered_control_lane(tmp_path, monkeypatch) -> None:
+def test_owner_commands_retain_receiver_wide_fifo(tmp_path, monkeypatch) -> None:
     spool = IngressLaneSpool(tmp_path / "spool.db")
     first = _update(20, 77, "/status")
     second = _update(21, 88, "/help")
@@ -222,6 +287,63 @@ def test_owner_commands_share_the_ordered_control_lane(tmp_path, monkeypatch) ->
         release.set()
         dispatcher.stop()
     assert calls == ["/status", "/help"]
+
+
+def test_owner_command_lane_is_separate_from_general_chatter(monkeypatch) -> None:
+    store = _store()
+    monkeypatch.setattr(config, "general_thread_id", lambda _store: "77")
+
+    command = herdres_gateway._preview_lane_update(
+        _update(22, 77, "/status"),
+        store,
+        receiver_kind="manager",
+        request_id_key=REQUEST_ID_KEY,
+        bot_key="manager",
+    )
+    chatter = herdres_gateway._preview_lane_update(
+        _update(23, 77, "how is everyone?"),
+        store,
+        receiver_kind="manager",
+        request_id_key=REQUEST_ID_KEY,
+        bot_key="manager",
+    )
+
+    assert command["lane_key"] == lane_key("manager", "__owner_commands__")
+    assert chatter["lane_key"] == lane_key("manager", "__general__")
+
+
+def test_unresolved_topic_keeps_same_provisional_lane_after_resolution() -> None:
+    store = _store()
+    unresolved = herdres_gateway._preview_lane_update(
+        _update(24, 99, "first"),
+        store,
+        receiver_kind="manager",
+        request_id_key=REQUEST_ID_KEY,
+        bot_key="manager",
+    )
+    state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-new",
+                "name": "worker-new",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-new",
+            }
+        ),
+        topic_id="99",
+    )
+    resolved = herdres_gateway._preview_lane_update(
+        _update(25, 99, "second"),
+        store,
+        receiver_kind="manager",
+        request_id_key=REQUEST_ID_KEY,
+        bot_key="manager",
+    )
+
+    assert unresolved["lane_key"] == lane_key("manager", "99")
+    assert resolved["lane_key"] == unresolved["lane_key"]
 
 
 def test_poison_head_quarantines_visibly_without_delaying_other_lane(
@@ -345,8 +467,41 @@ def test_lane_overflow_notifies_once_and_advances_cursor(tmp_path, monkeypatch) 
     assert mirrors == [42]
 
 
+def test_lane_overflow_notice_uses_real_sixty_second_throttle(
+    tmp_path, monkeypatch
+) -> None:
+    sent: list[tuple[str, str, str]] = []
+    now = [1000.0]
+    lane = lane_key("manager", f"overflow-{tmp_path.name}")
+    route = {"chat_id": "-100", "topic_id": "77", "message_id": "1041"}
+
+    class Telegram:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, chat_id, message, **kwargs):
+            sent.append((chat_id, message, str(kwargs.get("thread_id"))))
+            return {"ok": True, "message_id": "1"}
+
+    monkeypatch.setattr(herdres_gateway.time, "time", lambda: now[0])
+    monkeypatch.setattr(herdres_gateway, "TelegramClient", Telegram)
+
+    herdres_gateway._notify_lane_overflow("token", route, lane)
+    _wait_for(lambda: len(sent) == 1)
+    now[0] += 59.0
+    herdres_gateway._notify_lane_overflow("token", route, lane)
+    time.sleep(0.05)
+    assert len(sent) == 1
+    now[0] += 1.0
+    herdres_gateway._notify_lane_overflow("token", route, lane)
+    _wait_for(lambda: len(sent) == 2)
+
+    assert [topic for _chat, _message, topic in sent] == ["77", "77"]
+
+
 def test_cursor_commit_survives_failure_before_legacy_mirror(tmp_path, monkeypatch) -> None:
-    spool = IngressLaneSpool(tmp_path / "spool.db")
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
     spool.initialize_cursor("manager", 50)
     offsets_seen: list[int] = []
     update = _update(50, 77, "durable")
@@ -366,13 +521,18 @@ def test_cursor_commit_survives_failure_before_legacy_mirror(tmp_path, monkeypat
     herdres_gateway._poll_once_lanes(
         "manager", "token", timeout_seconds=0, request_id_key=REQUEST_ID_KEY, spool=spool
     )
+    reopened_spool = IngressLaneSpool(spool_path)
     herdres_gateway._poll_once_lanes(
-        "manager", "token", timeout_seconds=0, request_id_key=REQUEST_ID_KEY, spool=spool
+        "manager",
+        "token",
+        timeout_seconds=0,
+        request_id_key=REQUEST_ID_KEY,
+        spool=reopened_spool,
     )
 
     assert offsets_seen == [50, 51]
-    assert spool.cursor("manager") == 51
-    assert len(spool.rows()) == 1
+    assert reopened_spool.cursor("manager") == 51
+    assert len(reopened_spool.rows()) == 1
 
 
 def test_first_lane_start_migrates_legacy_receiver_cursor(tmp_path, monkeypatch) -> None:
@@ -497,11 +657,14 @@ def _kill_stage_child(
             ingress_first_seen_at=item.first_seen_at,
         )
         assert checkpoint == herdres_gateway.CHECKPOINT_ADVANCE
-        ready.send("terminal-cached")
+        if stage == "after_dispatch":
+            ready.send("terminal-cached")
     time.sleep(60)
 
 
-@pytest.mark.parametrize("stage", ["before_dispatch", "after_dispatch"])
+@pytest.mark.parametrize(
+    "stage", ["before_dispatch", "during_command_json", "after_dispatch"]
+)
 def test_kill_9_restart_submits_each_request_exactly_once(
     stage, tmp_path, monkeypatch
 ) -> None:
@@ -513,16 +676,43 @@ def test_kill_9_restart_submits_each_request_exactly_once(
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
-    update = _update(70 if stage == "before_dispatch" else 71, 77, stage)
-    if stage == "after_dispatch":
+    update_id = {
+        "before_dispatch": 70,
+        "during_command_json": 71,
+        "after_dispatch": 72,
+    }[stage]
+    update = _update(update_id, 77, stage)
+    if stage != "before_dispatch":
         _enqueue(spool, update, "77")
     context = multiprocessing.get_context("fork")
-    submits = context.Value("i", 0)
+    rpc_attempts = context.Value("i", 0)
+    logical_submits = context.Value("i", 0)
+    byte_conflicts = context.Value("i", 0)
+    receipt_path = tmp_path / "fake-tendwire-receipt.json"
+    parent, child = context.Pipe(duplex=False)
 
     class Client:
         def command_json(self, request_json):
-            with submits.get_lock():
-                submits.value += 1
+            with rpc_attempts.get_lock():
+                rpc_attempts.value += 1
+            created = False
+            try:
+                fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                if receipt_path.read_text(encoding="utf-8") != request_json:
+                    with byte_conflicts.get_lock():
+                        byte_conflicts.value += 1
+            else:
+                created = True
+                with os.fdopen(fd, "w", encoding="utf-8") as receipt:
+                    receipt.write(request_json)
+                    receipt.flush()
+                    os.fsync(receipt.fileno())
+                with logical_submits.get_lock():
+                    logical_submits.value += 1
+            if stage == "during_command_json" and created:
+                child.send("mid-rpc")
+                time.sleep(60)
             return _accepted_command_response(json.loads(request_json))
 
     class Telegram:
@@ -539,14 +729,13 @@ def test_kill_9_restart_submits_each_request_exactly_once(
         lambda payload: herdres.command_reply(payload),
     )
     monkeypatch.setattr(herdres_gateway, "TelegramClient", Telegram)
-    parent, child = context.Pipe(duplex=False)
     process = context.Process(
         target=_kill_stage_child,
         args=(str(spool_path), update, stage, child),
     )
     process.start()
     assert parent.poll(5.0)
-    assert parent.recv() in {"enqueued", "terminal-cached"}
+    assert parent.recv() in {"enqueued", "mid-rpc", "terminal-cached"}
     os.kill(process.pid, signal.SIGKILL)
     process.join(5.0)
     assert process.exitcode == -signal.SIGKILL
@@ -566,7 +755,9 @@ def test_kill_9_restart_submits_each_request_exactly_once(
     finally:
         dispatcher.stop()
 
-    assert submits.value == 1
+    assert logical_submits.value == 1
+    assert byte_conflicts.value == 0
+    assert rpc_attempts.value == (2 if stage == "during_command_json" else 1)
 
 
 def test_tendwire_submit_releases_state_lock_and_preserves_concurrent_write(

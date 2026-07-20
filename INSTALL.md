@@ -227,6 +227,12 @@ after redelivery or restart without another Tendwire call. A
 `backend_unavailable` status follows `no_receipt` or `terminal_rejected`;
 status text alone is never retry authority.
 
+If Herdres is killed during `command_json`, it cannot distinguish an accepted
+mutation from a lost call result. Restart therefore replays the identical
+fsynced request bytes under the same request ID. Tendwire must retain its durable
+request receipt for the configured horizon and suppress the repeated mutation;
+do not replace this paired receipt continuity with a local `submitting` marker.
+
 The final-root lease covers canonical paging, range-only presentation-plan
 begin/part/commit staging, and ACK. It uses 900 seconds when unset, empty, or
 invalid and clamps configured values to 60 through 3600 seconds. Keep it long

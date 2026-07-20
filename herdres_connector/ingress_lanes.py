@@ -355,6 +355,29 @@ class IngressLaneSpool:
             ).rowcount
         return int(changed)
 
+    def renew_lease(
+        self,
+        seq: int,
+        lease_owner: str,
+        *,
+        lease_seconds: float,
+        now: float | None = None,
+    ) -> bool:
+        """Extend a live dispatch lease without changing lane ordering."""
+
+        timestamp = time.time() if now is None else float(now)
+        lease_until = timestamp + max(0.1, float(lease_seconds))
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE lane_items
+                SET lease_until = ?, updated_at = ?
+                WHERE seq = ? AND state = 'processing' AND lease_owner = ?
+                """,
+                (lease_until, timestamp, int(seq), str(lease_owner)),
+            ).rowcount
+        return changed == 1
+
     def mark_done(
         self,
         seq: int,
