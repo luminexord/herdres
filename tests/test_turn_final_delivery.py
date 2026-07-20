@@ -1029,6 +1029,30 @@ def _runtime(
     )
 
 
+def test_turn_final_drain_keeps_polling_when_feed_uses_send_budget(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    working = _turn_row(
+        "turn-budget-floor",
+        "twrev1.budget_floor",
+        None,
+        user="consume the feed budget",
+    )
+    working["assistant_stream_text"] = "working update"
+    tendwire = TurnFinalTendwire(working)
+
+    result = sync_once(
+        _store(),
+        _runtime(tendwire, DeletingTelegram(), max_sends=1),
+    )
+
+    assert result["feed_sent"] == 1
+    assert result["sent"] == 1
+    assert tendwire.poll_calls == 1
+
+
 def test_short_inline_stages_and_delivers_without_page_fetch_then_two_syncs_noop(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     row = _turn_row("turn-short", "twrev1.short", "short exact final", user="exact prompt")
@@ -1497,7 +1521,7 @@ class MissingEditTelegram(DeletingTelegram):
         )
 
 
-def test_not_found_edit_at_budget_boundary_retries_as_send_not_stale_edit(monkeypatch):
+def test_not_found_edit_uses_drain_floor_to_retry_as_send_in_same_pass(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
@@ -1517,14 +1541,15 @@ def test_not_found_edit_at_budget_boundary_retries_as_send_not_stale_edit(monkey
     missing = sync_once(store, _runtime(tendwire, telegram, max_sends=1))
     resumed = sync_once(store, _runtime(tendwire, telegram, max_sends=1))
 
-    assert missing["tendwire_turn_final"]["operations"] == 1
-    assert missing["tendwire_turn_final"]["deferred"] == 1
+    assert missing["tendwire_turn_final"]["operations"] == 2
+    assert missing["tendwire_turn_final"]["deferred"] == 0
+    assert missing["tendwire_turn_final"]["acked"] == 1
     assert missing["tendwire_turn_final"]["failed"] == 0
     assert missing["tendwire_turn_final"]["uncertain"] == 0
     assert len(telegram.sent) == sent_before + 1
     assert telegram.edit_attempts == 1
-    assert resumed["tendwire_turn_final"]["operations"] == 1
-    assert resumed["tendwire_turn_final"]["acked"] == 1
+    assert resumed["tendwire_turn_final"]["operations"] == 0
+    assert resumed["tendwire_turn_final"]["acked"] == 0
 
 
 class RateLimitedOnceTelegram(DeletingTelegram):
@@ -1936,8 +1961,18 @@ def test_explicit_failed_plan_recovery_clones_prefix_and_never_replays_telegram(
     no_spin = sync_once(store, _runtime(tendwire, telegram, max_sends=100))
     old_jobs_before = deepcopy(state.tendwire_turn_jobs(store))
     failed_token = next(iter(tendwire._plans))
+    failed_entry = next(
+        iter(state.source_worker_entries(store).values())
+    )
 
     assert exhausted["tendwire_turn_final"]["status"] == "attempts_exhausted"
+    assert "pending_plan_token" not in failed_entry
+    assert "pending_content_revision" not in failed_entry
+    assert failed_entry["abandoned_plan_token"] == failed_token
+    assert (
+        failed_entry["abandoned_content_revision"]
+        == "twrev1.recovery"
+    )
     assert no_spin["tendwire_turn_final"]["polled"] == 0
     assert telegram.final_attempts == attempts_after_failure
     assert [
@@ -4330,7 +4365,7 @@ def test_restart_clears_obsolete_pending_plan_and_delivers_newer_root(
 
 
 @pytest.mark.parametrize(
-    "unresolved_state", ["failed", "unknown", "error"]
+    "unresolved_state", ["unknown", "error"]
 )
 def test_newer_root_defers_while_pending_plan_is_not_strictly_obsolete(
     monkeypatch, unresolved_state
@@ -4398,6 +4433,85 @@ def test_newer_root_defers_while_pending_plan_is_not_strictly_obsolete(
     assert telegram.sent == sends
     assert telegram.edited == edits
     assert tendwire.page_calls == pages
+
+
+def test_dead_letter_pending_plan_is_cleared_before_newer_final_delivers(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    turn_id = "turn-dead-predecessor"
+    tendwire = PlanRetentionTendwire(
+        _turn_row(
+            turn_id,
+            "twrev1.dead_predecessor",
+            "abandoned final",
+        )
+    )
+    tendwire.ack_committed_response_lost_once = True
+    tendwire.completed_observe_lost_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+
+    interrupted = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    assert interrupted["tendwire_turn_final"]["status"] == "timeout"
+    entry = next(iter(state.source_worker_entries(store).values()))
+    dead_plan = entry["pending_plan_token"]
+    dead_revision = entry["pending_content_revision"]
+    dead_receipt_key, dead_receipt = next(
+        (key, receipt)
+        for key, receipt in state.tendwire_turn_jobs(store).items()
+        if receipt.get("plan_token") == dead_plan
+    )
+    state.update_tendwire_turn_job(
+        store, dead_receipt_key, substate="failed"
+    )
+    dead_job = next(
+        job
+        for job in tendwire._jobs
+        if job["payload"]["plan_token"] == dead_plan
+    )
+    dead_job["status"] = "dead_letter"
+    tendwire._plans[dead_plan]["state"] = "failed"
+    tendwire.row = _turn_row(
+        turn_id,
+        "twrev1.after_dead_predecessor",
+        "new final proceeds",
+    )
+    checkpoints = []
+
+    delivered = sync_once(
+        store,
+        _runtime(
+            tendwire,
+            telegram,
+            max_sends=1,
+            checkpoint=lambda: checkpoints.append(deepcopy(store)),
+        ),
+    )
+
+    assert delivered["tendwire_turn_final"]["deferred"] == 0
+    assert delivered["tendwire_turn_final"]["acked"] == 1
+    assert tendwire.defer_calls == []
+    assert entry["last_clean_content_revision"] == (
+        "twrev1.after_dead_predecessor"
+    )
+    assert "pending_plan_token" not in entry
+    assert "pending_content_revision" not in entry
+    cleared_entry = next(
+        next(iter(state.source_worker_entries(snapshot).values()))
+        for snapshot in checkpoints
+        if "pending_plan_token"
+        not in next(iter(state.source_worker_entries(snapshot).values()))
+        and next(iter(state.source_worker_entries(snapshot).values())).get(
+            "abandoned_plan_token"
+        )
+        == dead_plan
+    )
+    assert cleared_entry["abandoned_content_revision"] == dead_revision
+    assert dead_receipt["substate"] == "failed"
 
 class SensitiveProviderErrorTelegram(DeletingTelegram):
     def __init__(self, kind):

@@ -981,11 +981,15 @@ def _recovery_audit_eviction_key(
     audits = _recovery_audits(store)
     request_bindings = _recovery_request_bindings(store)
     protected_plan_tokens = {
-        str(entry["pending_plan_token"])
+        str(plan_token)
         for entry in state.source_worker_entries(store).values()
         if isinstance(entry, dict)
-        and _valid_recovery_plan_token(entry.get("pending_plan_token"))
-        and entry.get("pending_plan_token") != released_plan_token
+        for plan_token in (
+            entry.get("pending_plan_token"),
+            entry.get("abandoned_plan_token"),
+        )
+        if _valid_recovery_plan_token(plan_token)
+        and plan_token != released_plan_token
     }
     for request_key, audit in audits.items():
         audit_plan_token = (
@@ -1107,6 +1111,10 @@ def _turn_final_recovery_preflight(
         (key, entry)
         for key, entry in state.source_worker_entries(store).items()
         if entry.get("pending_plan_token") == failed_plan_token
+        or (
+            entry.get("pending_plan_token") is None
+            and entry.get("abandoned_plan_token") == failed_plan_token
+        )
     ]
     if len(matches) != 1:
         return _recovery_error(
@@ -1120,6 +1128,8 @@ def _turn_final_recovery_preflight(
             "failed plan no longer has one uniquely routable worker",
         )
     revision = entry.get("pending_content_revision")
+    if revision is None:
+        revision = entry.get("abandoned_content_revision")
     part_count = entry.get("pending_turn_part_count")
     job_count = entry.get("pending_turn_job_count")
     prior_generation = entry.get("pending_plan_generation", 1)
@@ -1434,8 +1444,20 @@ def _clone_recovery_prefix(
             binding["tendwire_job_key"] = key_map[str(binding["tendwire_job_key"])]
 
     entry = state.source_worker_entries(store).get(entry_key)
-    if entry is None or entry.get("pending_plan_token") != failed_plan_token:
+    if entry is None or not (
+        entry.get("pending_plan_token") == failed_plan_token
+        or (
+            entry.get("pending_plan_token") is None
+            and entry.get("abandoned_plan_token") == failed_plan_token
+        )
+    ):
         raise RuntimeError("recovery entry changed before copied-state cutover")
+    if entry.get("pending_content_revision") is None:
+        entry["pending_content_revision"] = entry.get(
+            "abandoned_content_revision"
+        )
+    entry.pop("abandoned_plan_token", None)
+    entry.pop("abandoned_content_revision", None)
     entry["pending_plan_token"] = plan_token
     entry["pending_turn_job_count"] = len(prefix) + executable_job_count
     entry["pending_plan_generation"] = int(response["generation"])
