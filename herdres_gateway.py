@@ -392,13 +392,18 @@ def _preview_lane_update(
         return {"action": "drop", "reason": "deferred_to_managed_bot"}
     if current_bot_kind != MANAGER_BOT_KIND and target_bot_kind != current_bot_kind:
         return {"action": "drop", "reason": "deferred_to_other_bot"}
-    _entry_key, entry = state.find_entry_by_thread(store, topic_id)
     general = config.general_thread_id(store)
-    lane_topic = (
-        "__control__"
-        if entry is None or topic_id == general or (text or caption).lstrip().startswith("/")
-        else topic_id
-    )
+    message_text = (text or caption).lstrip()
+    if message_text.startswith("/"):
+        # Owner commands retain receiver-wide FIFO without queueing behind
+        # ordinary conversation in the general topic.
+        lane_topic = "__owner_commands__"
+    elif topic_id == general:
+        lane_topic = "__general__"
+    else:
+        # Use the topic ID even before sync has created its state entry. If the
+        # entry resolves between two updates, both still enter the same FIFO.
+        lane_topic = topic_id
     return {
         "action": "spool",
         "request_id": request_id,
@@ -896,10 +901,11 @@ class _InboundLaneDispatcher:
             if backoff_seconds is None
             else float(backoff_seconds)
         )
-        self.lease_seconds = (
+        self.lease_seconds = max(
+            0.1,
             max(120.0, float(COMMAND_TIMEOUT) + 30.0)
             if lease_seconds is None
-            else float(lease_seconds)
+            else float(lease_seconds),
         )
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -975,6 +981,20 @@ class _InboundLaneDispatcher:
             )
             return
         bot_key, token = token_spec
+        lease_finished = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._renew_lease,
+            args=(item, lease_owner, lease_finished),
+            name=f"herdres-inbound-lease-{item.seq}",
+            daemon=True,
+        )
+        if not self.spool.renew_lease(
+            item.seq,
+            lease_owner,
+            lease_seconds=self.lease_seconds,
+        ):
+            return
+        heartbeat.start()
         try:
             checkpoint = handle_update(
                 item.update,
@@ -990,6 +1010,9 @@ class _InboundLaneDispatcher:
                 f"{sanitize_text(str(exc), 200)}"
             )
             checkpoint = CHECKPOINT_RETRY
+        finally:
+            lease_finished.set()
+            heartbeat.join(timeout=1.0)
         if checkpoint == CHECKPOINT_ADVANCE:
             self.spool.mark_done(item.seq, lease_owner)
         else:
@@ -998,6 +1021,29 @@ class _InboundLaneDispatcher:
                 lease_owner,
                 backoff_seconds=self.backoff_seconds,
             )
+
+    def _renew_lease(
+        self,
+        item: LaneItem,
+        lease_owner: str,
+        finished: threading.Event,
+    ) -> None:
+        """Keep the lease live for the whole ingress pipeline, including speech."""
+
+        interval = max(0.03, min(30.0, self.lease_seconds / 3.0))
+        while not finished.wait(interval):
+            try:
+                if not self.spool.renew_lease(
+                    item.seq,
+                    lease_owner,
+                    lease_seconds=self.lease_seconds,
+                ):
+                    return
+            except Exception as exc:  # noqa: BLE001 - retry within the lease budget
+                log(
+                    f"lane lease renewal {item.seq} failed: {type(exc).__name__}: "
+                    f"{sanitize_text(str(exc), 160)}"
+                )
 
 
 def _poll_once(
