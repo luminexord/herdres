@@ -18,6 +18,12 @@ Description=Tendwire daemon (observes Herdr; source-mode control plane)
 After=default.target
 
 [Service]
+# Stale-process hardening: kill the whole control group on stop so an old
+# daemon can never survive a restart holding the socket with outdated code.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=20
+FinalKillSignal=SIGKILL
 Type=simple
 # Adjust to your tendwire checkout (or drop if tendwire is pip-installed):
 Environment=PYTHONPATH=%h/tendwire/src
