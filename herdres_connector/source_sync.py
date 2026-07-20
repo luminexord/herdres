@@ -3967,6 +3967,12 @@ def _drain_turn_final(
     ] = {}
     lease_seconds = config.tendwire_turn_final_lease_seconds()
     for _iteration in range(max_operations + 100):
+        # Terminal failures must only act on the lease from this iteration.
+        # A materialize failure has no plan job and therefore must not reuse
+        # the identity of a successfully delivered job from an earlier pass.
+        failed_job_key = ""
+        failed_plan_token = ""
+        failed_revision = ""
         if result["operations"] >= max_operations:
             break
         poll = runtime.tendwire.turn_final_poll(
@@ -5360,11 +5366,6 @@ def _validate_delta_page(
                     "delta_protocol_ambiguous",
                     "Tendwire turn.delta upsert omitted its projection",
                 )
-            if _turn_id(raw_turn) != change_turn_id:
-                raise _TurnContentError(
-                    "delta_protocol_ambiguous",
-                    "Tendwire turn.delta projection identity mismatched",
-                )
             try:
                 turn = _validate_turn_row(raw_turn)
             except _TurnContentError as exc:
@@ -5372,6 +5373,12 @@ def _validate_delta_page(
                 turn[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
                     turn, exc.status
                 )
+            else:
+                if _turn_id(turn) != change_turn_id:
+                    raise _TurnContentError(
+                        "delta_protocol_ambiguous",
+                        "Tendwire turn.delta projection identity mismatched",
+                    )
             upserts.append(turn)
         elif op == "remove":
             if not isinstance(raw_change.get("removed_at"), str):
