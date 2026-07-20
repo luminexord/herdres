@@ -400,7 +400,7 @@ def test_delta_page_still_rejects_page_level_protocol_errors(change):
     assert exc_info.value.status == "delta_protocol_ambiguous"
 
 
-def test_delta_page_identity_mismatch_is_not_hidden_by_legacy_isolation():
+def test_delta_page_isolates_invalid_row_before_checking_its_identity():
     legacy = _turn_row(
         "turn-projection", "twrev1.identity", None
     )
@@ -408,16 +408,24 @@ def test_delta_page_identity_mismatch_is_not_hidden_by_legacy_isolation():
     change = _upsert(legacy)
     change["turn_id"] = "turn-envelope"
 
-    with pytest.raises(_TurnContentError) as exc_info:
-        _validate_delta_page(
-            _page(
-                [change],
-                mode="changes",
-                checkpoint="twdelta1.identity_mismatch",
-            )
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [change],
+            mode="changes",
+            checkpoint="twdelta1.identity_mismatch",
         )
+    )
 
-    assert exc_info.value.status == "delta_protocol_ambiguous"
+    assert removals == []
+    assert upserts == [
+        {
+            **legacy,
+            _TURN_CONTENT_OUTCOME_KEY: {
+                "turn_id": "turn-projection",
+                "status": "invalid_content_schema",
+            },
+        }
+    ]
 
 
 def test_invalid_watermark_starts_one_bootstrap_and_ambiguity_resumes_its_cursor():

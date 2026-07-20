@@ -1924,6 +1924,101 @@ class ExhaustedRecoveryTendwire(TurnFinalTendwire):
         return response
 
 
+class UnrelatedTerminalReadyAfterFirstPartTendwire(
+    ExhaustedRecoveryTendwire
+):
+    def __init__(self, row, unrelated_row):
+        super().__init__(row)
+        self.emit_ready = True
+        self.turn_schema_version = 2
+        self.unrelated_row = unrelated_row
+        self.unrelated_revision = unrelated_row["content"][
+            "content_revision"
+        ]
+        self.unrelated_failure_emitted = False
+
+    def snapshot(self):
+        response = super().snapshot()
+        response["workers"].append(
+            _source_worker(
+                {
+                    "id": self.unrelated_row["worker_id"],
+                    "name": "Unrelated",
+                    "status": "idle",
+                    "space_id": "space-1",
+                    "fingerprint": self.unrelated_row[
+                        "worker_fingerprint"
+                    ],
+                    "meta": {
+                        "agent": "codex",
+                        "stable_key": self.unrelated_row[
+                            "stable_key"
+                        ],
+                        "stable_key_version": 1,
+                    },
+                }
+            )
+        )
+        return response
+
+    def turn_final_poll(self, *, limit=1, lease_seconds=60):
+        first_part_delivered = any(
+            job["status"] == "delivered"
+            for job in self._jobs
+        )
+        if first_part_delivered and not self.unrelated_failure_emitted:
+            self.unrelated_failure_emitted = True
+            previous_row = self.row
+            self.row = self.unrelated_row
+            try:
+                payload = self._ready_payload()
+            finally:
+                self.row = previous_row
+            self._ref_counter += 1
+            ref = f"twref1.ready{self._ref_counter}"
+            return {
+                "ok": True,
+                "schema_version": 1,
+                "items": [
+                    {
+                        "ref": ref,
+                        "key": (
+                            "turn-final:revision:"
+                            f"{payload['final_identity']}"
+                        ),
+                        "attempt": self._ref_counter,
+                        "payload": payload,
+                    }
+                ],
+            }
+        return super().turn_final_poll(
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+
+    def turn_content_get(
+        self, turn_id, revision, field, cursor=None
+    ):
+        response = super().turn_content_get(
+            turn_id, revision, field, cursor
+        )
+        if revision == self.unrelated_revision:
+            response["content_revision"] = "twrev1.wrong_revision"
+        return response
+
+    def turn_final_fail(self, ref, reason):
+        if self.unrelated_failure_emitted and not any(
+            job.get("ref") == ref for job in self._jobs
+        ):
+            self.fail_calls.append((ref, reason))
+            return {
+                "ok": True,
+                "schema_version": 1,
+                "status": "attempts_exhausted",
+            }
+        return super().turn_final_fail(ref, reason)
+
+
 class FailSecondPartOnceTelegram(DeletingTelegram):
     def __init__(self):
         super().__init__()
@@ -1958,8 +2053,6 @@ def test_explicit_failed_plan_recovery_clones_prefix_and_never_replays_telegram(
 
     exhausted = sync_once(store, _runtime(tendwire, telegram, max_sends=100))
     attempts_after_failure = list(telegram.final_attempts)
-    no_spin = sync_once(store, _runtime(tendwire, telegram, max_sends=100))
-    old_jobs_before = deepcopy(state.tendwire_turn_jobs(store))
     failed_token = next(iter(tendwire._plans))
     failed_entry = next(
         iter(state.source_worker_entries(store).values())
@@ -1973,6 +2066,8 @@ def test_explicit_failed_plan_recovery_clones_prefix_and_never_replays_telegram(
         failed_entry["abandoned_content_revision"]
         == "twrev1.recovery"
     )
+    no_spin = sync_once(store, _runtime(tendwire, telegram, max_sends=100))
+    old_jobs_before = deepcopy(state.tendwire_turn_jobs(store))
     assert no_spin["tendwire_turn_final"]["polled"] == 0
     assert telegram.final_attempts == attempts_after_failure
     assert [
@@ -2063,6 +2158,62 @@ def test_explicit_failed_plan_recovery_clones_prefix_and_never_replays_telegram(
         (failed_token, "operator-recovery-1"),
         (failed_token, "operator-recovery-1"),
     ]
+
+
+def test_unrelated_terminal_materialize_failure_preserves_live_plan(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0"
+    )
+    live_revision = "twrev1.live_plan"
+    live_row = _turn_row(
+        "turn-live-plan",
+        live_revision,
+        ("live multipart response\n\n" * 500) + "LIVE_TAIL",
+    )
+    unrelated_row = _turn_row(
+        "turn-unrelated-failure",
+        "twrev1.unrelated_failure",
+        "unrelated final",
+    )
+    unrelated_row["worker_id"] = "worker-2"
+    unrelated_row["worker_fingerprint"] = "fp-2"
+    unrelated_row["stable_key"] = _stable_key(
+        "worker-2", "fp-2"
+    )
+    tendwire = UnrelatedTerminalReadyAfterFirstPartTendwire(
+        live_row, unrelated_row
+    )
+    store = _store()
+
+    result = sync_once(
+        store,
+        _runtime(tendwire, DeletingTelegram(), max_sends=100),
+    )
+
+    live_token = tendwire._plan_by_revision[live_revision]
+    live_entry = next(
+        iter(state.source_worker_entries(store).values())
+    )
+    live_jobs = [
+        job
+        for job in tendwire._jobs
+        if job["payload"]["plan_token"] == live_token
+    ]
+    assert len(live_jobs) > 1
+    assert live_jobs[0]["status"] == "delivered"
+    assert any(job["status"] == "queued" for job in live_jobs[1:])
+    assert result["tendwire_turn_final"]["status"] == (
+        "attempts_exhausted"
+    )
+    assert live_entry["pending_plan_token"] == live_token
+    assert live_entry["pending_content_revision"] == live_revision
+    assert "abandoned_plan_token" not in live_entry
+    assert "abandoned_content_revision" not in live_entry
+
 
 class FailSecondPartTwiceTelegram(DeletingTelegram):
     def __init__(self):
