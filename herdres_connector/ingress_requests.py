@@ -443,6 +443,27 @@ def _validated_records_mapping(
     return records
 
 
+def cached_terminal_outcome(
+    store: dict[str, Any], request_id: str, *, now: float
+) -> dict[str, Any] | None:
+    """Read a validated terminal/quarantine outcome without mutating state."""
+
+    request_id = validate_request_id(request_id)
+    timestamp = _timestamp(now)
+    if timestamp is None:
+        raise ValueError("invalid ingress timestamp")
+    records = _validated_records_mapping(store, now=timestamp)
+    if records is None or request_id not in records:
+        return None
+    record = records[request_id]
+    if not _valid_record(record, request_id):
+        # Legacy records are retry evidence, never terminal authority.
+        return None
+    if record["state"] not in {"terminal", "quarantined"}:
+        return None
+    return copy.deepcopy(record["outcome"])
+
+
 def quarantine_request(
     record: dict[str, Any],
     reason: str,

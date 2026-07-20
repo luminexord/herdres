@@ -324,7 +324,16 @@ def _success_reply(response: dict[str, Any]) -> str:
 def _submit_ingress_command_record(
     store: dict[str, Any], record: dict[str, Any]
 ) -> dict[str, Any]:
-    """Replay the durable bytes and reduce only authoritative dispositions."""
+    """Replay durable bytes off-lock and reduce authoritative dispositions.
+
+    ``command_reply`` enters with the connector state lock held.  The canonical
+    request is already fsynced before this helper starts, so Tendwire may safely
+    receive it while the global JSON flock is released.  Once the lock is
+    reacquired, reload the store before applying the response so a concurrent
+    sync/dispatcher write is never clobbered.
+    """
+
+    request_id = validate_request_id(record.get("request_id"))
 
     while True:
         now = time.time()
@@ -345,8 +354,30 @@ def _submit_ingress_command_record(
 
         # Construct the child only after deadline/cache preflight. command_json
         # sends these exact UTF-8 bytes rather than reserializing the request.
-        response = TendwireClient().command_json(request_json)
+        with state.released_lock():
+            response = TendwireClient().command_json(request_json)
         transitioned_at = time.time()
+
+        latest = state.load_state()
+        store.clear()
+        store.update(latest)
+        record, migrated = ingress_requests.ensure_request_shell(
+            store,
+            request_id,
+            now=transitioned_at,
+            retry_horizon=config.command_retry_horizon_seconds(),
+            retention=config.command_request_retention_seconds(),
+        )
+        if migrated:
+            state.save_state(store)
+        if record["state"] in {"terminal", "quarantined"}:
+            return copy.deepcopy(record["outcome"])
+        if record.get("request_json") != request_json:
+            outcome = ingress_requests.quarantine_request(
+                record, "conflicting ingress request", now=transitioned_at
+            )
+            state.save_state(store)
+            return outcome
 
         if command_process_ambiguous(response) or command_process_not_started(
             response

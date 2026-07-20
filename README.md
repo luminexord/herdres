@@ -89,6 +89,34 @@ Zero, negative, or invalid reconciliation intervals use the hourly default so
 the retained projection stays bounded. Set the force flag for an explicit
 reconciliation pass.
 
+### Durable inbound lanes
+
+`HERDRES_INBOUND_LANES=1` enables the opt-in per-topic ingress scheduler. It is
+off by default, so an upgrade keeps the existing synchronous gateway behavior
+until explicitly enabled. Lane mode stores accepted updates in
+`~/.local/share/herdres/inbound_spool.db` (override with
+`HERDRES_INBOUND_SPOOL_PATH`) using SQLite WAL and `synchronous=FULL`. The lane
+item and stable receiving-bot cursor commit in one transaction; the old offset
+file remains a best-effort, atomic rollback mirror.
+
+Message lanes are keyed by receiving-bot kind and Telegram topic. General,
+unroutable messages, slash commands, and callback queries share that receiver's
+control lane. Each lane is strict FIFO with at most one leased head, while up to
+`HERDRES_INBOUND_DISPATCH_WORKERS` lanes run concurrently (default `8`). A
+retry delays only its lane using exponential backoff based on
+`HERDRES_INBOUND_LANE_BACKOFF_SECONDS` (default `2`, capped at five minutes).
+Expired leases are reclaimed after a crash and replay the same request ID;
+terminal ingress records complete without a second Tendwire submission.
+
+`HERDRES_INBOUND_LANE_DEPTH` bounds each lane at `32` open items by default.
+When a lane is full, the gateway does not spool that update: it advances the
+durable cursor and posts one throttled owner-visible notice in the affected
+topic. Wrong-chat, non-owner, bot-authored, empty, and other-token updates are
+also dropped and advanced before spooling. Dispatch releases the global
+`state.json` flock around the idempotent Tendwire request and reloads state after
+reacquiring it, so unrelated lane dispatchers do not serialize on the backend
+call.
+
 ### Inbound command identity and redelivery
 
 `install-user.sh` initializes one private 32-byte request-ID key at the path
@@ -114,10 +142,12 @@ the polling position and the opaque request ID. Every distinct update receives
 a different ID even when its content is identical, and Herdres does not
 suppress commands by comparing their content.
 
-The gateway derives the opaque ID before private route resolution and creates a
-durable schema-v2 lifecycle shell before routing, transcription, or child
-creation. Its `created_at`, `deadline_at`, and `retain_until` are fixed from
-that first-seen instant. Before Tendwire can observe a command, Herdres
+The gateway derives the opaque ID before private route resolution. In legacy
+mode it creates the durable schema-v2 lifecycle shell before routing,
+transcription, or child creation; lane mode first commits the update and cursor
+to the separate spool and creates the same unchanged state record during lane
+dispatch. In either mode `created_at`, `deadline_at`, and `retain_until` are
+fixed from the Telegram first-seen instant. Before Tendwire can observe a command, Herdres
 canonicalizes the exact schema-v1 public request, stores that JSON string, and
 fsyncs the temporary state file, atomic replacement, and parent directory. The
 Tendwire child receives those stored UTF-8 bytes verbatim; an ID-only

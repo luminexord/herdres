@@ -13,6 +13,7 @@ DEFAULT_OFFSET_PATH = HOME / ".local/share/herdres/gateway.offset"
 DEFAULT_PROCESSED_PATH = HOME / ".local/share/herdres/gateway_processed_messages.json"
 DEFAULT_TENDWIRE_DB_PATH = HOME / ".local/share/tendwire/tendwire.db"
 DEFAULT_REQUEST_ID_KEY_PATH = HOME / ".local/share/herdres/request-id.key"
+DEFAULT_INBOUND_SPOOL_PATH = HOME / ".local/share/herdres/inbound_spool.db"
 DEFAULT_HERDRES_ENV_PATH = HOME / ".config/herdres/herdres.env"
 DEFAULT_GENERAL_THREAD_ID = "1"
 SOURCE_SERVICES = ("tendwired.service", "herdres-gateway.service", "herdres.service")
@@ -158,6 +159,50 @@ def command_retry_horizon_seconds(env: Any | None = None) -> int:
 
 def command_request_retention_seconds(env: Any | None = None) -> int:
     return command_retry_horizon_seconds(env) + 86_400
+
+
+def inbound_lanes_enabled(env: Any | None = None) -> bool:
+    """Enable the durable, independently dispatched Telegram ingress lanes."""
+
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_INBOUND_LANES", "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def inbound_spool_path(env: Any | None = None) -> Path:
+    source = os.environ if env is None else env
+    return Path(
+        source.get("HERDRES_INBOUND_SPOOL_PATH", DEFAULT_INBOUND_SPOOL_PATH)
+    ).expanduser()
+
+
+def inbound_dispatch_workers(env: Any | None = None) -> int:
+    source = os.environ if env is None else env
+    try:
+        value = int(str(source.get("HERDRES_INBOUND_DISPATCH_WORKERS", "8") or "8"))
+    except (TypeError, ValueError):
+        return 8
+    return min(64, max(1, value))
+
+
+def inbound_lane_depth(env: Any | None = None) -> int:
+    source = os.environ if env is None else env
+    try:
+        value = int(str(source.get("HERDRES_INBOUND_LANE_DEPTH", "32") or "32"))
+    except (TypeError, ValueError):
+        return 32
+    return min(4096, max(1, value))
+
+
+def inbound_lane_backoff_seconds(env: Any | None = None) -> float:
+    source = os.environ if env is None else env
+    try:
+        value = float(
+            str(source.get("HERDRES_INBOUND_LANE_BACKOFF_SECONDS", "2") or "2")
+        )
+    except (TypeError, ValueError):
+        return 2.0
+    return min(300.0, max(0.01, value))
 
 
 def require_source_mode(env: Any | None = None) -> None:
