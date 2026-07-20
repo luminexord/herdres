@@ -60,6 +60,13 @@ gateway. Deleting, regenerating, or changing the key path without restoring
 the original key changes every derived request ID and can make an already-seen
 Telegram update appear to be a new mutation.
 
+When `HERDRES_INBOUND_LANES=1`, the authoritative receiving-bot cursors and
+pending updates live in the separate SQLite WAL selected by
+`HERDRES_INBOUND_SPOOL_PATH` (default
+`~/.local/share/herdres/inbound_spool.db`). The legacy offset files are only
+atomic, fsynced rollback mirrors. Stop the gateway before backing up or
+restoring the spool so SQLite can checkpoint its WAL consistently.
+
 ### Tendwire worker continuity key
 
 Tendwire owns a 32-byte installation key at
@@ -181,6 +188,10 @@ HERDRES_TELEGRAM_CHAT_ID=...
 HERDR_TELEGRAM_TOPICS_STATE=~/.local/share/herdres/state.json
 HERDRES_REQUEST_ID_KEY_PATH=~/.local/share/herdres/request-id.key
 HERDRES_COMMAND_RETRY_HORIZON_SECONDS=86400
+HERDRES_INBOUND_LANES=0
+HERDRES_INBOUND_DISPATCH_WORKERS=8
+HERDRES_INBOUND_LANE_DEPTH=32
+HERDRES_INBOUND_LANE_BACKOFF_SECONDS=2
 TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.db
 HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS=60
 ```

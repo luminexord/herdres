@@ -13,12 +13,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from herdres_connector import config, decisions, ingress_requests, speech, state
 from herdres_connector.ingress_identity import derive_telegram_request_id, load_request_id_key, validate_request_id
+from herdres_connector.ingress_lanes import IngressLaneSpool, LaneItem, lane_key
 from herdres_connector.managed_bots import MANAGER_BOT_KIND, managed_bot_kind_for_key, managed_bot_kind_for_username, managed_bot_tokens
 from herdres_connector.safe import sanitize_text
 from herdres_connector.telegram_delivery import TelegramClient
@@ -138,7 +140,20 @@ def _load_offset(key: str = MANAGER_BOT_KIND) -> int:
 def _save_offset(offset: int, key: str = MANAGER_BOT_KIND) -> None:
     path = _offset_path_for(key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(int(offset)), encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(str(int(offset)))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 
@@ -278,6 +293,154 @@ def _payload_for_message(message: dict[str, Any], store: dict[str, Any], *, bot_
     return payload
 
 
+def _cached_ingress_terminal(store: dict[str, Any], request_id: str) -> bool:
+    return (
+        ingress_requests.cached_terminal_outcome(
+            store, request_id, now=time.time()
+        )
+        is not None
+    )
+
+
+def _preview_lane_update(
+    update: dict[str, Any],
+    store: dict[str, Any],
+    *,
+    receiver_kind: str,
+    request_id_key: bytes,
+    bot_key: str,
+) -> dict[str, Any]:
+    """Apply cheap ingest gates and compute a lock-free routing preview."""
+
+    update_id = update.get("update_id")
+    if type(update_id) is not int or update_id < 0:
+        return {"action": "invalid"}
+    callback = update.get("callback_query")
+    if isinstance(callback, dict):
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        user = callback.get("from") if isinstance(callback.get("from"), dict) else {}
+        try:
+            request_id = derive_telegram_request_id(
+                request_id_key,
+                receiver_id=receiver_kind,
+                update_id=update_id,
+                chat_id=chat.get("id"),
+                message_id=message.get("message_id"),
+            )
+        except ValueError:
+            return {"action": "drop", "reason": "invalid_ingress_identity"}
+        configured_chat = config.telegram_chat_id(store)
+        if configured_chat and str(chat.get("id") or "") != configured_chat:
+            return {"action": "drop", "reason": "wrong_chat"}
+        if not _owner_allowed(
+            store,
+            str(user.get("id") or ""),
+            bool(user.get("is_bot")) if user else True,
+        ):
+            return {"action": "drop", "reason": "sender_not_allowed"}
+        topic_id = _message_thread_id(message, store)
+        return {
+            "action": "spool",
+            "request_id": request_id,
+            "kind": "callback_query",
+            "lane_key": lane_key(receiver_kind, "__control__"),
+            "route": {
+                "chat_id": str(chat.get("id") or ""),
+                "topic_id": topic_id,
+                "message_id": str(message.get("message_id") or ""),
+            },
+        }
+
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return {"action": "drop", "reason": "unsupported_update"}
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    try:
+        request_id = derive_telegram_request_id(
+            request_id_key,
+            receiver_id=receiver_kind,
+            update_id=update_id,
+            chat_id=chat.get("id"),
+            message_id=message.get("message_id"),
+        )
+    except ValueError:
+        return {"action": "drop", "reason": "invalid_ingress_identity"}
+    configured_chat = config.telegram_chat_id(store)
+    if configured_chat and str(chat.get("id") or "") != configured_chat:
+        return {"action": "drop", "reason": "wrong_chat"}
+    user = message.get("from") if isinstance(message.get("from"), dict) else {}
+    if not _owner_allowed(
+        store,
+        str(user.get("id") or ""),
+        bool(user.get("is_bot")) if user else True,
+    ):
+        return {"action": "drop", "reason": "sender_not_allowed"}
+    text = str(message.get("text") or "")
+    caption = str(message.get("caption") or "")
+    if not text and not caption and not speech.voice_attachment_from_message(message):
+        return {"action": "drop", "reason": "no_content"}
+    topic_id = _message_thread_id(message, store)
+    target_bot_kind = _explicit_target_bot_kind_for_message(
+        store, message, text or caption, topic_id
+    )
+    current_bot_kind = managed_bot_kind_for_key(bot_key) or MANAGER_BOT_KIND
+    if (
+        current_bot_kind == MANAGER_BOT_KIND
+        and target_bot_kind in _managed_bot_token_kinds(store)
+    ):
+        return {"action": "drop", "reason": "deferred_to_managed_bot"}
+    if current_bot_kind != MANAGER_BOT_KIND and target_bot_kind != current_bot_kind:
+        return {"action": "drop", "reason": "deferred_to_other_bot"}
+    _entry_key, entry = state.find_entry_by_thread(store, topic_id)
+    general = config.general_thread_id(store)
+    lane_topic = (
+        "__control__"
+        if entry is None or topic_id == general or (text or caption).lstrip().startswith("/")
+        else topic_id
+    )
+    return {
+        "action": "spool",
+        "request_id": request_id,
+        "kind": "message",
+        "lane_key": lane_key(receiver_kind, lane_topic),
+        "route": {
+            "chat_id": str(chat.get("id") or ""),
+            "topic_id": topic_id,
+            "message_id": str(message.get("message_id") or ""),
+            "target_bot_kind": target_bot_kind,
+        },
+    }
+
+
+_OVERFLOW_NOTICE_LOCK = threading.Lock()
+_OVERFLOW_NOTICE_AT: dict[str, float] = {}
+
+
+def _notify_lane_overflow(token: str, route: dict[str, Any], lane: str) -> None:
+    """Send at most one non-blocking owner notice per lane per minute."""
+
+    now = time.time()
+    with _OVERFLOW_NOTICE_LOCK:
+        if now - _OVERFLOW_NOTICE_AT.get(lane, 0.0) < 60.0:
+            return
+        _OVERFLOW_NOTICE_AT[lane] = now
+
+    def send() -> None:
+        try:
+            TelegramClient(token=token).send_message(
+                str(route.get("chat_id") or ""),
+                "Inbound lane is full; this message was dropped. Wait for the agent to catch up and try again.",
+                thread_id=str(route.get("topic_id") or ""),
+                reply_to_message_id=str(route.get("message_id") or ""),
+                notify=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - overflow notices are best effort
+            log(f"lane overflow notice failed: {sanitize_text(str(exc), 160)}")
+
+    threading.Thread(target=send, name="herdres-lane-overflow-notice", daemon=True).start()
+
+
 def _delete_topic_icon_service_message(message: dict[str, Any], store: dict[str, Any], token: str) -> bool:
     if not config.delete_topic_icon_service_messages():
         return False
@@ -396,13 +559,22 @@ def _preflight_ingress_request(
     request_id: str,
     *,
     now: float | None = None,
+    first_seen_at: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     timestamp = time.time() if now is None else float(now)
+    created_at = timestamp if first_seen_at is None else min(timestamp, float(first_seen_at))
     retry_horizon = config.command_retry_horizon_seconds()
     retention = config.command_request_retention_seconds()
     with state.state_lock():
         store = state.load_state()
         changed = ingress_requests.prune_requests(store, now=timestamp)
+        _record, created = ingress_requests.ensure_request_shell(
+            store,
+            request_id,
+            now=created_at,
+            retry_horizon=retry_horizon,
+            retention=retention,
+        )
         record, outcome, preflight_changed = ingress_requests.preflight_request(
             store,
             request_id,
@@ -410,7 +582,7 @@ def _preflight_ingress_request(
             retry_horizon=retry_horizon,
             retention=retention,
         )
-        if changed or preflight_changed:
+        if changed or created or preflight_changed:
             state.save_state(store)
     return record, outcome
 
@@ -423,6 +595,7 @@ def handle_message(
     receiver_id: str,
     request_id_key: bytes,
     bot_key: str | None = None,
+    ingress_first_seen_at: float | None = None,
 ) -> str:
     chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
     try:
@@ -441,7 +614,9 @@ def handle_message(
     # routing, voice transcription, or child-process creation. A terminal or
     # expired redelivery is answered from its cached local outcome and never
     # creates a child that could call Tendwire.
-    record, cached_outcome = _preflight_ingress_request(request_id)
+    record, cached_outcome = _preflight_ingress_request(
+        request_id, first_seen_at=ingress_first_seen_at
+    )
     if cached_outcome is not None:
         result = cached_outcome
     else:
@@ -560,6 +735,7 @@ def handle_update(
     receiver_id: str,
     request_id_key: bytes,
     bot_key: str | None = None,
+    ingress_first_seen_at: float | None = None,
 ) -> str:
     update_id = update.get("update_id")
     if type(update_id) is not int or update_id < 0:
@@ -588,6 +764,7 @@ def handle_update(
         receiver_id=receiver_id,
         request_id_key=request_id_key,
         bot_key=bot_key,
+        ingress_first_seen_at=ingress_first_seen_at,
     )
 
 
@@ -608,13 +785,238 @@ def _receiver_id_for_key(key: str) -> str:
     return managed_bot_kind_for_key(key) or key
 
 
+def _mirror_offset_best_effort(offset: int, key: str) -> None:
+    try:
+        _save_offset(offset, key)
+    except Exception as exc:  # noqa: BLE001 - SQLite cursor is authoritative in lane mode
+        log(f"legacy offset mirror failed for {key}: {sanitize_text(str(exc), 160)}")
+
+
+def _poll_once_lanes(
+    key: str,
+    token: str,
+    *,
+    timeout_seconds: int,
+    request_id_key: bytes,
+    spool: IngressLaneSpool,
+) -> None:
+    receiver_kind = _receiver_id_for_key(key)
+    offset = spool.cursor(receiver_kind)
+    if offset is None:
+        legacy_offset = _read_offset(key)
+        if legacy_offset is None:
+            backlog = get_updates(token, None, timeout_seconds=0)
+            if backlog:
+                last_update_id = backlog[-1].get("update_id")
+                if type(last_update_id) is not int or last_update_id < 0:
+                    raise RuntimeError("backlog contains an invalid update id")
+                legacy_offset = spool.initialize_cursor(
+                    receiver_kind, last_update_id + 1
+                )
+                _mirror_offset_best_effort(legacy_offset, key)
+                log(f"drained {len(backlog)} backlog update(s) for {key}")
+            return
+        offset = spool.initialize_cursor(receiver_kind, legacy_offset)
+
+    for update in get_updates(token, offset, timeout_seconds=timeout_seconds):
+        raw_update_id = update.get("update_id")
+        if type(raw_update_id) is not int or raw_update_id < 0:
+            log(f"invalid update id for {key}; cursor retained")
+            break
+        update_id = raw_update_id
+        try:
+            # state.json is replaced atomically, so this routing preview needs no
+            # flock and can never queue behind sync or a different lane.
+            store = state.load_state()
+            preview = _preview_lane_update(
+                update,
+                store,
+                receiver_kind=receiver_kind,
+                request_id_key=request_id_key,
+                bot_key=key,
+            )
+            if preview.get("action") == "invalid":
+                log(f"invalid update id for {key}; cursor retained")
+                break
+            if preview.get("action") != "spool":
+                offset = spool.advance_cursor(receiver_kind, update_id + 1)
+                _mirror_offset_best_effort(offset, key)
+                continue
+
+            first_seen_at = time.time()
+            request_id = str(preview["request_id"])
+            result = spool.enqueue(
+                request_id=request_id,
+                receiver_kind=receiver_kind,
+                update_id=update_id,
+                lane_key_value=str(preview["lane_key"]),
+                kind=str(preview["kind"]),
+                update=update,
+                route=preview["route"],
+                first_seen_at=first_seen_at,
+                deadline_at=(
+                    first_seen_at + config.command_retry_horizon_seconds()
+                ),
+                depth_limit=config.inbound_lane_depth(),
+                already_done=_cached_ingress_terminal(store, request_id),
+            )
+            offset = result.next_update_id
+            _mirror_offset_best_effort(offset, key)
+            if result.status == "overflow":
+                _notify_lane_overflow(
+                    token, preview["route"], str(preview["lane_key"])
+                )
+        except Exception as exc:  # noqa: BLE001 - retain cursor on failed durable accept
+            log(
+                f"update {update_id} ingest failed for {key}: "
+                f"{type(exc).__name__}: {sanitize_text(str(exc), 200)}"
+            )
+            break
+
+
+class _InboundLaneDispatcher:
+    def __init__(
+        self,
+        spool: IngressLaneSpool,
+        request_id_key: bytes,
+        *,
+        workers: int | None = None,
+        backoff_seconds: float | None = None,
+        lease_seconds: float | None = None,
+    ) -> None:
+        self.spool = spool
+        self.request_id_key = request_id_key
+        self.worker_count = (
+            config.inbound_dispatch_workers()
+            if workers is None
+            else max(1, int(workers))
+        )
+        self.backoff_seconds = (
+            config.inbound_lane_backoff_seconds()
+            if backoff_seconds is None
+            else float(backoff_seconds)
+        )
+        self.lease_seconds = (
+            max(120.0, float(COMMAND_TIMEOUT) + 30.0)
+            if lease_seconds is None
+            else float(lease_seconds)
+        )
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._token_lock = threading.Lock()
+        self._tokens: dict[str, tuple[str, str]] = {}
+        self._threads: list[threading.Thread] = []
+
+    def update_specs(self, specs: list[tuple[str, str, int]]) -> None:
+        tokens = {
+            _receiver_id_for_key(key): (key, token)
+            for key, token, _timeout in specs
+        }
+        with self._token_lock:
+            self._tokens = tokens
+        self._wake.set()
+
+    def start(self) -> None:
+        if self._threads:
+            return
+        reclaimed = self.spool.reclaim_processing()
+        if reclaimed:
+            log(f"reclaimed {reclaimed} inbound dispatch lease(s)")
+        for index in range(self.worker_count):
+            thread = threading.Thread(
+                target=self._worker,
+                args=(f"{os.getpid()}-{uuid.uuid4().hex}-{index}",),
+                name=f"herdres-inbound-dispatch-{index}",
+                daemon=True,
+            )
+            self._threads.append(thread)
+            thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        for thread in self._threads:
+            thread.join(timeout=2.0)
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    def _token_for(self, receiver_kind: str) -> tuple[str, str] | None:
+        with self._token_lock:
+            return self._tokens.get(receiver_kind)
+
+    def _worker(self, lease_owner: str) -> None:
+        while not self._stop.is_set():
+            try:
+                item = self.spool.claim(
+                    lease_owner,
+                    lease_seconds=self.lease_seconds,
+                )
+                if item is None:
+                    self._wake.wait(0.05)
+                    self._wake.clear()
+                    continue
+                self._dispatch(item, lease_owner)
+            except Exception as exc:  # noqa: BLE001 - leases make worker-loop recovery safe
+                log(
+                    f"lane worker failed: {type(exc).__name__}: "
+                    f"{sanitize_text(str(exc), 200)}"
+                )
+                self._wake.wait(ERROR_BACKOFF)
+                self._wake.clear()
+
+    def _dispatch(self, item: LaneItem, lease_owner: str) -> None:
+        token_spec = self._token_for(item.receiver_kind)
+        if token_spec is None:
+            self.spool.retry(
+                item.seq,
+                lease_owner,
+                backoff_seconds=self.backoff_seconds,
+            )
+            return
+        bot_key, token = token_spec
+        try:
+            checkpoint = handle_update(
+                item.update,
+                token,
+                receiver_id=item.receiver_kind,
+                request_id_key=self.request_id_key,
+                bot_key=bot_key,
+                ingress_first_seen_at=item.first_seen_at,
+            )
+        except Exception as exc:  # noqa: BLE001 - same request ID is retried from durable bytes
+            log(
+                f"lane dispatch {item.seq} failed: {type(exc).__name__}: "
+                f"{sanitize_text(str(exc), 200)}"
+            )
+            checkpoint = CHECKPOINT_RETRY
+        if checkpoint == CHECKPOINT_ADVANCE:
+            self.spool.mark_done(item.seq, lease_owner)
+        else:
+            self.spool.retry(
+                item.seq,
+                lease_owner,
+                backoff_seconds=self.backoff_seconds,
+            )
+
+
 def _poll_once(
     key: str,
     token: str,
     *,
     timeout_seconds: int,
     request_id_key: bytes,
+    spool: IngressLaneSpool | None = None,
 ) -> None:
+    if config.inbound_lanes_enabled():
+        _poll_once_lanes(
+            key,
+            token,
+            timeout_seconds=timeout_seconds,
+            request_id_key=request_id_key,
+            spool=spool or IngressLaneSpool(),
+        )
+        return
     offset = _read_offset(key)
     if offset is None:
         offset = _drain_backlog(key, token)
@@ -651,6 +1053,8 @@ def _poll_worker(
     timeout_seconds: int,
     request_id_key: bytes,
     stop_event: threading.Event,
+    spool: IngressLaneSpool | None = None,
+    dispatcher: _InboundLaneDispatcher | None = None,
 ) -> None:
     while not stop_event.is_set():
         try:
@@ -659,7 +1063,10 @@ def _poll_worker(
                 token,
                 timeout_seconds=timeout_seconds,
                 request_id_key=request_id_key,
+                spool=spool,
             )
+            if dispatcher is not None:
+                dispatcher.wake()
         except Exception as exc:  # noqa: BLE001 - a dead poll thread silently drops inbound messages
             log(f"poll error for {key}: {type(exc).__name__}: {sanitize_text(str(exc), 200)}")
             time.sleep(ERROR_BACKOFF)
@@ -677,6 +1084,8 @@ def _reconcile_workers(
     workers: dict[str, dict[str, Any]],
     specs: list[tuple[str, str, int]],
     request_id_key: bytes,
+    spool: IngressLaneSpool | None = None,
+    dispatcher: _InboundLaneDispatcher | None = None,
 ) -> None:
     desired = {key: (token, timeout) for key, token, timeout in specs}
     for key, worker in list(workers.items()):
@@ -693,7 +1102,7 @@ def _reconcile_workers(
         stop = threading.Event()
         thread = threading.Thread(
             target=_poll_worker,
-            args=(key, token, timeout_seconds, request_id_key, stop),
+            args=(key, token, timeout_seconds, request_id_key, stop, spool, dispatcher),
             name=f"herdres-gateway-{key}",
             daemon=True,
         )
@@ -714,18 +1123,33 @@ def run() -> int:
     except RuntimeError:
         log("Herdres request identity key is missing or unsafe")
         return 1
+    lanes_enabled = config.inbound_lanes_enabled()
+    spool = IngressLaneSpool() if lanes_enabled else None
+    dispatcher = (
+        _InboundLaneDispatcher(spool, request_id_key)
+        if spool is not None
+        else None
+    )
     workers: dict[str, dict[str, Any]] = {}
     log("started")
     while True:
         try:
             store = state.load_state()
+            specs = _poll_specs(store, token)
+            if dispatcher is not None:
+                dispatcher.update_specs(specs)
+                dispatcher.start()
             _reconcile_workers(
                 workers,
-                _poll_specs(store, token),
+                specs,
                 request_id_key,
+                spool,
+                dispatcher,
             )
             time.sleep(WORKER_RECONCILE_SECONDS)
         except KeyboardInterrupt:
+            if dispatcher is not None:
+                dispatcher.stop()
             return 0
         except Exception as exc:  # noqa: BLE001
             log(f"gateway reconcile error: {sanitize_text(str(exc), 200)}")
