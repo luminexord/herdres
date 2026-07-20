@@ -2370,6 +2370,7 @@ def _stage_final_plan(
             "completed turn has no presentation parts",
         )
     if runtime.dry_run:
+        _clear_abandoned_plan_handle(entry)
         entry["pending_turn_id"] = _turn_id(item)
         entry["pending_content_revision"] = revision
         entry["pending_plan_token"] = "dry-run"
@@ -2457,6 +2458,7 @@ def _stage_final_plan(
             "invalid_prepare_response",
             "prepare response returned an invalid plan generation",
         )
+    _clear_abandoned_plan_handle(entry)
     entry["pending_turn_id"] = _turn_id(item)
     entry["pending_content_revision"] = revision
     entry["pending_plan_token"] = plan_token
@@ -3620,11 +3622,41 @@ def _maybe_complete_turn_plan(
         "replaces_failed_plan_token",
         "pending_final_identity",
         "pending_working_predecessor_turn_id",
+        "abandoned_plan_token",
+        "abandoned_content_revision",
     ):
         entry.pop(field, None)
     _clear_stream_delivery_state(entry, _turn_id(item))
     _record_delivery_success(entry, bot_kind)
     return True
+
+
+def _abandon_pending_turn_plan(
+    store: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    plan_token: str,
+    revision: str,
+) -> bool:
+    """Release a terminal plan without losing its explicit-recovery handle."""
+    if (
+        entry.get("pending_plan_token") != plan_token
+        or entry.get("pending_content_revision") != revision
+    ):
+        return False
+    _clear_final_source_owner(
+        store, entry.get("pending_final_identity")
+    )
+    entry["abandoned_plan_token"] = plan_token
+    entry["abandoned_content_revision"] = revision
+    entry.pop("pending_plan_token", None)
+    entry.pop("pending_content_revision", None)
+    return True
+
+
+def _clear_abandoned_plan_handle(entry: dict[str, Any]) -> None:
+    entry.pop("abandoned_plan_token", None)
+    entry.pop("abandoned_content_revision", None)
 
 
 def _reconcile_completed_turn_plans(
@@ -3672,6 +3704,28 @@ def _reconcile_completed_turn_plans(
             and observed_token == plan_token
             and observed.get("state") == "superseded"
         )
+        failed = (
+            observed.get("ok") is True
+            and observed_token == plan_token
+            and observed.get("state") in {"failed", "dead_letter"}
+        )
+        dead_receipt = any(
+            isinstance(receipt, dict)
+            and receipt.get("plan_token") == plan_token
+            and receipt.get("content_revision") == revision
+            and receipt.get("substate") == "failed"
+            for receipt in state.tendwire_turn_jobs(store).values()
+        )
+        if failed or dead_receipt:
+            if _abandon_pending_turn_plan(
+                store,
+                entry,
+                plan_token=plan_token,
+                revision=revision,
+            ):
+                reconciled += 1
+                _checkpoint_turn_job(runtime)
+            continue
         if plan_not_found or superseded:
             _clear_final_source_owner(
                 store, entry.get("pending_final_identity")
@@ -3688,6 +3742,8 @@ def _reconcile_completed_turn_plans(
                 "replaces_failed_plan_token",
                 "pending_final_identity",
                 "pending_working_predecessor_turn_id",
+                "abandoned_plan_token",
+                "abandoned_content_revision",
             ):
                 entry.pop(field, None)
             reconciled += 1
@@ -3820,8 +3876,9 @@ def _fail_turn_final(
     result["changed"] = True
     result["status"] = reason_code
     response_status = str(response.get("status") or "")
-    if response_status == "attempts_exhausted":
+    if response_status in {"attempts_exhausted", "dead_letter"}:
         result["status"] = response_status
+        result["_terminal_failure"] = True
     if uncertain:
         result["uncertain"] += 1
         result["status"] = "delivery_uncertain"
@@ -3897,6 +3954,8 @@ def _drain_turn_final(
         "changed": False,
     }
     failed_job_key = ""
+    failed_plan_token = ""
+    failed_revision = ""
     if (
         not runtime.with_outbox
         or max_operations <= 0
@@ -4089,6 +4148,8 @@ def _drain_turn_final(
         plan_token = str(payload["plan_token"])
         job_key = str(lease["key"])
         failed_job_key = job_key
+        failed_plan_token = plan_token
+        failed_revision = revision
         operation = str(payload["operation"])
         sequence = int(payload["sequence_index"])
         ordinal = int(payload["part_ordinal"])
@@ -4204,6 +4265,7 @@ def _drain_turn_final(
                 result,
             )
             break
+        _clear_abandoned_plan_handle(entry)
         entry["pending_turn_id"] = _turn_id(item)
         entry["pending_content_revision"] = revision
         entry["pending_plan_token"] = plan_token
@@ -4406,6 +4468,7 @@ def _drain_turn_final(
                 "delivery_rejected",
                 result,
             )
+            result["_terminal_failure"] = True
             break
 
         if substate in {
@@ -4888,13 +4951,12 @@ def _drain_turn_final(
         ):
             _checkpoint_turn_job(runtime)
 
-    if (
-        result.get("status") == "attempts_exhausted"
-        and failed_job_key
-    ):
+    terminal_failure = bool(result.pop("_terminal_failure", False))
+    if terminal_failure and failed_job_key:
         failed_receipt = state.find_tendwire_turn_job(
             store, failed_job_key
         )
+        terminal_changed = False
         if (
             failed_receipt is not None
             and failed_receipt.get("substate")
@@ -4910,6 +4972,20 @@ def _drain_turn_final(
                 failed_job_key,
                 substate="failed",
             )
+            terminal_changed = True
+        for pending_entry in state.source_worker_entries(
+            store
+        ).values():
+            terminal_changed = (
+                _abandon_pending_turn_plan(
+                    store,
+                    pending_entry,
+                    plan_token=failed_plan_token,
+                    revision=failed_revision,
+                )
+                or terminal_changed
+            )
+        if terminal_changed:
             _checkpoint_turn_job(runtime)
     return result
 
@@ -5284,11 +5360,17 @@ def _validate_delta_page(
                     "delta_protocol_ambiguous",
                     "Tendwire turn.delta upsert omitted its projection",
                 )
-            turn = _validate_turn_row(raw_turn)
-            if _turn_id(turn) != change_turn_id:
+            if _turn_id(raw_turn) != change_turn_id:
                 raise _TurnContentError(
                     "delta_protocol_ambiguous",
                     "Tendwire turn.delta projection identity mismatched",
+                )
+            try:
+                turn = _validate_turn_row(raw_turn)
+            except _TurnContentError as exc:
+                turn = dict(raw_turn)
+                turn[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
+                    turn, exc.status
                 )
             upserts.append(turn)
         elif op == "remove":
@@ -5838,7 +5920,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     }
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
     if runtime.with_outbox:
-        remaining = max(0, runtime.max_sends - int(turn_counts["sent"]))
+        remaining = max(3, runtime.max_sends - int(turn_counts["sent"]))
         turn_final_result = _drain_turn_final(
             store,
             turns_payload,

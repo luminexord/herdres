@@ -6,7 +6,13 @@ import time
 import pytest
 
 from herdres_connector import config, doctor, state
-from herdres_connector.source_sync import SyncRuntime, sync_once
+from herdres_connector.source_sync import (
+    _TURN_CONTENT_OUTCOME_KEY,
+    _TurnContentError,
+    _validate_delta_page,
+    SyncRuntime,
+    sync_once,
+)
 from test_source_only import FakeTelegram, FakeTendwire, _store
 from test_turn_final_delivery import TurnFinalTendwire, _stable_key, _turn_row
 
@@ -329,6 +335,89 @@ def test_transport_ambiguity_never_bootstraps_or_traverses():
     assert store["tendwire_delta_sync"]["watermark"] == "twdelta1.current"
     assert store["tendwire_delta_sync"]["status"] == "active"
     assert result["tendwire_delta_sync"]["health_flag"] == "turn_delta_transport_ambiguous"
+
+
+def test_delta_page_isolates_revisionless_legacy_row_without_dropping_valid_rows():
+    valid = _turn_row(
+        "turn-valid", "twrev1.valid", None, user="current prompt"
+    )
+    legacy = _turn_row(
+        "turn-legacy", "twrev1.legacy", None, user="legacy prompt"
+    )
+    legacy["content"]["content_revision"] = None
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(valid), _upsert(legacy)],
+            mode="changes",
+            checkpoint="twdelta1.legacy_tolerated",
+        )
+    )
+
+    assert removals == []
+    assert [row["id"] for row in upserts] == [
+        "turn-valid",
+        "turn-legacy",
+    ]
+    assert _TURN_CONTENT_OUTCOME_KEY not in upserts[0]
+    assert upserts[1][_TURN_CONTENT_OUTCOME_KEY] == {
+        "turn_id": "turn-legacy",
+        "status": "invalid_content_schema",
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(
+            {
+                "op": "upsert",
+                "turn_id": "turn-missing",
+                "changed_at": "2030-01-01T00:00:00Z",
+            },
+            id="missing-turn-projection",
+        ),
+        pytest.param(
+            {
+                "op": "replace",
+                "turn_id": "turn-bad-op",
+                "changed_at": "2030-01-01T00:00:00Z",
+            },
+            id="bad-operation",
+        ),
+    ],
+)
+def test_delta_page_still_rejects_page_level_protocol_errors(change):
+    with pytest.raises(_TurnContentError) as exc_info:
+        _validate_delta_page(
+            _page(
+                [change],
+                mode="changes",
+                checkpoint="twdelta1.invalid_page",
+            )
+        )
+
+    assert exc_info.value.status == "delta_protocol_ambiguous"
+
+
+def test_delta_page_identity_mismatch_is_not_hidden_by_legacy_isolation():
+    legacy = _turn_row(
+        "turn-projection", "twrev1.identity", None
+    )
+    legacy["content"]["content_revision"] = None
+    change = _upsert(legacy)
+    change["turn_id"] = "turn-envelope"
+
+    with pytest.raises(_TurnContentError) as exc_info:
+        _validate_delta_page(
+            _page(
+                [change],
+                mode="changes",
+                checkpoint="twdelta1.identity_mismatch",
+            )
+        )
+
+    assert exc_info.value.status == "delta_protocol_ambiguous"
 
 
 def test_invalid_watermark_starts_one_bootstrap_and_ambiguity_resumes_its_cursor():
