@@ -69,9 +69,9 @@ def tendwire_timeout_seconds(env: Any | None = None) -> float:
 def tendwire_delta_limit(env: Any | None = None) -> int:
     source = os.environ if env is None else env
     try:
-        value = int(str(source.get("HERDRES_TENDWIRE_DELTA_LIMIT", "100") or "100"))
+        value = int(str(source.get("HERDRES_TENDWIRE_DELTA_LIMIT", "500") or "500"))
     except (TypeError, ValueError):
-        return 100
+        return 500
     return min(500, max(1, value))
 
 

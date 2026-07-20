@@ -59,11 +59,14 @@ calls.
 
 After one bounded, cursor-resumable bootstrap, Herdres persists Tendwire's
 `twdelta1.*` watermark and local schema-v2 turn projection under the single
-`tendwire_delta_sync` state key. Normal syncs read one bounded `turn.delta`
-page, so an unchanged pass does not traverse retained turn history or fetch
-canonical content. Each continuation cursor is saved only after its page has
-been applied; the watermark advances only after the final page of the frozen
-batch is applied and fsynced through the existing atomic state writer.
+`tendwire_delta_sync` state key. Bootstrap pages use the 500-row protocol
+maximum by default and a one-hour stateless Tendwire cursor. This keeps the
+full supported 100,000-row bootstrap inside the production five-second loop's
+cursor window while preserving the existing apply-and-fsync guard on every
+page. Normal syncs read one bounded `turn.delta` page. An unchanged page does
+not traverse retained history, fetch canonical content, mutate local state, or
+fsync the state file. The watermark advances only after the final page of the
+frozen batch is applied and fsynced through the existing atomic state writer.
 
 Timeouts, EOF, and malformed frames never trigger a second turn observation.
 An invalid or expired watermark starts one fresh bounded bootstrap, resuming
@@ -80,7 +83,7 @@ default as a safety net. Configure the page/repair behavior with:
 
 ```text
 HERDRES_TENDWIRE_TIMEOUT_SECONDS=60
-HERDRES_TENDWIRE_DELTA_LIMIT=100
+HERDRES_TENDWIRE_DELTA_LIMIT=500
 HERDRES_TENDWIRE_FULL_RECONCILE_SECONDS=3600
 HERDRES_TENDWIRE_FORCE_FULL_RECONCILE=0
 ```

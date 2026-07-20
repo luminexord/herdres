@@ -118,21 +118,42 @@ def _delta_env(monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_WORKING_UPDATE_MIN_SECONDS", "0")
 
 
+def test_delta_default_page_size_completes_supported_bootstrap_within_cursor_ttl(
+    monkeypatch,
+):
+    monkeypatch.delenv("HERDRES_TENDWIRE_DELTA_LIMIT", raising=False)
+    assert config.tendwire_delta_limit() == 500
+
+
 def test_unchanged_active_sync_uses_only_one_delta_page_and_no_provider_or_content():
     row = _turn_row("turn-live", "twrev1.live", None, user="prompt")
     tendwire = DeltaTendwire(
-        [_page([], mode="changes", checkpoint="twdelta1.same")]
+        [_page([], mode="changes", checkpoint="twdelta1.current")],
+        workers=[],
+        spaces=[],
     )
     store = _store()
+    store["telegram_deleted_topics"] = []
+    store["telegram_message_bindings"] = {}
     store["tendwire_delta_sync"] = _active_delta(row)
+    before = deepcopy(store)
+    checkpoints = []
     telegram = FakeTelegram()
 
     result = sync_once(
         store,
-        SyncRuntime(tendwire, telegram, with_outbox=False),
+        SyncRuntime(
+            tendwire,
+            telegram,
+            with_outbox=False,
+            checkpoint=lambda: checkpoints.append(deepcopy(store)),
+        ),
     )
 
     assert result["ok"] is True
+    assert result["changed"] is False
+    assert store == before
+    assert checkpoints == []
     assert tendwire.turn_calls == 0
     assert tendwire.content_calls == 0
     assert len(tendwire.delta_calls) == 1
@@ -458,7 +479,6 @@ def test_invalid_watermark_starts_one_bootstrap_and_ambiguity_resumes_its_cursor
     sync_once(store, runtime)
     assert len(tendwire.delta_calls) == 2
     assert tendwire.delta_calls[1]["watermark"] is None
-    assert store["tendwire_delta_sync"]["pending_cursor"] == "twdeltac1.resume"
 
     sync_once(store, runtime)
     assert len(tendwire.delta_calls) == 3

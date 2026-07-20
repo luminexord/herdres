@@ -5608,6 +5608,18 @@ def _observe_turn_delta(
                 "reason": "delta_protocol_ambiguous",
             }
         )
+    if (
+        expected_mode == "changes"
+        and cursor is None
+        and not page["has_more"]
+        and not upserts
+        and not removals
+        and page.get("checkpoint") == watermark
+        and int(delta.get("failure_count") or 0) == 0
+        and "last_error_at" not in delta
+        and "health_flag" not in delta
+    ):
+        return {"kind": "noop", "delta": delta, "reason": "unchanged"}
     projection = delta["projection"]
     for row in upserts:
         projection[_turn_id(row)] = row
@@ -5752,7 +5764,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     bootstrap_complete = True
     if delta_observation is not None:
         bootstrap_complete = (
-            delta_observation.get("kind") == "full"
+            delta_observation.get("kind") in {"full", "noop"}
             or (
                 delta_observation.get("kind") == "delta"
                 and (
@@ -5907,11 +5919,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 runtime,
                 now=observed_at,
             )
-        elif runtime.checkpoint is not None:
-            # Persist bootstrapping/fallback health transitions without ever
-            # issuing a second turn observation in this pass.
-            runtime.checkpoint()
-        changed = True
+        changed = changed or delta_observation["kind"] != "noop"
     turn_final_result = {
         "enabled": runtime.with_outbox,
         "polled": 0,
