@@ -11,6 +11,8 @@ import herdres_gateway
 from herdres_connector import ingress_requests, state, tendwire_client
 
 from test_source_only import (
+    FakeTelegram,
+    FakeTendwire,
     REQUEST_ID,
     REQUEST_ID_2,
     REQUEST_ID_KEY,
@@ -19,6 +21,7 @@ from test_source_only import (
     _source_worker,
     _store,
 )
+from test_turn_final_delivery import _turn_row
 
 
 def _request(request_id: str = REQUEST_ID) -> dict[str, object]:
@@ -235,6 +238,53 @@ def test_legacy_record_migrates_once_without_status_finality() -> None:
     assert changed is False
 
 
+def test_v2_record_migrates_additively_to_submission_capable_v3() -> None:
+    original = _record(REQUEST_ID, with_request=True)
+    v2 = {
+        key: copy.deepcopy(value)
+        for key, value in original.items()
+        if key
+        not in {
+            "submission_id",
+            "submission_state",
+            "turn_id",
+            "target_owner",
+            "submitted_at",
+            "linked_at",
+        }
+    }
+    v2["schema_version"] = 2
+    store = {ingress_requests.RECORDS_KEY: {REQUEST_ID: v2}}
+
+    migrated, changed = ingress_requests.ensure_request_shell(
+        store,
+        REQUEST_ID,
+        now=130.0,
+        retry_horizon=60,
+        retention=120,
+    )
+
+    assert changed is True
+    assert migrated["schema_version"] == 3
+    assert migrated["request_json"] == v2["request_json"]
+    assert {
+        key: migrated[key]
+        for key in (
+            "submission_id",
+            "submission_state",
+            "turn_id",
+            "target_owner",
+            "submitted_at",
+            "linked_at",
+        )
+    } == {
+        "submission_id": None,
+        "submission_state": None,
+        "turn_id": None,
+        "target_owner": None,
+        "submitted_at": None,
+        "linked_at": None,
+    }
 def test_corrupt_current_record_is_a_non_destructive_global_barrier() -> None:
     private = "123456:abcdefghijklmnopqrstuvwxyz_PRIVATE"
     corrupt_record = {
@@ -442,6 +492,147 @@ def test_terminal_accepted_cache_survives_restart_and_route_loss(
     assert len(calls) == 1
 
 
+def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
+    tmp_path, monkeypatch
+) -> None:
+    _setup_command_state(tmp_path, monkeypatch)
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "3"
+    )
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    submission_id = "twsub1." + ("b" * 64)
+    calls: list[dict[str, object]] = []
+
+    class V3Client:
+        def command_json(self, request_json):
+            request = json.loads(request_json)
+            calls.append(request)
+            response = _accepted_command_response(request)
+            response["schema_version"] = 3
+            response["result"].update(
+                {"submission_id": submission_id, "turn_id": None}
+            )
+            return response
+
+    monkeypatch.setattr(herdres, "TendwireClient", V3Client)
+    accepted = herdres.command_reply(_payload())
+    assert accepted["disposition"] == "terminal_accepted"
+    assert calls[0]["response_schema_version"] == 3
+
+    submission_store = state.load_state()
+    record = submission_store[ingress_requests.RECORDS_KEY][REQUEST_ID]
+    assert record["submission_id"] == submission_id
+    assert record["submission_state"] == "pending_observation"
+    assert record["turn_id"] is None
+    assert record["target_owner"]["stable_key"].startswith("wsk1_")
+    source_workers = [
+        {
+            "id": "worker-1",
+            "name": "Alpha",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "fp-original",
+        }
+    ]
+
+    submission_telegram = FakeTelegram()
+    herdres.sync_once(
+        submission_store,
+        herdres.SyncRuntime(
+            FakeTendwire(
+                turns={"schema_version": 1, "turns": []},
+                workers=source_workers,
+            ),
+            submission_telegram,
+            with_outbox=False,
+        ),
+    )
+    assert len(submission_telegram.sent) == 1
+
+    legacy_store = _store()
+    legacy_telegram = FakeTelegram()
+    legacy_turn = {
+        "id": "turn-predicted",
+        "worker_id": "worker-1",
+        "space_id": "space-1",
+        "complete": False,
+        "user_text": "original instruction",
+    }
+    herdres.sync_once(
+        legacy_store,
+        herdres.SyncRuntime(
+            FakeTendwire(
+                turns={"schema_version": 1, "turns": [legacy_turn]}
+            ),
+            legacy_telegram,
+            with_outbox=False,
+        ),
+    )
+    assert submission_telegram.sent[0][1] == legacy_telegram.sent[0][1]
+
+    linked_turn = _turn_row(
+        "turn-observed", "twrev1.observed", None, user="original instruction"
+    )
+    linked_turn["submission_id"] = submission_id
+    linked_turn["submission_state"] = "linked"
+
+    class LinkedDelta(FakeTendwire):
+        def turn_delta(self, **_kwargs):
+            return {
+                "schema_version": 1,
+                "projection_schema_version": 2,
+                "host_id": "host-public",
+                "mode": "bootstrap",
+                "changes": [
+                    {
+                        "op": "upsert",
+                        "turn_id": linked_turn["id"],
+                        "changed_at": "2030-01-01T00:00:00Z",
+                        "turn": copy.deepcopy(linked_turn),
+                    }
+                ],
+                "has_more": False,
+                "next_cursor": None,
+                "checkpoint": "twdelta1.linked",
+                "aggregate": {"changes_returned": 1},
+            }
+
+    herdres.sync_once(
+        submission_store,
+        herdres.SyncRuntime(
+            LinkedDelta(
+                turns={"schema_version": 2, "turns": []},
+                workers=source_workers,
+            ),
+            submission_telegram,
+            with_outbox=False,
+        ),
+    )
+    assert len(submission_telegram.sent) == 1
+    record = submission_store[ingress_requests.RECORDS_KEY][REQUEST_ID]
+    assert record["submission_state"] == "linked"
+    assert record["turn_id"] == "turn-observed"
+    assert record["linked_at"] is not None
+    entry = next(iter(state.source_worker_entries(submission_store).values()))
+    assert entry["last_stream_submission_id"] == submission_id
+    assert entry["last_stream_turn_id"] == "turn-observed"
+    binding = state.find_message_binding(
+        submission_store, entry["last_stream_message_id"]
+    )
+    assert binding["submission_id"] == submission_id
+    assert binding["turn_id"] == "turn-observed"
+    linked_updated_at = record["updated_at"]
+    replayed, replay_changed = ingress_requests.link_submission(
+        submission_store,
+        submission_id,
+        "turn-observed",
+        now=linked_updated_at + 1,
+    )
+    assert replay_changed is False
+    assert replayed["updated_at"] == linked_updated_at
+
+
 def test_exact_bytes_recover_accepted_response_loss_with_one_backend_send(
     tmp_path, monkeypatch
 ) -> None:
@@ -490,6 +681,74 @@ def test_exact_bytes_recover_accepted_response_loss_with_one_backend_send(
     assert child_starts[0] == child_starts[1]
     assert backend_sends == 1
     assert "private stderr" not in json.dumps(first, sort_keys=True)
+
+
+def test_v3_ack_loss_replays_submission_once_without_duplicate_working(
+    tmp_path, monkeypatch
+) -> None:
+    _setup_command_state(tmp_path, monkeypatch)
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "3"
+    )
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    submission_id = "twsub1." + ("c" * 64)
+    backend_receipts: set[str] = set()
+    backend_sends = 0
+    child_starts = 0
+
+    def run(argv, *, input, **_kwargs):
+        nonlocal backend_sends, child_starts
+        child_starts += 1
+        request = json.loads(bytes(input))
+        request_id = request["request_id"]
+        if request_id not in backend_receipts:
+            backend_receipts.add(request_id)
+            backend_sends += 1
+            return subprocess.CompletedProcess(argv, 0, b"lost-ack", b"")
+        response = _accepted_command_response(request)
+        response["schema_version"] = 3
+        response["result"].update(
+            {"submission_id": submission_id, "turn_id": None}
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps(response, separators=(",", ":")).encode(),
+            b"",
+        )
+
+    monkeypatch.setattr(tendwire_client.subprocess, "run", run)
+    first = herdres.command_reply(_payload())
+    second = herdres.command_reply(_payload())
+    assert first["checkpoint"] == "retry"
+    assert second["disposition"] == "terminal_accepted"
+    assert backend_sends == 1
+    assert child_starts == 2
+
+    store = state.load_state()
+    telegram = FakeTelegram()
+    workers = [
+        {
+            "id": "worker-1",
+            "name": "Alpha",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "fp-original",
+        }
+    ]
+    runtime = lambda: herdres.SyncRuntime(
+        FakeTendwire(
+            turns={"schema_version": 1, "turns": []}, workers=workers
+        ),
+        telegram,
+        with_outbox=False,
+    )
+    herdres.sync_once(store, runtime())
+    herdres.sync_once(store, runtime())
+    assert len(telegram.sent) == 1
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert entry["last_stream_submission_id"] == submission_id
 
 
 def test_stale_refresh_uses_real_client_validation_and_persists_second_bytes(

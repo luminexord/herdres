@@ -8,10 +8,29 @@ from types import SimpleNamespace
 import pytest
 
 from herdres_connector import tendwire_client
+from herdres_connector import config
 from herdres_connector.tendwire_client import TendwireClient
 
 
 REQUEST_ID = "hri1_SIodGeqCeIvApzpEvIaEM-L07UzUMgUFyeltRQxPpqU"
+
+
+def test_command_response_schema_negotiation_is_explicit_and_fail_closed(
+    monkeypatch,
+):
+    monkeypatch.delenv(
+        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", raising=False
+    )
+    monkeypatch.delenv("HERDRES_TENDWIRE_RESPONSE_SCHEMA_VERSION", raising=False)
+    assert config.command_response_schema_version() == 2
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "3"
+    )
+    assert config.command_response_schema_version() == 3
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "4"
+    )
+    assert config.command_response_schema_version() == 2
 
 
 def _command_request() -> dict[str, object]:
@@ -264,6 +283,52 @@ def test_command_accepts_v17_envelope_with_optional_turn_id(
     assert result["status"] == "accepted"
     assert result["result"]["turn_id"] == "turn-public"
     assert result["result"]["observed_turn_state"] == observed_turn_state
+
+
+def test_command_v3_negotiation_accepts_nullable_turn_and_v2_fallback(
+    client_runner,
+):
+    client, calls, responses = client_runner
+    request = _command_request()
+    request["response_schema_version"] = 3
+    accepted = _accepted_result()
+    accepted.update(
+        {
+            "submission_id": "twsub1." + ("a" * 64),
+            "turn_id": None,
+            "observed_turn_state": "linked",
+        }
+    )
+    v3 = _command_response(result=accepted)
+    v3["schema_version"] = 3
+    responses.extend([{"body": v3}, {"body": _command_response()}])
+
+    negotiated = client.command(request)
+    fallback = client.command(request)
+
+    assert negotiated["schema_version"] == 3
+    assert negotiated["result"]["turn_id"] is None
+    assert negotiated["result"]["submission_id"].startswith("twsub1.")
+    assert fallback["schema_version"] == 2
+    assert all(
+        json.loads(call[1]["input"])["response_schema_version"] == 3
+        for call in calls
+    )
+
+
+def test_command_rejects_unsolicited_v3_envelope(client_runner):
+    client, _calls, responses = client_runner
+    response = _command_response()
+    response["schema_version"] = 3
+    response["result"].update(
+        {"submission_id": "twsub1." + ("d" * 64), "turn_id": None}
+    )
+    responses.append({"body": response})
+
+    result = client.command(_command_request())
+
+    assert result["status"] == "request_state_uncertain"
+    assert result["action"] == "send_instruction"
 
 
 def test_command_json_repeats_verbatim_utf8_input_bytes(client_runner):

@@ -161,6 +161,26 @@ def command_request_retention_seconds(env: Any | None = None) -> int:
     return command_retry_horizon_seconds(env) + 86_400
 
 
+def command_response_schema_version(env: Any | None = None) -> int:
+    """Return the explicitly negotiated Tendwire command envelope version.
+
+    Version 2 remains the default so an installed pre-v3 Tendwire keeps seeing
+    byte-for-byte compatible command requests.  Operators can opt in to v3
+    submission receipts without changing the request schema itself.
+    """
+
+    source = os.environ if env is None else env
+    raw = source.get(
+        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION",
+        source.get("HERDRES_TENDWIRE_RESPONSE_SCHEMA_VERSION", "2"),
+    )
+    try:
+        value = int(str(raw or "2"))
+    except (TypeError, ValueError):
+        return 2
+    return value if value in {2, 3} else 2
+
+
 def inbound_lanes_enabled(env: Any | None = None) -> bool:
     """Enable the durable, independently dispatched Telegram ingress lanes."""
 
