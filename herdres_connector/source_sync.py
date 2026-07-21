@@ -898,7 +898,11 @@ def _set_stream_delivery(
     placeholder: bool = False,
 ) -> bool:
     """Single writer for the stream-delivery key group."""
-    changed = _entry_put(entry, "last_stream_turn_id", turn_id)
+    changed = False
+    if "last_stream_submission_id" in entry:
+        entry.pop("last_stream_submission_id", None)
+        changed = True
+    changed = _entry_put(entry, "last_stream_turn_id", turn_id) or changed
     changed = _entry_put(entry, "last_stream_hash", content_hash) or changed
     if placeholder:
         if not entry.get("last_stream_message_id"):

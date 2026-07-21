@@ -314,10 +314,12 @@ def _valid_accepted_command_result(
     ):
         return False
     turn_id = value.get("turn_id")
-    if "turn_id" in value and turn_id is not None and (
-        not isinstance(turn_id, str) or not turn_id.strip()
-    ):
-        return False
+    if "turn_id" in value:
+        if turn_id is None:
+            if response_schema_version != 3:
+                return False
+        elif not isinstance(turn_id, str) or not turn_id.strip():
+            return False
     submission_id = value.get("submission_id")
     if "submission_id" in value and (
         not isinstance(submission_id, str) or not submission_id.strip()

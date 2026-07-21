@@ -355,7 +355,10 @@ def _submit_ingress_command_record(
             state.save_state(store)
             return outcome
 
-        if record.get("target_owner") is None:
+        if (
+            record.get("target_owner") is None
+            and '"response_schema_version":3' in request_json
+        ):
             try:
                 request = json.loads(request_json)
             except (json.JSONDecodeError, TypeError, ValueError):
@@ -757,7 +760,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             entry, payload.get("reply_to_message_id")
         ):
             entry["speak_next_reply"] = True
-        if record is not None and record.get("target_owner") is None:
+        if (
+            record is not None
+            and record.get("target_owner") is None
+            and config.command_response_schema_version() == 3
+        ):
             target_identity = state.entry_stable_identity(entry)
             if target_identity is not None:
                 ingress_requests.attach_target_owner(

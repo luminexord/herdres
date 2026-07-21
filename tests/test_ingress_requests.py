@@ -8,7 +8,7 @@ import pytest
 
 import herdres
 import herdres_gateway
-from herdres_connector import ingress_requests, state, tendwire_client
+from herdres_connector import ingress_requests, source_sync, state, tendwire_client
 
 from test_source_only import (
     FakeTelegram,
@@ -492,6 +492,26 @@ def test_terminal_accepted_cache_survives_restart_and_route_loss(
     assert len(calls) == 1
 
 
+def test_v2_command_does_not_attach_submission_owner(tmp_path, monkeypatch) -> None:
+    _setup_command_state(tmp_path, monkeypatch)
+
+    def forbidden_owner(*_args, **_kwargs):
+        raise AssertionError("v2 command must not persist a submission owner")
+
+    class Client:
+        def command_json(self, request_json):
+            return _accepted_command_response(json.loads(request_json))
+
+    monkeypatch.setattr(ingress_requests, "attach_target_owner", forbidden_owner)
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+
+    result = herdres.command_reply(_payload())
+
+    assert result["disposition"] == "terminal_accepted"
+    record = state.load_state()[ingress_requests.RECORDS_KEY][REQUEST_ID]
+    assert record["target_owner"] is None
+
+
 def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
     tmp_path, monkeypatch
 ) -> None:
@@ -631,6 +651,67 @@ def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
     )
     assert replay_changed is False
     assert replayed["updated_at"] == linked_updated_at
+
+
+def test_unrelated_working_delivery_blocks_stale_submission_rebind() -> None:
+    store = _store()
+    _entry_key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "working",
+                "space_id": "space-1",
+                "fingerprint": "fp-original",
+            }
+        ),
+        topic_id="77",
+    )
+    stale_submission_id = "twsub1." + ("e" * 64)
+    entry.update(
+        {
+            "last_stream_submission_id": stale_submission_id,
+            "last_stream_turn_id": stale_submission_id,
+            "last_stream_hash": "old-hash",
+            "last_stream_message_id": "501",
+        }
+    )
+    state.bind_message_to_worker(
+        store,
+        "501",
+        entry,
+        topic_id="77",
+        kind="working",
+        turn_id=stale_submission_id,
+        submission_id=stale_submission_id,
+    )
+
+    source_sync._set_stream_delivery(
+        entry,
+        turn_id="turn-unrelated",
+        content_hash="unrelated-hash",
+        message_id="777",
+    )
+    state.bind_message_to_worker(
+        store,
+        "777",
+        entry,
+        topic_id="77",
+        kind="working",
+        turn_id="turn-unrelated",
+    )
+    stale_record = {
+        "submission_id": stale_submission_id,
+        "turn_id": "turn-stale-linked",
+    }
+
+    assert "last_stream_submission_id" not in entry
+    assert source_sync._associate_submission_working(
+        store, stale_record, entry
+    ) is False
+    assert entry["last_stream_turn_id"] == "turn-unrelated"
+    assert state.find_message_binding(store, "777")["turn_id"] == "turn-unrelated"
 
 
 def test_exact_bytes_recover_accepted_response_loss_with_one_backend_send(
