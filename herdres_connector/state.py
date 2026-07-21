@@ -2071,6 +2071,7 @@ def bind_message_to_worker(
     part_ordinal: int | None = None,
     part_count: int | None = None,
     tendwire_job_key: str = "",
+    submission_id: str = "",
 ) -> None:
     message = str(message_id or "").strip()
     if not message or message == "0":
@@ -2085,6 +2086,8 @@ def bind_message_to_worker(
         "turn_id": str(turn_id or ""),
         "bot_kind": str(bot_kind or ""),
     }
+    if submission_id:
+        binding["submission_id"] = str(submission_id)
     delivery_values_present = bool(
         content_revision
         or plan_token

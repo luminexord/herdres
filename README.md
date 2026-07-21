@@ -84,6 +84,7 @@ default as a safety net. Configure the page/repair behavior with:
 ```text
 HERDRES_TENDWIRE_TIMEOUT_SECONDS=60
 HERDRES_TENDWIRE_DELTA_LIMIT=500
+HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION=2
 HERDRES_TENDWIRE_FULL_RECONCILE_SECONDS=3600
 HERDRES_TENDWIRE_FORCE_FULL_RECONCILE=0
 ```
@@ -91,6 +92,11 @@ HERDRES_TENDWIRE_FORCE_FULL_RECONCILE=0
 Zero, negative, or invalid reconciliation intervals use the hourly default so
 the retained projection stays bounded. Set the force flag for an explicit
 reconciliation pass.
+
+Command envelopes remain on schema v2 by default for installed-contract
+compatibility. Set `HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION=3` to opt
+in to deterministic submission receipts. Herdres accepts a v2 response from an
+older Tendwire even when v3 was requested.
 
 ### Durable inbound lanes
 

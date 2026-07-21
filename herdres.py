@@ -292,7 +292,7 @@ def _pending_number_reply(entry: dict[str, Any], text: str) -> tuple[str, str] |
 
 
 def _command_request(entry: dict[str, Any], payload: dict[str, Any], text: str) -> dict[str, Any]:
-    return {
+    request = {
         "schema_version": 1,
         "action": "send_instruction",
         "request_id": validate_request_id(payload.get("request_id")),
@@ -300,6 +300,9 @@ def _command_request(entry: dict[str, Any], payload: dict[str, Any], text: str) 
         "target": _target_for_entry(entry),
         "instruction": {"text": text},
     }
+    if config.command_response_schema_version() == 3:
+        request["response_schema_version"] = 3
+    return request
 
 
 def _success_reply(response: dict[str, Any]) -> str:
@@ -352,6 +355,36 @@ def _submit_ingress_command_record(
             state.save_state(store)
             return outcome
 
+        if record.get("target_owner") is None:
+            try:
+                request = json.loads(request_json)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                request = None
+            target = request.get("target") if isinstance(request, dict) else None
+            worker_id = (
+                str(target.get("worker_id") or "")
+                if isinstance(target, dict)
+                else ""
+            )
+            _entry_key, owner_entry = state.find_worker_entry_by_id(
+                store, worker_id
+            )
+            identity = (
+                state.entry_stable_identity(owner_entry)
+                if isinstance(owner_entry, dict)
+                else None
+            )
+            if identity is not None:
+                ingress_requests.attach_target_owner(
+                    record,
+                    identity[0],
+                    identity[1],
+                    now=now,
+                )
+                # The submission owner must survive route loss and process
+                # restart before any mutating child can start.
+                state.save_state(store)
+
         # Construct the child only after deadline/cache preflight. command_json
         # sends these exact UTF-8 bytes rather than reserializing the request.
         with state.released_lock():
@@ -396,6 +429,51 @@ def _submit_ingress_command_record(
 
         disposition = response.get("disposition")
         if disposition == "terminal_accepted":
+            result = (
+                response.get("result")
+                if isinstance(response.get("result"), dict)
+                else {}
+            )
+            submission_id = result.get("submission_id")
+            if isinstance(submission_id, str) and submission_id:
+                if record.get("target_owner") is None:
+                    accepted_target = result.get("target")
+                    accepted_worker_id = (
+                        str(accepted_target.get("worker_id") or "")
+                        if isinstance(accepted_target, dict)
+                        else ""
+                    )
+                    _entry_key, accepted_entry = state.find_worker_entry_by_id(
+                        store, accepted_worker_id
+                    )
+                    accepted_identity = (
+                        state.entry_stable_identity(accepted_entry)
+                        if isinstance(accepted_entry, dict)
+                        else None
+                    )
+                    if accepted_identity is not None:
+                        ingress_requests.attach_target_owner(
+                            record,
+                            accepted_identity[0],
+                            accepted_identity[1],
+                            now=transitioned_at,
+                        )
+                try:
+                    ingress_requests.attach_submission_receipt(
+                        record,
+                        submission_id,
+                        str(result.get("observed_turn_state") or ""),
+                        result.get("turn_id"),
+                        now=transitioned_at,
+                    )
+                except ValueError:
+                    outcome = ingress_requests.quarantine_request(
+                        record,
+                        "invalid Tendwire submission receipt",
+                        now=transitioned_at,
+                    )
+                    state.save_state(store)
+                    return outcome
             reply = _success_reply(response) if config.ack_on_send() else ""
             outcome = ingress_requests.mark_terminal(
                 record,
@@ -679,6 +757,18 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             entry, payload.get("reply_to_message_id")
         ):
             entry["speak_next_reply"] = True
+        if record is not None and record.get("target_owner") is None:
+            target_identity = state.entry_stable_identity(entry)
+            if target_identity is not None:
+                ingress_requests.attach_target_owner(
+                    record,
+                    target_identity[0],
+                    target_identity[1],
+                    now=time.time(),
+                )
+                # Route ownership is durable before the command can mutate
+                # Tendwire, including commands whose public target is a space.
+                state.save_state(store)
         try:
             request = _command_request(entry, payload, text)
         except ValueError:

@@ -3691,7 +3691,7 @@ def test_gateway_fsyncs_first_seen_shell_before_route_or_child(
     assert checkpoint == herdres_gateway.CHECKPOINT_RETRY
     assert [kind for kind, _record in observations] == ["route", "child"]
     for _kind, record in observations:
-        assert record["schema_version"] == 2
+        assert record["schema_version"] == 3
         assert record["request_id"] == request_id
         assert record["created_at"] == 100.0
         assert record["updated_at"] == 100.0

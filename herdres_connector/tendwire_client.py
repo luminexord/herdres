@@ -48,6 +48,9 @@ _SEND_COMMAND_REQUEST_FIELDS = {
     "target",
     "instruction",
 }
+_SEND_COMMAND_V3_REQUEST_FIELDS = _SEND_COMMAND_REQUEST_FIELDS | {
+    "response_schema_version"
+}
 _DECISION_COMMAND_REQUEST_FIELDS = {
     "schema_version",
     "action",
@@ -84,9 +87,11 @@ _COMMAND_ACCEPTED_RESULT_FIELDS = frozenset(
         "observed_turn_state",
     }
 )
-_COMMAND_ACCEPTED_OPTIONAL_RESULT_FIELDS = frozenset({"turn_id"})
+_COMMAND_ACCEPTED_OPTIONAL_RESULT_FIELDS = frozenset(
+    {"submission_id", "turn_id"}
+)
 _COMMAND_ACCEPTED_OBSERVED_TURN_STATES = frozenset(
-    {"pending_observation", "observed", "complete"}
+    {"pending_observation", "observed", "complete", "linked"}
 )
 _DECISION_ACCEPTED_RESULT_FIELDS = frozenset(
     {
@@ -205,11 +210,23 @@ def _request_state_uncertain(request: dict[str, Any] | None = None) -> dict[str,
 
 
 def _exact_send_command_request(request: Any) -> dict[str, Any] | None:
-    if not isinstance(request, dict) or set(request) != _SEND_COMMAND_REQUEST_FIELDS:
+    fields = set(request) if isinstance(request, dict) else set()
+    if (
+        not isinstance(request, dict)
+        or (
+            fields != _SEND_COMMAND_REQUEST_FIELDS
+            and fields != _SEND_COMMAND_V3_REQUEST_FIELDS
+        )
+    ):
         return None
     if type(request.get("schema_version")) is not int or request["schema_version"] != 1:
         return None
     if request.get("action") != "send_instruction" or request.get("dry_run") is not False:
+        return None
+    if (
+        "response_schema_version" in request
+        and request.get("response_schema_version") != 3
+    ):
         return None
     try:
         validate_request_id(request.get("request_id"))
@@ -285,20 +302,28 @@ def _exact_public_command_request(request: Any) -> dict[str, Any] | None:
 def _valid_accepted_command_result(
     value: Any,
     request: dict[str, Any],
+    *,
+    response_schema_version: int,
 ) -> bool:
     if not isinstance(value, dict):
         return False
     fields = set(value)
-    if fields not in {
-        _COMMAND_ACCEPTED_RESULT_FIELDS,
+    if not _COMMAND_ACCEPTED_RESULT_FIELDS <= fields or not fields <= (
         _COMMAND_ACCEPTED_RESULT_FIELDS
-        | _COMMAND_ACCEPTED_OPTIONAL_RESULT_FIELDS,
-    }:
+        | _COMMAND_ACCEPTED_OPTIONAL_RESULT_FIELDS
+    ):
         return False
     turn_id = value.get("turn_id")
-    if "turn_id" in value and (
+    if "turn_id" in value and turn_id is not None and (
         not isinstance(turn_id, str) or not turn_id.strip()
     ):
+        return False
+    submission_id = value.get("submission_id")
+    if "submission_id" in value and (
+        not isinstance(submission_id, str) or not submission_id.strip()
+    ):
+        return False
+    if response_schema_version == 2 and "submission_id" in value:
         return False
     target = value.get("target")
     if not isinstance(target, dict) or set(target) != {"worker_id"}:
@@ -328,7 +353,11 @@ def _validated_command_response(
     if (
         set(response) != _COMMAND_RESPONSE_FIELDS
         or type(response.get("schema_version")) is not int
-        or response["schema_version"] != 2
+        or response["schema_version"] not in {2, 3}
+        or (
+            response["schema_version"] == 3
+            and request.get("response_schema_version") != 3
+        )
         or response.get("request_id") != request["request_id"]
         or response.get("action") != "send_instruction"
         or response.get("dry_run") is not False
@@ -357,7 +386,11 @@ def _validated_command_response(
             status != "accepted"
             or response["ok"] is not True
             or response.get("error") is not None
-            or not _valid_accepted_command_result(response.get("result"), request)
+            or not _valid_accepted_command_result(
+                response.get("result"),
+                request,
+                response_schema_version=response["schema_version"],
+            )
         ):
             return None
         return response
