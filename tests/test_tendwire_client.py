@@ -23,6 +23,8 @@ def test_command_response_schema_negotiation_is_explicit_and_fail_closed(
     )
     monkeypatch.delenv("HERDRES_TENDWIRE_RESPONSE_SCHEMA_VERSION", raising=False)
     assert config.command_response_schema_version() == 2
+    monkeypatch.setenv("HERDRES_TENDWIRE_RESPONSE_SCHEMA_VERSION", "3")
+    assert config.command_response_schema_version() == 2
     monkeypatch.setenv(
         "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "3"
     )
@@ -314,6 +316,18 @@ def test_command_v3_negotiation_accepts_nullable_turn_and_v2_fallback(
         json.loads(call[1]["input"])["response_schema_version"] == 3
         for call in calls
     )
+
+
+def test_command_v2_rejects_nullable_turn_id(client_runner):
+    client, _calls, responses = client_runner
+    accepted = _accepted_result()
+    accepted["turn_id"] = None
+    responses.append({"body": _command_response(result=accepted)})
+
+    result = client.command(_command_request())
+
+    assert result["status"] == "request_state_uncertain"
+    assert result["action"] == "send_instruction"
 
 
 def test_command_rejects_unsolicited_v3_envelope(client_runner):

@@ -170,10 +170,7 @@ def command_response_schema_version(env: Any | None = None) -> int:
     """
 
     source = os.environ if env is None else env
-    raw = source.get(
-        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION",
-        source.get("HERDRES_TENDWIRE_RESPONSE_SCHEMA_VERSION", "2"),
-    )
+    raw = source.get("HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "2")
     try:
         value = int(str(raw or "2"))
     except (TypeError, ValueError):
