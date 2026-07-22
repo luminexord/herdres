@@ -1096,7 +1096,7 @@ def test_fresh_duplicate_key_claimants_are_all_quarantined_without_routing_or_to
     assert first_telegram.sent == second_telegram.sent == []
 
 
-def test_persisted_collision_quarantines_old_claimants_and_creates_distinct_current_entry():
+def test_persisted_duplicate_stable_key_consolidates_to_oldest_topic():
     store = _store()
     key_a, entry_a, _created = state.upsert_worker_entry(
         store, _worker("claude-2", KEY_B), topic_id="26"
@@ -1115,16 +1115,19 @@ def test_persisted_collision_quarantines_old_claimants_and_creates_distinct_curr
     )
 
     entries = state.source_worker_entries(store)
-    assert len(entries) == 3
-    assert state.entry_is_quarantined(entries[key_a]) is True
-    assert state.entry_is_quarantined(entries[key_b]) is True
-    assert state.find_worker_entry_by_id(store, "claude-2") == (None, None)
-    assert state.entry_is_quarantined(entries[key_a]) is True
-    assert state.entry_is_quarantined(entries[key_b]) is True
-    assert all(state.entry_is_quarantined(entry) for entry in entries.values())
-    assert state.find_worker_entry_by_id(store, "claude-9") == (None, None)
-    assert state.find_entry_key_by_stable_key(store, KEY_A) is None
+    assert len(entries) == 2
+    assert entries[key_a]["topic_id"] == "26"
+    assert entries[key_a]["tendwire_worker_id"] == "claude-9"
+    assert not state.entry_is_quarantined(entries[key_a])
+    assert state.worker_entry_is_uniquely_routable(store, key_a, entries[key_a])
+    assert state.find_entry_by_thread(store, "26") == (key_a, entries[key_a])
+    assert state.entry_is_retired(entries[key_b])
+    assert state.entry_stable_identity(entries[key_b]) is None
+    assert entries[key_b]["retired_tendwire_stable_key"] == KEY_A
+    assert state.find_entry_by_thread(store, "28") == (None, None)
     assert telegram.topics == []
+    assert telegram.closed_topics == ["28"]
+    assert any(kwargs.get("thread_id") == "28" for _chat, _text, kwargs, _mid in telegram.sent)
 
 
 def test_closed_key_reuse_never_adopts_or_routes_the_closed_entry():
@@ -1574,7 +1577,7 @@ def test_same_snapshot_worker_id_with_distinct_keys_is_order_independent_and_qua
         assert _worker_entry_for_turn(store, "claude-2", "w1") == (None, None)
 
 
-def test_preflight_blocked_key_quarantines_every_exact_and_stable_owner_on_repeat():
+def test_preflight_duplicate_key_consolidates_bindings_and_is_repeat_idempotent():
     store = _store()
     exact_key, exact_owner, _created = state.upsert_worker_entry(
         store,
@@ -1621,19 +1624,30 @@ def test_preflight_blocked_key_quarantines_every_exact_and_stable_owner_on_repea
     assert set(state.source_worker_entries(store)) == {exact_key, other_key}
     assert state.source_worker_entries(store) == entries_after_first
     assert state.message_bindings(store) == bindings_after_first
+    entries = state.source_worker_entries(store)
+    assert not state.entry_is_quarantined(entries[exact_key])
+    assert state.worker_entry_is_uniquely_routable(store, exact_key, entries[exact_key])
+    assert state.entry_is_retired(entries[other_key])
+    assert state.entry_stable_identity(entries[other_key]) is None
+    assert "routing_quarantined" not in state.message_bindings(store)["500"]
+    assert state.message_bindings(store)["501"]["routing_quarantined"] is True
     assert all(
-        state.entry_is_quarantined(entry)
-        for entry in state.source_worker_entries(store).values()
-    )
-    assert all(
-        binding["routing_quarantined"] is True
+        binding["worker_id"] == "worker-1" and binding["stable_key"] == KEY_A
         for binding in state.message_bindings(store).values()
     )
-    assert state.find_worker_entry_by_id(store, "worker-1") == (None, None)
-    assert state.find_worker_entry_by_stable_key(store, KEY_A) == (None, None)
+    assert state.find_worker_entry_by_id(store, "worker-1") == (
+        exact_key,
+        entries[exact_key],
+    )
+    assert state.find_worker_entry_by_stable_key(store, KEY_A) == (
+        exact_key,
+        entries[exact_key],
+    )
     assert first["feed_sent"] == second["feed_sent"] == 0
     assert first_telegram.topics == second_telegram.topics == []
-    assert first_telegram.sent == second_telegram.sent == []
+    assert first_telegram.closed_topics == ["28"]
+    assert second_telegram.sent == []
+    assert second_telegram.closed_topics == []
 
 
 def test_cross_dimensional_reconciliation_reserves_stable_owner_before_worker_id_in_both_orders():
@@ -1716,11 +1730,11 @@ def test_cross_dimensional_reconciliation_reserves_stable_owner_before_worker_id
     reverse = run(list(reversed(snapshot)))
 
     assert forward == reverse
-    assert forward[0]["topics"] == []
-    assert forward[1]["topics"] == ["telegram-bot 2"]
+    assert forward[0]["topics"] == ["telegram-bot 2"]
+    assert forward[1]["topics"] == []
     assert forward[2]["topics"] == []
-    assert forward[1]["entries"] == forward[2]["entries"]
-    assert forward[1]["bindings"] == forward[2]["bindings"]
+    assert forward[0]["entries"] == forward[1]["entries"] == forward[2]["entries"]
+    assert forward[0]["bindings"] == forward[1]["bindings"] == forward[2]["bindings"]
     assert forward[1]["ledger"] == forward[2]["ledger"] == {
         "final:turn-old:hash": {
             "worker_id": "worker-1",
@@ -1916,7 +1930,7 @@ def test_identical_blocked_snapshot_claims_pair_with_quarantine_rows_idempotentl
 
 
 @pytest.mark.parametrize("topic_mode", ["worker", "space"])
-def test_quarantined_exact_v1_owner_blocks_id_churn_without_topic_routing_or_replay(
+def test_quarantined_exact_v1_owner_heals_after_stable_key_duplicate_consolidation(
     monkeypatch, topic_mode
 ):
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", topic_mode)
@@ -1954,7 +1968,7 @@ def test_quarantined_exact_v1_owner_blocks_id_churn_without_topic_routing_or_rep
 
     assert state.blocked_worker_stable_keys(store, [current]) == {KEY_A}
     passes = []
-    for _pass in range(3):
+    for pass_index in range(3):
         telegram = FakeTelegram()
         result = sync_once(
             store,
@@ -1965,26 +1979,31 @@ def test_quarantined_exact_v1_owner_blocks_id_churn_without_topic_routing_or_rep
             ),
         )
         entries = state.source_worker_entries(store)
-        assert len(entries) == 2
-        assert all(state.entry_is_quarantined(entry) for entry in entries.values())
-        new_owner = next(
-            entry
-            for entry in entries.values()
-            if entry["tendwire_worker_id"] == "worker-new"
-        )
-        assert "topic_id" not in new_owner
-        assert state.find_worker_entry_by_id(store, "worker-new") == (None, None)
-        assert state.find_worker_entry_by_stable_key(store, KEY_A) == (None, None)
-        assert _worker_entry_for_turn(store, "worker-new", "space-1") == (None, None)
-        assert herdres._worker_entry_from_reply(
-            store,
-            {"reply_to_message_id": "500", "topic_id": "26"},
-        ) == (None, None)
-        assert state.message_bindings(store)["500"]["routing_quarantined"] is True
-        assert state.delivered_turns(store) == {}
-        assert result["feed_sent"] == 0
-        assert telegram.topics == []
-        assert telegram.sent == []
+        if pass_index == 0:
+            assert len(entries) == 2
+            assert all(state.entry_is_quarantined(entry) for entry in entries.values())
+            assert state.find_worker_entry_by_stable_key(store, KEY_A) == (None, None)
+            assert state.delivered_turns(store) == {}
+            assert result["feed_sent"] == 0
+            assert telegram.topics == []
+            assert telegram.sent == []
+        else:
+            assert len(entries) == 1
+            new_key, new_owner = state.find_worker_entry_by_stable_key(store, KEY_A)
+            assert new_key is not None and new_owner is not None
+            assert new_owner["tendwire_worker_id"] == "worker-new"
+            assert state.worker_entry_is_uniquely_routable(store, new_key, new_owner)
+            assert _worker_entry_for_turn(store, "worker-new", "space-1") == (
+                new_key,
+                new_owner,
+            )
+            assert result["feed_sent"] == int(pass_index == 1)
+            assert len(telegram.sent) == int(pass_index == 1)
+            if topic_mode == "worker":
+                assert new_owner["topic_id"] == "26"
+                assert telegram.topics == []
+            elif pass_index == 1:
+                assert telegram.topics == ["Project"]
         passes.append(
             (
                 deepcopy(entries),
@@ -1992,7 +2011,7 @@ def test_quarantined_exact_v1_owner_blocks_id_churn_without_topic_routing_or_rep
                 deepcopy(state.delivered_turns(store)),
             )
         )
-    assert passes[0] == passes[1] == passes[2]
+    assert passes[1] == passes[2]
 
 
 def test_closed_nonquarantined_exact_v1_history_does_not_block_id_churn_on_repeat():

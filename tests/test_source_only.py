@@ -2673,7 +2673,7 @@ def test_stable_reply_binding_requires_resolved_worker_topic_ownership():
         assert resolved_key == worker_key
         assert resolved_worker is worker
 
-def test_stable_reply_binding_requires_worker_and_identity_uniqueness_on_worker_and_space_topics():
+def test_stable_reply_binding_ignores_positional_worker_id_collision_on_worker_and_space_topics():
     store = _store()
     worker_key, worker, _created = _stable_reply_worker(store)
     _other_key, other, _created = state.upsert_worker_entry(
@@ -2713,10 +2713,7 @@ def test_stable_reply_binding_requires_worker_and_identity_uniqueness_on_worker_
         worker_key,
         worker,
     )
-    assert (
-        state.worker_entry_is_uniquely_routable(store, worker_key, worker)
-        is False
-    )
+    assert state.worker_entry_is_uniquely_routable(store, worker_key, worker)
     for message_id, topic_id in (("501", "26"), ("502", "77")):
         state.bind_message_to_worker(
             store,
@@ -2725,10 +2722,12 @@ def test_stable_reply_binding_requires_worker_and_identity_uniqueness_on_worker_
             topic_id=topic_id,
             kind="final",
         )
-        assert herdres._worker_entry_from_reply(
+        resolved_key, resolved_worker = herdres._worker_entry_from_reply(
             store,
             {"reply_to_message_id": message_id, "topic_id": topic_id},
-        ) == (None, None)
+        )
+        assert resolved_key == worker_key
+        assert resolved_worker is worker
 
 
 

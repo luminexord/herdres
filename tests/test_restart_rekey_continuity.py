@@ -74,78 +74,159 @@ def _captured_rekey_repro() -> tuple[dict, list[dict]]:
     return store, workers
 
 
-def test_captured_live_shape_retires_every_displaced_topic_holder():
-    store, workers = _captured_rekey_repro()
-    expected_new_retirements = (
-        "worker:claude-1-1-1-1:0e8605e506",
-        "worker:claude-1-1-2-1:96044de7d5",
-        "worker:claude-1-2-1:e504eacfcc",
-        "worker:claude-1-2-2-1:82436b9eff",
-        "worker:claude-1-2-2-2:fbadaa6841",
-        "worker:claude-1-2:53d81a5f5b",
-        "worker:claude-2-1-2-2:29c310e21b",
-        "worker:claude-2-1:07fcdba57d",
-        "worker:claude:73fd1aefd9",
-        "worker:codex-1-1:9d8e174441",
-        "worker:codex-1:0550716aa5",
-        "worker:codex:03205b2610",
-        "worker:codex:03205b2610:2",
-        "worker:codex:a2cc350e22",
+def _captured_duplicate_repro() -> tuple[dict, list[dict]]:
+    store = json.loads(
+        (_REKEY_REPRO_FIXTURES / "state-dupes-live.json").read_text(
+            encoding="utf-8"
+        )
     )
-    topic_holders = {
-        key: entry
-        for key, entry in state.source_worker_entries(store).items()
-        if entry.get("topic_id")
+    workers = json.loads(
+        (_REKEY_REPRO_FIXTURES / "workers-live.json").read_text(encoding="utf-8")
+    )
+    return store, workers
+
+
+def test_captured_duplicate_state_consolidates_by_stable_key_and_survives_renumber():
+    store, workers = _captured_duplicate_repro()
+    original_topics = {
+        "14985",
+        "14987",
+        "14989",
+        "14997",
+        "14999",
+        "15001",
+        "15003",
+        "15005",
+        "15007",
+        "15009",
+        "15011",
     }
-    already_retired = {
-        key for key, entry in topic_holders.items() if state.entry_is_retired(entry)
+    captured_duplicate_topics = {
+        "15136",
+        "15140",
+        "15142",
+        "15151",
+        "15153",
+        "15155",
     }
-    assert len(topic_holders) == 19
-    assert len(already_retired) == 4
+    assert any(
+        len(state._all_worker_entry_keys_by_stable_key(store, stable_key)) >= 3
+        for stable_key in {state.worker_stable_key(worker) for worker in workers}
+    )
 
-    plan = state.plan_worker_rekey_continuity(store, workers)
+    telegram = FakeTelegram()
+    sync_once(
+        store,
+        SyncRuntime(FakeTendwire(workers=workers), telegram, with_outbox=False),
+    )
 
-    # No topic is safe to hand off in this captured incident. The one exact
-    # current owner remains live; every other unretired topic holder retires.
-    assert plan.matches == ()
-    assert len(plan.stale_entry_keys) == 39
-    assert tuple(
-        key
-        for key in plan.stale_entry_keys
-        if topic_holders.get(key, {}).get("topic_id")
-    ) == expected_new_retirements
-    assert len(expected_new_retirements) == 14
-    assert dict(state.apply_worker_rekey_continuity_plan(store, workers, plan)) == {}
+    for worker in workers:
+        stable_key = state.worker_stable_key(worker)
+        assert len(state._all_worker_entry_keys_by_stable_key(store, stable_key)) == 1
+    assert telegram.topics == []
+    assert set(telegram.closed_topics) == captured_duplicate_topics
+    assert {thread for _chat, thread, _name in telegram.renamed_topics} == (
+        captured_duplicate_topics
+    )
+    assert {
+        str(kwargs.get("thread_id") or "")
+        for _chat, text, kwargs, _message_id in telegram.sent
+        if "stable pane identity was consolidated" in text
+    } == captured_duplicate_topics
 
-    retired_topic_holders = {
-        key
-        for key, entry in topic_holders.items()
-        if state.entry_is_retired(entry)
-    }
-    assert len(retired_topic_holders) == 18
-    assert retired_topic_holders == already_retired | set(expected_new_retirements)
-    for key in expected_new_retirements:
-        entry = topic_holders[key]
-        assert entry["routing_retired_reason"] == "herdr_restart_rekey_unmatched"
-        assert entry["topic_id"]
+    for topic_id in original_topics:
+        entry_key, entry = state.find_entry_by_thread(store, topic_id)
+        assert entry_key is not None
+        assert entry is not None
+        assert entry["topic_id"] == topic_id
+        assert state.worker_entry_is_uniquely_routable(store, entry_key, entry)
+    for topic_id in captured_duplicate_topics:
+        assert state.find_entry_by_thread(store, topic_id) == (None, None)
 
-    # Retirement is presence-based, so the next planner pass has no work.
-    assert state.plan_worker_rekey_continuity(store, workers) == ((), ())
-
-
-def test_captured_live_shape_recreates_every_worker_topic_in_bounded_passes(
-    monkeypatch,
-):
-    store, workers = _captured_rekey_repro()
-    plan = state.plan_worker_rekey_continuity(store, workers)
-    state.apply_worker_rekey_continuity_plan(store, workers, plan)
-    original_retired_topics = {
-        str(entry["topic_id"])
+    stable_topics = {
+        state.entry_stable_identity(entry): str(entry.get("topic_id") or "")
         for entry in state.source_worker_entries(store).values()
-        if entry.get("topic_id") and state.entry_is_retired(entry)
+        if state.entry_stable_identity(entry) is not None
     }
-    assert len(original_retired_topics) == 18
+    pane_keys = {
+        identity: key
+        for key, entry in state.source_worker_entries(store).items()
+        if (identity := state.entry_stable_identity(entry)) is not None
+    }
+    renumbered = deepcopy(workers)
+    for index, worker in enumerate(renumbered, start=1):
+        worker["id"] = f"renumbered-{index}"
+        worker["fingerprint"] = f"renumbered-fingerprint-{index}"
 
+    renumber_telegram = FakeTelegram()
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(workers=renumbered),
+            renumber_telegram,
+            with_outbox=False,
+        ),
+    )
+    assert renumber_telegram.topics == []
+    assert renumber_telegram.sent == []
+    assert renumber_telegram.renamed_topics == []
+    assert renumber_telegram.closed_topics == []
+    assert {
+        state.entry_stable_identity(entry): str(entry.get("topic_id") or "")
+        for entry in state.source_worker_entries(store).values()
+        if state.entry_stable_identity(entry) is not None
+    } == stable_topics
+    assert {
+        identity: key
+        for key, entry in state.source_worker_entries(store).items()
+        if (identity := state.entry_stable_identity(entry)) is not None
+    } == pane_keys
+    for topic_id in original_topics:
+        assert state.find_entry_by_thread(store, topic_id) != (None, None)
+
+    panes_after_renumber = deepcopy(store["panes"])
+    repeated_telegram = FakeTelegram()
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(workers=renumbered),
+            repeated_telegram,
+            with_outbox=False,
+        ),
+    )
+    assert store["panes"] == panes_after_renumber
+    assert repeated_telegram.topics == []
+    assert repeated_telegram.sent == []
+    assert repeated_telegram.renamed_topics == []
+    assert repeated_telegram.closed_topics == []
+
+
+def test_captured_live_shape_stable_owners_are_not_displaced_by_worker_ids():
+    store, workers = _captured_rekey_repro()
+    assert state.consolidate_worker_entries_by_stable_key(store, workers) > 0
+    stable_owner_keys = {
+        key
+        for key, entry in state.source_worker_entries(store).items()
+        if state.entry_stable_identity(entry)
+        in {state.worker_stable_identity(worker) for worker in workers}
+    }
+    assert len(stable_owner_keys) == len(workers)
+    assert all(
+        len(
+            state._all_worker_entry_keys_by_stable_key(
+                store, state.worker_stable_key(worker)
+            )
+        )
+        == 1
+        for worker in workers
+    )
+    plan = state.plan_worker_rekey_continuity(store, workers)
+    assert plan.matches == ()
+    assert stable_owner_keys.isdisjoint(plan.stale_entry_keys)
+
+
+def test_captured_live_shape_reuses_stable_topics_and_only_mints_missing_topic():
+    store, workers = _captured_rekey_repro()
     def routable_topic_entries(worker: dict) -> list[dict]:
         identity = state.worker_stable_identity(worker)
         return [
@@ -157,44 +238,36 @@ def test_captured_live_shape_recreates_every_worker_topic_in_bounded_passes(
             and entry.get("tendwire_worker_id") == worker["id"]
         ]
 
-    # The fixture has one already-fresh exact owner; ten workers need creation.
-    assert sum(len(routable_topic_entries(worker)) for worker in workers) == 1
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MAX_CREATES", "3")
     telegram = FakeTelegram()
     runtime = SyncRuntime(FakeTendwire(workers=workers), telegram, with_outbox=False)
-    create_deltas = []
-    for _ in range(4):
-        before = len(telegram.topics)
-        sync_once(store, runtime)
-        create_deltas.append(len(telegram.topics) - before)
-
-    assert create_deltas == [3, 3, 3, 1]
-    assert len(telegram.topics) == 10
-    assert all(len(routable_topic_entries(worker)) == 1 for worker in workers)
-    assert {
-        str(entry["topic_id"])
-        for entry in state.source_worker_entries(store).values()
-        if state.entry_is_retired(entry) and entry.get("topic_id")
-    } == original_retired_topics
-    assert not any(
-        str(entry.get("topic_id") or "") in original_retired_topics
-        for key, entry in state.source_worker_entries(store).items()
-        if state.worker_entry_is_uniquely_routable(store, key, entry)
-    )
-
-    panes_after_healing = deepcopy(state.source_worker_entries(store))
-    before_calls = (
-        len(telegram.topics),
-        len(telegram.renamed_topics),
-        len(telegram.closed_topics),
-    )
     sync_once(store, runtime)
-    assert state.source_worker_entries(store) == panes_after_healing
-    assert (
-        len(telegram.topics),
-        len(telegram.renamed_topics),
-        len(telegram.closed_topics),
-    ) == before_calls
+
+    assert telegram.topics == ["gitmoot-codex"]
+    assert all(len(routable_topic_entries(worker)) == 1 for worker in workers)
+
+    stable_topics_after_healing = {
+        state.entry_stable_identity(entry): str(entry.get("topic_id") or "")
+        for entry in state.source_worker_entries(store).values()
+        if state.entry_stable_identity(entry) is not None
+    }
+    repeated_telegram = FakeTelegram()
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(workers=workers),
+            repeated_telegram,
+            with_outbox=False,
+        ),
+    )
+    assert {
+        state.entry_stable_identity(entry): str(entry.get("topic_id") or "")
+        for entry in state.source_worker_entries(store).values()
+        if state.entry_stable_identity(entry) is not None
+    } == stable_topics_after_healing
+    assert all(len(routable_topic_entries(worker)) == 1 for worker in workers)
+    assert repeated_telegram.topics == []
+    assert repeated_telegram.renamed_topics == []
+    assert repeated_telegram.closed_topics == []
 
 
 def test_retired_only_worker_history_does_not_block_fresh_creation():
