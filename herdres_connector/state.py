@@ -615,6 +615,12 @@ def _physical_identity_matches(
     ]
     agreements = [field for field in comparable if previous[field] == current[field]]
     conflicts = [field for field in comparable if previous[field] != current[field]]
+    # A differing working directory is a hard veto, never just one outvoted
+    # signal: same-label panes in one workspace routinely differ ONLY by cwd,
+    # and migrating a topic across that boundary routes messages to the wrong
+    # pane (the failure this matcher exists to prevent).
+    if "cwd" in conflicts:
+        return False
     label_and_agent = "label" in agreements and "agent" in agreements
     explicit_majority = len(agreements) >= 3 and len(agreements) > len(conflicts)
     return (label_and_agent and len(agreements) > len(conflicts)) or explicit_majority

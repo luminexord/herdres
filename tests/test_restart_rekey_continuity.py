@@ -332,3 +332,54 @@ def test_restart_rekey_worker_id_reshuffle_heals_safely_and_idempotently():
     assert repeated_telegram.renamed_topics == []
     assert repeated_telegram.closed_topics == []
     assert repeated_telegram.deleted_topics == []
+
+
+def test_cwd_conflict_vetoes_migration_even_with_other_agreements() -> None:
+    # Verifier-reproduced hazard: same label+agent+terminal_title+space but a
+    # DIFFERENT cwd must never migrate (two panes in one workspace that share
+    # a reused label differ only by directory).
+    from herdres_connector import state
+
+    stale = _worker(
+        "claude-1",
+        "wsk1_" + "a" * 64,
+        label="worker-pane",
+        agent="claude",
+        cwd="/work/OLD-PATH",
+        title="shared-title",
+        space="space-1",
+        fingerprint="fp-old",
+    )
+    live = _worker(
+        "claude-2",
+        "wsk1_" + "b" * 64,
+        label="worker-pane",
+        agent="claude",
+        cwd="/work/NEW-PATH",
+        title="shared-title",
+        space="space-1",
+        fingerprint="fp-new",
+    )
+    entry = {
+        "entry_type": "worker",
+        "tendwire_worker_id": "claude-1",
+        "tendwire_pane_label": "worker-pane",
+        "tendwire_foreground_cwd": "/work/OLD-PATH",
+        "tendwire_terminal_title": "shared-title",
+        "agent": "claude",
+        "space_id": "space-1",
+    }
+    assert state._physical_identity_matches(entry, live) is False
+
+    # Same shape with MATCHING cwd migrates (control: the veto is cwd-specific).
+    live_same_cwd = _worker(
+        "claude-2",
+        "wsk1_" + "c" * 64,
+        label="worker-pane",
+        agent="claude",
+        cwd="/work/OLD-PATH",
+        title="shared-title",
+        space="space-1",
+        fingerprint="fp-new2",
+    )
+    assert state._physical_identity_matches(entry, live_same_cwd) is True
