@@ -307,6 +307,24 @@ def entry_stable_identity(entry: dict[str, Any]) -> tuple[str, int] | None:
     return stable_key, STABLE_WORKER_KEY_VERSION
 
 
+def entry_continuity_identity(entry: dict[str, Any]) -> tuple[str, int] | None:
+    """Return the current or deliberately released v1 identity for handoff.
+
+    Closed-history healing releases the active identity pair so it cannot
+    remain a routable owner.  The paired ``retired_*`` fields preserve exactly
+    which authenticated public identity owned its Telegram topic and are safe
+    to use only while planning a one-to-one physical topic handoff.
+    """
+    identity = entry_stable_identity(entry)
+    if identity is not None:
+        return identity
+    stable_key = entry.get("retired_tendwire_stable_key")
+    version = entry.get("retired_tendwire_stable_key_version")
+    if not valid_stable_worker_key_pair(stable_key, version):
+        return None
+    return stable_key, STABLE_WORKER_KEY_VERSION
+
+
 def message_binding_stable_identity(binding: dict[str, Any]) -> tuple[str, int] | None:
     stable_key = binding.get("stable_key")
     version = binding.get("stable_key_version")
@@ -541,7 +559,10 @@ def worker_physical_identity_signals(worker: dict[str, Any]) -> dict[str, str]:
     return {
         "label": _physical_text(meta.get("label"), 120),
         "cwd": _physical_text(
-            meta.get("foreground_cwd") or meta.get("cwd"),
+            meta.get("foreground_cwd")
+            or meta.get("cwd")
+            or worker.get("foreground_cwd")
+            or worker.get("cwd"),
             320,
             case_insensitive=False,
         ),
@@ -619,6 +640,21 @@ def _physical_identity_matches(
     return (label_and_agent and len(agreements) > len(conflicts)) or explicit_majority
 
 
+def _labeled_physical_identity_matches(
+    entry: dict[str, Any], worker: dict[str, Any]
+) -> bool:
+    """Require the operator-visible label and agent for released-key recovery."""
+    previous = entry_physical_identity_signals(entry)
+    current = worker_physical_identity_signals(worker)
+    return (
+        bool(previous["label"])
+        and previous["label"] == current["label"]
+        and bool(previous["agent"])
+        and previous["agent"] == current["agent"]
+        and _physical_identity_matches(entry, worker)
+    )
+
+
 def plan_worker_rekey_continuity(
     data: dict[str, Any], workers: list[dict[str, Any]]
 ) -> WorkerRekeyContinuityPlan:
@@ -654,6 +690,24 @@ def plan_worker_rekey_continuity(
     }
     live_worker_ids.discard("")
     entries = source_worker_entries(data)
+    # A closed old owner can already have had its active identity released by
+    # the stable-key healer while its Telegram topic remains intact.  Treat a
+    # unique physical match as a handoff candidate even when the historical
+    # identity is still present in the live snapshot (closed+live Tendwire
+    # observations commonly share it).  Without this pre-pass, consolidation
+    # skips the duplicated observation and the live row reaches topic minting.
+    physical_topic_candidate_keys = {
+        entry_key
+        for entry_key, entry in entries.items()
+        if not entry_is_retired(entry)
+        and entry.get("topic_id")
+        and entry_stable_identity(entry) is None
+        and entry_continuity_identity(entry) is not None
+        and any(
+            _labeled_physical_identity_matches(entry, worker)
+            for worker in eligible_workers
+        )
+    }
     topicless_live_claim_persisted = any(
         not entry_is_retired(entry)
         and _entry_is_live(entry)
@@ -714,18 +768,23 @@ def plan_worker_rekey_continuity(
     }
     stale_keys = tuple(
         sorted(
-            key
-            for key, entry in displaced_entries.items()
-            if (broad_rekey_recovery and entry.get("topic_id"))
-            or (broad_rekey_recovery and entry_is_quarantined(entry))
-            or str(
-                entry.get("tendwire_worker_id") or entry.get("worker_id") or ""
-            )
-            in live_worker_ids
-            or any(
-                _physical_identity_matches(entry, worker)
-                for worker in eligible_workers
-            )
+            {
+                key
+                for key, entry in displaced_entries.items()
+                if (broad_rekey_recovery and entry.get("topic_id"))
+                or (broad_rekey_recovery and entry_is_quarantined(entry))
+                or str(
+                    entry.get("tendwire_worker_id")
+                    or entry.get("worker_id")
+                    or ""
+                )
+                in live_worker_ids
+                or any(
+                    _physical_identity_matches(entry, worker)
+                    for worker in eligible_workers
+                )
+            }
+            | physical_topic_candidate_keys
         )
     )
     candidates_by_worker: dict[int, list[str]] = {}
@@ -733,8 +792,8 @@ def plan_worker_rekey_continuity(
     migration_candidate_keys = {
         entry_key
         for entry_key in stale_keys
-        if (identity := entry_stable_identity(entries[entry_key])) is not None
-        and identity[0] not in live_keys
+        if entries[entry_key].get("topic_id")
+        and entry_continuity_identity(entries[entry_key]) is not None
     }
     for worker in eligible_workers:
         worker_ref = id(worker)
@@ -896,7 +955,10 @@ def _stamp_consolidated_worker_observation(
 
 
 def consolidate_worker_entries_by_stable_key(
-    data: dict[str, Any], workers: list[dict[str, Any]]
+    data: dict[str, Any],
+    workers: list[dict[str, Any]],
+    *,
+    excluded_entry_keys: frozenset[str] = frozenset(),
 ) -> int:
     """Collapse positional-id duplicates into one stable-key owner.
 
@@ -915,6 +977,8 @@ def consolidate_worker_entries_by_stable_key(
     entries = source_worker_entries(data)
     by_stable_key: dict[str, list[str]] = {}
     for entry_key, entry in entries.items():
+        if entry_key in excluded_entry_keys:
+            continue
         identity = entry_stable_identity(entry)
         if identity is not None:
             by_stable_key.setdefault(identity[0], []).append(entry_key)
@@ -1080,7 +1144,7 @@ def _retarget_rekey_topic_bindings(
     *,
     topic_id: str,
 ) -> None:
-    stale_identity = entry_stable_identity(stale)
+    stale_identity = entry_continuity_identity(stale)
     current_identity = entry_stable_identity(current)
     bindings = data.get("telegram_message_bindings")
     if stale_identity is None or current_identity is None or not isinstance(bindings, dict):
