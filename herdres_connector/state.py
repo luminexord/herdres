@@ -655,6 +655,25 @@ def _labeled_physical_identity_matches(
     )
 
 
+def _retired_rekey_topic_is_recoverable(entry: dict[str, Any]) -> bool:
+    """Allow continuity to finish a previously planned restart handoff.
+
+    A restart pass can retire and release an unmatched old owner before the
+    corresponding live observation is available to continuity planning.  That
+    row remains a safe candidate only while its topic still exists and the
+    retirement came from restart re-key reconciliation.  Arbitrary closed
+    history must remain fail-closed.
+    """
+    if not entry_is_retired(entry):
+        return True
+    return (
+        compact_ws(entry.get("routing_retired_reason"), 120)
+        == "herdr_restart_rekey_unmatched"
+        and "retired_topic_closed" not in entry
+        and "retired_topic_missing" not in entry
+    )
+
+
 def plan_worker_rekey_continuity(
     data: dict[str, Any], workers: list[dict[str, Any]]
 ) -> WorkerRekeyContinuityPlan:
@@ -699,8 +718,8 @@ def plan_worker_rekey_continuity(
     physical_topic_candidate_keys = {
         entry_key
         for entry_key, entry in entries.items()
-        if not entry_is_retired(entry)
-        and entry.get("topic_id")
+        if entry.get("topic_id")
+        and _retired_rekey_topic_is_recoverable(entry)
         and entry_stable_identity(entry) is None
         and entry_continuity_identity(entry) is not None
         and any(
@@ -1195,6 +1214,12 @@ def finalize_worker_rekey_topic_handoff(
     for field in _TOPIC_BINDING_FIELDS:
         if field in stale:
             current_entry[field] = stale[field]
+    # Retirement prefixes an archived topic name before Telegram close/rename
+    # side effects run.  A handoff recovered on the next planning pass must
+    # retain the pane's original visible name, not the temporary archive name.
+    original_topic_name = compact_ws(stale.get("retired_original_topic_name"), 120)
+    if original_topic_name:
+        current_entry["topic_name"] = original_topic_name
     _retarget_rekey_topic_bindings(
         data, stale, current_entry, topic_id=topic_id
     )
