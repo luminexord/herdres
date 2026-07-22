@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from herdres_connector import config, doctor, state
+from herdres_connector import config, doctor, source_sync, state
 from herdres_connector.source_sync import (
     _TURN_CONTENT_OUTCOME_KEY,
     _TurnContentError,
@@ -608,7 +608,142 @@ def test_explicit_unsupported_is_the_only_immediate_full_poll_fallback():
     assert len(tendwire.delta_calls) == 1
     assert tendwire.turn_calls == 1
     assert store["tendwire_delta_sync"]["status"] == "fallback"
+    assert store["tendwire_delta_sync"]["fallback_kind"] == "terminal"
     assert result["tendwire_delta_sync"]["health_flag"] == "turn_delta_unsupported"
+
+    repeated = sync_once(
+        store,
+        SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
+    )
+    assert repeated["ok"] is True
+    assert len(tendwire.delta_calls) == 1
+    assert tendwire.turn_calls == 2
+
+
+def test_transient_delta_fallback_recovers_with_persisted_exponential_backoff(
+    monkeypatch,
+):
+    clock = [1000.0]
+    monkeypatch.setattr(source_sync.time, "time", lambda: clock[0])
+    tendwire = DeltaTendwire(
+        [
+            {"ok": False, "status": "nonzero_exit"},
+            {"ok": False, "status": "nonzero_exit"},
+            {"ok": False, "status": "nonzero_exit"},
+            {"ok": False, "status": "nonzero_exit"},
+            {"ok": False, "status": "nonzero_exit"},
+            _page([], mode="changes", checkpoint="twdelta1.current"),
+        ],
+        turns={"schema_version": 2, "turns": []},
+    )
+    store = _store()
+    store["tendwire_delta_sync"] = _active_delta()
+    runtime = SyncRuntime(tendwire, FakeTelegram(), with_outbox=False)
+
+    for _attempt in range(3):
+        result = sync_once(store, runtime)
+        assert result["ok"] is True
+        assert store["tendwire_delta_sync"]["status"] == "active"
+        assert tendwire.turn_calls == 0
+
+    fourth = sync_once(store, runtime)
+    delta = store["tendwire_delta_sync"]
+    assert fourth["ok"] is True
+    assert delta["status"] == "fallback"
+    assert delta["fallback_kind"] == "transient"
+    assert delta["fallback_attempt"] == 1
+    assert delta["fallback_retry_at"] == 1060.0
+    assert tendwire.turn_calls == 1
+
+    clock[0] = 1059.0
+    sync_once(store, runtime)
+    assert len(tendwire.delta_calls) == 4
+    assert tendwire.turn_calls == 2
+
+    clock[0] = 1060.0
+    sync_once(store, runtime)
+    delta = store["tendwire_delta_sync"]
+    assert len(tendwire.delta_calls) == 5
+    assert delta["status"] == "fallback"
+    assert delta["fallback_attempt"] == 2
+    assert delta["fallback_retry_at"] == 1180.0
+    assert tendwire.turn_calls == 3
+
+    clock[0] = 1179.0
+    sync_once(store, runtime)
+    assert len(tendwire.delta_calls) == 5
+    assert tendwire.turn_calls == 4
+
+    clock[0] = 1180.0
+    recovered = sync_once(store, runtime)
+    delta = store["tendwire_delta_sync"]
+    assert recovered["ok"] is True
+    assert len(tendwire.delta_calls) == 6
+    assert tendwire.turn_calls == 4
+    assert delta["status"] == "active"
+    assert delta["failure_count"] == 0
+    assert not any(key.startswith("fallback_") for key in delta)
+    assert "health_flag" not in delta
+
+
+def test_legacy_transient_fallback_is_probed_immediately_after_upgrade(
+    monkeypatch,
+):
+    clock = [2000.0]
+    monkeypatch.setattr(source_sync.time, "time", lambda: clock[0])
+    tendwire = DeltaTendwire(
+        [_page([], mode="changes", checkpoint="twdelta1.current")]
+    )
+    store = _store()
+    delta = _active_delta()
+    delta.update(
+        {
+            "status": "fallback",
+            "failure_count": 2,
+            "health_flag": "turn_delta_repeated_nonzero_exit",
+        }
+    )
+    store["tendwire_delta_sync"] = delta
+
+    result = sync_once(
+        store, SyncRuntime(tendwire, FakeTelegram(), with_outbox=False)
+    )
+
+    assert result["ok"] is True
+    assert len(tendwire.delta_calls) == 1
+    assert tendwire.turn_calls == 0
+    assert store["tendwire_delta_sync"]["status"] == "active"
+    assert not any(
+        key.startswith("fallback_")
+        for key in store["tendwire_delta_sync"]
+    )
+
+
+def test_transport_ambiguity_uses_the_same_four_failure_recovery_lane(
+    monkeypatch,
+):
+    clock = [3000.0]
+    monkeypatch.setattr(source_sync.time, "time", lambda: clock[0])
+    tendwire = DeltaTendwire(
+        [
+            {"ok": False, "status": "transport_ambiguous"}
+            for _attempt in range(4)
+        ],
+        turns={"schema_version": 2, "turns": []},
+    )
+    store = _store()
+    store["tendwire_delta_sync"] = _active_delta()
+    runtime = SyncRuntime(tendwire, FakeTelegram(), with_outbox=False)
+
+    for _attempt in range(4):
+        sync_once(store, runtime)
+
+    delta = store["tendwire_delta_sync"]
+    assert len(tendwire.delta_calls) == 4
+    assert tendwire.turn_calls == 1
+    assert delta["status"] == "fallback"
+    assert delta["fallback_kind"] == "transient"
+    assert delta["fallback_retry_at"] == 3060.0
 
 
 def test_bootstrap_too_large_degrades_to_full_poll_with_health_flag():

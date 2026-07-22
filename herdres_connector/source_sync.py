@@ -972,11 +972,22 @@ def _turn_is_working_placeholder(item: dict[str, Any], entry: dict[str, Any]) ->
     return normalized_status(entry.get("status")) == "working"
 
 
-def _final_delivery_bindings(store: dict[str, Any], turn_id: str) -> list[tuple[str, dict[str, Any]]]:
+def _final_delivery_bindings(
+    store: dict[str, Any],
+    turn_id: str,
+    *,
+    topic_id: str | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
     return [
         (message_id, binding)
         for message_id, binding in state.message_bindings(store).items()
-        if isinstance(binding, dict) and str(binding.get("kind") or "") == "final" and str(binding.get("turn_id") or "") == turn_id
+        if isinstance(binding, dict)
+        and str(binding.get("kind") or "") == "final"
+        and str(binding.get("turn_id") or "") == turn_id
+        and (
+            topic_id is None
+            or str(binding.get("topic_id") or "") == topic_id
+        )
     ]
 
 
@@ -1024,9 +1035,18 @@ def _clear_open_turn_final_delivery_state(store: dict[str, Any], entry: dict[str
 
 def _repair_delivered_final_entry(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], content_hash: str) -> bool:
     turn_id = _turn_id(item)
-    final_bindings = _final_delivery_bindings(store, turn_id)
-    message_ids = [message_id for message_id, _binding in final_bindings if message_id] if final_bindings else None
-    bot_kind = str(final_bindings[-1][1].get("bot_kind") or "") if final_bindings else ""
+    topic_id = str(entry.get("topic_id") or "")
+    final_bindings = _final_delivery_bindings(
+        store, turn_id, topic_id=topic_id
+    )
+    if not final_bindings:
+        return False
+    message_ids = [
+        message_id
+        for message_id, _binding in final_bindings
+        if message_id
+    ]
+    bot_kind = str(final_bindings[-1][1].get("bot_kind") or "")
     return _set_final_delivery(
         entry,
         turn_id=turn_id,
@@ -1132,7 +1152,9 @@ def _replace_changed_final(
     content_hash: str,
     identity: str,
 ) -> bool:
-    bindings = _final_delivery_bindings(store, _turn_id(item))
+    bindings = _final_delivery_bindings(
+        store, _turn_id(item), topic_id=thread_id
+    )
     message_ids = [message_id for message_id, _binding in bindings if message_id]
     if len(message_ids) != 1:
         return False
@@ -2805,7 +2827,22 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
     turn_id = _turn_id(item)
     content_hash = _turn_content_hash(item, "final")
     identity = f"final:{turn_id}:{content_hash}"
-    if identity in state.delivered_turns(store):
+    visible_here = bool(
+        _final_delivery_bindings(store, turn_id, topic_id=thread_id)
+    )
+    exact_final_visible_here = bool(
+        visible_here
+        and entry.get("last_turn_id") == turn_id
+        and entry.get("last_clean_hash") == content_hash
+    )
+    placeholder_here = bool(
+        entry.get("last_turn_id") == turn_id
+        and entry.get("last_clean_hash") == content_hash
+        and entry.get("last_clean_message_ids") == ["0"]
+    )
+    if identity in state.delivered_turns(store) and (
+        exact_final_visible_here or placeholder_here
+    ):
         _repair_delivered_final_entry(store, item, entry, content_hash)
         return False
     feed_item = turn_item_from_source(item, entry)
@@ -2821,7 +2858,7 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
         )
         return True
     send_changed_as_new = _changed_final_should_send_new_message(item, entry)
-    if _final_turn_delivered(store, turn_id):
+    if _final_turn_delivered(store, turn_id) and visible_here:
         if not send_changed_as_new and entry.get("last_clean_hash") == content_hash and _replace_changed_final(
             store,
             item,
@@ -5545,6 +5582,9 @@ _DELTA_STATE_KEY = "tendwire_delta_sync"
 _DELTA_SCHEMA_VERSION = 1
 _DELTA_PROJECTION_SCHEMA_VERSION = 2
 _DELTA_TRANSPORT_STATUS = "transport_ambiguous"
+_DELTA_TRANSIENT_FAILURE_THRESHOLD = 4
+_DELTA_FALLBACK_BASE_SECONDS = 60
+_DELTA_FALLBACK_MAX_SECONDS = 3600
 _DELTA_WATERMARK_RECOVERY = frozenset(
     {"invalid_watermark", "expired_watermark"}
 )
@@ -5924,11 +5964,113 @@ def _clear_projection_stale_cards(store: dict[str, Any], projection: dict[str, A
     return cleared
 
 
-def _set_delta_fallback(delta: dict[str, Any], reason: str) -> None:
+def _set_delta_fallback(
+    delta: dict[str, Any],
+    reason: str,
+    *,
+    terminal: bool,
+    now: float,
+) -> None:
     delta["status"] = "fallback"
     delta["pending_cursor"] = None
     delta["bootstrap_state"] = None
     delta["health_flag"] = f"turn_delta_{compact_ws(reason, 48)}"
+    delta["fallback_kind"] = "terminal" if terminal else "transient"
+    delta["fallback_reason"] = compact_ws(reason, 48)
+    if terminal:
+        delta.pop("fallback_attempt", None)
+        delta.pop("fallback_retry_at", None)
+        delta.pop("fallback_probe", None)
+        return
+    previous_attempt = delta.get("fallback_attempt")
+    attempt = (
+        previous_attempt + 1
+        if isinstance(previous_attempt, int)
+        and not isinstance(previous_attempt, bool)
+        and previous_attempt >= 0
+        else 1
+    )
+    delay = min(
+        _DELTA_FALLBACK_BASE_SECONDS
+        * (2 ** min(attempt - 1, 16)),
+        _DELTA_FALLBACK_MAX_SECONDS,
+    )
+    delta["fallback_attempt"] = attempt
+    delta["fallback_retry_at"] = now + delay
+    delta.pop("fallback_probe", None)
+
+
+def _normalize_delta_fallback(delta: dict[str, Any], *, now: float) -> str:
+    kind = delta.get("fallback_kind")
+    if kind in {"terminal", "transient"}:
+        return str(kind)
+    health_flag = compact_ws(delta.get("health_flag"), 80)
+    reason = (
+        health_flag.removeprefix("turn_delta_")
+        if health_flag.startswith("turn_delta_")
+        else "legacy_fallback"
+    )
+    terminal = reason in {
+        "unsupported",
+        *_DELTA_TERMINAL_FALLBACK,
+    }
+    delta["fallback_kind"] = "terminal" if terminal else "transient"
+    delta["fallback_reason"] = reason
+    if not terminal:
+        # Older versions made transient fallback permanent. Probe once
+        # immediately after upgrade, then use the normal persisted backoff.
+        delta["fallback_attempt"] = 0
+        delta["fallback_retry_at"] = now
+    return str(delta["fallback_kind"])
+
+
+def _begin_delta_fallback_probe(delta: dict[str, Any], *, now: float) -> None:
+    watermark = delta.get("watermark")
+    if isinstance(watermark, str) and watermark:
+        delta["status"] = "active"
+        delta["pending_cursor"] = None
+    else:
+        _begin_delta_rebootstrap(
+            delta,
+            reason="transient_fallback_recovery",
+            now=now,
+        )
+    delta["fallback_probe"] = True
+
+
+def _record_delta_transient_failure(
+    delta: dict[str, Any], *, status: str, now: float
+) -> bool:
+    delta["last_error_at"] = now
+    failure_count = int(delta.get("failure_count") or 0) + 1
+    delta["failure_count"] = failure_count
+    safe_status = compact_ws(status, 48)
+    delta["health_flag"] = f"turn_delta_{safe_status}"
+    if delta.get("fallback_probe") or (
+        failure_count >= _DELTA_TRANSIENT_FAILURE_THRESHOLD
+    ):
+        _set_delta_fallback(
+            delta,
+            f"repeated_{safe_status}",
+            terminal=False,
+            now=now,
+        )
+        return True
+    return False
+
+
+def _clear_delta_fallback_recovery(delta: dict[str, Any]) -> None:
+    delta["failure_count"] = 0
+    for key in (
+        "fallback_kind",
+        "fallback_reason",
+        "fallback_attempt",
+        "fallback_retry_at",
+        "fallback_probe",
+        "last_error_at",
+        "health_flag",
+    ):
+        delta.pop(key, None)
 
 
 def _begin_delta_rebootstrap(delta: dict[str, Any], *, reason: str, now: float) -> None:
@@ -5969,7 +6111,15 @@ def _observe_turn_delta(
 
     delta = _delta_state(store, now=now)
     if delta.get("status") == "fallback":
-        return {"kind": "full", "delta": delta, "reason": "fallback"}
+        fallback_kind = _normalize_delta_fallback(delta, now=now)
+        retry_at = delta.get("fallback_retry_at")
+        if fallback_kind == "terminal" or (
+            isinstance(retry_at, (int, float))
+            and not isinstance(retry_at, bool)
+            and now < float(retry_at)
+        ):
+            return {"kind": "full", "delta": delta, "reason": "fallback"}
+        _begin_delta_fallback_probe(delta, now=now)
     if _delta_full_reconcile_due(delta, now=now):
         return {"kind": "full", "delta": delta, "reason": "reconcile"}
     cursor = delta.get("pending_cursor")
@@ -5987,14 +6137,22 @@ def _observe_turn_delta(
         status = _delta_error_code(page) or "delta_failed"
         delta["last_error_at"] = now
         if status == "unsupported_method":
-            _set_delta_fallback(delta, "unsupported")
+            _set_delta_fallback(
+                delta, "unsupported", terminal=True, now=now
+            )
             return transition(
                 {"kind": "full", "delta": delta, "reason": "unsupported"}
             )
         if status == _DELTA_TRANSPORT_STATUS:
-            delta["health_flag"] = "turn_delta_transport_ambiguous"
+            fell_back = _record_delta_transient_failure(
+                delta, status=status, now=now
+            )
             return transition(
-                {"kind": "empty", "delta": delta, "reason": status}
+                {
+                    "kind": "full" if fell_back else "empty",
+                    "delta": delta,
+                    "reason": status,
+                }
             )
         if status in _DELTA_WATERMARK_RECOVERY and cursor is None and watermark is not None:
             _begin_delta_rebootstrap(delta, reason=status, now=now)
@@ -6005,40 +6163,43 @@ def _observe_turn_delta(
             status in _DELTA_WATERMARK_RECOVERY
             and delta.get("status") == "bootstrapping"
         ):
-            _set_delta_fallback(delta, status)
+            _set_delta_fallback(
+                delta, status, terminal=True, now=now
+            )
             return transition(
                 {"kind": "full", "delta": delta, "reason": status}
             )
-        failure_count = int(delta.get("failure_count") or 0) + 1
-        delta["failure_count"] = failure_count
-        delta["health_flag"] = f"turn_delta_{compact_ws(status, 48)}"
-        if failure_count >= 2:
-            _set_delta_fallback(delta, f"repeated_{status}")
-            return transition(
-                {"kind": "full", "delta": delta, "reason": status}
-            )
+        fell_back = _record_delta_transient_failure(
+            delta, status=status, now=now
+        )
         return transition(
-            {"kind": "empty", "delta": delta, "reason": status}
+            {
+                "kind": "full" if fell_back else "empty",
+                "delta": delta,
+                "reason": status,
+            }
         )
     try:
         upserts, removals, aggregate = _validate_delta_page(page)
     except _TurnContentError:
-        delta["last_error_at"] = now
-        delta["health_flag"] = "turn_delta_transport_ambiguous"
+        fell_back = _record_delta_transient_failure(
+            delta, status="delta_protocol_ambiguous", now=now
+        )
         return transition(
             {
-                "kind": "empty",
+                "kind": "full" if fell_back else "empty",
                 "delta": delta,
                 "reason": "delta_protocol_ambiguous",
             }
         )
     expected_mode = "bootstrap" if watermark is None and delta.get("status") == "bootstrapping" else "changes"
     if page.get("mode") != expected_mode:
-        delta["last_error_at"] = now
-        delta["health_flag"] = "turn_delta_transport_ambiguous"
+        fell_back = _record_delta_transient_failure(
+            delta, status="delta_protocol_ambiguous", now=now
+        )
         return transition(
             {
-                "kind": "empty",
+                "kind": "full" if fell_back else "empty",
                 "delta": delta,
                 "reason": "delta_protocol_ambiguous",
             }
@@ -6061,8 +6222,7 @@ def _observe_turn_delta(
     for removal in removals:
         turn_id = str(removal["turn_id"])
         projection.pop(turn_id, None)
-    delta["failure_count"] = 0
-    delta.pop("last_error_at", None)
+    _clear_delta_fallback_recovery(delta)
     delta["last_batch"] = {
         "mode": str(page["mode"]),
         **aggregate,

@@ -7,7 +7,7 @@ import json
 import pytest
 
 import herdres
-from herdres_connector import state
+from herdres_connector import source_sync, state
 from herdres_connector.source_sync import SyncRuntime, _worker_entry_for_turn, sync_once
 
 from test_source_only import FakeTelegram, FakeTendwire, _store
@@ -1130,6 +1130,105 @@ def test_persisted_duplicate_stable_key_consolidates_to_oldest_topic():
     assert any(kwargs.get("thread_id") == "28" for _chat, _text, kwargs, _mid in telegram.sent)
 
 
+def test_duplicate_consolidation_redelivers_newest_final_to_surviving_topic_once():
+    store = _store()
+    old_key, old_owner, _created = state.upsert_worker_entry(
+        store, _worker("worker-old", KEY_B), topic_id="26"
+    )
+    newer_key, newer_owner, _created = state.upsert_worker_entry(
+        store, _worker("worker-new", KEY_C), topic_id="28"
+    )
+    for entry in (old_owner, newer_owner):
+        entry["tendwire_stable_key"] = KEY_A
+        entry["tendwire_stable_key_version"] = 1
+
+    old_owner.update(
+        {
+            "last_turn_id": "turn-old",
+            "last_clean_hash": "old-hash",
+            "last_clean_message_id": "500",
+            "last_clean_message_ids": ["500"],
+        }
+    )
+    state.bind_message_to_worker(
+        store,
+        "500",
+        old_owner,
+        topic_id="26",
+        kind="final",
+        turn_id="turn-old",
+    )
+    newest = _final_turn(
+        "worker-current", turn_id="turn-new", text="Newest final answer"
+    )
+    newest_hash = source_sync._turn_content_hash(newest, "final")
+    newer_owner.update(
+        {
+            "last_turn_id": "turn-new",
+            "last_clean_hash": newest_hash,
+            "last_clean_message_id": "501",
+            "last_clean_message_ids": ["501"],
+        }
+    )
+    state.bind_message_to_worker(
+        store,
+        "501",
+        newer_owner,
+        topic_id="28",
+        kind="final",
+        turn_id="turn-new",
+    )
+    identity = f"final:turn-new:{newest_hash}"
+    state.mark_delivered(
+        store, identity, {"worker_id": "worker-new", "turn_id": "turn-new"}
+    )
+    current = _worker("worker-current", KEY_A)
+
+    first_telegram = FakeTelegram()
+    first = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(workers=[current], turns={"turns": [newest]}),
+            first_telegram,
+            with_outbox=False,
+        ),
+    )
+
+    survivor = state.source_worker_entries(store)[old_key]
+    assert state.entry_is_retired(state.source_worker_entries(store)[newer_key])
+    assert survivor["topic_id"] == "26"
+    assert survivor["last_turn_id"] == "turn-new"
+    assert first["feed_sent"] == 1
+    final_sends = [
+        sent
+        for sent in first_telegram.sent
+        if sent[2].get("thread_id") == "26"
+        and "Newest final answer" in sent[1]
+    ]
+    assert len(final_sends) == 1
+    assert identity in state.delivered_turns(store)
+    assert {
+        binding["topic_id"]
+        for binding in state.message_bindings(store).values()
+        if binding.get("turn_id") == "turn-new"
+    } == {"26", "28"}
+
+    second_telegram = FakeTelegram()
+    second = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(workers=[current], turns={"turns": [newest]}),
+            second_telegram,
+            with_outbox=False,
+        ),
+    )
+    assert second["feed_sent"] == 0
+    assert not any(
+        "Newest final answer" in text
+        for _chat, text, _kwargs, _message_id in second_telegram.sent
+    )
+
+
 def test_closed_key_reuse_never_adopts_or_routes_the_closed_entry():
     store = _store()
     old_key, old, _created = state.upsert_worker_entry(
@@ -1956,7 +2055,7 @@ def test_quarantined_exact_v1_owner_heals_after_stable_key_duplicate_consolidati
     state.quarantine_worker_entry(
         store,
         old_key,
-        reason="preexisting_quarantine",
+        reason="preflight_stable_key_conflict",
     )
     current = _worker(
         "worker-new",
@@ -2012,6 +2111,34 @@ def test_quarantined_exact_v1_owner_heals_after_stable_key_duplicate_consolidati
             )
         )
     assert passes[1] == passes[2]
+
+
+def test_duplicate_consolidation_preserves_non_identity_quarantine():
+    store = _store()
+    survivor_key, survivor, _created = state.upsert_worker_entry(
+        store, _worker("worker-old", KEY_B), topic_id="26"
+    )
+    duplicate_key, duplicate, _created = state.upsert_worker_entry(
+        store, _worker("worker-new", KEY_C), topic_id="28"
+    )
+    for entry in (survivor, duplicate):
+        entry["tendwire_stable_key"] = KEY_A
+        entry["tendwire_stable_key_version"] = 1
+    state.quarantine_worker_entry(store, survivor_key, reason="operator_hold")
+    state.bind_message_to_worker(
+        store, "500", survivor, topic_id="26", kind="final"
+    )
+
+    assert state.consolidate_worker_entries_by_stable_key(
+        store, [_worker("worker-current", KEY_A)]
+    ) == 1
+
+    entries = state.source_worker_entries(store)
+    assert entries[survivor_key]["stable_key_quarantine_reason"] == "operator_hold"
+    assert state.entry_is_quarantined(entries[survivor_key])
+    assert state.entry_is_retired(entries[duplicate_key])
+    assert state.message_bindings(store)["500"]["routing_quarantined"] is True
+    assert state.find_worker_entry_by_stable_key(store, KEY_A) == (None, None)
 
 
 def test_closed_nonquarantined_exact_v1_history_does_not_block_id_churn_on_repeat():

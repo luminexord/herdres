@@ -800,6 +800,58 @@ def test_topic_creation_checkpoints_provider_identity_before_later_sync_work(mon
     assert telegram.topics == ["Project"]
 
 
+def test_worker_topic_creation_refuses_second_topic_for_same_stable_owner(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    stable_key = "wsk1_" + "a" * 64
+    first_worker = {
+        "id": "worker-1",
+        "name": "codex",
+        "status": "working",
+        "space_id": "space-1",
+        "fingerprint": "fp-1",
+        "meta": {
+            "stable_key": stable_key,
+            "stable_key_version": 1,
+        },
+    }
+    second_worker = {
+        **first_worker,
+        "id": "worker-2",
+        "fingerprint": "fp-2",
+        "meta": {
+            "stable_key": "wsk1_" + "b" * 64,
+            "stable_key_version": 1,
+        },
+    }
+    _first_key, _first, _created = state.upsert_worker_entry(
+        store, first_worker, topic_id="77"
+    )
+    _second_key, second, _created = state.upsert_worker_entry(
+        store, second_worker
+    )
+    second["tendwire_stable_key"] = stable_key
+    second["tendwire_stable_key_version"] = 1
+    second_worker["meta"] = {
+        "stable_key": stable_key,
+        "stable_key_version": 1,
+    }
+    telegram = FakeTelegram()
+
+    needed, created = source_sync._ensure_topic(
+        store,
+        second_worker,
+        second,
+        SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+        chat_id="-100",
+    )
+
+    assert needed is False and created is False
+    assert second.get("topic_id") is None
+    assert telegram.topics == []
+
+
 def test_worker_topic_mode_creates_one_topic_per_worker(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")

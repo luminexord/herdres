@@ -801,7 +801,32 @@ def _topic_age_key(entry_key: str, entry: dict[str, Any]) -> tuple[int, int | st
     return 1, topic_id, entry_key
 
 
-def _clear_consolidated_survivor_markers(entry: dict[str, Any]) -> None:
+_CONSOLIDATION_HEALABLE_QUARANTINE_REASONS = frozenset(
+    {
+        "closed_stable_key_reuse",
+        "persisted_stable_key_collision",
+        "preflight_stable_key_conflict",
+        "recycled_worker_id",
+        "snapshot_stable_key_conflict",
+        "snapshot_worker_key_conflict",
+        "source_identity_absent",
+        "stable_key_mismatch",
+    }
+)
+
+
+def _consolidation_may_heal_quarantine(entry: dict[str, Any]) -> bool:
+    if not entry_is_quarantined(entry):
+        return True
+    return (
+        compact_ws(entry.get("stable_key_quarantine_reason"), 120)
+        in _CONSOLIDATION_HEALABLE_QUARANTINE_REASONS
+    )
+
+
+def _clear_consolidated_survivor_markers(
+    entry: dict[str, Any], *, heal_quarantine: bool
+) -> None:
     """Make a formerly retired/quarantined row the live stable-key owner."""
     original_name = compact_ws(entry.get("retired_original_topic_name"), 120)
     if original_name:
@@ -826,10 +851,11 @@ def _clear_consolidated_survivor_markers(entry: dict[str, Any]) -> None:
         "retired_topic_notice_message_id",
         "topic_migrated_to_stable_key",
         "topic_migrated_to_stable_key_version",
-        "stable_key_quarantined",
-        "stable_key_quarantine_reason",
     ):
         entry.pop(field, None)
+    if heal_quarantine:
+        entry.pop("stable_key_quarantined", None)
+        entry.pop("stable_key_quarantine_reason", None)
 
 
 def _stamp_consolidated_worker_observation(
@@ -913,6 +939,7 @@ def consolidate_worker_entries_by_stable_key(
             key=lambda key: _topic_age_key(key, entries[key]),
         )
         survivor = entries[survivor_key]
+        heal_quarantine = _consolidation_may_heal_quarantine(survivor)
         survivor_topic_id = str(survivor.get("topic_id") or "")
         duplicate_topic_ids = {
             str(entries[key].get("topic_id") or "")
@@ -955,7 +982,9 @@ def consolidate_worker_entries_by_stable_key(
         if voice_ids:
             survivor["voice_reply_message_ids"] = voice_ids[-VOICE_REPLY_ID_HISTORY:]
 
-        _clear_consolidated_survivor_markers(survivor)
+        _clear_consolidated_survivor_markers(
+            survivor, heal_quarantine=heal_quarantine
+        )
         survivor["tendwire_stable_key"] = stable_key
         survivor["tendwire_stable_key_version"] = STABLE_WORKER_KEY_VERSION
         _stamp_consolidated_worker_observation(survivor, worker)
@@ -986,7 +1015,10 @@ def consolidate_worker_entries_by_stable_key(
                 binding["space_id"] = current_space_id
                 binding["stable_key"] = stable_key
                 binding["stable_key_version"] = STABLE_WORKER_KEY_VERSION
-                binding.pop("routing_quarantined", None)
+                if heal_quarantine:
+                    binding.pop("routing_quarantined", None)
+                else:
+                    binding["routing_quarantined"] = True
 
         for entry_key in entry_keys:
             if entry_key == survivor_key:
