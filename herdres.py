@@ -156,9 +156,14 @@ def _worker_entry_from_reply(store: dict[str, Any], payload: dict[str, Any]) -> 
     )
     if not binding or "routing_quarantined" in binding:
         return None, None
+    pane_uuid = state.message_binding_pane_uuid(binding)
     identity = state.message_binding_stable_identity(binding)
     has_stable_fields = "stable_key" in binding or "stable_key_version" in binding
-    if identity is not None:
+    if pane_uuid:
+        key, entry = state.find_worker_entry_by_pane_uuid(store, pane_uuid)
+    elif "pane_uuid" in binding or "pane_uuid_version" in binding:
+        return None, None
+    elif identity is not None:
         key, entry = state.find_worker_entry_by_stable_key(store, identity[0])
     elif has_stable_fields:
         return None, None
