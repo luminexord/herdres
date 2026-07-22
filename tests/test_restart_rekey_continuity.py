@@ -86,6 +86,117 @@ def _captured_duplicate_repro() -> tuple[dict, list[dict]]:
     return store, workers
 
 
+@pytest.fixture
+def session_key_drift_live_shape() -> tuple[dict, list[dict], dict[str, str]]:
+    """Sanitized 2026-07-22 shape: released old owners plus new keys."""
+    store = _store()
+    physical_panes = (
+        ("herdres", "14985", "/root/herdres", "claude"),
+        ("pipeline", "14987", "/root", "claude"),
+        ("joltra-2", "14989", "/root/Clipping-Platform", "claude"),
+        ("temp", "14997", "/root", "claude"),
+        ("Gitmoot2", "14999", "/root/gitmoot", "claude"),
+        ("vetrina", "15003", "/root", "claude"),
+        ("joltra", "15005", "/root/Clipping-Platform", "claude"),
+        ("Gitmoot4", "15007", "/root/gitmoot", "claude"),
+    )
+    workers: list[dict] = []
+    topics_by_label: dict[str, str] = {}
+    for index, (label, topic_id, cwd, agent) in enumerate(physical_panes, start=1):
+        old_stable_key = "wsk1_" + f"{index:064x}"
+        new_stable_key = "wsk1_" + f"{index + 100:064x}"
+        old_worker = _worker(
+            f"old-{index}",
+            old_stable_key,
+            label=label,
+            agent=agent,
+            cwd=cwd,
+            title=f"old session · {label}",
+            space="w6536a4e5b44342",
+            fingerprint=f"old-fingerprint-{index}",
+        )
+        _old_entry_key, old_entry = _persist(store, old_worker, topic_id)
+        if index == 1:
+            state.bind_message_to_worker(
+                store,
+                "500",
+                old_entry,
+                topic_id=topic_id,
+                kind="final",
+                turn_id="turn-before-session-drift",
+            )
+        # #170 can release the active key from closed history before #168 sees
+        # the row.  The topic and exact historical identity remain available.
+        old_entry["status"] = "closed"
+        old_entry["tendwire_raw_status"] = "closed"
+        old_entry["stable_key_quarantined"] = True
+        old_entry["stable_key_quarantine_reason"] = "closed_stable_key_reuse"
+        old_entry["retired_tendwire_stable_key"] = old_stable_key
+        old_entry["retired_tendwire_stable_key_version"] = 1
+        old_entry.pop("tendwire_stable_key", None)
+        old_entry.pop("tendwire_stable_key_version", None)
+
+        current = _worker(
+            f"current-{index}",
+            new_stable_key,
+            label=label,
+            agent=agent,
+            cwd=cwd,
+            title=f"new session · {label}",
+            space="w6536a4e5b44342",
+            fingerprint=f"new-fingerprint-{index}",
+        )
+        # The production Tendwire snapshot omitted cwd even though Herdr still
+        # reported it. Missing cwd is neutral; an explicit disagreement vetoes.
+        current["meta"].pop("cwd")
+        current["meta"].pop("foreground_cwd")
+        _persist(store, current)
+        workers.append(current)
+        topics_by_label[label] = topic_id
+    return store, workers, topics_by_label
+
+
+def test_session_key_drift_migrates_every_live_topic_before_mint_and_is_idempotent(
+    session_key_drift_live_shape,
+):
+    store, workers, topics_by_label = session_key_drift_live_shape
+    telegram = FakeTelegram()
+
+    sync_once(
+        store,
+        SyncRuntime(FakeTendwire(workers=workers), telegram, with_outbox=False),
+    )
+
+    assert telegram.topics == []
+    assert telegram.renamed_topics == []
+    assert telegram.closed_topics == []
+    for worker in workers:
+        entry_key, entry = state.find_worker_entry_by_stable_key(
+            store, state.worker_stable_key(worker)
+        )
+        assert entry_key is not None and entry is not None
+        assert entry["topic_id"] == topics_by_label[worker["meta"]["label"]]
+        assert entry["topic_name"] == worker["meta"]["label"]
+        assert state.worker_entry_is_uniquely_routable(store, entry_key, entry)
+    binding = state.find_message_binding(store, "500", topic_id="14985")
+    assert binding is not None
+    assert binding["stable_key"] == state.worker_stable_key(workers[0])
+    assert binding["worker_id"] == workers[0]["id"]
+
+    panes_after_first = deepcopy(store["panes"])
+    repeated_telegram = FakeTelegram()
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(workers=workers), repeated_telegram, with_outbox=False
+        ),
+    )
+    assert store["panes"] == panes_after_first
+    assert repeated_telegram.topics == []
+    assert repeated_telegram.renamed_topics == []
+    assert repeated_telegram.closed_topics == []
+
+
 def test_captured_duplicate_state_consolidates_by_stable_key_and_survives_renumber():
     store, workers = _captured_duplicate_repro()
     original_topics = {
