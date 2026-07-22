@@ -762,6 +762,17 @@ def _turn_has_complete_final(item: dict[str, Any]) -> bool:
     )
 
 
+def _turn_has_real_content(item: dict[str, Any]) -> bool:
+    return bool(
+        not _turn_has_content_outcome(item)
+        and (
+            item.get("assistant_stream_text")
+            or item.get("user_text")
+            or _turn_has_complete_final(item)
+        )
+    )
+
+
 def _turn_content_hash(item: dict[str, Any], kind: str) -> str:
     return short_hash(
         {
@@ -2859,7 +2870,19 @@ def _sync_turns(
     yield_barrier: Any | None = None,
     list_finals_are_authoritative: bool = True,
     checkpoint_after_delivery: bool = False,
+    retained_projection: dict[str, Any] | None = None,
 ) -> dict[str, int]:
+    def retained_turn_for_entry(
+        turn_id: str, entry_key: str | None
+    ) -> dict[str, Any] | None:
+        if not isinstance(retained_projection, dict) or not turn_id or not entry_key:
+            return None
+        candidate = retained_projection.get(turn_id)
+        if not isinstance(candidate, dict):
+            return None
+        candidate_entry_key, _candidate_entry = _entry_for_turn(store, candidate)
+        return candidate if candidate_entry_key == entry_key else None
+
     counts = {"feed_sent": 0, "sent": 0, "updated": 0, "content_pages": 0}
     turns = _turns(turns_payload)
     if live_worker_ids is not None:
@@ -2886,13 +2909,7 @@ def _sync_turns(
         worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
         if not worker_key:
             continue
-        complete = _turn_has_complete_final(item)
-        has_real_content = (
-            bool(item.get("assistant_stream_text"))
-            or bool(item.get("user_text"))
-            or complete
-        )
-        if not has_real_content:
+        if not _turn_has_real_content(item):
             continue
         latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
     # Pass 2: synthetic "Work is in progress." placeholders only fill workers
@@ -2970,15 +2987,41 @@ def _sync_turns(
                 continue
             if worker_key in seen_working_workers:
                 continue
-            seen_working_workers.add(worker_key)
-            repaired_open_final = _clear_open_turn_final_delivery_state(store, entry, _turn_id(item))
             previous_stream_turn_id = str(entry.get("last_stream_turn_id") or "")
+            previous_item = retained_turn_for_entry(
+                previous_stream_turn_id, entry_key
+            )
+            current_is_placeholder = _turn_is_working_placeholder(item, entry)
+            previous_has_real_content = bool(
+                isinstance(previous_item, dict)
+                and _turn_has_real_content(previous_item)
+            )
+            previous_is_placeholder = bool(
+                isinstance(previous_item, dict)
+                and _turn_is_working_placeholder(previous_item, entry)
+            )
+            if (
+                current_is_placeholder
+                and previous_stream_turn_id != _turn_id(item)
+                and previous_has_real_content
+            ):
+                # A delta page contains only changed rows. Do not let an
+                # isolated synthetic status row displace the retained real
+                # turn and force a new Telegram message on the next update.
+                continue
+            seen_working_workers.add(worker_key)
+            repaired_open_final = _clear_open_turn_final_delivery_state(
+                store, entry, _turn_id(item)
+            )
             reuse_previous_working = bool(
                 item.get("assistant_stream_text")
                 and previous_stream_turn_id
                 and previous_stream_turn_id != _turn_id(item)
-                and previous_stream_turn_id
-                in placeholder_turn_ids_by_worker.get(worker_key, set())
+                and (
+                    previous_stream_turn_id
+                    in placeholder_turn_ids_by_worker.get(worker_key, set())
+                    or previous_is_placeholder
+                )
             )
             delivered = _deliver_working(
                 store,
@@ -6112,6 +6155,13 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                     and delta_observation.get("kind") == "delta"
                     and delta_observation.get("page", {}).get("mode")
                     == "changes"
+                ),
+                retained_projection=(
+                    delta.get("projection")
+                    if delta_observation is not None
+                    and delta_observation.get("kind") == "delta"
+                    and isinstance(delta, dict)
+                    else None
                 ),
             )
         )

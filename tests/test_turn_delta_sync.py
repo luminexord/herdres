@@ -187,6 +187,110 @@ def test_active_working_upsert_uses_existing_card_delivery_path():
     assert tendwire.content_calls == 0
 
 
+def test_delta_real_placeholder_real_keeps_one_working_card_across_restart():
+    real = _turn_row("turn-real", "twrev1.real0", None, user="prompt")
+    real["assistant_stream_text"] = "first progress"
+    placeholder = _turn_row(
+        "turn-placeholder", "twrev1.placeholder", None
+    )
+    changed_real = deepcopy(real)
+    changed_real["assistant_stream_text"] = "second progress"
+    telegram = FakeTelegram()
+    store = _store()
+    store["tendwire_delta_sync"] = _active_delta()
+
+    first = DeltaTendwire(
+        [_page([_upsert(real)], mode="changes", checkpoint="twdelta1.real0")]
+    )
+    result = sync_once(
+        store, SyncRuntime(first, telegram, with_outbox=False)
+    )
+    assert result["feed_sent"] == 1
+    assert len(telegram.sent) == 1
+    assert telegram.edited == []
+
+    restarted = deepcopy(store)
+    second = DeltaTendwire(
+        [
+            _page(
+                [_upsert(placeholder)],
+                mode="changes",
+                checkpoint="twdelta1.placeholder",
+            ),
+            _page(
+                [_upsert(changed_real)],
+                mode="changes",
+                checkpoint="twdelta1.real1",
+            ),
+        ]
+    )
+    placeholder_result = sync_once(
+        restarted, SyncRuntime(second, telegram, with_outbox=False)
+    )
+    assert placeholder_result["feed_sent"] == 0
+    assert len(telegram.sent) == 1
+    assert telegram.edited == []
+
+    real_result = sync_once(
+        restarted, SyncRuntime(second, telegram, with_outbox=False)
+    )
+    assert real_result["feed_sent"] == 1
+    assert len(telegram.sent) == 1
+    assert len(telegram.edited) == 1
+    assert "second progress" in telegram.edited[0][2]
+
+    entry = next(
+        item
+        for item in restarted["panes"].values()
+        if item.get("tendwire_worker_id") == "worker-1"
+    )
+    assert entry["last_stream_turn_id"] == "turn-real"
+    assert entry["last_stream_message_id"] == telegram.sent[0][3]
+    working_bindings = [
+        binding
+        for binding in state.message_bindings(restarted).values()
+        if binding.get("kind") == "working"
+    ]
+    assert len(working_bindings) == 1
+    assert working_bindings[0]["turn_id"] == "turn-real"
+
+
+def test_delta_real_turn_reuses_retained_placeholder_card():
+    placeholder = _turn_row(
+        "turn-placeholder", "twrev1.placeholder", None
+    )
+    real = _turn_row("turn-real", "twrev1.real", None, user="prompt")
+    real["assistant_stream_text"] = "source progress"
+    tendwire = DeltaTendwire(
+        [
+            _page(
+                [_upsert(placeholder)],
+                mode="changes",
+                checkpoint="twdelta1.placeholder",
+            ),
+            _page([_upsert(real)], mode="changes", checkpoint="twdelta1.real"),
+        ]
+    )
+    store = _store()
+    store["tendwire_delta_sync"] = _active_delta()
+    telegram = FakeTelegram()
+
+    sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
+    restarted = deepcopy(store)
+    sync_once(restarted, SyncRuntime(tendwire, telegram, with_outbox=False))
+
+    assert len(telegram.sent) == 1
+    assert len(telegram.edited) == 1
+    assert "source progress" in telegram.edited[0][2]
+    entry = next(
+        item
+        for item in restarted["panes"].values()
+        if item.get("tendwire_worker_id") == "worker-1"
+    )
+    assert entry["last_stream_turn_id"] == "turn-real"
+    assert entry["last_stream_message_id"] == telegram.sent[0][3]
+
+
 def test_page_replays_idempotently_after_crash_before_state_save():
     row = _turn_row("turn-replay", "twrev1.replay", None, user="prompt")
     response = _page([_upsert(row)], checkpoint="twdelta1.replayed")
