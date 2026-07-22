@@ -421,14 +421,14 @@ def worker_entry_is_uniquely_routable(
 ) -> bool:
     if not entry_is_routable(entry):
         return False
-    worker_id = str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "")
     identity = entry_stable_identity(entry)
     if identity is None:
         return False
-    return (
-        _worker_entry_keys_by_worker(data, worker_id) == [key]
-        and _worker_entry_keys_by_stable_key(data, identity[0]) == [key]
-    )
+    # Worker ids are positional observations: Herdr renumbers them whenever
+    # panes are opened or closed.  The validated stable key is the route
+    # identity, so a harmless worker-id collision/renumber must not make an
+    # otherwise unique pane unroutable.
+    return _worker_entry_keys_by_stable_key(data, identity[0]) == [key]
 
 
 def find_entry_key_by_stable_key(data: dict[str, Any], stable_key: str) -> str | None:
@@ -471,7 +471,6 @@ def blocked_worker_stable_keys(data: dict[str, Any], workers: list[dict[str, Any
         if len(stable_keys) > 1:
             blocked.update(stable_keys)
     persisted_by_stable: dict[str, list[str]] = {}
-    persisted_by_worker: dict[str, list[str]] = {}
     for key, entry in source_worker_entries(data).items():
         # Retired rows are historical routes, not current ownership claims.
         # Let a live observation create a fresh owner even when the historical
@@ -486,24 +485,12 @@ def blocked_worker_stable_keys(data: dict[str, Any], workers: list[dict[str, Any
             continue
         if not entry_is_routable(entry):
             continue
-        worker_id = str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "")
         persisted_by_stable.setdefault(identity[0], []).append(key)
-        if worker_id:
-            persisted_by_worker.setdefault(worker_id, []).append(key)
     blocked.update(
         stable_key
         for stable_key, entry_keys in persisted_by_stable.items()
         if len(entry_keys) > 1
     )
-    for entry_keys in persisted_by_worker.values():
-        if len(entry_keys) <= 1:
-            continue
-        blocked.update(
-            identity[0]
-            for key in entry_keys
-            if (identity := entry_stable_identity(source_worker_entries(data).get(key) or {}))
-            is not None
-        )
     return blocked
 
 
@@ -666,24 +653,13 @@ def plan_worker_rekey_continuity(
         compact_ws(worker.get("id"), 160) for worker in eligible_workers
     }
     live_worker_ids.discard("")
-    live_worker_claims = {
-        (worker_stable_key(worker), compact_ws(worker.get("id"), 160))
-        for worker in eligible_workers
-    }
     entries = source_worker_entries(data)
     topicless_live_claim_persisted = any(
         not entry_is_retired(entry)
         and _entry_is_live(entry)
         and not entry.get("topic_id")
         and (identity := entry_stable_identity(entry)) is not None
-        and (
-            identity[0],
-            compact_ws(
-                entry.get("tendwire_worker_id") or entry.get("worker_id"),
-                160,
-            ),
-        )
-        in live_worker_claims
+        and identity[0] in live_keys
         for entry in entries.values()
     )
     displaced_topic_entry_keys = {
@@ -693,14 +669,7 @@ def plan_worker_rekey_continuity(
         and entry.get("topic_id")
         and (
             (identity := entry_stable_identity(entry)) is None
-            or (
-                identity[0],
-                compact_ws(
-                    entry.get("tendwire_worker_id") or entry.get("worker_id"),
-                    160,
-                ),
-            )
-            not in live_worker_claims
+            or identity[0] not in live_keys
         )
     }
     corroborating_topic_entry_keys = {
@@ -732,8 +701,8 @@ def plan_worker_rekey_continuity(
                 broad_rekey_recovery
                 and entry_is_quarantined(entry)
                 and (
-                    (identity is not None and identity[0] in live_keys)
-                    or compact_ws(
+                    identity is None
+                    and compact_ws(
                         entry.get("tendwire_worker_id")
                         or entry.get("worker_id"),
                         160,
@@ -822,6 +791,228 @@ def _retire_rekey_entry(
             entry["topic_name"] = desired_name
             entry["retired_topic_rename_pending"] = True
         entry.setdefault("retired_topic_close_pending", True)
+
+
+def _topic_age_key(entry_key: str, entry: dict[str, Any]) -> tuple[int, int | str, str]:
+    """Sort Telegram topics oldest-first (forum topic ids are monotonic)."""
+    topic_id = str(entry.get("topic_id") or "")
+    if topic_id.isdecimal():
+        return 0, int(topic_id), entry_key
+    return 1, topic_id, entry_key
+
+
+def _clear_consolidated_survivor_markers(entry: dict[str, Any]) -> None:
+    """Make a formerly retired/quarantined row the live stable-key owner."""
+    original_name = compact_ws(entry.get("retired_original_topic_name"), 120)
+    if original_name:
+        entry["topic_name"] = original_name
+    for field in (
+        "routing_retired",
+        "routing_retired_reason",
+        "retired_tendwire_stable_key",
+        "retired_tendwire_stable_key_version",
+        "retired_original_topic_name",
+        "retired_topic_id",
+        "retired_topic_name",
+        "retired_topic_rename_pending",
+        "retired_topic_renamed",
+        "retired_topic_rename_error",
+        "retired_topic_close_pending",
+        "retired_topic_closed",
+        "retired_topic_close_error",
+        "retired_topic_missing",
+        "retired_topic_notice_pending",
+        "retired_topic_notice_error",
+        "retired_topic_notice_message_id",
+        "topic_migrated_to_stable_key",
+        "topic_migrated_to_stable_key_version",
+        "stable_key_quarantined",
+        "stable_key_quarantine_reason",
+    ):
+        entry.pop(field, None)
+
+
+def _stamp_consolidated_worker_observation(
+    entry: dict[str, Any], worker: dict[str, Any]
+) -> None:
+    """Refresh positional attributes before legacy re-key planning runs."""
+    worker_id = compact_ws(worker.get("id"), 160)
+    space_id = compact_ws(worker.get("space_id"), 160)
+    fingerprint = compact_ws(worker.get("fingerprint"), 160)
+    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+    entry["tendwire_worker_id"] = worker_id
+    entry["worker_id"] = worker_id
+    entry["tendwire_space_id"] = space_id
+    entry["space_id"] = space_id
+    entry["tendwire_fingerprint"] = fingerprint
+    entry["tendwire_stable_identity_class"] = "current_v1"
+    entry["agent"] = worker_agent(worker)
+    entry["worker_name"] = compact_ws(worker.get("name") or worker_id, 80)
+    entry["tendwire_raw_status"] = compact_ws(worker.get("status"), 80)
+    entry["status"] = normalized_status(worker.get("status"))
+    entry["tendwire_status_line"] = compact_ws(
+        worker.get("summary") or worker.get("status"), 240
+    )
+    entry["tendwire_last_seen_at"] = str(worker.get("last_seen_at") or "")
+    if meta.get("label"):
+        entry["tendwire_pane_label"] = compact_ws(meta.get("label"), 120)
+    if meta.get("foreground_cwd") or meta.get("cwd"):
+        entry["tendwire_foreground_cwd"] = compact_ws(
+            meta.get("foreground_cwd") or meta.get("cwd"), 320
+        )
+    if meta.get("terminal_title") or meta.get("pane_title") or meta.get("title"):
+        entry["tendwire_terminal_title"] = compact_ws(
+            meta.get("terminal_title")
+            or meta.get("pane_title")
+            or meta.get("title"),
+            160,
+        )
+
+
+def consolidate_worker_entries_by_stable_key(
+    data: dict[str, Any], workers: list[dict[str, Any]]
+) -> int:
+    """Collapse positional-id duplicates into one stable-key owner.
+
+    Consolidation is intentionally limited to a stable key with exactly one
+    live snapshot observation.  Conflicting source claims remain fail-closed.
+    The oldest topic survives; newer duplicate topics remain as retired history
+    long enough for source sync to post a visible notice, rename, and close
+    them.  Topicless duplicates are removed immediately.
+    """
+    observed_workers: dict[str, list[dict[str, Any]]] = {}
+    for worker in workers:
+        identity = worker_stable_identity(worker)
+        if identity is not None:
+            observed_workers.setdefault(identity[0], []).append(worker)
+
+    entries = source_worker_entries(data)
+    by_stable_key: dict[str, list[str]] = {}
+    for entry_key, entry in entries.items():
+        identity = entry_stable_identity(entry)
+        if identity is not None:
+            by_stable_key.setdefault(identity[0], []).append(entry_key)
+
+    panes = data.setdefault("panes", {})
+    bindings = data.get("telegram_message_bindings")
+    changed = 0
+    for stable_key in sorted(by_stable_key):
+        entry_keys = by_stable_key[stable_key]
+        current_workers = observed_workers.get(stable_key, [])
+        if (
+            len(entry_keys) <= 1
+            or len(current_workers) != 1
+            or normalized_status(current_workers[0].get("status"))
+            in {"closed", "failed"}
+        ):
+            continue
+        worker = current_workers[0]
+        topic_holders = [key for key in entry_keys if entries[key].get("topic_id")]
+        survivor_key = min(
+            topic_holders or entry_keys,
+            key=lambda key: _topic_age_key(key, entries[key]),
+        )
+        survivor = entries[survivor_key]
+        survivor_topic_id = str(survivor.get("topic_id") or "")
+        duplicate_topic_ids = {
+            str(entries[key].get("topic_id") or "")
+            for key in entry_keys
+            if key != survivor_key and entries[key].get("topic_id")
+        }
+
+        # Preserve useful non-identity cache fields and voice reply provenance.
+        voice_ids = (
+            [
+                str(value)
+                for value in survivor.get("voice_reply_message_ids", [])
+                if str(value)
+            ]
+            if isinstance(survivor.get("voice_reply_message_ids"), list)
+            else []
+        )
+        protected = {
+            "topic_id",
+            "topic_name",
+            "tendwire_stable_key",
+            "tendwire_stable_key_version",
+            "routing_retired",
+            "routing_retired_reason",
+            "stable_key_quarantined",
+            "stable_key_quarantine_reason",
+        }
+        for entry_key in entry_keys:
+            if entry_key == survivor_key:
+                continue
+            duplicate = entries[entry_key]
+            for field, value in duplicate.items():
+                if field not in protected and field not in survivor:
+                    survivor[field] = value
+            if isinstance(duplicate.get("voice_reply_message_ids"), list):
+                for value in duplicate["voice_reply_message_ids"]:
+                    text = str(value)
+                    if text and text not in voice_ids:
+                        voice_ids.append(text)
+        if voice_ids:
+            survivor["voice_reply_message_ids"] = voice_ids[-VOICE_REPLY_ID_HISTORY:]
+
+        _clear_consolidated_survivor_markers(survivor)
+        survivor["tendwire_stable_key"] = stable_key
+        survivor["tendwire_stable_key_version"] = STABLE_WORKER_KEY_VERSION
+        _stamp_consolidated_worker_observation(survivor, worker)
+
+        current_worker_id = compact_ws(worker.get("id"), 160)
+        current_fingerprint = compact_ws(worker.get("fingerprint"), 160)
+        current_space_id = compact_ws(worker.get("space_id"), 160)
+        group_topic_ids = duplicate_topic_ids | (
+            {survivor_topic_id} if survivor_topic_id else set()
+        )
+        if isinstance(bindings, dict):
+            for binding in bindings.values():
+                if not isinstance(binding, dict):
+                    continue
+                binding_identity = message_binding_stable_identity(binding)
+                related_topic = str(binding.get("topic_id") or "") in group_topic_ids
+                has_stable_fields = (
+                    "stable_key" in binding or "stable_key_version" in binding
+                )
+                legacy_related_topic = related_topic and not has_stable_fields
+                if (
+                    binding_identity != (stable_key, STABLE_WORKER_KEY_VERSION)
+                    and not legacy_related_topic
+                ):
+                    continue
+                binding["worker_id"] = current_worker_id
+                binding["worker_fingerprint"] = current_fingerprint
+                binding["space_id"] = current_space_id
+                binding["stable_key"] = stable_key
+                binding["stable_key_version"] = STABLE_WORKER_KEY_VERSION
+                binding.pop("routing_quarantined", None)
+
+        for entry_key in entry_keys:
+            if entry_key == survivor_key:
+                continue
+            duplicate = entries[entry_key]
+            topic_id = str(duplicate.get("topic_id") or "")
+            if topic_id and topic_id != survivor_topic_id:
+                _retire_rekey_entry(
+                    duplicate,
+                    reason="stable_key_duplicate_consolidated",
+                    archive_topic=True,
+                )
+                duplicate["retired_topic_notice_pending"] = True
+                duplicate["consolidated_into_entry_key"] = survivor_key
+                duplicate["consolidated_into_topic_id"] = survivor_topic_id
+                duplicate["retired_tendwire_stable_key"] = stable_key
+                duplicate["retired_tendwire_stable_key_version"] = (
+                    STABLE_WORKER_KEY_VERSION
+                )
+                duplicate["tendwire_stable_identity_class"] = "retired_duplicate_v1"
+                duplicate.pop("tendwire_stable_key", None)
+                duplicate.pop("tendwire_stable_key_version", None)
+            else:
+                panes.pop(entry_key, None)
+            changed += 1
+    return changed
 
 
 def apply_worker_rekey_continuity_plan(

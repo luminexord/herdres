@@ -1271,6 +1271,19 @@ def _ensure_topic(
         return False, False
     if entry.get("topic_id"):
         return False, False
+    if str(entry.get("entry_type") or "") == "worker":
+        identity = state.entry_stable_identity(entry)
+        if identity is not None and any(
+            other is not entry
+            and other.get("topic_id")
+            and state.entry_is_routable(other)
+            and state.entry_stable_identity(other) == identity
+            for other in state.source_worker_entries(store).values()
+        ):
+            # Telegram has no idempotency key for createForumTopic. Stable-key
+            # ownership is therefore the final guard against a positional-id
+            # duplicate minting a second topic.
+            return False, False
     reused = state.find_legacy_topic_id_by_name(store, entry.get("topic_name") or "")
     if reused:
         entry["topic_id"] = reused
@@ -1654,6 +1667,41 @@ def _sync_retired_worker_topics(
         topic_id = str(entry.get("topic_id") or "")
         if not topic_id:
             continue
+        if entry.get("retired_topic_notice_pending"):
+            if runtime.dry_run:
+                continue
+            survivor_topic_id = str(entry.get("consolidated_into_topic_id") or "")
+            target = (
+                f" (topic {html_escape(survivor_topic_id)})"
+                if survivor_topic_id
+                else ""
+            )
+            sent = runtime.telegram.send_message(
+                chat_id,
+                "This duplicate pane topic was retired after its stable pane "
+                f"identity was consolidated into the original topic{target}. "
+                "Please continue there.",
+                thread_id=topic_id,
+                notify=False,
+            )
+            if sent.get("ok"):
+                entry.pop("retired_topic_notice_pending", None)
+                entry.pop("retired_topic_notice_error", None)
+                entry["retired_topic_notice_message_id"] = str(
+                    sent.get("message_id") or ""
+                )
+                changed += 1
+                if runtime.checkpoint is not None:
+                    runtime.checkpoint()
+            elif _topic_missing(sent.get("error")):
+                entry.pop("retired_topic_notice_pending", None)
+                entry["retired_topic_missing"] = True
+                changed += 1
+            else:
+                entry["retired_topic_notice_error"] = compact_ws(
+                    sent.get("error"), 240
+                )
+                continue
         if entry.get("retired_topic_rename_pending"):
             if runtime.dry_run:
                 continue
@@ -1717,6 +1765,9 @@ def _sync_sources(
     worker_topic_renames: dict[str, str] = {}
     worker_numbered_bases: dict[str, str] = {}
     workers = _workers(snapshot)
+    counts["updated"] += state.consolidate_worker_entries_by_stable_key(
+        store, workers
+    )
     continuity_plan = state.plan_worker_rekey_continuity(store, workers)
     continuity_handoffs = state.apply_worker_rekey_continuity_plan(
         store, workers, continuity_plan
