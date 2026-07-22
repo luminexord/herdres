@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
@@ -36,6 +37,10 @@ _TENDWIRE_TURN_JOB_KEY_RE = re.compile(
 
 STABLE_WORKER_KEY_VERSION = 1
 STABLE_WORKER_KEY_RE = re.compile(r"^wsk1_[0-9a-f]{64}$")
+PANE_UUID_VERSION = 1
+PANE_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 
 
 def load_state(path: Path | None = None) -> dict[str, Any]:
@@ -333,6 +338,30 @@ def message_binding_stable_identity(binding: dict[str, Any]) -> tuple[str, int] 
     return stable_key, STABLE_WORKER_KEY_VERSION
 
 
+def valid_pane_uuid(value: Any, version: Any = PANE_UUID_VERSION) -> bool:
+    """Return whether a value is a canonical Herdres-owned v4 pane UUID."""
+    return (
+        isinstance(value, str)
+        and PANE_UUID_RE.fullmatch(value) is not None
+        and type(version) is int
+        and version == PANE_UUID_VERSION
+    )
+
+
+def entry_pane_uuid(entry: dict[str, Any]) -> str:
+    value = entry.get("pane_uuid")
+    version = entry.get("pane_uuid_version")
+    return value if valid_pane_uuid(value, version) else ""
+
+
+def message_binding_pane_uuid(binding: dict[str, Any]) -> str:
+    value = binding.get("pane_uuid")
+    version = binding.get("pane_uuid_version")
+    return value if valid_pane_uuid(value, version) else ""
+
+
+def _new_pane_uuid() -> str:
+    return str(uuid.uuid4())
 
 
 def entry_is_quarantined(entry: dict[str, Any]) -> bool:
@@ -442,11 +471,35 @@ def worker_entry_is_uniquely_routable(
     identity = entry_stable_identity(entry)
     if identity is None:
         return False
+    pane_uuid = entry_pane_uuid(entry)
+    if pane_uuid:
+        # Herdr's stable key and worker id are mutable routing hints.  Once a
+        # pane has a Herdres UUID, that UUID is the durable topic owner.
+        return [
+            entry_key
+            for entry_key, candidate in source_worker_entries(data).items()
+            if entry_is_routable(candidate)
+            and entry_pane_uuid(candidate) == pane_uuid
+        ] == [key]
     # Worker ids are positional observations: Herdr renumbers them whenever
     # panes are opened or closed.  The validated stable key is the route
     # identity, so a harmless worker-id collision/renumber must not make an
     # otherwise unique pane unroutable.
     return _worker_entry_keys_by_stable_key(data, identity[0]) == [key]
+
+
+def find_worker_entry_by_pane_uuid(
+    data: dict[str, Any], pane_uuid: str
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    if not valid_pane_uuid(pane_uuid):
+        return None, None
+    matches = [
+        (key, entry)
+        for key, entry in source_worker_entries(data).items()
+        if entry_pane_uuid(entry) == pane_uuid
+        and worker_entry_is_uniquely_routable(data, key, entry)
+    ]
+    return matches[0] if len(matches) == 1 else (None, None)
 
 
 def find_entry_key_by_stable_key(data: dict[str, Any], stable_key: str) -> str | None:
@@ -652,6 +705,442 @@ def _labeled_physical_identity_matches(
         and bool(previous["agent"])
         and previous["agent"] == current["agent"]
         and _physical_identity_matches(entry, worker)
+    )
+
+
+class DurablePaneReconciliation(NamedTuple):
+    """One sync pass's durable worker-to-pane reservations."""
+
+    reservations: Mapping[int, str]
+    changed: int
+
+
+def _durable_candidate_entry(entry: dict[str, Any]) -> bool:
+    pane_uuid = entry_pane_uuid(entry)
+    # A UUID retired after this migration represents a genuinely gone pane and
+    # must never be reclaimed by a later pane that happens to look similar.
+    # UUID-less retired rows are legacy compensation history and remain
+    # eligible during the one-time adoption/consolidation migration.
+    if pane_uuid:
+        return not entry_is_retired(entry)
+    compensation_history = (
+        compact_ws(entry.get("routing_retired_reason"), 120)
+        == "herdr_restart_rekey_unmatched"
+    )
+    if compensation_history:
+        return True
+    return not entry_is_retired(entry) and _entry_is_live(entry)
+
+
+def _durable_survivor_key(
+    entries: dict[str, dict[str, Any]], candidate_keys: set[str]
+) -> str:
+    durable = [key for key in candidate_keys if entry_pane_uuid(entries[key])]
+    pool = durable or list(candidate_keys)
+    topic_holders = [key for key in pool if entries[key].get("topic_id")]
+    return min(
+        topic_holders or pool,
+        key=lambda key: _topic_age_key(key, entries[key]),
+    )
+
+
+def _retarget_durable_bindings(
+    data: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    related_topic_ids: set[str],
+    surviving_topic_id: str,
+) -> None:
+    bindings = data.get("telegram_message_bindings")
+    if not isinstance(bindings, dict):
+        return
+    identity = entry_stable_identity(entry)
+    pane_uuid = entry_pane_uuid(entry)
+    if identity is None or not pane_uuid:
+        return
+    for binding in bindings.values():
+        if not isinstance(binding, dict):
+            continue
+        topic_id = str(binding.get("topic_id") or "")
+        if topic_id not in related_topic_ids:
+            continue
+        if topic_id != surviving_topic_id:
+            binding["routing_quarantined"] = True
+            continue
+        binding["worker_id"] = str(entry.get("tendwire_worker_id") or "")
+        binding["worker_fingerprint"] = str(
+            entry.get("tendwire_fingerprint") or ""
+        )
+        binding["space_id"] = str(
+            entry.get("tendwire_space_id") or entry.get("space_id") or ""
+        )
+        binding["stable_key"] = identity[0]
+        binding["stable_key_version"] = identity[1]
+        binding["pane_uuid"] = pane_uuid
+        binding["pane_uuid_version"] = PANE_UUID_VERSION
+        binding.pop("routing_quarantined", None)
+
+
+def reconcile_durable_pane_identities(
+    data: dict[str, Any], workers: list[dict[str, Any]]
+) -> DurablePaneReconciliation:
+    """Attach current workers to Herdres-owned pane UUIDs in place.
+
+    Herdr stable keys are consulted first as a cheap observation match, then
+    the existing label/agent/working-directory matcher reattaches a pane after
+    drift.  Neither hint becomes the topic identity: the selected state row and
+    its ``pane_uuid`` survive while those observations are refreshed.
+    """
+    ordered_workers = sorted(workers, key=canonical_worker_observation_key)
+    snapshot_key_counts: dict[str, int] = {}
+    snapshot_worker_id_counts: dict[str, int] = {}
+    for worker in ordered_workers:
+        stable_key = worker_stable_key(worker)
+        worker_id = compact_ws(worker.get("id"), 160)
+        if stable_key:
+            snapshot_key_counts[stable_key] = (
+                snapshot_key_counts.get(stable_key, 0) + 1
+            )
+        if worker_id:
+            snapshot_worker_id_counts[worker_id] = (
+                snapshot_worker_id_counts.get(worker_id, 0) + 1
+            )
+    all_entries = source_worker_entries(data)
+    persisted_blocked_keys = blocked_worker_stable_keys(data, ordered_workers)
+
+    def compensation_match(worker: dict[str, Any]) -> bool:
+        return any(
+            compact_ws(entry.get("routing_retired_reason"), 120)
+            == "herdr_restart_rekey_unmatched"
+            and _labeled_physical_identity_matches(entry, worker)
+            for entry in all_entries.values()
+        )
+
+    eligible_workers = [
+        worker
+        for worker in ordered_workers
+        if normalized_status(worker.get("status")) not in {"closed", "failed"}
+        and worker_stable_identity(worker) is not None
+        and snapshot_key_counts.get(worker_stable_key(worker)) == 1
+        and snapshot_worker_id_counts.get(compact_ws(worker.get("id"), 160)) == 1
+        and (
+            worker_stable_key(worker) not in persisted_blocked_keys
+            or compensation_match(worker)
+        )
+    ]
+    if not eligible_workers:
+        return DurablePaneReconciliation(MappingProxyType({}), 0)
+
+    entries = all_entries
+    candidates = {
+        key: entry
+        for key, entry in entries.items()
+        if _durable_candidate_entry(entry)
+    }
+    physical_workers_by_entry: dict[str, set[int]] = {}
+    for key, entry in candidates.items():
+        physical_workers_by_entry[key] = {
+            id(worker)
+            for worker in eligible_workers
+            if _labeled_physical_identity_matches(entry, worker)
+        }
+
+    # A current exact-key row is an observation of the live worker, not pane
+    # history competing for adoption.  Every other row that physically fits
+    # exactly one live worker is a historical candidate.  More than one such
+    # history is indistinguishable evidence: those rows may represent separate
+    # panes with identical labels, cwd, agent, title, and space.  Never choose
+    # one by topic age (or absorb all of them) because that lets one pane steal
+    # another pane's UUID and Telegram topic.
+    ambiguous_history_by_worker: dict[int, set[str]] = {}
+    for worker in eligible_workers:
+        worker_ref = id(worker)
+        identity = worker_stable_identity(worker)
+        historical = {
+            key
+            for key, worker_refs in physical_workers_by_entry.items()
+            if worker_refs == {worker_ref}
+            and entry_stable_identity(entries[key]) != identity
+        }
+        if len(historical) > 1:
+            ambiguous_history_by_worker[worker_ref] = historical
+
+    reservations: dict[int, str] = {}
+    groups: dict[int, set[str]] = {}
+    claimed: set[str] = {
+        key
+        for history in ambiguous_history_by_worker.values()
+        for key in history
+    }
+    changed = 0
+
+    # Fail closed before continuity/consolidation can reconsider these rows.
+    # Archive every ambiguous historical topic, quarantine replies to those
+    # topics, and leave the live observation unreserved so it receives a fresh
+    # pane UUID (and therefore a fresh topic) below.
+    bindings = data.get("telegram_message_bindings")
+    for history in ambiguous_history_by_worker.values():
+        ambiguous_topic_ids = {
+            str(entries[key].get("topic_id") or "") for key in history
+        }
+        ambiguous_topic_ids.discard("")
+        for key in sorted(history):
+            entry = entries[key]
+            before = json.dumps(
+                entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+            _retire_rekey_entry(
+                entry,
+                reason="durable_pane_identity_ambiguous",
+                archive_topic=True,
+            )
+            # Compensation rows may already carry a different retirement
+            # reason via setdefault.  Override it so the legacy continuity
+            # planner cannot later reclaim an ambiguity we deliberately closed.
+            entry["routing_retired_reason"] = "durable_pane_identity_ambiguous"
+            if entry.get("topic_id"):
+                entry["retired_topic_notice_pending"] = True
+            after = json.dumps(
+                entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+            changed += int(before != after)
+        if isinstance(bindings, dict):
+            for binding in bindings.values():
+                if not isinstance(binding, dict):
+                    continue
+                if str(binding.get("topic_id") or "") in ambiguous_topic_ids:
+                    if binding.get("routing_quarantined") is not True:
+                        binding["routing_quarantined"] = True
+                        changed += 1
+
+    # Cheap path: one live observation of a key adopts its exact persisted
+    # owner.  If compensation left several copies, prefer those that also fit
+    # the physical pane before choosing the oldest topic during consolidation.
+    live_key_counts: dict[str, int] = {}
+    for worker in eligible_workers:
+        stable_key = worker_stable_key(worker)
+        live_key_counts[stable_key] = live_key_counts.get(stable_key, 0) + 1
+    for worker in eligible_workers:
+        worker_ref = id(worker)
+        stable_key = worker_stable_key(worker)
+        if live_key_counts.get(stable_key) != 1:
+            continue
+        exact = {
+            key
+            for key, entry in candidates.items()
+            if key not in claimed
+            and not entry_is_quarantined(entry)
+            and entry_stable_identity(entry)
+            == (stable_key, STABLE_WORKER_KEY_VERSION)
+        }
+        physical_exact = {
+            key for key in exact if worker_ref in physical_workers_by_entry[key]
+        }
+        exact = physical_exact or exact
+        if not exact:
+            continue
+        seed = _durable_survivor_key(entries, exact)
+        groups[worker_ref] = {seed}
+        claimed.add(seed)
+
+    # Drift path: accept only candidates that fit this worker and no other live
+    # worker.  Multiple rows for the same one pane are intentional migration
+    # stragglers and are consolidated into the original topic below.
+    for worker in eligible_workers:
+        worker_ref = id(worker)
+        if worker_ref in groups:
+            continue
+        physical = {
+            key
+            for key, worker_refs in physical_workers_by_entry.items()
+            if key not in claimed and worker_refs == {worker_ref}
+        }
+        if physical:
+            groups[worker_ref] = physical
+            claimed.update(physical)
+
+    # Once a worker has a seed, absorb every other unambiguous physical copy.
+    # This is what heals #170/#172/#173 rows without allowing a shared-label
+    # ambiguity to steal either pane's UUID.
+    for worker in eligible_workers:
+        worker_ref = id(worker)
+        if worker_ref not in groups:
+            worker_id = compact_ws(worker.get("id"), 160)
+            has_private_migration_claim = any(
+                compact_ws(
+                    entry.get("tendwire_worker_id") or entry.get("worker_id"),
+                    160,
+                )
+                == worker_id
+                and not entry_pane_uuid(entry)
+                and entry_stable_identity(entry) is None
+                and not entry_is_retired(entry)
+                for entry in entries.values()
+            )
+            if has_private_migration_claim:
+                continue
+            groups[worker_ref] = set()
+            continue
+        extras = {
+            key
+            for key, worker_refs in physical_workers_by_entry.items()
+            if key not in claimed and worker_refs == {worker_ref}
+        }
+        groups[worker_ref].update(extras)
+        claimed.update(extras)
+
+    # A compensation-era pane can also have closed/topicless quarantine rows
+    # that are intentionally excluded from ordinary matching.  Once an
+    # unambiguous #170/#172/#173 history row has established the physical pane,
+    # absorb those remaining labeled copies into the same migration group.
+    for worker in eligible_workers:
+        worker_ref = id(worker)
+        group = groups.get(worker_ref)
+        if not group or not any(
+            compact_ws(entries[key].get("routing_retired_reason"), 120)
+            == "herdr_restart_rekey_unmatched"
+            for key in group
+        ):
+            continue
+        stragglers = set()
+        for key, entry in entries.items():
+            if key in claimed or entry_pane_uuid(entry):
+                continue
+            matching_workers = {
+                id(candidate)
+                for candidate in eligible_workers
+                if _labeled_physical_identity_matches(entry, candidate)
+            }
+            if matching_workers == {worker_ref}:
+                stragglers.add(key)
+        group.update(stragglers)
+        claimed.update(stragglers)
+
+    panes = data.setdefault("panes", {})
+
+    def allocate_pane_uuid() -> str:
+        while True:
+            candidate = _new_pane_uuid()
+            if f"pane:{candidate}" in panes:
+                continue
+            if any(
+                entry_pane_uuid(entry) == candidate
+                for entry in panes.values()
+                if isinstance(entry, dict)
+            ):
+                continue
+            return candidate
+
+    for worker in eligible_workers:
+        worker_ref = id(worker)
+        if worker_ref not in groups:
+            continue
+        group = groups.get(worker_ref)
+        if not group:
+            pane_uuid = allocate_pane_uuid()
+            survivor_key = f"pane:{pane_uuid}"
+            panes[survivor_key] = {
+                "source": "tendwire",
+                "entry_type": "worker",
+                "pane_uuid": pane_uuid,
+                "pane_uuid_version": PANE_UUID_VERSION,
+                "_pane_identity_pending_create": True,
+            }
+            entries[survivor_key] = panes[survivor_key]
+            group = {survivor_key}
+            changed += 1
+        else:
+            survivor_key = _durable_survivor_key(entries, group)
+
+        survivor = entries[survivor_key]
+        pane_uuid = entry_pane_uuid(survivor)
+        if not pane_uuid:
+            inherited = sorted(
+                {
+                    entry_pane_uuid(entries[key])
+                    for key in group
+                    if entry_pane_uuid(entries[key])
+                }
+            )
+            pane_uuid = inherited[0] if inherited else allocate_pane_uuid()
+
+        before_survivor = json.dumps(
+            survivor, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        related_topic_ids = {
+            str(entries[key].get("topic_id") or "") for key in group
+        }
+        related_topic_ids.discard("")
+        surviving_topic_id = str(survivor.get("topic_id") or "")
+
+        protected = {
+            "topic_id",
+            "topic_name",
+            "pane_uuid",
+            "pane_uuid_version",
+            "tendwire_stable_key",
+            "tendwire_stable_key_version",
+            "routing_retired",
+            "routing_retired_reason",
+            "stable_key_quarantined",
+            "stable_key_quarantine_reason",
+        }
+        for duplicate_key in sorted(group):
+            if duplicate_key == survivor_key:
+                continue
+            duplicate = entries[duplicate_key]
+            for field, value in duplicate.items():
+                if field not in protected and field not in survivor:
+                    survivor[field] = value
+
+        _clear_consolidated_survivor_markers(survivor, heal_quarantine=True)
+        survivor["pane_uuid"] = pane_uuid
+        survivor["pane_uuid_version"] = PANE_UUID_VERSION
+        identity = worker_stable_identity(worker)
+        assert identity is not None
+        survivor["tendwire_stable_key"] = identity[0]
+        survivor["tendwire_stable_key_version"] = identity[1]
+        _stamp_consolidated_worker_observation(survivor, worker)
+
+        for duplicate_key in sorted(group):
+            if duplicate_key == survivor_key:
+                continue
+            duplicate = entries[duplicate_key]
+            duplicate_topic_id = str(duplicate.get("topic_id") or "")
+            duplicate.pop("pane_uuid", None)
+            duplicate.pop("pane_uuid_version", None)
+            if duplicate_topic_id and duplicate_topic_id != surviving_topic_id:
+                _retire_rekey_entry(
+                    duplicate,
+                    reason="durable_pane_duplicate_consolidated",
+                    archive_topic=True,
+                )
+                duplicate["retired_topic_notice_pending"] = True
+                duplicate["consolidated_into_entry_key"] = survivor_key
+                duplicate["consolidated_into_topic_id"] = surviving_topic_id
+                duplicate["tendwire_stable_identity_class"] = (
+                    "retired_durable_duplicate"
+                )
+                duplicate.pop("tendwire_stable_key", None)
+                duplicate.pop("tendwire_stable_key_version", None)
+            else:
+                panes.pop(duplicate_key, None)
+            changed += 1
+
+        _retarget_durable_bindings(
+            data,
+            survivor,
+            related_topic_ids=related_topic_ids,
+            surviving_topic_id=surviving_topic_id,
+        )
+        after_survivor = json.dumps(
+            survivor, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        changed += int(before_survivor != after_survivor)
+        reservations[worker_ref] = survivor_key
+
+    return DurablePaneReconciliation(
+        MappingProxyType(dict(reservations)), changed
     )
 
 
@@ -2258,6 +2747,7 @@ def _retarget_worker_bindings(
     identity = entry_stable_identity(entry)
     if identity is None:
         return
+    pane_uuid = entry_pane_uuid(entry)
     bindings = data.get("telegram_message_bindings")
     if not isinstance(bindings, dict):
         return
@@ -2269,15 +2759,23 @@ def _retarget_worker_bindings(
             space_id=previous_space_id,
         ):
             continue
-        if "routing_quarantined" in binding:
-            continue
         bound_topic_id = str(binding.get("topic_id") or "")
         has_stable_fields = "stable_key" in binding or "stable_key_version" in binding
         binding_identity = message_binding_stable_identity(binding)
+        binding_uuid = message_binding_pane_uuid(binding)
+        if "routing_quarantined" in binding and (
+            not pane_uuid or binding_uuid != pane_uuid
+        ):
+            continue
         if (
             not bound_topic_id
             or bound_topic_id not in previous_topic_ids
-            or (has_stable_fields and binding_identity != identity)
+            or (binding_uuid and binding_uuid != pane_uuid)
+            or (
+                not pane_uuid
+                and has_stable_fields
+                and binding_identity != identity
+            )
         ):
             binding["routing_quarantined"] = True
             continue
@@ -2286,6 +2784,10 @@ def _retarget_worker_bindings(
         binding["space_id"] = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
         binding["stable_key"] = identity[0]
         binding["stable_key_version"] = identity[1]
+        if pane_uuid:
+            binding["pane_uuid"] = pane_uuid
+            binding["pane_uuid_version"] = PANE_UUID_VERSION
+            binding.pop("routing_quarantined", None)
 
 
 def upsert_worker_entry(
@@ -2388,8 +2890,12 @@ def upsert_worker_entry(
         if blocked_key
         else f"source_identity_{identity_class}"
     )
-    created = key is None
     panes = data.setdefault("panes", {})
+    created = (
+        key is None
+        or not isinstance(panes.get(key), dict)
+        or (panes.get(key) or {}).get("_pane_identity_pending_create") is True
+    )
     if key is None:
         base_key = f"worker:{worker_id}:{short_hash(fingerprint or worker_id, 10)}"
         key = base_key
@@ -2425,6 +2931,7 @@ def upsert_worker_entry(
             "topic_name": entry.get("topic_name") or topic_name_for_worker(worker),
         }
     )
+    entry.pop("_pane_identity_pending_create", None)
     if physical["label"]:
         entry["tendwire_pane_label"] = compact_ws(meta.get("label"), 120)
     if physical["cwd"]:
@@ -2885,6 +3392,10 @@ def bind_message_to_worker(
     if identity is not None:
         binding["stable_key"] = identity[0]
         binding["stable_key_version"] = identity[1]
+    pane_uuid = entry_pane_uuid(entry)
+    if pane_uuid:
+        binding["pane_uuid"] = pane_uuid
+        binding["pane_uuid_version"] = PANE_UUID_VERSION
     if entry_is_quarantined(entry):
         binding["routing_quarantined"] = True
     bindings[message] = binding

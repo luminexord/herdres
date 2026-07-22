@@ -20,6 +20,54 @@ LEGACY_KEY = "d" * 24
 _AUTO_VERSION = object()
 
 
+def _normalize_generated_pane_uuids(value):
+    """Keep order-invariance assertions focused on identity ownership.
+
+    UUIDv4 values are intentionally random.  Replace each with a stable label
+    derived from the entry's current public routing hint, including UUIDs
+    embedded in new ``pane:<uuid>`` storage keys and message bindings.
+    """
+    normalized = deepcopy(value)
+    replacements = {}
+
+    def collect(item):
+        if isinstance(item, dict):
+            if state.entry_pane_uuid(item):
+                replacements[item["pane_uuid"]] = "pane-for:" + str(
+                    item.get("tendwire_stable_key")
+                    or item.get("topic_id")
+                    or "unknown"
+                )
+            for child in item.values():
+                collect(child)
+        elif isinstance(item, list):
+            for child in item:
+                collect(child)
+
+    collect(normalized)
+
+    def rewrite(item):
+        if isinstance(item, dict):
+            return {
+                next(
+                    (
+                        key.replace(old, new)
+                        for old, new in replacements.items()
+                        if old in key
+                    ),
+                    key,
+                ): rewrite(child)
+                for key, child in item.items()
+            }
+        if isinstance(item, list):
+            return [rewrite(child) for child in item]
+        if isinstance(item, str):
+            return replacements.get(item, item)
+        return item
+
+    return rewrite(normalized)
+
+
 @pytest.fixture(autouse=True)
 def _worker_mode(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
@@ -595,7 +643,9 @@ def test_production_shaped_missing_version_migration_is_order_reload_and_deliver
             "forum_topic_icons", {}
         ).pop("fetched_at", None)
         return json.dumps(
-            normalized, sort_keys=True, separators=(",", ":")
+            _normalize_generated_pane_uuids(normalized),
+            sort_keys=True,
+            separators=(",", ":"),
         )
 
     assert run(reverse=False) == run(reverse=True)
@@ -1823,7 +1873,7 @@ def test_cross_dimensional_reconciliation_reserves_stable_owner_before_worker_id
                     "topics": list(telegram.topics),
                 }
             )
-        return passes
+        return _normalize_generated_pane_uuids({"passes": passes})["passes"]
 
     forward = run(snapshot)
     reverse = run(list(reversed(snapshot)))
