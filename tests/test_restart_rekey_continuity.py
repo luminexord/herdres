@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +12,9 @@ from herdres_connector import state
 from herdres_connector.source_sync import SyncRuntime, sync_once
 
 from test_source_only import FakeTelegram, FakeTendwire, _store
+
+
+_REKEY_REPRO_FIXTURES = Path(__file__).parent / "fixtures" / "rekey-repro"
 
 
 def _key(letter: str) -> str:
@@ -57,6 +62,179 @@ def _persist(store: dict, worker: dict, topic_id: str | None = None):
     return state.upsert_worker_entry(
         store, worker, topic_id=topic_id or ""
     )[:2]
+
+
+def _captured_rekey_repro() -> tuple[dict, list[dict]]:
+    store = json.loads(
+        (_REKEY_REPRO_FIXTURES / "state-live.json").read_text(encoding="utf-8")
+    )
+    workers = json.loads(
+        (_REKEY_REPRO_FIXTURES / "workers-live.json").read_text(encoding="utf-8")
+    )
+    return store, workers
+
+
+def test_captured_live_shape_retires_every_displaced_topic_holder():
+    store, workers = _captured_rekey_repro()
+    expected_new_retirements = (
+        "worker:claude-1-1-1-1:0e8605e506",
+        "worker:claude-1-1-2-1:96044de7d5",
+        "worker:claude-1-2-1:e504eacfcc",
+        "worker:claude-1-2-2-1:82436b9eff",
+        "worker:claude-1-2-2-2:fbadaa6841",
+        "worker:claude-1-2:53d81a5f5b",
+        "worker:claude-2-1-2-2:29c310e21b",
+        "worker:claude-2-1:07fcdba57d",
+        "worker:claude:73fd1aefd9",
+        "worker:codex-1-1:9d8e174441",
+        "worker:codex-1:0550716aa5",
+        "worker:codex:03205b2610",
+        "worker:codex:03205b2610:2",
+        "worker:codex:a2cc350e22",
+    )
+    topic_holders = {
+        key: entry
+        for key, entry in state.source_worker_entries(store).items()
+        if entry.get("topic_id")
+    }
+    already_retired = {
+        key for key, entry in topic_holders.items() if state.entry_is_retired(entry)
+    }
+    assert len(topic_holders) == 19
+    assert len(already_retired) == 4
+
+    plan = state.plan_worker_rekey_continuity(store, workers)
+
+    # No topic is safe to hand off in this captured incident. The one exact
+    # current owner remains live; every other unretired topic holder retires.
+    assert plan.matches == ()
+    assert len(plan.stale_entry_keys) == 39
+    assert tuple(
+        key
+        for key in plan.stale_entry_keys
+        if topic_holders.get(key, {}).get("topic_id")
+    ) == expected_new_retirements
+    assert len(expected_new_retirements) == 14
+    assert dict(state.apply_worker_rekey_continuity_plan(store, workers, plan)) == {}
+
+    retired_topic_holders = {
+        key
+        for key, entry in topic_holders.items()
+        if state.entry_is_retired(entry)
+    }
+    assert len(retired_topic_holders) == 18
+    assert retired_topic_holders == already_retired | set(expected_new_retirements)
+    for key in expected_new_retirements:
+        entry = topic_holders[key]
+        assert entry["routing_retired_reason"] == "herdr_restart_rekey_unmatched"
+        assert entry["topic_id"]
+
+    # Retirement is presence-based, so the next planner pass has no work.
+    assert state.plan_worker_rekey_continuity(store, workers) == ((), ())
+
+
+def test_captured_live_shape_recreates_every_worker_topic_in_bounded_passes(
+    monkeypatch,
+):
+    store, workers = _captured_rekey_repro()
+    plan = state.plan_worker_rekey_continuity(store, workers)
+    state.apply_worker_rekey_continuity_plan(store, workers, plan)
+    original_retired_topics = {
+        str(entry["topic_id"])
+        for entry in state.source_worker_entries(store).values()
+        if entry.get("topic_id") and state.entry_is_retired(entry)
+    }
+    assert len(original_retired_topics) == 18
+
+    def routable_topic_entries(worker: dict) -> list[dict]:
+        identity = state.worker_stable_identity(worker)
+        return [
+            entry
+            for key, entry in state.source_worker_entries(store).items()
+            if entry.get("topic_id")
+            and state.worker_entry_is_uniquely_routable(store, key, entry)
+            and state.entry_stable_identity(entry) == identity
+            and entry.get("tendwire_worker_id") == worker["id"]
+        ]
+
+    # The fixture has one already-fresh exact owner; ten workers need creation.
+    assert sum(len(routable_topic_entries(worker)) for worker in workers) == 1
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MAX_CREATES", "3")
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(FakeTendwire(workers=workers), telegram, with_outbox=False)
+    create_deltas = []
+    for _ in range(4):
+        before = len(telegram.topics)
+        sync_once(store, runtime)
+        create_deltas.append(len(telegram.topics) - before)
+
+    assert create_deltas == [3, 3, 3, 1]
+    assert len(telegram.topics) == 10
+    assert all(len(routable_topic_entries(worker)) == 1 for worker in workers)
+    assert {
+        str(entry["topic_id"])
+        for entry in state.source_worker_entries(store).values()
+        if state.entry_is_retired(entry) and entry.get("topic_id")
+    } == original_retired_topics
+    assert not any(
+        str(entry.get("topic_id") or "") in original_retired_topics
+        for key, entry in state.source_worker_entries(store).items()
+        if state.worker_entry_is_uniquely_routable(store, key, entry)
+    )
+
+    panes_after_healing = deepcopy(state.source_worker_entries(store))
+    before_calls = (
+        len(telegram.topics),
+        len(telegram.renamed_topics),
+        len(telegram.closed_topics),
+    )
+    sync_once(store, runtime)
+    assert state.source_worker_entries(store) == panes_after_healing
+    assert (
+        len(telegram.topics),
+        len(telegram.renamed_topics),
+        len(telegram.closed_topics),
+    ) == before_calls
+
+
+def test_retired_only_worker_history_does_not_block_fresh_creation():
+    store = _store()
+    worker = _worker(
+        "claude-2",
+        _key("6"),
+        label="pane-r",
+        agent="claude",
+        cwd="/work/r",
+        title="Pane R",
+        space="space-r",
+        fingerprint="fp-r",
+    )
+    retired_key, retired = _persist(store, worker, "14000")
+    state._retire_rekey_entry(
+        retired,
+        reason="test_retired_history",
+        archive_topic=True,
+    )
+
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(FakeTendwire(workers=[worker]), telegram, with_outbox=False)
+    sync_once(store, runtime)
+
+    fresh = [
+        (key, entry)
+        for key, entry in state.source_worker_entries(store).items()
+        if key != retired_key
+        and entry.get("tendwire_worker_id") == worker["id"]
+        and entry.get("topic_id")
+    ]
+    assert len(fresh) == 1
+    fresh_key, fresh_entry = fresh[0]
+    assert fresh_entry["topic_id"] != "14000"
+    assert state.worker_entry_is_uniquely_routable(store, fresh_key, fresh_entry)
+    assert state.entry_is_retired(state.source_worker_entries(store)[retired_key])
+
+    sync_once(store, runtime)
+    assert len(telegram.topics) == 1
 
 
 def test_physical_match_migrates_without_any_worker_id_match():

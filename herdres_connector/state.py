@@ -368,6 +368,7 @@ def _worker_entry_keys_by_worker_any_status(data: dict[str, Any], worker_id: str
         key
         for key, entry in source_worker_entries(data).items()
         if not entry_is_quarantined(entry)
+        and not entry_is_retired(entry)
         and _entry_identity_is_allowed(entry)
         and str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "") == worker_id
     ]
@@ -472,6 +473,11 @@ def blocked_worker_stable_keys(data: dict[str, Any], workers: list[dict[str, Any
     persisted_by_stable: dict[str, list[str]] = {}
     persisted_by_worker: dict[str, list[str]] = {}
     for key, entry in source_worker_entries(data).items():
+        # Retired rows are historical routes, not current ownership claims.
+        # Let a live observation create a fresh owner even when the historical
+        # row was also quarantined before it was retired.
+        if entry_is_retired(entry):
+            continue
         identity = entry_stable_identity(entry)
         if identity is None:
             continue
@@ -631,9 +637,13 @@ def plan_worker_rekey_continuity(
 ) -> WorkerRekeyContinuityPlan:
     """Plan one-to-one topic continuity after a Herdr restart re-keys panes.
 
-    Positional worker ids are used only to identify displaced duplicate rows
-    which must stop claiming a live route.  They are deliberately never part
-    of the physical match score used to migrate a topic.
+    Once live stable-keyed rows have been persisted without topics and multiple
+    displaced topic claims corroborate a global re-key, every topic-owning row
+    whose stable identity claim disappeared from the live snapshot must retire,
+    even when no live pane can safely inherit its topic. Positional worker ids
+    still identify displaced topicless duplicate rows which must stop claiming
+    a live route. They are deliberately never part of the physical match score
+    used to migrate a topic.
     """
     live_workers = [
         worker
@@ -656,19 +666,90 @@ def plan_worker_rekey_continuity(
         compact_ws(worker.get("id"), 160) for worker in eligible_workers
     }
     live_worker_ids.discard("")
+    live_worker_claims = {
+        (worker_stable_key(worker), compact_ws(worker.get("id"), 160))
+        for worker in eligible_workers
+    }
     entries = source_worker_entries(data)
-    absent_key_entries = {
+    topicless_live_claim_persisted = any(
+        not entry_is_retired(entry)
+        and _entry_is_live(entry)
+        and not entry.get("topic_id")
+        and (identity := entry_stable_identity(entry)) is not None
+        and (
+            identity[0],
+            compact_ws(
+                entry.get("tendwire_worker_id") or entry.get("worker_id"),
+                160,
+            ),
+        )
+        in live_worker_claims
+        for entry in entries.values()
+    )
+    displaced_topic_entry_keys = {
+        key
+        for key, entry in entries.items()
+        if not entry_is_retired(entry)
+        and entry.get("topic_id")
+        and (
+            (identity := entry_stable_identity(entry)) is None
+            or (
+                identity[0],
+                compact_ws(
+                    entry.get("tendwire_worker_id") or entry.get("worker_id"),
+                    160,
+                ),
+            )
+            not in live_worker_claims
+        )
+    }
+    corroborating_topic_entry_keys = {
+        key
+        for key in displaced_topic_entry_keys
+        if entry_stable_identity(entries[key]) is not None
+    }
+    # One quarantined owner can be an ordinary collision and must remain
+    # fail-closed. Two or more displaced topic claims corroborate a global pane
+    # re-key, allowing already-unroutable blockers to retire as one batch.
+    broad_rekey_recovery = (
+        topicless_live_claim_persisted
+        and len(corroborating_topic_entry_keys) >= 2
+    )
+    displaced_entries = {
         key: entry
         for key, entry in entries.items()
         if not entry_is_retired(entry)
-        and (identity := entry_stable_identity(entry)) is not None
-        and identity[0] not in live_keys
+        and (
+            (
+                (identity := entry_stable_identity(entry)) is not None
+                and identity[0] not in live_keys
+            )
+            or (
+                broad_rekey_recovery
+                and key in displaced_topic_entry_keys
+            )
+            or (
+                broad_rekey_recovery
+                and entry_is_quarantined(entry)
+                and (
+                    (identity is not None and identity[0] in live_keys)
+                    or compact_ws(
+                        entry.get("tendwire_worker_id")
+                        or entry.get("worker_id"),
+                        160,
+                    )
+                    in live_worker_ids
+                )
+            )
+        )
     }
     stale_keys = tuple(
         sorted(
             key
-            for key, entry in absent_key_entries.items()
-            if str(
+            for key, entry in displaced_entries.items()
+            if (broad_rekey_recovery and entry.get("topic_id"))
+            or (broad_rekey_recovery and entry_is_quarantined(entry))
+            or str(
                 entry.get("tendwire_worker_id") or entry.get("worker_id") or ""
             )
             in live_worker_ids
@@ -680,9 +761,15 @@ def plan_worker_rekey_continuity(
     )
     candidates_by_worker: dict[int, list[str]] = {}
     workers_by_candidate: dict[str, list[int]] = {}
+    migration_candidate_keys = {
+        entry_key
+        for entry_key in stale_keys
+        if (identity := entry_stable_identity(entries[entry_key])) is not None
+        and identity[0] not in live_keys
+    }
     for worker in eligible_workers:
         worker_ref = id(worker)
-        for entry_key in stale_keys:
+        for entry_key in migration_candidate_keys:
             if _physical_identity_matches(entries[entry_key], worker):
                 candidates_by_worker.setdefault(worker_ref, []).append(entry_key)
                 workers_by_candidate.setdefault(entry_key, []).append(worker_ref)
@@ -1357,7 +1444,11 @@ def _resolve_worker_upsert_entry_key(
     """Resolve the row an upsert would own without mutating reconciliation state."""
     worker_id = compact_ws(worker.get("id"), 160)
     identity = worker_stable_identity(worker)
-    raw_exact_matches = _all_worker_entry_keys_by_worker(data, worker_id)
+    raw_exact_matches = [
+        key
+        for key in _all_worker_entry_keys_by_worker(data, worker_id)
+        if not entry_is_retired(source_worker_entries(data).get(key) or {})
+    ]
     exact_matches = _worker_entry_keys_by_worker(data, worker_id)
     if worker_id in (blocked_worker_ids or set()):
         exact_identity_matches = [
@@ -1461,6 +1552,7 @@ def precompute_worker_entry_reservations(
         candidates = [
             key
             for key in _all_worker_entry_keys_by_worker(data, worker_id)
+            if not entry_is_retired(entries.get(key) or {})
             if entry_stable_identity(entries.get(key) or {}) == identity
             and (
                 allow_nonquarantined
@@ -1904,7 +1996,11 @@ def upsert_worker_entry(
     physical = worker_physical_identity_signals(worker)
     identity_class = worker_stable_identity_class(worker)
     identity = worker_stable_identity(worker)
-    raw_exact_matches = _all_worker_entry_keys_by_worker(data, worker_id)
+    raw_exact_matches = [
+        key
+        for key in _all_worker_entry_keys_by_worker(data, worker_id)
+        if not entry_is_retired(source_worker_entries(data).get(key) or {})
+    ]
     exact_matches = _worker_entry_keys_by_worker(data, worker_id)
     all_stable_matches = (
         _all_worker_entry_keys_by_stable_key(data, identity[0]) if identity is not None else []
