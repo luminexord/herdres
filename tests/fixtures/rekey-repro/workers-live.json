@@ -1,0 +1,209 @@
+[
+  {
+    "fingerprint": "093e9a5ee7dcf5ee1707c649",
+    "id": "claude-1-1",
+    "last_seen_at": null,
+    "meta": {
+      "focused": false,
+      "label": "pipeline",
+      "revision": 4,
+      "stable_key": "wsk1_47db433a7f9b2c8d84d16402a2ecff4750e122f7a92f03a5d4e4a38d2c8463b5",
+      "stable_key_version": 1,
+      "state_change_seq": 303,
+      "terminal_title": "✳ build-trend-scout-pipeline",
+      "terminal_title_stripped": "build-trend-scout-pipeline"
+    },
+    "name": "claude",
+    "space_id": "w6536a4e5b44342",
+    "status": "idle",
+    "summary": null
+  },
+  {
+    "fingerprint": "1189b9177b20099133ae1420",
+    "id": "claude-1-1-1",
+    "last_seen_at": null,
+    "meta": {
+      "focused": false,
+      "label": "herdres",
+      "raw_status": "working",
+      "revision": 1,
+      "stable_key": "wsk1_a95d7a16b125d6e0a3dc33781b91d915fd61b7b23d9ed8cbae589aecf6362dbf",
+      "stable_key_version": 1,
+      "state_change_seq": 296,
+      "terminal_title": "⠐ github-issue-topic-cleanup-automation",
+      "terminal_title_stripped": "github-issue-topic-cleanup-automation"
+    },
+    "name": "claude",
+    "space_id": "w6536a4e5b44342",
+    "status": "active",
+    "summary": null
+  },
+  {
+    "fingerprint": "d483c8e5759a867dc4507493",
+    "id": "claude-1-1-2",
+    "last_seen_at": null,
+    "meta": {
+      "focused": false,
+      "label": "joltra-2",
+      "revision": 0,
+      "stable_key": "wsk1_01ead0d1ee2b1c47e32d3bbce470867c4c376d0a0554e4a714f1b29589237092",
+      "stable_key_version": 1,
+      "state_change_seq": 0
+    },
+    "name": "claude",
+    "space_id": "w6536a4e5b44342",
+    "status": "idle",
+    "summary": null
+  },
+  {
+    "fingerprint": "94d2d297898f0781479726c7",
+    "id": "claude-1-2",
+    "last_seen_at": null,
+    "meta": {
+      "focused": true,
+      "label": "Gitmoot",
+      "raw_status": "working",
+      "revision": 4,
+      "stable_key": "wsk1_30fafebaf2b89b37446b111fcf6abf245c1d31565a666d7ef08fa3dca331f957",
+      "stable_key_version": 1,
+      "state_change_seq": 309,
+      "terminal_title": "⠂ restyle-health-charts-dashboard",
+      "terminal_title_stripped": "restyle-health-charts-dashboard"
+    },
+    "name": "claude",
+    "space_id": "w6536a4e5b44342",
+    "status": "active",
+    "summary": null
+  },
+  {
+    "fingerprint": "d2c036ff21c3c832ea11d9a0",
+    "id": "claude-2",
+    "last_seen_at": "2026-07-22T03:19:32.161725+00:00",
+    "meta": {
+      "focused": false,
+      "label": "vetrina",
+      "revision": 1,
+      "stable_key": "wsk1_3f585390b904898bb9ecffef774b2d52c1d4226b5de976ad0abf776bc038ef48",
+      "stable_key_version": 1,
+      "state_change_seq": 221,
+      "terminal_title": "✳ Autonomous website creation service for local businesses",
+      "terminal_title_stripped": "Autonomous website creation service for local businesses",
+      "type": "pane_focused"
+    },
+    "name": "claude",
+    "space_id": "w6536a4e5b44342",
+    "status": "idle",
+    "summary": null
+  },
+  {
+    "fingerprint": "ba1c09dd0083be4fe7a75dc5",
+    "id": "claude-2-1",
+    "last_seen_at": null,
+    "meta": {
+      "focused": false,
+      "label": "temp",
+      "revision": 1,
+      "stable_key": "wsk1_5e0a506d517746b3fbd699e7bba44b5ab354954729fcf0fe568061a39d8fdf6e",
+      "stable_key_version": 1,
+      "state_change_seq": 146,
+      "terminal_title": "✳ Review call transcript from agentgram",
+      "terminal_title_stripped": "Review call transcript from agentgram"
+    },
+    "name": "claude",
+    "space_id": "w6536a4e5b44342",
+    "status": "idle",
+    "summary": null
+  },
+  {
+    "fingerprint": "9940617d22f2b1cef249ffa4",
+    "id": "claude-2-2",
+    "last_seen_at": null,
+    "meta": {
+      "focused": false,
+      "label": "joltra",
+      "revision": 0,
+      "stable_key": "wsk1_a1f39705551e577148291412727f450459dcbc8bc777885fbf59bbaebd1eebb8",
+      "stable_key_version": 1,
+      "state_change_seq": 0
+    },
+    "name": "claude",
+    "space_id": "w6536a4e5b44342",
+    "status": "idle",
+    "summary": null
+  },
+  {
+    "fingerprint": "454252303affef52a90d5d9f",
+    "id": "claude-6",
+    "last_seen_at": null,
+    "meta": {
+      "focused": false,
+      "label": "Gitmoot4",
+      "revision": 1,
+      "stable_key": "wsk1_420687e7a2c3e53292600d2f72e7ef8965045b041df5b01476e50ed5b13da06a",
+      "stable_key_version": 1,
+      "state_change_seq": 304,
+      "terminal_title": "✳ file-github-issues-dashboard-fixes",
+      "terminal_title_stripped": "file-github-issues-dashboard-fixes"
+    },
+    "name": "claude",
+    "space_id": "w6536a4e5b44342",
+    "status": "idle",
+    "summary": null
+  },
+  {
+    "fingerprint": "83bdeca9beb0c7ecf3c7ff5d",
+    "id": "claude-7",
+    "last_seen_at": null,
+    "meta": {
+      "focused": false,
+      "label": "Gitmoot2",
+      "revision": 1,
+      "stable_key": "wsk1_a1a4088970068bc0f4d11c471e48ad561bcd6448389e3a90cf3682733f663743",
+      "stable_key_version": 1,
+      "state_change_seq": 292,
+      "terminal_title": "✳ Execute Gitmoot2 coordination queue tasks",
+      "terminal_title_stripped": "Execute Gitmoot2 coordination queue tasks"
+    },
+    "name": "claude",
+    "space_id": "w6536a4e5b44342",
+    "status": "idle",
+    "summary": null
+  },
+  {
+    "fingerprint": "b997835c59b1a7f3b41e065c",
+    "id": "claude-8",
+    "last_seen_at": null,
+    "meta": {
+      "focused": false,
+      "label": "Gitmoot 3",
+      "revision": 1,
+      "stable_key": "wsk1_62f99f28acea9ab78bb5d2042f9a5f6ca817e74ff283710b785153aac9f7a94d",
+      "stable_key_version": 1,
+      "state_change_seq": 277,
+      "terminal_title": "✳ Execute Gitmoot 3 coordinator workflows",
+      "terminal_title_stripped": "Execute Gitmoot 3 coordinator workflows"
+    },
+    "name": "claude",
+    "space_id": "w6536a4e5b44342",
+    "status": "idle",
+    "summary": null
+  },
+  {
+    "fingerprint": "5818e06b6e44eeb00c95fd55",
+    "id": "codex-2-2",
+    "last_seen_at": null,
+    "meta": {
+      "focused": false,
+      "label": "gitmoot-codex",
+      "revision": 0,
+      "stable_key": "wsk1_d5891090eb7c15c555b3334dad5b62b10dd444539b4e13d6d4f374cde882d935",
+      "stable_key_version": 1,
+      "state_change_seq": 0
+    },
+    "name": "codex",
+    "space_id": "w6536a4e5b44342",
+    "status": "idle",
+    "summary": null
+  }
+]
+

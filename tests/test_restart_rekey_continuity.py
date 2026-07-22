@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +12,9 @@ from herdres_connector import state
 from herdres_connector.source_sync import SyncRuntime, sync_once
 
 from test_source_only import FakeTelegram, FakeTendwire, _store
+
+
+_REKEY_REPRO_FIXTURES = Path(__file__).parent / "fixtures" / "rekey-repro"
 
 
 def _key(letter: str) -> str:
@@ -57,6 +62,63 @@ def _persist(store: dict, worker: dict, topic_id: str | None = None):
     return state.upsert_worker_entry(
         store, worker, topic_id=topic_id or ""
     )[:2]
+
+
+def test_captured_live_shape_retires_every_absent_key_topic_holder():
+    store = json.loads(
+        (_REKEY_REPRO_FIXTURES / "state-live.json").read_text(encoding="utf-8")
+    )
+    workers = json.loads(
+        (_REKEY_REPRO_FIXTURES / "workers-live.json").read_text(encoding="utf-8")
+    )
+    expected_stale_keys = (
+        "worker:claude-1-1-1-1:0e8605e506",
+        "worker:codex-1-1:9d8e174441",
+        "worker:codex-1:0550716aa5",
+        "worker:codex:03205b2610:2",
+    )
+
+    live_stable_keys = {
+        identity[0]
+        for worker in workers
+        if (identity := state.worker_stable_identity(worker)) is not None
+    }
+    absent_key_topic_holders = tuple(
+        sorted(
+            key
+            for key, entry in state.source_worker_entries(store).items()
+            if entry.get("topic_id")
+            and not state.entry_is_retired(entry)
+            and (identity := state.entry_stable_identity(entry)) is not None
+            and identity[0] not in live_stable_keys
+        )
+    )
+    assert absent_key_topic_holders == expected_stale_keys
+    assert any(
+        not entry.get("topic_id")
+        and state.entry_stable_identity(entry)[0] in live_stable_keys
+        for entry in state.source_worker_entries(store).values()
+        if state.entry_stable_identity(entry) is not None
+    )
+
+    plan = state.plan_worker_rekey_continuity(store, workers)
+
+    # The panes really reshuffled: none is safe to migrate, but every stale
+    # topic owner still has to retire so it cannot keep a quarantined route.
+    assert plan.matches == ()
+    assert plan.stale_entry_keys == expected_stale_keys
+    assert dict(state.apply_worker_rekey_continuity_plan(store, workers, plan)) == {}
+    for key in expected_stale_keys:
+        entry = state.source_worker_entries(store)[key]
+        assert state.entry_is_retired(entry)
+        assert entry["routing_retired_reason"] == "herdr_restart_rekey_unmatched"
+        assert entry["topic_id"]
+
+    # Retirement is presence-based, so the next pass has no work to repeat.
+    assert state.plan_worker_rekey_continuity(store, workers) == (
+        (),
+        (),
+    )
 
 
 def test_physical_match_migrates_without_any_worker_id_match():

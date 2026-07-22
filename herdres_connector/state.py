@@ -631,9 +631,12 @@ def plan_worker_rekey_continuity(
 ) -> WorkerRekeyContinuityPlan:
     """Plan one-to-one topic continuity after a Herdr restart re-keys panes.
 
-    Positional worker ids are used only to identify displaced duplicate rows
-    which must stop claiming a live route.  They are deliberately never part
-    of the physical match score used to migrate a topic.
+    Once live stable-keyed rows have been persisted without topics, every
+    topic-owning row whose stable key disappeared from the live snapshot must
+    retire, even when no live pane can safely inherit its topic. Positional
+    worker ids still identify displaced topicless duplicate rows which must stop
+    claiming a live route. They are deliberately never part of the physical
+    match score used to migrate a topic.
     """
     live_workers = [
         worker
@@ -656,7 +659,26 @@ def plan_worker_rekey_continuity(
         compact_ws(worker.get("id"), 160) for worker in eligible_workers
     }
     live_worker_ids.discard("")
+    live_worker_claims = {
+        (worker_stable_key(worker), compact_ws(worker.get("id"), 160))
+        for worker in eligible_workers
+    }
     entries = source_worker_entries(data)
+    rekey_recovery_in_progress = any(
+        not entry_is_retired(entry)
+        and _entry_is_live(entry)
+        and not entry.get("topic_id")
+        and (identity := entry_stable_identity(entry)) is not None
+        and (
+            identity[0],
+            compact_ws(
+                entry.get("tendwire_worker_id") or entry.get("worker_id"),
+                160,
+            ),
+        )
+        in live_worker_claims
+        for entry in entries.values()
+    )
     absent_key_entries = {
         key: entry
         for key, entry in entries.items()
@@ -668,7 +690,8 @@ def plan_worker_rekey_continuity(
         sorted(
             key
             for key, entry in absent_key_entries.items()
-            if str(
+            if (rekey_recovery_in_progress and entry.get("topic_id"))
+            or str(
                 entry.get("tendwire_worker_id") or entry.get("worker_id") or ""
             )
             in live_worker_ids
