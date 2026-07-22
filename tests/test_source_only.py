@@ -186,6 +186,7 @@ class FakeTelegram:
             "edited": [],
             "topics": [],
             "deleted_topics": [],
+            "closed_topics": [],
             "renamed_topics": [],
             "pins": [],
             "api_calls": [],
@@ -194,11 +195,13 @@ class FakeTelegram:
         }
         shared.setdefault("voice_notes", [])
         shared.setdefault("renamed_topics", [])
+        shared.setdefault("closed_topics", [])
         self._shared = shared
         self.sent = shared["sent"]
         self.edited = shared["edited"]
         self.topics = shared["topics"]
         self.deleted_topics = shared["deleted_topics"]
+        self.closed_topics = shared["closed_topics"]
         self.renamed_topics = shared["renamed_topics"]
         self.pins = shared["pins"]
         self.api_calls = shared["api_calls"]
@@ -253,6 +256,10 @@ class FakeTelegram:
 
     def delete_topic(self, _chat_id, thread_id):
         self.deleted_topics.append(str(thread_id))
+        return {"ok": True}
+
+    def close_topic(self, _chat_id, thread_id):
+        self.closed_topics.append(str(thread_id))
         return {"ok": True}
 
     def send_message(self, chat_id, html, **kwargs):
@@ -3401,12 +3408,16 @@ def test_gateway_unknown_message_caches_local_advance_without_tendwire_mutation(
     state.save_state(store)
     before = state.load_state()
     child_payloads = []
+    telegram = FakeTelegram()
 
     def run_child(payload):
         child_payloads.append(dict(payload))
         return herdres.command_reply(payload)
 
     monkeypatch.setattr(herdres_gateway, "run_herdres_command", run_child)
+    monkeypatch.setattr(
+        herdres_gateway, "TelegramClient", lambda **_kwargs: telegram
+    )
     checkpoint = herdres_gateway.handle_update(
         {
             "update_id": 45,
@@ -3433,8 +3444,21 @@ def test_gateway_unknown_message_caches_local_advance_without_tendwire_mutation(
     assert record["request_json"] is None
     assert record["outcome"] == _gateway_child(
         child_payloads[0]["request_id"],
-        handled=False,
+        reply=herdres.REKEYED_TOPIC_QUARANTINE_REPLY,
     )
+    assert telegram.sent == [
+        (
+            "-100",
+            herdres.REKEYED_TOPIC_QUARANTINE_REPLY,
+            {
+                "thread_id": "999",
+                "reply_to_message_id": "11",
+                "notify": True,
+                "token": "fake",
+            },
+            "100",
+        )
+    ]
 
 
 @pytest.mark.parametrize(

@@ -30,6 +30,10 @@ from herdres_connector.tendwire_client import (
 
 VERSION = "0.7.0rc4-tendwired-source-only"
 SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the target again."
+REKEYED_TOPIC_QUARANTINE_REPLY = (
+    "This pane was re-keyed after a Herdr restart; a fresh topic is being "
+    "created. Please use the new pane topic when it appears."
+)
 
 
 def _json(data: dict[str, Any]) -> int:
@@ -634,7 +638,10 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         if entry is None:
             if record is not None:
                 return _local_ingress_outcome(
-                    store, record, reason="message is not routed", handled=False
+                    store,
+                    record,
+                    reason="message is not routed",
+                    reply=REKEYED_TOPIC_QUARANTINE_REPLY,
                 )
             return {"handled": False}
         voice_reply = _voice_mode_reply(store, entry, payload)

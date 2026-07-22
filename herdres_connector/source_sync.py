@@ -1640,6 +1640,61 @@ def _stamp_numbered_base(entry: dict[str, Any], wid: str, numbered_bases: dict[s
         entry.pop("connector_numbered_base", None)
 
 
+def _sync_retired_worker_topics(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+) -> int:
+    """Archive retired restart-era topics without ever deleting history."""
+    changed = 0
+    for entry in state.source_worker_entries(store).values():
+        if not state.entry_is_retired(entry):
+            continue
+        topic_id = str(entry.get("topic_id") or "")
+        if not topic_id:
+            continue
+        if entry.get("retired_topic_rename_pending"):
+            if runtime.dry_run:
+                continue
+            renamed = runtime.telegram.rename_topic(
+                chat_id, topic_id, str(entry.get("topic_name") or "📁 Retired pane")
+            )
+            if renamed.get("ok") or _topic_not_modified(renamed.get("error")):
+                entry.pop("retired_topic_rename_pending", None)
+                entry.pop("retired_topic_rename_error", None)
+                entry["retired_topic_renamed"] = True
+                changed += 1
+            elif _topic_missing(renamed.get("error")):
+                entry.pop("retired_topic_rename_pending", None)
+                entry["retired_topic_missing"] = True
+                changed += 1
+            else:
+                entry["retired_topic_rename_error"] = compact_ws(
+                    renamed.get("error"), 240
+                )
+                continue
+        if entry.get("retired_topic_close_pending"):
+            if runtime.dry_run or entry.get("retired_topic_missing"):
+                continue
+            closed = runtime.telegram.close_topic(chat_id, topic_id)
+            close_error = str(closed.get("error") or "").lower()
+            if closed.get("ok") or "topic_closed" in close_error or "already closed" in close_error:
+                entry.pop("retired_topic_close_pending", None)
+                entry.pop("retired_topic_close_error", None)
+                entry["retired_topic_closed"] = True
+                changed += 1
+            elif _topic_missing(closed.get("error")):
+                entry.pop("retired_topic_close_pending", None)
+                entry["retired_topic_missing"] = True
+                changed += 1
+            else:
+                entry["retired_topic_close_error"] = compact_ws(
+                    closed.get("error"), 240
+                )
+    return changed
+
+
 def _sync_sources(
     store: dict[str, Any],
     snapshot: dict[str, Any],
@@ -1662,6 +1717,11 @@ def _sync_sources(
     worker_topic_renames: dict[str, str] = {}
     worker_numbered_bases: dict[str, str] = {}
     workers = _workers(snapshot)
+    continuity_plan = state.plan_worker_rekey_continuity(store, workers)
+    continuity_handoffs = state.apply_worker_rekey_continuity_plan(
+        store, workers, continuity_plan
+    )
+    counts["updated"] += len(continuity_plan.stale_entry_keys)
     blocked_stable_keys = state.blocked_worker_stable_keys(store, workers)
     blocked_worker_ids = state.conflicting_snapshot_worker_ids(workers)
     counts["updated"] += state.quarantine_worker_stable_key_owners(
@@ -1718,6 +1778,13 @@ def _sync_sources(
             use_preplanned_key=True,
             reserved_entry_keys=reserved_entry_keys,
         )
+        stale_entry_key = continuity_handoffs.get(id(worker))
+        if stale_entry_key is not None:
+            counts["updated"] += int(
+                state.finalize_worker_rekey_topic_handoff(
+                    store, stale_entry_key, entry
+                )
+            )
         entry["status"] = _effective_worker_status(worker, turn_status_by_worker)
         _stamp_managed_voice(entry, _space_voice_mode(store, space_id))
         if not state.worker_entry_is_uniquely_routable(store, _key, entry):
@@ -1778,6 +1845,9 @@ def _sync_sources(
 
     seen_space_keys: set[str] = set()
     if topic_mode == "worker":
+        counts["updated"] += _sync_retired_worker_topics(
+            store, runtime, chat_id=chat_id
+        )
         return counts
 
     for space_id, space in spaces.items():
@@ -1879,6 +1949,8 @@ def _cleanup_topics(
             reap_enabled = False
     if reap_enabled:
         for key, entry in list(state.source_worker_entries(store).items()):
+            if state.entry_is_retired(entry):
+                continue
             wid = compact_ws(entry.get("tendwire_worker_id") or entry.get("worker_id"), 160)
             if wid and wid in snapshot_worker_ids:
                 if entry.pop("reap_miss_count", None) is not None:
@@ -1938,6 +2010,8 @@ def _cleanup_topics(
             worker_entry["deleted_topic_id"] = topic_id
             worker_entry["deleted_topic_reason"] = reason
     for key, entry in list(state.source_worker_entries(store).items()):
+        if state.entry_is_retired(entry):
+            continue
         topic_id = str(entry.get("topic_id") or "")
         if not topic_id:
             continue
