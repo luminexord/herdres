@@ -1765,14 +1765,19 @@ def _sync_sources(
     worker_topic_renames: dict[str, str] = {}
     worker_numbered_bases: dict[str, str] = {}
     workers = _workers(snapshot)
-    counts["updated"] += state.consolidate_worker_entries_by_stable_key(
-        store, workers
-    )
     continuity_plan = state.plan_worker_rekey_continuity(store, workers)
     continuity_handoffs = state.apply_worker_rekey_continuity_plan(
         store, workers, continuity_plan
     )
     counts["updated"] += len(continuity_plan.stale_entry_keys)
+    # Physical continuity owns first choice of an existing topic. Stable-key
+    # consolidation runs only after those handoffs are reserved, and may not
+    # revive/reassign a matched historical row before finalize moves its topic.
+    counts["updated"] += state.consolidate_worker_entries_by_stable_key(
+        store,
+        workers,
+        excluded_entry_keys=frozenset(continuity_handoffs.values()),
+    )
     blocked_stable_keys = state.blocked_worker_stable_keys(store, workers)
     blocked_worker_ids = state.conflicting_snapshot_worker_ids(workers)
     counts["updated"] += state.quarantine_worker_stable_key_owners(

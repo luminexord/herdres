@@ -458,6 +458,22 @@ move intentionally receives another handle. This reconciliation does not change
 the Telegram topic policy below: space topics remain the default and worker/pane
 topics remain opt-in.
 
+The v1 handle is not derived from an agent session. Tendwire derives it from the
+host plus Herdr's workspace/public-pane identity, so an agent `/clear` that only
+rotates the Claude/Codex session does not intentionally change the handle. A
+pane close/reopen or replacement can receive a new public-pane identity and
+therefore a new handle without restarting Herdr. Herdres treats that as a
+continuity event when exactly one historical topic and one live pane agree on
+the operator-visible label and agent; matching cwd/space evidence strengthens
+the match, while an explicit cwd disagreement is always a veto. The handoff is
+planned before stable-key consolidation, topic naming, or `createForumTopic`, so
+the existing topic id and history survive and no numbered replacement is minted.
+
+Closed-history healing may deliberately move an old row's key into the paired
+`retired_tendwire_stable_key` fields so it cannot remain routable. Those fields
+remain eligible only for this one-to-one physical topic handoff; they never make
+the historical row independently routable again.
+
 Public observations always pass through the exact-v1 gate. A narrow private
 state migration exists only for a persisted exact-shaped `wsk1_` handle whose
 persisted version field is absent. An absent handle, a legacy 24-character
