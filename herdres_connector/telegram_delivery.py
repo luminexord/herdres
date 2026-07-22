@@ -367,6 +367,16 @@ class TelegramClient:
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
+    def close_topic(self, chat_id: str, thread_id: str) -> dict[str, Any]:
+        try:
+            self.api(
+                "closeForumTopic",
+                {"chat_id": chat_id, "message_thread_id": str(thread_id)},
+            )
+            return {"ok": True}
+        except TelegramError as exc:
+            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
     def delete_topic(self, chat_id: str, thread_id: str) -> dict[str, Any]:
         try:
             self.api("deleteForumTopic", {"chat_id": chat_id, "message_thread_id": str(thread_id)})

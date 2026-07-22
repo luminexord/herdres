@@ -323,6 +323,15 @@ def entry_is_quarantined(entry: dict[str, Any]) -> bool:
     return "stable_key_quarantined" in entry
 
 
+def entry_is_retired(entry: dict[str, Any]) -> bool:
+    """Return whether reconciliation has retired this historical route.
+
+    Like quarantine, retirement is presence-based.  A malformed persisted
+    value must never accidentally make an old route live again.
+    """
+    return "routing_retired" in entry
+
+
 def _entry_identity_is_allowed(entry: dict[str, Any]) -> bool:
     """Only an exact persisted v1 identity is independently routable."""
     return entry_stable_identity(entry) is not None
@@ -335,6 +344,7 @@ def _entry_is_live(entry: dict[str, Any]) -> bool:
 def entry_is_routable(entry: dict[str, Any]) -> bool:
     return (
         not entry_is_quarantined(entry)
+        and not entry_is_retired(entry)
         and _entry_identity_is_allowed(entry)
         and _entry_is_live(entry)
     )
@@ -498,6 +508,333 @@ def conflicting_snapshot_worker_ids(workers: list[dict[str, Any]]) -> set[str]:
         if worker_id:
             claims[worker_id] = claims.get(worker_id, 0) + 1
     return {worker_id for worker_id, count in claims.items() if count > 1}
+
+
+class WorkerRekeyContinuityPlan(NamedTuple):
+    """One immutable restart-rekey decision over the pre-sync state graph."""
+
+    matches: tuple[tuple[int, str], ...]
+    stale_entry_keys: tuple[str, ...]
+
+
+_PHYSICAL_SIGNAL_FIELDS = ("label", "cwd", "agent", "terminal_title", "space")
+_TOPIC_BINDING_FIELDS = (
+    "topic_id",
+    "topic_name",
+    "connector_numbered_base",
+    "last_topic_icon",
+    "last_topic_icon_id",
+    "last_topic_icon_missing",
+    "last_topic_icon_error",
+    "pinned_status_message_id",
+    "pinned_status_hash",
+    "pinned_status_pinned",
+    "pinned_status_last_error",
+    "rename_attempts",
+    "voice_reply_message_ids",
+)
+
+
+def _physical_text(
+    value: Any, limit: int = 240, *, case_insensitive: bool = True
+) -> str:
+    text = compact_ws(value, limit)
+    return text.casefold() if case_insensitive else text
+
+
+def worker_physical_identity_signals(worker: dict[str, Any]) -> dict[str, str]:
+    """Stable-enough pane traits explicitly excluding positional worker id."""
+    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+    return {
+        "label": _physical_text(meta.get("label"), 120),
+        "cwd": _physical_text(
+            meta.get("foreground_cwd") or meta.get("cwd"),
+            320,
+            case_insensitive=False,
+        ),
+        "agent": _physical_text(worker_agent(worker), 40),
+        "terminal_title": _physical_text(
+            meta.get("terminal_title")
+            or meta.get("pane_title")
+            or meta.get("title"),
+            160,
+            case_insensitive=False,
+        ),
+        "space": _physical_text(
+            worker.get("space_id")
+            or meta.get("space_id")
+            or meta.get("space_name")
+            or meta.get("space"),
+            160,
+            case_insensitive=False,
+        ),
+    }
+
+
+def entry_physical_identity_signals(entry: dict[str, Any]) -> dict[str, str]:
+    label = entry.get("tendwire_pane_label")
+    if not label:
+        # Older Herdres rows predate explicit physical-signal persistence.  In
+        # worker-topic mode their topic name was sourced from the pane label
+        # first, so it is the only safe legacy bridge for the live incident.
+        label = entry.get("connector_numbered_base") or entry.get("topic_name")
+        if isinstance(label, str) and label.startswith("📁 "):
+            label = label[2:]
+    return {
+        "label": _physical_text(label, 120),
+        "cwd": _physical_text(
+            entry.get("tendwire_foreground_cwd")
+            or entry.get("tendwire_cwd"),
+            320,
+            case_insensitive=False,
+        ),
+        "agent": _physical_text(entry.get("agent"), 40),
+        "terminal_title": _physical_text(
+            entry.get("tendwire_terminal_title"),
+            160,
+            case_insensitive=False,
+        ),
+        "space": _physical_text(
+            entry.get("tendwire_space_id") or entry.get("space_id"),
+            160,
+            case_insensitive=False,
+        ),
+    }
+
+
+def _physical_identity_matches(
+    entry: dict[str, Any], worker: dict[str, Any]
+) -> bool:
+    """Require label+agent or a strict majority of explicit pane signals."""
+    previous = entry_physical_identity_signals(entry)
+    current = worker_physical_identity_signals(worker)
+    comparable = [
+        field
+        for field in _PHYSICAL_SIGNAL_FIELDS
+        if previous[field] and current[field]
+    ]
+    agreements = [field for field in comparable if previous[field] == current[field]]
+    conflicts = [field for field in comparable if previous[field] != current[field]]
+    # A differing working directory is a hard veto, never just one outvoted
+    # signal: same-label panes in one workspace routinely differ ONLY by cwd,
+    # and migrating a topic across that boundary routes messages to the wrong
+    # pane (the failure this matcher exists to prevent).
+    if "cwd" in conflicts:
+        return False
+    label_and_agent = "label" in agreements and "agent" in agreements
+    explicit_majority = len(agreements) >= 3 and len(agreements) > len(conflicts)
+    return (label_and_agent and len(agreements) > len(conflicts)) or explicit_majority
+
+
+def plan_worker_rekey_continuity(
+    data: dict[str, Any], workers: list[dict[str, Any]]
+) -> WorkerRekeyContinuityPlan:
+    """Plan one-to-one topic continuity after a Herdr restart re-keys panes.
+
+    Positional worker ids are used only to identify displaced duplicate rows
+    which must stop claiming a live route.  They are deliberately never part
+    of the physical match score used to migrate a topic.
+    """
+    live_workers = [
+        worker
+        for worker in workers
+        if normalized_status(worker.get("status")) not in {"closed", "failed"}
+        and worker_stable_identity(worker) is not None
+    ]
+    live_key_counts: dict[str, int] = {}
+    for worker in live_workers:
+        identity = worker_stable_identity(worker)
+        if identity is not None:
+            live_key_counts[identity[0]] = live_key_counts.get(identity[0], 0) + 1
+    eligible_workers = [
+        worker
+        for worker in live_workers
+        if live_key_counts.get(worker_stable_key(worker)) == 1
+    ]
+    live_keys = set(live_key_counts)
+    live_worker_ids = {
+        compact_ws(worker.get("id"), 160) for worker in eligible_workers
+    }
+    live_worker_ids.discard("")
+    entries = source_worker_entries(data)
+    absent_key_entries = {
+        key: entry
+        for key, entry in entries.items()
+        if not entry_is_retired(entry)
+        and (identity := entry_stable_identity(entry)) is not None
+        and identity[0] not in live_keys
+    }
+    stale_keys = tuple(
+        sorted(
+            key
+            for key, entry in absent_key_entries.items()
+            if str(
+                entry.get("tendwire_worker_id") or entry.get("worker_id") or ""
+            )
+            in live_worker_ids
+            or any(
+                _physical_identity_matches(entry, worker)
+                for worker in eligible_workers
+            )
+        )
+    )
+    candidates_by_worker: dict[int, list[str]] = {}
+    workers_by_candidate: dict[str, list[int]] = {}
+    for worker in eligible_workers:
+        worker_ref = id(worker)
+        for entry_key in stale_keys:
+            if _physical_identity_matches(entries[entry_key], worker):
+                candidates_by_worker.setdefault(worker_ref, []).append(entry_key)
+                workers_by_candidate.setdefault(entry_key, []).append(worker_ref)
+    matches = tuple(
+        sorted(
+            (
+                (id(worker), candidates_by_worker[id(worker)][0])
+                for worker in eligible_workers
+                if len(candidates_by_worker.get(id(worker), ())) == 1
+                and len(
+                    workers_by_candidate.get(
+                        candidates_by_worker[id(worker)][0], ()
+                    )
+                )
+                == 1
+            ),
+            key=lambda item: item[1],
+        )
+    )
+    return WorkerRekeyContinuityPlan(matches, stale_keys)
+
+
+def _retired_topic_name(entry: dict[str, Any]) -> str:
+    original = compact_ws(
+        entry.get("retired_original_topic_name") or entry.get("topic_name"),
+        110,
+    )
+    if original.startswith("📁 "):
+        return original
+    return f"📁 {original or 'Retired pane'}"
+
+
+def _retire_rekey_entry(
+    entry: dict[str, Any], *, reason: str, archive_topic: bool
+) -> None:
+    identity = entry_stable_identity(entry)
+    entry["routing_retired"] = True
+    entry.setdefault("routing_retired_reason", reason)
+    if identity is not None:
+        entry.setdefault("retired_tendwire_stable_key", identity[0])
+        entry.setdefault("retired_tendwire_stable_key_version", identity[1])
+    entry["status"] = "closed"
+    if archive_topic and entry.get("topic_id"):
+        entry.setdefault(
+            "retired_original_topic_name",
+            compact_ws(entry.get("topic_name"), 120) or "Retired pane",
+        )
+        desired_name = _retired_topic_name(entry)
+        if entry.get("topic_name") != desired_name:
+            entry["topic_name"] = desired_name
+            entry["retired_topic_rename_pending"] = True
+        entry.setdefault("retired_topic_close_pending", True)
+
+
+def apply_worker_rekey_continuity_plan(
+    data: dict[str, Any],
+    workers: list[dict[str, Any]],
+    plan: WorkerRekeyContinuityPlan,
+) -> Mapping[int, str]:
+    """Retire displaced rows and return safe worker-to-topic handoffs."""
+    if plan_worker_rekey_continuity(data, workers) != plan:
+        return MappingProxyType({})
+    entries = source_worker_entries(data)
+    matched_stale = {entry_key for _worker_ref, entry_key in plan.matches}
+    for entry_key in plan.stale_entry_keys:
+        entry = entries.get(entry_key)
+        if entry is None:
+            return MappingProxyType({})
+        _retire_rekey_entry(
+            entry,
+            reason=(
+                "herdr_restart_rekey_continuity"
+                if entry_key in matched_stale
+                else "herdr_restart_rekey_unmatched"
+            ),
+            archive_topic=entry_key not in matched_stale,
+        )
+    return MappingProxyType(dict(plan.matches))
+
+
+def _retarget_rekey_topic_bindings(
+    data: dict[str, Any],
+    stale: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    topic_id: str,
+) -> None:
+    stale_identity = entry_stable_identity(stale)
+    current_identity = entry_stable_identity(current)
+    bindings = data.get("telegram_message_bindings")
+    if stale_identity is None or current_identity is None or not isinstance(bindings, dict):
+        return
+    stale_fingerprint = str(stale.get("tendwire_fingerprint") or "")
+    stale_space = str(stale.get("tendwire_space_id") or stale.get("space_id") or "")
+    for binding in bindings.values():
+        if not isinstance(binding, dict) or str(binding.get("topic_id") or "") != topic_id:
+            continue
+        binding_identity = message_binding_stable_identity(binding)
+        legacy_exact_owner = (
+            binding_identity is None
+            and "stable_key" not in binding
+            and "stable_key_version" not in binding
+            and str(binding.get("worker_fingerprint") or "") == stale_fingerprint
+            and str(binding.get("space_id") or "") == stale_space
+        )
+        if binding_identity != stale_identity and not legacy_exact_owner:
+            continue
+        binding["worker_id"] = str(current.get("tendwire_worker_id") or "")
+        binding["worker_fingerprint"] = str(current.get("tendwire_fingerprint") or "")
+        binding["space_id"] = str(
+            current.get("tendwire_space_id") or current.get("space_id") or ""
+        )
+        binding["stable_key"] = current_identity[0]
+        binding["stable_key_version"] = current_identity[1]
+
+
+def finalize_worker_rekey_topic_handoff(
+    data: dict[str, Any],
+    stale_entry_key: str,
+    current_entry: dict[str, Any],
+) -> bool:
+    """Move one safely matched historical Telegram topic to its live row."""
+    stale = source_worker_entries(data).get(stale_entry_key)
+    if stale is None or not entry_is_retired(stale):
+        return False
+    topic_id = str(stale.get("topic_id") or "")
+    if not topic_id:
+        return False
+    if current_entry.get("topic_id"):
+        # A concurrently-created live topic wins; preserve and close the old
+        # history rather than deleting either side.
+        _retire_rekey_entry(
+            stale, reason="herdr_restart_rekey_topic_already_replaced", archive_topic=True
+        )
+        return False
+    for field in _TOPIC_BINDING_FIELDS:
+        if field in stale:
+            current_entry[field] = stale[field]
+    _retarget_rekey_topic_bindings(
+        data, stale, current_entry, topic_id=topic_id
+    )
+    stale["retired_topic_id"] = topic_id
+    stale["retired_topic_name"] = str(stale.get("topic_name") or "")
+    current_identity = entry_stable_identity(current_entry)
+    if current_identity is not None:
+        stale["topic_migrated_to_stable_key"] = current_identity[0]
+        stale["topic_migrated_to_stable_key_version"] = current_identity[1]
+    for field in _TOPIC_BINDING_FIELDS:
+        stale.pop(field, None)
+    stale.pop("retired_topic_rename_pending", None)
+    stale.pop("retired_topic_close_pending", None)
+    return True
 
 
 
@@ -1564,6 +1901,7 @@ def upsert_worker_entry(
     agent = worker_agent(worker)
     meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
     model = compact_ws(worker.get("model") or meta.get("model"), 80)
+    physical = worker_physical_identity_signals(worker)
     identity_class = worker_stable_identity_class(worker)
     identity = worker_stable_identity(worker)
     raw_exact_matches = _all_worker_entry_keys_by_worker(data, worker_id)
@@ -1679,6 +2017,19 @@ def upsert_worker_entry(
             "topic_name": entry.get("topic_name") or topic_name_for_worker(worker),
         }
     )
+    if physical["label"]:
+        entry["tendwire_pane_label"] = compact_ws(meta.get("label"), 120)
+    if physical["cwd"]:
+        entry["tendwire_foreground_cwd"] = compact_ws(
+            meta.get("foreground_cwd") or meta.get("cwd"), 320
+        )
+    if physical["terminal_title"]:
+        entry["tendwire_terminal_title"] = compact_ws(
+            meta.get("terminal_title")
+            or meta.get("pane_title")
+            or meta.get("title"),
+            160,
+        )
     if topic_id and not must_quarantine:
         entry["topic_id"] = str(topic_id)
     if model:

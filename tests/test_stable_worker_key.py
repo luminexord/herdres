@@ -1292,7 +1292,7 @@ def test_faulty_snapshot_after_valid_state_reuses_and_quarantines_without_duplic
     assert faulty_telegram.topics == repeated_telegram.topics == []
 
 
-def test_rotation_creates_a_numbered_topic_instead_of_reusing_old_topic():
+def test_rotation_with_majority_physical_identity_migrates_the_old_topic():
     store = _store()
     old_key, old, _created = state.upsert_worker_entry(
         store,
@@ -1312,10 +1312,12 @@ def test_rotation_creates_a_numbered_topic_instead_of_reusing_old_topic():
 
     current_key, current = state.find_worker_entry_by_id(store, "claude-2")
     assert current_key != old_key
-    assert old["topic_id"] == "26"
-    assert current["topic_id"] != "26"
-    assert current["topic_name"] == "telegram-bot 2"
-    assert telegram.topics == ["telegram-bot 2"]
+    assert old["retired_topic_id"] == "26"
+    assert "topic_id" not in old
+    assert state.entry_is_retired(old) is True
+    assert current["topic_id"] == "26"
+    assert current["topic_name"] == "telegram-bot"
+    assert telegram.topics == []
 
 
 def test_stable_bearing_reply_binding_resolves_stable_first_and_fails_closed():
