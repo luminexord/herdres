@@ -86,6 +86,136 @@ def _captured_duplicate_repro() -> tuple[dict, list[dict]]:
     return store, workers
 
 
+def _worker_from_captured_entry(entry: dict) -> dict:
+    return {
+        "id": entry["tendwire_worker_id"],
+        "name": entry["worker_name"],
+        "status": entry["tendwire_raw_status"],
+        "space_id": entry["tendwire_space_id"],
+        "fingerprint": entry["tendwire_fingerprint"],
+        "meta": {
+            "agent": entry["agent"],
+            "label": entry["tendwire_pane_label"],
+            "terminal_title": entry["tendwire_terminal_title"],
+            "stable_key": entry["tendwire_stable_key"],
+            "stable_key_version": entry["tendwire_stable_key_version"],
+        },
+    }
+
+
+def test_rotation3_captured_pairs_handoff_even_when_retired_before_planning():
+    captured = json.loads(
+        (_REKEY_REPRO_FIXTURES / "state-rotation3-pairs-live.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    store = _store()
+    store["panes"] = captured["panes"]
+    pair_keys = (
+        ("worker:claude-1-1:a65adfc545", "worker:claude-1:5cf213bebc", "15347"),
+        ("worker:claude-2-2:e48831025e", "worker:claude-2-2:fe2b44ae95", "15362"),
+    )
+    workers = [
+        _worker_from_captured_entry(store["panes"][live_key])
+        for _retired_key, live_key, _topic_id in pair_keys
+    ]
+
+    # Rewind only the already-observed Telegram side effects to the exact
+    # continuity-plan boundary: the old owners are already retired, while the
+    # new live rows have not reached topic creation yet.
+    for retired_key, live_key, _topic_id in pair_keys:
+        retired = store["panes"][retired_key]
+        live = store["panes"][live_key]
+        retired.pop("retired_topic_closed")
+        retired.pop("retired_topic_renamed")
+        retired["retired_topic_close_pending"] = True
+        retired["retired_topic_rename_pending"] = True
+        live.pop("topic_id")
+        live.pop("topic_name")
+
+    plan = state.plan_worker_rekey_continuity(store, workers)
+    assert {entry_key for _worker_ref, entry_key in plan.matches} == {
+        retired_key for retired_key, _live_key, _topic_id in pair_keys
+    }
+
+    telegram = FakeTelegram()
+    sync_once(
+        store,
+        SyncRuntime(FakeTendwire(workers=workers), telegram, with_outbox=False),
+    )
+
+    assert telegram.topics == []
+    assert telegram.renamed_topics == []
+    assert telegram.closed_topics == []
+    for worker, (retired_key, _live_key, topic_id) in zip(workers, pair_keys):
+        current_key, current = state.find_worker_entry_by_stable_key(
+            store, state.worker_stable_key(worker)
+        )
+        assert current_key is not None and current is not None
+        assert current["topic_id"] == topic_id
+        assert current["topic_name"] == worker["meta"]["label"]
+        assert store["panes"][retired_key]["retired_topic_id"] == topic_id
+        assert "topic_id" not in store["panes"][retired_key]
+
+
+def test_same_busy_pane_keeps_one_topic_across_three_repeated_key_drifts():
+    store = _store()
+    topic_id = "15347"
+    worker = _worker(
+        "claude-1-1",
+        _key("1"),
+        label="herdres",
+        agent="claude",
+        cwd="",
+        title="busy task 0",
+        space="w6536a4e5b44342",
+        fingerprint="rotation-0",
+    )
+    _current_key, current = _persist(store, worker, topic_id)
+
+    for generation in range(1, 4):
+        identity = state.entry_stable_identity(current)
+        assert identity is not None
+        state._retire_rekey_entry(
+            current,
+            reason="herdr_restart_rekey_unmatched",
+            archive_topic=True,
+        )
+        current["retired_tendwire_stable_key"] = identity[0]
+        current["retired_tendwire_stable_key_version"] = identity[1]
+        current["tendwire_stable_identity_class"] = "retired_closed_v1"
+        current.pop("tendwire_stable_key")
+        current.pop("tendwire_stable_key_version")
+
+        worker = _worker(
+            f"claude-{generation}",
+            "wsk1_" + f"{generation + 1:064x}",
+            label="herdres",
+            agent="claude",
+            cwd="",
+            title=f"busy task {generation}",
+            space="w6536a4e5b44342",
+            fingerprint=f"rotation-{generation}",
+        )
+        _next_key, _next = _persist(store, worker)
+        telegram = FakeTelegram()
+        sync_once(
+            store,
+            SyncRuntime(
+                FakeTendwire(workers=[worker]), telegram, with_outbox=False
+            ),
+        )
+
+        current_key, current = state.find_worker_entry_by_stable_key(
+            store, state.worker_stable_key(worker)
+        )
+        assert current_key is not None and current is not None
+        assert current["topic_id"] == topic_id
+        assert telegram.topics == []
+        assert telegram.renamed_topics == []
+        assert telegram.closed_topics == []
+
+
 @pytest.fixture
 def session_key_drift_live_shape() -> tuple[dict, list[dict], dict[str, str]]:
     """Sanitized 2026-07-22 shape: released old owners plus new keys."""
