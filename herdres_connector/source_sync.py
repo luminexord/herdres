@@ -1787,6 +1787,11 @@ def _sync_sources(
     worker_topic_renames: dict[str, str] = {}
     worker_numbered_bases: dict[str, str] = {}
     workers = _workers(snapshot)
+    durable = state.reconcile_durable_pane_identities(store, workers)
+    counts["updated"] += durable.changed
+    legacy_workers = [
+        worker for worker in workers if id(worker) not in durable.reservations
+    ]
     continuity_plan = state.plan_worker_rekey_continuity(store, workers)
     continuity_handoffs = state.apply_worker_rekey_continuity_plan(
         store, workers, continuity_plan
@@ -1798,7 +1803,10 @@ def _sync_sources(
     counts["updated"] += state.consolidate_worker_entries_by_stable_key(
         store,
         workers,
-        excluded_entry_keys=frozenset(continuity_handoffs.values()),
+        excluded_entry_keys=frozenset(
+            set(continuity_handoffs.values())
+            | set(durable.reservations.values())
+        ),
     )
     blocked_stable_keys = state.blocked_worker_stable_keys(store, workers)
     blocked_worker_ids = state.conflicting_snapshot_worker_ids(workers)
@@ -1808,12 +1816,25 @@ def _sync_sources(
         reason="preflight_stable_key_conflict",
     )
     worker_assignment_keys = _worker_topic_assignment_keys(workers)
-    worker_entry_reservations = state.precompute_worker_entry_reservations(
+    legacy_reservations = state.precompute_worker_entry_reservations(
         store,
-        workers,
+        legacy_workers,
         blocked_stable_keys=blocked_stable_keys,
         blocked_worker_ids=blocked_worker_ids,
     )
+    # Private stable-key migrations become eligible for UUID adoption only
+    # after their existing fail-closed planner has authenticated and applied
+    # them.  Re-run durable attachment in this same transaction so migration
+    # is idempotent after the first persisted sync, not one tick later.
+    post_migration_durable = state.reconcile_durable_pane_identities(
+        store, legacy_workers
+    )
+    counts["updated"] += post_migration_durable.changed
+    worker_entry_reservations = {
+        **dict(legacy_reservations),
+        **dict(durable.reservations),
+        **dict(post_migration_durable.reservations),
+    }
     reserved_entry_keys = frozenset(
         key for key in worker_entry_reservations.values() if key is not None
     )
