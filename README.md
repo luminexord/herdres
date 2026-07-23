@@ -537,19 +537,23 @@ Finished council/gitmoot/gm worker topics are deleted automatically when
 In worker mode, a pane topic whose entry remains closed for 24 hours is
 reversibly closed by default; retired duplicate/archive topics use the same
 TTL. A UUID-owned pane that becomes live again is reopened before turn
-delivery. This lifecycle never deletes topics, never touches General, shared
-space topics, dashboard/setup topics, or a live pane's topic, and records its
-close/reopen audit in state. Disable new auto-closes with:
+delivery. Set `HERDRES_TOPIC_CLEANUP_ACTION=delete` to delete eligible topics
+instead; a revived pane then keeps its durable identity and mints a fresh topic
+through the normal creation path. General, shared space topics, pinned and
+dashboard/setup topics, and live routable pane topics remain protected in both
+modes. The selected `close` or `delete` action is recorded in the lifecycle
+audit. Disable new cleanup with:
 
 ```sh
 HERDRES_CLOSE_DORMANT_AFTER_HOURS=0
 ```
 
-Telegram close/reopen work is off-lock and bounded per sync pass by
+Telegram close/delete/reopen work is off-lock and bounded per sync pass by
 `HERDRES_CLEANUP_BUDGET_SECONDS` (default `5`) and
 `HERDRES_CLEANUP_MAX_OPS` (default `12`). Repeated target failures are
 permanently abandoned after three attempts; Telegram 429 responses persist
-their requested backoff.
+their requested backoff. Changing from `close` to `delete` also deletes
+already-auto-closed dormant or retired topics once they are TTL-eligible.
 
 Rich Telegram messages are enabled by default. Final responses render as open
 rich content; working updates render as compact editable updates.

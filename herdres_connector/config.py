@@ -391,7 +391,7 @@ def source_topic_create_cap(env: Any | None = None) -> int:
 
 
 def close_dormant_after_hours(env: Any | None = None) -> float:
-    """Age at which closed pane and retired archive topics are auto-closed.
+    """Age at which closed pane and retired archive topics are cleaned up.
 
     Zero deliberately disables the lifecycle cleanup.  The legacy issue-draft
     name remains accepted so an operator who tested the pre-RC proposal does
@@ -409,8 +409,17 @@ def close_dormant_after_hours(env: Any | None = None) -> float:
     return min(24.0 * 365.0, max(0.0, value))
 
 
+def topic_cleanup_action(env: Any | None = None) -> str:
+    """Lifecycle action for dormant pane and retired archive topics."""
+    source = os.environ if env is None else env
+    value = str(
+        source.get("HERDRES_TOPIC_CLEANUP_ACTION", "close") or "close"
+    ).strip().lower()
+    return value if value in {"close", "delete"} else "close"
+
+
 def cleanup_budget_seconds(env: Any | None = None) -> float:
-    """Hard wall-clock budget for close/reopen Telegram calls in one pass."""
+    """Hard wall-clock budget for close/delete/reopen calls in one pass."""
     source = os.environ if env is None else env
     try:
         value = float(

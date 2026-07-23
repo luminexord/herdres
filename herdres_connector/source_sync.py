@@ -2181,7 +2181,7 @@ def _cleanup_topics(
 def _topic_cleanup_protected_ids(
     store: dict[str, Any], *, include_live: bool = True
 ) -> set[str]:
-    """Topics that lifecycle cleanup must never close or reopen."""
+    """Topics that lifecycle cleanup must never close, delete, or reopen."""
     protected = {str(config.general_thread_id(store))}
     for entry in state.source_space_entries(store).values():
         topic_id = str(entry.get("topic_id") or "")
@@ -2226,12 +2226,14 @@ def _topic_cleanup_protected_ids(
 def _topic_cleanup_empty_result() -> dict[str, Any]:
     return {
         "closed": 0,
+        "deleted": 0,
         "reopened": 0,
         "abandoned": 0,
         "deferred": 0,
         "candidates": 0,
         "operations": 0,
         "would_close": 0,
+        "would_delete": 0,
         "would_reopen": 0,
         "changed": False,
     }
@@ -2270,6 +2272,7 @@ def _refresh_topic_cleanup_lifecycle(
                 changed = True
             if (
                 entry.get("retired_topic_closed") is True
+                and entry.get("topic_id")
                 and "topic_closed_at" not in entry
             ):
                 # Pre-lifecycle RCs closed archives immediately. Adopt their
@@ -2302,9 +2305,10 @@ def _topic_cleanup_targets(
     statically_protected = _topic_cleanup_protected_ids(
         store, include_live=False
     )
-    close_protected = _topic_cleanup_protected_ids(store)
+    mutation_protected = _topic_cleanup_protected_ids(store)
     abandoned = _topic_cleanup_abandoned(store)
     ttl_seconds = config.close_dormant_after_hours() * 3600.0
+    cleanup_action = config.topic_cleanup_action()
     targets: list[dict[str, Any]] = []
     abandoned_eligible = 0
     seen: set[tuple[str, str]] = set()
@@ -2363,7 +2367,7 @@ def _topic_cleanup_targets(
     if ttl_seconds <= 0:
         return targets, abandoned_eligible
     for entry_key, entry in state.source_worker_entries(store).items():
-        if entry.get("topic_closed_at") is not None:
+        if cleanup_action == "close" and entry.get("topic_closed_at") is not None:
             continue
         if state.entry_is_retired(entry):
             raw_since = entry.get("routing_retired_at")
@@ -2384,12 +2388,12 @@ def _topic_cleanup_targets(
         if now - since < ttl_seconds:
             continue
         add_target(
-            "close",
+            cleanup_action,
             entry_key,
             entry,
             since=since,
             reason=reason,
-            protected=close_protected,
+            protected=mutation_protected,
         )
     return targets, abandoned_eligible
 
@@ -2415,7 +2419,7 @@ def _topic_cleanup_target_still_valid(
             and state.entry_is_routable(entry)
             and entry.get("topic_closed_at") is not None
         )
-    if entry.get("topic_closed_at") is not None:
+    if target["action"] == "close" and entry.get("topic_closed_at") is not None:
         return False
     ttl_seconds = config.close_dormant_after_hours() * 3600.0
     if ttl_seconds <= 0:
@@ -2460,6 +2464,10 @@ def _execute_topic_cleanup_targets(
                 response = runtime.telegram.reopen_topic(
                     chat_id, str(target["topic_id"])
                 )
+            elif target["action"] == "delete":
+                response = runtime.telegram.delete_topic(
+                    chat_id, str(target["topic_id"])
+                )
             else:
                 response = runtime.telegram.close_topic(
                     chat_id, str(target["topic_id"])
@@ -2476,11 +2484,22 @@ def _execute_topic_cleanup_targets(
             return outcomes, len(targets) - index - 1
         error = response.get("error")
         kind = "" if response.get("ok") else classify_telegram_error(error)
-        success_kinds = (
-            {"topic_closed", "already_closed", "topic_not_found", "not_found"}
-            if target["action"] == "close"
-            else {"already_open", "not_modified", "topic_not_found", "not_found"}
-        )
+        if target["action"] == "close":
+            success_kinds = {
+                "topic_closed",
+                "already_closed",
+                "topic_not_found",
+                "not_found",
+            }
+        elif target["action"] == "delete":
+            success_kinds = {"topic_not_found", "not_found"}
+        else:
+            success_kinds = {
+                "already_open",
+                "not_modified",
+                "topic_not_found",
+                "not_found",
+            }
         outcomes.append(
             {
                 "target": target,
@@ -2492,6 +2511,46 @@ def _execute_topic_cleanup_targets(
             }
         )
     return outcomes, 0
+
+
+_DELETED_TOPIC_ENTRY_FIELDS = (
+    "last_topic_icon",
+    "last_topic_icon_id",
+    "last_topic_icon_missing",
+    "last_topic_icon_error",
+    "pinned_status_message_id",
+    "pinned_status_hash",
+    "pinned_status_pinned",
+    "pinned_status_last_error",
+    "rename_attempts",
+    "voice_reply_message_ids",
+)
+
+
+def _record_lifecycle_topic_deleted(
+    entry: dict[str, Any],
+    *,
+    topic_id: str,
+    reason: str,
+    now: float,
+) -> None:
+    """Drop the provider identity while retaining the pane continuity row."""
+    entry.pop("topic_id", None)
+    entry["deleted_topic_id"] = topic_id
+    entry["deleted_topic_reason"] = reason
+    entry["topic_deleted_at"] = now
+    entry.pop("topic_closed_at", None)
+    entry.pop("topic_auto_closed_at", None)
+    entry.pop("topic_reopened_at", None)
+    entry.pop("topic_missing_at", None)
+    entry.pop("retired_topic_close_pending", None)
+    entry.pop("retired_topic_close_error", None)
+    for field in _DELETED_TOPIC_ENTRY_FIELDS:
+        entry.pop(field, None)
+    if state.entry_is_retired(entry):
+        entry.pop("retired_topic_closed", None)
+        entry["retired_topic_deleted"] = True
+        entry["retired_topic_missing"] = True
 
 
 def _apply_topic_cleanup_outcomes(
@@ -2524,7 +2583,15 @@ def _apply_topic_cleanup_outcomes(
         if outcome["status"] == "success":
             attempts.pop(target_key, None)
             kind = str(outcome.get("kind") or "")
-            if target["action"] == "close":
+            if target["action"] == "delete":
+                _record_lifecycle_topic_deleted(
+                    entry,
+                    topic_id=str(target["topic_id"]),
+                    reason=str(target["reason"]),
+                    now=now,
+                )
+                result["deleted"] += 1
+            elif target["action"] == "close":
                 entry["topic_closed_at"] = now
                 entry["topic_auto_closed_at"] = now
                 entry.pop("retired_topic_close_pending", None)
@@ -2595,6 +2662,9 @@ def _sync_topic_lifecycle_cleanup(
     if runtime.dry_run:
         result["would_close"] = sum(
             target["action"] == "close" for target in targets
+        )
+        result["would_delete"] = sum(
+            target["action"] == "delete" for target in targets
         )
         result["would_reopen"] = sum(
             target["action"] == "reopen" for target in targets
@@ -6983,8 +7053,10 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         **{
             key: value
             for key, value in lifecycle_cleanup.items()
-            if key != "changed"
+            if key not in {"changed", "deleted"}
         },
+        "deleted": int(deletion_cleanup.get("deleted") or 0)
+        + int(lifecycle_cleanup.get("deleted") or 0),
         "changed": bool(
             deletion_cleanup.get("changed")
             or lifecycle_cleanup.get("changed")

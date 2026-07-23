@@ -26,7 +26,9 @@ class CleanupTelegram:
     def __init__(self, responses=None):
         self.responses = list(responses or [])
         self.closed = []
+        self.deleted = []
         self.reopened = []
+        self.created = []
 
     def _response(self):
         if not self.responses:
@@ -40,9 +42,17 @@ class CleanupTelegram:
         self.closed.append(str(topic_id))
         return self._response()
 
+    def delete_topic(self, _chat_id, topic_id):
+        self.deleted.append(str(topic_id))
+        return self._response()
+
     def reopen_topic(self, _chat_id, topic_id):
         self.reopened.append(str(topic_id))
         return self._response()
+
+    def create_topic(self, _chat_id, name, icon_color=None):
+        self.created.append((str(name), icon_color))
+        return {"ok": True, "topic_id": str(100 + len(self.created))}
 
 
 def _runtime(telegram):
@@ -93,6 +103,7 @@ def _entry(topic_id, *, status="closed", dormant_at=None, retired_at=None):
 @pytest.fixture(autouse=True)
 def _cleanup_config(monkeypatch):
     monkeypatch.setenv("HERDRES_CLOSE_DORMANT_AFTER_HOURS", "24")
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "close")
     monkeypatch.setenv("HERDRES_CLEANUP_BUDGET_SECONDS", "5")
     monkeypatch.setenv("HERDRES_CLEANUP_MAX_OPS", "12")
 
@@ -268,6 +279,134 @@ def test_retired_archive_waits_full_ttl_then_closes():
     assert entry["retired_topic_closed"] is True
 
 
+def test_delete_mode_deletes_dormant_and_retired_topics_once_at_ttl(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
+    dormant = _entry("42", dormant_at=NOW - DAY)
+    retired = _entry("43", retired_at=NOW - DAY)
+    retired["pane_uuid"] = "00000000-0000-4000-8000-000000000002"
+    store = _store(("pane:dormant", dormant), ("retired:one", retired))
+    telegram = CleanupTelegram()
+
+    first = _cleanup(store, telegram)
+    second = _cleanup(store, telegram, now=NOW + 60)
+
+    assert first["deleted"] == 2
+    assert second["deleted"] == 0
+    assert telegram.deleted == ["42", "43"]
+    assert "topic_id" not in dormant
+    assert "topic_id" not in retired
+    assert retired["retired_topic_deleted"] is True
+    assert [
+        item["action"] for item in store["telegram_topic_cleanup_audit"]
+    ] == ["delete", "delete"]
+
+
+def test_delete_mode_never_touches_protected_topics(monkeypatch):
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
+    general = _entry("1", retired_at=NOW - DAY)
+    pinned = _entry("44", retired_at=NOW - DAY)
+    pinned["pinned_topic"] = True
+    retired_shared = _entry("45", retired_at=NOW - DAY)
+    live_shared = _entry("45", status="idle")
+    live_shared["pane_uuid"] = "00000000-0000-4000-8000-000000000002"
+    space_topic = _entry("46", retired_at=NOW - DAY)
+    ordinary = _entry("47", retired_at=NOW - DAY)
+    store = _store(
+        ("retired:general", general),
+        ("retired:pinned", pinned),
+        ("retired:shared", retired_shared),
+        ("pane:live", live_shared),
+        ("retired:space", space_topic),
+        ("retired:ordinary", ordinary),
+    )
+    store["spaces"]["space:one"] = {
+        "source": "tendwire",
+        "entry_type": "space",
+        "topic_id": "46",
+    }
+    telegram = CleanupTelegram()
+
+    result = _cleanup(store, telegram)
+
+    assert result["deleted"] == 1
+    assert telegram.deleted == ["47"]
+    assert all(
+        entry.get("topic_id")
+        for entry in (general, pinned, retired_shared, live_shared, space_topic)
+    )
+
+
+def test_revive_after_delete_recreates_topic_with_same_pane_identity(monkeypatch):
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
+    entry = _entry("48", dormant_at=NOW - DAY)
+    store = _store(("pane:one", entry))
+    telegram = CleanupTelegram()
+
+    deleted = _cleanup(store, telegram)
+    entry["status"] = "idle"
+    entry["tendwire_raw_status"] = "idle"
+    source_sync._refresh_topic_cleanup_lifecycle(
+        store, now=NOW + 1, dry_run=False
+    )
+    needed, created = source_sync._ensure_topic(
+        store,
+        {"name": "revived pane"},
+        entry,
+        _runtime(telegram),
+        chat_id="-100",
+    )
+
+    assert deleted["deleted"] == 1
+    assert (needed, created) == (True, True)
+    assert telegram.deleted == ["48"]
+    assert entry["topic_id"] == "101"
+    assert entry["pane_uuid"] == PANE_UUID
+    assert "topic_dormant_at" not in entry
+    assert "topic_closed_at" not in entry
+    assert telegram.reopened == []
+
+
+def test_mode_flip_close_to_delete_removes_already_closed_topic(monkeypatch):
+    entry = _entry("49", dormant_at=NOW - DAY)
+    store = _store(("pane:one", entry))
+    telegram = CleanupTelegram()
+
+    closed = _cleanup(store, telegram)
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
+    deleted = _cleanup(store, telegram, now=NOW + 60)
+    repeated = _cleanup(store, telegram, now=NOW + 120)
+
+    assert closed["closed"] == 1
+    assert deleted["deleted"] == 1
+    assert repeated["operations"] == 0
+    assert telegram.closed == ["49"]
+    assert telegram.deleted == ["49"]
+    assert "topic_id" not in entry
+    assert [
+        item["action"] for item in store["telegram_topic_cleanup_audit"]
+    ] == ["close", "delete"]
+
+
+def test_already_gone_delete_is_terminal_success(monkeypatch):
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
+    entry = _entry("53", retired_at=NOW - DAY)
+    store = _store(("retired:one", entry))
+    telegram = CleanupTelegram(
+        [{"ok": False, "error": "Bad Request: TOPIC_ID_INVALID"}]
+    )
+
+    first = _cleanup(store, telegram)
+    second = _cleanup(store, telegram, now=NOW + 60)
+
+    assert first["deleted"] == 1
+    assert second["operations"] == 0
+    assert telegram.deleted == ["53"]
+    assert "topic_id" not in entry
+    assert entry["retired_topic_missing"] is True
+
+
 def test_pre_lifecycle_retired_close_marker_is_adopted_without_api_call():
     entry = _entry("41", retired_at=NOW - (10 * DAY))
     entry["retired_topic_closed"] = True
@@ -297,6 +436,41 @@ def test_rate_limit_persists_backoff_without_spending_attempt_cap():
     assert recovered["closed"] == 1
     assert telegram.closed == ["50", "50"]
     assert store["telegram_topic_cleanup_attempts"] == {}
+
+
+def test_delete_mode_rate_limit_backoff_and_attempt_cap(monkeypatch):
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
+    limited_entry = _entry("51", dormant_at=NOW - DAY)
+    limited_store = _store(("pane:limited", limited_entry))
+    limited_telegram = CleanupTelegram(
+        [RateLimited(7, "Too Many Requests"), {"ok": True}]
+    )
+
+    limited = _cleanup(limited_store, limited_telegram)
+    backed_off = _cleanup(limited_store, limited_telegram, now=NOW + 6)
+    recovered = _cleanup(limited_store, limited_telegram, now=NOW + 7)
+
+    assert limited["deferred"] == 1
+    assert backed_off["operations"] == 0
+    assert recovered["deleted"] == 1
+    assert limited_telegram.deleted == ["51", "51"]
+    assert limited_store["telegram_topic_cleanup_attempts"] == {}
+
+    failing_entry = _entry("52", dormant_at=NOW - DAY)
+    failing_store = _store(("pane:failing", failing_entry))
+    failing_telegram = CleanupTelegram(
+        [{"ok": False, "error": "Bad Request: nope"}] * 4
+    )
+
+    results = [
+        _cleanup(failing_store, failing_telegram, now=NOW + offset)
+        for offset in (0, 1, 2, 3)
+    ]
+
+    assert failing_telegram.deleted == ["52", "52", "52"]
+    assert results[2]["abandoned"] == 1
+    assert results[3]["abandoned"] == 1
+    assert failing_store["telegram_topic_cleanup_abandoned"] == ["delete:52"]
 
 
 def test_cleanup_uses_released_lock_phase(monkeypatch):
