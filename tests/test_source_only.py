@@ -300,6 +300,35 @@ def _store():
     }
 
 
+def test_sync_once_wires_topic_lifecycle_cleanup(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    calls = []
+
+    def lifecycle(current, runtime, *, chat_id, now=None):
+        calls.append((current, runtime.telegram, chat_id, now))
+        return source_sync._topic_cleanup_empty_result()
+
+    monkeypatch.setattr(
+        source_sync, "_sync_topic_lifecycle_cleanup", lifecycle
+    )
+    store = _store()
+    telegram = FakeTelegram()
+
+    result = sync_once(
+        store,
+        SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+    )
+
+    assert result["ok"] is True
+    assert len(calls) == 1
+    assert calls[0][0] is store
+    assert calls[0][1] is telegram
+    assert calls[0][2] == "-100"
+    assert isinstance(calls[0][3], float)
+
+
 def test_status_overview_uses_old_pane_board_shape():
     html = render_status_overview(
         [

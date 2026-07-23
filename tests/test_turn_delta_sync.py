@@ -164,6 +164,60 @@ def test_unchanged_active_sync_uses_only_one_delta_page_and_no_provider_or_conte
     assert telegram.deleted_topics == []
 
 
+def test_delta_watermark_persists_across_cleanup_phase_reload(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("HERDRES_CLOSE_DORMANT_AFTER_HOURS", "24")
+    store = _store()
+    store["tendwire_delta_sync"] = _active_delta()
+    store["panes"]["retired:cleanup"] = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "pane_uuid": "00000000-0000-4000-8000-000000000099",
+        "pane_uuid_version": 1,
+        "tendwire_stable_key": _stable_key("retired-cleanup"),
+        "tendwire_stable_key_version": 1,
+        "tendwire_worker_id": "retired-cleanup",
+        "tendwire_fingerprint": "fp-1",
+        "status": "closed",
+        "tendwire_raw_status": "closed",
+        "topic_id": "990",
+        "routing_retired": True,
+        "routing_retired_at": 0.0,
+    }
+    state.save_state(store, state_path)
+    telegram = FakeTelegram()
+    tendwire = DeltaTendwire(
+        [
+            _page(
+                [],
+                mode="changes",
+                checkpoint="twdelta1.after-cleanup",
+            )
+        ],
+        workers=[],
+        spaces=[],
+    )
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        result = sync_once(
+            current,
+            SyncRuntime(tendwire, telegram, with_outbox=False),
+        )
+        state.save_state(current, state_path)
+    restarted = state.load_state(state_path)
+
+    assert result["topic_cleanup"]["closed"] == 1
+    assert telegram.closed_topics == ["990"]
+    assert (
+        restarted["tendwire_delta_sync"]["watermark"]
+        == "twdelta1.after-cleanup"
+    )
+
+
 def test_active_working_upsert_uses_existing_card_delivery_path():
     prior = _turn_row("turn-working", "twrev1.working0", None, user="prompt")
     changed = _turn_row("turn-working", "twrev1.working1", None, user="prompt")

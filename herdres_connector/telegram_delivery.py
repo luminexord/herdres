@@ -396,6 +396,19 @@ class TelegramClient:
 
     def close_topic(self, chat_id: str, thread_id: str) -> dict[str, Any]:
         try:
+            return self.close_topic_for_cleanup(chat_id, thread_id)
+        except RateLimited as exc:
+            return {
+                "ok": False,
+                "error": sanitize_text(str(exc), 300),
+                "rate_limited": True,
+                "retry_after": exc.retry_after,
+            }
+
+    def close_topic_for_cleanup(
+        self, chat_id: str, thread_id: str
+    ) -> dict[str, Any]:
+        try:
             self.api(
                 "closeForumTopic",
                 {"chat_id": chat_id, "message_thread_id": str(thread_id)},
@@ -407,6 +420,19 @@ class TelegramClient:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
     def reopen_topic(self, chat_id: str, thread_id: str) -> dict[str, Any]:
+        try:
+            return self.reopen_topic_for_cleanup(chat_id, thread_id)
+        except RateLimited as exc:
+            return {
+                "ok": False,
+                "error": sanitize_text(str(exc), 300),
+                "rate_limited": True,
+                "retry_after": exc.retry_after,
+            }
+
+    def reopen_topic_for_cleanup(
+        self, chat_id: str, thread_id: str
+    ) -> dict[str, Any]:
         try:
             self.api(
                 "reopenForumTopic",
@@ -420,8 +446,23 @@ class TelegramClient:
 
     def delete_topic(self, chat_id: str, thread_id: str) -> dict[str, Any]:
         try:
+            return self.delete_topic_for_cleanup(chat_id, thread_id)
+        except RateLimited as exc:
+            return {
+                "ok": False,
+                "error": sanitize_text(str(exc), 300),
+                "rate_limited": True,
+                "retry_after": exc.retry_after,
+            }
+
+    def delete_topic_for_cleanup(
+        self, chat_id: str, thread_id: str
+    ) -> dict[str, Any]:
+        try:
             self.api("deleteForumTopic", {"chat_id": chat_id, "message_thread_id": str(thread_id)})
             return {"ok": True}
+        except RateLimited:
+            raise
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
