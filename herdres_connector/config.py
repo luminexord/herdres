@@ -390,6 +390,47 @@ def source_topic_create_cap(env: Any | None = None) -> int:
         return 3
 
 
+def close_dormant_after_hours(env: Any | None = None) -> float:
+    """Age at which closed pane and retired archive topics are auto-closed.
+
+    Zero deliberately disables the lifecycle cleanup.  The legacy issue-draft
+    name remains accepted so an operator who tested the pre-RC proposal does
+    not silently lose their setting.
+    """
+    source = os.environ if env is None else env
+    raw = source.get(
+        "HERDRES_CLOSE_DORMANT_AFTER_HOURS",
+        source.get("HERDR_TELEGRAM_TOPICS_CLOSE_DORMANT_AFTER_HOURS", "24"),
+    )
+    try:
+        value = float(str(raw or "0"))
+    except (TypeError, ValueError):
+        return 24.0
+    return min(24.0 * 365.0, max(0.0, value))
+
+
+def cleanup_budget_seconds(env: Any | None = None) -> float:
+    """Hard wall-clock budget for close/reopen Telegram calls in one pass."""
+    source = os.environ if env is None else env
+    try:
+        value = float(
+            str(source.get("HERDRES_CLEANUP_BUDGET_SECONDS", "5") or "0")
+        )
+    except (TypeError, ValueError):
+        return 5.0
+    return min(60.0, max(0.0, value))
+
+
+def cleanup_max_ops(env: Any | None = None) -> int:
+    """Maximum close/reopen calls in one pass, independent of time budget."""
+    source = os.environ if env is None else env
+    try:
+        value = int(str(source.get("HERDRES_CLEANUP_MAX_OPS", "12") or "0"))
+    except (TypeError, ValueError):
+        return 12
+    return min(100, max(0, value))
+
+
 def managed_bots_enabled(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "0") or "").strip().lower()

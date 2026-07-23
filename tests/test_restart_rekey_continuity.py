@@ -137,7 +137,9 @@ def test_rotation3_captured_pairs_heal_to_one_uuid_entry_with_original_topics():
     )
 
     assert telegram.topics == []
-    assert set(telegram.closed_topics) == {"15476", "15468"}
+    # Newly retired archives wait the configured TTL before lifecycle cleanup
+    # closes them; reconciliation itself never performs topic-close calls.
+    assert telegram.closed_topics == []
     assert {thread for _chat, thread, _name in telegram.renamed_topics} == {
         "15476",
         "15468",
@@ -417,7 +419,7 @@ def test_captured_duplicate_state_heals_to_one_uuid_entry_per_pane_and_survives_
         stable_key = state.worker_stable_key(worker)
         assert len(state._all_worker_entry_keys_by_stable_key(store, stable_key)) == 1
     assert telegram.topics == []
-    assert set(telegram.closed_topics) == captured_duplicate_topics
+    assert telegram.closed_topics == []
     assert {thread for _chat, thread, _name in telegram.renamed_topics} == (
         captured_duplicate_topics
     )
@@ -926,7 +928,7 @@ def test_restart_rekey_worker_id_reshuffle_heals_safely_and_idempotently():
     assert entries[old_gamma_a_key]["topic_name"].startswith("📁 ")
     assert entries[old_gamma_b_key]["topic_name"].startswith("📁 ")
     assert entries[old_delta_key]["topic_name"].startswith("📁 ")
-    assert telegram.closed_topics == ["13900", "13901", "13902"]
+    assert telegram.closed_topics == []
     assert {thread for _chat, thread, _name in telegram.renamed_topics} == {
         "13900",
         "13901",
@@ -1053,7 +1055,7 @@ def test_indistinguishable_durable_twins_are_both_archived_without_uuid_theft():
     assert live_entry["topic_id"] not in {"14100", "14101"}
     assert state.entry_pane_uuid(live_entry) not in {twin_a_uuid, twin_b_uuid}
     assert len(telegram.topics) == 1
-    assert set(telegram.closed_topics) == {"14100", "14101"}
+    assert telegram.closed_topics == []
     assert {
         thread for _chat, thread, _name in telegram.renamed_topics
     } == {"14100", "14101"}

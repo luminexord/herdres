@@ -50,6 +50,33 @@ def _topic_missing(error: Any) -> bool:
     return "topic_id_invalid" in text or "message thread not found" in text
 
 
+def classify_telegram_error(error: Any) -> str:
+    """Classify Telegram failures consistently across delivery and cleanup."""
+    text = str(error or "").lower()
+    if any(
+        marker in text
+        for marker in ("method not found", "no such method", "not found: method", "404")
+    ):
+        return "capability"
+    if "topic_closed" in text or "topic is closed" in text:
+        return "topic_closed"
+    if "already closed" in text:
+        return "already_closed"
+    if "already open" in text or "topic_not_modified" in text:
+        return "already_open"
+    if "message is not modified" in text:
+        return "not_modified"
+    if "message to edit not found" in text or "message not found" in text:
+        return "not_found"
+    if "topic_id_invalid" in text or "message thread not found" in text:
+        return "topic_not_found"
+    if "chat not found" in text or "bot was kicked" in text or "not enough rights" in text:
+        return "bot_access"
+    if "bad request" in text:
+        return "bad_request"
+    return "transient"
+
+
 def _multipart_body(boundary: str, fields: dict[str, str], file_field: str, filename: str,
                     content_type: str, content: bytes) -> bytes:
     parts: list[bytes] = []
@@ -374,6 +401,20 @@ class TelegramClient:
                 {"chat_id": chat_id, "message_thread_id": str(thread_id)},
             )
             return {"ok": True}
+        except RateLimited:
+            raise
+        except TelegramError as exc:
+            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+
+    def reopen_topic(self, chat_id: str, thread_id: str) -> dict[str, Any]:
+        try:
+            self.api(
+                "reopenForumTopic",
+                {"chat_id": chat_id, "message_thread_id": str(thread_id)},
+            )
+            return {"ok": True}
+        except RateLimited:
+            raise
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
