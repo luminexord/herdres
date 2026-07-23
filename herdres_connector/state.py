@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -1344,6 +1345,7 @@ def _retire_rekey_entry(
     identity = entry_stable_identity(entry)
     entry["routing_retired"] = True
     entry.setdefault("routing_retired_reason", reason)
+    entry.setdefault("routing_retired_at", time.time())
     if identity is not None:
         entry.setdefault("retired_tendwire_stable_key", identity[0])
         entry.setdefault("retired_tendwire_stable_key_version", identity[1])
@@ -1401,6 +1403,7 @@ def _clear_consolidated_survivor_markers(
     for field in (
         "routing_retired",
         "routing_retired_reason",
+        "routing_retired_at",
         "retired_tendwire_stable_key",
         "retired_tendwire_stable_key_version",
         "retired_original_topic_name",

@@ -1176,7 +1176,7 @@ def test_persisted_duplicate_stable_key_consolidates_to_oldest_topic():
     assert entries[key_b]["retired_tendwire_stable_key"] == KEY_A
     assert state.find_entry_by_thread(store, "28") == (None, None)
     assert telegram.topics == []
-    assert telegram.closed_topics == ["28"]
+    assert telegram.closed_topics == []
     assert any(kwargs.get("thread_id") == "28" for _chat, _text, kwargs, _mid in telegram.sent)
 
 
@@ -1794,7 +1794,7 @@ def test_preflight_duplicate_key_consolidates_bindings_and_is_repeat_idempotent(
     )
     assert first["feed_sent"] == second["feed_sent"] == 0
     assert first_telegram.topics == second_telegram.topics == []
-    assert first_telegram.closed_topics == ["28"]
+    assert first_telegram.closed_topics == []
     assert second_telegram.sent == []
     assert second_telegram.closed_topics == []
 

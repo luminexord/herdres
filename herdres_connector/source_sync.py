@@ -29,6 +29,7 @@ from .telegram_delivery import (
     TOPIC_ICON_COLORS,
     RateLimited,
     TelegramClient,
+    classify_telegram_error,
     delete_turn_delivery_message,
     drain_outbox,
     topic_icon_catalog,
@@ -45,6 +46,8 @@ _SUBMISSION_STATE_KEY = "_herdres_submission_state"
 _SUBMISSION_STATES = frozenset(
     {"pending_observation", "observed", "complete", "linked"}
 )
+_TOPIC_CLEANUP_ATTEMPT_CAP = 3
+_TOPIC_CLEANUP_AUDIT_LIMIT = 200
 
 
 class _TurnContentError(RuntimeError):
@@ -1744,24 +1747,6 @@ def _sync_retired_worker_topics(
                     renamed.get("error"), 240
                 )
                 continue
-        if entry.get("retired_topic_close_pending"):
-            if runtime.dry_run or entry.get("retired_topic_missing"):
-                continue
-            closed = runtime.telegram.close_topic(chat_id, topic_id)
-            close_error = str(closed.get("error") or "").lower()
-            if closed.get("ok") or "topic_closed" in close_error or "already closed" in close_error:
-                entry.pop("retired_topic_close_pending", None)
-                entry.pop("retired_topic_close_error", None)
-                entry["retired_topic_closed"] = True
-                changed += 1
-            elif _topic_missing(closed.get("error")):
-                entry.pop("retired_topic_close_pending", None)
-                entry["retired_topic_missing"] = True
-                changed += 1
-            else:
-                entry["retired_topic_close_error"] = compact_ws(
-                    closed.get("error"), 240
-                )
     return changed
 
 
@@ -2190,6 +2175,463 @@ def _cleanup_topics(
             result["pruned"] += 1
         result["changed"] = True
     store["telegram_deleted_topics"] = audit[-200:]
+    return result
+
+
+def _topic_cleanup_protected_ids(
+    store: dict[str, Any], *, include_live: bool = True
+) -> set[str]:
+    """Topics that lifecycle cleanup must never close or reopen."""
+    protected = {str(config.general_thread_id(store))}
+    for entry in state.source_space_entries(store).values():
+        topic_id = str(entry.get("topic_id") or "")
+        if topic_id:
+            # Space topics can route several panes; pane dormancy is never
+            # sufficient evidence to close one.
+            protected.add(topic_id)
+    for entry in state.source_worker_entries(store).values():
+        topic_id = str(entry.get("topic_id") or "")
+        if not topic_id:
+            continue
+        if include_live and state.entry_is_routable(entry):
+            protected.add(topic_id)
+        if any(
+            entry.get(field) is True
+            for field in (
+                "cleanup_protected",
+                "dashboard_topic",
+                "pinned_topic",
+                "personal_space",
+            )
+        ):
+            protected.add(topic_id)
+    telegram = (
+        store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
+    )
+    for key, value in telegram.items():
+        normalized_key = str(key).lower()
+        if not any(
+            marker in normalized_key
+            for marker in ("general", "dashboard", "setup", "offer", "personal")
+        ):
+            continue
+        if "topic" in normalized_key or "thread" in normalized_key:
+            clean = str(value or "").strip()
+            if clean:
+                protected.add(clean)
+    protected.discard("")
+    return protected
+
+
+def _topic_cleanup_empty_result() -> dict[str, Any]:
+    return {
+        "closed": 0,
+        "reopened": 0,
+        "abandoned": 0,
+        "deferred": 0,
+        "candidates": 0,
+        "operations": 0,
+        "would_close": 0,
+        "would_reopen": 0,
+        "changed": False,
+    }
+
+
+def _topic_cleanup_attempts(store: dict[str, Any]) -> dict[str, int]:
+    raw = store.get("telegram_topic_cleanup_attempts")
+    if not isinstance(raw, dict):
+        raw = {}
+        store["telegram_topic_cleanup_attempts"] = raw
+    return raw
+
+
+def _topic_cleanup_abandoned(store: dict[str, Any]) -> set[str]:
+    raw = store.get("telegram_topic_cleanup_abandoned")
+    if not isinstance(raw, list):
+        raw = []
+    return {str(item) for item in raw if str(item)}
+
+
+def _topic_cleanup_target_key(action: str, topic_id: str) -> str:
+    return f"{action}:{topic_id}"
+
+
+def _refresh_topic_cleanup_lifecycle(
+    store: dict[str, Any], *, now: float, dry_run: bool
+) -> bool:
+    """Persist the first observed closed/retired instant and clear it on revive."""
+    if dry_run:
+        return False
+    changed = False
+    for entry in state.source_worker_entries(store).values():
+        if state.entry_is_retired(entry):
+            if "routing_retired_at" not in entry:
+                entry["routing_retired_at"] = now
+                changed = True
+            if (
+                entry.get("retired_topic_closed") is True
+                and "topic_closed_at" not in entry
+            ):
+                # Pre-lifecycle RCs closed archives immediately. Adopt their
+                # terminal marker instead of issuing one redundant close after
+                # the newly introduced TTL.
+                entry["topic_closed_at"] = now
+                entry["topic_auto_closed_at"] = now
+                changed = True
+            continue
+        if state.entry_is_routable(entry):
+            if entry.pop("topic_dormant_at", None) is not None:
+                changed = True
+            continue
+        if (
+            normalized_status(
+                entry.get("status") or entry.get("tendwire_raw_status")
+            )
+            in {"closed", "failed"}
+            and entry.get("topic_id")
+            and "topic_dormant_at" not in entry
+        ):
+            entry["topic_dormant_at"] = now
+            changed = True
+    return changed
+
+
+def _topic_cleanup_targets(
+    store: dict[str, Any], *, now: float
+) -> tuple[list[dict[str, Any]], int]:
+    statically_protected = _topic_cleanup_protected_ids(
+        store, include_live=False
+    )
+    close_protected = _topic_cleanup_protected_ids(store)
+    abandoned = _topic_cleanup_abandoned(store)
+    ttl_seconds = config.close_dormant_after_hours() * 3600.0
+    targets: list[dict[str, Any]] = []
+    abandoned_eligible = 0
+    seen: set[tuple[str, str]] = set()
+
+    def add_target(
+        action: str,
+        entry_key: str,
+        entry: dict[str, Any],
+        *,
+        since: float,
+        reason: str,
+        protected: set[str],
+    ) -> None:
+        nonlocal abandoned_eligible
+        topic_id = str(entry.get("topic_id") or "")
+        dedup = (action, topic_id)
+        if not topic_id or topic_id in protected or dedup in seen:
+            return
+        seen.add(dedup)
+        target_key = _topic_cleanup_target_key(action, topic_id)
+        if target_key in abandoned:
+            abandoned_eligible += 1
+            return
+        targets.append(
+            {
+                "action": action,
+                "entry_key": entry_key,
+                "topic_id": topic_id,
+                "since": since,
+                "reason": reason,
+                "target_key": target_key,
+            }
+        )
+
+    # Reopens are first so a revived pane is writable before this pass starts
+    # delivering its turn feed.
+    for entry_key, entry in state.source_worker_entries(store).items():
+        if (
+            not state.entry_is_retired(entry)
+            and state.entry_is_routable(entry)
+            and entry.get("topic_closed_at") is not None
+        ):
+            try:
+                closed_at = float(entry.get("topic_closed_at"))
+            except (TypeError, ValueError):
+                continue
+            add_target(
+                "reopen",
+                entry_key,
+                entry,
+                since=closed_at,
+                reason="pane_revived",
+                protected=statically_protected,
+            )
+
+    if ttl_seconds <= 0:
+        return targets, abandoned_eligible
+    for entry_key, entry in state.source_worker_entries(store).items():
+        if entry.get("topic_closed_at") is not None:
+            continue
+        if state.entry_is_retired(entry):
+            raw_since = entry.get("routing_retired_at")
+            reason = "retired_topic_ttl"
+        else:
+            if state.entry_is_routable(entry):
+                continue
+            if normalized_status(
+                entry.get("status") or entry.get("tendwire_raw_status")
+            ) not in {"closed", "failed"}:
+                continue
+            raw_since = entry.get("topic_dormant_at")
+            reason = "dormant_pane_ttl"
+        try:
+            since = float(raw_since)
+        except (TypeError, ValueError):
+            continue
+        if now - since < ttl_seconds:
+            continue
+        add_target(
+            "close",
+            entry_key,
+            entry,
+            since=since,
+            reason=reason,
+            protected=close_protected,
+        )
+    return targets, abandoned_eligible
+
+
+def _topic_cleanup_target_still_valid(
+    store: dict[str, Any], target: dict[str, Any], *, now: float
+) -> bool:
+    entry = state.source_worker_entries(store).get(str(target["entry_key"]))
+    if not isinstance(entry, dict):
+        return False
+    topic_id = str(target["topic_id"])
+    if (
+        str(entry.get("topic_id") or "") != topic_id
+        or topic_id
+        in _topic_cleanup_protected_ids(
+            store, include_live=target["action"] != "reopen"
+        )
+    ):
+        return False
+    if target["action"] == "reopen":
+        return (
+            not state.entry_is_retired(entry)
+            and state.entry_is_routable(entry)
+            and entry.get("topic_closed_at") is not None
+        )
+    if entry.get("topic_closed_at") is not None:
+        return False
+    ttl_seconds = config.close_dormant_after_hours() * 3600.0
+    if ttl_seconds <= 0:
+        return False
+    raw_since = (
+        entry.get("routing_retired_at")
+        if state.entry_is_retired(entry)
+        else entry.get("topic_dormant_at")
+    )
+    try:
+        since = float(raw_since)
+    except (TypeError, ValueError):
+        return False
+    if since != float(target["since"]) or now - since < ttl_seconds:
+        return False
+    return state.entry_is_retired(entry) or (
+        not state.entry_is_routable(entry)
+        and normalized_status(
+            entry.get("status") or entry.get("tendwire_raw_status")
+        )
+        in {"closed", "failed"}
+    )
+
+
+def _execute_topic_cleanup_targets(
+    targets: list[dict[str, Any]],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+) -> tuple[list[dict[str, Any]], int]:
+    budget = config.cleanup_budget_seconds()
+    max_ops = config.cleanup_max_ops()
+    if budget <= 0 or max_ops <= 0:
+        return [], len(targets)
+    deadline = time.monotonic() + budget
+    outcomes: list[dict[str, Any]] = []
+    for index, target in enumerate(targets):
+        if len(outcomes) >= max_ops or time.monotonic() >= deadline:
+            return outcomes, len(targets) - index
+        try:
+            if target["action"] == "reopen":
+                response = runtime.telegram.reopen_topic(
+                    chat_id, str(target["topic_id"])
+                )
+            else:
+                response = runtime.telegram.close_topic(
+                    chat_id, str(target["topic_id"])
+                )
+        except RateLimited as exc:
+            outcomes.append(
+                {
+                    "target": target,
+                    "status": "rate_limited",
+                    "retry_after": exc.retry_after,
+                    "error": compact_ws(exc, 240),
+                }
+            )
+            return outcomes, len(targets) - index - 1
+        error = response.get("error")
+        kind = "" if response.get("ok") else classify_telegram_error(error)
+        success_kinds = (
+            {"topic_closed", "already_closed", "topic_not_found", "not_found"}
+            if target["action"] == "close"
+            else {"already_open", "not_modified", "topic_not_found", "not_found"}
+        )
+        outcomes.append(
+            {
+                "target": target,
+                "status": "success"
+                if response.get("ok") or kind in success_kinds
+                else "failed",
+                "kind": kind,
+                "error": compact_ws(error, 240),
+            }
+        )
+    return outcomes, 0
+
+
+def _apply_topic_cleanup_outcomes(
+    store: dict[str, Any],
+    outcomes: list[dict[str, Any]],
+    result: dict[str, Any],
+    *,
+    now: float,
+) -> None:
+    attempts = _topic_cleanup_attempts(store)
+    abandoned = _topic_cleanup_abandoned(store)
+    audit = store.get("telegram_topic_cleanup_audit")
+    if not isinstance(audit, list):
+        audit = []
+    for outcome in outcomes:
+        target = outcome["target"]
+        if not _topic_cleanup_target_still_valid(store, target, now=now):
+            result["deferred"] += 1
+            continue
+        result["operations"] += 1
+        target_key = str(target["target_key"])
+        if outcome["status"] == "rate_limited":
+            store["telegram_topic_cleanup_backoff_until"] = (
+                now + float(outcome.get("retry_after") or 1)
+            )
+            result["deferred"] += 1
+            result["changed"] = True
+            continue
+        entry = state.source_worker_entries(store)[str(target["entry_key"])]
+        if outcome["status"] == "success":
+            attempts.pop(target_key, None)
+            kind = str(outcome.get("kind") or "")
+            if target["action"] == "close":
+                entry["topic_closed_at"] = now
+                entry["topic_auto_closed_at"] = now
+                entry.pop("retired_topic_close_pending", None)
+                entry.pop("retired_topic_close_error", None)
+                if state.entry_is_retired(entry):
+                    entry["retired_topic_closed"] = True
+                if kind in {"topic_not_found", "not_found"}:
+                    if state.entry_is_retired(entry):
+                        entry["retired_topic_missing"] = True
+                    else:
+                        entry.pop("topic_id", None)
+                        entry["topic_missing_at"] = now
+                result["closed"] += 1
+            else:
+                entry.pop("topic_closed_at", None)
+                entry.pop("topic_auto_closed_at", None)
+                entry["topic_reopened_at"] = now
+                if kind in {"topic_not_found", "not_found"}:
+                    entry.pop("topic_id", None)
+                    entry["topic_missing_at"] = now
+                result["reopened"] += 1
+            audit.append(
+                {
+                    "action": str(target["action"]),
+                    "at": now,
+                    "entry_key": str(target["entry_key"]),
+                    "pane_uuid": state.entry_pane_uuid(entry),
+                    "reason": str(target["reason"]),
+                    "result": kind or "ok",
+                    "topic_id": str(target["topic_id"]),
+                }
+            )
+            result["changed"] = True
+            continue
+        try:
+            previous_attempts = int(attempts.get(target_key) or 0)
+        except (TypeError, ValueError):
+            previous_attempts = 0
+        count = previous_attempts + 1
+        attempts[target_key] = count
+        entry["topic_cleanup_last_error"] = str(outcome.get("error") or "")
+        entry["topic_cleanup_last_error_at"] = now
+        if count >= _TOPIC_CLEANUP_ATTEMPT_CAP:
+            abandoned.add(target_key)
+            result["abandoned"] += 1
+        result["changed"] = True
+    store["telegram_topic_cleanup_attempts"] = attempts
+    store["telegram_topic_cleanup_abandoned"] = sorted(abandoned)
+    store["telegram_topic_cleanup_audit"] = audit[-_TOPIC_CLEANUP_AUDIT_LIMIT:]
+
+
+def _sync_topic_lifecycle_cleanup(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Run bounded close/reopen operations outside the state-lock hot path."""
+    clock = time.time() if now is None else float(now)
+    result = _topic_cleanup_empty_result()
+    result["changed"] = _refresh_topic_cleanup_lifecycle(
+        store, now=clock, dry_run=runtime.dry_run
+    )
+    targets, abandoned_eligible = _topic_cleanup_targets(store, now=clock)
+    result["candidates"] = len(targets) + abandoned_eligible
+    result["abandoned"] = abandoned_eligible
+    if runtime.dry_run:
+        result["would_close"] = sum(
+            target["action"] == "close" for target in targets
+        )
+        result["would_reopen"] = sum(
+            target["action"] == "reopen" for target in targets
+        )
+        return result
+    try:
+        backoff_until = float(
+            store.get("telegram_topic_cleanup_backoff_until") or 0
+        )
+    except (TypeError, ValueError):
+        backoff_until = 0
+    if backoff_until > clock:
+        result["deferred"] = len(targets)
+        return result
+    if store.pop("telegram_topic_cleanup_backoff_until", None) is not None:
+        result["changed"] = True
+    if not targets:
+        return result
+
+    if state.lock_held():
+        # Phase 1: persist the immutable target basis under lock. Phase 2:
+        # release the lock for slow/rate-limited Telegram calls. Phase 3:
+        # reload concurrent state and apply only still-valid outcomes.
+        state.save_state(store)
+        with state.released_lock():
+            outcomes, deferred = _execute_topic_cleanup_targets(
+                targets, runtime, chat_id=chat_id
+            )
+        fresh = state.load_state()
+        store.clear()
+        store.update(fresh)
+    else:
+        outcomes, deferred = _execute_topic_cleanup_targets(
+            targets, runtime, chat_id=chat_id
+        )
+    result["deferred"] += deferred
+    _apply_topic_cleanup_outcomes(store, outcomes, result, now=clock)
     return result
 
 
@@ -5546,7 +5988,12 @@ def _tendwire_non_success(runtime: SyncRuntime, status: str) -> dict[str, Any]:
         "routing_repaired": 0,
         "message_bindings": 0,
         "turn_updates": 0,
-        "topic_cleanup": {"deleted": 0, "failed": 0, "pruned": 0, "changed": False},
+        "topic_cleanup": {
+            "deleted": 0,
+            "failed": 0,
+            "pruned": 0,
+            "changed": False,
+        },
         "content_pages": 0,
         "tendwire_turn_final": {
             "enabled": runtime.with_outbox,
@@ -6380,6 +6827,12 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         return _tendwire_non_success(runtime, exc.status)
     changed = False
     source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
+    lifecycle_cleanup = _sync_topic_lifecycle_cleanup(
+        store,
+        runtime,
+        chat_id=chat_id,
+        now=observed_at,
+    )
     submission_link_updates = _apply_submission_links(
         store, _turns(turns_payload), now=observed_at
     )
@@ -6519,7 +6972,24 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     routing_repaired += _repair_space_mode_routing_state(store)
     snapshot_worker_ids = {compact_ws(worker.get("id"), 160) for worker in _workers(snapshot)}
     snapshot_worker_ids.discard("")
-    topic_cleanup = _cleanup_topics(store, runtime, chat_id=chat_id, snapshot_worker_ids=snapshot_worker_ids)
+    deletion_cleanup = _cleanup_topics(
+        store,
+        runtime,
+        chat_id=chat_id,
+        snapshot_worker_ids=snapshot_worker_ids,
+    )
+    topic_cleanup = {
+        **deletion_cleanup,
+        **{
+            key: value
+            for key, value in lifecycle_cleanup.items()
+            if key != "changed"
+        },
+        "changed": bool(
+            deletion_cleanup.get("changed")
+            or lifecycle_cleanup.get("changed")
+        ),
+    }
     changed = changed or bool(
         source_counts["created"]
         or source_counts["updated"]

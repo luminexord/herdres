@@ -187,6 +187,7 @@ class FakeTelegram:
             "topics": [],
             "deleted_topics": [],
             "closed_topics": [],
+            "reopened_topics": [],
             "renamed_topics": [],
             "pins": [],
             "api_calls": [],
@@ -196,12 +197,14 @@ class FakeTelegram:
         shared.setdefault("voice_notes", [])
         shared.setdefault("renamed_topics", [])
         shared.setdefault("closed_topics", [])
+        shared.setdefault("reopened_topics", [])
         self._shared = shared
         self.sent = shared["sent"]
         self.edited = shared["edited"]
         self.topics = shared["topics"]
         self.deleted_topics = shared["deleted_topics"]
         self.closed_topics = shared["closed_topics"]
+        self.reopened_topics = shared["reopened_topics"]
         self.renamed_topics = shared["renamed_topics"]
         self.pins = shared["pins"]
         self.api_calls = shared["api_calls"]
@@ -260,6 +263,10 @@ class FakeTelegram:
 
     def close_topic(self, _chat_id, thread_id):
         self.closed_topics.append(str(thread_id))
+        return {"ok": True}
+
+    def reopen_topic(self, _chat_id, thread_id):
+        self.reopened_topics.append(str(thread_id))
         return {"ok": True}
 
     def send_message(self, chat_id, html, **kwargs):

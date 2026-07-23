@@ -17,7 +17,14 @@ from typing import Any
 from . import config
 from .rendering import html_to_plain, split_text_chunks, split_text_spans, try_render_table, worker_label
 from .safe import canonical_text, sanitize_text
-from .telegram_delivery import MESSAGE_TEXT_LIMIT, SPLIT_TEXT_LIMIT, RateLimited, TelegramClient, TelegramError
+from .telegram_delivery import (
+    MESSAGE_TEXT_LIMIT,
+    SPLIT_TEXT_LIMIT,
+    RateLimited,
+    TelegramClient,
+    TelegramError,
+    classify_telegram_error,
+)
 
 
 MAX_REPLY_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "64000"))
@@ -754,20 +761,7 @@ def _telegram_message_id(response: dict[str, Any]) -> str:
 
 
 def _classify_telegram_error(error: Exception) -> str:
-    text = str(error or "").lower()
-    if any(marker in text for marker in ("method not found", "no such method", "not found: method", "404")):
-        return "capability"
-    if "message is not modified" in text:
-        return "not_modified"
-    if "message to edit not found" in text or "message not found" in text:
-        return "not_found"
-    if "topic_id_invalid" in text or "message thread not found" in text:
-        return "topic_not_found"
-    if "chat not found" in text or "bot was kicked" in text or "not enough rights" in text:
-        return "bot_access"
-    if "bad request" in text:
-        return "bad_request"
-    return "transient"
+    return classify_telegram_error(error)
 
 
 def _retry_rich_delivery(kind: str, error: Exception) -> dict[str, Any]:
