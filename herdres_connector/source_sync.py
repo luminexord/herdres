@@ -43,6 +43,8 @@ TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
 _SUBMISSION_ID_KEY = "_herdres_submission_id"
 _SUBMISSION_STATE_KEY = "_herdres_submission_state"
+_TURN_STABLE_KEY_KEY = "_herdres_stable_key"
+_TURN_STABLE_KEY_VERSION_KEY = "_herdres_stable_key_version"
 _SUBMISSION_STATES = frozenset(
     {"pending_observation", "observed", "complete", "linked"}
 )
@@ -143,6 +145,237 @@ def _turn_activity_status(item: dict[str, Any]) -> str:
     if item.get("complete") is False or item.get("has_open_turn") is True or bool(item.get("assistant_stream_text")):
         return "working"
     return ""
+
+
+def _turn_stable_identity(
+    item: dict[str, Any],
+) -> tuple[str, int] | None:
+    stable_key = item.get("stable_key")
+    stable_key_version = item.get("stable_key_version")
+    if stable_key is None and stable_key_version is None:
+        meta = item.get("meta")
+        if isinstance(meta, dict):
+            stable_key = meta.get("stable_key")
+            stable_key_version = meta.get("stable_key_version")
+    if state.valid_stable_worker_key_pair(
+        stable_key, stable_key_version
+    ):
+        return str(stable_key), int(stable_key_version)
+    stable_key = item.get(_TURN_STABLE_KEY_KEY)
+    stable_key_version = item.get(_TURN_STABLE_KEY_VERSION_KEY)
+    if state.valid_stable_worker_key_pair(
+        stable_key, stable_key_version
+    ):
+        return str(stable_key), int(stable_key_version)
+    return None
+
+
+def _annotate_turn_generation_identities(
+    turns_payload: dict[str, Any],
+    workers: list[dict[str, Any]],
+) -> None:
+    """Attach an internal stable identity to legacy rows from the snapshot."""
+    identities_by_worker: dict[str, set[tuple[str, int]]] = {}
+    spaces_by_worker: dict[str, set[str]] = {}
+    for worker in workers:
+        worker_id = compact_ws(worker.get("id"), 160)
+        identity = state.worker_stable_identity(worker)
+        if worker_id and identity is not None:
+            identities_by_worker.setdefault(worker_id, set()).add(identity)
+            space_id = compact_ws(worker.get("space_id"), 160)
+            if space_id:
+                spaces_by_worker.setdefault(worker_id, set()).add(space_id)
+    for item in _turns(turns_payload):
+        if _turn_stable_identity(item) is not None:
+            continue
+        worker_id = compact_ws(item.get("worker_id"), 160)
+        identities = identities_by_worker.get(worker_id, set())
+        if len(identities) != 1:
+            continue
+        turn_space_id = compact_ws(item.get("space_id"), 160)
+        worker_spaces = spaces_by_worker.get(worker_id, set())
+        if (
+            turn_space_id
+            and worker_spaces
+            and turn_space_id not in worker_spaces
+        ):
+            continue
+        identity = next(iter(identities))
+        item[_TURN_STABLE_KEY_KEY] = identity[0]
+        item[_TURN_STABLE_KEY_VERSION_KEY] = identity[1]
+
+
+def _worker_observation_sequence(worker: dict[str, Any]) -> int | None:
+    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+    value = meta.get("state_change_seq")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _select_stable_generation(
+    workers: list[dict[str, Any]],
+    turns: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str]:
+    """Choose one active generation, or fail closed on conflicting activity."""
+    worker_ids = {
+        compact_ws(worker.get("id"), 160) for worker in workers
+    }
+    latest_rows: dict[str, dict[str, Any]] = {}
+    for item in turns:
+        worker_id = compact_ws(item.get("worker_id"), 160)
+        if worker_id in worker_ids and worker_id not in latest_rows:
+            latest_rows[worker_id] = item
+
+    open_turn_ids = {
+        worker_id
+        for worker_id, item in latest_rows.items()
+        if _turn_activity_status(item) == "working"
+    }
+    if len(open_turn_ids) > 1:
+        return None, "conflicting_turn_activity"
+    if len(open_turn_ids) == 1:
+        wanted = next(iter(open_turn_ids))
+        return (
+            next(
+                worker
+                for worker in workers
+                if compact_ws(worker.get("id"), 160) == wanted
+            ),
+            "freshest_turn_activity",
+        )
+    for item in turns:
+        worker_id = compact_ws(item.get("worker_id"), 160)
+        if worker_id not in worker_ids:
+            continue
+        return (
+            next(
+                worker
+                for worker in workers
+                if compact_ws(worker.get("id"), 160) == worker_id
+            ),
+            "freshest_turn_activity",
+        )
+
+    working = [
+        worker
+        for worker in workers
+        if normalized_status(worker.get("status")) == "working"
+    ]
+    if len(working) > 1:
+        return None, "conflicting_observation_activity"
+    if len(working) == 1:
+        return working[0], "freshest_observation_activity"
+
+    sequenced = [
+        (sequence, worker)
+        for worker in workers
+        if (sequence := _worker_observation_sequence(worker)) is not None
+    ]
+    if sequenced:
+        highest = max(sequence for sequence, _worker in sequenced)
+        freshest = [
+            worker for sequence, worker in sequenced if sequence == highest
+        ]
+        if len(freshest) == 1:
+            return freshest[0], "freshest_observation_activity"
+        return None, "conflicting_observation_activity"
+
+    seen = [
+        (str(worker.get("last_seen_at") or ""), worker)
+        for worker in workers
+        if str(worker.get("last_seen_at") or "")
+    ]
+    if seen:
+        highest = max(value for value, _worker in seen)
+        freshest = [worker for value, worker in seen if value == highest]
+        if len(freshest) == 1:
+            return freshest[0], "freshest_observation_activity"
+    return None, "conflicting_observation_activity"
+
+
+def _resolve_stable_worker_generations(
+    store: dict[str, Any],
+    snapshot: dict[str, Any],
+    turns_payload: dict[str, Any],
+    *,
+    observed_at: float,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Reduce restart generations to one stable-key observation per pane."""
+    workers = _workers(snapshot)
+    _annotate_turn_generation_identities(turns_payload, workers)
+    live_by_stable_key: dict[str, list[dict[str, Any]]] = {}
+    for worker in workers:
+        identity = state.worker_stable_identity(worker)
+        if identity is None or not _worker_is_open(worker):
+            continue
+        live_by_stable_key.setdefault(identity[0], []).append(worker)
+
+    excluded_worker_refs: set[int] = set()
+    resolutions: list[dict[str, str]] = []
+    entries = state.source_worker_entries(store)
+    for stable_key, generations in live_by_stable_key.items():
+        claims = [
+            (entry_key, entry)
+            for entry_key, entry in entries.items()
+            if not state.entry_is_retired(entry)
+            and state.entry_stable_identity(entry)
+            == (stable_key, state.STABLE_WORKER_KEY_VERSION)
+        ]
+        topic_claims = [
+            pair for pair in claims if str(pair[1].get("topic_id") or "")
+        ]
+        owners = topic_claims if len(topic_claims) == 1 else claims
+        if len(owners) != 1:
+            continue
+        entry_key, entry = owners[0]
+        matching_turns = [
+            item
+            for item in _turns(turns_payload)
+            if _turn_stable_identity(item)
+            == (stable_key, state.STABLE_WORKER_KEY_VERSION)
+        ]
+        if len(generations) == 1:
+            selected = generations[0]
+            reason = "stable_key_cache_refresh"
+        else:
+            selected, reason = _select_stable_generation(
+                generations, matching_turns
+            )
+        worker_ids = [
+            compact_ws(worker.get("id"), 160) for worker in generations
+        ]
+        if selected is None:
+            state.mark_worker_generation_ambiguous(
+                store,
+                entry_key,
+                worker_ids=worker_ids,
+                observed_at=observed_at,
+            )
+            continue
+        state.clear_worker_generation_ambiguity(store, entry_key)
+        selected_id = compact_ws(selected.get("id"), 160)
+        previous_id = _entry_worker_id(entry)
+        excluded_worker_refs.update(
+            id(worker) for worker in generations if worker is not selected
+        )
+        resolutions.append(
+            {
+                "stable_key": stable_key,
+                "entry_key": entry_key,
+                "from_worker_id": previous_id,
+                "to_worker_id": selected_id,
+                "reason": reason,
+            }
+        )
+
+    if not excluded_worker_refs:
+        return snapshot, resolutions
+    resolved_snapshot = dict(snapshot)
+    resolved_snapshot["workers"] = [
+        worker for worker in workers if id(worker) not in excluded_worker_refs
+    ]
+    return resolved_snapshot, resolutions
 
 
 def _turn_activity_statuses(payload: dict[str, Any], live_worker_ids: set[str] | None = None) -> tuple[dict[str, str], dict[str, str]]:
@@ -334,7 +567,27 @@ def _record_delivery_success(entry: dict[str, Any], bot_kind: str) -> None:
 def _entry_for_turn(store: dict[str, Any], item: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
     worker_id = compact_ws(item.get("worker_id"), 160)
     space_id = compact_ws(item.get("space_id"), 160)
-    key, worker_entry = _worker_entry_for_turn(store, worker_id, space_id)
+    identity = _turn_stable_identity(item)
+    if identity is not None:
+        key, worker_entry = state.find_worker_entry_by_stable_key(
+            store, identity[0]
+        )
+        if (
+            key is None
+            or worker_entry is None
+            or state.entry_stable_identity(worker_entry) != identity
+            or not state.worker_entry_is_uniquely_routable(
+                store, key, worker_entry
+            )
+        ):
+            return None, None
+        # A restart generation may carry the pre-handoff space id. Stable-key
+        # routing follows the current entry's space/topic cache.
+        space_id = _entry_space_id(worker_entry)
+    else:
+        key, worker_entry = _worker_entry_for_turn(
+            store, worker_id, space_id
+        )
     if key is None:
         return None, None
     if worker_entry is None:
@@ -1096,6 +1349,7 @@ def _record_final_delivery_success(
     )
     _record_delivery_success(entry, bot_kind)
     _clear_stream_delivery_state(entry, turn_id)
+    entry.pop("tendwire_rebind_catchup_pending", None)
 
 
 def _promote_working_to_final(
@@ -3512,6 +3766,7 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
         exact_final_visible_here or placeholder_here
     ):
         _repair_delivered_final_entry(store, item, entry, content_hash)
+        entry.pop("tendwire_rebind_catchup_pending", None)
         return False
     feed_item = turn_item_from_source(item, entry)
     if runtime.dry_run:
@@ -3524,6 +3779,7 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
             render_version=RENDER_VERSION,
             placeholder=True,
         )
+        entry.pop("tendwire_rebind_catchup_pending", None)
         return True
     send_changed_as_new = _changed_final_should_send_new_message(item, entry)
     if _final_turn_delivered(store, turn_id) and visible_here:
@@ -3717,14 +3973,23 @@ def _sync_turns(
     turns = _turns(turns_payload)
     if live_worker_ids is not None:
         # Retired-worker turns must not be delivered (same rule already applied
-        # to status aggregation): a stale row can otherwise emit a duplicate
-        # working card or a misattributed final.
+        # to status aggregation), except that a row from a previous positional
+        # generation remains eligible when its stable key still owns a live
+        # route. That exception is the restart catch-up path.
         turns = [
             item
             for item in turns
             if compact_ws(item.get("worker_id"), 160) in live_worker_ids
+            or (
+                (identity := _turn_stable_identity(item)) is not None
+                and state.find_entry_key_by_stable_key(
+                    store, identity[0]
+                )
+                is not None
+            )
         ]
     latest_content_turn_by_worker: dict[str, str] = {}
+    latest_completed_turn_by_worker: dict[str, str] = {}
     placeholder_turn_ids_by_worker: dict[str, set[str]] = {}
     # Pass 1: real content only (user prompt, stream, or a completed final).
     # Tendwire store output is already ordered by per-worker observed recency.
@@ -3742,6 +4007,10 @@ def _sync_turns(
         if not _turn_has_real_content(item):
             continue
         latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
+        if _turn_has_complete_final(item):
+            latest_completed_turn_by_worker.setdefault(
+                worker_key, _turn_id(item)
+            )
     # Pass 2: synthetic "Work is in progress." placeholders only fill workers
     # with no real turn at all — a placeholder must never outrank a real turn.
     for item in turns:
@@ -3777,6 +4046,10 @@ def _sync_turns(
         latest_turn_id = latest_content_turn_by_worker.get(worker_key)
         complete = _turn_has_complete_final(item)
         if complete:
+            if entry.get("tendwire_rebind_catchup_pending"):
+                latest_turn_id = latest_completed_turn_by_worker.get(
+                    worker_key
+                )
             if not list_finals_are_authoritative and _content_revision(item):
                 continue
             if latest_turn_id and _turn_id(item) != latest_turn_id:
@@ -6981,6 +7254,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     delta_observation: dict[str, Any] | None = None
     delta: dict[str, Any] | None = None
     snapshot = runtime.tendwire.snapshot()
+    observed_snapshot_workers: list[dict[str, Any]] = []
     if _herdr_backend_explicitly_unhealthy(snapshot):
         return _tendwire_non_success(runtime, "tendwire_herdr_unhealthy")
     if hasattr(runtime.tendwire, "turn_delta"):
@@ -7025,8 +7299,40 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         # The list envelope/schema is connector-wide. Descriptor defects are
         # converted to bounded row-local outcomes by _validate_turns_payload.
         return _tendwire_non_success(runtime, exc.status)
+    observed_snapshot_workers = _workers(snapshot)
+    snapshot, generation_resolutions = _resolve_stable_worker_generations(
+        store,
+        snapshot,
+        turns_payload,
+        observed_at=observed_at,
+    )
     changed = False
     source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
+    worker_rebinds = 0
+    for resolution in generation_resolutions:
+        from_worker_id = resolution["from_worker_id"]
+        to_worker_id = resolution["to_worker_id"]
+        if not from_worker_id or from_worker_id == to_worker_id:
+            continue
+        _entry_key, rebound_entry = state.find_worker_entry_by_stable_key(
+            store, resolution["stable_key"]
+        )
+        if (
+            rebound_entry is None
+            or _entry_worker_id(rebound_entry) != to_worker_id
+        ):
+            continue
+        worker_rebinds += int(
+            state.record_worker_generation_rebind(
+                store,
+                rebound_entry,
+                stable_key=resolution["stable_key"],
+                from_worker_id=from_worker_id,
+                to_worker_id=to_worker_id,
+                reason=resolution["reason"],
+                observed_at=observed_at,
+            )
+        )
     lifecycle_cleanup = _sync_topic_lifecycle_cleanup(
         store,
         runtime,
@@ -7072,7 +7378,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     )
     live_worker_ids = {
         compact_ws(worker.get("id"), 160)
-        for worker in _workers(snapshot)
+        for worker in observed_snapshot_workers
         if _worker_is_open(worker)
     }
     live_worker_ids.discard("")
@@ -7176,7 +7482,10 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         yield_barrier=yield_barrier,
     )
     routing_repaired += _repair_space_mode_routing_state(store)
-    snapshot_worker_ids = {compact_ws(worker.get("id"), 160) for worker in _workers(snapshot)}
+    snapshot_worker_ids = {
+        compact_ws(worker.get("id"), 160)
+        for worker in observed_snapshot_workers
+    }
     snapshot_worker_ids.discard("")
     deletion_cleanup = _cleanup_topics(
         store,
@@ -7202,6 +7511,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         source_counts["created"]
         or source_counts["updated"]
         or source_counts["icon_updated"]
+        or worker_rebinds
         or routing_repaired
         or turn_counts["sent"]
         or turn_counts["updated"]
@@ -7286,6 +7596,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "panes": source_counts["panes"],
         "spaces": source_counts["spaces"],
         "icon_updated": source_counts["icon_updated"],
+        "worker_rebinds": worker_rebinds,
         "pinned_status_updated": int(pinned_changed) + topic_pinned_updated,
         "feed_sent": turn_counts["feed_sent"] + submission_counts["sent"],
         "sent": turn_counts["sent"] + submission_counts["sent"],

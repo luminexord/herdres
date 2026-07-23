@@ -38,6 +38,7 @@ _TENDWIRE_TURN_JOB_KEY_RE = re.compile(
 
 STABLE_WORKER_KEY_VERSION = 1
 STABLE_WORKER_KEY_RE = re.compile(r"^wsk1_[0-9a-f]{64}$")
+WORKER_REBIND_AUDIT_LIMIT = 200
 PANE_UUID_VERSION = 1
 PANE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -1371,6 +1372,7 @@ def _topic_age_key(entry_key: str, entry: dict[str, Any]) -> tuple[int, int | st
 
 _CONSOLIDATION_HEALABLE_QUARANTINE_REASONS = frozenset(
     {
+        "ambiguous_stable_key_generations",
         "closed_stable_key_reuse",
         "persisted_stable_key_collision",
         "preflight_stable_key_conflict",
@@ -2735,6 +2737,124 @@ def quarantine_worker_stable_key_owners(
         if identity is not None and identity[0] in stable_keys:
             changed += int(quarantine_worker_entry(data, key, reason=reason))
     return changed
+
+
+def mark_worker_generation_ambiguous(
+    data: dict[str, Any],
+    key: str,
+    *,
+    worker_ids: list[str],
+    observed_at: float,
+) -> bool:
+    """Fail closed when one stable pane has competing active generations."""
+    entry = source_worker_entries(data).get(key)
+    if entry is None:
+        return False
+    changed = quarantine_worker_entry(
+        data, key, reason="ambiguous_stable_key_generations"
+    )
+    normalized_ids = sorted(
+        {str(value) for value in worker_ids if str(value)}
+    )
+    previous = entry.get("tendwire_worker_generation_ambiguity")
+    marker = (
+        previous
+        if isinstance(previous, dict)
+        and previous.get("worker_ids") == normalized_ids
+        else {
+            "worker_ids": normalized_ids,
+            "observed_at": float(observed_at),
+        }
+    )
+    if entry.get("tendwire_worker_generation_ambiguity") != marker:
+        entry["tendwire_worker_generation_ambiguity"] = marker
+        changed = True
+    if entry.get("stable_key_quarantine_reason") in {
+        "preflight_stable_key_conflict",
+        "snapshot_stable_key_conflict",
+    }:
+        entry["stable_key_quarantine_reason"] = (
+            "ambiguous_stable_key_generations"
+        )
+        changed = True
+    return changed
+
+
+def clear_worker_generation_ambiguity(
+    data: dict[str, Any], key: str
+) -> bool:
+    """Heal only the quarantine lane created by generation ambiguity."""
+    entry = source_worker_entries(data).get(key)
+    if entry is None:
+        return False
+    changed = entry.pop("tendwire_worker_generation_ambiguity", None) is not None
+    if entry.get("stable_key_quarantine_reason") != (
+        "ambiguous_stable_key_generations"
+    ):
+        return changed
+    entry.pop("stable_key_quarantined", None)
+    entry.pop("stable_key_quarantine_reason", None)
+    identity = entry_stable_identity(entry)
+    pane_uuid = entry_pane_uuid(entry)
+    topic_id = str(entry.get("topic_id") or "")
+    bindings = data.get("telegram_message_bindings")
+    if isinstance(bindings, dict) and identity is not None:
+        for binding in bindings.values():
+            if (
+                not isinstance(binding, dict)
+                or message_binding_stable_identity(binding) != identity
+                or (
+                    topic_id
+                    and str(binding.get("topic_id") or "") != topic_id
+                )
+                or (
+                    pane_uuid
+                    and message_binding_pane_uuid(binding) not in {"", pane_uuid}
+                )
+            ):
+                continue
+            if "routing_quarantined" in binding:
+                binding.pop("routing_quarantined", None)
+                changed = True
+    return True
+
+
+def record_worker_generation_rebind(
+    data: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    stable_key: str,
+    from_worker_id: str,
+    to_worker_id: str,
+    reason: str,
+    observed_at: float,
+) -> bool:
+    """Persist bounded #174 evidence for a stable-key cache refresh."""
+    if (
+        not valid_stable_worker_key_pair(stable_key, STABLE_WORKER_KEY_VERSION)
+        or not from_worker_id
+        or not to_worker_id
+        or from_worker_id == to_worker_id
+    ):
+        return False
+    audit = data.get("tendwire_worker_rebind_audit")
+    if not isinstance(audit, list):
+        audit = []
+    record = {
+        "stable_key": stable_key,
+        "from_worker_id": str(from_worker_id),
+        "to_worker_id": str(to_worker_id),
+        "reason": compact_ws(reason, 80),
+        "observed_at": float(observed_at),
+    }
+    audit.append(record)
+    data["tendwire_worker_rebind_audit"] = audit[-WORKER_REBIND_AUDIT_LIMIT:]
+    entry["tendwire_rebind_catchup_pending"] = {
+        "from_worker_id": str(from_worker_id),
+        "to_worker_id": str(to_worker_id),
+    }
+    entry.pop("tendwire_worker_generation_ambiguity", None)
+    return True
 
 
 def _retarget_worker_bindings(
