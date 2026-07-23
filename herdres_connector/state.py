@@ -26,6 +26,7 @@ TENDWIRE_TURN_JOB_SUBSTATES = frozenset(
         "retryable",
         "telegram_applied",
         "old_slot_retired",
+        "suppressed",
         "acknowledged",
         "failed",
     }
@@ -1095,7 +1096,13 @@ def reconcile_durable_pane_identities(
                 if field not in protected and field not in survivor:
                     survivor[field] = value
 
-        _clear_consolidated_survivor_markers(survivor, heal_quarantine=True)
+        _clear_consolidated_survivor_markers(
+            survivor,
+            heal_quarantine=not isinstance(
+                survivor.get("tendwire_worker_generation_ambiguity"),
+                dict,
+            ),
+        )
         survivor["pane_uuid"] = pane_uuid
         survivor["pane_uuid_version"] = PANE_UUID_VERSION
         identity = worker_stable_identity(worker)
@@ -1372,7 +1379,6 @@ def _topic_age_key(entry_key: str, entry: dict[str, Any]) -> tuple[int, int | st
 
 _CONSOLIDATION_HEALABLE_QUARANTINE_REASONS = frozenset(
     {
-        "ambiguous_stable_key_generations",
         "closed_stable_key_reuse",
         "persisted_stable_key_collision",
         "preflight_stable_key_conflict",
@@ -2816,7 +2822,7 @@ def clear_worker_generation_ambiguity(
             if "routing_quarantined" in binding:
                 binding.pop("routing_quarantined", None)
                 changed = True
-    return True
+    return changed
 
 
 def record_worker_generation_rebind(
@@ -2828,6 +2834,7 @@ def record_worker_generation_rebind(
     to_worker_id: str,
     reason: str,
     observed_at: float,
+    evidence_turn_id: str = "",
 ) -> bool:
     """Persist bounded #174 evidence for a stable-key cache refresh."""
     if (
@@ -2849,10 +2856,16 @@ def record_worker_generation_rebind(
     }
     audit.append(record)
     data["tendwire_worker_rebind_audit"] = audit[-WORKER_REBIND_AUDIT_LIMIT:]
-    entry["tendwire_rebind_catchup_pending"] = {
-        "from_worker_id": str(from_worker_id),
-        "to_worker_id": str(to_worker_id),
-    }
+    if reason == "freshest_turn_activity" and evidence_turn_id:
+        entry.pop("tendwire_rebind_catchup_bound", None)
+        entry["tendwire_rebind_catchup_pending"] = {
+            "from_worker_id": str(from_worker_id),
+            "to_worker_id": str(to_worker_id),
+            "evidence_turn_id": str(evidence_turn_id),
+        }
+    else:
+        entry.pop("tendwire_rebind_catchup_pending", None)
+        entry.pop("tendwire_rebind_catchup_bound", None)
     entry.pop("tendwire_worker_generation_ambiguity", None)
     return True
 
@@ -3388,7 +3401,13 @@ def update_tendwire_turn_job(
         raise ValueError("invalid tendwire job substate")
     current = receipt.get("substate")
     transitions = {
-        "reserved": {"reserved", "retryable", "telegram_applied", "failed"},
+        "reserved": {
+            "reserved",
+            "retryable",
+            "telegram_applied",
+            "suppressed",
+            "failed",
+        },
         "retryable": {"retryable", "reserved", "failed"},
         "telegram_applied": {
             "telegram_applied",
@@ -3397,6 +3416,7 @@ def update_tendwire_turn_job(
             "failed",
         },
         "old_slot_retired": {"old_slot_retired", "acknowledged", "failed"},
+        "suppressed": {"suppressed", "acknowledged", "failed"},
         "acknowledged": {"acknowledged"},
         "failed": {"failed"},
     }

@@ -205,26 +205,37 @@ def _annotate_turn_generation_identities(
         item[_TURN_STABLE_KEY_VERSION_KEY] = identity[1]
 
 
-def _worker_observation_sequence(worker: dict[str, Any]) -> int | None:
-    meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
-    value = meta.get("state_change_seq")
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-        return value
-    return None
+def _turn_recency(item: Mapping[str, Any]) -> str:
+    """Return Tendwire's explicit, canonical per-turn recency coordinate."""
+    value = item.get("updated_at")
+    return str(value) if isinstance(value, str) and value else ""
 
 
 def _select_stable_generation(
     workers: list[dict[str, Any]],
     turns: list[dict[str, Any]],
-) -> tuple[dict[str, Any] | None, str]:
-    """Choose one active generation, or fail closed on conflicting activity."""
-    worker_ids = {
-        compact_ws(worker.get("id"), 160) for worker in workers
+    *,
+    incumbent_worker_id: str,
+    incumbent_last_turn_id: str,
+) -> tuple[dict[str, Any] | None, str, str]:
+    """Prefer the incumbent unless fresh turn evidence proves a handoff."""
+    workers_by_id = {
+        compact_ws(worker.get("id"), 160): worker for worker in workers
     }
+    workers_by_id.pop("", None)
     latest_rows: dict[str, dict[str, Any]] = {}
     for item in turns:
         worker_id = compact_ws(item.get("worker_id"), 160)
-        if worker_id in worker_ids and worker_id not in latest_rows:
+        if worker_id not in workers_by_id or _turn_has_content_outcome(item):
+            continue
+        current = latest_rows.get(worker_id)
+        if current is None or (
+            _turn_recency(item),
+            _turn_id(item) == incumbent_last_turn_id,
+        ) > (
+            _turn_recency(current),
+            _turn_id(current) == incumbent_last_turn_id,
+        ):
             latest_rows[worker_id] = item
 
     open_turn_ids = {
@@ -233,65 +244,38 @@ def _select_stable_generation(
         if _turn_activity_status(item) == "working"
     }
     if len(open_turn_ids) > 1:
-        return None, "conflicting_turn_activity"
+        return None, "conflicting_turn_activity", ""
     if len(open_turn_ids) == 1:
         wanted = next(iter(open_turn_ids))
         return (
-            next(
-                worker
-                for worker in workers
-                if compact_ws(worker.get("id"), 160) == wanted
-            ),
+            workers_by_id[wanted],
             "freshest_turn_activity",
+            _turn_id(latest_rows[wanted]),
         )
-    for item in turns:
-        worker_id = compact_ws(item.get("worker_id"), 160)
-        if worker_id not in worker_ids:
-            continue
+
+    if latest_rows:
+        highest = max(_turn_recency(item) for item in latest_rows.values())
+        freshest_ids = {
+            worker_id
+            for worker_id, item in latest_rows.items()
+            if _turn_recency(item) == highest
+        }
+        if incumbent_worker_id in freshest_ids:
+            wanted = incumbent_worker_id
+        elif len(freshest_ids) == 1:
+            wanted = next(iter(freshest_ids))
+        else:
+            return None, "conflicting_turn_activity", ""
         return (
-            next(
-                worker
-                for worker in workers
-                if compact_ws(worker.get("id"), 160) == worker_id
-            ),
+            workers_by_id[wanted],
             "freshest_turn_activity",
+            _turn_id(latest_rows[wanted]),
         )
 
-    working = [
-        worker
-        for worker in workers
-        if normalized_status(worker.get("status")) == "working"
-    ]
-    if len(working) > 1:
-        return None, "conflicting_observation_activity"
-    if len(working) == 1:
-        return working[0], "freshest_observation_activity"
-
-    sequenced = [
-        (sequence, worker)
-        for worker in workers
-        if (sequence := _worker_observation_sequence(worker)) is not None
-    ]
-    if sequenced:
-        highest = max(sequence for sequence, _worker in sequenced)
-        freshest = [
-            worker for sequence, worker in sequenced if sequence == highest
-        ]
-        if len(freshest) == 1:
-            return freshest[0], "freshest_observation_activity"
-        return None, "conflicting_observation_activity"
-
-    seen = [
-        (str(worker.get("last_seen_at") or ""), worker)
-        for worker in workers
-        if str(worker.get("last_seen_at") or "")
-    ]
-    if seen:
-        highest = max(value for value, _worker in seen)
-        freshest = [worker for value, worker in seen if value == highest]
-        if len(freshest) == 1:
-            return freshest[0], "freshest_observation_activity"
-    return None, "conflicting_observation_activity"
+    incumbent = workers_by_id.get(incumbent_worker_id)
+    if incumbent is not None:
+        return incumbent, "incumbent_quiet", ""
+    return None, "no_turn_evidence", ""
 
 
 def _resolve_stable_worker_generations(
@@ -300,7 +284,7 @@ def _resolve_stable_worker_generations(
     turns_payload: dict[str, Any],
     *,
     observed_at: float,
-) -> tuple[dict[str, Any], list[dict[str, str]]]:
+) -> tuple[dict[str, Any], list[dict[str, str]], bool]:
     """Reduce restart generations to one stable-key observation per pane."""
     workers = _workers(snapshot)
     _annotate_turn_generation_identities(turns_payload, workers)
@@ -313,6 +297,7 @@ def _resolve_stable_worker_generations(
 
     excluded_worker_refs: set[int] = set()
     resolutions: list[dict[str, str]] = []
+    changed = False
     entries = state.source_worker_entries(store)
     for stable_key, generations in live_by_stable_key.items():
         claims = [
@@ -335,27 +320,44 @@ def _resolve_stable_worker_generations(
             if _turn_stable_identity(item)
             == (stable_key, state.STABLE_WORKER_KEY_VERSION)
         ]
+        previous_id = _entry_worker_id(entry)
         if len(generations) == 1:
             selected = generations[0]
             reason = "stable_key_cache_refresh"
+            evidence_turn_id = ""
         else:
-            selected, reason = _select_stable_generation(
-                generations, matching_turns
+            selected, reason, evidence_turn_id = _select_stable_generation(
+                generations,
+                matching_turns,
+                incumbent_worker_id=previous_id,
+                incumbent_last_turn_id=str(entry.get("last_turn_id") or ""),
             )
         worker_ids = [
             compact_ws(worker.get("id"), 160) for worker in generations
         ]
         if selected is None:
-            state.mark_worker_generation_ambiguous(
-                store,
-                entry_key,
-                worker_ids=worker_ids,
-                observed_at=observed_at,
-            )
+            if reason == "conflicting_turn_activity":
+                changed = (
+                    state.mark_worker_generation_ambiguous(
+                        store,
+                        entry_key,
+                        worker_ids=worker_ids,
+                        observed_at=observed_at,
+                    )
+                    or changed
+                )
+            else:
+                # A replacement snapshot row without a turn is not evidence
+                # of ownership. Hide it from source upsert and preserve the
+                # incumbent route byte-for-byte.
+                excluded_worker_refs.update(id(worker) for worker in generations)
             continue
-        state.clear_worker_generation_ambiguity(store, entry_key)
+        if reason == "freshest_turn_activity":
+            changed = (
+                state.clear_worker_generation_ambiguity(store, entry_key)
+                or changed
+            )
         selected_id = compact_ws(selected.get("id"), 160)
-        previous_id = _entry_worker_id(entry)
         excluded_worker_refs.update(
             id(worker) for worker in generations if worker is not selected
         )
@@ -366,16 +368,17 @@ def _resolve_stable_worker_generations(
                 "from_worker_id": previous_id,
                 "to_worker_id": selected_id,
                 "reason": reason,
+                "evidence_turn_id": evidence_turn_id,
             }
         )
 
     if not excluded_worker_refs:
-        return snapshot, resolutions
+        return snapshot, resolutions, changed
     resolved_snapshot = dict(snapshot)
     resolved_snapshot["workers"] = [
         worker for worker in workers if id(worker) not in excluded_worker_refs
     ]
-    return resolved_snapshot, resolutions
+    return resolved_snapshot, resolutions, changed
 
 
 def _turn_activity_statuses(payload: dict[str, Any], live_worker_ids: set[str] | None = None) -> tuple[dict[str, str], dict[str, str]]:
@@ -4958,12 +4961,14 @@ def _maybe_complete_turn_plan(
         "replaces_failed_plan_token",
         "pending_final_identity",
         "pending_working_predecessor_turn_id",
+        "pending_turn_suppressed",
         "abandoned_plan_token",
         "abandoned_content_revision",
     ):
         entry.pop(field, None)
     _clear_stream_delivery_state(entry, _turn_id(item))
     _record_delivery_success(entry, bot_kind)
+    entry.pop("tendwire_rebind_catchup_pending", None)
     return True
 
 
@@ -4987,6 +4992,7 @@ def _abandon_pending_turn_plan(
     entry["abandoned_content_revision"] = revision
     entry.pop("pending_plan_token", None)
     entry.pop("pending_content_revision", None)
+    entry.pop("pending_turn_suppressed", None)
     return True
 
 
@@ -5078,6 +5084,7 @@ def _reconcile_completed_turn_plans(
                 "replaces_failed_plan_token",
                 "pending_final_identity",
                 "pending_working_predecessor_turn_id",
+                "pending_turn_suppressed",
                 "abandoned_plan_token",
                 "abandoned_content_revision",
             ):
@@ -5107,7 +5114,11 @@ def _reconcile_completed_turn_plans(
                 isinstance(receipt, dict)
                 and receipt.get("plan_token") == plan_token
                 and receipt.get("substate")
-                in {"telegram_applied", "old_slot_retired"}
+                in {
+                    "telegram_applied",
+                    "old_slot_retired",
+                    "suppressed",
+                }
             ):
                 state.update_tendwire_turn_job(
                     store, job_key, substate="acknowledged"
@@ -5118,13 +5129,24 @@ def _reconcile_completed_turn_plans(
             "worker_id": _entry_worker_id(entry),
             "space_id": _entry_space_id(entry),
         }
-        if _maybe_complete_turn_plan(
-            store,
-            item,
-            entry,
-            plan_token=plan_token,
-            revision=revision,
-        ):
+        completed = (
+            _complete_suppressed_turn_plan(
+                store,
+                item,
+                entry,
+                plan_token=plan_token,
+                revision=revision,
+            )
+            if _suppressed_turn_plan(entry, plan_token, revision)
+            else _maybe_complete_turn_plan(
+                store,
+                item,
+                entry,
+                plan_token=plan_token,
+                revision=revision,
+            )
+        )
+        if completed:
             reconciled += 1
             advanced = True
         if advanced:
@@ -5267,6 +5289,176 @@ def _defer_turn_final(
         )
 
 
+def _turns_by_id_for_catchup(
+    turns_payload: dict[str, Any],
+    turn_projection: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    candidates = list(_turns(turns_payload))
+    if isinstance(turn_projection, Mapping):
+        candidates.extend(
+            item
+            for item in turn_projection.values()
+            if isinstance(item, dict)
+        )
+    for item in candidates:
+        turn_id = _turn_id(item)
+        if not turn_id or _turn_has_content_outcome(item):
+            continue
+        current = rows.get(turn_id)
+        if current is None or _turn_recency(item) > _turn_recency(current):
+            rows[turn_id] = item
+    return rows
+
+
+def _ensure_rebind_catchup_bound(
+    entry: dict[str, Any],
+    turns_payload: dict[str, Any],
+    turn_projection: Mapping[str, Any] | None,
+) -> tuple[dict[str, str] | None, dict[str, dict[str, Any]]]:
+    rows = _turns_by_id_for_catchup(turns_payload, turn_projection)
+    existing = entry.get("tendwire_rebind_catchup_bound")
+    if isinstance(existing, dict):
+        turn_id = str(existing.get("turn_id") or "")
+        updated_at = str(existing.get("updated_at") or "")
+        if turn_id and updated_at:
+            return {
+                "turn_id": turn_id,
+                "updated_at": updated_at,
+            }, rows
+    pending = entry.get("tendwire_rebind_catchup_pending")
+    identity = state.entry_stable_identity(entry)
+    if not isinstance(pending, dict) or identity is None:
+        return None, rows
+    completed = [
+        item
+        for item in rows.values()
+        if _turn_stable_identity(item) == identity
+        and _turn_has_complete_final(item)
+        and _turn_recency(item)
+    ]
+    if not completed:
+        return None, rows
+    newest_at = max(_turn_recency(item) for item in completed)
+    newest = [
+        item for item in completed if _turn_recency(item) == newest_at
+    ]
+    last_turn_id = str(entry.get("last_turn_id") or "")
+    chosen = next(
+        (item for item in newest if _turn_id(item) == last_turn_id),
+        newest[0] if len(newest) == 1 else None,
+    )
+    if chosen is None:
+        return None, rows
+    bound = {
+        "turn_id": _turn_id(chosen),
+        "updated_at": _turn_recency(chosen),
+    }
+    entry["tendwire_rebind_catchup_bound"] = dict(bound)
+    return bound, rows
+
+
+def _suppress_rebind_catchup_root(
+    entry: dict[str, Any],
+    payload: dict[str, Any],
+    turns_payload: dict[str, Any],
+    turn_projection: Mapping[str, Any] | None,
+) -> bool:
+    bound, rows = _ensure_rebind_catchup_bound(
+        entry, turns_payload, turn_projection
+    )
+    if bound is None:
+        return False
+    item = rows.get(str(payload.get("turn_id") or ""))
+    if item is None or _turn_stable_identity(item) != state.entry_stable_identity(
+        entry
+    ):
+        return False
+    updated_at = _turn_recency(item)
+    if not updated_at:
+        return False
+    if updated_at > bound["updated_at"]:
+        entry.pop("tendwire_rebind_catchup_bound", None)
+        entry.pop("tendwire_rebind_catchup_pending", None)
+        return False
+    return (
+        _turn_id(item) != bound["turn_id"]
+        and updated_at <= bound["updated_at"]
+    )
+
+
+def _suppressed_turn_plan(
+    entry: dict[str, Any], plan_token: str, revision: str
+) -> bool:
+    marker = entry.get("pending_turn_suppressed")
+    return bool(
+        isinstance(marker, dict)
+        and marker.get("plan_token") == plan_token
+        and marker.get("content_revision") == revision
+    )
+
+
+def _complete_suppressed_turn_plan(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    plan_token: str,
+    revision: str,
+) -> bool:
+    if not _suppressed_turn_plan(entry, plan_token, revision):
+        return False
+    expected_jobs = entry.get("pending_turn_job_count")
+    receipts = [
+        receipt
+        for receipt in state.tendwire_turn_jobs(store).values()
+        if isinstance(receipt, dict)
+        and receipt.get("plan_token") == plan_token
+    ]
+    if (
+        isinstance(expected_jobs, bool)
+        or not isinstance(expected_jobs, int)
+        or expected_jobs <= 0
+        or len(receipts) < expected_jobs
+        or any(
+            receipt.get("substate") != "acknowledged"
+            for receipt in receipts
+        )
+    ):
+        return False
+    state.mark_delivered(
+        store,
+        f"final:{_turn_id(item)}:{revision}",
+        {
+            "worker_id": entry.get("tendwire_worker_id"),
+            "turn_id": _turn_id(item),
+            "content_revision": revision,
+            "suppressed": True,
+        },
+    )
+    _clear_final_source_owner(
+        store, entry.get("pending_final_identity")
+    )
+    for field in (
+        "pending_turn_id",
+        "pending_content_revision",
+        "pending_plan_token",
+        "pending_turn_part_count",
+        "pending_turn_job_count",
+        "pending_turn_user_hash",
+        "pending_plan_generation",
+        "pending_acknowledged_prefix_count",
+        "replaces_failed_plan_token",
+        "pending_final_identity",
+        "pending_working_predecessor_turn_id",
+        "pending_turn_suppressed",
+        "abandoned_plan_token",
+        "abandoned_content_revision",
+    ):
+        entry.pop(field, None)
+    return True
+
+
 def _drain_turn_final(
     store: dict[str, Any],
     turns_payload: dict[str, Any],
@@ -5353,6 +5545,7 @@ def _drain_turn_final(
             if entry is None or not str(entry.get("topic_id") or ""):
                 owner_matches = False
                 owner_bound = False
+                suppress_historical = False
             else:
                 owner_matches, owner_bound = (
                     _bind_or_verify_final_source_owner(
@@ -5362,6 +5555,12 @@ def _drain_turn_final(
                         entry,
                         allow_bind=True,
                     )
+                )
+                suppress_historical = _suppress_rebind_catchup_root(
+                    entry,
+                    payload,
+                    turns_payload,
+                    turn_projection,
                 )
             if not owner_matches:
                 _defer_turn_final(
@@ -5477,6 +5676,15 @@ def _drain_turn_final(
                 entry["pending_working_predecessor_turn_id"] = (
                     predecessor_turn_id
                 )
+            if suppress_historical:
+                entry["pending_turn_suppressed"] = {
+                    "plan_token": str(
+                        entry.get("pending_plan_token") or ""
+                    ),
+                    "turn_id": _turn_id(item),
+                    "content_revision": _content_revision(item),
+                    "reason": "rebind_catchup_older_than_bound",
+                }
             materialized_sources[source_identity] = (
                 payload,
                 item,
@@ -5505,6 +5713,7 @@ def _drain_turn_final(
             in {
                 "telegram_applied",
                 "old_slot_retired",
+                "suppressed",
                 "acknowledged",
             }
         )
@@ -5812,6 +6021,85 @@ def _drain_turn_final(
             )
             result["_terminal_failure"] = True
             break
+
+        if _suppressed_turn_plan(entry, plan_token, revision):
+            if substate not in {"suppressed", "acknowledged"}:
+                state.update_tendwire_turn_job(
+                    store, job_key, substate="suppressed"
+                )
+                _checkpoint_turn_job(runtime)
+                substate = "suppressed"
+            ack = runtime.tendwire.turn_final_ack(
+                ref,
+                {
+                    "outcome": "applied",
+                    "job_key": job_key,
+                },
+            )
+            if ack.get("ok") is False:
+                observed = runtime.tendwire.connector_prepare_commit(
+                    plan_token=plan_token
+                )
+                advanced = False
+                if (
+                    observed.get("ok") is True
+                    and observed.get("plan_token") == plan_token
+                    and observed.get("state") == "completed"
+                ):
+                    for receipt_key, observed_receipt in list(
+                        state.tendwire_turn_jobs(store).items()
+                    ):
+                        if (
+                            isinstance(observed_receipt, dict)
+                            and observed_receipt.get("plan_token")
+                            == plan_token
+                            and observed_receipt.get("substate")
+                            in {
+                                "suppressed",
+                                "telegram_applied",
+                                "old_slot_retired",
+                            }
+                        ):
+                            state.update_tendwire_turn_job(
+                                store,
+                                receipt_key,
+                                substate="acknowledged",
+                            )
+                            advanced = True
+                    advanced = (
+                        _complete_suppressed_turn_plan(
+                            store,
+                            item,
+                            entry,
+                            plan_token=plan_token,
+                            revision=revision,
+                        )
+                        or advanced
+                    )
+                if advanced:
+                    _checkpoint_turn_job(runtime)
+                result["status"] = str(
+                    ack.get("status") or "turn_final_ack_failed"
+                )
+                result["changed"] = True
+                break
+            if substate != "acknowledged":
+                state.update_tendwire_turn_job(
+                    store, job_key, substate="acknowledged"
+                )
+                _checkpoint_turn_job(runtime)
+            result["delivered"] += 1
+            result["acked"] += 1
+            result["changed"] = True
+            if _complete_suppressed_turn_plan(
+                store,
+                item,
+                entry,
+                plan_token=plan_token,
+                revision=revision,
+            ):
+                _checkpoint_turn_job(runtime)
+            continue
 
         if substate in {
             "telegram_applied",
@@ -6307,6 +6595,7 @@ def _drain_turn_final(
                 "retryable",
                 "telegram_applied",
                 "old_slot_retired",
+                "suppressed",
             }
         ):
             state.update_tendwire_turn_job(
@@ -7300,13 +7589,17 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         # converted to bounded row-local outcomes by _validate_turns_payload.
         return _tendwire_non_success(runtime, exc.status)
     observed_snapshot_workers = _workers(snapshot)
-    snapshot, generation_resolutions = _resolve_stable_worker_generations(
+    (
+        snapshot,
+        generation_resolutions,
+        generation_resolution_changed,
+    ) = _resolve_stable_worker_generations(
         store,
         snapshot,
         turns_payload,
         observed_at=observed_at,
     )
-    changed = False
+    changed = generation_resolution_changed
     source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
     worker_rebinds = 0
     for resolution in generation_resolutions:
@@ -7331,6 +7624,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 to_worker_id=to_worker_id,
                 reason=resolution["reason"],
                 observed_at=observed_at,
+                evidence_turn_id=resolution["evidence_turn_id"],
             )
         )
     lifecycle_cleanup = _sync_topic_lifecycle_cleanup(
