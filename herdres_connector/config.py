@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -398,33 +399,42 @@ def close_dormant_after_hours(env: Any | None = None) -> float:
     not silently lose their setting.
     """
     source = os.environ if env is None else env
-    raw = source.get(
-        "HERDRES_CLOSE_DORMANT_AFTER_HOURS",
-        source.get("HERDR_TELEGRAM_TOPICS_CLOSE_DORMANT_AFTER_HOURS", "24"),
-    )
+    raw = source.get("HERDRES_CLOSE_DORMANT_AFTER_HOURS")
+    if raw is None or not str(raw).strip():
+        raw = source.get(
+            "HERDR_TELEGRAM_TOPICS_CLOSE_DORMANT_AFTER_HOURS", "24"
+        )
+    if raw is None or not str(raw).strip():
+        raw = "24"
     try:
-        value = float(str(raw or "0"))
+        value = float(str(raw))
     except (TypeError, ValueError):
-        return 24.0
+        print(
+            "herdres: invalid HERDRES_CLOSE_DORMANT_AFTER_HOURS; "
+            "topic lifecycle cleanup disabled",
+            file=sys.stderr,
+        )
+        return 0.0
     return min(24.0 * 365.0, max(0.0, value))
 
 
 def topic_cleanup_action(env: Any | None = None) -> str:
     """Lifecycle action for dormant pane and retired archive topics."""
     source = os.environ if env is None else env
-    value = str(
-        source.get("HERDRES_TOPIC_CLEANUP_ACTION", "close") or "close"
-    ).strip().lower()
+    raw = source.get("HERDRES_TOPIC_CLEANUP_ACTION", "close")
+    value = str(raw if raw is not None and str(raw).strip() else "close")
+    value = value.strip().lower()
     return value if value in {"close", "delete"} else "close"
 
 
 def cleanup_budget_seconds(env: Any | None = None) -> float:
     """Hard wall-clock budget for close/delete/reopen calls in one pass."""
     source = os.environ if env is None else env
+    raw = source.get("HERDRES_CLEANUP_BUDGET_SECONDS", "5")
+    if raw is None or not str(raw).strip():
+        raw = "5"
     try:
-        value = float(
-            str(source.get("HERDRES_CLEANUP_BUDGET_SECONDS", "5") or "0")
-        )
+        value = float(str(raw))
     except (TypeError, ValueError):
         return 5.0
     return min(60.0, max(0.0, value))
@@ -433,8 +443,11 @@ def cleanup_budget_seconds(env: Any | None = None) -> float:
 def cleanup_max_ops(env: Any | None = None) -> int:
     """Maximum close/reopen calls in one pass, independent of time budget."""
     source = os.environ if env is None else env
+    raw = source.get("HERDRES_CLEANUP_MAX_OPS", "12")
+    if raw is None or not str(raw).strip():
+        raw = "12"
     try:
-        value = int(str(source.get("HERDRES_CLEANUP_MAX_OPS", "12") or "0"))
+        value = int(str(raw))
     except (TypeError, ValueError):
         return 12
     return min(100, max(0, value))

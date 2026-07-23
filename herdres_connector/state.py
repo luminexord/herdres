@@ -1359,7 +1359,6 @@ def _retire_rekey_entry(
         if entry.get("topic_name") != desired_name:
             entry["topic_name"] = desired_name
             entry["retired_topic_rename_pending"] = True
-        entry.setdefault("retired_topic_close_pending", True)
 
 
 def _topic_age_key(entry_key: str, entry: dict[str, Any]) -> tuple[int, int | str, str]:

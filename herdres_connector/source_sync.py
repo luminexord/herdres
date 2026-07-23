@@ -48,6 +48,10 @@ _SUBMISSION_STATES = frozenset(
 )
 _TOPIC_CLEANUP_ATTEMPT_CAP = 3
 _TOPIC_CLEANUP_AUDIT_LIMIT = 200
+_TOPIC_CLEANUP_MIN_RETRY_SECONDS = 60.0
+_TOPIC_CLEANUP_PERMANENT_ERROR_KINDS = frozenset(
+    {"bad_request", "bot_access", "capability"}
+)
 
 
 class _TurnContentError(RuntimeError):
@@ -1685,6 +1689,19 @@ def _sync_retired_worker_topics(
     chat_id: str,
 ) -> int:
     """Archive retired restart-era topics without ever deleting history."""
+    def stamp_closed(entry: dict[str, Any]) -> None:
+        closed_at = time.time()
+        entry["retired_topic_closed"] = True
+        entry.setdefault("topic_closed_at", closed_at)
+        entry.setdefault("topic_auto_closed_at", closed_at)
+        for field in (
+            "retired_topic_notice_pending",
+            "retired_topic_notice_error",
+            "retired_topic_rename_pending",
+            "retired_topic_rename_error",
+        ):
+            entry.pop(field, None)
+
     changed = 0
     for entry in state.source_worker_entries(store).values():
         if not state.entry_is_retired(entry):
@@ -1722,6 +1739,10 @@ def _sync_retired_worker_topics(
                 entry.pop("retired_topic_notice_pending", None)
                 entry["retired_topic_missing"] = True
                 changed += 1
+            elif classify_telegram_error(sent.get("error")) == "topic_closed":
+                stamp_closed(entry)
+                changed += 1
+                continue
             else:
                 entry["retired_topic_notice_error"] = compact_ws(
                     sent.get("error"), 240
@@ -1741,6 +1762,9 @@ def _sync_retired_worker_topics(
             elif _topic_missing(renamed.get("error")):
                 entry.pop("retired_topic_rename_pending", None)
                 entry["retired_topic_missing"] = True
+                changed += 1
+            elif classify_telegram_error(renamed.get("error")) == "topic_closed":
+                stamp_closed(entry)
                 changed += 1
             else:
                 entry["retired_topic_rename_error"] = compact_ws(
@@ -2243,7 +2267,6 @@ def _topic_cleanup_attempts(store: dict[str, Any]) -> dict[str, int]:
     raw = store.get("telegram_topic_cleanup_attempts")
     if not isinstance(raw, dict):
         raw = {}
-        store["telegram_topic_cleanup_attempts"] = raw
     return raw
 
 
@@ -2254,8 +2277,55 @@ def _topic_cleanup_abandoned(store: dict[str, Any]) -> set[str]:
     return {str(item) for item in raw if str(item)}
 
 
+def _topic_cleanup_retry_after(store: dict[str, Any]) -> dict[str, float]:
+    raw = store.get("telegram_topic_cleanup_retry_after")
+    if not isinstance(raw, dict):
+        raw = {}
+    return raw
+
+
 def _topic_cleanup_target_key(action: str, topic_id: str) -> str:
     return f"{action}:{topic_id}"
+
+
+def _prune_topic_cleanup_tracking(store: dict[str, Any]) -> bool:
+    """Drop retry/abandon state once its provider topic can no longer exist."""
+    topic_ids = {
+        str(entry.get("topic_id"))
+        for entry in state.source_worker_entries(store).values()
+        if entry.get("topic_id")
+    }
+
+    def stale(target_key: Any, *, drop_reopen: bool) -> bool:
+        action, separator, topic_id = str(target_key).partition(":")
+        return (
+            not separator
+            or not topic_id
+            or (drop_reopen and action == "reopen")
+            or topic_id not in topic_ids
+        )
+
+    changed = False
+    attempts = _topic_cleanup_attempts(store)
+    for target_key in list(attempts):
+        if stale(target_key, drop_reopen=True):
+            attempts.pop(target_key, None)
+            changed = True
+    retry_after = _topic_cleanup_retry_after(store)
+    for target_key in list(retry_after):
+        if stale(target_key, drop_reopen=False):
+            retry_after.pop(target_key, None)
+            changed = True
+    abandoned = _topic_cleanup_abandoned(store)
+    kept_abandoned = {
+        target_key
+        for target_key in abandoned
+        if not stale(target_key, drop_reopen=True)
+    }
+    if kept_abandoned != abandoned:
+        store["telegram_topic_cleanup_abandoned"] = sorted(kept_abandoned)
+        changed = True
+    return changed
 
 
 def _refresh_topic_cleanup_lifecycle(
@@ -2300,17 +2370,23 @@ def _refresh_topic_cleanup_lifecycle(
 
 
 def _topic_cleanup_targets(
-    store: dict[str, Any], *, now: float
-) -> tuple[list[dict[str, Any]], int]:
+    store: dict[str, Any], *, now: float, preview: bool = False
+) -> tuple[list[dict[str, Any]], int, int]:
     statically_protected = _topic_cleanup_protected_ids(
         store, include_live=False
     )
     mutation_protected = _topic_cleanup_protected_ids(store)
-    abandoned = _topic_cleanup_abandoned(store)
+    abandoned = {
+        target_key
+        for target_key in _topic_cleanup_abandoned(store)
+        if not target_key.startswith("reopen:")
+    }
     ttl_seconds = config.close_dormant_after_hours() * 3600.0
     cleanup_action = config.topic_cleanup_action()
     targets: list[dict[str, Any]] = []
     abandoned_eligible = 0
+    delayed_eligible = 0
+    retry_after = _topic_cleanup_retry_after(store)
     seen: set[tuple[str, str]] = set()
 
     def add_target(
@@ -2322,7 +2398,7 @@ def _topic_cleanup_targets(
         reason: str,
         protected: set[str],
     ) -> None:
-        nonlocal abandoned_eligible
+        nonlocal abandoned_eligible, delayed_eligible
         topic_id = str(entry.get("topic_id") or "")
         dedup = (action, topic_id)
         if not topic_id or topic_id in protected or dedup in seen:
@@ -2331,6 +2407,13 @@ def _topic_cleanup_targets(
         target_key = _topic_cleanup_target_key(action, topic_id)
         if target_key in abandoned:
             abandoned_eligible += 1
+            return
+        try:
+            next_attempt_at = float(retry_after.get(target_key) or 0)
+        except (TypeError, ValueError):
+            next_attempt_at = 0
+        if next_attempt_at > now:
+            delayed_eligible += 1
             return
         targets.append(
             {
@@ -2365,11 +2448,15 @@ def _topic_cleanup_targets(
             )
 
     if ttl_seconds <= 0:
-        return targets, abandoned_eligible
+        return targets, abandoned_eligible, delayed_eligible
     for entry_key, entry in state.source_worker_entries(store).items():
         if cleanup_action == "close" and entry.get("topic_closed_at") is not None:
             continue
         if state.entry_is_retired(entry):
+            if entry.get("retired_topic_notice_pending") or entry.get(
+                "retired_topic_rename_pending"
+            ):
+                continue
             raw_since = entry.get("routing_retired_at")
             reason = "retired_topic_ttl"
         else:
@@ -2384,7 +2471,11 @@ def _topic_cleanup_targets(
         try:
             since = float(raw_since)
         except (TypeError, ValueError):
-            continue
+            if not preview:
+                continue
+            # A dry run must reveal destructive candidates even before a real
+            # pass has written its first-observed lifecycle watermark.
+            since = now - ttl_seconds
         if now - since < ttl_seconds:
             continue
         add_target(
@@ -2395,7 +2486,7 @@ def _topic_cleanup_targets(
             reason=reason,
             protected=mutation_protected,
         )
-    return targets, abandoned_eligible
+    return targets, abandoned_eligible, delayed_eligible
 
 
 def _topic_cleanup_target_still_valid(
@@ -2420,6 +2511,11 @@ def _topic_cleanup_target_still_valid(
             and entry.get("topic_closed_at") is not None
         )
     if target["action"] == "close" and entry.get("topic_closed_at") is not None:
+        return False
+    if state.entry_is_retired(entry) and (
+        entry.get("retired_topic_notice_pending")
+        or entry.get("retired_topic_rename_pending")
+    ):
         return False
     ttl_seconds = config.close_dormant_after_hours() * 3600.0
     if ttl_seconds <= 0:
@@ -2460,25 +2556,32 @@ def _execute_topic_cleanup_targets(
         if len(outcomes) >= max_ops or time.monotonic() >= deadline:
             return outcomes, len(targets) - index
         try:
-            if target["action"] == "reopen":
-                response = runtime.telegram.reopen_topic(
-                    chat_id, str(target["topic_id"])
-                )
-            elif target["action"] == "delete":
-                response = runtime.telegram.delete_topic(
-                    chat_id, str(target["topic_id"])
-                )
-            else:
-                response = runtime.telegram.close_topic(
-                    chat_id, str(target["topic_id"])
-                )
+            action = str(target["action"])
+            method = getattr(
+                runtime.telegram, f"{action}_topic_for_cleanup", None
+            )
+            if method is None:
+                method = getattr(runtime.telegram, f"{action}_topic")
+            response = method(chat_id, str(target["topic_id"]))
         except RateLimited as exc:
             outcomes.append(
                 {
                     "target": target,
                     "status": "rate_limited",
                     "retry_after": exc.retry_after,
+                    "received_at": time.time(),
                     "error": compact_ws(exc, 240),
+                }
+            )
+            return outcomes, len(targets) - index - 1
+        if response.get("rate_limited"):
+            outcomes.append(
+                {
+                    "target": target,
+                    "status": "rate_limited",
+                    "retry_after": response.get("retry_after") or 1,
+                    "received_at": time.time(),
+                    "error": compact_ws(response.get("error"), 240),
                 }
             )
             return outcomes, len(targets) - index - 1
@@ -2561,27 +2664,38 @@ def _apply_topic_cleanup_outcomes(
     now: float,
 ) -> None:
     attempts = _topic_cleanup_attempts(store)
+    retry_after = _topic_cleanup_retry_after(store)
     abandoned = _topic_cleanup_abandoned(store)
     audit = store.get("telegram_topic_cleanup_audit")
     if not isinstance(audit, list):
         audit = []
     for outcome in outcomes:
         target = outcome["target"]
+        target_key = str(target["target_key"])
+        if outcome["status"] == "rate_limited":
+            try:
+                current_backoff = float(
+                    store.get("telegram_topic_cleanup_backoff_until") or 0
+                )
+            except (TypeError, ValueError):
+                current_backoff = 0
+            received_at = float(outcome.get("received_at") or time.time())
+            store["telegram_topic_cleanup_backoff_until"] = max(
+                current_backoff,
+                received_at + float(outcome.get("retry_after") or 1),
+            )
+            result["operations"] += 1
+            result["deferred"] += 1
+            result["changed"] = True
+            continue
         if not _topic_cleanup_target_still_valid(store, target, now=now):
             result["deferred"] += 1
             continue
         result["operations"] += 1
-        target_key = str(target["target_key"])
-        if outcome["status"] == "rate_limited":
-            store["telegram_topic_cleanup_backoff_until"] = (
-                now + float(outcome.get("retry_after") or 1)
-            )
-            result["deferred"] += 1
-            result["changed"] = True
-            continue
         entry = state.source_worker_entries(store)[str(target["entry_key"])]
         if outcome["status"] == "success":
             attempts.pop(target_key, None)
+            retry_after.pop(target_key, None)
             kind = str(outcome.get("kind") or "")
             if target["action"] == "delete":
                 _record_lifecycle_topic_deleted(
@@ -2599,11 +2713,12 @@ def _apply_topic_cleanup_outcomes(
                 if state.entry_is_retired(entry):
                     entry["retired_topic_closed"] = True
                 if kind in {"topic_not_found", "not_found"}:
+                    entry.pop("topic_id", None)
+                    entry.pop("topic_closed_at", None)
+                    entry.pop("topic_auto_closed_at", None)
+                    entry["topic_missing_at"] = now
                     if state.entry_is_retired(entry):
                         entry["retired_topic_missing"] = True
-                    else:
-                        entry.pop("topic_id", None)
-                        entry["topic_missing_at"] = now
                 result["closed"] += 1
             else:
                 entry.pop("topic_closed_at", None)
@@ -2626,19 +2741,27 @@ def _apply_topic_cleanup_outcomes(
             )
             result["changed"] = True
             continue
-        try:
-            previous_attempts = int(attempts.get(target_key) or 0)
-        except (TypeError, ValueError):
-            previous_attempts = 0
-        count = previous_attempts + 1
-        attempts[target_key] = count
         entry["topic_cleanup_last_error"] = str(outcome.get("error") or "")
         entry["topic_cleanup_last_error_at"] = now
-        if count >= _TOPIC_CLEANUP_ATTEMPT_CAP:
-            abandoned.add(target_key)
-            result["abandoned"] += 1
+        retry_after[target_key] = now + _TOPIC_CLEANUP_MIN_RETRY_SECONDS
+        kind = str(outcome.get("kind") or "")
+        if (
+            target["action"] != "reopen"
+            and kind in _TOPIC_CLEANUP_PERMANENT_ERROR_KINDS
+        ):
+            try:
+                previous_attempts = int(attempts.get(target_key) or 0)
+            except (TypeError, ValueError):
+                previous_attempts = 0
+            count = previous_attempts + 1
+            attempts[target_key] = count
+            if count >= _TOPIC_CLEANUP_ATTEMPT_CAP:
+                abandoned.add(target_key)
+                retry_after.pop(target_key, None)
+                result["abandoned"] += 1
         result["changed"] = True
     store["telegram_topic_cleanup_attempts"] = attempts
+    store["telegram_topic_cleanup_retry_after"] = retry_after
     store["telegram_topic_cleanup_abandoned"] = sorted(abandoned)
     store["telegram_topic_cleanup_audit"] = audit[-_TOPIC_CLEANUP_AUDIT_LIMIT:]
 
@@ -2656,9 +2779,16 @@ def _sync_topic_lifecycle_cleanup(
     result["changed"] = _refresh_topic_cleanup_lifecycle(
         store, now=clock, dry_run=runtime.dry_run
     )
-    targets, abandoned_eligible = _topic_cleanup_targets(store, now=clock)
-    result["candidates"] = len(targets) + abandoned_eligible
+    if not runtime.dry_run:
+        result["changed"] = _prune_topic_cleanup_tracking(store) or result["changed"]
+    targets, abandoned_eligible, delayed_eligible = _topic_cleanup_targets(
+        store, now=clock, preview=runtime.dry_run
+    )
+    result["candidates"] = (
+        len(targets) + abandoned_eligible + delayed_eligible
+    )
     result["abandoned"] = abandoned_eligible
+    result["deferred"] = delayed_eligible
     if runtime.dry_run:
         result["would_close"] = sum(
             target["action"] == "close" for target in targets
@@ -2677,7 +2807,7 @@ def _sync_topic_lifecycle_cleanup(
     except (TypeError, ValueError):
         backoff_until = 0
     if backoff_until > clock:
-        result["deferred"] = len(targets)
+        result["deferred"] += len(targets)
         return result
     if store.pop("telegram_topic_cleanup_backoff_until", None) is not None:
         result["changed"] = True
@@ -6903,6 +7033,12 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         chat_id=chat_id,
         now=observed_at,
     )
+    if delta_observation is not None:
+        # Lifecycle cleanup may save, release the lock, and reload the store in
+        # place. Rebind the observation to the reloaded delta lane so the final
+        # page watermark/checkpoint is not written into an orphaned sub-dict.
+        delta = _delta_state(store, now=observed_at)
+        delta_observation["delta"] = delta
     submission_link_updates = _apply_submission_links(
         store, _turns(turns_payload), now=observed_at
     )

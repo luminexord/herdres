@@ -583,6 +583,7 @@ def test_retired_only_worker_history_does_not_block_fresh_creation():
         reason="test_retired_history",
         archive_topic=True,
     )
+    assert "retired_topic_close_pending" not in retired
 
     telegram = FakeTelegram()
     runtime = SyncRuntime(FakeTendwire(workers=[worker]), telegram, with_outbox=False)

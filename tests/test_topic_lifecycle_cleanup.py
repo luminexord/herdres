@@ -5,10 +5,11 @@ from contextlib import contextmanager
 
 import pytest
 
-from herdres_connector import source_sync, state
+from herdres_connector import config, source_sync, state
 from herdres_connector.source_sync import SyncRuntime
 from herdres_connector.telegram_delivery import (
     RateLimited,
+    TelegramClient,
     TelegramError,
     classify_telegram_error,
 )
@@ -55,10 +56,11 @@ class CleanupTelegram:
         return {"ok": True, "topic_id": str(100 + len(self.created))}
 
 
-def _runtime(telegram):
+def _runtime(telegram, *, dry_run=False):
     return SyncRuntime(
         tendwire=None,
         telegram=telegram,
+        dry_run=dry_run,
         with_outbox=False,
     )
 
@@ -191,7 +193,8 @@ def test_already_gone_close_is_terminal_success():
     assert second["operations"] == 0
     assert telegram.closed == ["12"]
     assert entry["retired_topic_missing"] is True
-    assert entry["topic_closed_at"] == NOW
+    assert "topic_id" not in entry
+    assert "topic_closed_at" not in entry
 
 
 def test_three_failures_permanently_abandon_target():
@@ -203,7 +206,7 @@ def test_three_failures_permanently_abandon_target():
 
     results = [
         _cleanup(store, telegram, now=NOW + offset)
-        for offset in (0, 1, 2, 3)
+        for offset in (0, 60, 120, 180)
     ]
 
     assert telegram.closed == ["13", "13", "13"]
@@ -420,7 +423,8 @@ def test_pre_lifecycle_retired_close_marker_is_adopted_without_api_call():
     assert entry["topic_closed_at"] == NOW
 
 
-def test_rate_limit_persists_backoff_without_spending_attempt_cap():
+def test_rate_limit_persists_backoff_without_spending_attempt_cap(monkeypatch):
+    monkeypatch.setattr(source_sync.time, "time", lambda: NOW)
     entry = _entry("50", dormant_at=NOW - DAY)
     store = _store(("pane:one", entry))
     telegram = CleanupTelegram(
@@ -439,6 +443,7 @@ def test_rate_limit_persists_backoff_without_spending_attempt_cap():
 
 
 def test_delete_mode_rate_limit_backoff_and_attempt_cap(monkeypatch):
+    monkeypatch.setattr(source_sync.time, "time", lambda: NOW)
     monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
     limited_entry = _entry("51", dormant_at=NOW - DAY)
     limited_store = _store(("pane:limited", limited_entry))
@@ -464,7 +469,7 @@ def test_delete_mode_rate_limit_backoff_and_attempt_cap(monkeypatch):
 
     results = [
         _cleanup(failing_store, failing_telegram, now=NOW + offset)
-        for offset in (0, 1, 2, 3)
+        for offset in (0, 60, 120, 180)
     ]
 
     assert failing_telegram.deleted == ["52", "52", "52"]
@@ -505,3 +510,247 @@ def test_topic_closed_has_distinct_error_classification():
     assert classify_telegram_error(
         TelegramError("Bad Request: TOPIC_CLOSED")
     ) not in {"topic_not_found", "bad_request"}
+
+
+class AlwaysRateLimitedTopics(TelegramClient):
+    def api(self, _method, _payload):
+        raise RateLimited(9, "Too Many Requests")
+
+
+@pytest.mark.parametrize("action", ("close", "delete", "reopen"))
+def test_legacy_topic_methods_swallow_rate_limits_but_cleanup_variants_raise(
+    action,
+):
+    telegram = AlwaysRateLimitedTopics(token="test")
+
+    legacy = getattr(telegram, f"{action}_topic")("-100", "70")
+
+    assert legacy == {
+        "ok": False,
+        "error": "Too Many Requests",
+        "rate_limited": True,
+        "retry_after": 9,
+    }
+    with pytest.raises(RateLimited):
+        getattr(telegram, f"{action}_topic_for_cleanup")("-100", "70")
+
+
+def test_empty_cleanup_config_values_match_unset_defaults():
+    assert config.close_dormant_after_hours(
+        {"HERDRES_CLOSE_DORMANT_AFTER_HOURS": ""}
+    ) == config.close_dormant_after_hours({})
+    assert config.topic_cleanup_action(
+        {"HERDRES_TOPIC_CLEANUP_ACTION": ""}
+    ) == config.topic_cleanup_action({})
+    assert config.cleanup_budget_seconds(
+        {"HERDRES_CLEANUP_BUDGET_SECONDS": ""}
+    ) == config.cleanup_budget_seconds({})
+    assert config.cleanup_max_ops(
+        {"HERDRES_CLEANUP_MAX_OPS": ""}
+    ) == config.cleanup_max_ops({})
+
+
+def test_invalid_dormant_ttl_fails_closed_with_diagnostic(capsys):
+    assert config.close_dormant_after_hours(
+        {"HERDRES_CLOSE_DORMANT_AFTER_HOURS": "never"}
+    ) == 0
+    assert "lifecycle cleanup disabled" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("action", "preview_key"),
+    (("close", "would_close"), ("delete", "would_delete")),
+)
+def test_dry_run_previews_underlying_dormancy_without_live_stamps(
+    monkeypatch, action, preview_key
+):
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", action)
+    entry = _entry("71", status="closed")
+    store = _store(("pane:one", entry))
+
+    result = source_sync._sync_topic_lifecycle_cleanup(
+        store,
+        _runtime(CleanupTelegram(), dry_run=True),
+        chat_id="-100",
+        now=NOW,
+    )
+
+    assert result[preview_key] == 1
+    assert "topic_dormant_at" not in entry
+
+
+@pytest.mark.parametrize(
+    "pending_field",
+    ("retired_topic_notice_pending", "retired_topic_rename_pending"),
+)
+def test_retired_ttl_waits_for_notice_and_rename(pending_field):
+    entry = _entry("72", retired_at=NOW - DAY)
+    entry[pending_field] = True
+    store = _store(("retired:one", entry))
+    telegram = CleanupTelegram()
+
+    result = _cleanup(store, telegram)
+
+    assert result["closed"] == 0
+    assert telegram.closed == []
+
+
+class TopicClosedArchiveTelegram(CleanupTelegram):
+    def __init__(self):
+        super().__init__()
+        self.notices = []
+        self.renames = []
+
+    def send_message(self, _chat_id, _text, **kwargs):
+        self.notices.append(str(kwargs.get("thread_id") or ""))
+        return {"ok": False, "error": "Bad Request: TOPIC_CLOSED"}
+
+    def rename_topic(self, _chat_id, topic_id, _name):
+        self.renames.append(str(topic_id))
+        return {"ok": False, "error": "Bad Request: TOPIC_CLOSED"}
+
+
+@pytest.mark.parametrize("path", ("notice", "rename"))
+def test_retired_topic_closed_is_terminal_for_notice_and_rename(path):
+    entry = _entry("73", retired_at=NOW)
+    if path == "notice":
+        entry["retired_topic_notice_pending"] = True
+        entry["retired_topic_rename_pending"] = True
+    else:
+        entry["retired_topic_rename_pending"] = True
+    store = _store(("retired:one", entry))
+    telegram = TopicClosedArchiveTelegram()
+
+    first = source_sync._sync_retired_worker_topics(
+        store, _runtime(telegram), chat_id="-100"
+    )
+    second = source_sync._sync_retired_worker_topics(
+        store, _runtime(telegram), chat_id="-100"
+    )
+
+    assert first == 1
+    assert second == 0
+    assert "retired_topic_notice_pending" not in entry
+    assert "retired_topic_rename_pending" not in entry
+    assert entry["retired_topic_closed"] is True
+    assert entry["topic_closed_at"] == entry["topic_auto_closed_at"]
+    assert len(telegram.notices) + len(telegram.renames) == 1
+
+
+def test_reopen_failures_never_permanently_abandon_and_are_spaced():
+    entry = _entry("74", status="idle")
+    entry["topic_closed_at"] = NOW - DAY
+    entry["topic_auto_closed_at"] = NOW - DAY
+    store = _store(("pane:one", entry))
+    telegram = CleanupTelegram(
+        [{"ok": False, "error": "Bad Request: temporary reopen failure"}] * 4
+    )
+
+    results = [
+        _cleanup(store, telegram, now=NOW + offset)
+        for offset in (0, 1, 60, 120, 180)
+    ]
+
+    assert telegram.reopened == ["74", "74", "74", "74"]
+    assert results[1]["deferred"] == 1
+    assert store["telegram_topic_cleanup_attempts"] == {}
+    assert store["telegram_topic_cleanup_abandoned"] == []
+
+
+def test_transient_failures_are_spaced_without_spending_attempt_cap():
+    entry = _entry("75", dormant_at=NOW - DAY)
+    store = _store(("pane:one", entry))
+    telegram = CleanupTelegram(
+        [{"ok": False, "error": "temporary transport outage"}] * 2
+    )
+
+    first = _cleanup(store, telegram)
+    too_soon = _cleanup(store, telegram, now=NOW + 59)
+    retried = _cleanup(store, telegram, now=NOW + 60)
+
+    assert first["operations"] == 1
+    assert too_soon["operations"] == 0
+    assert too_soon["deferred"] == 1
+    assert retried["operations"] == 1
+    assert telegram.closed == ["75", "75"]
+    assert store["telegram_topic_cleanup_attempts"] == {}
+
+
+def test_abandon_tracking_is_removed_when_topic_disappears():
+    entry = _entry("76", dormant_at=NOW - DAY)
+    store = _store(("pane:one", entry))
+    telegram = CleanupTelegram(
+        [{"ok": False, "error": "Bad Request: permanent"}] * 3
+    )
+    for offset in (0, 60, 120):
+        _cleanup(store, telegram, now=NOW + offset)
+    assert store["telegram_topic_cleanup_abandoned"] == ["close:76"]
+
+    entry.pop("topic_id")
+    result = _cleanup(store, telegram, now=NOW + 180)
+
+    assert result["changed"] is True
+    assert store["telegram_topic_cleanup_abandoned"] == []
+    assert store["telegram_topic_cleanup_attempts"] == {}
+
+
+def test_phase3_real_reload_discards_close_for_concurrently_revived_pane(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    entry = _entry("77", dormant_at=NOW - DAY)
+    store = _store(("pane:one", entry))
+    state.save_state(store, state_path)
+
+    class RevivingTelegram(CleanupTelegram):
+        def close_topic(self, chat_id, topic_id):
+            result = super().close_topic(chat_id, topic_id)
+            concurrent = state.load_state(state_path)
+            revived = concurrent["panes"]["pane:one"]
+            revived["status"] = "idle"
+            revived["tendwire_raw_status"] = "idle"
+            state.save_state(concurrent, state_path)
+            return result
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        result = _cleanup(current, RevivingTelegram())
+
+    revived = current["panes"]["pane:one"]
+    assert result["closed"] == 0
+    assert result["deferred"] == 1
+    assert revived["status"] == "idle"
+    assert "topic_closed_at" not in revived
+
+
+def test_rate_limit_backoff_uses_receipt_time_even_after_conflict(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    clock = [NOW]
+    monkeypatch.setattr(source_sync.time, "time", lambda: clock[0])
+    entry = _entry("78", dormant_at=NOW - DAY)
+    store = _store(("pane:one", entry))
+    state.save_state(store, state_path)
+
+    class RevivingRateLimitedTelegram(CleanupTelegram):
+        def close_topic(self, _chat_id, topic_id):
+            self.closed.append(str(topic_id))
+            concurrent = state.load_state(state_path)
+            revived = concurrent["panes"]["pane:one"]
+            revived["status"] = "idle"
+            revived["tendwire_raw_status"] = "idle"
+            state.save_state(concurrent, state_path)
+            clock[0] = NOW + 10
+            raise RateLimited(7, "Too Many Requests")
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        result = _cleanup(current, RevivingRateLimitedTelegram())
+
+    assert result["operations"] == 1
+    assert result["deferred"] == 1
+    assert current["panes"]["pane:one"]["status"] == "idle"
+    assert current["telegram_topic_cleanup_backoff_until"] == NOW + 17
