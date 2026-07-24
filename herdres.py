@@ -20,7 +20,13 @@ from herdres_connector import ingress_requests
 from herdres_connector.ingress_identity import validate_request_id
 from herdres_connector.managed_bots import managed_bot_kind_for_username
 from herdres_connector.safe import compact_ws, public_prune, sanitize_text, short_hash
-from herdres_connector.source_sync import SyncRuntime, sync_once
+from herdres_connector.outbound_dispatcher import OutboundDispatcher
+from herdres_connector.source_sync import (
+    SyncRuntime,
+    deliver_submission_working_card,
+    drain_outbound_once,
+    sync_once,
+)
 from herdres_connector.telegram_delivery import TelegramClient
 from herdres_connector.tendwire_client import (
     TendwireClient,
@@ -545,6 +551,32 @@ def _submit_ingress_command_record(
                 created_at=record.get("created_at"),
                 detail=disposition,
             )
+            if isinstance(submission_id, str) and submission_id:
+                try:
+                    working = deliver_submission_working_card(
+                        store,
+                        request_id,
+                        _runtime(
+                            dry_run=False,
+                            with_outbox=False,
+                            checkpoint=lambda: state.save_state(store),
+                        ),
+                        chat_id=config.telegram_chat_id(store),
+                        now=transitioned_at,
+                    )
+                    _ingress_timing_log(
+                        "working_card_delivery",
+                        request_id,
+                        created_at=record.get("created_at"),
+                        detail=str(working.get("status") or "unknown"),
+                    )
+                except Exception as exc:  # noqa: BLE001 - acceptance stays authoritative
+                    _ingress_timing_log(
+                        "working_card_delivery",
+                        request_id,
+                        created_at=record.get("created_at"),
+                        detail=f"failed:{type(exc).__name__}",
+                    )
             return outcome
         if disposition == "terminal_rejected":
             outcome = ingress_requests.mark_terminal(
@@ -968,6 +1000,37 @@ def _sync_pass() -> dict[str, Any]:
     return result
 
 
+def _outbound_pass() -> dict[str, Any]:
+    """Drain connector work independently of the full sync-pass duration."""
+
+    with state.state_lock(phase="outbound_pass.load"):
+        with state.lock_phase("outbound_pass.load"):
+            store = state.load_state()
+
+        def checkpoint() -> None:
+            if not state.lock_held():
+                raise RuntimeError(
+                    "outbound checkpoint requires the held state lock"
+                )
+            with state.lock_phase("outbound.checkpoint"):
+                state.save_state(store)
+
+        with state.lock_phase("outbound.drain"):
+            result = drain_outbound_once(
+                store,
+                _runtime(
+                    dry_run=False,
+                    with_outbox=True,
+                    checkpoint=checkpoint,
+                ),
+                chat_id=config.telegram_chat_id(store),
+            )
+        if result.get("changed"):
+            with state.lock_phase("outbound_pass.final_save"):
+                state.save_state(store)
+    return result
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
     config.load_env_file()
     config.require_source_mode()
@@ -976,13 +1039,34 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return _json(_sync_pass())
     import time as _time
 
-    while True:
-        started = _time.monotonic()
-        try:
-            _sync_pass()
-        except Exception as exc:  # noqa: BLE001 - keep the loop alive across transient failures
-            print(json.dumps({"ok": False, "status": "sync_pass_failed", "error": sanitize_text(str(exc), 300)}), flush=True)
-        _time.sleep(max(0.5, interval - (_time.monotonic() - started)))
+    def outbound_error(exc: Exception) -> None:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "status": "outbound_pass_failed",
+                    "error": sanitize_text(str(exc), 300),
+                }
+            ),
+            flush=True,
+        )
+
+    dispatcher = OutboundDispatcher(
+        _outbound_pass,
+        database_path=config.tendwire_db_path(),
+        on_error=outbound_error,
+    )
+    dispatcher.start()
+    try:
+        while True:
+            started = _time.monotonic()
+            try:
+                _sync_pass()
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive across transient failures
+                print(json.dumps({"ok": False, "status": "sync_pass_failed", "error": sanitize_text(str(exc), 300)}), flush=True)
+            _time.sleep(max(0.5, interval - (_time.monotonic() - started)))
+    finally:
+        dispatcher.stop()
 
 
 def cmd_command(_args: argparse.Namespace) -> int:

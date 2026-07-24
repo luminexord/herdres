@@ -113,6 +113,24 @@ class _OfflockClient:
         return call
 
 
+def _offlock_runtime(
+    store: dict[str, Any], runtime: SyncRuntime
+) -> SyncRuntime:
+    """Release the connector-state flock around provider calls when held."""
+
+    if not state.lock_held() or runtime.dry_run:
+        return runtime
+    return SyncRuntime(
+        _OfflockClient(runtime.tendwire, store),
+        _OfflockClient(runtime.telegram, store),
+        dry_run=runtime.dry_run,
+        with_outbox=runtime.with_outbox,
+        max_sends=runtime.max_sends,
+        checkpoint=runtime.checkpoint,
+        after_provider_accept=runtime.after_provider_accept,
+    )
+
+
 def _workers(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in snapshot.get("workers", []) if isinstance(item, dict)]
 
@@ -3479,58 +3497,136 @@ def _sync_submission_working_cards(
             )
             if record is None:
                 continue
-        submission_id = str(record.get("submission_id") or "")
-        turn_id = str(record.get("turn_id") or "")
-        entry = _submission_owner_entry(store, record)
-        if entry is None:
-            continue
-        counts["updated"] += int(
-            _associate_submission_working(store, record, entry)
-        )
-        if record.get("submission_state") == "complete" or (
-            turn_id and turn_id in complete_turn_ids
-        ):
-            if record.get("submission_state") != "complete":
-                before = dict(record)
-                ingress_requests.attach_submission_receipt(
-                    record,
-                    submission_id,
-                    "complete",
-                    turn_id,
-                    now=now,
-                )
-                counts["updated"] += int(record != before)
-            continue
-        stream_identity = turn_id or submission_id
-        item = {
-            "id": stream_identity,
-            "worker_id": str(
-                entry.get("tendwire_worker_id") or entry.get("worker_id") or ""
-            ),
-            "space_id": str(
-                entry.get("tendwire_space_id") or entry.get("space_id") or ""
-            ),
-            "complete": False,
-            "user_text": _submission_instruction(record),
-        }
-        before = dict(entry)
-        delivered = _deliver_working(
+        delivered = _deliver_submission_working_record(
             store,
-            item,
-            entry,
+            record,
             runtime,
             chat_id=chat_id,
+            now=now,
+            complete_turn_ids=complete_turn_ids,
         )
-        if delivered or entry.get("last_stream_turn_id") == stream_identity:
-            if entry.get("last_stream_submission_id") != submission_id:
-                entry["last_stream_submission_id"] = submission_id
-            message_id = str(entry.get("last_stream_message_id") or "")
-            binding = state.find_message_binding(store, message_id)
-            if isinstance(binding, dict):
-                binding["submission_id"] = submission_id
-        counts["sent"] += int(delivered)
-        counts["updated"] += int(not delivered and entry != before)
+        counts["sent"] += delivered["sent"]
+        counts["updated"] += delivered["updated"]
     return counts
+
+
+def _deliver_submission_working_record(
+    store: dict[str, Any],
+    record: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    now: float,
+    complete_turn_ids: set[str] | None = None,
+) -> dict[str, int]:
+    """Deliver the working card for one durable Tendwire v3 receipt."""
+
+    counts = {"sent": 0, "updated": 0}
+    submission_id = str(record.get("submission_id") or "")
+    turn_id = str(record.get("turn_id") or "")
+    if not submission_id:
+        return counts
+    entry = _submission_owner_entry(store, record)
+    if entry is None:
+        return counts
+    counts["updated"] += int(
+        _associate_submission_working(store, record, entry)
+    )
+    if record.get("submission_state") == "complete" or (
+        turn_id
+        and complete_turn_ids is not None
+        and turn_id in complete_turn_ids
+    ):
+        if record.get("submission_state") != "complete":
+            before = dict(record)
+            ingress_requests.attach_submission_receipt(
+                record,
+                submission_id,
+                "complete",
+                turn_id,
+                now=now,
+            )
+            counts["updated"] += int(record != before)
+        return counts
+    stream_identity = turn_id or submission_id
+    item = {
+        "id": stream_identity,
+        "worker_id": str(
+            entry.get("tendwire_worker_id") or entry.get("worker_id") or ""
+        ),
+        "space_id": str(
+            entry.get("tendwire_space_id") or entry.get("space_id") or ""
+        ),
+        "complete": False,
+        "user_text": _submission_instruction(record),
+    }
+    before = dict(entry)
+    delivered = _deliver_working(
+        store,
+        item,
+        entry,
+        runtime,
+        chat_id=chat_id,
+    )
+    if delivered or entry.get("last_stream_turn_id") == stream_identity:
+        if entry.get("last_stream_submission_id") != submission_id:
+            entry["last_stream_submission_id"] = submission_id
+        message_id = str(entry.get("last_stream_message_id") or "")
+        binding = state.find_message_binding(store, message_id)
+        if isinstance(binding, dict):
+            binding["submission_id"] = submission_id
+    counts["sent"] += int(delivered)
+    counts["updated"] += int(not delivered and entry != before)
+    return counts
+
+
+def deliver_submission_working_card(
+    store: dict[str, Any],
+    request_id: str,
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Deliver one receipt-derived card at the durable acceptance boundary."""
+
+    observed_at = time.time() if now is None else float(now)
+    record = next(
+        (
+            candidate
+            for candidate in ingress_requests.retained_submission_records(
+                store, now=observed_at
+            )
+            if candidate.get("request_id") == request_id
+        ),
+        None,
+    )
+    if record is None:
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "sent": 0,
+            "updated": 0,
+            "status": "receipt_not_found",
+        }
+    effective_runtime = _offlock_runtime(store, runtime)
+    counts = _deliver_submission_working_record(
+        store,
+        record,
+        effective_runtime,
+        chat_id=chat_id,
+        now=observed_at,
+    )
+    changed = bool(counts["sent"] or counts["updated"])
+    if changed and runtime.checkpoint is not None:
+        runtime.checkpoint()
+    return {
+        "ok": True,
+        "request_id": request_id,
+        **counts,
+        "changed": changed,
+        "status": "delivered" if counts["sent"] else "unchanged",
+    }
 
 
 def _refind_entry(store: dict[str, Any], entry_key: str | None) -> dict[str, Any] | None:
@@ -5562,6 +5658,7 @@ def _drain_turn_final(
     max_operations: int,
     turn_projection: Mapping[str, Any] | None = None,
     yield_barrier: Callable[[], None] | None = None,
+    legacy_turns_loader: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     result = {
         "enabled": runtime.with_outbox,
@@ -5588,6 +5685,7 @@ def _drain_turn_final(
     materialized_sources: dict[
         str, tuple[dict[str, Any], dict[str, Any]]
     ] = {}
+    legacy_turns_loaded = False
     lease_seconds = config.tendwire_turn_final_lease_seconds()
     for _iteration in range(max_operations + 100):
         # Terminal failures must only act on the lease from this iteration.
@@ -5863,6 +5961,35 @@ def _drain_turn_final(
                     and _content_revision(candidate) == revision
                 ]
                 item = matches[0] if len(matches) == 1 else None
+            if (
+                item is None
+                and not legacy_turns_loaded
+                and legacy_turns_loader is not None
+            ):
+                legacy_turns_loaded = True
+                relisted = legacy_turns_loader()
+                if relisted.get("ok") is False:
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "transient_delivery",
+                        result,
+                        delay_seconds=1,
+                    )
+                    break
+                try:
+                    turns_payload = _validate_turns_payload(relisted)
+                except _TurnContentError as exc:
+                    _fail_turn_final(
+                        runtime,
+                        ref,
+                        f"{exc.status}: {exc}",
+                        result,
+                    )
+                    break
+                item = _turn_item_by_revision(
+                    turns_payload, revision
+                )
             if item is None:
                 _fail_turn_final(
                     runtime,
@@ -7782,6 +7909,68 @@ def _observe_sync_inputs(
     return observed
 
 
+def drain_outbound_once(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    max_operations: int | None = None,
+) -> dict[str, Any]:
+    """Drain outbound-only work without waiting for a reconciliation pass.
+
+    Modern turn-final jobs carry their immutable source descriptor. The retained
+    delta projection remains the compatibility source for older queued jobs.
+    This path deliberately performs no snapshot, pending, topic, or pane scan.
+    """
+
+    effective_runtime = _offlock_runtime(store, runtime)
+    operation_limit = max(
+        1,
+        int(
+            effective_runtime.max_sends
+            if max_operations is None
+            else max_operations
+        ),
+    )
+    delta = store.get(_DELTA_STATE_KEY)
+    projection = (
+        delta.get("projection")
+        if isinstance(delta, dict)
+        and isinstance(delta.get("projection"), dict)
+        else None
+    )
+    turn_final_result = _drain_turn_final(
+        store,
+        {"schema_version": TURN_SCHEMA_VERSION, "turns": []},
+        effective_runtime,
+        chat_id=chat_id,
+        max_operations=operation_limit,
+        turn_projection=projection,
+        legacy_turns_loader=effective_runtime.tendwire.turns,
+    )
+    remaining = max(
+        0,
+        operation_limit - int(turn_final_result.get("operations") or 0),
+    )
+    attention_result = drain_outbox(
+        store,
+        effective_runtime.telegram,
+        effective_runtime.tendwire,
+        chat_id=chat_id,
+        max_sends=remaining,
+        dry_run=effective_runtime.dry_run,
+    )
+    return {
+        "ok": True,
+        "changed": bool(
+            turn_final_result.get("changed")
+            or attention_result.get("changed")
+        ),
+        "tendwire_turn_final": turn_final_result,
+        "tendwire_outbox": attention_result,
+    }
+
+
 def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     config.require_source_mode()
     observed_at = time.time()
@@ -7817,16 +8006,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             # The list envelope/schema is connector-wide. Descriptor defects
             # are converted to bounded row-local outcomes by validation.
             return _tendwire_non_success(runtime, exc.status)
-    if state.lock_held() and not runtime.dry_run:
-        runtime = SyncRuntime(
-            _OfflockClient(runtime.tendwire, store),
-            _OfflockClient(runtime.telegram, store),
-            dry_run=runtime.dry_run,
-            with_outbox=runtime.with_outbox,
-            max_sends=runtime.max_sends,
-            checkpoint=runtime.checkpoint,
-            after_provider_accept=runtime.after_provider_accept,
-        )
+    runtime = _offlock_runtime(store, runtime)
 
     def _yield_between_turns() -> None:
         if not state.lock_held():
