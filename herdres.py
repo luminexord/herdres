@@ -30,6 +30,7 @@ from herdres_connector.tendwire_client import (
 
 VERSION = "0.7.0rc4-tendwired-source-only"
 SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the target again."
+BUSY_SEND_REPLY = "Submitted to busy Tendwire worker."
 REKEYED_TOPIC_QUARANTINE_REPLY = (
     "This pane was re-keyed after a Herdr restart; a fresh topic is being "
     "created. Please use the new pane topic when it appears."
@@ -327,14 +328,17 @@ def _success_reply(response: dict[str, Any]) -> str:
         str(result.get("transport_state") or "").strip().lower() == "submitted"
         and str(result.get("target_state_at_send") or "").strip().lower() == "working"
     ):
-        return "Submitted to busy Tendwire worker."
+        return BUSY_SEND_REPLY
     return "Sent to Tendwire worker."
 
 
 
 
 def _submit_ingress_command_record(
-    store: dict[str, Any], record: dict[str, Any]
+    store: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    instant_ack_posted: bool = False,
 ) -> dict[str, Any]:
     """Replay durable bytes off-lock and reduce authoritative dispositions.
 
@@ -487,10 +491,16 @@ def _submit_ingress_command_record(
                     state.save_state(store)
                     return outcome
             reply = _success_reply(response) if config.ack_on_send() else ""
+            if instant_ack_posted and reply != BUSY_SEND_REPLY:
+                reply = ""
             outcome = ingress_requests.mark_terminal(
                 record,
                 disposition,
                 now=transitioned_at,
+                # In durable-lane mode the gateway posts success before
+                # submission. Its empty terminal reply prevents cache replay
+                # from resurrecting a late second success message; the explicit
+                # legacy rollback path retains its historical terminal ack.
                 reply=reply,
             )
             state.save_state(store)
@@ -600,7 +610,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             if cached is not None:
                 return cached
             if isinstance(record.get("request_json"), str):
-                return _submit_ingress_command_record(store, record)
+                return _submit_ingress_command_record(
+                    store,
+                    record,
+                    instant_ack_posted=payload.get("instant_ack_posted") is True,
+                )
         elif changed:
             state.save_state(store)
         # A write-in is deliberately two-step: only a prior inline-button tap
@@ -824,7 +838,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             # Exact canonical bytes are fsynced before Tendwire can observe the
             # request, and every retry reads only this stored string.
             state.save_state(store)
-        return _submit_ingress_command_record(store, record)
+        return _submit_ingress_command_record(
+            store,
+            record,
+            instant_ack_posted=payload.get("instant_ack_posted") is True,
+        )
 
 
 def callback_reply(_payload: dict[str, Any]) -> dict[str, Any]:

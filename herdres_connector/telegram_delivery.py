@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import config, state
 from .rendering import html_to_plain, render_attention_notice, split_text_chunks
@@ -554,10 +554,13 @@ def drain_outbox(
     chat_id: str,
     max_sends: int,
     dry_run: bool = False,
+    yield_barrier: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     result = {"enabled": True, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
     if max_sends <= 0:
         return result
+    if yield_barrier is not None:
+        yield_barrier()
     poll = tendwire.connector_poll(limit=max_sends)
     if not poll.get("ok"):
         result.update({"changed": True, "status": poll.get("status") or "poll_failed"})
@@ -568,6 +571,8 @@ def drain_outbox(
     delivered = audit.setdefault("delivered_identities", [])
     delivered_set = {str(item) for item in delivered}
     for item in items[:max_sends]:
+        if yield_barrier is not None:
+            yield_barrier()
         ref = str(item.get("ref") or "")
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         identity = short_hash({"key": item.get("key"), "payload": payload}, 24)

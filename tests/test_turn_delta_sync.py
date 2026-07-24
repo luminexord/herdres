@@ -218,6 +218,107 @@ def test_delta_watermark_persists_across_cleanup_phase_reload(
     )
 
 
+def test_offlock_delta_observation_revalidates_cursor_before_apply(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    store = _store()
+    store["tendwire_delta_sync"] = _active_delta()
+    state.save_state(store, state_path)
+
+    class ConcurrentDelta(DeltaTendwire):
+        def turn_delta(self, **kwargs):
+            current = state.load_state(state_path)
+            current["tendwire_delta_sync"]["watermark"] = "twdelta1.concurrent"
+            current["tendwire_delta_sync"]["projection"] = {
+                "concurrent": {"id": "concurrent"}
+            }
+            state.save_state(current, state_path)
+            return _page(
+                [],
+                mode="changes",
+                checkpoint="twdelta1.stale-observation",
+            )
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        result = sync_once(
+            current,
+            SyncRuntime(
+                ConcurrentDelta([], workers=[], spaces=[]),
+                FakeTelegram(),
+                with_outbox=False,
+            ),
+        )
+
+    assert result["status"] == "tendwire_delta_cursor_changed"
+    assert current["tendwire_delta_sync"]["watermark"] == "twdelta1.concurrent"
+    assert set(current["tendwire_delta_sync"]["projection"]) == {"concurrent"}
+
+
+def test_late_release_window_revalidates_delta_basis_before_checkpoint(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    store = _store()
+    store["tendwire_delta_sync"] = _active_delta()
+    state.save_state(store, state_path)
+
+    def concurrent_full_pass(
+        current, _runtime, *, chat_id, snapshot_worker_ids
+    ):
+        assert chat_id == "-100"
+        assert snapshot_worker_ids == set()
+        with state.released_lock():
+            concurrent = state.load_state(state_path)
+            concurrent["tendwire_delta_sync"]["watermark"] = (
+                "twdelta1.concurrent-full"
+            )
+            concurrent["tendwire_delta_sync"]["projection"] = {
+                "concurrent": {"id": "concurrent"}
+            }
+            state.save_state(concurrent, state_path)
+        state.reload_state_in_place(current, state_path)
+        return {
+            "deleted": 0,
+            "failed": 0,
+            "pruned": 0,
+            "changed": False,
+        }
+
+    monkeypatch.setattr(source_sync, "_cleanup_topics", concurrent_full_pass)
+    tendwire = DeltaTendwire(
+        [
+            _page(
+                [],
+                mode="changes",
+                checkpoint="twdelta1.stale-late-checkpoint",
+            )
+        ],
+        workers=[],
+        spaces=[],
+    )
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        result = sync_once(
+            current,
+            SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
+        )
+
+    assert result["status"] == "tendwire_delta_cursor_changed"
+    assert (
+        current["tendwire_delta_sync"]["watermark"]
+        == "twdelta1.concurrent-full"
+    )
+    assert (
+        state.load_state(state_path)["tendwire_delta_sync"]["watermark"]
+        == "twdelta1.concurrent-full"
+    )
+
+
 def test_active_working_upsert_uses_existing_card_delivery_path():
     prior = _turn_row("turn-working", "twrev1.working0", None, user="prompt")
     changed = _turn_row("turn-working", "twrev1.working1", None, user="prompt")

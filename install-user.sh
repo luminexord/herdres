@@ -100,8 +100,62 @@ print("Registered herdres-pending-hook in ~/.claude/settings.json.")
 HOOKPY
 fi
 
-[ -f "$HOME/.config/herdres/herdres.env" ] || \
-    install -Dm600 .env.example "$HOME/.config/herdres/herdres.env"
+HERDRES_ENV_PATH="$HOME/.config/herdres/herdres.env"
+[ -f "$HERDRES_ENV_PATH" ] || install -Dm600 .env.example "$HERDRES_ENV_PATH"
+
+# Older installation guidance explicitly put HERDRES_INBOUND_LANES=0 in this
+# EnvironmentFile. systemd gives EnvironmentFile values precedence over unit
+# Environment= defaults, so leaving that line active silently disables the
+# gateway lane machinery during an upgrade. Running this installer is the
+# user's consent to comment out that one legacy rollback value; preserve it and
+# an explanatory marker so opting back out remains a deliberate edit.
+if grep -Eq '^[[:space:]]*(export[[:space:]]+)?HERDRES_INBOUND_LANES[[:space:]]*=[[:space:]]*(['"'"'"]?0['"'"'"]?)[[:space:]]*(#.*)?$' "$HERDRES_ENV_PATH"; then
+    python3 - "$HERDRES_ENV_PATH" <<'LANEMIGRATE'
+import os
+import re
+import stat
+import sys
+import tempfile
+
+path = sys.argv[1]
+pattern = re.compile(
+    r"^\s*(?:export\s+)?HERDRES_INBOUND_LANES\s*=\s*(?:0|'0'|\"0\")\s*(?:#.*)?$"
+)
+marker = (
+    "# Herdres installer migration (approved by running install-user.sh): "
+    "legacy lane rollback disabled; uncomment the next line only to roll back."
+)
+with open(path, encoding="utf-8") as source:
+    lines = source.read().splitlines(keepends=True)
+changed = False
+rewritten = []
+for line in lines:
+    body = line.rstrip("\r\n")
+    ending = line[len(body):]
+    if pattern.fullmatch(body):
+        rewritten.extend((marker + (ending or "\n"), "# " + body + ending))
+        changed = True
+    else:
+        rewritten.append(line)
+if changed:
+    metadata = os.stat(path, follow_symlinks=False)
+    directory = os.path.dirname(path)
+    descriptor, temporary = tempfile.mkstemp(prefix=".herdres.env.", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+            target.writelines(rewritten)
+            target.flush()
+            os.fsync(target.fileno())
+        os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    print("Commented legacy HERDRES_INBOUND_LANES=0 in herdres.env.")
+LANEMIGRATE
+fi
 
 # Request IDs must survive connector restarts and Telegram redelivery without
 # depending on a bot token. Install the dedicated raw key once, fully written
