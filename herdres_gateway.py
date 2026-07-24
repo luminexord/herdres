@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import urllib.request
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from herdres_connector import config, decisions, ingress_requests, speech, state
 from herdres_connector.ingress_identity import derive_telegram_request_id, load_request_id_key, validate_request_id
@@ -61,6 +62,31 @@ _CHILD_REPLY_LIMIT = 160
 def log(message: str) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] [herdres-gateway] {message}", flush=True)
+
+
+def _timing_log(
+    hop: str,
+    *,
+    request_id: str = "",
+    update_id: int | None = None,
+    seq: int | None = None,
+    elapsed_from_receive: float | None = None,
+    detail: str = "",
+) -> None:
+    if not config.gateway_timing_logs_enabled():
+        return
+    fields = [f"hop={hop}", f"at={time.time():.6f}"]
+    if request_id:
+        fields.append(f"request_id={request_id}")
+    if update_id is not None:
+        fields.append(f"update_id={int(update_id)}")
+    if seq is not None:
+        fields.append(f"seq={int(seq)}")
+    if elapsed_from_receive is not None:
+        fields.append(f"receive_ms={max(0.0, elapsed_from_receive) * 1000.0:.1f}")
+    if detail:
+        fields.append(f"detail={sanitize_text(detail, 120).replace(' ', '_')}")
+    log("lane timing " + " ".join(fields))
 
 
 def _legacy_offset_path_for(key: str = MANAGER_BOT_KIND) -> Path:
@@ -420,7 +446,6 @@ def _preview_lane_update(
 
 _OVERFLOW_NOTICE_LOCK = threading.Lock()
 _OVERFLOW_NOTICE_AT: dict[str, float] = {}
-QUEUED_ACK = "Queued."
 
 
 def _notify_lane_overflow(token: str, route: dict[str, Any], lane: str) -> None:
@@ -540,6 +565,9 @@ def run_herdres_command(payload: dict[str, Any]) -> dict[str, Any]:
         return _private_retry_child_result(request_id)
     if proc.returncode != 0:
         return _private_retry_child_result(request_id)
+    for raw_line in proc.stderr.decode("utf-8", "replace").splitlines():
+        if raw_line.startswith("[herdres-timing] "):
+            log(sanitize_text(raw_line, 500))
     try:
         data = json.loads(proc.stdout.decode("utf-8") or "{}")
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -603,6 +631,7 @@ def handle_message(
     bot_key: str | None = None,
     ingress_first_seen_at: float | None = None,
     instant_ack_posted: bool = False,
+    deferred_reply: Callable[[str], None] | None = None,
 ) -> str:
     chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
     try:
@@ -658,6 +687,9 @@ def handle_message(
     ):
         reply = ""
     if not reply:
+        return CHECKPOINT_ADVANCE
+    if deferred_reply is not None:
+        deferred_reply(reply)
         return CHECKPOINT_ADVANCE
     try:
         TelegramClient(token=token).send_message(
@@ -751,6 +783,7 @@ def handle_update(
     bot_key: str | None = None,
     ingress_first_seen_at: float | None = None,
     instant_ack_posted: bool = False,
+    deferred_reply: Callable[[str], None] | None = None,
 ) -> str:
     update_id = update.get("update_id")
     if type(update_id) is not int or update_id < 0:
@@ -781,6 +814,7 @@ def handle_update(
         bot_key=bot_key,
         ingress_first_seen_at=ingress_first_seen_at,
         instant_ack_posted=instant_ack_posted,
+        deferred_reply=deferred_reply,
     )
 
 
@@ -815,6 +849,7 @@ def _poll_once_lanes(
     timeout_seconds: int,
     request_id_key: bytes,
     spool: IngressLaneSpool,
+    on_enqueue: Callable[[], None] | None = None,
 ) -> None:
     receiver_kind = _receiver_id_for_key(key)
     offset = spool.cursor(receiver_kind)
@@ -834,16 +869,29 @@ def _poll_once_lanes(
             return
         offset = spool.initialize_cursor(receiver_kind, legacy_offset)
 
-    for update in get_updates(token, offset, timeout_seconds=timeout_seconds):
+    poll_started = time.monotonic()
+    updates = get_updates(token, offset, timeout_seconds=timeout_seconds)
+    _timing_log(
+        "get_updates_return",
+        detail=f"receiver={receiver_kind},batch={len(updates)},poll_ms={(time.monotonic() - poll_started) * 1000.0:.1f}",
+    )
+    if not updates:
+        return
+    # A Telegram response is one routing cohort. State is atomically replaced,
+    # so one immutable snapshot is sufficient for every cheap preview in it.
+    # Loading the multi-megabyte state once per update made polling fall behind
+    # precisely when Telegram returned a burst.
+    store = state.load_state()
+    mirror_offset: int | None = None
+    for update in updates:
         raw_update_id = update.get("update_id")
         if type(raw_update_id) is not int or raw_update_id < 0:
             log(f"invalid update id for {key}; cursor retained")
             break
         update_id = raw_update_id
+        first_seen_at = time.time()
+        _timing_log("telegram_update_received", update_id=update_id)
         try:
-            # state.json is replaced atomically, so this routing preview needs no
-            # flock and can never queue behind sync or a different lane.
-            store = state.load_state()
             preview = _preview_lane_update(
                 update,
                 store,
@@ -856,10 +904,9 @@ def _poll_once_lanes(
                 break
             if preview.get("action") != "spool":
                 offset = spool.advance_cursor(receiver_kind, update_id + 1)
-                _mirror_offset_best_effort(offset, key)
+                mirror_offset = offset
                 continue
 
-            first_seen_at = time.time()
             request_id = str(preview["request_id"])
             result = spool.enqueue(
                 request_id=request_id,
@@ -877,7 +924,17 @@ def _poll_once_lanes(
                 already_done=_cached_ingress_terminal(store, request_id),
             )
             offset = result.next_update_id
-            _mirror_offset_best_effort(offset, key)
+            mirror_offset = offset
+            _timing_log(
+                "durable_enqueue_commit",
+                request_id=request_id,
+                update_id=update_id,
+                seq=result.seq,
+                elapsed_from_receive=time.time() - first_seen_at,
+                detail=result.status,
+            )
+            if result.status == "enqueued" and on_enqueue is not None:
+                on_enqueue()
             if result.status == "overflow":
                 _notify_lane_overflow(
                     token, preview["route"], str(preview["lane_key"])
@@ -888,6 +945,11 @@ def _poll_once_lanes(
                 f"{type(exc).__name__}: {sanitize_text(str(exc), 200)}"
             )
             break
+    # SQLite is authoritative in lane mode. Mirror only the final cursor for the
+    # whole Telegram response instead of fsyncing the legacy rollback file once
+    # per update.
+    if mirror_offset is not None:
+        _mirror_offset_best_effort(mirror_offset, key)
 
 
 class _InboundLaneDispatcher:
@@ -923,6 +985,11 @@ class _InboundLaneDispatcher:
         self._token_lock = threading.Lock()
         self._tokens: dict[str, tuple[str, str]] = {}
         self._threads: list[threading.Thread] = []
+        self._notification_queues: list[queue.Queue[tuple[LaneItem, str, str] | None]] = [
+            queue.Queue(maxsize=max(32, config.inbound_lane_depth() * 2))
+            for _index in range(self.worker_count)
+        ]
+        self._notification_threads: list[threading.Thread] = []
 
     def update_specs(self, specs: list[tuple[str, str, int]]) -> None:
         tokens = {
@@ -939,6 +1006,15 @@ class _InboundLaneDispatcher:
         reclaimed = self.spool.reclaim_processing()
         if reclaimed:
             log(f"reclaimed {reclaimed} inbound dispatch lease(s)")
+        for index, notification_queue in enumerate(self._notification_queues):
+            thread = threading.Thread(
+                target=self._notification_worker,
+                args=(notification_queue,),
+                name=f"herdres-inbound-notify-{index}",
+                daemon=True,
+            )
+            self._notification_threads.append(thread)
+            thread.start()
         for index in range(self.worker_count):
             thread = threading.Thread(
                 target=self._worker,
@@ -952,8 +1028,16 @@ class _InboundLaneDispatcher:
     def stop(self) -> None:
         self._stop.set()
         self._wake.set()
+        for notification_queue in self._notification_queues:
+            try:
+                notification_queue.put_nowait(None)
+            except queue.Full:
+                # The stop flag makes a busy worker exit before its next send.
+                pass
         for thread in self._threads:
             thread.join(timeout=2.0)
+        for thread in self._notification_threads:
+            thread.join(timeout=0.05)
 
     def wake(self) -> None:
         self._wake.set()
@@ -973,6 +1057,13 @@ class _InboundLaneDispatcher:
                     self._wake.wait(0.05)
                     self._wake.clear()
                     continue
+                _timing_log(
+                    "dispatcher_claim",
+                    request_id=item.request_id,
+                    update_id=item.update_id,
+                    seq=item.seq,
+                    elapsed_from_receive=time.time() - item.first_seen_at,
+                )
                 self._dispatch(item, lease_owner)
             except Exception as exc:  # noqa: BLE001 - leases make worker-loop recovery safe
                 log(
@@ -1007,7 +1098,6 @@ class _InboundLaneDispatcher:
             return
         heartbeat.start()
         try:
-            instant_ack_posted = self._post_queued_ack(item, token)
             checkpoint = handle_update(
                 item.update,
                 token,
@@ -1015,7 +1105,7 @@ class _InboundLaneDispatcher:
                 request_id_key=self.request_id_key,
                 bot_key=bot_key,
                 ingress_first_seen_at=item.first_seen_at,
-                instant_ack_posted=instant_ack_posted,
+                deferred_reply=lambda reply: self._defer_reply(item, token, reply),
             )
         except Exception as exc:  # noqa: BLE001 - same request ID is retried from durable bytes
             log(
@@ -1027,7 +1117,18 @@ class _InboundLaneDispatcher:
             lease_finished.set()
             heartbeat.join(timeout=1.0)
         if checkpoint == CHECKPOINT_ADVANCE:
-            self.spool.mark_done(item.seq, lease_owner)
+            self.spool.mark_done(
+                item.seq,
+                lease_owner,
+                notify_state="sent" if item.kind != "message" else None,
+            )
+            _timing_log(
+                "lane_done",
+                request_id=item.request_id,
+                update_id=item.update_id,
+                seq=item.seq,
+                elapsed_from_receive=time.time() - item.first_seen_at,
+            )
         else:
             self.spool.retry(
                 item.seq,
@@ -1035,44 +1136,79 @@ class _InboundLaneDispatcher:
                 backoff_seconds=self.backoff_seconds,
             )
 
-    def _post_queued_ack(self, item: LaneItem, token: str) -> bool:
-        """Attempt the first-delivery acknowledgement before child submission."""
+    def _defer_reply(self, item: LaneItem, token: str, reply: str) -> None:
+        """Claim one terminal reply and queue it outside the lane critical path."""
 
-        if item.kind == "message" and item.notify_state == "sent":
-            return True
-        if item.kind != "message":
-            if self.spool.claim_notification(item.seq):
-                self.spool.mark_notification_sent(item.seq)
-            return False
-        if not self.spool.claim_notification(item.seq):
-            return False
-        if not config.ack_on_send():
-            # ``sent`` is reserved for proof that the instant acknowledgement
-            # actually posted.  ``claimed`` prevents a later config toggle from
-            # introducing an out-of-order acknowledgement on retry.
-            return False
+        if item.kind != "message" or not self.spool.claim_notification(item.seq):
+            return
+        shard = hash(item.lane_key) % len(self._notification_queues)
         try:
-            sent = TelegramClient(token=token).send_message(
-                str(item.route.get("chat_id") or ""),
-                QUEUED_ACK,
-                thread_id=str(item.route.get("topic_id") or ""),
-                reply_to_message_id=str(item.route.get("message_id") or ""),
-                notify=True,
-            )
-        except Exception as exc:  # noqa: BLE001 - claimed ambiguity is never retried
-            log(
-                f"queued ack {item.seq} ambiguous: "
-                f"{type(exc).__name__}: {sanitize_text(str(exc), 160)}"
-            )
-            return False
-        if sent.get("ok"):
-            return self.spool.mark_notification_sent(item.seq)
-        else:
-            log(
-                f"queued ack {item.seq} failed: "
-                f"{sanitize_text(sent.get('error') or 'Telegram send failed', 160)}"
-            )
-        return False
+            self._notification_queues[shard].put_nowait((item, token, reply))
+        except queue.Full:
+            # The durable claim makes this the same no-retry ambiguity as a
+            # process loss immediately after a Telegram write.
+            log(f"lane reply {item.seq} dropped: notification shard is full")
+            return
+        _timing_log(
+            "ack_queued",
+            request_id=item.request_id,
+            update_id=item.update_id,
+            seq=item.seq,
+            elapsed_from_receive=time.time() - item.first_seen_at,
+        )
+
+    def _notification_worker(
+        self,
+        notification_queue: queue.Queue[tuple[LaneItem, str, str] | None],
+    ) -> None:
+        """Send replies FIFO per lane shard without delaying command submission."""
+
+        while True:
+            try:
+                job = notification_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._stop.is_set():
+                    return
+                continue
+            if job is None:
+                return
+            if self._stop.is_set():
+                return
+            item, token, reply = job
+            try:
+                sent = TelegramClient(token=token).send_message(
+                    str(item.route.get("chat_id") or ""),
+                    reply,
+                    thread_id=str(item.route.get("topic_id") or ""),
+                    reply_to_message_id=str(item.route.get("message_id") or ""),
+                    notify=True,
+                )
+                stored = (
+                    self.spool.mark_notification_sent(item.seq)
+                    if sent.get("ok")
+                    else False
+                )
+            except Exception as exc:  # noqa: BLE001 - claimed ambiguity is never retried
+                log(
+                    f"lane reply {item.seq} ambiguous: "
+                    f"{type(exc).__name__}: {sanitize_text(str(exc), 160)}"
+                )
+                continue
+            if stored:
+                _timing_log(
+                    "ack_stored",
+                    request_id=item.request_id,
+                    update_id=item.update_id,
+                    seq=item.seq,
+                    elapsed_from_receive=time.time() - item.first_seen_at,
+                )
+            elif sent.get("ok"):
+                log(f"lane reply {item.seq} sent but notification state was not claimable")
+            else:
+                log(
+                    f"lane reply {item.seq} failed: "
+                    f"{sanitize_text(sent.get('error') or 'Telegram send failed', 160)}"
+                )
 
     def _renew_lease(
         self,
@@ -1105,6 +1241,7 @@ def _poll_once(
     timeout_seconds: int,
     request_id_key: bytes,
     spool: IngressLaneSpool | None = None,
+    on_enqueue: Callable[[], None] | None = None,
 ) -> None:
     if config.inbound_lanes_enabled():
         _poll_once_lanes(
@@ -1113,6 +1250,7 @@ def _poll_once(
             timeout_seconds=timeout_seconds,
             request_id_key=request_id_key,
             spool=spool or IngressLaneSpool(),
+            on_enqueue=on_enqueue,
         )
         return
     offset = _read_offset(key)
@@ -1162,9 +1300,8 @@ def _poll_worker(
                 timeout_seconds=timeout_seconds,
                 request_id_key=request_id_key,
                 spool=spool,
+                on_enqueue=dispatcher.wake if dispatcher is not None else None,
             )
-            if dispatcher is not None:
-                dispatcher.wake()
         except Exception as exc:  # noqa: BLE001 - a dead poll thread silently drops inbound messages
             log(f"poll error for {key}: {type(exc).__name__}: {sanitize_text(str(exc), 200)}")
             time.sleep(ERROR_BACKOFF)

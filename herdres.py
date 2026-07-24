@@ -332,6 +332,30 @@ def _success_reply(response: dict[str, Any]) -> str:
     return "Sent to Tendwire worker."
 
 
+def _ingress_timing_log(
+    hop: str,
+    request_id: str,
+    *,
+    created_at: float | None = None,
+    detail: str = "",
+) -> None:
+    """Write a private, parent-filtered ingress timing breadcrumb to stderr."""
+
+    if not config.gateway_timing_logs_enabled():
+        return
+    now = time.time()
+    fields = [
+        f"hop={hop}",
+        f"at={now:.6f}",
+        f"request_id={request_id}",
+    ]
+    if created_at is not None:
+        fields.append(f"receive_ms={max(0.0, now - float(created_at)) * 1000.0:.1f}")
+    if detail:
+        fields.append(f"detail={sanitize_text(detail, 120).replace(' ', '_')}")
+    print("[herdres-timing] " + " ".join(fields), file=sys.stderr, flush=True)
+
+
 
 
 def _submit_ingress_command_record(
@@ -403,9 +427,20 @@ def _submit_ingress_command_record(
 
         # Construct the child only after deadline/cache preflight. command_json
         # sends these exact UTF-8 bytes rather than reserializing the request.
+        _ingress_timing_log(
+            "tendwire_submit_sent",
+            request_id,
+            created_at=record.get("created_at"),
+        )
         with state.released_lock():
             response = TendwireClient().command_json(request_json)
         transitioned_at = time.time()
+        _ingress_timing_log(
+            "tendwire_submit_returned",
+            request_id,
+            created_at=record.get("created_at"),
+            detail=str(response.get("disposition") or response.get("status") or "unknown"),
+        )
 
         latest = state.load_state()
         store.clear()
@@ -497,13 +532,18 @@ def _submit_ingress_command_record(
                 record,
                 disposition,
                 now=transitioned_at,
-                # In durable-lane mode the gateway posts success before
-                # submission. Its empty terminal reply prevents cache replay
-                # from resurrecting a late second success message; the explicit
-                # legacy rollback path retains its historical terminal ack.
+                # A legacy caller that already posted an instant success keeps
+                # its empty terminal reply. The lane gateway leaves this reply
+                # intact and queues it off the dispatch critical path.
                 reply=reply,
             )
             state.save_state(store)
+            _ingress_timing_log(
+                "receipt_stored",
+                request_id,
+                created_at=record.get("created_at"),
+                detail=disposition,
+            )
             return outcome
         if disposition == "terminal_rejected":
             outcome = ingress_requests.mark_terminal(
@@ -513,6 +553,12 @@ def _submit_ingress_command_record(
                 reply=SAFE_SEND_FAILURE_REPLY,
             )
             state.save_state(store)
+            _ingress_timing_log(
+                "receipt_stored",
+                request_id,
+                created_at=record.get("created_at"),
+                detail=disposition,
+            )
             return outcome
         if disposition == "terminal_uncertain":
             outcome = ingress_requests.quarantine_request(
@@ -838,6 +884,12 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             # Exact canonical bytes are fsynced before Tendwire can observe the
             # request, and every retry reads only this stored string.
             state.save_state(store)
+        _ingress_timing_log(
+            "canonical_commit",
+            ingress_request_id,
+            created_at=record.get("created_at"),
+            detail="new" if attached else "cached",
+        )
         return _submit_ingress_command_record(
             store,
             record,

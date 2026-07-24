@@ -223,6 +223,14 @@ def inbound_lane_backoff_seconds(env: Any | None = None) -> float:
     return min(300.0, max(0.01, value))
 
 
+def gateway_timing_logs_enabled(env: Any | None = None) -> bool:
+    """Emit one structured timing breadcrumb at each durable ingress hop."""
+
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_GATEWAY_TIMING_LOGS", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def require_source_mode(env: Any | None = None) -> None:
     current = mode(env)
     if current != "source":

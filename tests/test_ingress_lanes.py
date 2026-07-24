@@ -118,7 +118,7 @@ def _configured_state(path: Path) -> None:
     state.save_state(store, path=path)
 
 
-def test_busy_lane_does_not_delay_another_agent_under_five_seconds(
+def test_busy_lane_does_not_delay_another_agent_under_two_seconds(
     tmp_path, monkeypatch
 ) -> None:
     spool = IngressLaneSpool(tmp_path / "spool.db")
@@ -132,7 +132,7 @@ def test_busy_lane_does_not_delay_another_agent_under_five_seconds(
         topic = update["message"]["message_thread_id"]
         if topic == 77:
             blocked.set()
-            release.wait(4.0)
+            release.wait(2.0)
         else:
             delivered_b.set()
         return herdres_gateway.CHECKPOINT_ADVANCE
@@ -146,8 +146,8 @@ def test_busy_lane_does_not_delay_another_agent_under_five_seconds(
     dispatcher.start()
     try:
         assert blocked.wait(1.0)
-        assert delivered_b.wait(4.0)
-        assert time.monotonic() - started_at < 5.0
+        assert delivered_b.wait(1.5)
+        assert time.monotonic() - started_at < 2.0
     finally:
         release.set()
         dispatcher.stop()
@@ -866,26 +866,38 @@ def test_lane_configuration_defaults_and_bounds() -> None:
     assert config.inbound_lane_depth({}) == 32
     assert config.inbound_lane_depth({"HERDRES_INBOUND_LANE_DEPTH": "5000"}) == 4096
     assert config.inbound_lane_backoff_seconds({}) == 2.0
+    assert config.gateway_timing_logs_enabled({}) is True
+    assert (
+        config.gateway_timing_logs_enabled({"HERDRES_GATEWAY_TIMING_LOGS": "0"})
+        is False
+    )
 
 
-def test_queued_ack_precedes_submission_and_is_sent_once(
+def test_slow_terminal_ack_does_not_delay_submission_or_lane_completion(
     tmp_path, monkeypatch
 ) -> None:
     spool = IngressLaneSpool(tmp_path / "spool.db")
     update = _update(90, 77, "ship it")
     _enqueue(spool, update, "77")
     events: list[str] = []
+    ack_started = threading.Event()
+    release_ack = threading.Event()
 
     class Telegram:
         def __init__(self, token):
             self.token = token
 
         def send_message(self, _chat_id, text, **_kwargs):
-            events.append(f"telegram:{text}")
+            events.append(f"telegram-start:{text}")
+            ack_started.set()
+            assert release_ack.wait(2.0)
+            events.append(f"telegram-done:{text}")
             return {"ok": True, "message_id": "ack-1"}
 
-    def handle(*_args, **_kwargs):
+    def handle(*_args, deferred_reply=None, **_kwargs):
         events.append("submit")
+        assert deferred_reply is not None
+        deferred_reply("Sent to Tendwire worker.")
         return herdres_gateway.CHECKPOINT_ADVANCE
 
     monkeypatch.setenv("HERDRES_ACK_ON_SEND", "1")
@@ -897,11 +909,24 @@ def test_queued_ack_precedes_submission_and_is_sent_once(
     dispatcher.update_specs([("manager", "token", 0)])
     dispatcher.start()
     try:
+        assert ack_started.wait(1.0)
         _wait_for(lambda: spool.rows()[0]["state"] == "done")
+        assert events[:2] == [
+            "submit",
+            "telegram-start:Sent to Tendwire worker.",
+        ]
+        assert "telegram-done:Sent to Tendwire worker." not in events
+        release_ack.set()
+        _wait_for(lambda: spool.rows()[0]["notify_state"] == "sent")
     finally:
+        release_ack.set()
         dispatcher.stop()
 
-    assert events == [f"telegram:{herdres_gateway.QUEUED_ACK}", "submit"]
+    assert events == [
+        "submit",
+        "telegram-start:Sent to Tendwire worker.",
+        "telegram-done:Sent to Tendwire worker.",
+    ]
     assert spool.rows()[0]["notify_state"] == "sent"
 
 
@@ -954,8 +979,18 @@ def test_ack_claim_ambiguity_is_never_retried(tmp_path, monkeypatch) -> None:
     dispatcher = herdres_gateway._InboundLaneDispatcher(
         spool, REQUEST_ID_KEY, workers=1
     )
-    dispatcher._post_queued_ack(item, "token")
-    dispatcher._post_queued_ack(item, "token")
+    dispatcher._defer_reply(item, "token", "Sent.")
+    dispatcher._defer_reply(item, "token", "Sent.")
+    notification_queue = dispatcher._notification_queues[0]
+    worker = threading.Thread(
+        target=dispatcher._notification_worker,
+        args=(notification_queue,),
+    )
+    worker.start()
+    _wait_for(lambda: attempts == ["send"])
+    dispatcher._stop.set()
+    notification_queue.put_nowait(None)
+    worker.join(1.0)
 
     assert attempts == ["send"]
     assert spool.rows()[0]["notify_state"] == "claimed"
@@ -1032,17 +1067,16 @@ def test_production_lane_ack_order_and_terminal_reply_policy(
     dispatcher.start()
     try:
         _wait_for(lambda: spool.rows()[0]["state"] == "done")
+        _wait_for(lambda: any(event.startswith("telegram:") for event in events))
     finally:
         dispatcher.stop()
 
-    assert events[0] == f"telegram:{herdres_gateway.QUEUED_ACK}"
-    assert events[1] == "submit"
+    assert events[0] == "submit"
     record = state.load_state(state_path)[ingress_requests.RECORDS_KEY][
         _request_id(update)
     ]
     if outcome == "busy_success":
         assert events == [
-            f"telegram:{herdres_gateway.QUEUED_ACK}",
             "submit",
             "telegram:Submitted to busy Tendwire worker.",
         ]
@@ -1051,5 +1085,104 @@ def test_production_lane_ack_order_and_terminal_reply_policy(
             == "Submitted to busy Tendwire worker."
         )
     else:
-        assert events[2] == f"telegram:{herdres.SAFE_SEND_FAILURE_REPLY}"
+        assert events[1] == f"telegram:{herdres.SAFE_SEND_FAILURE_REPLY}"
         assert record["outcome"]["reply"] == herdres.SAFE_SEND_FAILURE_REPLY
+
+
+def test_fake_telegram_ten_item_cohort_cannot_form_dispatch_plateau(
+    tmp_path, monkeypatch
+) -> None:
+    """A slow Telegram reply must not create a delayed cohort of lane dispatches."""
+
+    state_path = tmp_path / "state.json"
+    _configured_state(state_path)
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "1")
+    monkeypatch.setenv("HERDRES_GATEWAY_TIMING_LOGS", "0")
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    spool.initialize_cursor("manager", 200)
+    updates = [_update(update_id, 77, f"cohort-{update_id}") for update_id in range(200, 210)]
+    tendwire_events: list[tuple[str, int, float]] = []
+    event_lock = threading.Lock()
+    release_ack = threading.Event()
+
+    class FakeTendwire:
+        def command_json(self, request_json):
+            request = json.loads(request_json)
+            update_id = int(request["instruction"]["text"].split("-")[-1])
+            with event_lock:
+                tendwire_events.append(("start", update_id, time.time()))
+            response = _accepted_command_response(request)
+            with event_lock:
+                tendwire_events.append(("done", update_id, time.time()))
+            return response
+
+    class SlowFakeTelegram:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, *_args, **_kwargs):
+            assert release_ack.wait(5.0)
+            return {"ok": True, "message_id": "ack"}
+
+    state_load_threads: list[str] = []
+    real_load_state = state.load_state
+
+    def counted_load_state(*args, **kwargs):
+        state_load_threads.append(threading.current_thread().name)
+        return real_load_state(*args, **kwargs)
+
+    monkeypatch.setattr(herdres_gateway.state, "load_state", counted_load_state)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "get_updates",
+        lambda *_args, **_kwargs: updates,
+    )
+    monkeypatch.setattr(herdres_gateway, "_save_offset", lambda *_args: None)
+    monkeypatch.setattr(herdres, "TendwireClient", FakeTendwire)
+    monkeypatch.setattr(herdres_gateway, "TelegramClient", SlowFakeTelegram)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "run_herdres_command",
+        lambda payload: herdres.command_reply(payload),
+    )
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        spool, REQUEST_ID_KEY, workers=1, backoff_seconds=0.01, lease_seconds=2
+    )
+    dispatcher.update_specs([("manager", "token", 0)])
+    dispatcher.start()
+    try:
+        herdres_gateway._poll_once_lanes(
+            "manager",
+            "token",
+            timeout_seconds=0,
+            request_id_key=REQUEST_ID_KEY,
+            spool=spool,
+            on_enqueue=dispatcher.wake,
+        )
+        _wait_for(
+            lambda: len([event for event in tendwire_events if event[0] == "done"])
+            == 10,
+            timeout=8.0,
+        )
+        rows = spool.rows()
+        _wait_for(lambda: all(row["state"] == "done" for row in spool.rows()))
+    finally:
+        release_ack.set()
+        dispatcher.stop()
+
+    # The poll response loads the routing snapshot once, not once per update.
+    # Later loads belong to canonical/receipt handling in the fake command path.
+    assert state_load_threads.count("MainThread") == 1
+    starts = {update_id: at for kind, update_id, at in tendwire_events if kind == "start"}
+    done = {update_id: at for kind, update_id, at in tendwire_events if kind == "done"}
+    first_seen = {int(row["update_id"]): float(row["first_seen_at"]) for row in rows}
+    assert starts[200] - first_seen[200] < 2.0
+    predecessor_gaps = [
+        starts[update_id] - done[update_id - 1] for update_id in range(201, 210)
+    ]
+    assert max(predecessor_gaps) < 2.0
+    # Any old 20-second synchronous-ack staircase would make at least the first
+    # three queued items violate the same two-second predecessor budget.
+    assert sum(gap >= 2.0 for gap in predecessor_gaps) == 0
