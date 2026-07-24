@@ -7787,6 +7787,17 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         if config.offlock_interpane_yield_enabled() and not runtime.dry_run
         else None
     )
+    if yield_barrier is not None:
+        # Ingress deliberately needs two consecutive state-lock acquisitions:
+        # the gateway first fsyncs its immutable request shell, then the command
+        # child acquires the lock to attach canonical bytes and submit them.
+        # The off-lock observation window can admit the first acquisition, but
+        # without this handoff sync immediately reacquires the flock and enters
+        # the comparatively heavy reconciliation phase before the child exists.
+        # Yield once more after observation so the already-waiting child wins a
+        # lock window instead of holding every later item in its strict FIFO
+        # lane behind a full sync pass.
+        yield_barrier()
     observed_snapshot_workers = _workers(snapshot)
     (
         snapshot,

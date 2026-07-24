@@ -77,6 +77,15 @@ class EnqueueResult:
     seq: int | None = None
 
 
+@dataclass(frozen=True)
+class DispatchSnapshot:
+    """Small diagnostic view of work visible to a dispatcher iteration."""
+
+    pending_count: int
+    eligible_lane_count: int
+    first_eligible_lane: str
+
+
 def lane_key(receiver_kind: str, topic_id: str) -> str:
     """Return the stable, collision-free on-disk representation of a lane."""
 
@@ -337,6 +346,52 @@ class IngressLaneSpool:
             lease_owner=str(lease_owner),
             lease_until=lease_until,
             notify_state=str(row["notify_state"]),
+        )
+
+    def dispatch_snapshot(self, *, now: float | None = None) -> DispatchSnapshot:
+        """Count pending rows and lane heads currently eligible for a lease."""
+
+        timestamp = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            pending_row = connection.execute(
+                "SELECT COUNT(*) AS count FROM lane_items WHERE state = 'pending'"
+            ).fetchone()
+            eligible_row = connection.execute(
+                """
+                WITH eligible AS (
+                    SELECT candidate.seq, candidate.lane_key
+                    FROM lane_items AS candidate
+                    WHERE candidate.state = 'pending'
+                      AND candidate.next_attempt_at <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM lane_items AS prior
+                          WHERE prior.lane_key = candidate.lane_key
+                            AND prior.state != 'done'
+                            AND prior.seq < candidate.seq
+                      )
+                )
+                SELECT
+                    COUNT(*) AS count,
+                    (
+                        SELECT lane_key
+                        FROM eligible
+                        ORDER BY seq
+                        LIMIT 1
+                    ) AS first_lane
+                FROM eligible
+                """,
+                (timestamp,),
+            ).fetchone()
+        return DispatchSnapshot(
+            pending_count=int(pending_row["count"]) if pending_row is not None else 0,
+            eligible_lane_count=(
+                int(eligible_row["count"]) if eligible_row is not None else 0
+            ),
+            first_eligible_lane=(
+                str(eligible_row["first_lane"])
+                if eligible_row is not None and eligible_row["first_lane"] is not None
+                else ""
+            ),
         )
 
     def reclaim_processing(self, *, now: float | None = None) -> int:

@@ -1099,14 +1099,16 @@ def test_production_lane_ack_order_and_terminal_reply_policy(
 def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
     tmp_path, monkeypatch
 ) -> None:
-    """Production poll composition must not defer claims to reconcile cohorts."""
+    """Production startup and polling must not defer claims to reconcile cohorts."""
 
     state_path = tmp_path / "state.json"
     _configured_state(state_path)
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    monkeypatch.setenv("HERDRES_INBOUND_DISPATCH_WORKERS", "8")
     monkeypatch.setenv("HERDRES_INBOUND_LANE_BACKOFF_SECONDS", "2")
+    monkeypatch.setattr(herdres_gateway, "LONG_POLL_SECONDS", 0)
     spool = IngressLaneSpool(tmp_path / "spool.db")
     spool.initialize_cursor("manager", 200)
     pending_updates = [
@@ -1114,8 +1116,10 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
         for update_id in range(200, 210)
     ]
     poll_batches: list[int] = []
-    poll_stop = threading.Event()
+    poll_drained = threading.Event()
+    release_poll = threading.Event()
     timing_lock = threading.Lock()
+    dispatcher_diagnostics: list[tuple[str, str]] = []
     timings: dict[str, dict[int, float]] = {
         "durable_enqueue_commit": {},
         "dispatcher_claim": {},
@@ -1123,16 +1127,23 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
 
     def fake_get_updates(_token, offset, *, timeout_seconds):
         assert timeout_seconds == 0
+        assert ready_for_enqueue.wait(1.0)
         if not pending_updates:
-            poll_stop.set()
-            poll_batches.append(0)
+            poll_drained.set()
+            release_poll.wait(3.0)
             return []
         update = pending_updates.pop(0)
         assert update["update_id"] == offset
+        # Model separate Telegram responses instead of handing the dispatcher a
+        # synthetic in-process burst.
+        time.sleep(0.03)
         poll_batches.append(1)
         return [update]
 
-    def capture_timing(hop, *, update_id=None, **_kwargs):
+    def capture_timing(hop, *, update_id=None, detail="", **_kwargs):
+        if hop.startswith("dispatcher_"):
+            with timing_lock:
+                dispatcher_diagnostics.append((hop, str(detail)))
         if hop not in timings or update_id is None:
             return
         with timing_lock:
@@ -1147,27 +1158,25 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
         lambda *_args, **_kwargs: herdres_gateway.CHECKPOINT_ADVANCE,
     )
 
-    # Observe the second empty claim: the first consumes update_specs()'s
-    # startup wake, while the second means the worker is entering its bounded
-    # idle wait with no stale signal.  This makes removal of the enqueue wake
-    # reproducibly expose the two-second plateau.
+    # Do not let the fake Telegram source produce updates until the production
+    # startup path has all configured dispatch workers waiting.
     ready_for_enqueue = threading.Event()
     empty_claims = 0
+    empty_claims_lock = threading.Lock()
     real_claim = spool.claim
 
     def observed_claim(*args, **kwargs):
         nonlocal empty_claims
         item = real_claim(*args, **kwargs)
         if item is None:
-            empty_claims += 1
-            if empty_claims >= 2:
-                ready_for_enqueue.set()
+            with empty_claims_lock:
+                empty_claims += 1
+                if empty_claims >= 8:
+                    ready_for_enqueue.set()
         return item
 
     monkeypatch.setattr(spool, "claim", observed_claim)
-    dispatcher = herdres_gateway._InboundLaneDispatcher(
-        spool, REQUEST_ID_KEY, workers=1, backoff_seconds=2, lease_seconds=2
-    )
+    dispatcher = herdres_gateway._InboundLaneDispatcher(spool, REQUEST_ID_KEY)
     wake_calls = 0
     real_wake = dispatcher.wake
 
@@ -1177,40 +1186,77 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
         real_wake()
 
     monkeypatch.setattr(dispatcher, "wake", counted_wake)
-    dispatcher.update_specs([("manager", "token", 0)])
-    dispatcher.start()
-    poll_thread = threading.Thread(
-        target=herdres_gateway._poll_worker,
-        args=(
-            "manager",
-            "token",
-            0,
+    workers: dict[str, dict[str, object]] = {}
+    specs = herdres_gateway._poll_specs(state.load_state(), "token")
+    try:
+        # This helper is the exact update_specs -> dispatcher.start ->
+        # poll-worker reconcile sequence used by run().
+        herdres_gateway._reconcile_gateway_workers(
+            workers,
+            specs,
             REQUEST_ID_KEY,
-            poll_stop,
             spool,
             dispatcher,
-        ),
-        name="test-production-poll-worker",
-    )
-    try:
+        )
         assert ready_for_enqueue.wait(1.0)
-        poll_thread.start()
-        poll_thread.join(3.0)
-        assert not poll_thread.is_alive()
+        assert poll_drained.wait(3.0)
         _wait_for(
             lambda: len(timings["dispatcher_claim"]) == 10,
             timeout=3.0,
         )
         _wait_for(lambda: all(row["state"] == "done" for row in spool.rows()))
     finally:
-        poll_stop.set()
-        if poll_thread.ident is not None:
-            poll_thread.join(1.0)
+        for worker in workers.values():
+            stop = worker.get("stop")
+            if isinstance(stop, threading.Event):
+                stop.set()
+        release_poll.set()
+        for worker in workers.values():
+            thread = worker.get("thread")
+            if isinstance(thread, threading.Thread):
+                thread.join(1.0)
         dispatcher.stop()
 
     update_ids = set(range(200, 210))
-    assert poll_batches == ([1] * 10) + [0]
+    assert poll_batches == [1] * 10
     assert wake_calls == 10
+    assert dispatcher.worker_count == 8
+    assert (
+        "dispatcher_update_specs",
+        "specs=1,receivers=1",
+    ) in dispatcher_diagnostics
+    assert any(
+        hop == "dispatcher_workers_started"
+        and "configured=8,alive=8" in detail
+        for hop, detail in dispatcher_diagnostics
+    )
+    assert any(
+        hop == "dispatcher_workers_running" and "running=8,configured=8" in detail
+        for hop, detail in dispatcher_diagnostics
+    )
+    assert any(
+        hop == "dispatcher_iteration"
+        and "eligible=" in detail
+        and "pending=" in detail
+        for hop, detail in dispatcher_diagnostics
+    )
+    assert any(
+        hop == "dispatcher_wake_set"
+        and "source=poll_enqueue" in detail
+        for hop, detail in dispatcher_diagnostics
+    )
+    assert any(
+        hop == "dispatcher_wake_received"
+        and "signaled=1" in detail
+        and "source=poll_enqueue" in detail
+        for hop, detail in dispatcher_diagnostics
+    )
+    assert any(
+        hop == "dispatcher_claim_attempt"
+        and "result=claimed" in detail
+        and 'lane=["manager","77"]' in detail
+        for hop, detail in dispatcher_diagnostics
+    )
     assert set(timings["durable_enqueue_commit"]) == update_ids
     assert set(timings["dispatcher_claim"]) == update_ids
     claim_latencies = [
