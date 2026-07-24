@@ -1746,7 +1746,11 @@ def _status_entries_for_topic_pin(store: dict[str, Any], entry: dict[str, Any]) 
     return workers or ([entry] if _entry_open_for_pin(entry) else [])
 
 
-def _account_lines_html(entries: list[dict[str, Any]]) -> str:
+def _account_lines_html(
+    entries: list[dict[str, Any]],
+    *,
+    usage_snapshot: dict[str, Any] | None = None,
+) -> str:
     """The who-am-I/usage footer for a pinned board: one line per account kind present in
     `entries` ('' when disabled or nothing resolvable). Escaped, ready to append."""
     if not config.pinned_account_enabled():
@@ -1761,18 +1765,53 @@ def _account_lines_html(entries: list[dict[str, Any]]) -> str:
                 break
     if not kinds:
         return ""
-    snapshot = accounts.usage_snapshot()
+    snapshot = (
+        accounts.usage_snapshot()
+        if usage_snapshot is None
+        else usage_snapshot
+    )
     lines = [line for kind in sorted(kinds) for line in (accounts.account_line(kind, snapshot=snapshot),) if line]
     return "\n".join(html_escape(line, 200) for line in lines)
 
 
-def _sync_topic_pinned(store: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
+def _account_usage_snapshot_offlock(
+    store: dict[str, Any], runtime: SyncRuntime
+) -> dict[str, Any]:
+    """Refresh optional account usage without holding the global state flock."""
+
+    if not config.pinned_account_enabled():
+        return {}
+    if not state.lock_actually_held() or runtime.dry_run:
+        return accounts.usage_snapshot()
+    # The OAuth usage endpoint has a 15-second timeout.  Persist the complete
+    # pre-refresh state, release the flock for cache/network collection, then
+    # adopt any lane-child commit before pinned rendering resumes.
+    state.save_state(store)
+    try:
+        with state.released_lock():
+            snapshot = accounts.usage_snapshot()
+    finally:
+        state.reload_state_in_place(store)
+    return snapshot
+
+
+def _sync_topic_pinned(
+    store: dict[str, Any],
+    entry: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    account_usage: dict[str, Any] | None = None,
+) -> bool:
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
         return False
     pin_entries = _status_entries_for_topic_pin(store, entry)
     html = render_status_overview(pin_entries)
-    account_html = _account_lines_html(pin_entries or [entry])
+    account_html = _account_lines_html(
+        pin_entries or [entry],
+        usage_snapshot=account_usage,
+    )
     if account_html:
         html = f"{html}\n{account_html}"
     content_hash = short_hash(html, 20)
@@ -6685,6 +6724,7 @@ def _sync_pinned(
     *,
     chat_id: str,
     yield_barrier: Callable[[], None] | None = None,
+    account_usage: dict[str, Any] | None = None,
 ) -> bool:
     current_worker_ids: set[str] = set()
     current_space_ids = {
@@ -6712,7 +6752,10 @@ def _sync_pinned(
     if not entries:
         return False
     html = render_status_overview(entries)
-    account_html = _account_lines_html(entries)
+    account_html = _account_lines_html(
+        entries,
+        usage_snapshot=account_usage,
+    )
     if account_html:
         html = f"{html}\n{account_html}"
     telegram = store.setdefault("telegram", {})
@@ -6756,6 +6799,7 @@ def _sync_topic_pinned_statuses(
     *,
     chat_id: str,
     yield_barrier: Callable[[], None] | None = None,
+    account_usage: dict[str, Any] | None = None,
 ) -> int:
     updated = 0
     for entry_key in list(state.source_entries(store)):
@@ -6764,7 +6808,15 @@ def _sync_topic_pinned_statuses(
         entry = state.source_entries(store).get(entry_key)
         if entry is None:
             continue
-        updated += int(_sync_topic_pinned(store, entry, runtime, chat_id=chat_id))
+        updated += int(
+            _sync_topic_pinned(
+                store,
+                entry,
+                runtime,
+                chat_id=chat_id,
+                account_usage=account_usage,
+            )
+        )
     return updated
 
 
@@ -7733,7 +7785,8 @@ def _observe_sync_inputs(
 def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     config.require_source_mode()
     observed_at = time.time()
-    observed = _observe_sync_inputs(store, runtime, now=observed_at)
+    with state.lock_phase("sync.observe"):
+        observed = _observe_sync_inputs(store, runtime, now=observed_at)
     if observed.get("unhealthy"):
         return _tendwire_non_success(runtime, "tendwire_herdr_unhealthy")
     if observed.get("cursor_conflict"):
@@ -7757,12 +7810,13 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         return _unsupported_turn_schema_version(runtime, turn_schema)
     list_finals_are_authoritative = turn_schema != TURN_SCHEMA_VERSION
     chat_id = config.telegram_chat_id(store)
-    try:
-        turns_payload = _validate_turns_payload(turns_payload)
-    except _TurnContentError as exc:
-        # The list envelope/schema is connector-wide. Descriptor defects are
-        # converted to bounded row-local outcomes by _validate_turns_payload.
-        return _tendwire_non_success(runtime, exc.status)
+    with state.lock_phase("sync.validate"):
+        try:
+            turns_payload = _validate_turns_payload(turns_payload)
+        except _TurnContentError as exc:
+            # The list envelope/schema is connector-wide. Descriptor defects
+            # are converted to bounded row-local outcomes by validation.
+            return _tendwire_non_success(runtime, exc.status)
     if state.lock_held() and not runtime.dry_run:
         runtime = SyncRuntime(
             _OfflockClient(runtime.tendwire, store),
@@ -7797,20 +7851,25 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         # Yield once more after observation so the already-waiting child wins a
         # lock window instead of holding every later item in its strict FIFO
         # lane behind a full sync pass.
-        yield_barrier()
-    observed_snapshot_workers = _workers(snapshot)
-    (
-        snapshot,
-        generation_resolutions,
-        generation_resolution_changed,
-    ) = _resolve_stable_worker_generations(
-        store,
-        snapshot,
-        turns_payload,
-        observed_at=observed_at,
-    )
+        with state.lock_phase("sync.post_observe_handoff"):
+            yield_barrier()
+    with state.lock_phase("sync.generations"):
+        observed_snapshot_workers = _workers(snapshot)
+        (
+            snapshot,
+            generation_resolutions,
+            generation_resolution_changed,
+        ) = _resolve_stable_worker_generations(
+            store,
+            snapshot,
+            turns_payload,
+            observed_at=observed_at,
+        )
     changed = generation_resolution_changed
-    source_counts = _sync_sources(store, snapshot, turns_payload, runtime, chat_id=chat_id)
+    with state.lock_phase("sync.sources"):
+        source_counts = _sync_sources(
+            store, snapshot, turns_payload, runtime, chat_id=chat_id
+        )
     worker_rebinds = 0
     for resolution in generation_resolutions:
         from_worker_id = resolution["from_worker_id"]
@@ -7837,31 +7896,34 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 evidence_turn_id=resolution["evidence_turn_id"],
             )
         )
-    lifecycle_cleanup = _sync_topic_lifecycle_cleanup(
-        store,
-        runtime,
-        chat_id=chat_id,
-        now=observed_at,
-    )
+    with state.lock_phase("sync.lifecycle_cleanup"):
+        lifecycle_cleanup = _sync_topic_lifecycle_cleanup(
+            store,
+            runtime,
+            chat_id=chat_id,
+            now=observed_at,
+        )
     if delta_observation is not None:
         # Lifecycle cleanup may save, release the lock, and reload the store in
         # place. Rebind the observation to the reloaded delta lane so the final
         # page watermark/checkpoint is not written into an orphaned sub-dict.
         delta = _delta_state(store, now=observed_at)
         delta_observation["delta"] = delta
-    submission_link_updates = _apply_submission_links(
-        store, _turns(turns_payload), now=observed_at
-    )
-    submission_counts = _sync_submission_working_cards(
-        store,
-        _turns(turns_payload),
-        runtime,
-        chat_id=chat_id,
-        now=observed_at,
-        yield_barrier=yield_barrier,
-    )
-    routing_repaired = _repair_space_mode_routing_state(store)
-    message_bindings = _backfill_message_bindings(store)
+    with state.lock_phase("sync.submissions"):
+        submission_link_updates = _apply_submission_links(
+            store, _turns(turns_payload), now=observed_at
+        )
+        submission_counts = _sync_submission_working_cards(
+            store,
+            _turns(turns_payload),
+            runtime,
+            chat_id=chat_id,
+            now=observed_at,
+            yield_barrier=yield_barrier,
+        )
+    with state.lock_phase("sync.routing"):
+        routing_repaired = _repair_space_mode_routing_state(store)
+        message_bindings = _backfill_message_bindings(store)
     bootstrap_complete = True
     if delta_observation is not None:
         bootstrap_complete = (
@@ -7874,22 +7936,24 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 )
             )
         )
-    bootstrapped = _bootstrap_existing_turns(
-        store,
-        turns_payload,
-        pending_payload,
-        skip_v2_finals=not list_finals_are_authoritative,
-        complete=bootstrap_complete,
-    )
+    with state.lock_phase("sync.bootstrap"):
+        bootstrapped = _bootstrap_existing_turns(
+            store,
+            turns_payload,
+            pending_payload,
+            skip_v2_finals=not list_finals_are_authoritative,
+            complete=bootstrap_complete,
+        )
     live_worker_ids = {
         compact_ws(worker.get("id"), 160)
         for worker in observed_snapshot_workers
         if _worker_is_open(worker)
     }
     live_worker_ids.discard("")
-    reconciled_turn_plans = _reconcile_completed_turn_plans(
-        store, runtime
-    )
+    with state.lock_phase("sync.turn_plan_reconcile"):
+        reconciled_turn_plans = _reconcile_completed_turn_plans(
+            store, runtime
+        )
 
     try:
         feed_turns_payload = (
@@ -7899,33 +7963,38 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             and delta_observation.get("page", {}).get("mode") == "bootstrap"
             else turns_payload
         )
-        turn_counts = (
-            {"feed_sent": 0, "sent": 0, "updated": 0, "content_pages": 0}
-            if bootstrapped
-            else _sync_turns(
-                store,
-                feed_turns_payload,
-                pending_payload,
-                runtime,
-                chat_id=chat_id,
-                live_worker_ids=live_worker_ids,
-                yield_barrier=yield_barrier,
-                list_finals_are_authoritative=list_finals_are_authoritative,
-                checkpoint_after_delivery=(
-                    delta_observation is not None
-                    and delta_observation.get("kind") == "delta"
-                    and delta_observation.get("page", {}).get("mode")
-                    == "changes"
-                ),
-                retained_projection=(
-                    delta.get("projection")
-                    if delta_observation is not None
-                    and delta_observation.get("kind") == "delta"
-                    and isinstance(delta, dict)
-                    else None
-                ),
-            )
-        )
+        if bootstrapped:
+            turn_counts = {
+                "feed_sent": 0,
+                "sent": 0,
+                "updated": 0,
+                "content_pages": 0,
+            }
+        else:
+            with state.lock_phase("sync.turns"):
+                turn_counts = _sync_turns(
+                    store,
+                    feed_turns_payload,
+                    pending_payload,
+                    runtime,
+                    chat_id=chat_id,
+                    live_worker_ids=live_worker_ids,
+                    yield_barrier=yield_barrier,
+                    list_finals_are_authoritative=list_finals_are_authoritative,
+                    checkpoint_after_delivery=(
+                        delta_observation is not None
+                        and delta_observation.get("kind") == "delta"
+                        and delta_observation.get("page", {}).get("mode")
+                        == "changes"
+                    ),
+                    retained_projection=(
+                        delta.get("projection")
+                        if delta_observation is not None
+                        and delta_observation.get("kind") == "delta"
+                        and isinstance(delta, dict)
+                        else None
+                    ),
+                )
     except _TurnContentError as exc:
         if not exc.conflict:
             return _tendwire_non_success(runtime, exc.status)
@@ -7940,44 +8009,47 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             relisted_finals_are_authoritative = (
                 relisted_schema != TURN_SCHEMA_VERSION
             )
-            turn_counts = _sync_turns(
-                store,
-                turns_payload,
-                pending_payload,
-                runtime,
-                chat_id=chat_id,
-                live_worker_ids=live_worker_ids,
-                relist_on_conflict=False,
-                yield_barrier=yield_barrier,
-                list_finals_are_authoritative=relisted_finals_are_authoritative,
-                checkpoint_after_delivery=(
-                    delta_observation is not None
-                    and delta_observation.get("kind") == "delta"
-                    and delta_observation.get("page", {}).get("mode")
-                    == "changes"
-                ),
-            )
+            with state.lock_phase("sync.turns_relist"):
+                turn_counts = _sync_turns(
+                    store,
+                    turns_payload,
+                    pending_payload,
+                    runtime,
+                    chat_id=chat_id,
+                    live_worker_ids=live_worker_ids,
+                    relist_on_conflict=False,
+                    yield_barrier=yield_barrier,
+                    list_finals_are_authoritative=relisted_finals_are_authoritative,
+                    checkpoint_after_delivery=(
+                        delta_observation is not None
+                        and delta_observation.get("kind") == "delta"
+                        and delta_observation.get("page", {}).get("mode")
+                        == "changes"
+                    ),
+                )
         except _TurnContentError as retry_exc:
             return _tendwire_non_success(runtime, retry_exc.status)
-    decision_result = _deliver_decisions(
-        store,
-        pending_payload,
-        runtime,
-        chat_id=chat_id,
-        yield_barrier=yield_barrier,
-    )
-    routing_repaired += _repair_space_mode_routing_state(store)
+    with state.lock_phase("sync.decisions"):
+        decision_result = _deliver_decisions(
+            store,
+            pending_payload,
+            runtime,
+            chat_id=chat_id,
+            yield_barrier=yield_barrier,
+        )
+        routing_repaired += _repair_space_mode_routing_state(store)
     snapshot_worker_ids = {
         compact_ws(worker.get("id"), 160)
         for worker in observed_snapshot_workers
     }
     snapshot_worker_ids.discard("")
-    deletion_cleanup = _cleanup_topics(
-        store,
-        runtime,
-        chat_id=chat_id,
-        snapshot_worker_ids=snapshot_worker_ids,
-    )
+    with state.lock_phase("sync.topic_cleanup"):
+        deletion_cleanup = _cleanup_topics(
+            store,
+            runtime,
+            chat_id=chat_id,
+            snapshot_worker_ids=snapshot_worker_ids,
+        )
     topic_cleanup = {
         **deletion_cleanup,
         **{
@@ -8010,49 +8082,56 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         or decision_result.get("changed")
     )
     if config.pinned_status_enabled():
-        pinned_changed = _sync_pinned(
-            store,
-            runtime,
-            chat_id=chat_id,
-            yield_barrier=yield_barrier,
-        )
-        topic_pinned_updated = _sync_topic_pinned_statuses(
-            store,
-            runtime,
-            chat_id=chat_id,
-            yield_barrier=yield_barrier,
-        )
+        with state.lock_phase("sync.pinned.account_usage"):
+            account_usage = _account_usage_snapshot_offlock(store, runtime)
+        with state.lock_phase("sync.pinned.overview"):
+            pinned_changed = _sync_pinned(
+                store,
+                runtime,
+                chat_id=chat_id,
+                yield_barrier=yield_barrier,
+                account_usage=account_usage,
+            )
+        with state.lock_phase("sync.pinned.topics"):
+            topic_pinned_updated = _sync_topic_pinned_statuses(
+                store,
+                runtime,
+                chat_id=chat_id,
+                yield_barrier=yield_barrier,
+                account_usage=account_usage,
+            )
     else:
         pinned_changed = False
         topic_pinned_updated = 0
     changed = changed or pinned_changed or bool(topic_pinned_updated)
     delta_card_updates = 0
-    if delta_observation is not None:
-        if delta_observation["kind"] == "delta":
-            if (
-                store.get(_DELTA_STATE_KEY)
-                != delta_observation.get("apply_basis")
-            ):
-                # A later off-lock phase let another full pass advance the
-                # watermark.  Do not apply this pass's now-stale checkpoint.
-                return _tendwire_non_success(
-                    runtime, "tendwire_delta_cursor_changed"
+    with state.lock_phase("sync.delta_apply"):
+        if delta_observation is not None:
+            if delta_observation["kind"] == "delta":
+                if (
+                    store.get(_DELTA_STATE_KEY)
+                    != delta_observation.get("apply_basis")
+                ):
+                    # A later off-lock phase let another full pass advance the
+                    # watermark.  Do not apply this pass's stale checkpoint.
+                    return _tendwire_non_success(
+                        runtime, "tendwire_delta_cursor_changed"
+                    )
+                delta_card_updates = _finish_delta_page(
+                    store,
+                    delta_observation,
+                    runtime,
+                    now=observed_at,
                 )
-            delta_card_updates = _finish_delta_page(
-                store,
-                delta_observation,
-                runtime,
-                now=observed_at,
-            )
-        elif delta_observation["kind"] == "full":
-            delta_card_updates = _apply_full_reconciliation(
-                store,
-                delta_observation["delta"],
-                turns_payload,
-                runtime,
-                now=observed_at,
-            )
-        changed = changed or delta_observation["kind"] != "noop"
+            elif delta_observation["kind"] == "full":
+                delta_card_updates = _apply_full_reconciliation(
+                    store,
+                    delta_observation["delta"],
+                    turns_payload,
+                    runtime,
+                    now=observed_at,
+                )
+            changed = changed or delta_observation["kind"] != "noop"
     turn_final_result = {
         "enabled": runtime.with_outbox,
         "polled": 0,
@@ -8068,31 +8147,34 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     }
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
     if runtime.with_outbox:
-        remaining = max(3, runtime.max_sends - int(turn_counts["sent"]))
-        turn_final_result = _drain_turn_final(
-            store,
-            turns_payload,
-            runtime,
-            chat_id=chat_id,
-            max_operations=remaining,
-            yield_barrier=yield_barrier,
-            turn_projection=(
-                delta.get("projection")
-                if isinstance(delta, dict)
-                and isinstance(delta.get("projection"), dict)
-                else None
-            ),
-        )
-        remaining = max(0, remaining - int(turn_final_result["operations"]))
-        outbox_result = drain_outbox(
-            store,
-            runtime.telegram,
-            runtime.tendwire,
-            chat_id=chat_id,
-            max_sends=remaining,
-            dry_run=runtime.dry_run,
-            yield_barrier=yield_barrier,
-        )
+        with state.lock_phase("sync.outbox"):
+            remaining = max(3, runtime.max_sends - int(turn_counts["sent"]))
+            turn_final_result = _drain_turn_final(
+                store,
+                turns_payload,
+                runtime,
+                chat_id=chat_id,
+                max_operations=remaining,
+                yield_barrier=yield_barrier,
+                turn_projection=(
+                    delta.get("projection")
+                    if isinstance(delta, dict)
+                    and isinstance(delta.get("projection"), dict)
+                    else None
+                ),
+            )
+            remaining = max(
+                0, remaining - int(turn_final_result["operations"])
+            )
+            outbox_result = drain_outbox(
+                store,
+                runtime.telegram,
+                runtime.tendwire,
+                chat_id=chat_id,
+                max_sends=remaining,
+                dry_run=runtime.dry_run,
+                yield_barrier=yield_barrier,
+            )
         changed = changed or bool(turn_final_result.get("changed")) or bool(outbox_result.get("changed"))
     return {
         "ok": True,
