@@ -438,6 +438,7 @@ def test_lane_overflow_notifies_once_and_advances_cursor(tmp_path, monkeypatch) 
     _enqueue(spool, _update(40, 77, "already queued"), "77")
     notices: list[tuple[str, str]] = []
     mirrors: list[int] = []
+    durable_commit_wakes = 0
     monkeypatch.setenv("HERDRES_INBOUND_LANE_DEPTH", "1")
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     store = _store()
@@ -469,18 +470,24 @@ def test_lane_overflow_notifies_once_and_advances_cursor(tmp_path, monkeypatch) 
         herdres_gateway, "_save_offset", lambda offset, _key: mirrors.append(offset)
     )
 
+    def wake_after_commit() -> None:
+        nonlocal durable_commit_wakes
+        durable_commit_wakes += 1
+
     herdres_gateway._poll_once_lanes(
         "manager",
         "token",
         timeout_seconds=0,
         request_id_key=REQUEST_ID_KEY,
         spool=spool,
+        on_enqueue=wake_after_commit,
     )
 
     assert spool.cursor("manager") == 42
     assert len(spool.rows()) == 1
     assert notices == [("77", lane_key("manager", "77"))]
     assert mirrors == [42]
+    assert durable_commit_wakes == 1
 
 
 def test_lane_overflow_notice_uses_real_sixty_second_throttle(
@@ -1089,100 +1096,127 @@ def test_production_lane_ack_order_and_terminal_reply_policy(
         assert record["outcome"]["reply"] == herdres.SAFE_SEND_FAILURE_REPLY
 
 
-def test_fake_telegram_ten_item_cohort_cannot_form_dispatch_plateau(
+def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
     tmp_path, monkeypatch
 ) -> None:
-    """A slow Telegram reply must not create a delayed cohort of lane dispatches."""
+    """Production poll composition must not defer claims to reconcile cohorts."""
 
     state_path = tmp_path / "state.json"
     _configured_state(state_path)
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "1")
-    monkeypatch.setenv("HERDRES_GATEWAY_TIMING_LOGS", "0")
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    monkeypatch.setenv("HERDRES_INBOUND_LANE_BACKOFF_SECONDS", "2")
     spool = IngressLaneSpool(tmp_path / "spool.db")
     spool.initialize_cursor("manager", 200)
-    updates = [_update(update_id, 77, f"cohort-{update_id}") for update_id in range(200, 210)]
-    tendwire_events: list[tuple[str, int, float]] = []
-    event_lock = threading.Lock()
-    release_ack = threading.Event()
+    pending_updates = [
+        _update(update_id, 77, f"cohort-{update_id}")
+        for update_id in range(200, 210)
+    ]
+    poll_batches: list[int] = []
+    poll_stop = threading.Event()
+    timing_lock = threading.Lock()
+    timings: dict[str, dict[int, float]] = {
+        "durable_enqueue_commit": {},
+        "dispatcher_claim": {},
+    }
 
-    class FakeTendwire:
-        def command_json(self, request_json):
-            request = json.loads(request_json)
-            update_id = int(request["instruction"]["text"].split("-")[-1])
-            with event_lock:
-                tendwire_events.append(("start", update_id, time.time()))
-            response = _accepted_command_response(request)
-            with event_lock:
-                tendwire_events.append(("done", update_id, time.time()))
-            return response
+    def fake_get_updates(_token, offset, *, timeout_seconds):
+        assert timeout_seconds == 0
+        if not pending_updates:
+            poll_stop.set()
+            poll_batches.append(0)
+            return []
+        update = pending_updates.pop(0)
+        assert update["update_id"] == offset
+        poll_batches.append(1)
+        return [update]
 
-    class SlowFakeTelegram:
-        def __init__(self, token):
-            self.token = token
+    def capture_timing(hop, *, update_id=None, **_kwargs):
+        if hop not in timings or update_id is None:
+            return
+        with timing_lock:
+            timings[hop][int(update_id)] = time.monotonic()
 
-        def send_message(self, *_args, **_kwargs):
-            assert release_ack.wait(5.0)
-            return {"ok": True, "message_id": "ack"}
-
-    state_load_threads: list[str] = []
-    real_load_state = state.load_state
-
-    def counted_load_state(*args, **kwargs):
-        state_load_threads.append(threading.current_thread().name)
-        return real_load_state(*args, **kwargs)
-
-    monkeypatch.setattr(herdres_gateway.state, "load_state", counted_load_state)
-    monkeypatch.setattr(
-        herdres_gateway,
-        "get_updates",
-        lambda *_args, **_kwargs: updates,
-    )
+    monkeypatch.setattr(herdres_gateway, "get_updates", fake_get_updates)
     monkeypatch.setattr(herdres_gateway, "_save_offset", lambda *_args: None)
-    monkeypatch.setattr(herdres, "TendwireClient", FakeTendwire)
-    monkeypatch.setattr(herdres_gateway, "TelegramClient", SlowFakeTelegram)
+    monkeypatch.setattr(herdres_gateway, "_timing_log", capture_timing)
     monkeypatch.setattr(
         herdres_gateway,
-        "run_herdres_command",
-        lambda payload: herdres.command_reply(payload),
+        "handle_update",
+        lambda *_args, **_kwargs: herdres_gateway.CHECKPOINT_ADVANCE,
     )
+
+    # Observe the second empty claim: the first consumes update_specs()'s
+    # startup wake, while the second means the worker is entering its bounded
+    # idle wait with no stale signal.  This makes removal of the enqueue wake
+    # reproducibly expose the two-second plateau.
+    ready_for_enqueue = threading.Event()
+    empty_claims = 0
+    real_claim = spool.claim
+
+    def observed_claim(*args, **kwargs):
+        nonlocal empty_claims
+        item = real_claim(*args, **kwargs)
+        if item is None:
+            empty_claims += 1
+            if empty_claims >= 2:
+                ready_for_enqueue.set()
+        return item
+
+    monkeypatch.setattr(spool, "claim", observed_claim)
     dispatcher = herdres_gateway._InboundLaneDispatcher(
-        spool, REQUEST_ID_KEY, workers=1, backoff_seconds=0.01, lease_seconds=2
+        spool, REQUEST_ID_KEY, workers=1, backoff_seconds=2, lease_seconds=2
     )
+    wake_calls = 0
+    real_wake = dispatcher.wake
+
+    def counted_wake() -> None:
+        nonlocal wake_calls
+        wake_calls += 1
+        real_wake()
+
+    monkeypatch.setattr(dispatcher, "wake", counted_wake)
     dispatcher.update_specs([("manager", "token", 0)])
     dispatcher.start()
-    try:
-        herdres_gateway._poll_once_lanes(
+    poll_thread = threading.Thread(
+        target=herdres_gateway._poll_worker,
+        args=(
             "manager",
             "token",
-            timeout_seconds=0,
-            request_id_key=REQUEST_ID_KEY,
-            spool=spool,
-            on_enqueue=dispatcher.wake,
-        )
+            0,
+            REQUEST_ID_KEY,
+            poll_stop,
+            spool,
+            dispatcher,
+        ),
+        name="test-production-poll-worker",
+    )
+    try:
+        assert ready_for_enqueue.wait(1.0)
+        poll_thread.start()
+        poll_thread.join(3.0)
+        assert not poll_thread.is_alive()
         _wait_for(
-            lambda: len([event for event in tendwire_events if event[0] == "done"])
-            == 10,
-            timeout=8.0,
+            lambda: len(timings["dispatcher_claim"]) == 10,
+            timeout=3.0,
         )
-        rows = spool.rows()
         _wait_for(lambda: all(row["state"] == "done" for row in spool.rows()))
     finally:
-        release_ack.set()
+        poll_stop.set()
+        if poll_thread.ident is not None:
+            poll_thread.join(1.0)
         dispatcher.stop()
 
-    # The poll response loads the routing snapshot once, not once per update.
-    # Later loads belong to canonical/receipt handling in the fake command path.
-    assert state_load_threads.count("MainThread") == 1
-    starts = {update_id: at for kind, update_id, at in tendwire_events if kind == "start"}
-    done = {update_id: at for kind, update_id, at in tendwire_events if kind == "done"}
-    first_seen = {int(row["update_id"]): float(row["first_seen_at"]) for row in rows}
-    assert starts[200] - first_seen[200] < 2.0
-    predecessor_gaps = [
-        starts[update_id] - done[update_id - 1] for update_id in range(201, 210)
+    update_ids = set(range(200, 210))
+    assert poll_batches == ([1] * 10) + [0]
+    assert wake_calls == 10
+    assert set(timings["durable_enqueue_commit"]) == update_ids
+    assert set(timings["dispatcher_claim"]) == update_ids
+    claim_latencies = [
+        timings["dispatcher_claim"][update_id]
+        - timings["durable_enqueue_commit"][update_id]
+        for update_id in sorted(update_ids)
     ]
-    assert max(predecessor_gaps) < 2.0
-    # Any old 20-second synchronous-ack staircase would make at least the first
-    # three queued items violate the same two-second predecessor budget.
-    assert sum(gap >= 2.0 for gap in predecessor_gaps) == 0
+    assert min(claim_latencies) >= 0.0
+    assert max(claim_latencies) < 2.0
