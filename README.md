@@ -98,6 +98,14 @@ compatibility. Set `HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION=3` to opt
 in to deterministic submission receipts. Herdres accepts a v2 response from an
 older Tendwire even when v3 was requested.
 
+Outbound delivery is not paced by the full source reconciliation. A durable v3
+submission receipt immediately renders its one working card, and
+`herdres sync --loop` runs a separate coalescing connector dispatcher. SQLite
+database/WAL commit notifications wake that dispatcher when Tendwire enqueues a
+turn-final job; a one-second fallback covers missed notifications and deferred
+jobs. The dispatcher uses only Tendwire's existing connector API and the same
+Telegram/state delivery machinery as the normal sync tail.
+
 ### Durable inbound lanes
 
 The per-topic ingress scheduler is enabled by default
@@ -616,8 +624,9 @@ This branch runs two user services (plus the Tendwire daemon):
 
 - `herdres.service` — the source sync loop (`herdres sync --loop`). It reads
   Tendwire snapshots/turns/pending and drives Telegram topics, messages, and
-  pinned status. This replaces the old `herdres.timer`; there is no timer unit
-  on this branch.
+  pinned status. Its wakeable outbound dispatcher drains working/final cards
+  independently of long reconciliation passes. This replaces the old
+  `herdres.timer`; there is no timer unit on this branch.
 - `herdres-gateway.service` — inbound Telegram polling; forwards topic input to
   `herdres command` → `tendwire command`.
 - `tendwired.service` — the Tendwire daemon (installed from the Tendwire repo);
