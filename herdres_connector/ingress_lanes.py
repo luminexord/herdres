@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS lane_items (
 );
 CREATE INDEX IF NOT EXISTS lane_items_open_by_lane
     ON lane_items(lane_key, seq) WHERE state != 'done';
+CREATE INDEX IF NOT EXISTS lane_items_pending_by_attempt
+    ON lane_items(next_attempt_at, seq) WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS lane_items_processing_by_lease
+    ON lane_items(lease_until) WHERE state = 'processing';
 """
 
 

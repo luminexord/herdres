@@ -57,11 +57,39 @@ _COMMAND_DISPOSITIONS = frozenset(
 )
 _RETRY_DISPOSITIONS = frozenset({"no_receipt", "in_progress"})
 _CHILD_REPLY_LIMIT = 160
+_TIMING_LOG_QUEUE: queue.Queue[str] = queue.Queue(maxsize=4096)
+_TIMING_LOG_THREAD_LOCK = threading.Lock()
+_timing_log_thread: threading.Thread | None = None
 
 
 def log(message: str) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] [herdres-gateway] {message}", flush=True)
+
+
+def _timing_log_worker() -> None:
+    while True:
+        message = _TIMING_LOG_QUEUE.get()
+        try:
+            log(message)
+        finally:
+            _TIMING_LOG_QUEUE.task_done()
+
+
+def _ensure_timing_log_worker() -> None:
+    global _timing_log_thread
+
+    if _timing_log_thread is not None and _timing_log_thread.is_alive():
+        return
+    with _TIMING_LOG_THREAD_LOCK:
+        if _timing_log_thread is not None and _timing_log_thread.is_alive():
+            return
+        _timing_log_thread = threading.Thread(
+            target=_timing_log_worker,
+            name="herdres-gateway-timing-log",
+            daemon=True,
+        )
+        _timing_log_thread.start()
 
 
 def _timing_log(
@@ -86,7 +114,15 @@ def _timing_log(
         fields.append(f"receive_ms={max(0.0, elapsed_from_receive) * 1000.0:.1f}")
     if detail:
         fields.append(f"detail={sanitize_text(detail, 120).replace(' ', '_')}")
-    log("lane timing " + " ".join(fields))
+    # Dispatcher cadence must not depend on stdout/journald accepting a
+    # synchronous flush. Preserve the event timestamp at the producer and let
+    # one daemon writer serialize diagnostic output. Timing evidence is
+    # intentionally best-effort when the bounded queue is saturated.
+    _ensure_timing_log_worker()
+    try:
+        _TIMING_LOG_QUEUE.put_nowait("lane timing " + " ".join(fields))
+    except queue.Full:
+        pass
 
 
 def _legacy_offset_path_for(key: str = MANAGER_BOT_KIND) -> Path:
@@ -1031,6 +1067,11 @@ class _InboundLaneDispatcher:
         self._threads: list[threading.Thread] = []
         self._worker_count_lock = threading.Lock()
         self._running_workers = 0
+        self._dispatch_slots = threading.BoundedSemaphore(self.worker_count)
+        self._dispatch_queue: queue.Queue[
+            tuple[LaneItem, str, float] | None
+        ] = queue.Queue(maxsize=self.worker_count)
+        self._dispatch_threads: list[threading.Thread] = []
         self._notification_queues: list[queue.Queue[tuple[LaneItem, str, str] | None]] = [
             queue.Queue(maxsize=max(32, config.inbound_lane_depth() * 2))
             for _index in range(self.worker_count)
@@ -1072,6 +1113,14 @@ class _InboundLaneDispatcher:
             thread.start()
         for index in range(self.worker_count):
             thread = threading.Thread(
+                target=self._dispatch_worker,
+                name=f"herdres-inbound-service-{index}",
+                daemon=True,
+            )
+            self._dispatch_threads.append(thread)
+            thread.start()
+        for index in range(self.worker_count):
+            thread = threading.Thread(
                 target=self._worker,
                 args=(f"{os.getpid()}-{uuid.uuid4().hex}-{index}",),
                 name=f"herdres-inbound-dispatch-{index}",
@@ -1097,6 +1146,8 @@ class _InboundLaneDispatcher:
                 # The stop flag makes a busy worker exit before its next send.
                 pass
         for thread in self._threads:
+            thread.join(timeout=2.0)
+        for thread in self._dispatch_threads:
             thread.join(timeout=2.0)
         for thread in self._notification_threads:
             thread.join(timeout=0.05)
@@ -1125,7 +1176,9 @@ class _InboundLaneDispatcher:
         iteration: int,
         timeout: float,
     ) -> None:
+        wait_started = time.monotonic()
         signaled = self._wake.acquire(timeout=timeout)
+        waited_ms = (time.monotonic() - wait_started) * 1000.0
         source = "timeout"
         if signaled:
             try:
@@ -1136,7 +1189,9 @@ class _InboundLaneDispatcher:
             "dispatcher_wake_received",
             detail=(
                 f"worker={worker_name},iteration={iteration},"
-                f"signaled={int(signaled)},source={source}"
+                f"signaled={int(signaled)},source={source},"
+                f"timeout_ms={max(0.0, timeout) * 1000.0:.1f},"
+                f"waited_ms={waited_ms:.1f}"
             ),
         )
 
@@ -1154,11 +1209,36 @@ class _InboundLaneDispatcher:
             detail=f"worker={worker_name},running={running},configured={self.worker_count}",
         )
         iteration = 0
+        previous_iteration_end: float | None = None
         try:
             while not self._stop.is_set():
                 iteration += 1
+                iteration_started = time.monotonic()
+                idle_ms = (
+                    0.0
+                    if previous_iteration_end is None
+                    else max(
+                        0.0,
+                        (iteration_started - previous_iteration_end) * 1000.0,
+                    )
+                )
+                _timing_log(
+                    "dispatcher_iteration_start",
+                    detail=(
+                        f"worker={worker_name},iteration={iteration},"
+                        f"idle_ms={idle_ms:.1f}"
+                    ),
+                )
+                snapshot_ms = 0.0
+                claim_ms = 0.0
+                dispatch_ms = 0.0
+                result = "error"
+                wait_timeout: float | None = None
+                dispatch_slot_acquired = False
                 try:
+                    stage_started = time.monotonic()
                     snapshot = self.spool.dispatch_snapshot()
+                    snapshot_ms = (time.monotonic() - stage_started) * 1000.0
                     _timing_log(
                         "dispatcher_iteration",
                         detail=(
@@ -1170,68 +1250,118 @@ class _InboundLaneDispatcher:
                             f"worker={worker_name},iteration={iteration}"
                         ),
                     )
-                    item = self.spool.claim(
-                        lease_owner,
-                        lease_seconds=self.lease_seconds,
+                    dispatch_slot_acquired = self._dispatch_slots.acquire(
+                        blocking=False
                     )
+                    if dispatch_slot_acquired:
+                        stage_started = time.monotonic()
+                        item = self.spool.claim(
+                            lease_owner,
+                            lease_seconds=self.lease_seconds,
+                        )
+                        claim_ms = (
+                            time.monotonic() - stage_started
+                        ) * 1000.0
+                    else:
+                        item = None
                     if item is None:
-                        if snapshot.claimable_lane_count:
+                        if not dispatch_slot_acquired:
+                            result = "capacity"
+                        elif snapshot.claimable_lane_count:
                             result = "lease-denied"
                         elif snapshot.eligible_lane_count:
                             result = "blocked"
                         else:
                             result = "empty"
+                        if dispatch_slot_acquired:
+                            self._dispatch_slots.release()
+                            dispatch_slot_acquired = False
                         _timing_log(
                             "dispatcher_claim_attempt",
                             detail=(
-                                f"spool={self.spool.storage_id},"
+                                f"worker={worker_name},iteration={iteration},"
                                 f"result={result},"
+                                f"spool={self.spool.storage_id},"
                                 f"eligible={snapshot.eligible_lane_count},"
                                 f"pending={snapshot.pending_count},"
                                 f"claimable={snapshot.claimable_lane_count},"
                                 f"processing={snapshot.processing_count},"
-                                f"lane={snapshot.first_claimable_lane or '-'},"
-                                f"worker={worker_name},iteration={iteration}"
+                                f"lane={snapshot.first_claimable_lane or '-'}"
                             ),
                         )
-                        # Enqueue commits normally wake us immediately.  The
-                        # timeout is the bounded fallback for a missed/coalesced
-                        # wake, using the configured two-second default.
-                        self._wait_for_wake(
-                            worker_name=worker_name,
-                            iteration=iteration,
-                            timeout=self.backoff_seconds,
+                        # The configured backoff is a wall-clock cadence, not
+                        # an extra sleep added after SQLite and diagnostics.
+                        # Deduct the work already spent in this iteration so an
+                        # idle worker begins its next claim cycle within the
+                        # two-second default even if a stage was briefly slow.
+                        wait_timeout = max(
+                            0.0,
+                            iteration_started
+                            + self.backoff_seconds
+                            - time.monotonic(),
                         )
-                        continue
-                    _timing_log(
-                        "dispatcher_claim_attempt",
-                        request_id=item.request_id,
-                        update_id=item.update_id,
-                        seq=item.seq,
-                        detail=(
-                            f"spool={self.spool.storage_id},"
-                            f"result=claimed,receiver={item.receiver_kind},"
-                            f"lane={item.lane_key},worker={worker_name},"
-                            f"iteration={iteration}"
-                        ),
-                    )
-                    _timing_log(
-                        "dispatcher_claim",
-                        request_id=item.request_id,
-                        update_id=item.update_id,
-                        seq=item.seq,
-                        elapsed_from_receive=time.time() - item.first_seen_at,
-                    )
-                    self._dispatch(item, lease_owner)
+                    else:
+                        result = "claimed"
+                        _timing_log(
+                            "dispatcher_claim_attempt",
+                            request_id=item.request_id,
+                            update_id=item.update_id,
+                            seq=item.seq,
+                            detail=(
+                                f"worker={worker_name},iteration={iteration},"
+                                f"result=claimed,spool={self.spool.storage_id},"
+                                f"receiver={item.receiver_kind},lane={item.lane_key}"
+                            ),
+                        )
+                        _timing_log(
+                            "dispatcher_claim",
+                            request_id=item.request_id,
+                            update_id=item.update_id,
+                            seq=item.seq,
+                            elapsed_from_receive=time.time() - item.first_seen_at,
+                        )
+                        stage_started = time.monotonic()
+                        self._dispatch_queue.put_nowait(
+                            (item, lease_owner, time.monotonic())
+                        )
+                        dispatch_ms = (
+                            time.monotonic() - stage_started
+                        ) * 1000.0
+                        dispatch_slot_acquired = False
                 except Exception as exc:  # noqa: BLE001 - leases make worker-loop recovery safe
+                    if dispatch_slot_acquired:
+                        self._dispatch_slots.release()
+                    result = f"error-{type(exc).__name__}"
                     log(
                         f"lane worker failed: {type(exc).__name__}: "
                         f"{sanitize_text(str(exc), 200)}"
                     )
+                    wait_timeout = min(
+                        ERROR_BACKOFF,
+                        max(
+                            0.0,
+                            iteration_started
+                            + self.backoff_seconds
+                            - time.monotonic(),
+                        ),
+                    )
+                iteration_ended = time.monotonic()
+                _timing_log(
+                    "dispatcher_iteration_end",
+                    detail=(
+                        f"worker={worker_name},iteration={iteration},"
+                        f"result={result},"
+                        f"total_ms={(iteration_ended - iteration_started) * 1000.0:.1f},"
+                        f"snapshot_ms={snapshot_ms:.1f},claim_ms={claim_ms:.1f},"
+                        f"dispatch_ms={dispatch_ms:.1f}"
+                    ),
+                )
+                previous_iteration_end = iteration_ended
+                if wait_timeout is not None:
                     self._wait_for_wake(
                         worker_name=worker_name,
                         iteration=iteration,
-                        timeout=ERROR_BACKOFF,
+                        timeout=wait_timeout,
                     )
         finally:
             with self._worker_count_lock:
@@ -1241,6 +1371,57 @@ class _InboundLaneDispatcher:
                 "dispatcher_workers_running",
                 detail=f"worker={worker_name},running={running},configured={self.worker_count}",
             )
+
+    def _dispatch_worker(self) -> None:
+        """Run slow command/state work outside the bounded claim cadence."""
+
+        worker_name = threading.current_thread().name
+        while not self._stop.is_set():
+            try:
+                job = self._dispatch_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if job is None:
+                self._dispatch_queue.task_done()
+                return
+            item, lease_owner, queued_at = job
+            service_started = time.monotonic()
+            _timing_log(
+                "dispatcher_service_start",
+                request_id=item.request_id,
+                update_id=item.update_id,
+                seq=item.seq,
+                detail=(
+                    f"worker={worker_name},"
+                    f"queue_ms={(service_started - queued_at) * 1000.0:.1f},"
+                    f"lane={item.lane_key}"
+                ),
+            )
+            result = "done"
+            try:
+                self._dispatch(item, lease_owner)
+            except Exception as exc:  # noqa: BLE001 - lease expiry preserves recovery
+                result = f"error-{type(exc).__name__}"
+                log(
+                    f"lane service failed: {type(exc).__name__}: "
+                    f"{sanitize_text(str(exc), 200)}"
+                )
+            finally:
+                _timing_log(
+                    "dispatcher_service_end",
+                    request_id=item.request_id,
+                    update_id=item.update_id,
+                    seq=item.seq,
+                    detail=(
+                        f"worker={worker_name},result={result},"
+                        f"service_ms={(time.monotonic() - service_started) * 1000.0:.1f},"
+                        f"lane={item.lane_key}"
+                    ),
+                )
+                self._dispatch_slots.release()
+                self._dispatch_queue.task_done()
+                if not self._stop.is_set():
+                    self._set_wake("dispatch_complete")
 
     def _dispatch(self, item: LaneItem, lease_owner: str) -> None:
         token_spec = self._token_for(item.receiver_kind)

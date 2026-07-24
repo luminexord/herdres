@@ -1346,6 +1346,132 @@ def test_unchanged_specs_do_not_broadcast_dispatcher_wakes(
     assert "permits=8" in spec_wakes[0]
 
 
+def test_real_dispatcher_claim_cadence_for_sixty_idle_seconds_and_enqueue(
+    tmp_path, monkeypatch
+) -> None:
+    """The production thread/spool/wake composition keeps a wall-clock SLA."""
+
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    attempts: list[float] = []
+    diagnostics: list[tuple[str, str]] = []
+    claimed = threading.Event()
+    timing_lock = threading.Lock()
+
+    def capture_timing(hop, *, update_id=None, detail="", **_kwargs):
+        observed_at = time.monotonic()
+        with timing_lock:
+            diagnostics.append((hop, str(detail)))
+            if hop == "dispatcher_claim_attempt":
+                attempts.append(observed_at)
+                if update_id == 600:
+                    claimed.set()
+
+    monkeypatch.setattr(herdres_gateway, "_timing_log", capture_timing)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "handle_update",
+        lambda *_args, **_kwargs: herdres_gateway.CHECKPOINT_ADVANCE,
+    )
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        spool,
+        REQUEST_ID_KEY,
+        workers=1,
+        backoff_seconds=2,
+        lease_seconds=5,
+    )
+    dispatcher.update_specs([("manager", "token", 0)])
+    dispatcher.start()
+    idle_started = time.monotonic()
+    try:
+        idle_deadline = idle_started + 60.0
+        while True:
+            remaining = idle_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
+
+        enqueue_started = time.monotonic()
+        _enqueue(spool, _update(600, 77, "after-sixty-idle-seconds"), "77")
+        dispatcher.wake()
+        assert claimed.wait(2.0)
+        claimed_at = time.monotonic()
+    finally:
+        dispatcher.stop()
+
+    with timing_lock:
+        idle_attempts = [
+            observed_at
+            for observed_at in attempts
+            if idle_started <= observed_at < enqueue_started
+        ]
+        captured_diagnostics = list(diagnostics)
+    gaps = [
+        current - previous
+        for previous, current in zip(idle_attempts, idle_attempts[1:])
+    ]
+    assert len(idle_attempts) >= 29
+    assert gaps
+    assert max(gaps) <= 2.5
+    assert 0 <= claimed_at - enqueue_started < 2
+    assert any(
+        hop == "dispatcher_iteration_start"
+        and "idle_ms=" in detail
+        and "iteration=" in detail
+        for hop, detail in captured_diagnostics
+    )
+    assert any(
+        hop == "dispatcher_iteration_end"
+        and "snapshot_ms=" in detail
+        and "claim_ms=" in detail
+        and "dispatch_ms=" in detail
+        for hop, detail in captured_diagnostics
+    )
+
+
+def test_slow_service_does_not_block_claim_loop_iterations(
+    tmp_path, monkeypatch
+) -> None:
+    """Claim cadence stays observable while bounded service work is occupied."""
+
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    _enqueue(spool, _update(610, 77, "slow-service"), "77")
+    service_started = threading.Event()
+    release_service = threading.Event()
+    capacity_attempts: list[float] = []
+    timing_lock = threading.Lock()
+
+    def capture_timing(hop, *, detail="", **_kwargs):
+        if hop != "dispatcher_claim_attempt" or "result=capacity" not in detail:
+            return
+        with timing_lock:
+            capacity_attempts.append(time.monotonic())
+
+    def slow_handle_update(*_args, **_kwargs):
+        service_started.set()
+        assert release_service.wait(2.0)
+        return herdres_gateway.CHECKPOINT_ADVANCE
+
+    monkeypatch.setattr(herdres_gateway, "_timing_log", capture_timing)
+    monkeypatch.setattr(herdres_gateway, "handle_update", slow_handle_update)
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        spool,
+        REQUEST_ID_KEY,
+        workers=1,
+        backoff_seconds=0.1,
+        lease_seconds=5,
+    )
+    dispatcher.update_specs([("manager", "token", 0)])
+    dispatcher.start()
+    try:
+        assert service_started.wait(1.0)
+        _wait_for(lambda: len(capacity_attempts) >= 2, timeout=0.5)
+    finally:
+        release_service.set()
+        dispatcher.stop()
+
+    assert capacity_attempts[1] - capacity_attempts[0] <= 0.25
+
+
 def test_single_lane_acceptance_cadence_claim_and_service_stay_under_two_seconds(
     tmp_path, monkeypatch
 ) -> None:
