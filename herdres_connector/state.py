@@ -69,7 +69,19 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
     state_file = path or config.state_path()
     state_file.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_file.with_suffix(state_file.suffix + ".tmp")
-    payload = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    # This file is an internal durability boundary, not a hand-edited config.
+    # Compact separators cut serialization and fsync bytes on the live state
+    # ledger; inbound commands cross this boundary before and after Tendwire,
+    # so pretty-print whitespace was directly extending every lane service.
+    payload = (
+        json.dumps(
+            data,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
     try:
         with tmp.open("w", encoding="utf-8") as handle:
             handle.write(payload)

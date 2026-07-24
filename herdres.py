@@ -374,6 +374,7 @@ def _submit_ingress_command_record(
     """
 
     request_id = validate_request_id(record.get("request_id"))
+    inline_in_progress_replayed = False
 
     while True:
         now = time.time()
@@ -569,6 +570,14 @@ def _submit_ingress_command_record(
             )
             state.save_state(store)
             return outcome
+        if disposition == "in_progress" and not inline_in_progress_replayed:
+            # Tendwire v3 may return a short-lived pending receipt immediately
+            # after accepting the transport write. One exact-byte replay is a
+            # read of that idempotent request, not a second instruction. Keep
+            # it inside this claim so the normal two-second lane backoff does
+            # not turn a sub-second receipt into a serialized queue.
+            inline_in_progress_replayed = True
+            continue
         if disposition not in ingress_requests.RETRYABLE_DISPOSITIONS:
             outcome = ingress_requests.quarantine_request(
                 record, "invalid Tendwire command result", now=transitioned_at
@@ -635,6 +644,17 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     with state.state_lock():
         store = state.load_state()
         now = time.time()
+        durable_spool = payload.get("_durable_spool") is True
+        first_seen_at = payload.get("_ingress_first_seen_at")
+        durable_first_seen_at = (
+            min(now, float(first_seen_at))
+            if (
+                durable_spool
+                and isinstance(first_seen_at, (int, float))
+                and not isinstance(first_seen_at, bool)
+            )
+            else None
+        )
         changed = ingress_requests.prune_requests(store, now=now)
         record: dict[str, Any] | None = None
         try:
@@ -642,6 +662,19 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         except ValueError:
             ingress_request_id = ""
         if ingress_request_id:
+            shell_created = False
+            if durable_first_seen_at is not None:
+                # The lane row durably owns the original receive time. Restore
+                # that time into the global request record before applying the
+                # current deadline check, but keep all expiry/pruning decisions
+                # on the current wall clock.
+                _record, shell_created = ingress_requests.ensure_request_shell(
+                    store,
+                    ingress_request_id,
+                    now=durable_first_seen_at,
+                    retry_horizon=config.command_retry_horizon_seconds(),
+                    retention=config.command_request_retention_seconds(),
+                )
             record, cached, prepared = ingress_requests.preflight_request(
                 store,
                 ingress_request_id,
@@ -649,10 +682,15 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 retry_horizon=config.command_retry_horizon_seconds(),
                 retention=config.command_request_retention_seconds(),
             )
+            prepared = prepared or shell_created
             if changed or prepared:
                 # First-seen lifecycle bounds are durable before routing,
-                # speech preparation, or child-process construction.
-                state.save_state(store)
+                # speech preparation, or child-process construction for legacy
+                # direct callers. Lane mode already has those exact bytes and
+                # bounds in the durable spool, so it folds this shell write into
+                # the canonical request commit below.
+                if not durable_spool or cached is not None:
+                    state.save_state(store)
             if cached is not None:
                 return cached
             if isinstance(record.get("request_json"), str):
@@ -847,7 +885,10 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 )
                 # Route ownership is durable before the command can mutate
                 # Tendwire, including commands whose public target is a space.
-                state.save_state(store)
+                # The canonical request save below includes this owner in the
+                # same fsync for durable-spool callers.
+                if not durable_spool:
+                    state.save_state(store)
         try:
             request = _command_request(entry, payload, text)
         except ValueError:
