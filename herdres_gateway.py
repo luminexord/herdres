@@ -986,9 +986,13 @@ class _InboundLaneDispatcher:
         )
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._wake_lock = threading.Lock()
+        self._wake_source = "initial"
         self._token_lock = threading.Lock()
         self._tokens: dict[str, tuple[str, str]] = {}
         self._threads: list[threading.Thread] = []
+        self._worker_count_lock = threading.Lock()
+        self._running_workers = 0
         self._notification_queues: list[queue.Queue[tuple[LaneItem, str, str] | None]] = [
             queue.Queue(maxsize=max(32, config.inbound_lane_depth() * 2))
             for _index in range(self.worker_count)
@@ -1002,7 +1006,11 @@ class _InboundLaneDispatcher:
         }
         with self._token_lock:
             self._tokens = tokens
-        self._wake.set()
+        _timing_log(
+            "dispatcher_update_specs",
+            detail=f"specs={len(specs)},receivers={len(tokens)}",
+        )
+        self._set_wake("update_specs")
 
     def start(self) -> None:
         if self._threads:
@@ -1028,10 +1036,17 @@ class _InboundLaneDispatcher:
             )
             self._threads.append(thread)
             thread.start()
+        _timing_log(
+            "dispatcher_workers_started",
+            detail=(
+                f"configured={self.worker_count},"
+                f"alive={sum(thread.is_alive() for thread in self._threads)}"
+            ),
+        )
 
     def stop(self) -> None:
         self._stop.set()
-        self._wake.set()
+        self._set_wake("stop")
         for notification_queue in self._notification_queues:
             try:
                 notification_queue.put_nowait(None)
@@ -1044,45 +1059,137 @@ class _InboundLaneDispatcher:
             thread.join(timeout=0.05)
 
     def wake(self) -> None:
-        self._wake.set()
+        self._set_wake("poll_enqueue")
+
+    def _set_wake(self, source: str) -> None:
+        with self._wake_lock:
+            self._wake_source = str(source)
+            self._wake.set()
+        _timing_log(
+            "dispatcher_wake_set",
+            detail=f"source={source},caller={threading.current_thread().name}",
+        )
+
+    def _wait_for_wake(
+        self,
+        *,
+        worker_name: str,
+        iteration: int,
+        timeout: float,
+    ) -> None:
+        signaled = self._wake.wait(timeout=timeout)
+        with self._wake_lock:
+            source = self._wake_source
+            self._wake.clear()
+        _timing_log(
+            "dispatcher_wake_received",
+            detail=(
+                f"worker={worker_name},iteration={iteration},"
+                f"signaled={int(signaled)},source={source}"
+            ),
+        )
 
     def _token_for(self, receiver_kind: str) -> tuple[str, str] | None:
         with self._token_lock:
             return self._tokens.get(receiver_kind)
 
     def _worker(self, lease_owner: str) -> None:
-        while not self._stop.is_set():
-            try:
-                item = self.spool.claim(
-                    lease_owner,
-                    lease_seconds=self.lease_seconds,
-                )
-                if item is None:
-                    # Enqueue commits normally wake us immediately.  The
-                    # timeout is the bounded fallback for a missed/coalesced
-                    # wake, using the configured two-second default.
-                    self._wake.wait(timeout=self.backoff_seconds)
-                    self._wake.clear()
-                    continue
-                _timing_log(
-                    "dispatcher_claim",
-                    request_id=item.request_id,
-                    update_id=item.update_id,
-                    seq=item.seq,
-                    elapsed_from_receive=time.time() - item.first_seen_at,
-                )
-                self._dispatch(item, lease_owner)
-            except Exception as exc:  # noqa: BLE001 - leases make worker-loop recovery safe
-                log(
-                    f"lane worker failed: {type(exc).__name__}: "
-                    f"{sanitize_text(str(exc), 200)}"
-                )
-                self._wake.wait(ERROR_BACKOFF)
-                self._wake.clear()
+        worker_name = threading.current_thread().name
+        with self._worker_count_lock:
+            self._running_workers += 1
+            running = self._running_workers
+        _timing_log(
+            "dispatcher_workers_running",
+            detail=f"worker={worker_name},running={running},configured={self.worker_count}",
+        )
+        iteration = 0
+        try:
+            while not self._stop.is_set():
+                iteration += 1
+                try:
+                    snapshot = self.spool.dispatch_snapshot()
+                    _timing_log(
+                        "dispatcher_iteration",
+                        detail=(
+                            f"worker={worker_name},iteration={iteration},"
+                            f"eligible={snapshot.eligible_lane_count},"
+                            f"pending={snapshot.pending_count}"
+                        ),
+                    )
+                    item = self.spool.claim(
+                        lease_owner,
+                        lease_seconds=self.lease_seconds,
+                    )
+                    if item is None:
+                        result = (
+                            "lease-denied"
+                            if snapshot.eligible_lane_count
+                            else "empty"
+                        )
+                        _timing_log(
+                            "dispatcher_claim_attempt",
+                            detail=(
+                                f"worker={worker_name},iteration={iteration},"
+                                f"result={result},"
+                                f"lane={snapshot.first_eligible_lane or '-'}"
+                            ),
+                        )
+                        # Enqueue commits normally wake us immediately.  The
+                        # timeout is the bounded fallback for a missed/coalesced
+                        # wake, using the configured two-second default.
+                        self._wait_for_wake(
+                            worker_name=worker_name,
+                            iteration=iteration,
+                            timeout=self.backoff_seconds,
+                        )
+                        continue
+                    _timing_log(
+                        "dispatcher_claim_attempt",
+                        request_id=item.request_id,
+                        update_id=item.update_id,
+                        seq=item.seq,
+                        detail=(
+                            f"worker={worker_name},iteration={iteration},"
+                            f"result=claimed,lane={item.lane_key}"
+                        ),
+                    )
+                    _timing_log(
+                        "dispatcher_claim",
+                        request_id=item.request_id,
+                        update_id=item.update_id,
+                        seq=item.seq,
+                        elapsed_from_receive=time.time() - item.first_seen_at,
+                    )
+                    self._dispatch(item, lease_owner)
+                except Exception as exc:  # noqa: BLE001 - leases make worker-loop recovery safe
+                    log(
+                        f"lane worker failed: {type(exc).__name__}: "
+                        f"{sanitize_text(str(exc), 200)}"
+                    )
+                    self._wait_for_wake(
+                        worker_name=worker_name,
+                        iteration=iteration,
+                        timeout=ERROR_BACKOFF,
+                    )
+        finally:
+            with self._worker_count_lock:
+                self._running_workers -= 1
+                running = self._running_workers
+            _timing_log(
+                "dispatcher_workers_running",
+                detail=f"worker={worker_name},running={running},configured={self.worker_count}",
+            )
 
     def _dispatch(self, item: LaneItem, lease_owner: str) -> None:
         token_spec = self._token_for(item.receiver_kind)
         if token_spec is None:
+            _timing_log(
+                "dispatcher_claim_attempt",
+                request_id=item.request_id,
+                update_id=item.update_id,
+                seq=item.seq,
+                detail=f"result=spec-missing,lane={item.lane_key}",
+            )
             self.spool.retry(
                 item.seq,
                 lease_owner,
@@ -1353,6 +1460,27 @@ def _reconcile_workers(
         log(f"poll worker started: {key}")
 
 
+def _reconcile_gateway_workers(
+    workers: dict[str, dict[str, Any]],
+    specs: list[tuple[str, str, int]],
+    request_id_key: bytes,
+    spool: IngressLaneSpool | None = None,
+    dispatcher: _InboundLaneDispatcher | None = None,
+) -> None:
+    """Apply one production worker-spec snapshot in startup order."""
+
+    if dispatcher is not None:
+        dispatcher.update_specs(specs)
+        dispatcher.start()
+    _reconcile_workers(
+        workers,
+        specs,
+        request_id_key,
+        spool,
+        dispatcher,
+    )
+
+
 def run() -> int:
     config.load_env_file()
     config.require_source_mode()
@@ -1378,10 +1506,7 @@ def run() -> int:
         try:
             store = state.load_state()
             specs = _poll_specs(store, token)
-            if dispatcher is not None:
-                dispatcher.update_specs(specs)
-                dispatcher.start()
-            _reconcile_workers(
+            _reconcile_gateway_workers(
                 workers,
                 specs,
                 request_id_key,

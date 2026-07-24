@@ -19,7 +19,7 @@ from unittest.mock import patch
 import herdres
 import pytest
 
-from herdres_connector import config, state
+from herdres_connector import config, source_sync, state
 from herdres_connector.source_sync import (
     SyncRuntime,
     _OfflockClient,
@@ -354,6 +354,50 @@ def test_blocked_sync_observation_does_not_delay_command_submission(
     assert elapsed < 5.0
     assert not thread.is_alive()
     assert result["ok"] is True
+
+
+def test_sync_yields_again_before_heavy_source_reconciliation(
+    tmp_path, monkeypatch
+):
+    """The command child gets a lock window after gateway preflight."""
+
+    _reset_lock_state()
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    state.save_state(_store(), statepath)
+    release_windows = 0
+    real_released_lock = state.released_lock
+    real_sync_sources = source_sync._sync_sources
+
+    class ObservedRelease:
+        def __enter__(self):
+            nonlocal release_windows
+            release_windows += 1
+            self._window = real_released_lock()
+            return self._window.__enter__()
+
+        def __exit__(self, *args):
+            return self._window.__exit__(*args)
+
+    def observed_sync_sources(*args, **kwargs):
+        # One window belongs to provider observation. The second is the
+        # explicit post-observation handoff for the gateway command child.
+        assert release_windows >= 2
+        return real_sync_sources(*args, **kwargs)
+
+    monkeypatch.setattr(state, "released_lock", ObservedRelease)
+    monkeypatch.setattr(source_sync, "_sync_sources", observed_sync_sources)
+    with state.state_lock(path=statepath):
+        current = state.load_state(statepath)
+        result = sync_once(
+            current,
+            SyncRuntime(FakeTendwire(), FakeTelegram(), with_outbox=False),
+        )
+
+    assert result["ok"] is True
+    assert release_windows >= 2
 
 
 # --- config flags ------------------------------------------------------------
