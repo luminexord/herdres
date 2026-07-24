@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -155,6 +156,9 @@ def reload_state_in_place(data: dict[str, Any], path: Path | None = None) -> Non
 # each holder dropping only its OWN fd. (Prod routes inbound commands through subprocesses, one holder
 # per process, where this is equivalent to a module global.)
 _LOCK_STATE = threading.local()
+_LOCK_HOLD_WARN_SECONDS = 2.0
+_LOCK_HOLD_OBSERVERS: list[Any] = []
+_LOCK_HOLD_OBSERVERS_GUARD = threading.Lock()
 
 
 def _held_lock_fd() -> int | None:
@@ -176,6 +180,109 @@ def lock_actually_held() -> bool:
     return lock_held() and getattr(_LOCK_STATE, "release_depth", 0) == 0
 
 
+def _lock_phase_name() -> str:
+    return str(getattr(_LOCK_STATE, "phase", "") or "unlabeled")
+
+
+def _lock_segments() -> dict[int, dict[str, Any]]:
+    segments = getattr(_LOCK_STATE, "segments", None)
+    if not isinstance(segments, dict):
+        segments = {}
+        _LOCK_STATE.segments = segments
+    return segments
+
+
+def _record_lock_acquired(fd: int) -> None:
+    now_wall = time.time()
+    _lock_segments()[fd] = {
+        "acquired_at": now_wall,
+        "acquired_monotonic": time.monotonic(),
+        "phases": [_lock_phase_name()],
+    }
+
+
+def _notify_lock_hold(event: dict[str, Any]) -> None:
+    with _LOCK_HOLD_OBSERVERS_GUARD:
+        observers = tuple(_LOCK_HOLD_OBSERVERS)
+    for observer in observers:
+        try:
+            observer(dict(event))
+        except Exception:
+            # Diagnostics must never endanger the state durability boundary.
+            continue
+
+
+def _record_lock_released(fd: int) -> None:
+    segment = _lock_segments().pop(fd, None)
+    if not isinstance(segment, dict):
+        return
+    released_at = time.time()
+    hold_seconds = max(
+        0.0, time.monotonic() - float(segment["acquired_monotonic"])
+    )
+    phases = [
+        str(phase)
+        for phase in segment.get("phases", ())
+        if isinstance(phase, str) and phase
+    ]
+    phase = phases[-1] if phases else "unlabeled"
+    event = {
+        "phase": phase,
+        "phase_trace": tuple(dict.fromkeys(phases)),
+        "acquired_at": float(segment["acquired_at"]),
+        "released_at": released_at,
+        "hold_seconds": hold_seconds,
+    }
+    _notify_lock_hold(event)
+    if hold_seconds > _LOCK_HOLD_WARN_SECONDS:
+        trace = ">".join(event["phase_trace"])
+        print(
+            "[herdres-state-lock] "
+            f"phase={phase} "
+            f"acquired_at={event['acquired_at']:.6f} "
+            f"released_at={released_at:.6f} "
+            f"hold_ms={hold_seconds * 1000.0:.1f} "
+            f"phase_trace={trace}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+@contextmanager
+def observe_lock_holds(observer: Any):
+    """Observe every contiguous flock hold; intended for probes and regressions."""
+
+    with _LOCK_HOLD_OBSERVERS_GUARD:
+        _LOCK_HOLD_OBSERVERS.append(observer)
+    try:
+        yield
+    finally:
+        with _LOCK_HOLD_OBSERVERS_GUARD:
+            try:
+                _LOCK_HOLD_OBSERVERS.remove(observer)
+            except ValueError:
+                pass
+
+
+@contextmanager
+def lock_phase(label: str):
+    """Label the current sync phase for flock-level hold diagnostics."""
+
+    previous = getattr(_LOCK_STATE, "phase", "")
+    _LOCK_STATE.phase = str(label or "unlabeled")
+    held = _held_lock_fd()
+    if held is not None and lock_actually_held():
+        segment = _lock_segments().get(held)
+        if isinstance(segment, dict):
+            phases = segment.setdefault("phases", [])
+            if not phases or phases[-1] != _LOCK_STATE.phase:
+                phases.append(_LOCK_STATE.phase)
+    try:
+        yield
+    finally:
+        _LOCK_STATE.phase = previous
+
+
 class _ReleasedLock:
     """Drop the state lock (if held) for the `with` body, then re-acquire it on exit. A no-op when no
     lock is held (called directly in tests) or when already nested inside another released window (the
@@ -190,6 +297,7 @@ class _ReleasedLock:
         if held is not None and depth == 0:
             self._fd = held
             fcntl.flock(self._fd, fcntl.LOCK_UN)
+            _record_lock_released(self._fd)
             _LOCK_STATE.release_depth = depth + 1
         return self
 
@@ -199,6 +307,7 @@ class _ReleasedLock:
             # Re-acquire BLOCKING so the caller resumes holding the lock exactly as before. A failure
             # (the lock file vanished) propagates and aborts the pass rather than continuing unlocked.
             fcntl.flock(self._fd, fcntl.LOCK_EX)
+            _record_lock_acquired(self._fd)
         return False
 
 
@@ -210,21 +319,31 @@ def released_lock() -> "_ReleasedLock":
 
 
 @contextmanager
-def state_lock(path: Path | None = None):
+def state_lock(path: Path | None = None, *, phase: str = "state"):
     state_file = path or config.state_path()
     lock_file = state_file.with_suffix(state_file.suffix + ".lock")
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     with lock_file.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
+        _record_lock_acquired(handle.fileno())
         # Expose the held fd so released_lock() can drop it around slow off-lock sends. Save/restore
         # (rather than force None) so a nested state_lock can't strand an outer holder.
         prev_held = _held_lock_fd()
+        prev_phase = getattr(_LOCK_STATE, "phase", "")
         _LOCK_STATE.held_fd = handle.fileno()
+        _LOCK_STATE.phase = str(phase or "state")
+        segment = _lock_segments().get(handle.fileno())
+        if isinstance(segment, dict):
+            segment["phases"] = [_LOCK_STATE.phase]
         try:
             yield
         finally:
             _LOCK_STATE.held_fd = prev_held
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            _LOCK_STATE.phase = prev_phase
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            finally:
+                _record_lock_released(handle.fileno())
 
 
 def source_worker_entries(data: dict[str, Any]) -> dict[str, dict[str, Any]]:

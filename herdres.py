@@ -943,24 +943,28 @@ def callback_reply(_payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sync_pass() -> dict[str, Any]:
-    with state.state_lock():
-        store = state.load_state()
+    with state.state_lock(phase="sync_pass.load"):
+        with state.lock_phase("sync_pass.load"):
+            store = state.load_state()
 
         def checkpoint() -> None:
             if not state.lock_held():
                 raise RuntimeError("state checkpoint requires the held state lock")
-            state.save_state(store)
+            with state.lock_phase("sync.checkpoint"):
+                state.save_state(store)
 
-        result = sync_once(
-            store,
-            _runtime(
-                dry_run=False,
-                with_outbox=True,
-                checkpoint=checkpoint,
-            ),
-        )
+        with state.lock_phase("sync_once"):
+            result = sync_once(
+                store,
+                _runtime(
+                    dry_run=False,
+                    with_outbox=True,
+                    checkpoint=checkpoint,
+                ),
+            )
         if result.get("changed"):
-            state.save_state(store)
+            with state.lock_phase("sync_pass.final_save"):
+                state.save_state(store)
     return result
 
 

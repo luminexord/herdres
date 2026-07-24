@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 from types import SimpleNamespace
 import threading
 import time
@@ -532,6 +533,154 @@ def test_real_sync_delivery_releases_lock_within_budget(tmp_path, monkeypatch):
     competitor_thread.join(4)
 
     assert sync_finished.is_set()
+
+
+def test_flock_hold_instrumentation_reports_phase_and_timestamps(
+    tmp_path, monkeypatch, capsys
+):
+    statepath = tmp_path / "state.json"
+    holds = []
+    monkeypatch.setattr(state, "_LOCK_HOLD_WARN_SECONDS", 0.0)
+
+    with state.observe_lock_holds(holds.append):
+        with state.state_lock(path=statepath, phase="sync.test_probe"):
+            time.sleep(0.002)
+
+    assert len(holds) == 1
+    hold = holds[0]
+    assert hold["phase"] == "sync.test_probe"
+    assert hold["phase_trace"] == ("sync.test_probe",)
+    assert hold["released_at"] >= hold["acquired_at"]
+    assert hold["hold_seconds"] > 0
+    warning = capsys.readouterr().err
+    assert "[herdres-state-lock]" in warning
+    assert "phase=sync.test_probe" in warning
+    assert "acquired_at=" in warning
+    assert "released_at=" in warning
+
+
+def test_full_busy_pass_flock_p99_and_concurrent_canonical_commit_budget(
+    tmp_path, monkeypatch
+):
+    """Production composition: slow account refresh is off-lock for a lane child."""
+
+    _reset_lock_state()
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "1")
+    monkeypatch.setenv("HERDRES_PINNED_ACCOUNT", "1")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    workers = [
+        _source_worker(
+            {
+                "id": f"worker-{index}",
+                "name": f"Worker {index}",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": f"fp-{index}",
+                "meta": {"agent": "codex"},
+            }
+        )
+        for index in range(12)
+    ]
+    turns = {
+        "turns": [
+            {
+                "id": f"turn-{index}",
+                "worker_id": worker["id"],
+                "worker_fingerprint": worker["fingerprint"],
+                "assistant_final_text": f"Final {index}",
+                "complete": True,
+            }
+            for index, worker in enumerate(workers)
+        ]
+    }
+    store = _store()
+    for index, worker in enumerate(workers):
+        state.upsert_worker_entry(
+            store, worker, topic_id=str(700 + index)
+        )
+    state.save_state(store, statepath)
+
+    account_refresh_entered = threading.Event()
+    release_account_refresh = threading.Event()
+
+    def slow_account_refresh():
+        account_refresh_entered.set()
+        assert release_account_refresh.wait(5)
+        return {"fetched_at": time.time()}
+
+    monkeypatch.setattr(
+        source_sync.accounts, "usage_snapshot", slow_account_refresh
+    )
+    tendwire = FakeTendwire(
+        turns=turns,
+        pending={"pending_interactions": []},
+        workers=workers,
+        spaces=[],
+    )
+    tendwire.turn_final_poll = lambda **_kwargs: {"ok": True, "items": []}
+    telegram = FakeTelegram()
+
+    def runtime_factory(**kwargs):
+        return SyncRuntime(
+            tendwire,
+            telegram,
+            with_outbox=bool(kwargs.get("with_outbox", True)),
+            checkpoint=kwargs.get("checkpoint"),
+        )
+
+    class CommandTendwire:
+        def command_json(self, request_json):
+            return _accepted_command_response(json.loads(request_json))
+
+    monkeypatch.setattr(herdres, "_runtime", runtime_factory)
+    monkeypatch.setattr(herdres, "TendwireClient", CommandTendwire)
+    holds = []
+    sync_result: dict[str, object] = {}
+    sync_error: list[BaseException] = []
+
+    def run_sync():
+        try:
+            sync_result.update(herdres._sync_pass())
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            sync_error.append(exc)
+
+    with state.observe_lock_holds(holds.append):
+        sync_thread = threading.Thread(target=run_sync)
+        sync_thread.start()
+        assert account_refresh_entered.wait(2)
+        started = time.monotonic()
+        reply = herdres.command_reply(
+            {
+                "request_id": REQUEST_ID,
+                "topic_id": "700",
+                "message_id": "9001",
+                "text": "commit while a full pass refreshes account usage",
+            }
+        )
+        canonical_commit_seconds = time.monotonic() - started
+        release_account_refresh.set()
+        sync_thread.join(8)
+
+    assert not sync_error
+    assert not sync_thread.is_alive()
+    assert sync_result["ok"] is True
+    assert reply["disposition"] == "terminal_accepted"
+    assert canonical_commit_seconds < 3.0
+    assert holds
+    hold_seconds = sorted(float(hold["hold_seconds"]) for hold in holds)
+    p99 = hold_seconds[math.ceil(0.99 * len(hold_seconds)) - 1]
+    assert p99 < 2.0
+    assert any(
+        hold["phase"] == "sync.pinned.account_usage" for hold in holds
+    )
+    persisted = state.load_state(statepath)
+    request = persisted["tendwire_ingress_command_requests"][REQUEST_ID]
+    assert isinstance(request.get("request_json"), str)
 
 
 def test_cleanup_topics_delete_cap(tmp_path, monkeypatch):
