@@ -100,13 +100,21 @@ older Tendwire even when v3 was requested.
 
 ### Durable inbound lanes
 
-`HERDRES_INBOUND_LANES=1` enables the opt-in per-topic ingress scheduler. It is
-off by default, so an upgrade keeps the existing synchronous gateway behavior
-until explicitly enabled. Lane mode stores accepted updates in
+The per-topic ingress scheduler is enabled by default
+(`HERDRES_INBOUND_LANES=1`). Set it to `0` only for an explicit rollback to the
+legacy synchronous gateway path. Lane mode stores accepted updates in
 `~/.local/share/herdres/inbound_spool.db` (override with
 `HERDRES_INBOUND_SPOOL_PATH`) using SQLite WAL and `synchronous=FULL`. The lane
 item and stable receiving-bot cursor commit in one transaction; the old offset
 file remains a best-effort, atomic rollback mirror.
+
+Upgrade migration: both shipped user units enable lane mode. If an older
+`~/.config/herdres/herdres.env` still contains an active
+`HERDRES_INBOUND_LANES=0`, that EnvironmentFile value overrides the unit
+default and leaves the gateway on the legacy path. Re-running
+`./install-user.sh` treats running the installer as consent to comment out only
+that legacy rollback line. The installer preserves it immediately below an
+explanatory marker so you can deliberately uncomment it to roll back.
 
 Message lanes are keyed by receiving-bot kind and Telegram topic. A topic uses
 that key immediately even before its state entry resolves, so resolution cannot

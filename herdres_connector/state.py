@@ -9,6 +9,7 @@ import re
 import threading
 import time
 import uuid
+from copy import deepcopy
 from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
@@ -92,6 +93,47 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
             pass
 
 
+def _replace_in_place(current: Any, fresh: Any) -> Any:
+    """Replace a JSON-shaped value while preserving live container references.
+
+    Slow sync phases release the process flock and reload state afterwards.  A
+    number of delivery helpers retain references to nested worker/Telegram
+    dictionaries across one provider call, so replacing only the root mapping
+    would leave those references detached.  Reconcile matching containers
+    recursively and return a replacement only when their shapes differ.
+    """
+
+    if isinstance(current, dict) and isinstance(fresh, dict):
+        for key in list(current):
+            if key not in fresh:
+                current.pop(key, None)
+        for key, value in fresh.items():
+            if key in current:
+                current[key] = _replace_in_place(current[key], value)
+            else:
+                current[key] = deepcopy(value)
+        return current
+    if isinstance(current, list) and isinstance(fresh, list):
+        # JSON arrays have no stable identity key.  Reconcile strictly by index
+        # so callers retaining an element reference keep the same logical slot;
+        # changing this requires an explicit identity schema and regression.
+        common = min(len(current), len(fresh))
+        for index in range(common):
+            current[index] = _replace_in_place(current[index], fresh[index])
+        if len(current) > len(fresh):
+            del current[len(fresh) :]
+        elif len(fresh) > len(current):
+            current.extend(deepcopy(fresh[len(current) :]))
+        return current
+    return deepcopy(fresh)
+
+
+def reload_state_in_place(data: dict[str, Any], path: Path | None = None) -> None:
+    """Reload authoritative state without detaching nested sync references."""
+
+    _replace_in_place(data, load_state(path))
+
+
 # Off-lock delivery (issue #122): sync_once holds state_lock() across the whole source-mode delivery
 # loop, so queued inbound commands (which also take state_lock()) stall behind its Telegram sends.
 # released_lock() drops the held lock for a bounded window and re-acquires it, so the delivery loop can
@@ -108,10 +150,18 @@ def _held_lock_fd() -> int | None:
 
 
 def lock_held() -> bool:
-    """True when this thread is inside a state_lock() (so released_lock() would actually drop it).
-    Lets the delivery loop's yield stay inert when sync_once runs outside the lock (tests/dry-run),
-    where there is nothing to yield and no on-disk state to reload."""
+    """True when this thread is inside a ``state_lock`` scope.
+
+    This remains true inside a ``released_lock`` window because the outer scope
+    still owns the descriptor and will re-acquire it on exit.
+    """
     return _held_lock_fd() is not None
+
+
+def lock_actually_held() -> bool:
+    """True only while this thread's state descriptor currently holds the flock."""
+
+    return lock_held() and getattr(_LOCK_STATE, "release_depth", 0) == 0
 
 
 class _ReleasedLock:

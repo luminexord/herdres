@@ -7,6 +7,7 @@ import signal
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,20 @@ from test_source_only import (
     _source_worker,
     _store,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_lane_telegram(monkeypatch):
+    monkeypatch.setattr(
+        herdres_gateway,
+        "TelegramClient",
+        lambda token: SimpleNamespace(
+            send_message=lambda *_args, **_kwargs: {
+                "ok": True,
+                "message_id": "ack",
+            }
+        ),
+    )
 
 
 def _update(update_id: int, topic_id: int, text: str) -> dict[str, object]:
@@ -354,6 +369,7 @@ def test_poison_head_quarantines_visibly_without_delaying_other_lane(
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     monkeypatch.setenv("HERDRES_ACK_ON_SEND", "1")
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     monkeypatch.setattr(config, "command_retry_horizon_seconds", lambda _env=None: 0.5)
     monkeypatch.setattr(config, "command_request_retention_seconds", lambda _env=None: 1.0)
     spool = IngressLaneSpool(tmp_path / "spool.db")
@@ -602,7 +618,7 @@ def test_terminal_ingress_cache_marks_refetched_update_done_without_dispatch(
 
 
 def test_feature_flag_off_uses_legacy_synchronous_path(tmp_path, monkeypatch) -> None:
-    monkeypatch.delenv("HERDRES_INBOUND_LANES", raising=False)
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "0")
     handled: list[int] = []
     saved: list[int] = []
     monkeypatch.setattr(herdres_gateway, "_read_offset", lambda _key: 60)
@@ -648,6 +664,15 @@ def _kill_stage_child(
     else:
         item = spool.claim("killed-dispatcher", lease_seconds=120)
         assert item is not None
+        if stage == "after_claim":
+            ready.send("claimed")
+            time.sleep(60)
+            return
+        if stage == "after_ack_claim":
+            assert spool.claim_notification(item.seq)
+            ready.send("ack-claimed")
+            time.sleep(60)
+            return
         checkpoint = herdres_gateway.handle_update(
             item.update,
             "token",
@@ -659,11 +684,22 @@ def _kill_stage_child(
         assert checkpoint == herdres_gateway.CHECKPOINT_ADVANCE
         if stage == "after_dispatch":
             ready.send("terminal-cached")
+        elif stage == "after_done":
+            assert spool.mark_done(item.seq, "killed-dispatcher")
+            ready.send("done")
     time.sleep(60)
 
 
 @pytest.mark.parametrize(
-    "stage", ["before_dispatch", "during_command_json", "after_dispatch"]
+    "stage",
+    [
+        "before_dispatch",
+        "after_claim",
+        "after_ack_claim",
+        "during_command_json",
+        "after_dispatch",
+        "after_done",
+    ],
 )
 def test_kill_9_restart_submits_each_request_exactly_once(
     stage, tmp_path, monkeypatch
@@ -678,8 +714,11 @@ def test_kill_9_restart_submits_each_request_exactly_once(
     spool = IngressLaneSpool(spool_path)
     update_id = {
         "before_dispatch": 70,
-        "during_command_json": 71,
-        "after_dispatch": 72,
+        "after_claim": 71,
+        "after_ack_claim": 72,
+        "during_command_json": 73,
+        "after_dispatch": 74,
+        "after_done": 75,
     }[stage]
     update = _update(update_id, 77, stage)
     if stage != "before_dispatch":
@@ -735,7 +774,14 @@ def test_kill_9_restart_submits_each_request_exactly_once(
     )
     process.start()
     assert parent.poll(5.0)
-    assert parent.recv() in {"enqueued", "mid-rpc", "terminal-cached"}
+    assert parent.recv() in {
+        "enqueued",
+        "claimed",
+        "ack-claimed",
+        "mid-rpc",
+        "terminal-cached",
+        "done",
+    }
     os.kill(process.pid, signal.SIGKILL)
     process.join(5.0)
     assert process.exitcode == -signal.SIGKILL
@@ -812,10 +858,198 @@ def test_tendwire_submit_releases_state_lock_and_preserves_concurrent_write(
 
 
 def test_lane_configuration_defaults_and_bounds() -> None:
-    assert config.inbound_lanes_enabled({}) is False
+    assert config.inbound_lanes_enabled({}) is True
+    assert config.inbound_lanes_enabled({"HERDRES_INBOUND_LANES": "0"}) is False
     assert config.inbound_lanes_enabled({"HERDRES_INBOUND_LANES": "1"}) is True
     assert config.inbound_dispatch_workers({}) == 8
     assert config.inbound_dispatch_workers({"HERDRES_INBOUND_DISPATCH_WORKERS": "0"}) == 1
     assert config.inbound_lane_depth({}) == 32
     assert config.inbound_lane_depth({"HERDRES_INBOUND_LANE_DEPTH": "5000"}) == 4096
     assert config.inbound_lane_backoff_seconds({}) == 2.0
+
+
+def test_queued_ack_precedes_submission_and_is_sent_once(
+    tmp_path, monkeypatch
+) -> None:
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    update = _update(90, 77, "ship it")
+    _enqueue(spool, update, "77")
+    events: list[str] = []
+
+    class Telegram:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, _chat_id, text, **_kwargs):
+            events.append(f"telegram:{text}")
+            return {"ok": True, "message_id": "ack-1"}
+
+    def handle(*_args, **_kwargs):
+        events.append("submit")
+        return herdres_gateway.CHECKPOINT_ADVANCE
+
+    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "1")
+    monkeypatch.setattr(herdres_gateway, "TelegramClient", Telegram)
+    monkeypatch.setattr(herdres_gateway, "handle_update", handle)
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        spool, REQUEST_ID_KEY, workers=1, backoff_seconds=0.01, lease_seconds=1
+    )
+    dispatcher.update_specs([("manager", "token", 0)])
+    dispatcher.start()
+    try:
+        _wait_for(lambda: spool.rows()[0]["state"] == "done")
+    finally:
+        dispatcher.stop()
+
+    assert events == [f"telegram:{herdres_gateway.QUEUED_ACK}", "submit"]
+    assert spool.rows()[0]["notify_state"] == "sent"
+
+
+def test_direct_command_keeps_success_reply_without_instant_ack(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    _configured_state(state_path)
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "1")
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+
+    class Client:
+        def command_json(self, request_json):
+            return _accepted_command_response(json.loads(request_json))
+
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+    result = herdres.command_reply(
+        {
+            "request_id": _request_id(_update(89, 77, "direct")),
+            "topic_id": "77",
+            "message_id": "1089",
+            "text": "direct",
+        }
+    )
+
+    assert result["disposition"] == "terminal_accepted"
+    assert result["reply"] == "Sent to Tendwire worker."
+
+
+def test_ack_claim_ambiguity_is_never_retried(tmp_path, monkeypatch) -> None:
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    update = _update(91, 77, "ambiguous ack")
+    _enqueue(spool, update, "77")
+    item = spool.claim("worker", lease_seconds=10)
+    assert item is not None
+    attempts: list[str] = []
+
+    class Telegram:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, *_args, **_kwargs):
+            attempts.append("send")
+            raise RuntimeError("connection lost after write")
+
+    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "1")
+    monkeypatch.setattr(herdres_gateway, "TelegramClient", Telegram)
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        spool, REQUEST_ID_KEY, workers=1
+    )
+    dispatcher._post_queued_ack(item, "token")
+    dispatcher._post_queued_ack(item, "token")
+
+    assert attempts == ["send"]
+    assert spool.rows()[0]["notify_state"] == "claimed"
+
+
+def test_reclaim_processing_preserves_retry_and_notification_evidence(
+    tmp_path,
+) -> None:
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    update = _update(92, 77, "reclaim")
+    _enqueue(spool, update, "77")
+    clock = time.time()
+    item = spool.claim("dead-worker", now=clock, lease_seconds=1)
+    assert item is not None
+    assert spool.claim_notification(item.seq, now=clock + 0.1)
+    assert spool.reclaim_processing(now=clock + 1.0) == 1
+
+    rows = spool.rows()
+    assert rows[0]["state"] == "pending"
+    assert rows[0]["notify_state"] == "claimed"
+    reclaimed = spool.claim("new-worker", now=clock + 1.0, lease_seconds=1)
+    assert reclaimed is not None
+    assert reclaimed.request_id == item.request_id
+
+
+@pytest.mark.parametrize("outcome", ["busy_success", "rejected"])
+def test_production_lane_ack_order_and_terminal_reply_policy(
+    outcome, tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    _configured_state(state_path)
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "1")
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    update = _update(93 if outcome == "busy_success" else 94, 77, "go")
+    _enqueue(spool, update, "77")
+    events: list[str] = []
+
+    class Client:
+        def command_json(self, request_json):
+            events.append("submit")
+            request = json.loads(request_json)
+            if outcome == "rejected":
+                return _failed_command_response(
+                    request,
+                    status="target_not_found",
+                    disposition="terminal_rejected",
+                )
+            accepted = _accepted_command_response(request)
+            accepted["result"]["target_state_at_send"] = "working"
+            return accepted
+
+    class Telegram:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, _chat_id, text, **_kwargs):
+            events.append(f"telegram:{text}")
+            return {"ok": True, "message_id": str(len(events))}
+
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+    monkeypatch.setattr(herdres_gateway, "TelegramClient", Telegram)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "run_herdres_command",
+        lambda payload: herdres.command_reply(payload),
+    )
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        spool, REQUEST_ID_KEY, workers=1, backoff_seconds=0.01, lease_seconds=1
+    )
+    dispatcher.update_specs([("manager", "token", 0)])
+    dispatcher.start()
+    try:
+        _wait_for(lambda: spool.rows()[0]["state"] == "done")
+    finally:
+        dispatcher.stop()
+
+    assert events[0] == f"telegram:{herdres_gateway.QUEUED_ACK}"
+    assert events[1] == "submit"
+    record = state.load_state(state_path)[ingress_requests.RECORDS_KEY][
+        _request_id(update)
+    ]
+    if outcome == "busy_success":
+        assert events == [
+            f"telegram:{herdres_gateway.QUEUED_ACK}",
+            "submit",
+            "telegram:Submitted to busy Tendwire worker.",
+        ]
+        assert (
+            record["outcome"]["reply"]
+            == "Submitted to busy Tendwire worker."
+        )
+    else:
+        assert events[2] == f"telegram:{herdres.SAFE_SEND_FAILURE_REPLY}"
+        assert record["outcome"]["reply"] == herdres.SAFE_SEND_FAILURE_REPLY

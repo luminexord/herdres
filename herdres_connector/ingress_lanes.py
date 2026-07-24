@@ -378,13 +378,50 @@ class IngressLaneSpool:
             ).rowcount
         return changed == 1
 
+    def claim_notification(
+        self, seq: int, *, now: float | None = None
+    ) -> bool:
+        """Claim the one permitted Queued notification attempt.
+
+        ``claimed`` is intentionally irreversible.  A process or transport loss
+        after this CAS is ambiguous, so retrying could visibly duplicate the
+        acknowledgement.
+        """
+
+        timestamp = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE lane_items
+                SET notify_state = 'claimed', updated_at = ?
+                WHERE seq = ? AND notify_state = 'pending'
+                """,
+                (timestamp, int(seq)),
+            ).rowcount
+        return changed == 1
+
+    def mark_notification_sent(
+        self, seq: int, *, now: float | None = None
+    ) -> bool:
+        timestamp = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE lane_items
+                SET notify_state = 'sent', updated_at = ?
+                WHERE seq = ? AND notify_state = 'claimed'
+                """,
+                (timestamp, int(seq)),
+            ).rowcount
+        return changed == 1
+
     def mark_done(
         self,
         seq: int,
         lease_owner: str,
         *,
         now: float | None = None,
-        notify_state: str = "sent",
+        notify_state: str | None = None,
     ) -> bool:
         timestamp = time.time() if now is None else float(now)
         with self._connect() as connection:
@@ -392,10 +429,15 @@ class IngressLaneSpool:
                 """
                 UPDATE lane_items
                 SET state = 'done', lease_owner = NULL, lease_until = NULL,
-                    notify_state = ?, updated_at = ?
+                    notify_state = COALESCE(?, notify_state), updated_at = ?
                 WHERE seq = ? AND state = 'processing' AND lease_owner = ?
                 """,
-                (str(notify_state), timestamp, int(seq), str(lease_owner)),
+                (
+                    None if notify_state is None else str(notify_state),
+                    timestamp,
+                    int(seq),
+                    str(lease_owner),
+                ),
             ).rowcount
         return changed == 1
 

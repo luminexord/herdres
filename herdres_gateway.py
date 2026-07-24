@@ -420,6 +420,7 @@ def _preview_lane_update(
 
 _OVERFLOW_NOTICE_LOCK = threading.Lock()
 _OVERFLOW_NOTICE_AT: dict[str, float] = {}
+QUEUED_ACK = "Queued."
 
 
 def _notify_lane_overflow(token: str, route: dict[str, Any], lane: str) -> None:
@@ -601,6 +602,7 @@ def handle_message(
     request_id_key: bytes,
     bot_key: str | None = None,
     ingress_first_seen_at: float | None = None,
+    instant_ack_posted: bool = False,
 ) -> str:
     chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
     try:
@@ -636,6 +638,7 @@ def handle_message(
                 command_payload = {"request_id": request_id}
             else:
                 payload["request_id"] = request_id
+                payload["instant_ack_posted"] = instant_ack_posted
                 command_payload = speech.pretranscribe_voice_payload(
                     payload,
                     bot_token=token,
@@ -648,6 +651,12 @@ def handle_message(
     if checkpoint == CHECKPOINT_RETRY:
         return checkpoint
     reply = result["reply"].strip()
+    if (
+        instant_ack_posted
+        and result.get("disposition") == "terminal_accepted"
+        and reply != "Submitted to busy Tendwire worker."
+    ):
+        reply = ""
     if not reply:
         return CHECKPOINT_ADVANCE
     try:
@@ -741,6 +750,7 @@ def handle_update(
     request_id_key: bytes,
     bot_key: str | None = None,
     ingress_first_seen_at: float | None = None,
+    instant_ack_posted: bool = False,
 ) -> str:
     update_id = update.get("update_id")
     if type(update_id) is not int or update_id < 0:
@@ -770,6 +780,7 @@ def handle_update(
         request_id_key=request_id_key,
         bot_key=bot_key,
         ingress_first_seen_at=ingress_first_seen_at,
+        instant_ack_posted=instant_ack_posted,
     )
 
 
@@ -996,6 +1007,7 @@ class _InboundLaneDispatcher:
             return
         heartbeat.start()
         try:
+            instant_ack_posted = self._post_queued_ack(item, token)
             checkpoint = handle_update(
                 item.update,
                 token,
@@ -1003,6 +1015,7 @@ class _InboundLaneDispatcher:
                 request_id_key=self.request_id_key,
                 bot_key=bot_key,
                 ingress_first_seen_at=item.first_seen_at,
+                instant_ack_posted=instant_ack_posted,
             )
         except Exception as exc:  # noqa: BLE001 - same request ID is retried from durable bytes
             log(
@@ -1021,6 +1034,45 @@ class _InboundLaneDispatcher:
                 lease_owner,
                 backoff_seconds=self.backoff_seconds,
             )
+
+    def _post_queued_ack(self, item: LaneItem, token: str) -> bool:
+        """Attempt the first-delivery acknowledgement before child submission."""
+
+        if item.kind == "message" and item.notify_state == "sent":
+            return True
+        if item.kind != "message":
+            if self.spool.claim_notification(item.seq):
+                self.spool.mark_notification_sent(item.seq)
+            return False
+        if not self.spool.claim_notification(item.seq):
+            return False
+        if not config.ack_on_send():
+            # ``sent`` is reserved for proof that the instant acknowledgement
+            # actually posted.  ``claimed`` prevents a later config toggle from
+            # introducing an out-of-order acknowledgement on retry.
+            return False
+        try:
+            sent = TelegramClient(token=token).send_message(
+                str(item.route.get("chat_id") or ""),
+                QUEUED_ACK,
+                thread_id=str(item.route.get("topic_id") or ""),
+                reply_to_message_id=str(item.route.get("message_id") or ""),
+                notify=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - claimed ambiguity is never retried
+            log(
+                f"queued ack {item.seq} ambiguous: "
+                f"{type(exc).__name__}: {sanitize_text(str(exc), 160)}"
+            )
+            return False
+        if sent.get("ok"):
+            return self.spool.mark_notification_sent(item.seq)
+        else:
+            log(
+                f"queued ack {item.seq} failed: "
+                f"{sanitize_text(sent.get('error') or 'Telegram send failed', 160)}"
+            )
+        return False
 
     def _renew_lease(
         self,

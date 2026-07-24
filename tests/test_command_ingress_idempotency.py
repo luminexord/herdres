@@ -355,6 +355,35 @@ def test_installer_and_runtime_use_same_default_and_preserve_private_key(
     _assert_key_not_disclosed(second, original)
 
 
+def test_installer_comments_legacy_lane_rollback_with_consent_marker(
+    tmp_path: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    env_path = home / ".config/herdres/herdres.env"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text(
+        "TELEGRAM_BOT_TOKEN=private\nHERDRES_INBOUND_LANES=0\n",
+        encoding="utf-8",
+    )
+    env_path.chmod(0o600)
+    environment = _installer_environment(home, None)
+
+    first = _run_installer(repository, environment)
+    _assert_success(first)
+    migrated = env_path.read_text(encoding="utf-8")
+    assert (
+        "approved by running install-user.sh" in migrated
+    )
+    assert "\n# HERDRES_INBOUND_LANES=0\n" in migrated
+    assert "\nHERDRES_INBOUND_LANES=0\n" not in migrated
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+
+    second = _run_installer(repository, environment)
+    _assert_success(second)
+    assert env_path.read_text(encoding="utf-8") == migrated
+
+
 @pytest.mark.parametrize("use_home_expansion", [False, True])
 def test_installer_and_runtime_expand_same_absolute_custom_path_without_rotation(
     tmp_path: Path,

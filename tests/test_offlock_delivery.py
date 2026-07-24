@@ -13,15 +13,29 @@ import fcntl
 import json
 from types import SimpleNamespace
 import threading
+import time
 from unittest.mock import patch
 
 import herdres
 import pytest
 
 from herdres_connector import config, state
-from herdres_connector.source_sync import SyncRuntime, _cleanup_topics, _sync_sources, sync_once
+from herdres_connector.source_sync import (
+    SyncRuntime,
+    _OfflockClient,
+    _cleanup_topics,
+    _sync_sources,
+    sync_once,
+)
 
-from test_source_only import FakeTelegram, FakeTendwire, _source_worker, _store
+from test_source_only import (
+    REQUEST_ID,
+    FakeTelegram,
+    FakeTendwire,
+    _accepted_command_response,
+    _source_worker,
+    _store,
+)
 
 
 def _reset_lock_state():
@@ -110,6 +124,19 @@ def test_released_lock_drops_then_reacquires(tmp_path):
     assert ops == [fcntl.LOCK_UN, fcntl.LOCK_EX]     # re-acquired on exit
 
 
+def test_lock_actually_held_exposes_released_window(tmp_path):
+    _reset_lock_state()
+    statepath = tmp_path / "state.json"
+
+    with state.state_lock(path=statepath):
+        assert state.lock_held() is True
+        assert state.lock_actually_held() is True
+        with state.released_lock():
+            assert state.lock_held() is True
+            assert state.lock_actually_held() is False
+        assert state.lock_actually_held() is True
+
+
 def test_reacquire_failure_propagates(tmp_path):
     # Fail-safe: a released_lock() re-acquire failure must PROPAGATE, never silently continue unlocked.
     _reset_lock_state()
@@ -144,6 +171,189 @@ def test_competitor_acquires_lock_during_yield(tmp_path):
             result["during"] = _competitor_can_acquire(lockpath)  # free during the yield -> True
         result["after"] = _competitor_can_acquire(lockpath)      # re-held -> False
     assert result == {"held": False, "during": True, "after": False}
+
+
+def test_slow_provider_call_does_not_hold_state_lock(tmp_path, monkeypatch):
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    store = _store()
+    state.save_state(store, statepath)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowProvider:
+        def send(self):
+            entered.set()
+            assert release.wait(3)
+            return {"ok": True}
+
+    finished = threading.Event()
+
+    def invoke():
+        with state.state_lock(path=statepath):
+            client = _OfflockClient(SlowProvider(), store)
+            assert client.send()["ok"] is True
+        finished.set()
+
+    thread = threading.Thread(target=invoke)
+    thread.start()
+    assert entered.wait(1)
+    started = time.monotonic()
+    with state.state_lock(path=statepath):
+        concurrent = state.load_state(statepath)
+        concurrent["concurrent_command"] = True
+        state.save_state(concurrent, statepath)
+    contiguous_hold = time.monotonic() - started
+    release.set()
+    thread.join(3)
+
+    assert finished.is_set()
+    assert contiguous_hold < 2.0
+    assert store["concurrent_command"] is True
+
+
+def test_nested_offlock_client_does_not_rollback_lane_child_commit(
+    tmp_path, monkeypatch
+):
+    """Regression for cleanup/speak phases that already own a release window."""
+
+    _reset_lock_state()
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    state.save_state(_store(), statepath)
+
+    class Provider:
+        def send(self):
+            return {"ok": True}
+
+    with state.state_lock(path=statepath):
+        current = state.load_state(statepath)
+        client = _OfflockClient(Provider(), current)
+        with state.released_lock():
+            child = state.load_state(statepath)
+            child["child_commit_survived"] = True
+            state.save_state(child, statepath)
+            assert client.send()["ok"] is True
+        state.reload_state_in_place(current, statepath)
+
+    assert current["child_commit_survived"] is True
+    assert state.load_state(statepath)["child_commit_survived"] is True
+
+
+def test_raising_offlock_provider_reloads_before_caller_continues(
+    tmp_path, monkeypatch
+):
+    _reset_lock_state()
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    state.save_state(_store(), statepath)
+    entered = threading.Event()
+    concurrent_committed = threading.Event()
+    finished = threading.Event()
+
+    class RaisingProvider:
+        def send(self):
+            entered.set()
+            assert concurrent_committed.wait(2)
+            raise RuntimeError("provider rate limited")
+
+    def invoke():
+        with state.state_lock(path=statepath):
+            current = state.load_state(statepath)
+            try:
+                _OfflockClient(RaisingProvider(), current).send()
+            except RuntimeError:
+                current["caller_continued"] = True
+                state.save_state(current, statepath)
+        finished.set()
+
+    thread = threading.Thread(target=invoke)
+    thread.start()
+    assert entered.wait(1)
+    with state.state_lock(path=statepath):
+        concurrent = state.load_state(statepath)
+        concurrent["child_terminal_receipt"] = "committed"
+        state.save_state(concurrent, statepath)
+    concurrent_committed.set()
+    thread.join(3)
+
+    assert finished.is_set()
+    persisted = state.load_state(statepath)
+    assert persisted["child_terminal_receipt"] == "committed"
+    assert persisted["caller_continued"] is True
+
+
+def test_blocked_sync_observation_does_not_delay_command_submission(
+    tmp_path, monkeypatch
+):
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    worker = _source_worker(
+        {
+            "id": "worker-1",
+            "name": "Alpha",
+            "status": "idle",
+            "space_id": "space-1",
+            "fingerprint": "fp-1",
+        }
+    )
+    store = _store()
+    state.upsert_worker_entry(store, worker, topic_id="77")
+    state.save_state(store, statepath)
+    entered = threading.Event()
+    release = threading.Event()
+    submitted: list[str] = []
+
+    class SlowSyncTendwire(FakeTendwire):
+        def snapshot(self):
+            entered.set()
+            assert release.wait(6)
+            return super().snapshot()
+
+    class CommandTendwire:
+        def command_json(self, request_json):
+            submitted.append(request_json)
+            return _accepted_command_response(json.loads(request_json))
+
+    slow = SlowSyncTendwire(workers=[worker])
+    monkeypatch.setattr(
+        herdres,
+        "_runtime",
+        lambda **_kwargs: SyncRuntime(
+            slow, FakeTelegram(), with_outbox=False
+        ),
+    )
+    monkeypatch.setattr(herdres, "TendwireClient", CommandTendwire)
+    result: dict[str, object] = {}
+
+    thread = threading.Thread(target=lambda: result.update(herdres._sync_pass()))
+    thread.start()
+    assert entered.wait(1)
+    started = time.monotonic()
+    reply = herdres.command_reply(
+        {
+            "request_id": REQUEST_ID,
+            "topic_id": "77",
+            "message_id": "9001",
+            "text": "submit while sync RPC is blocked",
+        }
+    )
+    elapsed = time.monotonic() - started
+    release.set()
+    thread.join(6)
+
+    assert reply["checkpoint"] == "advance"
+    assert reply["disposition"] == "terminal_accepted"
+    # This direct caller has no gateway instant-ack evidence, so lane mode alone
+    # must not suppress the terminal success reply.
+    assert reply["reply"] == "Sent to Tendwire worker."
+    assert len(submitted) == 1
+    assert elapsed < 5.0
+    assert not thread.is_alive()
+    assert result["ok"] is True
 
 
 # --- config flags ------------------------------------------------------------
@@ -223,6 +433,61 @@ def test_yield_preserves_both_deliveries(tmp_path, monkeypatch):
     workers = state.source_worker_entries(store)
     delivered = [w for w in workers.values() if w.get("last_clean_message_id") or w.get("final_message_ids")]
     assert len(delivered) == 2   # both survived the mid-loop reload
+
+
+def test_real_sync_delivery_releases_lock_within_budget(tmp_path, monkeypatch):
+    """The production sync_once wrapping is what keeps Telegram delivery off-lock."""
+
+    _reset_lock_state()
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    state.save_state(_store(), statepath)
+    delivery_entered = threading.Event()
+    release_delivery = threading.Event()
+    competitor_acquired = threading.Event()
+    sync_finished = threading.Event()
+
+    class SlowDeliveryTelegram(FakeTelegram):
+        def send_message(self, chat_id, html, **kwargs):
+            delivery_entered.set()
+            assert release_delivery.wait(3)
+            return super().send_message(chat_id, html, **kwargs)
+
+    def run_sync():
+        with state.state_lock(path=statepath):
+            current = state.load_state(statepath)
+            result = sync_once(
+                current,
+                SyncRuntime(
+                    _two_final_turns_tendwire(),
+                    SlowDeliveryTelegram(),
+                    with_outbox=False,
+                ),
+            )
+            assert result["sent"] == 2
+            state.save_state(current, statepath)
+        sync_finished.set()
+
+    def compete():
+        with state.state_lock(path=statepath):
+            competitor_acquired.set()
+
+    sync_thread = threading.Thread(target=run_sync)
+    sync_thread.start()
+    assert delivery_entered.wait(1)
+    competitor_thread = threading.Thread(target=compete)
+    competitor_thread.start()
+    try:
+        assert competitor_acquired.wait(0.75)
+    finally:
+        release_delivery.set()
+    sync_thread.join(4)
+    competitor_thread.join(4)
+
+    assert sync_finished.is_set()
 
 
 def test_cleanup_topics_delete_cap(tmp_path, monkeypatch):

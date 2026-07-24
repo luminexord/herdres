@@ -183,8 +183,8 @@ def inbound_lanes_enabled(env: Any | None = None) -> bool:
     """Enable the durable, independently dispatched Telegram ingress lanes."""
 
     source = os.environ if env is None else env
-    value = str(source.get("HERDRES_INBOUND_LANES", "") or "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
+    value = str(source.get("HERDRES_INBOUND_LANES", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def inbound_spool_path(env: Any | None = None) -> Path:

@@ -188,13 +188,21 @@ HERDRES_TELEGRAM_CHAT_ID=...
 HERDR_TELEGRAM_TOPICS_STATE=~/.local/share/herdres/state.json
 HERDRES_REQUEST_ID_KEY_PATH=~/.local/share/herdres/request-id.key
 HERDRES_COMMAND_RETRY_HORIZON_SECONDS=86400
-HERDRES_INBOUND_LANES=0
+HERDRES_INBOUND_LANES=1
 HERDRES_INBOUND_DISPATCH_WORKERS=8
 HERDRES_INBOUND_LANE_DEPTH=32
 HERDRES_INBOUND_LANE_BACKOFF_SECONDS=2
 TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.db
 HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS=60
 ```
+
+Upgrade migration: lane execution and acknowledgement live in
+`herdres-gateway.service`, so both shipped Herdres units set
+`HERDRES_INBOUND_LANES=1`. An active `HERDRES_INBOUND_LANES=0` left in
+`~/.config/herdres/herdres.env` by older installation guidance overrides those
+unit defaults. Re-running `./install-user.sh` treats running the installer as
+consent to comment out only that legacy rollback line; it preserves the line
+under an explanatory marker so you can deliberately uncomment it to roll back.
 
 `HERDRES_COMMAND_RETRY_HORIZON_SECONDS` fixes the retry deadline from the
 record's first-seen time; it does not configure a sliding idle timeout. Unset,

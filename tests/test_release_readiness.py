@@ -46,6 +46,12 @@ def test_no_timer_unit_is_shipped():
     assert list(UNIT_DIR.glob("*.timer")) == []
 
 
+def test_both_herdres_units_mirror_inbound_lane_rollout_flag():
+    for unit in HERDRES_OWNED_SERVICES:
+        contents = (UNIT_DIR / unit).read_text(encoding="utf-8")
+        assert "Environment=HERDRES_INBOUND_LANES=1" in contents
+
+
 def test_install_docs_agree_with_shipped_units():
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     install = (REPO_ROOT / "INSTALL.md").read_text(encoding="utf-8")

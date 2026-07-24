@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -72,6 +73,44 @@ class SyncRuntime:
     max_sends: int = 8
     checkpoint: Callable[[], None] | None = None
     after_provider_accept: Callable[[], None] | None = None
+
+
+class _OfflockClient:
+    """Release the state flock around one provider call and reload afterwards."""
+
+    def __init__(self, client: Any, store: dict[str, Any]) -> None:
+        self._client = client
+        self._store = store
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._client, name)
+        if not callable(attribute):
+            return attribute
+        if name == "with_token":
+            return lambda *args, **kwargs: _OfflockClient(
+                attribute(*args, **kwargs), self._store
+            )
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            if not state.lock_actually_held():
+                # An outer phase may already have released the flock.  In that
+                # case a nested save/reload would write the whole stale store
+                # without exclusion and could roll back a lane child commit.
+                return attribute(*args, **kwargs)
+            # Phase 1 persists every state transition that precedes the provider
+            # operation. Phase 2 performs the slow call off-lock. Phase 3 reloads
+            # concurrent command writes before the caller applies the outcome.
+            state.save_state(self._store)
+            try:
+                with state.released_lock():
+                    return attribute(*args, **kwargs)
+            finally:
+                # A provider may raise (notably RateLimited).  The caller can
+                # catch and continue, so it must still see concurrent commits
+                # before any later save under the re-acquired lock.
+                state.reload_state_in_place(self._store)
+
+        return call
 
 
 def _workers(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3348,6 +3387,7 @@ def _sync_submission_working_cards(
     *,
     chat_id: str,
     now: float,
+    yield_barrier: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     """Render v3 receipts while leaving the legacy predicted-turn path inert."""
 
@@ -3385,6 +3425,21 @@ def _sync_submission_working_cards(
         )
     )
     for record in records:
+        request_id = str(record.get("request_id") or "")
+        if yield_barrier is not None:
+            yield_barrier()
+            record = next(
+                (
+                    candidate
+                    for candidate in ingress_requests.retained_submission_records(
+                        store, now=now
+                    )
+                    if candidate.get("request_id") == request_id
+                ),
+                None,
+            )
+            if record is None:
+                continue
         submission_id = str(record.get("submission_id") or "")
         turn_id = str(record.get("turn_id") or "")
         entry = _submission_owner_entry(store, record)
@@ -5467,6 +5522,7 @@ def _drain_turn_final(
     chat_id: str,
     max_operations: int,
     turn_projection: Mapping[str, Any] | None = None,
+    yield_barrier: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     result = {
         "enabled": runtime.with_outbox,
@@ -5503,6 +5559,8 @@ def _drain_turn_final(
         failed_revision = ""
         if result["operations"] >= max_operations:
             break
+        if yield_barrier is not None:
+            yield_barrier()
         poll = runtime.tendwire.turn_final_poll(
             limit=1,
             lease_seconds=lease_seconds,
@@ -6621,7 +6679,13 @@ def _drain_turn_final(
     return result
 
 
-def _sync_pinned(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
+def _sync_pinned(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    yield_barrier: Callable[[], None] | None = None,
+) -> bool:
     current_worker_ids: set[str] = set()
     current_space_ids = {
         str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
@@ -6660,6 +6724,8 @@ def _sync_pinned(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -
         telegram["pinned_status_hash"] = content_hash
         telegram.setdefault("pinned_status_message_id", "0")
         return True
+    if yield_barrier is not None:
+        yield_barrier()
     if message_id:
         sent = runtime.telegram.edit_message(chat_id, message_id, html)
         if not sent.get("ok") and _message_missing(sent.get("error")):
@@ -6684,9 +6750,20 @@ def _sync_pinned(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -
     return False
 
 
-def _sync_topic_pinned_statuses(store: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> int:
+def _sync_topic_pinned_statuses(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    yield_barrier: Callable[[], None] | None = None,
+) -> int:
     updated = 0
-    for entry in state.source_entries(store).values():
+    for entry_key in list(state.source_entries(store)):
+        if yield_barrier is not None:
+            yield_barrier()
+        entry = state.source_entries(store).get(entry_key)
+        if entry is None:
+            continue
         updated += int(_sync_topic_pinned(store, entry, runtime, chat_id=chat_id))
     return updated
 
@@ -7537,40 +7614,138 @@ def _apply_full_reconciliation(
     return changed
 
 
-def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
-    config.require_source_mode()
-    observed_at = time.time()
-    delta_observation: dict[str, Any] | None = None
-    delta: dict[str, Any] | None = None
-    snapshot = runtime.tendwire.snapshot()
-    observed_snapshot_workers: list[dict[str, Any]] = []
-    if _herdr_backend_explicitly_unhealthy(snapshot):
-        return _tendwire_non_success(runtime, "tendwire_herdr_unhealthy")
-    if hasattr(runtime.tendwire, "turn_delta"):
-        delta_observation = _observe_turn_delta(
-            store,
-            runtime,
-            now=observed_at,
+def _observe_sync_inputs(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    now: float,
+) -> dict[str, Any]:
+    """Observe Tendwire off-lock, then atomically adopt the observed delta lane.
+
+    ``_observe_turn_delta`` intentionally mutates its supplied delta projection
+    and checkpoint fields.  Under the production flock it therefore runs
+    against a private state copy.  After the RPC window closes, the live state
+    is reloaded and its complete pre-observation delta basis must still match
+    before the private projection can be adopted.
+    """
+
+    has_delta = hasattr(runtime.tendwire, "turn_delta")
+    if not state.lock_held():
+        snapshot = runtime.tendwire.snapshot()
+        if _herdr_backend_explicitly_unhealthy(snapshot):
+            return {"unhealthy": True, "snapshot": snapshot}
+        observation = (
+            _observe_turn_delta(store, runtime, now=now) if has_delta else None
         )
-        delta = delta_observation["delta"]
-        if delta_observation["kind"] == "full":
+        if observation is not None and observation["kind"] == "full":
             turns_payload = runtime.tendwire.turns()
-        elif delta_observation["kind"] == "delta":
+        elif observation is not None and observation["kind"] == "delta":
             turns_payload = {
                 "schema_version": TURN_SCHEMA_VERSION,
-                "turns": delta_observation["upserts"],
+                "turns": observation["upserts"],
             }
-        else:
+        elif observation is not None:
             turns_payload = {
                 "schema_version": TURN_SCHEMA_VERSION,
                 "turns": [],
             }
-    else:
-        # Compatibility for embedders and old test doubles. The production
-        # TendwireClient always exposes turn_delta; only its explicit
-        # unsupported-method outcome activates the durable fallback lane.
-        turns_payload = runtime.tendwire.turns()
-    pending_payload = runtime.tendwire.pending()
+        else:
+            turns_payload = runtime.tendwire.turns()
+        if isinstance(observation, dict):
+            observation["apply_basis"] = deepcopy(observation["delta"])
+        return {
+            "snapshot": snapshot,
+            "delta_observation": observation,
+            "turns": turns_payload,
+            "pending": runtime.tendwire.pending(),
+        }
+
+    # Materialize default delta state before the phase-1 save so the equality
+    # check below compares a durable, explicit cursor/projection basis.
+    if has_delta:
+        _delta_state(store, now=now)
+    state.save_state(store)
+    delta_basis = deepcopy(store.get(_DELTA_STATE_KEY)) if has_delta else None
+    observed_store = deepcopy(store)
+    observed_runtime = SyncRuntime(
+        runtime.tendwire,
+        runtime.telegram,
+        dry_run=runtime.dry_run,
+        with_outbox=runtime.with_outbox,
+        max_sends=runtime.max_sends,
+        # Private observation must never checkpoint its speculative copy.
+        checkpoint=None,
+        after_provider_accept=runtime.after_provider_accept,
+    )
+    with state.released_lock():
+        snapshot = runtime.tendwire.snapshot()
+        if _herdr_backend_explicitly_unhealthy(snapshot):
+            observed = {"unhealthy": True, "snapshot": snapshot}
+        else:
+            observation = (
+                _observe_turn_delta(
+                    observed_store, observed_runtime, now=now
+                )
+                if has_delta
+                else None
+            )
+            if observation is not None and observation["kind"] == "full":
+                turns_payload = runtime.tendwire.turns()
+            elif observation is not None and observation["kind"] == "delta":
+                turns_payload = {
+                    "schema_version": TURN_SCHEMA_VERSION,
+                    "turns": observation["upserts"],
+                }
+            elif observation is not None:
+                turns_payload = {
+                    "schema_version": TURN_SCHEMA_VERSION,
+                    "turns": [],
+                }
+            else:
+                turns_payload = runtime.tendwire.turns()
+            observed = {
+                "snapshot": snapshot,
+                "delta_observation": observation,
+                "turns": turns_payload,
+                "pending": runtime.tendwire.pending(),
+            }
+
+    state.reload_state_in_place(store)
+    if observed.get("unhealthy"):
+        return observed
+    if has_delta:
+        if store.get(_DELTA_STATE_KEY) != delta_basis:
+            # Another observer advanced or re-bootstrapped the cursor while the
+            # RPC was in flight. Discard this page; applying it to the new basis
+            # would fork the retained projection.
+            return {"cursor_conflict": True}
+        observation = observed.get("delta_observation")
+        if isinstance(observation, dict):
+            store[_DELTA_STATE_KEY] = deepcopy(observation["delta"])
+            observation["delta"] = store[_DELTA_STATE_KEY]
+            # Later delivery/cleanup phases open more release windows.  Keep the
+            # exact adopted basis so the page can be revalidated immediately
+            # before its checkpoint is applied.
+            observation["apply_basis"] = deepcopy(observation["delta"])
+    return observed
+
+
+def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
+    config.require_source_mode()
+    observed_at = time.time()
+    observed = _observe_sync_inputs(store, runtime, now=observed_at)
+    if observed.get("unhealthy"):
+        return _tendwire_non_success(runtime, "tendwire_herdr_unhealthy")
+    if observed.get("cursor_conflict"):
+        return _tendwire_non_success(runtime, "tendwire_delta_cursor_changed")
+    delta_observation = observed.get("delta_observation")
+    delta: dict[str, Any] | None = None
+    snapshot = observed["snapshot"]
+    observed_snapshot_workers: list[dict[str, Any]] = []
+    if delta_observation is not None:
+        delta = delta_observation["delta"]
+    turns_payload = observed["turns"]
+    pending_payload = observed["pending"]
     for name, payload in (("snapshot", snapshot), ("turns", turns_payload), ("pending", pending_payload)):
         if payload.get("ok") is False:
             return _tendwire_non_success(runtime, f"tendwire_{name}_failed")
@@ -7588,6 +7763,30 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         # The list envelope/schema is connector-wide. Descriptor defects are
         # converted to bounded row-local outcomes by _validate_turns_payload.
         return _tendwire_non_success(runtime, exc.status)
+    if state.lock_held() and not runtime.dry_run:
+        runtime = SyncRuntime(
+            _OfflockClient(runtime.tendwire, store),
+            _OfflockClient(runtime.telegram, store),
+            dry_run=runtime.dry_run,
+            with_outbox=runtime.with_outbox,
+            max_sends=runtime.max_sends,
+            checkpoint=runtime.checkpoint,
+            after_provider_accept=runtime.after_provider_accept,
+        )
+
+    def _yield_between_turns() -> None:
+        if not state.lock_held():
+            return
+        state.save_state(store)
+        with state.released_lock():
+            pass
+        state.reload_state_in_place(store)
+
+    yield_barrier = (
+        _yield_between_turns
+        if config.offlock_interpane_yield_enabled() and not runtime.dry_run
+        else None
+    )
     observed_snapshot_workers = _workers(snapshot)
     (
         snapshot,
@@ -7648,6 +7847,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         runtime,
         chat_id=chat_id,
         now=observed_at,
+        yield_barrier=yield_barrier,
     )
     routing_repaired = _repair_space_mode_routing_state(store)
     message_bindings = _backfill_message_bindings(store)
@@ -7680,26 +7880,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         store, runtime
     )
 
-    def _yield_between_turns() -> None:
-        # Inert unless actually holding the state lock (the shim wraps sync_once in state_lock();
-        # tests/dry-run call sync_once directly). Commit under the lock so a competitor's load-modify-
-        # save lands on top of ours, release briefly, then reload IN PLACE (the shim owns the `store`
-        # reference and saves it after us) so committed deliveries + the additive turn-delivery ledger
-        # survive both sides.
-        if not state.lock_held():
-            return
-        state.save_state(store)
-        with state.released_lock():
-            pass
-        fresh = state.load_state()
-        store.clear()
-        store.update(fresh)
-
-    yield_barrier = (
-        _yield_between_turns
-        if config.offlock_interpane_yield_enabled() and not runtime.dry_run
-        else None
-    )
     try:
         feed_turns_payload = (
             {"schema_version": TURN_SCHEMA_VERSION, "turns": []}
@@ -7819,8 +7999,18 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         or decision_result.get("changed")
     )
     if config.pinned_status_enabled():
-        pinned_changed = _sync_pinned(store, runtime, chat_id=chat_id)
-        topic_pinned_updated = _sync_topic_pinned_statuses(store, runtime, chat_id=chat_id)
+        pinned_changed = _sync_pinned(
+            store,
+            runtime,
+            chat_id=chat_id,
+            yield_barrier=yield_barrier,
+        )
+        topic_pinned_updated = _sync_topic_pinned_statuses(
+            store,
+            runtime,
+            chat_id=chat_id,
+            yield_barrier=yield_barrier,
+        )
     else:
         pinned_changed = False
         topic_pinned_updated = 0
@@ -7828,6 +8018,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     delta_card_updates = 0
     if delta_observation is not None:
         if delta_observation["kind"] == "delta":
+            if (
+                store.get(_DELTA_STATE_KEY)
+                != delta_observation.get("apply_basis")
+            ):
+                # A later off-lock phase let another full pass advance the
+                # watermark.  Do not apply this pass's now-stale checkpoint.
+                return _tendwire_non_success(
+                    runtime, "tendwire_delta_cursor_changed"
+                )
             delta_card_updates = _finish_delta_page(
                 store,
                 delta_observation,
@@ -7865,6 +8064,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             runtime,
             chat_id=chat_id,
             max_operations=remaining,
+            yield_barrier=yield_barrier,
             turn_projection=(
                 delta.get("projection")
                 if isinstance(delta, dict)
@@ -7880,6 +8080,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             chat_id=chat_id,
             max_sends=remaining,
             dry_run=runtime.dry_run,
+            yield_barrier=yield_barrier,
         )
         changed = changed or bool(turn_final_result.get("changed")) or bool(outbox_result.get("changed"))
     return {
