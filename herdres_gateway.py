@@ -931,7 +931,10 @@ def _poll_once_lanes(
                 update_id=update_id,
                 seq=result.seq,
                 elapsed_from_receive=time.time() - first_seen_at,
-                detail=result.status,
+                detail=(
+                    f"spool={spool.storage_id},status={result.status},"
+                    f"receiver={receiver_kind},lane={preview['lane_key']}"
+                ),
             )
             # The enqueue transaction (including duplicate/overflow cursor
             # advancement) is durable before this callback runs.  Wake the
@@ -1008,7 +1011,10 @@ class _InboundLaneDispatcher:
             self._tokens = tokens
         _timing_log(
             "dispatcher_update_specs",
-            detail=f"specs={len(specs)},receivers={len(tokens)}",
+            detail=(
+                f"spool={self.spool.storage_id},specs={len(specs)},"
+                f"receivers={','.join(sorted(tokens)) or '-'}"
+            ),
         )
         self._set_wake("update_specs")
 
@@ -1111,9 +1117,12 @@ class _InboundLaneDispatcher:
                     _timing_log(
                         "dispatcher_iteration",
                         detail=(
-                            f"worker={worker_name},iteration={iteration},"
+                            f"spool={self.spool.storage_id},"
                             f"eligible={snapshot.eligible_lane_count},"
-                            f"pending={snapshot.pending_count}"
+                            f"pending={snapshot.pending_count},"
+                            f"claimable={snapshot.claimable_lane_count},"
+                            f"processing={snapshot.processing_count},"
+                            f"worker={worker_name},iteration={iteration}"
                         ),
                     )
                     item = self.spool.claim(
@@ -1121,17 +1130,23 @@ class _InboundLaneDispatcher:
                         lease_seconds=self.lease_seconds,
                     )
                     if item is None:
-                        result = (
-                            "lease-denied"
-                            if snapshot.eligible_lane_count
-                            else "empty"
-                        )
+                        if snapshot.claimable_lane_count:
+                            result = "lease-denied"
+                        elif snapshot.eligible_lane_count:
+                            result = "blocked"
+                        else:
+                            result = "empty"
                         _timing_log(
                             "dispatcher_claim_attempt",
                             detail=(
-                                f"worker={worker_name},iteration={iteration},"
+                                f"spool={self.spool.storage_id},"
                                 f"result={result},"
-                                f"lane={snapshot.first_eligible_lane or '-'}"
+                                f"eligible={snapshot.eligible_lane_count},"
+                                f"pending={snapshot.pending_count},"
+                                f"claimable={snapshot.claimable_lane_count},"
+                                f"processing={snapshot.processing_count},"
+                                f"lane={snapshot.first_claimable_lane or '-'},"
+                                f"worker={worker_name},iteration={iteration}"
                             ),
                         )
                         # Enqueue commits normally wake us immediately.  The
@@ -1149,8 +1164,10 @@ class _InboundLaneDispatcher:
                         update_id=item.update_id,
                         seq=item.seq,
                         detail=(
-                            f"worker={worker_name},iteration={iteration},"
-                            f"result=claimed,lane={item.lane_key}"
+                            f"spool={self.spool.storage_id},"
+                            f"result=claimed,receiver={item.receiver_kind},"
+                            f"lane={item.lane_key},worker={worker_name},"
+                            f"iteration={iteration}"
                         ),
                     )
                     _timing_log(
@@ -1358,12 +1375,13 @@ def _poll_once(
     on_enqueue: Callable[[], None] | None = None,
 ) -> None:
     if config.inbound_lanes_enabled():
+        lane_spool = spool if spool is not None else IngressLaneSpool()
         _poll_once_lanes(
             key,
             token,
             timeout_seconds=timeout_seconds,
             request_id_key=request_id_key,
-            spool=spool or IngressLaneSpool(),
+            spool=lane_spool,
             on_enqueue=on_enqueue,
         )
         return
@@ -1469,6 +1487,10 @@ def _reconcile_gateway_workers(
 ) -> None:
     """Apply one production worker-spec snapshot in startup order."""
 
+    if dispatcher is not None and spool is not dispatcher.spool:
+        raise RuntimeError(
+            "inbound dispatcher and poll workers must share one spool instance"
+        )
     if dispatcher is not None:
         dispatcher.update_specs(specs)
         dispatcher.start()

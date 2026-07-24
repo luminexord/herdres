@@ -82,8 +82,10 @@ class DispatchSnapshot:
     """Small diagnostic view of work visible to a dispatcher iteration."""
 
     pending_count: int
+    processing_count: int
     eligible_lane_count: int
-    first_eligible_lane: str
+    claimable_lane_count: int
+    first_claimable_lane: str
 
 
 def lane_key(receiver_kind: str, topic_id: str) -> str:
@@ -100,6 +102,8 @@ class IngressLaneSpool:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path or config.inbound_spool_path()).expanduser()
         self._initialize()
+        stat = self.path.stat()
+        self.storage_id = f"{stat.st_dev:x}:{stat.st_ino:x}"
 
     def _initialize(self) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -349,16 +353,23 @@ class IngressLaneSpool:
         )
 
     def dispatch_snapshot(self, *, now: float | None = None) -> DispatchSnapshot:
-        """Count pending rows and lane heads currently eligible for a lease."""
+        """Describe spool-visible work without applying receiver/spec filters.
+
+        A lane is eligible whenever the spool contains a pending row for it.
+        Claimability is deliberately separate: FIFO ordering or retry backoff
+        can temporarily make an eligible lane unclaimable.
+        """
 
         timestamp = time.time() if now is None else float(now)
         with self._connect() as connection:
-            pending_row = connection.execute(
-                "SELECT COUNT(*) AS count FROM lane_items WHERE state = 'pending'"
-            ).fetchone()
-            eligible_row = connection.execute(
+            snapshot_row = connection.execute(
                 """
-                WITH eligible AS (
+                WITH pending AS (
+                    SELECT seq, lane_key
+                    FROM lane_items
+                    WHERE state = 'pending'
+                ),
+                claimable AS (
                     SELECT candidate.seq, candidate.lane_key
                     FROM lane_items AS candidate
                     WHERE candidate.state = 'pending'
@@ -371,25 +382,53 @@ class IngressLaneSpool:
                       )
                 )
                 SELECT
-                    COUNT(*) AS count,
+                    (SELECT COUNT(*) FROM pending) AS pending_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM lane_items
+                        WHERE state = 'processing'
+                    ) AS processing_count,
+                    (
+                        SELECT COUNT(DISTINCT lane_key)
+                        FROM pending
+                    ) AS eligible_lane_count,
+                    (SELECT COUNT(*) FROM claimable) AS claimable_lane_count,
                     (
                         SELECT lane_key
-                        FROM eligible
+                        FROM claimable
                         ORDER BY seq
                         LIMIT 1
-                    ) AS first_lane
-                FROM eligible
+                    ) AS first_claimable_lane
                 """,
                 (timestamp,),
             ).fetchone()
         return DispatchSnapshot(
-            pending_count=int(pending_row["count"]) if pending_row is not None else 0,
-            eligible_lane_count=(
-                int(eligible_row["count"]) if eligible_row is not None else 0
+            pending_count=(
+                int(snapshot_row["pending_count"])
+                if snapshot_row is not None
+                else 0
             ),
-            first_eligible_lane=(
-                str(eligible_row["first_lane"])
-                if eligible_row is not None and eligible_row["first_lane"] is not None
+            processing_count=(
+                int(snapshot_row["processing_count"])
+                if snapshot_row is not None
+                else 0
+            ),
+            eligible_lane_count=(
+                int(snapshot_row["eligible_lane_count"])
+                if snapshot_row is not None
+                else 0
+            ),
+            claimable_lane_count=(
+                int(snapshot_row["claimable_lane_count"])
+                if snapshot_row is not None
+                else 0
+            ),
+            first_claimable_lane=(
+                str(snapshot_row["first_claimable_lane"])
+                if (
+                    snapshot_row is not None
+                    and snapshot_row["first_claimable_lane"] is not None
+                )
                 else ""
             ),
         )

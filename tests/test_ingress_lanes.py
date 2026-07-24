@@ -118,6 +118,26 @@ def _configured_state(path: Path) -> None:
     state.save_state(store, path=path)
 
 
+def test_pending_lane_is_spool_eligible_even_while_its_head_is_processing(
+    tmp_path,
+) -> None:
+    """Specs and FIFO claimability must never hide a pending spool lane."""
+
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    _enqueue(spool, _update(1, 77, "head"), "77")
+    _enqueue(spool, _update(2, 77, "pending follower"), "77")
+
+    claimed = spool.claim("worker", lease_seconds=30)
+    assert claimed is not None
+
+    snapshot = spool.dispatch_snapshot()
+    assert snapshot.pending_count == 1
+    assert snapshot.processing_count == 1
+    assert snapshot.eligible_lane_count == 1
+    assert snapshot.claimable_lane_count == 0
+    assert snapshot.first_claimable_lane == ""
+
+
 def test_busy_lane_does_not_delay_another_agent_under_two_seconds(
     tmp_path, monkeypatch
 ) -> None:
@@ -1118,8 +1138,10 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
     poll_batches: list[int] = []
     poll_drained = threading.Event()
     release_poll = threading.Event()
+    release_dispatch = threading.Event()
     timing_lock = threading.Lock()
     dispatcher_diagnostics: list[tuple[str, str]] = []
+    enqueue_diagnostics: list[str] = []
     timings: dict[str, dict[int, float]] = {
         "durable_enqueue_commit": {},
         "dispatcher_claim": {},
@@ -1144,6 +1166,11 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
         if hop.startswith("dispatcher_"):
             with timing_lock:
                 dispatcher_diagnostics.append((hop, str(detail)))
+        if hop == "durable_enqueue_commit":
+            with timing_lock:
+                enqueue_diagnostics.append(str(detail))
+            if update_id == 209:
+                release_dispatch.set()
         if hop not in timings or update_id is None:
             return
         with timing_lock:
@@ -1167,6 +1194,10 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
 
     def observed_claim(*args, **kwargs):
         nonlocal empty_claims
+        # Preserve the real claim implementation but hold the cohort at its
+        # durable boundary so the dispatcher must report all ten visible rows.
+        if ready_for_enqueue.is_set() and not release_dispatch.is_set():
+            return None
         item = real_claim(*args, **kwargs)
         if item is None:
             with empty_claims_lock:
@@ -1223,8 +1254,22 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
     assert dispatcher.worker_count == 8
     assert (
         "dispatcher_update_specs",
-        "specs=1,receivers=1",
+        f"spool={spool.storage_id},specs=1,receivers=manager",
     ) in dispatcher_diagnostics
+    # Production specs are receiver/token records; their receiver key does not
+    # equal the topic-derived lane key. The dispatcher must still see the row.
+    assert lane_key("manager", "77") not in {
+        herdres_gateway._receiver_id_for_key(key)
+        for key, _token, _timeout in specs
+    }
+    assert len(enqueue_diagnostics) == 10
+    assert all(
+        detail.startswith(
+            f"spool={spool.storage_id},status=enqueued,receiver=manager,"
+            'lane=["manager","77"]'
+        )
+        for detail in enqueue_diagnostics
+    )
     assert any(
         hop == "dispatcher_workers_started"
         and "configured=8,alive=8" in detail
@@ -1236,8 +1281,9 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
     )
     assert any(
         hop == "dispatcher_iteration"
-        and "eligible=" in detail
-        and "pending=" in detail
+        and detail.startswith(
+            f"spool={spool.storage_id},eligible=1,pending=10,claimable=1,"
+        )
         for hop, detail in dispatcher_diagnostics
     )
     assert any(
@@ -1266,3 +1312,22 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
     ]
     assert min(claim_latencies) >= 0.0
     assert max(claim_latencies) < 2.0
+
+
+def test_production_reconcile_rejects_a_different_poll_spool(tmp_path) -> None:
+    dispatcher_spool = IngressLaneSpool(tmp_path / "dispatcher.db")
+    poll_spool = IngressLaneSpool(tmp_path / "poll.db")
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        dispatcher_spool,
+        REQUEST_ID_KEY,
+        workers=1,
+    )
+
+    with pytest.raises(RuntimeError, match="share one spool instance"):
+        herdres_gateway._reconcile_gateway_workers(
+            {},
+            [("manager", "token", 0)],
+            REQUEST_ID_KEY,
+            poll_spool,
+            dispatcher,
+        )
