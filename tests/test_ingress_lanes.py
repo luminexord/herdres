@@ -1314,6 +1314,145 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
     assert max(claim_latencies) < 2.0
 
 
+def test_unchanged_specs_do_not_broadcast_dispatcher_wakes(
+    tmp_path, monkeypatch
+) -> None:
+    """The one-second reconcile loop must not wake every claimant when idle."""
+
+    diagnostics: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        herdres_gateway,
+        "_timing_log",
+        lambda hop, *, detail="", **_kwargs: diagnostics.append(
+            (hop, str(detail))
+        ),
+    )
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        IngressLaneSpool(tmp_path / "spool.db"),
+        REQUEST_ID_KEY,
+        workers=8,
+    )
+    specs = [("manager", "token", 0)]
+
+    dispatcher.update_specs(specs)
+    dispatcher.update_specs(specs)
+
+    spec_wakes = [
+        detail
+        for hop, detail in diagnostics
+        if hop == "dispatcher_wake_set" and "source=update_specs" in detail
+    ]
+    assert len(spec_wakes) == 1
+    assert "permits=8" in spec_wakes[0]
+
+
+def test_single_lane_acceptance_cadence_claim_and_service_stay_under_two_seconds(
+    tmp_path, monkeypatch
+) -> None:
+    """Ten spaced items use the production spool -> gateway -> command path."""
+
+    state_path = tmp_path / "state.json"
+    _configured_state(state_path)
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "0")
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    timings: dict[str, dict[int, float]] = {
+        "enqueue": {},
+        "dispatcher_claim": {},
+        "lane_done": {},
+    }
+    timing_lock = threading.Lock()
+
+    def capture_timing(hop, *, update_id=None, **_kwargs):
+        if update_id is None or hop not in timings:
+            return
+        with timing_lock:
+            timings[hop][int(update_id)] = time.monotonic()
+
+    class Client:
+        def command_json(self, request_json):
+            time.sleep(0.01)
+            return _accepted_command_response(json.loads(request_json))
+
+    def forbidden_parent_preflight(*_args, **_kwargs):
+        raise AssertionError("durable lane work must not take the parent state lock")
+
+    real_save_state = state.save_state
+    command_saves = 0
+
+    def counted_save(store, path=None):
+        nonlocal command_saves
+        command_saves += 1
+        return real_save_state(store, path=path)
+
+    monkeypatch.setattr(herdres_gateway, "_timing_log", capture_timing)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "_preflight_ingress_request",
+        forbidden_parent_preflight,
+    )
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+    monkeypatch.setattr(state, "save_state", counted_save)
+    monkeypatch.setattr(
+        herdres_gateway,
+        "run_herdres_command",
+        lambda payload: herdres.command_reply(payload),
+    )
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        spool,
+        REQUEST_ID_KEY,
+        workers=8,
+        backoff_seconds=2,
+        lease_seconds=5,
+    )
+    dispatcher.update_specs([("manager", "token", 0)])
+    dispatcher.start()
+    update_ids = range(300, 310)
+    max_open_depth = 0
+    try:
+        for update_id in update_ids:
+            update = _update(update_id, 77, f"cadence-{update_id}")
+            _enqueue(spool, update, "77")
+            timings["enqueue"][update_id] = time.monotonic()
+            dispatcher.wake()
+            max_open_depth = max(
+                max_open_depth,
+                sum(
+                    row["state"] in {"pending", "processing"}
+                    for row in spool.rows()
+                ),
+            )
+            # Scaled cadence keeps this regression fast while retaining the
+            # acceptance invariant that spacing exceeds service. The live
+            # verification uses the full six-second cadence.
+            time.sleep(0.25)
+        _wait_for(
+            lambda: len(timings["lane_done"]) == 10,
+            timeout=3.0,
+        )
+    finally:
+        dispatcher.stop()
+
+    claims = [
+        timings["dispatcher_claim"][update_id] - timings["enqueue"][update_id]
+        for update_id in update_ids
+    ]
+    services = [
+        timings["lane_done"][update_id]
+        - timings["dispatcher_claim"][update_id]
+        for update_id in update_ids
+    ]
+    assert max_open_depth <= 1
+    assert min(claims) >= 0
+    assert max(claims) < 2
+    assert min(services) >= 0
+    assert max(services) < 2
+    # One canonical durability barrier and one terminal receipt barrier per
+    # item; the former parent-shell and route-owner writes are coalesced.
+    assert command_saves == 20
+
+
 def test_production_reconcile_rejects_a_different_poll_spool(tmp_path) -> None:
     dispatcher_spool = IngressLaneSpool(tmp_path / "dispatcher.db")
     poll_spool = IngressLaneSpool(tmp_path / "poll.db")

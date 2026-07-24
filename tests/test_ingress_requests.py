@@ -417,6 +417,34 @@ def test_backend_unavailable_authority_comes_only_from_disposition(
         assert len(calls) == 1
 
 
+def test_in_progress_receipt_gets_one_inline_idempotent_poll(
+    tmp_path, monkeypatch
+) -> None:
+    _setup_command_state(tmp_path, monkeypatch)
+    calls: list[str] = []
+
+    class Client:
+        def command_json(self, request_json):
+            calls.append(request_json)
+            request = json.loads(request_json)
+            if len(calls) == 1:
+                return _failed_command_response(
+                    request,
+                    status="pending",
+                    disposition="in_progress",
+                )
+            return _accepted_command_response(request)
+
+    monkeypatch.setattr(herdres, "TendwireClient", Client)
+
+    result = herdres.command_reply(_payload())
+
+    assert result["checkpoint"] == "advance"
+    assert result["disposition"] == "terminal_accepted"
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+
+
 def test_terminal_uncertain_quarantines_and_restart_uses_cache(
     tmp_path, monkeypatch
 ) -> None:

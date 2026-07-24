@@ -114,6 +114,11 @@ class IngressLaneSpool:
         os.close(fd)
         os.chmod(self.path, 0o600)
         with self._connect() as connection:
+            # Journal mode is persistent database metadata. Reissuing this on
+            # every short-lived dispatcher connection turns an otherwise
+            # read-only snapshot into a lock-taking operation and amplifies an
+            # eight-worker wake into seconds of SQLite contention.
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
 
     def _connect(self) -> sqlite3.Connection:
@@ -124,7 +129,6 @@ class IngressLaneSpool:
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         return connection
 

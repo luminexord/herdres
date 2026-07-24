@@ -631,6 +631,7 @@ def handle_message(
     bot_key: str | None = None,
     ingress_first_seen_at: float | None = None,
     instant_ack_posted: bool = False,
+    durable_spool: bool = False,
     deferred_reply: Callable[[str], None] | None = None,
 ) -> str:
     chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
@@ -646,28 +647,55 @@ def handle_message(
         _drop(message, "invalid_ingress_identity")
         return CHECKPOINT_ADVANCE
 
-    # The immutable first-seen/deadline/retention shell is fsynced before
-    # routing, voice transcription, or child-process creation. A terminal or
-    # expired redelivery is answered from its cached local outcome and never
-    # creates a child that could call Tendwire.
-    record, cached_outcome = _preflight_ingress_request(
-        request_id, first_seen_at=ingress_first_seen_at
-    )
+    # In lane mode the exact Telegram update, first-seen time, deadline, and
+    # request identity are already one committed SQLite row. Do not acquire the
+    # large global state lock once here and then again in the command child:
+    # under a busy source sync that two-lock handoff starved for ~38 seconds.
+    # The child now creates the request shell and canonical bytes in one lock
+    # acquisition. Legacy direct callers retain the original preflight.
+    store = state.load_state()
+    if durable_spool:
+        records = store.get(ingress_requests.RECORDS_KEY)
+        record = (
+            records.get(request_id)
+            if isinstance(records, dict)
+            and isinstance(records.get(request_id), dict)
+            else None
+        )
+        cached_outcome = ingress_requests.cached_terminal_outcome(
+            store, request_id, now=time.time()
+        )
+    else:
+        record, cached_outcome = _preflight_ingress_request(
+            request_id, first_seen_at=ingress_first_seen_at
+        )
     if cached_outcome is not None:
         result = cached_outcome
     else:
-        store = state.load_state()
+        command_payload: dict[str, Any] = {"request_id": request_id}
+        if durable_spool:
+            command_payload["_durable_spool"] = True
+        if durable_spool and ingress_first_seen_at is not None:
+            command_payload["_ingress_first_seen_at"] = float(
+                ingress_first_seen_at
+            )
         if _delete_topic_icon_service_message(message, store, token):
-            command_payload = {"request_id": request_id}
-        elif isinstance(record.get("request_json"), str):
-            command_payload = {"request_id": request_id}
+            pass
+        elif isinstance(record, dict) and isinstance(
+            record.get("request_json"), str
+        ):
+            pass
         else:
             payload = _payload_for_message(message, store, bot_key=bot_key)
-            if payload is None:
-                command_payload = {"request_id": request_id}
-            else:
+            if payload is not None:
                 payload["request_id"] = request_id
                 payload["instant_ack_posted"] = instant_ack_posted
+                if durable_spool:
+                    payload["_durable_spool"] = True
+                if durable_spool and ingress_first_seen_at is not None:
+                    payload["_ingress_first_seen_at"] = float(
+                        ingress_first_seen_at
+                    )
                 command_payload = speech.pretranscribe_voice_payload(
                     payload,
                     bot_token=token,
@@ -783,6 +811,7 @@ def handle_update(
     bot_key: str | None = None,
     ingress_first_seen_at: float | None = None,
     instant_ack_posted: bool = False,
+    durable_spool: bool = False,
     deferred_reply: Callable[[str], None] | None = None,
 ) -> str:
     update_id = update.get("update_id")
@@ -814,6 +843,7 @@ def handle_update(
         bot_key=bot_key,
         ingress_first_seen_at=ingress_first_seen_at,
         instant_ack_posted=instant_ack_posted,
+        durable_spool=durable_spool,
         deferred_reply=deferred_reply,
     )
 
@@ -988,9 +1018,14 @@ class _InboundLaneDispatcher:
             else float(lease_seconds),
         )
         self._stop = threading.Event()
-        self._wake = threading.Event()
+        # One durable enqueue needs one claimant. A threading.Event wakes every
+        # waiter, so the former implementation made all eight workers run a
+        # snapshot plus BEGIN IMMEDIATE for each message and every unchanged
+        # one-second spec reconciliation. The semaphore preserves every enqueue
+        # edge while waking only the amount of work that can make progress.
+        self._wake = threading.Semaphore(0)
         self._wake_lock = threading.Lock()
-        self._wake_source = "initial"
+        self._wake_sources: queue.SimpleQueue[str] = queue.SimpleQueue()
         self._token_lock = threading.Lock()
         self._tokens: dict[str, tuple[str, str]] = {}
         self._threads: list[threading.Thread] = []
@@ -1008,6 +1043,7 @@ class _InboundLaneDispatcher:
             for key, token, _timeout in specs
         }
         with self._token_lock:
+            changed = tokens != self._tokens
             self._tokens = tokens
         _timing_log(
             "dispatcher_update_specs",
@@ -1016,7 +1052,8 @@ class _InboundLaneDispatcher:
                 f"receivers={','.join(sorted(tokens)) or '-'}"
             ),
         )
-        self._set_wake("update_specs")
+        if changed:
+            self._set_wake("update_specs", permits=self.worker_count)
 
     def start(self) -> None:
         if self._threads:
@@ -1052,7 +1089,7 @@ class _InboundLaneDispatcher:
 
     def stop(self) -> None:
         self._stop.set()
-        self._set_wake("stop")
+        self._set_wake("stop", permits=self.worker_count)
         for notification_queue in self._notification_queues:
             try:
                 notification_queue.put_nowait(None)
@@ -1067,13 +1104,18 @@ class _InboundLaneDispatcher:
     def wake(self) -> None:
         self._set_wake("poll_enqueue")
 
-    def _set_wake(self, source: str) -> None:
+    def _set_wake(self, source: str, *, permits: int = 1) -> None:
+        count = max(1, int(permits))
         with self._wake_lock:
-            self._wake_source = str(source)
-            self._wake.set()
+            for _index in range(count):
+                self._wake_sources.put(str(source))
+                self._wake.release()
         _timing_log(
             "dispatcher_wake_set",
-            detail=f"source={source},caller={threading.current_thread().name}",
+            detail=(
+                f"source={source},permits={count},"
+                f"caller={threading.current_thread().name}"
+            ),
         )
 
     def _wait_for_wake(
@@ -1083,10 +1125,13 @@ class _InboundLaneDispatcher:
         iteration: int,
         timeout: float,
     ) -> None:
-        signaled = self._wake.wait(timeout=timeout)
-        with self._wake_lock:
-            source = self._wake_source
-            self._wake.clear()
+        signaled = self._wake.acquire(timeout=timeout)
+        source = "timeout"
+        if signaled:
+            try:
+                source = self._wake_sources.get_nowait()
+            except queue.Empty:
+                source = "unknown"
         _timing_log(
             "dispatcher_wake_received",
             detail=(
@@ -1236,6 +1281,7 @@ class _InboundLaneDispatcher:
                 request_id_key=self.request_id_key,
                 bot_key=bot_key,
                 ingress_first_seen_at=item.first_seen_at,
+                durable_spool=True,
                 deferred_reply=lambda reply: self._defer_reply(item, token, reply),
             )
         except Exception as exc:  # noqa: BLE001 - same request ID is retried from durable bytes
