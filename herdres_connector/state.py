@@ -9,6 +9,7 @@ import re
 import threading
 import time
 import uuid
+from copy import deepcopy
 from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
@@ -90,6 +91,44 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _replace_in_place(current: Any, fresh: Any) -> Any:
+    """Replace a JSON-shaped value while preserving live container references.
+
+    Slow sync phases release the process flock and reload state afterwards.  A
+    number of delivery helpers retain references to nested worker/Telegram
+    dictionaries across one provider call, so replacing only the root mapping
+    would leave those references detached.  Reconcile matching containers
+    recursively and return a replacement only when their shapes differ.
+    """
+
+    if isinstance(current, dict) and isinstance(fresh, dict):
+        for key in list(current):
+            if key not in fresh:
+                current.pop(key, None)
+        for key, value in fresh.items():
+            if key in current:
+                current[key] = _replace_in_place(current[key], value)
+            else:
+                current[key] = deepcopy(value)
+        return current
+    if isinstance(current, list) and isinstance(fresh, list):
+        common = min(len(current), len(fresh))
+        for index in range(common):
+            current[index] = _replace_in_place(current[index], fresh[index])
+        if len(current) > len(fresh):
+            del current[len(fresh) :]
+        elif len(fresh) > len(current):
+            current.extend(deepcopy(fresh[len(current) :]))
+        return current
+    return deepcopy(fresh)
+
+
+def reload_state_in_place(data: dict[str, Any], path: Path | None = None) -> None:
+    """Reload authoritative state without detaching nested sync references."""
+
+    _replace_in_place(data, load_state(path))
 
 
 # Off-lock delivery (issue #122): sync_once holds state_lock() across the whole source-mode delivery

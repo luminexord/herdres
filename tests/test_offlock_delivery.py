@@ -13,15 +13,29 @@ import fcntl
 import json
 from types import SimpleNamespace
 import threading
+import time
 from unittest.mock import patch
 
 import herdres
 import pytest
 
 from herdres_connector import config, state
-from herdres_connector.source_sync import SyncRuntime, _cleanup_topics, _sync_sources, sync_once
+from herdres_connector.source_sync import (
+    SyncRuntime,
+    _OfflockClient,
+    _cleanup_topics,
+    _sync_sources,
+    sync_once,
+)
 
-from test_source_only import FakeTelegram, FakeTendwire, _source_worker, _store
+from test_source_only import (
+    REQUEST_ID,
+    FakeTelegram,
+    FakeTendwire,
+    _accepted_command_response,
+    _source_worker,
+    _store,
+)
 
 
 def _reset_lock_state():
@@ -144,6 +158,116 @@ def test_competitor_acquires_lock_during_yield(tmp_path):
             result["during"] = _competitor_can_acquire(lockpath)  # free during the yield -> True
         result["after"] = _competitor_can_acquire(lockpath)      # re-held -> False
     assert result == {"held": False, "during": True, "after": False}
+
+
+def test_slow_provider_call_does_not_hold_state_lock(tmp_path, monkeypatch):
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    store = _store()
+    state.save_state(store, statepath)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowProvider:
+        def send(self):
+            entered.set()
+            assert release.wait(3)
+            return {"ok": True}
+
+    finished = threading.Event()
+
+    def invoke():
+        with state.state_lock(path=statepath):
+            client = _OfflockClient(SlowProvider(), store)
+            assert client.send()["ok"] is True
+        finished.set()
+
+    thread = threading.Thread(target=invoke)
+    thread.start()
+    assert entered.wait(1)
+    started = time.monotonic()
+    with state.state_lock(path=statepath):
+        concurrent = state.load_state(statepath)
+        concurrent["concurrent_command"] = True
+        state.save_state(concurrent, statepath)
+    contiguous_hold = time.monotonic() - started
+    release.set()
+    thread.join(3)
+
+    assert finished.is_set()
+    assert contiguous_hold < 2.0
+    assert store["concurrent_command"] is True
+
+
+def test_blocked_sync_observation_does_not_delay_command_submission(
+    tmp_path, monkeypatch
+):
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    worker = _source_worker(
+        {
+            "id": "worker-1",
+            "name": "Alpha",
+            "status": "idle",
+            "space_id": "space-1",
+            "fingerprint": "fp-1",
+        }
+    )
+    store = _store()
+    state.upsert_worker_entry(store, worker, topic_id="77")
+    state.save_state(store, statepath)
+    entered = threading.Event()
+    release = threading.Event()
+    submitted: list[str] = []
+
+    class SlowSyncTendwire(FakeTendwire):
+        def snapshot(self):
+            entered.set()
+            assert release.wait(6)
+            return super().snapshot()
+
+    class CommandTendwire:
+        def command_json(self, request_json):
+            submitted.append(request_json)
+            return _accepted_command_response(json.loads(request_json))
+
+    slow = SlowSyncTendwire(workers=[worker])
+    monkeypatch.setattr(
+        herdres,
+        "_runtime",
+        lambda **_kwargs: SyncRuntime(
+            slow, FakeTelegram(), with_outbox=False
+        ),
+    )
+    monkeypatch.setattr(herdres, "TendwireClient", CommandTendwire)
+    result: dict[str, object] = {}
+
+    thread = threading.Thread(target=lambda: result.update(herdres._sync_pass()))
+    thread.start()
+    assert entered.wait(1)
+    started = time.monotonic()
+    reply = herdres.command_reply(
+        {
+            "request_id": REQUEST_ID,
+            "topic_id": "77",
+            "message_id": "9001",
+            "text": "submit while sync RPC is blocked",
+        }
+    )
+    elapsed = time.monotonic() - started
+    release.set()
+    thread.join(6)
+
+    assert reply["checkpoint"] == "advance"
+    assert reply["disposition"] == "terminal_accepted"
+    assert reply["reply"] == ""
+    assert len(submitted) == 1
+    assert elapsed < 5.0
+    assert not thread.is_alive()
+    assert result["ok"] is True
 
 
 # --- config flags ------------------------------------------------------------

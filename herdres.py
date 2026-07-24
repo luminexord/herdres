@@ -486,11 +486,19 @@ def _submit_ingress_command_record(
                     )
                     state.save_state(store)
                     return outcome
-            reply = _success_reply(response) if config.ack_on_send() else ""
+            reply = (
+                ""
+                if config.inbound_lanes_enabled()
+                else (_success_reply(response) if config.ack_on_send() else "")
+            )
             outcome = ingress_requests.mark_terminal(
                 record,
                 disposition,
                 now=transitioned_at,
+                # In durable-lane mode the gateway posts success before
+                # submission. Its empty terminal reply prevents cache replay
+                # from resurrecting a late second success message; the explicit
+                # legacy rollback path retains its historical terminal ack.
                 reply=reply,
             )
             state.save_state(store)

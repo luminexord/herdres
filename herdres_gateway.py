@@ -420,6 +420,7 @@ def _preview_lane_update(
 
 _OVERFLOW_NOTICE_LOCK = threading.Lock()
 _OVERFLOW_NOTICE_AT: dict[str, float] = {}
+QUEUED_ACK = "Queued."
 
 
 def _notify_lane_overflow(token: str, route: dict[str, Any], lane: str) -> None:
@@ -996,6 +997,7 @@ class _InboundLaneDispatcher:
             return
         heartbeat.start()
         try:
+            self._post_queued_ack(item, token)
             checkpoint = handle_update(
                 item.update,
                 token,
@@ -1020,6 +1022,40 @@ class _InboundLaneDispatcher:
                 item.seq,
                 lease_owner,
                 backoff_seconds=self.backoff_seconds,
+            )
+
+    def _post_queued_ack(self, item: LaneItem, token: str) -> None:
+        """Attempt the first-delivery acknowledgement before child submission."""
+
+        if item.kind != "message":
+            if self.spool.claim_notification(item.seq):
+                self.spool.mark_notification_sent(item.seq)
+            return
+        if not self.spool.claim_notification(item.seq):
+            return
+        if not config.ack_on_send():
+            self.spool.mark_notification_sent(item.seq)
+            return
+        try:
+            sent = TelegramClient(token=token).send_message(
+                str(item.route.get("chat_id") or ""),
+                QUEUED_ACK,
+                thread_id=str(item.route.get("topic_id") or ""),
+                reply_to_message_id=str(item.route.get("message_id") or ""),
+                notify=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - claimed ambiguity is never retried
+            log(
+                f"queued ack {item.seq} ambiguous: "
+                f"{type(exc).__name__}: {sanitize_text(str(exc), 160)}"
+            )
+            return
+        if sent.get("ok"):
+            self.spool.mark_notification_sent(item.seq)
+        else:
+            log(
+                f"queued ack {item.seq} failed: "
+                f"{sanitize_text(sent.get('error') or 'Telegram send failed', 160)}"
             )
 
     def _renew_lease(

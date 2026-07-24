@@ -100,9 +100,9 @@ older Tendwire even when v3 was requested.
 
 ### Durable inbound lanes
 
-`HERDRES_INBOUND_LANES=1` enables the opt-in per-topic ingress scheduler. It is
-off by default, so an upgrade keeps the existing synchronous gateway behavior
-until explicitly enabled. Lane mode stores accepted updates in
+The per-topic ingress scheduler is enabled by default
+(`HERDRES_INBOUND_LANES=1`). Set it to `0` only for an explicit rollback to the
+legacy synchronous gateway path. Lane mode stores accepted updates in
 `~/.local/share/herdres/inbound_spool.db` (override with
 `HERDRES_INBOUND_SPOOL_PATH`) using SQLite WAL and `synchronous=FULL`. The lane
 item and stable receiving-bot cursor commit in one transaction; the old offset
