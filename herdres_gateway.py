@@ -933,7 +933,11 @@ def _poll_once_lanes(
                 elapsed_from_receive=time.time() - first_seen_at,
                 detail=result.status,
             )
-            if result.status == "enqueued" and on_enqueue is not None:
+            # The enqueue transaction (including duplicate/overflow cursor
+            # advancement) is durable before this callback runs.  Wake the
+            # dispatcher at that exact boundary so poll-worker commits cannot
+            # sit until the next worker-spec reconciliation.
+            if on_enqueue is not None:
                 on_enqueue()
             if result.status == "overflow":
                 _notify_lane_overflow(
@@ -1054,7 +1058,10 @@ class _InboundLaneDispatcher:
                     lease_seconds=self.lease_seconds,
                 )
                 if item is None:
-                    self._wake.wait(0.05)
+                    # Enqueue commits normally wake us immediately.  The
+                    # timeout is the bounded fallback for a missed/coalesced
+                    # wake, using the configured two-second default.
+                    self._wake.wait(timeout=self.backoff_seconds)
                     self._wake.clear()
                     continue
                 _timing_log(
