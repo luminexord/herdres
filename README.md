@@ -126,9 +126,13 @@ with at most one leased head, while up to
 retry delays only its lane using exponential backoff based on
 `HERDRES_INBOUND_LANE_BACKOFF_SECONDS` (default `2`, capped at five minutes).
 The dispatcher renews a claimed lease across the full pipeline, including
-unbounded voice pretranscription, command execution, and acknowledgement.
+unbounded voice pretranscription, command execution, and terminal receipt commit.
 Expired leases are reclaimed after a crash and replay the same request ID;
 terminal ingress records complete without a second Tendwire submission.
+Owner-visible terminal acknowledgements are claimed once and sent by ordered
+per-lane background shards only after the command result is durable. A slow
+Telegram `sendMessage` therefore cannot hold a lane head or delay the next
+Tendwire submission.
 
 `HERDRES_INBOUND_LANE_DEPTH` bounds each lane at `32` open items by default.
 When a lane is full, the gateway does not spool that update: it advances the
@@ -137,7 +141,9 @@ topic. Wrong-chat, non-owner, bot-authored, empty, and other-token updates are
 also dropped and advanced before spooling. Dispatch releases the global
 `state.json` flock around the idempotent Tendwire request and reloads state after
 reacquiring it, so unrelated lane dispatchers do not serialize on the backend
-call.
+call. `HERDRES_GATEWAY_TIMING_LOGS=1` (the default) emits structured breadcrumbs
+for getUpdates return, durable enqueue, claim, canonical commit, Tendwire submit,
+receipt storage, and asynchronous acknowledgement; set it to `0` to quiet them.
 
 ### Inbound command identity and redelivery
 
