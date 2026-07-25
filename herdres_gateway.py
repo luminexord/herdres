@@ -56,6 +56,12 @@ _COMMAND_DISPOSITIONS = frozenset(
     }
 )
 _RETRY_DISPOSITIONS = frozenset({"no_receipt", "in_progress"})
+_TERMINAL_SUCCESS_REPLIES = frozenset(
+    {
+        "Sent to Tendwire worker.",
+        "Submitted to busy Tendwire worker.",
+    }
+)
 _CHILD_REPLY_LIMIT = 160
 _TIMING_LOG_QUEUE: queue.Queue[str] = queue.Queue(maxsize=4096)
 _TIMING_LOG_THREAD_LOCK = threading.Lock()
@@ -671,6 +677,10 @@ def handle_message(
     deferred_reply: Callable[[str], None] | None = None,
 ) -> str:
     chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    # ``run()`` loads herdres.env before polling. Read this at call time so
+    # tests, embedded callers, and a future env reloader all observe the same
+    # gateway-only policy without changing the ops CLI command result.
+    inbound_success_ack = config.inbound_success_ack_enabled()
     try:
         request_id = derive_telegram_request_id(
             request_id_key,
@@ -726,6 +736,7 @@ def handle_message(
             if payload is not None:
                 payload["request_id"] = request_id
                 payload["instant_ack_posted"] = instant_ack_posted
+                payload["_gateway_inbound_success_ack"] = inbound_success_ack
                 if durable_spool:
                     payload["_durable_spool"] = True
                 if durable_spool and ingress_first_seen_at is not None:
@@ -744,6 +755,14 @@ def handle_message(
     if checkpoint == CHECKPOINT_RETRY:
         return checkpoint
     reply = result["reply"].strip()
+    if (
+        not inbound_success_ack
+        and result.get("disposition") == "terminal_accepted"
+        and reply in _TERMINAL_SUCCESS_REPLIES
+    ):
+        # Covers terminal records written before this policy existed. New
+        # suppressed outcomes are already persisted with reply="" by the child.
+        reply = ""
     if (
         instant_ack_posted
         and result.get("disposition") == "terminal_accepted"

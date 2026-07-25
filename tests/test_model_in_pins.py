@@ -50,13 +50,19 @@ def test_pinned_status_flag_default_and_override():
     assert config.pinned_status_enabled(env={"HERDRES_PINNED_STATUS": "off"}) is False
 
 
-# --- HERDRES_ACK_ON_SEND opt-out --------------------------------------------
+# --- HERDRES_INBOUND_SUCCESS_ACK opt-in -------------------------------------
 
-def test_ack_on_send_flag_default_and_override():
-    assert config.ack_on_send(env={}) is True                                        # default on
-    assert config.ack_on_send(env={"HERDRES_ACK_ON_SEND": "1"}) is True
-    assert config.ack_on_send(env={"HERDRES_ACK_ON_SEND": "0"}) is False
-    assert config.ack_on_send(env={"HERDRES_ACK_ON_SEND": "off"}) is False
+def test_inbound_success_ack_flag_default_and_override():
+    assert config.inbound_success_ack_enabled(env={}) is False
+    assert config.inbound_success_ack_enabled(
+        env={"HERDRES_INBOUND_SUCCESS_ACK": "1"}
+    ) is True
+    assert config.inbound_success_ack_enabled(
+        env={"HERDRES_INBOUND_SUCCESS_ACK": "true"}
+    ) is True
+    assert config.inbound_success_ack_enabled(
+        env={"HERDRES_INBOUND_SUCCESS_ACK": "0"}
+    ) is False
 
 
 def _space_with_legacy_pin_store():

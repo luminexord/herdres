@@ -3530,7 +3530,7 @@ def test_gateway_same_update_retries_byte_identical_and_distinct_update_differs(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
-    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "0")
+    monkeypatch.setenv("HERDRES_INBOUND_SUCCESS_ACK", "0")
     store = _store()
     state.upsert_worker_entry(
         store,
@@ -3646,7 +3646,7 @@ def test_gateway_replays_cached_request_after_route_disappears(
         str(tmp_path / "state.json"),
     )
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "0")
+    monkeypatch.setenv("HERDRES_INBOUND_SUCCESS_ACK", "0")
     store = _store()
     state.upsert_worker_entry(
         store,
@@ -4219,7 +4219,7 @@ def test_gateway_terminal_uncertain_update_advances_then_processes_next(
         str(tmp_path / "state.json"),
     )
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "0")
+    monkeypatch.setenv("HERDRES_INBOUND_SUCCESS_ACK", "0")
     store = _store()
     state.upsert_worker_entry(
         store,
@@ -4331,7 +4331,7 @@ def test_gateway_terminal_notification_failure_advances_and_redelivery_is_cached
         str(tmp_path / "state.json"),
     )
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDRES_ACK_ON_SEND", "1")
+    monkeypatch.setenv("HERDRES_INBOUND_SUCCESS_ACK", "1")
     store = _store()
     state.upsert_worker_entry(
         store,

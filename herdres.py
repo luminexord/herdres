@@ -37,6 +37,10 @@ from herdres_connector.tendwire_client import (
 VERSION = "0.7.0rc4-tendwired-source-only"
 SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the target again."
 BUSY_SEND_REPLY = "Submitted to busy Tendwire worker."
+TERMINAL_SUCCESS_REPLIES = {
+    "Sent to Tendwire worker.",
+    BUSY_SEND_REPLY,
+}
 REKEYED_TOPIC_QUARANTINE_REPLY = (
     "This pane was re-keyed after a Herdr restart; a fresh topic is being "
     "created. Please use the new pane topic when it appears."
@@ -369,6 +373,7 @@ def _submit_ingress_command_record(
     record: dict[str, Any],
     *,
     instant_ack_posted: bool = False,
+    gateway_success_ack_enabled: bool = True,
 ) -> dict[str, Any]:
     """Replay durable bytes off-lock and reduce authoritative dispositions.
 
@@ -532,7 +537,12 @@ def _submit_ingress_command_record(
                     )
                     state.save_state(store)
                     return outcome
-            reply = _success_reply(response) if config.ack_on_send() else ""
+            reply = _success_reply(response)
+            if (
+                not gateway_success_ack_enabled
+                and reply in TERMINAL_SUCCESS_REPLIES
+            ):
+                reply = ""
             if instant_ack_posted and reply != BUSY_SEND_REPLY:
                 reply = ""
             outcome = ingress_requests.mark_terminal(
@@ -730,6 +740,9 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     store,
                     record,
                     instant_ack_posted=payload.get("instant_ack_posted") is True,
+                    gateway_success_ack_enabled=(
+                        payload.get("_gateway_inbound_success_ack") is not False
+                    ),
                 )
         elif changed:
             state.save_state(store)
@@ -967,6 +980,9 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             store,
             record,
             instant_ack_posted=payload.get("instant_ack_posted") is True,
+            gateway_success_ack_enabled=(
+                payload.get("_gateway_inbound_success_ack") is not False
+            ),
         )
 
 
