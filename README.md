@@ -142,6 +142,15 @@ per-lane background shards only after the command result is durable. A slow
 Telegram `sendMessage` therefore cannot hold a lane head or delay the next
 Tendwire submission.
 
+Accepted sends do not post a redundant terminal success card by default: the
+working card already shows that the message is being handled. Set
+`HERDRES_INBOUND_SUCCESS_ACK=1` to restore the legacy byte-identical replies
+(`Sent to Tendwire worker.` and
+`Submitted to busy Tendwire worker.`). This gateway-only flag is read for each
+inbound call and never suppresses the instant queued acknowledgement or any
+failure, quarantine, rate-limit, re-key, or uncertain reply. Operations CLI
+results are unchanged.
+
 `HERDRES_INBOUND_LANE_DEPTH` bounds each lane at `32` open items by default.
 When a lane is full, the gateway does not spool that update: it advances the
 durable cursor and posts one throttled owner-visible notice in the affected

@@ -304,13 +304,18 @@ def usage_refresh_seconds(env: Any | None = None) -> int:
     return value if value > 0 else 300
 
 
-def ack_on_send(env: Any | None = None) -> bool:
-    """Whether to reply with a 'Sent to Tendwire worker' ack after a successful
-    inbound send. Default on; HERDRES_ACK_ON_SEND=0 suppresses it, so you only see
-    the agent's working + response messages. Send FAILURES are still reported."""
+def inbound_success_ack_enabled(env: Any | None = None) -> bool:
+    """Whether the gateway posts terminal success text for an accepted send.
+
+    The default is off because the working card already confirms handling.
+    Failure, quarantine, rate-limit, and uncertain replies are not governed by
+    this flag.
+    """
     source = os.environ if env is None else env
-    value = str(source.get("HERDRES_ACK_ON_SEND", "1") or "").strip().lower()
-    return value not in {"0", "false", "no", "off"}
+    value = str(
+        source.get("HERDRES_INBOUND_SUCCESS_ACK", "0") or ""
+    ).strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def remote_decisions_enabled(env: Any | None = None) -> bool:
