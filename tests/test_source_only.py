@@ -1615,6 +1615,242 @@ def test_same_turn_working_edits_are_rate_limited(monkeypatch):
     assert entry["last_stream_hash"] == source_sync._turn_content_hash(turns["turns"][0], "working")
 
 
+def test_one_submission_keeps_one_working_card_across_five_rotating_passes(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_WORKING_UPDATE_MIN_SECONDS", "0"
+    )
+    store = _store()
+    telegram = FakeTelegram()
+    submission_id = "twsub1." + ("a" * 64)
+    worker = _source_worker(
+        {
+            "id": "worker-1",
+            "name": "Alpha",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "fp-1",
+        }
+    )
+    _entry_key, entry, _created = state.upsert_worker_entry(
+        store, worker, topic_id="77"
+    )
+    stable_identity = state.entry_stable_identity(entry)
+    assert stable_identity is not None
+    now = source_sync.time.time()
+    record, _changed = ingress_requests.ensure_request_shell(
+        store,
+        REQUEST_ID,
+        now=now,
+        retry_horizon=60,
+        retention=3600,
+    )
+    request = {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "request_id": REQUEST_ID,
+        "dry_run": False,
+        "target": {
+            "worker_id": "worker-1",
+            "worker_fingerprint": "fp-1",
+        },
+        "instruction": {"text": "take the long action"},
+    }
+    ingress_requests.attach_request_json(
+        record,
+        ingress_requests.canonical_request_json(request),
+        now=now,
+    )
+    ingress_requests.attach_target_owner(
+        record, stable_identity[0], stable_identity[1], now=now
+    )
+    ingress_requests.attach_submission_receipt(
+        record,
+        submission_id,
+        "pending_observation",
+        None,
+        now=now,
+    )
+    ingress_requests.mark_terminal(
+        record,
+        "terminal_accepted",
+        now=now,
+        reply="Sent to Tendwire worker.",
+    )
+
+    for index in range(5):
+        turn = {
+            "id": f"turn-pass-{index + 1}",
+            "worker_id": "worker-1",
+            "space_id": "space-1",
+            "user_text": "take the long action",
+            "assistant_stream_text": f"pass {index + 1} progress",
+            "complete": False,
+        }
+        sync_once(
+            store,
+            SyncRuntime(
+                FakeTendwire(
+                    turns={"turns": [turn]},
+                    workers=[worker],
+                ),
+                telegram,
+                with_outbox=False,
+            ),
+        )
+
+    working_sends = [
+        sent for sent in telegram.sent if "Working" in sent[1]
+    ]
+    assert len(working_sends) == 1
+    working_message_id = str(working_sends[0][3])
+    assert len(telegram.edited) == 5
+    assert {
+        str(_message_id)
+        for _chat, _message_id, _html in telegram.edited
+    } == {working_message_id}
+    assert "pass 5 progress" in telegram.edited[-1][2]
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert entry["last_stream_submission_id"] == submission_id
+    assert entry["last_stream_turn_id"] == "turn-pass-5"
+    bindings = [
+        binding
+        for binding in state.message_bindings(store).values()
+        if binding.get("kind") == "working"
+    ]
+    assert len(bindings) == 1
+    assert bindings[0]["submission_id"] == submission_id
+    assert bindings[0]["turn_id"] == "turn-pass-5"
+
+    final = {
+        "id": "turn-final-pass",
+        "worker_id": "worker-1",
+        "space_id": "space-1",
+        "user_text": "take the long action",
+        "assistant_final_text": "long action complete",
+        "complete": True,
+    }
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                turns={"turns": [final]},
+                workers=[worker],
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert len(
+        [sent for sent in telegram.sent if "Working" in sent[1]]
+    ) == 1
+    assert telegram.edited[-1][1] == working_message_id
+    assert "long action complete" in telegram.edited[-1][2]
+    assert record["submission_state"] == "complete"
+    assert "last_stream_message_id" not in entry
+
+
+def test_successive_turns_start_new_cards_and_omit_unattributed_stale_quote(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_WORKING_UPDATE_MIN_SECONDS", "0"
+    )
+    store = _store()
+    telegram = FakeTelegram()
+    first_submission = "twsub1." + ("b" * 64)
+    second_submission = "twsub1." + ("c" * 64)
+
+    first = {
+        "id": "turn-first",
+        "worker_id": "worker-1",
+        "user_text": "first Telegram instruction",
+        "assistant_stream_text": "first progress",
+        "complete": False,
+        "_herdres_submission_id": first_submission,
+    }
+    second = {
+        "id": "turn-second",
+        "worker_id": "worker-1",
+        "user_text": "second Telegram instruction",
+        "assistant_stream_text": "second progress",
+        "complete": False,
+        "_herdres_submission_id": second_submission,
+    }
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns={"turns": [first]}),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns={"turns": [second]}),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    working_sends = [
+        sent for sent in telegram.sent if "Working" in sent[1]
+    ]
+    assert len(working_sends) == 2
+    assert working_sends[0][3] != working_sends[1][3]
+    assert "first Telegram instruction" in working_sends[0][1]
+    assert "second Telegram instruction" in working_sends[1][1]
+
+    completed_second = {
+        **second,
+        "assistant_stream_text": None,
+        "assistant_final_text": "second response",
+        "complete": True,
+    }
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns={"turns": [completed_second]}),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+    assert telegram.edited[-1][1] == working_sends[1][3]
+
+    internal = {
+        "id": "turn-internal",
+        "worker_id": "worker-1",
+        # Tendwire repeated the prior Telegram text even though this turn was
+        # opened by automation and carries no submission link.
+        "user_text": "second Telegram instruction",
+        "assistant_stream_text": "automation progress remains visible",
+        "complete": False,
+        "source": "worker:worker-1",
+    }
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns={"turns": [internal]}),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    working_sends = [
+        sent for sent in telegram.sent if "Working" in sent[1]
+    ]
+    assert len(working_sends) == 3
+    internal_html = working_sends[-1][1]
+    assert "automation progress remains visible" in internal_html
+    assert "second Telegram instruction" not in internal_html
+    assert "<b>You</b>" not in internal_html
+
+
 def test_current_worker_final_without_updated_at_beats_older_command_turn(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
