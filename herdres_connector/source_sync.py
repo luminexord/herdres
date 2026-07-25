@@ -1226,11 +1226,19 @@ def _set_stream_delivery(
     content_hash: str,
     message_id: str | None = None,
     bot_kind: str | None = None,
+    submission_id: str | None = None,
     placeholder: bool = False,
 ) -> bool:
     """Single writer for the stream-delivery key group."""
     changed = False
-    if "last_stream_submission_id" in entry:
+    if submission_id:
+        changed = (
+            _entry_put(
+                entry, "last_stream_submission_id", submission_id
+            )
+            or changed
+        )
+    elif "last_stream_submission_id" in entry:
         entry.pop("last_stream_submission_id", None)
         changed = True
     changed = _entry_put(entry, "last_stream_turn_id", turn_id) or changed
@@ -1248,6 +1256,45 @@ def _set_stream_delivery(
 
 def _record_stream_update_time(entry: dict[str, Any], now: float | None = None) -> None:
     entry["last_stream_updated_at"] = f"{(time.time() if now is None else now):.3f}"
+
+
+def _stream_submission_id(
+    item: dict[str, Any], entry: dict[str, Any]
+) -> str:
+    """Return the stable owner for a pass-level working projection.
+
+    Tendwire may rotate a projection turn id while one submitted agent turn is
+    still running.  The explicit link wins (and therefore starts a new card
+    when a new Telegram submission arrives); otherwise the current card keeps
+    its durable submission owner across later unlinked pass rows.
+    """
+
+    explicit = item.get(_SUBMISSION_ID_KEY)
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    return str(entry.get("last_stream_submission_id") or "")
+
+
+def _turn_feed_item(
+    item: dict[str, Any], entry: dict[str, Any]
+) -> dict[str, Any]:
+    """Build one feed item without carrying a stale prompt into a new turn."""
+
+    presentation = item
+    user_hash = _turn_user_hash(item)
+    if (
+        user_hash
+        and not _stream_submission_id(item, entry)
+        and entry.get("last_turn_id") != _turn_id(item)
+        and entry.get("last_clean_user_hash") == user_hash
+    ):
+        # Some worker/automation rows repeat the last submitted Telegram text
+        # even though the new turn has no Telegram submission.  Keep the turn
+        # itself visible, but do not mislabel that stale text as a fresh "You"
+        # quote.
+        presentation = dict(item)
+        presentation.pop("user_text", None)
+    return turn_item_from_source(presentation, entry)
 
 
 def _changed_final_should_send_new_message(item: dict[str, Any], entry: dict[str, Any]) -> bool:
@@ -1383,6 +1430,30 @@ def _clear_stream_delivery_state(entry: dict[str, Any], turn_id: str) -> None:
     _clear_stream_delivery_keys(entry)
 
 
+def _complete_submission_receipt(
+    store: dict[str, Any],
+    submission_id: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    if not submission_id:
+        return False
+    completed_at = time.time() if now is None else now
+    for record in ingress_requests.retained_submission_records(
+        store, now=completed_at
+    ):
+        if record.get("submission_id") != submission_id:
+            continue
+        return ingress_requests.attach_submission_receipt(
+            record,
+            submission_id,
+            "complete",
+            record.get("turn_id"),
+            now=completed_at,
+        )
+    return False
+
+
 def _record_final_delivery_success(
     store: dict[str, Any],
     item: dict[str, Any],
@@ -1395,6 +1466,7 @@ def _record_final_delivery_success(
     bot_kind: str,
 ) -> None:
     turn_id = _turn_id(item)
+    submission_id = str(entry.get("last_stream_submission_id") or "")
     for message_id in message_ids:
         state.bind_message_to_worker(store, message_id, entry, topic_id=thread_id, kind="final", turn_id=turn_id, bot_kind=bot_kind)
     state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
@@ -1408,7 +1480,12 @@ def _record_final_delivery_success(
         render_version=RENDER_VERSION,
     )
     _record_delivery_success(entry, bot_kind)
-    _clear_stream_delivery_state(entry, turn_id)
+    if submission_id:
+        _clear_stream_delivery_keys(entry)
+    else:
+        _clear_stream_delivery_state(entry, turn_id)
+    if submission_id:
+        _complete_submission_receipt(store, submission_id)
     entry.pop("tendwire_rebind_catchup_pending", None)
 
 
@@ -1425,14 +1502,19 @@ def _promote_working_to_final(
 ) -> bool:
     turn_id = _turn_id(item)
     stream_message_id = str(entry.get("last_stream_message_id") or "")
-    if not stream_message_id or entry.get("last_stream_turn_id") != turn_id:
+    submission_id = _stream_submission_id(item, entry)
+    same_card = entry.get("last_stream_turn_id") == turn_id or bool(
+        submission_id
+        and entry.get("last_stream_submission_id") == submission_id
+    )
+    if not stream_message_id or not same_card:
         return False
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
     stored_bot_kind = str(entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND)
     if stored_bot_kind != bot_kind:
         return False
-    feed_item = turn_item_from_source(item, entry)
+    feed_item = _turn_feed_item(item, entry)
     # Telegram legacy edits cannot split. If the final view is too large for a
     # single safe edit, use the send path instead so long responses are split.
     if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(feed_item):
@@ -1484,7 +1566,7 @@ def _replace_changed_final(
     stored_bot_kind = str(bindings[-1][1].get("bot_kind") or entry.get("last_clean_bot_kind") or MANAGER_BOT_KIND)
     if stored_bot_kind != bot_kind:
         return False
-    feed_item = turn_item_from_source(item, entry)
+    feed_item = _turn_feed_item(item, entry)
     if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(feed_item):
         return False
     sent = edit_feed_item(
@@ -1570,7 +1652,7 @@ def _fold_superseded_final(
     stored_bot_kind = str(binding.get("bot_kind") or "")
     if not stored_bot_kind or stored_bot_kind != bot_kind:
         return False
-    folded_item = dict(turn_item_from_source(item, entry))
+    folded_item = dict(_turn_feed_item(item, entry))
     folded_item["collapse_response"] = True
     # Same oversize/split guards as _replace_changed_final: never let a cosmetic fold degrade a rich
     # message through the too-large -> legacy-plain fallback.
@@ -3299,15 +3381,22 @@ def _deliver_working(
         return False
     delivery_item = _working_delivery_item(item)
     turn_id = _turn_id(item)
+    submission_id = _stream_submission_id(item, entry)
     content_hash = _turn_content_hash(delivery_item, "working")
-    feed_item = turn_item_from_source(delivery_item, entry)
+    feed_item = _turn_feed_item(delivery_item, entry)
     if entry.get("last_stream_turn_id") == turn_id and entry.get("last_stream_hash") == content_hash:
         return False
     now = time.time()
     if _same_turn_working_update_too_soon(entry, turn_id, now=now):
         return False
     if runtime.dry_run:
-        _set_stream_delivery(entry, turn_id=turn_id, content_hash=content_hash, placeholder=True)
+        _set_stream_delivery(
+            entry,
+            turn_id=turn_id,
+            content_hash=content_hash,
+            submission_id=submission_id,
+            placeholder=True,
+        )
         _record_stream_update_time(entry, now)
         return True
     telegram = _telegram_state(store)
@@ -3319,6 +3408,11 @@ def _deliver_working(
         and (
             entry.get("last_stream_turn_id") == turn_id
             or reuse_previous_working
+            or (
+                submission_id
+                and entry.get("last_stream_submission_id")
+                == submission_id
+            )
         )
     ):
         sent = edit_feed_item(
@@ -3348,10 +3442,20 @@ def _deliver_working(
             content_hash=content_hash,
             message_id=str(sent.get("message_id") or entry.get("last_stream_message_id") or ""),
             bot_kind=bot_kind,
+            submission_id=submission_id,
         )
         _record_stream_update_time(entry, now)
         _record_delivery_success(entry, bot_kind)
-        state.bind_message_to_worker(store, entry.get("last_stream_message_id"), entry, topic_id=thread_id, kind="working", turn_id=turn_id, bot_kind=bot_kind)
+        state.bind_message_to_worker(
+            store,
+            entry.get("last_stream_message_id"),
+            entry,
+            topic_id=thread_id,
+            kind="working",
+            turn_id=turn_id,
+            bot_kind=bot_kind,
+            submission_id=submission_id,
+        )
         return True
     _record_delivery_error(entry, sent, bot_kind)
     return False
@@ -3548,6 +3652,23 @@ def _deliver_submission_working_record(
             )
             counts["updated"] += int(record != before)
         return counts
+    existing_message_id = str(
+        entry.get("last_stream_message_id") or ""
+    )
+    if (
+        entry.get("last_stream_submission_id") == submission_id
+        and existing_message_id
+        and existing_message_id != "0"
+    ):
+        binding = state.find_message_binding(store, existing_message_id)
+        if isinstance(binding, dict):
+            if binding.get("submission_id") != submission_id:
+                binding["submission_id"] = submission_id
+                counts["updated"] += 1
+            if turn_id and binding.get("turn_id") != turn_id:
+                binding["turn_id"] = turn_id
+                counts["updated"] += 1
+        return counts
     stream_identity = turn_id or submission_id
     item = {
         "id": stream_identity,
@@ -3559,6 +3680,7 @@ def _deliver_submission_working_record(
         ),
         "complete": False,
         "user_text": _submission_instruction(record),
+        _SUBMISSION_ID_KEY: submission_id,
     }
     before = dict(entry)
     delivered = _deliver_working(
@@ -3822,7 +3944,7 @@ def _stage_final_plan(
         return False, 0
 
     page_calls = _materialize_turn_item(item, runtime)
-    feed_item = turn_item_from_source(item, entry)
+    feed_item = _turn_feed_item(item, entry)
     parts = prepare_turn_delivery_parts(
         feed_item,
         rich_transport=rich_message_send_enabled(_telegram_state(store)),
@@ -3841,6 +3963,11 @@ def _stage_final_plan(
         entry["pending_turn_job_count"] = len(parts)
         entry["pending_turn_user_hash"] = _turn_user_hash(item)
         entry["pending_plan_generation"] = 1
+        entry.pop("pending_stream_submission_id", None)
+        if entry.get("last_stream_submission_id"):
+            entry["pending_stream_submission_id"] = str(
+                entry["last_stream_submission_id"]
+            )
         return True, page_calls
 
     begin = _prepare_begin(len(parts))
@@ -3929,6 +4056,11 @@ def _stage_final_plan(
     entry["pending_turn_job_count"] = int(job_count or 0)
     entry["pending_turn_user_hash"] = _turn_user_hash(item)
     entry["pending_plan_generation"] = generation
+    entry.pop("pending_stream_submission_id", None)
+    if entry.get("last_stream_submission_id"):
+        entry["pending_stream_submission_id"] = str(
+            entry["last_stream_submission_id"]
+        )
     final_identity = item.get(_TURN_FINAL_IDENTITY_KEY)
     if isinstance(final_identity, str) and final_identity:
         entry["pending_final_identity"] = final_identity
@@ -3961,7 +4093,7 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
         _repair_delivered_final_entry(store, item, entry, content_hash)
         entry.pop("tendwire_rebind_catchup_pending", None)
         return False
-    feed_item = turn_item_from_source(item, entry)
+    feed_item = _turn_feed_item(item, entry)
     if runtime.dry_run:
         state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
         _set_final_delivery(
@@ -5057,6 +5189,9 @@ def _maybe_complete_turn_plan(
     plan_token: str,
     revision: str,
 ) -> bool:
+    stream_submission_id = str(
+        entry.get("pending_stream_submission_id") or ""
+    )
     expected_jobs = entry.get("pending_turn_job_count")
     if (
         isinstance(expected_jobs, bool)
@@ -5146,6 +5281,7 @@ def _maybe_complete_turn_plan(
         "pending_turn_part_count",
         "pending_turn_job_count",
         "pending_turn_user_hash",
+        "pending_stream_submission_id",
         "pending_plan_generation",
         "pending_acknowledged_prefix_count",
         "replaces_failed_plan_token",
@@ -5156,7 +5292,13 @@ def _maybe_complete_turn_plan(
         "abandoned_content_revision",
     ):
         entry.pop(field, None)
-    _clear_stream_delivery_state(entry, _turn_id(item))
+    if stream_submission_id:
+        _clear_stream_delivery_keys(entry)
+        _complete_submission_receipt(
+            store, stream_submission_id
+        )
+    else:
+        _clear_stream_delivery_state(entry, _turn_id(item))
     _record_delivery_success(entry, bot_kind)
     entry.pop("tendwire_rebind_catchup_pending", None)
     return True
@@ -5269,6 +5411,7 @@ def _reconcile_completed_turn_plans(
                 "pending_turn_part_count",
                 "pending_turn_job_count",
                 "pending_turn_user_hash",
+                "pending_stream_submission_id",
                 "pending_plan_generation",
                 "pending_acknowledged_prefix_count",
                 "replaces_failed_plan_token",
@@ -5636,6 +5779,7 @@ def _complete_suppressed_turn_plan(
         "pending_turn_part_count",
         "pending_turn_job_count",
         "pending_turn_user_hash",
+        "pending_stream_submission_id",
         "pending_plan_generation",
         "pending_acknowledged_prefix_count",
         "replaces_failed_plan_token",
@@ -6058,6 +6202,13 @@ def _drain_turn_final(
         )
         if not entry.get("pending_turn_user_hash"):
             entry["pending_turn_user_hash"] = _turn_user_hash(item)
+        if (
+            not entry.get("pending_stream_submission_id")
+            and entry.get("last_stream_submission_id")
+        ):
+            entry["pending_stream_submission_id"] = str(
+                entry["last_stream_submission_id"]
+            )
         if "pending_plan_generation" not in entry:
             entry["pending_plan_generation"] = 1
 
@@ -6137,7 +6288,7 @@ def _drain_turn_final(
                 )
                 break
             result["content_pages"] += page_calls
-            feed_item = turn_item_from_source(item, entry)
+            feed_item = _turn_feed_item(item, entry)
             plans = prepare_turn_delivery_parts(
                 feed_item,
                 rich_transport=rich_message_send_enabled(_telegram_state(store)),
@@ -6619,9 +6770,7 @@ def _drain_turn_final(
                 candidate_kind == "working"
                 and message_id == candidate_id
             ):
-                _clear_stream_delivery_state(
-                    entry, _turn_id(item)
-                )
+                _clear_stream_delivery_keys(entry)
             _checkpoint_turn_job(runtime)
             substate = "telegram_applied"
 
