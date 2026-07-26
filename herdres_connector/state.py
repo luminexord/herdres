@@ -3268,6 +3268,22 @@ def upsert_worker_entry(
     if identity is not None:
         entry["tendwire_stable_key"] = identity[0]
         entry["tendwire_stable_key_version"] = identity[1]
+    # A source adapter can briefly omit public identity metadata while the
+    # same pane is being rediscovered.  That observation must fail closed, but
+    # the quarantine cannot remain sticky after the exact persisted v1 owner
+    # returns in a conflict-free snapshot.  Heal only this one transient
+    # reason; every collision/operator/unknown-version quarantine remains
+    # fail-closed and requires its dedicated reconciliation path.
+    if (
+        not created
+        and not must_quarantine
+        and identity is not None
+        and entry_stable_identity(entry) == identity
+        and entry.get("stable_key_quarantine_reason")
+        == "source_identity_absent"
+    ):
+        entry.pop("stable_key_quarantined", None)
+        entry.pop("stable_key_quarantine_reason", None)
     panes[key] = entry
     if not created and identity is not None and not must_quarantine:
         _retarget_worker_bindings(
