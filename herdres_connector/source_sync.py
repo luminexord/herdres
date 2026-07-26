@@ -617,6 +617,28 @@ def _record_delivery_error(entry: dict[str, Any], result: dict[str, Any], bot_ki
         entry["last_managed_bot_error"] = error
 
 
+def _repair_gone_delivery_topic(
+    store: dict[str, Any],
+    entry: dict[str, Any],
+    result: dict[str, Any],
+) -> bool:
+    kind = str(result.get("kind") or "")
+    classified = classify_telegram_error(result.get("error"))
+    if (
+        result.get("topic_missing") is not True
+        and kind != "topic_not_found"
+        and classified != "topic_not_found"
+    ):
+        return False
+    kind = "topic_not_found"
+    return state.clear_gone_live_topic(
+        store,
+        entry,
+        error_kind=kind,
+        error=result.get("error"),
+    )
+
+
 def _record_delivery_success(entry: dict[str, Any], bot_kind: str) -> None:
     entry.pop("last_delivery_error", None)
     if bot_kind != MANAGER_BOT_KIND:
@@ -1689,6 +1711,15 @@ def _ensure_topic(
     chat_id: str,
     can_create: bool = True,
 ) -> tuple[bool, bool]:
+    def stamp_replacement(topic_id: str) -> None:
+        recovery = entry.pop("topic_recovery_pending", None)
+        if not isinstance(recovery, dict):
+            return
+        recovery = dict(recovery)
+        recovery["replacement_topic_id"] = topic_id
+        recovery["recovered_at"] = time.time()
+        entry["last_topic_recovery"] = recovery
+
     if (
         str(entry.get("entry_type") or "") == "worker"
         and not state.entry_is_routable(entry)
@@ -1712,6 +1743,7 @@ def _ensure_topic(
     reused = state.find_legacy_topic_id_by_name(store, entry.get("topic_name") or "")
     if reused:
         entry["topic_id"] = reused
+        stamp_replacement(reused)
         return False, False
     if runtime.dry_run:
         return True, False
@@ -1721,6 +1753,7 @@ def _ensure_topic(
     created = runtime.telegram.create_topic(chat_id, topic_name, icon_color=topic_color_for_name(topic_name))
     if created.get("ok") and created.get("topic_id"):
         entry["topic_id"] = str(created["topic_id"])
+        stamp_replacement(str(created["topic_id"]))
         # Topic creation has no provider idempotency key. Persist the returned
         # identity before any later turn validation can abort this sync pass,
         # otherwise the next pass can create a duplicate topic.
@@ -1931,6 +1964,7 @@ def _sync_topic_pinned(
             message_id = ""
         elif _topic_missing(sent.get("error")):
             entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
+            _repair_gone_delivery_topic(store, entry, sent)
             return False
         else:
             entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
@@ -1939,6 +1973,7 @@ def _sync_topic_pinned(
         sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
         if not sent.get("ok"):
             entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
+            _repair_gone_delivery_topic(store, entry, sent)
             return False
         message_id = str(sent.get("message_id") or "")
         if not message_id:
@@ -3458,6 +3493,7 @@ def _deliver_working(
         )
         return True
     _record_delivery_error(entry, sent, bot_kind)
+    _repair_gone_delivery_topic(store, entry, sent)
     return False
 
 
@@ -4157,6 +4193,7 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
     )
     if not sent.get("ok"):
         _record_delivery_error(entry, sent, bot_kind)
+        _repair_gone_delivery_topic(store, entry, sent)
         return False
     message_ids: list[str] = []
     for message_id in split_legacy_message_ids(sent):
@@ -4198,6 +4235,7 @@ def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncR
         state.bind_message_to_worker(store, sent.get("message_id"), entry, topic_id=thread_id, kind="pending", turn_id=pending_id, bot_kind=bot_kind)
         return state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id})
     _record_delivery_error(entry, sent, bot_kind)
+    _repair_gone_delivery_topic(store, entry, sent)
     return False
 
 
@@ -6698,6 +6736,17 @@ def _drain_turn_final(
                         )
                         break
                 if not applied.get("ok"):
+                    if _repair_gone_delivery_topic(store, entry, applied):
+                        _defer_turn_final(
+                            runtime,
+                            ref,
+                            "transient_delivery",
+                            result,
+                            store,
+                            job_key,
+                            delay_seconds=1,
+                        )
+                        break
                     if _telegram_result_is_transient(applied):
                         _defer_turn_final(
                             runtime,

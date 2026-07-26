@@ -2199,7 +2199,21 @@ def test_quarantined_exact_v1_owner_heals_after_stable_key_duplicate_consolidati
             assert telegram.topics == []
             assert telegram.sent == []
         else:
-            assert len(entries) == 1
+            if topic_mode == "worker":
+                retired = [
+                    entry
+                    for entry in entries.values()
+                    if state.entry_is_retired(entry)
+                ]
+                assert len(entries) == 2
+                assert len(retired) == 1
+                assert (
+                    retired[0]["routing_retired_reason"]
+                    == "duplicate_live_claim"
+                )
+                assert state.entry_stable_identity(retired[0]) is None
+            else:
+                assert len(entries) == 1
             new_key, new_owner = state.find_worker_entry_by_stable_key(store, KEY_A)
             assert new_key is not None and new_owner is not None
             assert new_owner["tendwire_worker_id"] == "worker-new"

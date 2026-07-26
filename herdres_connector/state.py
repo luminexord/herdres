@@ -12,6 +12,7 @@ import time
 import uuid
 from copy import deepcopy
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, NamedTuple
@@ -42,6 +43,8 @@ _TENDWIRE_TURN_JOB_KEY_RE = re.compile(
 STABLE_WORKER_KEY_VERSION = 1
 STABLE_WORKER_KEY_RE = re.compile(r"^wsk1_[0-9a-f]{64}$")
 WORKER_REBIND_AUDIT_LIMIT = 200
+TOPIC_BINDING_AUDIT_LIMIT = 200
+DUPLICATE_LIVE_ACTIVITY_SECONDS = 24 * 60 * 60
 PANE_UUID_VERSION = 1
 PANE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -561,6 +564,62 @@ def entry_is_retired(entry: dict[str, Any]) -> bool:
     value must never accidentally make an old route live again.
     """
     return "routing_retired" in entry
+
+
+def clear_gone_live_topic(
+    data: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    error_kind: str,
+    error: Any,
+    observed_at: float | None = None,
+) -> bool:
+    """Release a live route whose Telegram topic was proven gone.
+
+    Delivery ledgers deliberately survive: a completed turn may be retried on
+    the replacement topic, while a later pass remains idempotent after that
+    retry succeeds. Only topic-scoped presentation caches are reset.
+    """
+    if entry_is_retired(entry) or not _entry_is_live(entry):
+        return False
+    topic_id = str(entry.get("topic_id") or "")
+    if not topic_id:
+        return False
+    repaired_at = time.time() if observed_at is None else float(observed_at)
+    entry.pop("topic_id", None)
+    entry["deleted_topic_id"] = topic_id
+    for field in (
+        "last_topic_icon",
+        "last_topic_icon_id",
+        "last_topic_icon_missing",
+        "last_topic_icon_error",
+        "pinned_status_message_id",
+        "pinned_status_hash",
+        "pinned_status_pinned",
+        "pinned_status_last_error",
+        "rename_attempts",
+        "topic_closed_at",
+        "topic_auto_closed_at",
+    ):
+        entry.pop(field, None)
+    note = {
+        "topic_id": topic_id,
+        "worker_id": str(
+            entry.get("tendwire_worker_id") or entry.get("worker_id") or ""
+        ),
+        "stable_key": str(entry.get("tendwire_stable_key") or ""),
+        "reason": "live_delivery_topic_gone",
+        "error_kind": compact_ws(error_kind, 80),
+        "error": compact_ws(error, 240),
+        "observed_at": repaired_at,
+    }
+    entry["topic_recovery_pending"] = dict(note)
+    audit = data.get("telegram_topic_binding_audit")
+    if not isinstance(audit, list):
+        audit = []
+    audit.append(note)
+    data["telegram_topic_binding_audit"] = audit[-TOPIC_BINDING_AUDIT_LIMIT:]
+    return True
 
 
 def _entry_identity_is_allowed(entry: dict[str, Any]) -> bool:
@@ -1582,6 +1641,24 @@ def _topic_age_key(entry_key: str, entry: dict[str, Any]) -> tuple[int, int | st
     return 1, topic_id, entry_key
 
 
+def _entry_has_recent_live_activity(
+    entry: dict[str, Any], *, observed_at: float
+) -> bool:
+    if not _entry_is_live(entry):
+        return False
+    raw = entry.get("tendwire_last_seen_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    age = observed_at - parsed.timestamp()
+    return 0 <= age <= DUPLICATE_LIVE_ACTIVITY_SECONDS
+
+
 _CONSOLIDATION_HEALABLE_QUARANTINE_REASONS = frozenset(
     {
         "closed_stable_key_reuse",
@@ -1687,9 +1764,10 @@ def consolidate_worker_entries_by_stable_key(
 
     Consolidation is intentionally limited to a stable key with exactly one
     live snapshot observation.  Conflicting source claims remain fail-closed.
-    The oldest topic survives; newer duplicate topics remain as retired history
-    long enough for source sync to post a visible notice, rename, and close
-    them.  Topicless duplicates are removed immediately.
+    A group with exactly one topic owner is a duplicate live claim: that owner
+    survives and topicless twins are explicitly retired. Multiple different
+    topics with recent activity remain fail-closed. Historical multi-topic
+    duplicates retain the older consolidation behavior.
     """
     observed_workers: dict[str, list[dict[str, Any]]] = {}
     for worker in workers:
@@ -1709,6 +1787,7 @@ def consolidate_worker_entries_by_stable_key(
     panes = data.setdefault("panes", {})
     bindings = data.get("telegram_message_bindings")
     changed = 0
+    observed_at = time.time()
     for stable_key in sorted(by_stable_key):
         entry_keys = by_stable_key[stable_key]
         current_workers = observed_workers.get(stable_key, [])
@@ -1720,7 +1799,32 @@ def consolidate_worker_entries_by_stable_key(
         ):
             continue
         worker = current_workers[0]
+        live_entry_keys = [
+            key for key in entry_keys if not entry_is_retired(entries[key])
+        ]
+        live_topic_holders = [
+            key for key in live_entry_keys if entries[key].get("topic_id")
+        ]
         topic_holders = [key for key in entry_keys if entries[key].get("topic_id")]
+        distinct_topic_ids = {
+            str(entries[key].get("topic_id") or "")
+            for key in live_topic_holders
+        }
+        distinct_topic_ids.discard("")
+        if (
+            len(distinct_topic_ids) > 1
+            and sum(
+                _entry_has_recent_live_activity(
+                    entries[key], observed_at=observed_at
+                )
+                for key in live_topic_holders
+            )
+            > 1
+        ):
+            continue
+        duplicate_live_claim = (
+            len(live_entry_keys) > 1 and len(live_topic_holders) == 1
+        )
         survivor_key = min(
             topic_holders or entry_keys,
             key=lambda key: _topic_age_key(key, entries[key]),
@@ -1749,6 +1853,8 @@ def consolidate_worker_entries_by_stable_key(
             "topic_name",
             "tendwire_stable_key",
             "tendwire_stable_key_version",
+            "pane_uuid",
+            "pane_uuid_version",
             "routing_retired",
             "routing_retired_reason",
             "stable_key_quarantined",
@@ -1812,7 +1918,21 @@ def consolidate_worker_entries_by_stable_key(
                 continue
             duplicate = entries[entry_key]
             topic_id = str(duplicate.get("topic_id") or "")
-            if topic_id and topic_id != survivor_topic_id:
+            if duplicate_live_claim and entry_key in live_entry_keys:
+                _retire_rekey_entry(
+                    duplicate,
+                    reason="duplicate_live_claim",
+                    archive_topic=False,
+                )
+                duplicate["routing_retired_reason"] = "duplicate_live_claim"
+                duplicate["consolidated_into_entry_key"] = survivor_key
+                duplicate["consolidated_into_topic_id"] = survivor_topic_id
+                duplicate["tendwire_stable_identity_class"] = (
+                    "retired_duplicate_live_claim"
+                )
+                duplicate.pop("tendwire_stable_key", None)
+                duplicate.pop("tendwire_stable_key_version", None)
+            elif topic_id and topic_id != survivor_topic_id:
                 _retire_rekey_entry(
                     duplicate,
                     reason="stable_key_duplicate_consolidated",
