@@ -381,8 +381,12 @@ def test_exact_v1_identity_return_heals_transient_absent_identity_quarantine():
     assert absent["stable_key_quarantine_reason"] == "source_identity_absent"
     assert state.message_bindings(store)["500"]["routing_quarantined"] is True
 
+    restored = _worker("claude-2", KEY_A)
+    blocked = state.blocked_worker_stable_keys(store, [restored])
+    assert KEY_A not in blocked
+
     healed_key, healed, healed_created = state.upsert_worker_entry(
-        store, _worker("claude-2", KEY_A)
+        store, restored, blocked_stable_keys=blocked
     )
 
     assert healed_key == key
@@ -402,8 +406,12 @@ def test_exact_v1_identity_return_does_not_heal_other_quarantine_reasons():
     entry["stable_key_quarantined"] = True
     entry["stable_key_quarantine_reason"] = "operator_hold"
 
+    restored = _worker("claude-2", KEY_A)
+    blocked = state.blocked_worker_stable_keys(store, [restored])
+    assert KEY_A in blocked
+
     repeated_key, repeated, repeated_created = state.upsert_worker_entry(
-        store, _worker("claude-2", KEY_A)
+        store, restored, blocked_stable_keys=blocked
     )
 
     assert repeated_key == key
