@@ -360,6 +360,68 @@ def test_fresh_absent_identity_is_quarantined_and_repeated_upsert_is_idempotent(
     assert state.find_worker_entry_by_id(store, "claude-2") == (None, None)
 
 
+def test_exact_v1_identity_return_heals_transient_absent_identity_quarantine():
+    store = _store()
+    key, entry, _created = state.upsert_worker_entry(
+        store, _worker("claude-2", KEY_A), topic_id="26"
+    )
+    entry["pane_uuid"] = "00000000-0000-4000-8000-000000000001"
+    entry["pane_uuid_version"] = 1
+    state.bind_message_to_worker(
+        store, "500", entry, topic_id="26", kind="final"
+    )
+
+    absent_key, absent, absent_created = state.upsert_worker_entry(
+        store, _worker("claude-2")
+    )
+
+    assert absent_key == key
+    assert absent_created is False
+    assert absent is entry
+    assert absent["stable_key_quarantine_reason"] == "source_identity_absent"
+    assert state.message_bindings(store)["500"]["routing_quarantined"] is True
+
+    restored = _worker("claude-2", KEY_A)
+    blocked = state.blocked_worker_stable_keys(store, [restored])
+    assert KEY_A not in blocked
+
+    healed_key, healed, healed_created = state.upsert_worker_entry(
+        store, restored, blocked_stable_keys=blocked
+    )
+
+    assert healed_key == key
+    assert healed_created is False
+    assert healed is entry
+    assert "stable_key_quarantined" not in healed
+    assert "stable_key_quarantine_reason" not in healed
+    assert "routing_quarantined" not in state.message_bindings(store)["500"]
+    assert state.find_worker_entry_by_stable_key(store, KEY_A) == (key, entry)
+
+
+def test_exact_v1_identity_return_does_not_heal_other_quarantine_reasons():
+    store = _store()
+    key, entry, _created = state.upsert_worker_entry(
+        store, _worker("claude-2", KEY_A), topic_id="26"
+    )
+    entry["stable_key_quarantined"] = True
+    entry["stable_key_quarantine_reason"] = "operator_hold"
+
+    restored = _worker("claude-2", KEY_A)
+    blocked = state.blocked_worker_stable_keys(store, [restored])
+    assert KEY_A in blocked
+
+    repeated_key, repeated, repeated_created = state.upsert_worker_entry(
+        store, restored, blocked_stable_keys=blocked
+    )
+
+    assert repeated_key == key
+    assert repeated_created is False
+    assert repeated is entry
+    assert repeated["stable_key_quarantined"] is True
+    assert repeated["stable_key_quarantine_reason"] == "operator_hold"
+    assert state.find_worker_entry_by_stable_key(store, KEY_A) == (None, None)
+
+
 def test_private_missing_version_planner_and_mutator_preserve_state_and_are_idempotent():
     store = _store()
     key, entry = _persisted_missing_version_worker(

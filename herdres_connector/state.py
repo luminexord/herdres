@@ -736,10 +736,34 @@ def blocked_worker_stable_keys(data: dict[str, Any], workers: list[dict[str, Any
         if identity is None:
             continue
         if entry_is_quarantined(entry):
-            blocked.add(identity[0])
-            continue
+            # One transient identity-less observation quarantines the
+            # previously authenticated owner.  If the next immutable snapshot
+            # proves the exact same one-to-one worker/key claim, allow upsert
+            # to heal that narrowly scoped marker.  Every other quarantine
+            # reason or mismatched/duplicate snapshot claim remains blocked.
+            snapshot_claimants = claims.get(identity[0], [])
+            persisted_worker_id = compact_ws(
+                entry.get("tendwire_worker_id") or entry.get("worker_id"),
+                160,
+            )
+            if not (
+                entry.get("stable_key_quarantine_reason")
+                == "source_identity_absent"
+                and snapshot_claimants == [persisted_worker_id]
+                and identity[0] not in blocked
+            ):
+                blocked.add(identity[0])
+                continue
         if not entry_is_routable(entry):
-            continue
+            # A healable transient quarantine is intentionally not routable
+            # until the later upsert clears it, but it still counts as a
+            # persisted ownership claim for duplicate detection below.
+            if not (
+                entry_is_quarantined(entry)
+                and entry.get("stable_key_quarantine_reason")
+                == "source_identity_absent"
+            ):
+                continue
         persisted_by_stable.setdefault(identity[0], []).append(key)
     blocked.update(
         stable_key
@@ -3268,6 +3292,22 @@ def upsert_worker_entry(
     if identity is not None:
         entry["tendwire_stable_key"] = identity[0]
         entry["tendwire_stable_key_version"] = identity[1]
+    # A source adapter can briefly omit public identity metadata while the
+    # same pane is being rediscovered.  That observation must fail closed, but
+    # the quarantine cannot remain sticky after the exact persisted v1 owner
+    # returns in a conflict-free snapshot.  Heal only this one transient
+    # reason; every collision/operator/unknown-version quarantine remains
+    # fail-closed and requires its dedicated reconciliation path.
+    if (
+        not created
+        and not must_quarantine
+        and identity is not None
+        and entry_stable_identity(entry) == identity
+        and entry.get("stable_key_quarantine_reason")
+        == "source_identity_absent"
+    ):
+        entry.pop("stable_key_quarantined", None)
+        entry.pop("stable_key_quarantine_reason", None)
     panes[key] = entry
     if not created and identity is not None and not must_quarantine:
         _retarget_worker_bindings(
