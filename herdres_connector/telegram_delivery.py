@@ -539,7 +539,15 @@ def topic_icon_id(
         return cached
     if telegram_client is None or getattr(telegram_client, "dry_run", False):
         return ""
-    if by_emoji and _cache_fresh(str(icons.get("fetched_at") or ""), config.topic_icon_cache_ttl_seconds()):
+    if _cache_fresh(
+        str(icons.get("fetched_at") or ""),
+        config.topic_icon_cache_ttl_seconds(),
+    ):
+        return ""
+    if _cache_fresh(
+        str(icons.get("last_error_at") or ""),
+        config.topic_icon_error_retry_seconds(),
+    ):
         return ""
     try:
         response = telegram_client.api("getForumTopicIconStickers", {})

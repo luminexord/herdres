@@ -392,6 +392,296 @@ def test_guarded_topic_icon_catalog_persists_and_is_reused(
     ] == ["getForumTopicIconStickers"]
 
 
+def test_guarded_topic_icon_error_cache_throttles_ten_panes(
+    tmp_path, monkeypatch
+) -> None:
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(statepath)
+    )
+    store = _store()
+    for index in range(10):
+        worker = _source_worker(
+            {
+                "id": f"worker-{index}",
+                "name": f"Worker {index}",
+                "status": "failed",
+                "space_id": "space-1",
+                "fingerprint": f"fp-{index}",
+            }
+        )
+        state.upsert_worker_entry(
+            store, worker, topic_id=str(770 + index)
+        )
+    state.save_state(store, statepath)
+
+    class FailingIconTelegram(FakeTelegram):
+        def api(self, method, payload):
+            self.api_calls.append((method, dict(payload), self.token))
+            if method == "getForumTopicIconStickers":
+                raise RuntimeError("icon catalogue unavailable")
+            return super().api(method, payload)
+
+    telegram = FailingIconTelegram()
+    real_save = state.save_state
+    save_calls = 0
+
+    def counted_save(current, path=None):
+        nonlocal save_calls
+        save_calls += 1
+        return real_save(current, path=path)
+
+    monkeypatch.setattr(state, "save_state", counted_save)
+    with state.state_lock(statepath):
+        current = state.load_state(statepath)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                telegram,
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(
+                    current, statepath
+                ),
+            ),
+        )
+        for key in list(state.source_worker_entries(current)):
+            entry = state.source_worker_entries(current)[key]
+            assert not source_sync._sync_topic_icon(
+                current, entry, runtime, chat_id="-100"
+            )
+
+    assert [
+        method
+        for method, _payload, _token in telegram.api_calls
+        if method == "getForumTopicIconStickers"
+    ] == ["getForumTopicIconStickers"]
+    # One guarded-read barrier and one shared error-cache barrier, not two
+    # full-state saves for each pane.
+    assert save_calls == 2
+    persisted = state.load_state(statepath)["telegram"][
+        "forum_topic_icons"
+    ]
+    assert persisted["last_error"] == "icon catalogue unavailable"
+    assert persisted["last_error_at"]
+
+
+def test_sync_topic_icon_reresolves_owner_after_guarded_catalog_read(
+    tmp_path, monkeypatch
+) -> None:
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(statepath)
+    )
+    store = _store()
+    worker = _source_worker(
+        {
+            "id": "worker-icon-missing",
+            "name": "Missing icon",
+            "status": "failed",
+            "space_id": "space-1",
+            "fingerprint": "fp-icon-missing",
+        }
+    )
+    key, _entry, _created = state.upsert_worker_entry(
+        store, worker, topic_id="77"
+    )
+    state.save_state(store, statepath)
+
+    class MissingFailedIconTelegram(FakeTelegram):
+        def api(self, method, payload):
+            self.api_calls.append((method, dict(payload), self.token))
+            if method == "getForumTopicIconStickers":
+                return {
+                    "ok": True,
+                    "result": [
+                        {
+                            "emoji": "✅",
+                            "custom_emoji_id": "icon-idle",
+                        }
+                    ],
+                }
+            return super().api(method, payload)
+
+    telegram = MissingFailedIconTelegram()
+    with state.state_lock(statepath):
+        current = state.load_state(statepath)
+        stale_entry = state.source_worker_entries(current)[key]
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                telegram,
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(
+                    current, statepath
+                ),
+            ),
+        )
+        assert not source_sync._sync_topic_icon(
+            current, stale_entry, runtime, chat_id="-100"
+        )
+        live_entry = state.source_worker_entries(current)[key]
+        assert stale_entry is not live_entry
+        assert live_entry["last_topic_icon_missing"] == "‼️"
+        state.save_state(current, statepath)
+
+    assert state.load_state(statepath)["panes"][key][
+        "last_topic_icon_missing"
+    ] == "‼️"
+
+
+@pytest.mark.parametrize("topic_mode", ["worker", "space"])
+def test_guarded_create_then_icon_uses_reloaded_owner(
+    tmp_path, monkeypatch, topic_mode
+) -> None:
+    statepath = tmp_path / f"{topic_mode}.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(statepath)
+    )
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", topic_mode)
+    worker = _source_worker(
+        {
+            "id": "worker-create-icon",
+            "name": "Create icon",
+            "status": "attention",
+            "space_id": "space-1",
+            "fingerprint": "fp-create-icon",
+        }
+    )
+    snapshot = {
+        "ok": True,
+        "workers": [worker],
+        "spaces": [
+            {
+                "id": "space-1",
+                "name": "Create icon space",
+                "status": "active",
+                "fingerprint": "space-fp",
+            }
+        ],
+    }
+    state.save_state(_store(), statepath)
+    telegram = FakeTelegram()
+
+    with state.state_lock(statepath):
+        current = state.load_state(statepath)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                telegram,
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(
+                    current, statepath
+                ),
+            ),
+        )
+        counts = _sync_sources(
+            current,
+            snapshot,
+            {"turns": []},
+            runtime,
+            chat_id="-100",
+        )
+        state.save_state(current, statepath)
+
+    bucket = (
+        state.source_worker_entries(current)
+        if topic_mode == "worker"
+        else state.source_space_entries(current)
+    )
+    entry = next(iter(bucket.values()))
+    assert entry["topic_id"] == "77"
+    assert entry["last_topic_icon"] == "❓"
+    assert entry["last_topic_icon_id"] == "icon-attention"
+    assert counts["icon_updated"] == 1
+    persisted_bucket = (
+        state.source_worker_entries(state.load_state(statepath))
+        if topic_mode == "worker"
+        else state.source_space_entries(state.load_state(statepath))
+    )
+    assert next(iter(persisted_bucket.values()))[
+        "last_topic_icon_id"
+    ] == "icon-attention"
+
+
+@pytest.mark.parametrize("topic_mode", ["worker", "space"])
+def test_guarded_cleanup_prunes_from_reloaded_bucket(
+    tmp_path, monkeypatch, topic_mode
+) -> None:
+    statepath = tmp_path / f"cleanup-{topic_mode}.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(statepath)
+    )
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", topic_mode)
+    store = _store()
+    if topic_mode == "worker":
+        store["panes"]["worker:council"] = {
+            "source": "tendwire",
+            "entry_type": "worker",
+            "tendwire_worker_id": "council",
+            "worker_id": "council",
+            "topic_id": "77",
+            "topic_name": "Council · cleanup",
+            "worker_name": "gm-local-as",
+            "status": "closed",
+            "tendwire_raw_status": "closed",
+        }
+    else:
+        _key, entry, _created = state.upsert_space_entry(
+            store,
+            {
+                "id": "council-space",
+                "name": "Council · cleanup",
+                "status": "closed",
+                "fingerprint": "council-space-fp",
+            },
+            topic_id="77",
+        )
+        entry["stale_space_topic"] = True
+        entry["space_topic_name"] = "Council · cleanup"
+    state.save_state(store, statepath)
+    telegram = FakeTelegram()
+
+    with state.state_lock(statepath):
+        current = state.load_state(statepath)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                telegram,
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(
+                    current, statepath
+                ),
+            ),
+        )
+        result = _cleanup_topics(
+            current,
+            runtime,
+            chat_id="-100",
+            snapshot_worker_ids={"live"},
+        )
+        state.save_state(current, statepath)
+
+    bucket = (
+        state.source_worker_entries(current)
+        if topic_mode == "worker"
+        else state.source_space_entries(current)
+    )
+    persisted_bucket = (
+        state.source_worker_entries(state.load_state(statepath))
+        if topic_mode == "worker"
+        else state.source_space_entries(state.load_state(statepath))
+    )
+    assert result["deleted"] == 1
+    assert result["pruned"] == int(topic_mode == "space")
+    assert telegram.deleted_topics == ["77"]
+    assert bucket == {}
+    assert persisted_bucket == {}
+
+
 def test_executor_read_rejects_mutator_and_with_token_stays_guarded() -> None:
     store = _store()
     guarded = _OfflockClient(FakeTelegram(), store, "telegram")

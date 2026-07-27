@@ -52,23 +52,206 @@ PANE_UUID_VERSION = 1
 PANE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+ACCEPTED_NOTIFICATION_JOURNAL_APPLIED_LIMIT = 200
+
+
+def accepted_notification_journal_path(path: Path | None = None) -> Path:
+    state_file = path or config.state_path()
+    return state_file.with_suffix(
+        state_file.suffix + ".accepted-notifications"
+    )
+
+
+def _load_accepted_notification_journal(
+    path: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    journal_file = accepted_notification_journal_path(path)
+    if not journal_file.exists():
+        return {}
+    try:
+        payload = json.loads(journal_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            "Herdres accepted-notification journal is corrupt"
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise RuntimeError(
+            "Herdres accepted-notification journal is corrupt"
+        )
+    receipts = payload.get("receipts")
+    if not isinstance(receipts, dict):
+        raise RuntimeError(
+            "Herdres accepted-notification journal is corrupt"
+        )
+    if not all(
+        isinstance(receipt_id, str) and isinstance(record, dict)
+        for receipt_id, record in receipts.items()
+    ):
+        raise RuntimeError(
+            "Herdres accepted-notification journal is corrupt"
+        )
+    return receipts
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def append_accepted_notification_receipt(
+    receipt_id: str,
+    record: Mapping[str, Any],
+    *,
+    data: dict[str, Any] | None = None,
+    path: Path | None = None,
+) -> None:
+    """Durably append one small provider-acceptance fact.
+
+    The journal is intentionally separate from the large state ledger.  The
+    provider has already accepted the message, so this few-hundred-byte fsync
+    must complete before the acceptance callback returns.  The next canonical
+    state save absorbs the fact and removes the sidecar.
+    """
+
+    if not receipt_id or not isinstance(record, Mapping):
+        return
+    state_file = path or config.state_path()
+    journal_file = accepted_notification_journal_path(state_file)
+    journal_file.parent.mkdir(parents=True, exist_ok=True)
+    receipts = _load_accepted_notification_journal(state_file)
+    if data is not None:
+        telegram = (
+            data.get("telegram")
+            if isinstance(data.get("telegram"), dict)
+            else {}
+        )
+        applied = telegram.get("accepted_notification_journal_applied")
+        applied_ids = {
+            str(item)
+            for item in (applied if isinstance(applied, list) else [])
+            if item
+        }
+        receipts = {
+            key: value
+            for key, value in receipts.items()
+            if key not in applied_ids
+        }
+    receipts.setdefault(receipt_id, deepcopy(dict(record)))
+    tmp = journal_file.with_suffix(journal_file.suffix + ".tmp")
+    payload = (
+        json.dumps(
+            {"version": 1, "receipts": receipts},
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, journal_file)
+        _fsync_directory(journal_file.parent)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _merge_accepted_notification_journal(
+    data: dict[str, Any], path: Path | None = None
+) -> None:
+    receipts = _load_accepted_notification_journal(path)
+    if not receipts:
+        return
+    telegram = data.setdefault("telegram", {})
+    if not isinstance(telegram, dict):
+        telegram = {}
+        data["telegram"] = telegram
+    records = telegram.setdefault("accepted_notification_messages", {})
+    if not isinstance(records, dict):
+        records = {}
+        telegram["accepted_notification_messages"] = records
+    applied = telegram.get("accepted_notification_journal_applied")
+    applied_ids = {
+        str(item)
+        for item in (applied if isinstance(applied, list) else [])
+        if item
+    }
+    for receipt_id, record in receipts.items():
+        if receipt_id not in applied_ids:
+            records.setdefault(receipt_id, deepcopy(record))
+
+
+def _mark_accepted_notification_journal_applied(
+    data: dict[str, Any], path: Path | None = None
+) -> bool:
+    receipts = _load_accepted_notification_journal(path)
+    if not receipts:
+        return False
+    telegram = data.setdefault("telegram", {})
+    if not isinstance(telegram, dict):
+        telegram = {}
+        data["telegram"] = telegram
+    applied = telegram.get("accepted_notification_journal_applied")
+    applied_ids = [
+        str(item)
+        for item in (applied if isinstance(applied, list) else [])
+        if item
+    ]
+    for receipt_id in receipts:
+        if receipt_id not in applied_ids:
+            applied_ids.append(receipt_id)
+    telegram["accepted_notification_journal_applied"] = applied_ids[
+        -ACCEPTED_NOTIFICATION_JOURNAL_APPLIED_LIMIT:
+    ]
+    return True
+
+
+def _clear_accepted_notification_journal(
+    path: Path | None = None,
+) -> None:
+    journal_file = accepted_notification_journal_path(path)
+    if not journal_file.exists():
+        return
+    journal_file.unlink()
+    _fsync_directory(journal_file.parent)
 
 
 def load_state(path: Path | None = None) -> dict[str, Any]:
     state_file = path or config.state_path()
     if not state_file.exists():
-        return {"version": 2, "enabled": True, "telegram": {}, "panes": {}, "spaces": {}}
-    try:
-        data = json.loads(state_file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise RuntimeError("Herdres state file is corrupt") from exc
-    if not isinstance(data, dict):
-        raise RuntimeError("Herdres state file is corrupt")
+        data = {
+            "version": 2,
+            "enabled": True,
+            "telegram": {},
+            "panes": {},
+            "spaces": {},
+        }
+    else:
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RuntimeError("Herdres state file is corrupt") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("Herdres state file is corrupt")
     data.setdefault("version", 2)
     data.setdefault("enabled", True)
     data.setdefault("telegram", {})
     data.setdefault("panes", {})
     data.setdefault("spaces", {})
+    _merge_accepted_notification_journal(data, state_file)
     return data
 
 
@@ -76,6 +259,9 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
     state_file = path or config.state_path()
     state_file.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_file.with_suffix(state_file.suffix + ".tmp")
+    journal_pending = _mark_accepted_notification_journal_applied(
+        data, state_file
+    )
     # This file is an internal durability boundary, not a hand-edited config.
     # Compact separators cut serialization and fsync bytes on the live state
     # ledger; inbound commands cross this boundary before and after Tendwire,
@@ -95,16 +281,9 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, state_file)
-        directory_fd = os.open(
-            state_file.parent,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _fsync_directory(state_file.parent)
+        if journal_pending:
+            _clear_accepted_notification_journal(state_file)
     finally:
         try:
             tmp.unlink(missing_ok=True)

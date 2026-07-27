@@ -1567,18 +1567,19 @@ def _notification_kind_pending(
 
 def _checkpoint_accepted_notification(
     store: dict[str, Any],
+    runtime: SyncRuntime,
     operation: _OfflockEntryOperation,
     result: Any,
     *,
     kind: str,
     bot_kind: str = MANAGER_BOT_KIND,
 ) -> str:
-    """Record an accepted exact message before owner disposition is known.
+    """Durably record an accepted exact message before disposition is known.
 
-    This mutates the in-memory receipt journal only.  An APPLY path coalesces
-    its durability with the next guarded provider operation (or its existing
-    terminal checkpoint); a path with no following barrier must call
-    ``_checkpoint_unbarriered_notification`` before returning.
+    The provider acceptance fact crosses a small fsynced sidecar boundary
+    here.  The next canonical full-state barrier absorbs and clears that
+    journal, avoiding another whole-ledger save per notification without
+    reopening the acceptance crash window.
     """
 
     if not isinstance(result, Mapping) or result.get("ok") is not True:
@@ -1598,32 +1599,22 @@ def _checkpoint_accepted_notification(
     records = _accepted_notification_messages(store, create=True)
     # Capacity gates starting new sends. An already-accepted provider fact is
     # always admitted, even if a concurrent writer filled the nominal bound.
-    records.setdefault(
-        receipt_id,
-        {
-            "kind": kind,
-            "topic_id": operation.route_topic_id,
-            "message_id": message_id,
-            "bot_kind": bot_kind,
-            "provenance": _operation_provenance(operation),
-        },
-    )
+    record = {
+        "kind": kind,
+        "topic_id": operation.route_topic_id,
+        "message_id": message_id,
+        "bot_kind": bot_kind,
+        "provenance": _operation_provenance(operation),
+    }
+    records.setdefault(receipt_id, record)
+    # Source-mode production calls run under the state flock. Unit-level
+    # in-memory helpers deliberately have no durable state path to journal.
+    if state.lock_actually_held():
+        state.append_accepted_notification_receipt(
+            receipt_id, record, data=store
+        )
+        _after_provider_accept(runtime)
     return receipt_id
-
-
-def _checkpoint_unbarriered_notification(
-    runtime: SyncRuntime,
-    receipt_id: str,
-    disposition: str,
-) -> None:
-    """Persist an accepted receipt when no APPLY barrier will follow."""
-
-    if (
-        receipt_id
-        and disposition != _OFFLOCK_APPLY
-        and runtime.checkpoint is not None
-    ):
-        runtime.checkpoint()
 
 
 def _complete_accepted_notification(
@@ -2956,7 +2947,11 @@ _ALERT_STATUSES = frozenset({"attention", "failed"})
 _RESERVED_STATUS_EMOJIS = frozenset({"\u2753", "\u203c\ufe0f", "\u2705", "\u26a1\ufe0f", "\u2615\ufe0f"})
 
 
-def _identity_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime) -> tuple[str, str]:
+def _identity_topic_icon(
+    store: dict[str, Any],
+    topic_identity: str,
+    runtime: SyncRuntime,
+) -> tuple[str, str]:
     """Deterministic per-topic identity icon from the allowed forum icon set."""
     catalog = topic_icon_catalog(
         store,
@@ -2966,8 +2961,15 @@ def _identity_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: 
     choices = sorted(emoji for emoji in catalog if emoji not in _RESERVED_STATUS_EMOJIS)
     if not choices:
         return "", ""
-    key = compact_ws(entry.get("topic_name") or entry.get("topic_id"), 80)
-    emoji = choices[int(short_hash({"topic_icon": key}, 8), 16) % len(choices)]
+    emoji = choices[
+        int(
+            short_hash(
+                {"topic_icon": compact_ws(topic_identity, 80)}, 8
+            ),
+            16,
+        )
+        % len(choices)
+    ]
     return emoji, catalog.get(emoji, "")
 
 
@@ -2986,6 +2988,20 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
         return False
     status = normalized_status(entry.get("status") or entry.get("tendwire_status_line"))
     current = str(entry.get("last_topic_icon") or "")
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=thread_id,
+        observe=(
+            "status",
+            "tendwire_status_line",
+            "last_topic_icon",
+            "last_topic_icon_id",
+        ),
+    )
+    topic_identity = str(
+        entry.get("topic_name") or entry.get("topic_id") or ""
+    )
     if status in _ALERT_STATUSES:
         emoji = status_emoji(status)
         emoji_id = topic_icon_id(
@@ -2997,9 +3013,19 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
     else:
         if current and current not in _RESERVED_STATUS_EMOJIS and entry.get("last_topic_icon_id"):
             return False
-        emoji, emoji_id = _identity_topic_icon(store, entry, runtime)
+        emoji, emoji_id = _identity_topic_icon(
+            store, topic_identity, runtime
+        )
         if not emoji:
             return False
+    # Catalogue reads are guarded provider calls and can replace every nested
+    # state object. Resolve the captured durable owner before any icon field is
+    # inspected or changed; the pre-read ``entry`` is dead from here onward.
+    resolution = _compare_and_apply_entry_operation(store, operation)
+    if resolution.disposition != _OFFLOCK_APPLY:
+        return False
+    entry = resolution.entry
+    assert entry is not None
     if not emoji_id:
         entry["last_topic_icon_missing"] = emoji
         return False
@@ -3227,6 +3253,7 @@ def _sync_topic_pinned(
             nonlocal accepted_receipt_id
             accepted_receipt_id = _checkpoint_accepted_notification(
                 store,
+                runtime,
                 operation,
                 result,
                 kind="topic_pinned",
@@ -3245,11 +3272,6 @@ def _sync_topic_pinned(
             acceptance_checkpoint=checkpoint_topic_pin,
         )
         sent, send_resolution = execution.result, execution.resolution
-        _checkpoint_unbarriered_notification(
-            runtime,
-            accepted_receipt_id,
-            send_resolution.disposition,
-        )
         if not sent.get("ok") and _topic_missing(sent.get("error")):
             _repair_provider_gone_topic(
                 store,
@@ -3531,6 +3553,7 @@ def _sync_retired_worker_topics(
                 accepted_receipt_id = (
                     _checkpoint_accepted_notification(
                         store,
+                        runtime,
                         operation,
                         result,
                         kind="retired_topic_notice",
@@ -3557,11 +3580,6 @@ def _sync_retired_worker_topics(
                 acceptance_checkpoint=checkpoint_retired_notice,
             )
             sent, notice_resolution = execution.result, execution.resolution
-            _checkpoint_unbarriered_notification(
-                runtime,
-                accepted_receipt_id,
-                notice_resolution.disposition,
-            )
             if _topic_missing(sent.get("error")):
                 _repair_provider_gone_topic(
                     store,
@@ -4074,7 +4092,10 @@ def _cleanup_topics(
         if live_known_ids and not (live_known_ids & snapshot_worker_ids):
             reap_enabled = False
     if reap_enabled:
-        for key, entry in list(state.source_worker_entries(store).items()):
+        for key in list(state.source_worker_entries(store)):
+            entry = state.source_worker_entries(store).get(key)
+            if entry is None:
+                continue
             if state.entry_is_retired(entry):
                 continue
             wid = compact_ws(entry.get("tendwire_worker_id") or entry.get("worker_id"), 160)
@@ -4167,7 +4188,10 @@ def _cleanup_topics(
             else:
                 worker_entry["deleted_topic_reason"] = reason
 
-    for key, entry in list(state.source_worker_entries(store).items()):
+    for key in list(state.source_worker_entries(store)):
+        entry = state.source_worker_entries(store).get(key)
+        if entry is None:
+            continue
         if state.entry_is_retired(entry):
             continue
         topic_id = str(entry.get("topic_id") or "")
@@ -4249,7 +4273,10 @@ def _cleanup_topics(
                 pop_worker(current_key)
             else:
                 current_entry["deleted_topic_reason"] = reason
-    for key, entry in list(state.source_space_entries(store).items()):
+    for key in list(state.source_space_entries(store)):
+        entry = state.source_space_entries(store).get(key)
+        if entry is None:
+            continue
         if not entry.get("stale_space_topic"):
             continue
         topic_id = str(entry.get("topic_id") or "")
@@ -10230,6 +10257,7 @@ def _sync_pinned(
             nonlocal accepted_receipt_id
             accepted_receipt_id = _checkpoint_accepted_notification(
                 store,
+                runtime,
                 captured,
                 result,
                 kind="global_pinned",
@@ -10280,11 +10308,6 @@ def _sync_pinned(
                 acceptance_checkpoint=checkpoint_global_pin,
             )
             result, resolution = execution.result, execution.resolution
-        _checkpoint_unbarriered_notification(
-            runtime,
-            accepted_receipt_id,
-            resolution.disposition,
-        )
         return result, resolution
 
     sent_new = False

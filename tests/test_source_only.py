@@ -1594,6 +1594,16 @@ class RebindingNotificationTelegram(FakeTelegram):
         return {"ok": True}
 
 
+class CrashNotificationTelegram(FakeTelegram):
+    def __init__(self):
+        super().__init__()
+        self.deleted_messages = []
+
+    def delete_message(self, chat_id, message_id):
+        self.deleted_messages.append((str(chat_id), str(message_id)))
+        return {"ok": True}
+
+
 def _store():
     return {
         "enabled": True,
@@ -3640,6 +3650,109 @@ def test_ten_global_status_deliveries_use_two_durability_barriers_each(
             deliver,
         )
         == 20
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["topic_pinned", "retired_topic_notice", "global_pinned"],
+)
+def test_notification_acceptance_journal_closes_crash_seam(
+    tmp_path, monkeypatch, kind
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(state_path)
+    )
+    initial = _notification_race_store(
+        retired=kind == "retired_topic_notice"
+    )
+    state.save_state(initial, state_path)
+    telegram = CrashNotificationTelegram()
+
+    def crash_after_accept():
+        raise RuntimeError("crash after notification acceptance")
+
+    def deliver(current, runtime):
+        if kind == "topic_pinned":
+            entry = current["panes"]["worker:notification-race"]
+            return source_sync._sync_topic_pinned(
+                current, entry, runtime, chat_id="-100"
+            )
+        if kind == "retired_topic_notice":
+            return bool(
+                source_sync._sync_retired_worker_topics(
+                    current, runtime, chat_id="-100"
+                )
+            )
+        return source_sync._sync_pinned(
+            current, runtime, chat_id="-100"
+        )
+
+    with pytest.raises(
+        RuntimeError, match="crash after notification acceptance"
+    ):
+        with state.state_lock(state_path):
+            current = state.load_state(state_path)
+            runtime = source_sync._offlock_runtime(
+                current,
+                SyncRuntime(
+                    FakeTendwire(),
+                    telegram,
+                    with_outbox=False,
+                    checkpoint=lambda: state.save_state(
+                        current, state_path
+                    ),
+                    after_provider_accept=crash_after_accept,
+                ),
+            )
+            deliver(current, runtime)
+
+    # The 11.7 MB ledger has not crossed another barrier, but the small
+    # acceptance fact is already durable in the sidecar.
+    durable_before_restart = json.loads(
+        state_path.read_text(encoding="utf-8")
+    )
+    assert not durable_before_restart["telegram"].get(
+        "accepted_notification_messages"
+    )
+    assert state.accepted_notification_journal_path(
+        state_path
+    ).exists()
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        assert len(
+            current["telegram"]["accepted_notification_messages"]
+        ) == 1
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                telegram,
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(
+                    current, state_path
+                ),
+            ),
+        )
+        retired, pending = source_sync._drain_accepted_notifications(
+            current, runtime, chat_id="-100"
+        )
+        assert deliver(current, runtime)
+        state.save_state(current, state_path)
+
+    deleted_ids = {message_id for _chat, message_id in telegram.deleted_messages}
+    visible_ids = {
+        str(row[3]) for row in telegram.sent
+    } - deleted_ids
+    assert (retired, pending) == (1, 0)
+    assert visible_ids == {"101"}
+    assert not state.accepted_notification_journal_path(
+        state_path
+    ).exists()
+    assert not state.load_state(state_path)["telegram"].get(
+        "accepted_notification_messages"
     )
 
 
