@@ -765,6 +765,7 @@ def test_phase3_delete_records_provider_fact_after_concurrent_rebind(
     rebound = current["panes"]["pane:one"]
     alias = current["spaces"]["space:live-alias"]
     assert telegram.deleted == ["22000"]
+    assert result["operations"] == 1
     assert result["deleted"] == 0
     assert result["deferred"] == 1
     assert result["changed"] is True
@@ -781,6 +782,63 @@ def test_phase3_delete_records_provider_fact_after_concurrent_rebind(
         }
     ]
     assert state.find_legacy_topic_id_by_name(current, "Live alias") == ""
+
+
+def test_delete_outcome_receipt_replay_is_idempotent(monkeypatch):
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
+    entry = _entry("79", dormant_at=NOW - DAY)
+    store = _store(("pane:one", entry))
+    store["telegram_dead_topic_ids"] = ["900", "901"]
+    targets, _abandoned, _delayed = source_sync._topic_cleanup_targets(
+        store, now=NOW, preview=False
+    )
+    outcome = {
+        "target": targets[0],
+        "status": "success",
+        "kind": "",
+        "error": "",
+    }
+
+    first = source_sync._topic_cleanup_empty_result()
+    source_sync._apply_topic_cleanup_outcomes(
+        store, [outcome], first, now=NOW
+    )
+    after_first = copy.deepcopy(store)
+    deletion_audit_length = len(store["telegram_deleted_topics"])
+
+    replay = source_sync._topic_cleanup_empty_result()
+    source_sync._apply_topic_cleanup_outcomes(
+        store, [outcome], replay, now=NOW
+    )
+
+    assert first["operations"] == 1
+    assert first["deleted"] == 1
+    assert first["changed"] is True
+    assert replay["operations"] == 1
+    assert replay["deleted"] == 0
+    assert replay["deferred"] == 1
+    assert replay["changed"] is False
+    assert store == after_first
+    assert store["telegram_dead_topic_ids"] == ["900", "901", "79"]
+    assert len(store["telegram_deleted_topics"]) == deletion_audit_length
+
+    store["spaces"]["space:late-alias"] = {
+        "source": "tendwire",
+        "entry_type": "space",
+        "topic_id": "79",
+        "topic_name": "Late alias",
+    }
+    alias_replay = source_sync._topic_cleanup_empty_result()
+    source_sync._apply_topic_cleanup_outcomes(
+        store, [outcome], alias_replay, now=NOW
+    )
+
+    late_alias = store["spaces"]["space:late-alias"]
+    assert alias_replay["changed"] is True
+    assert "topic_id" not in late_alias
+    assert late_alias["deleted_topic_id"] == "79"
+    assert store["telegram_dead_topic_ids"] == ["900", "901", "79"]
+    assert len(store["telegram_deleted_topics"]) == deletion_audit_length
 
 
 def test_rate_limit_backoff_uses_receipt_time_even_after_conflict(

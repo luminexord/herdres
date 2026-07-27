@@ -2498,21 +2498,39 @@ def _record_topic_delete_success(
     topic_id: str,
     name: Any,
     reason: str,
-) -> frozenset[str]:
-    """Atomically record provider-confirmed deletion and invalidate aliases."""
+) -> tuple[frozenset[str], bool]:
+    """Record a deletion and return (cleared worker keys, state changed)."""
+    previous_tombstones = store.get("telegram_dead_topic_ids")
+    previous_tombstones = (
+        list(previous_tombstones)
+        if isinstance(previous_tombstones, list)
+        else None
+    )
+    space_alias_present = any(
+        str(entry.get("topic_id") or "") == topic_id
+        for entry in state.source_space_entries(store).values()
+    )
     cleared_worker_keys = state.tombstone_dead_topic(store, topic_id)
+    changed = (
+        previous_tombstones != store.get("telegram_dead_topic_ids")
+        or space_alias_present
+        or bool(cleared_worker_keys)
+    )
     audit = store.get("telegram_deleted_topics")
     if not isinstance(audit, list):
         audit = []
-    audit.append(
-        {
-            "topic_id": topic_id,
-            "name": compact_ws(name, 120),
-            "reason": reason,
-        }
-    )
-    store["telegram_deleted_topics"] = audit[-_TOPIC_CLEANUP_AUDIT_LIMIT:]
-    return cleared_worker_keys
+    fact = {
+        "topic_id": topic_id,
+        "name": compact_ws(name, 120),
+        "reason": reason,
+    }
+    if fact not in audit:
+        audit.append(fact)
+        store["telegram_deleted_topics"] = audit[
+            -_TOPIC_CLEANUP_AUDIT_LIMIT:
+        ]
+        changed = True
+    return cleared_worker_keys, changed
 
 
 def _cleanup_topics(
@@ -2703,11 +2721,13 @@ def _cleanup_topics(
             deleted = runtime.telegram.delete_topic(chat_id, topic_id)
             if not deleted.get("ok"):
                 if _topic_missing(deleted.get("error")):
-                    cleared_worker_keys = _record_topic_delete_success(
-                        store,
-                        topic_id=topic_id,
-                        name=entry.get("topic_name"),
-                        reason="done_council_space_topic",
+                    cleared_worker_keys, _changed = (
+                        _record_topic_delete_success(
+                            store,
+                            topic_id=topic_id,
+                            name=entry.get("topic_name"),
+                            reason="done_council_space_topic",
+                        )
                     )
                     deleted_topic_ids.add(topic_id)
                     finalize_deleted_space_worker_aliases(
@@ -2722,7 +2742,7 @@ def _cleanup_topics(
                 continue
             result["deleted"] += 1
             deleted_topic_ids.add(topic_id)
-            cleared_worker_keys = _record_topic_delete_success(
+            cleared_worker_keys, _changed = _record_topic_delete_success(
                 store,
                 topic_id=topic_id,
                 name=entry.get("topic_name"),
@@ -3226,6 +3246,7 @@ def _apply_topic_cleanup_outcomes(
             result["deferred"] += 1
             result["changed"] = True
             continue
+        result["operations"] += 1
         target_still_valid = _topic_cleanup_target_still_valid(
             store, target, now=now
         )
@@ -3237,17 +3258,20 @@ def _apply_topic_cleanup_outcomes(
             # state has rebound the selected pane. Invalidate every alias
             # before deciding whether the target-specific lifecycle mutation
             # is still safe to apply.
-            _record_topic_delete_success(
-                store,
-                topic_id=str(target["topic_id"]),
-                name=target.get("topic_name"),
-                reason=str(target["reason"]),
+            _cleared_worker_keys, provider_fact_changed = (
+                _record_topic_delete_success(
+                    store,
+                    topic_id=str(target["topic_id"]),
+                    name=target.get("topic_name"),
+                    reason=str(target["reason"]),
+                )
             )
-            result["changed"] = True
+            result["changed"] = (
+                provider_fact_changed or result["changed"]
+            )
         if not target_still_valid:
             result["deferred"] += 1
             continue
-        result["operations"] += 1
         entry = state.source_worker_entries(store)[str(target["entry_key"])]
         if outcome["status"] == "success":
             attempts.pop(target_key, None)

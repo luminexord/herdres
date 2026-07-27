@@ -633,13 +633,16 @@ def tombstone_dead_topic(
     data: dict[str, Any], topic_id: str
 ) -> frozenset[str]:
     raw = data.get("telegram_dead_topic_ids")
-    tombstones = (
-        [compact_ws(value, 80) for value in raw]
-        if isinstance(raw, list)
-        else []
-    )
-    tombstones = [value for value in tombstones if value and value != topic_id]
-    tombstones.append(topic_id)
+    tombstones: list[str] = []
+    seen: set[str] = set()
+    for value in raw if isinstance(raw, list) else []:
+        normalized = compact_ws(value, 80)
+        if not normalized or normalized in seen:
+            continue
+        tombstones.append(normalized)
+        seen.add(normalized)
+    if topic_id not in seen:
+        tombstones.append(topic_id)
     data["telegram_dead_topic_ids"] = tombstones[-DEAD_TOPIC_TOMBSTONE_LIMIT:]
     # Space-mode delivery uses a worker-shaped view of its owning space.
     # Clear every persisted alias now so neither side can seed the dead id
