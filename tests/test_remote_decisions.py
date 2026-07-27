@@ -914,6 +914,66 @@ def test_guarded_decision_toggle_rebind_does_not_write_rebound_owner(
     assert live is not None and live["message_id"] == "102"
 
 
+def test_guarded_callback_failure_rebind_retires_exact_notice_once(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(_store(), state_path)
+    telegram = RebindingTelegram(state_path, on="never")
+    tendwire = FakeTendwire(
+        {"ok": False, "status": "answer_failed"}
+    )
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = _guarded_runtime(current, telegram, tendwire)
+        source_sync._deliver_decisions(
+            current, _pending(), runtime, chat_id="-100"
+        )
+        record = decisions.active_decision(current, "77")
+        assert record is not None
+        telegram.on = "send"
+        result = decisions.handle_callback(
+            current,
+            callback_data=_button(record, "2"),
+            topic_id="77",
+            chat_id="-100",
+            request_id=_request_id(update_id=108, message_id=9008),
+            telegram=runtime.telegram,
+            tendwire=runtime.tendwire,
+            provider_executor=source_sync._decision_provider_executor(
+                current, runtime
+            ),
+        )
+        artifacts = current["decisions"]["accepted_artifacts"]
+        assert len(artifacts) == 1
+        assert [
+            (
+                row["kind"],
+                row["topic_id"],
+                row["message_id"],
+            )
+            for row in artifacts.values()
+        ] == [("decision_notice", "77", "102")]
+
+        reconciled = source_sync._deliver_decisions(
+            current, _pending(), runtime, chat_id="-100"
+        )
+
+    assert result["status"] == "answer_failed"
+    assert reconciled["artifact_reconciled"] == 1
+    assert telegram.deleted == [
+        {"chat_id": "-100", "message_id": "102"}
+    ]
+    assert sum(
+        "Could not answer that prompt" in row["html"]
+        for row in telegram.sent
+    ) == 1
+    assert current["decisions"]["accepted_artifacts"] == {}
+    assert current.get("decisions", {}).get("failure_notices", []) == []
+
+
 def test_guarded_decision_submit_rebind_tracks_acceptance_once(
     tmp_path, monkeypatch
 ) -> None:

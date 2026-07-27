@@ -497,21 +497,37 @@ def delete_turn_delivery_message(
 TOPIC_ICON_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
 
 
-def topic_icon_catalog(store: dict[str, Any], telegram_client: TelegramClient | None = None) -> dict[str, str]:
+def topic_icon_catalog(
+    store: dict[str, Any],
+    telegram_client: TelegramClient | None = None,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[str, str]:
     """Return the emoji -> custom_emoji_id map of the forum topic icon set."""
     telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
     icons = telegram.get("forum_topic_icons") if isinstance(telegram, dict) else {}
     by_emoji = icons.get("by_emoji") if isinstance(icons, dict) and isinstance(icons.get("by_emoji"), dict) else {}
     if not by_emoji:
         # Populate the cache through the existing fetch path.
-        topic_icon_id(store, "\u2705", telegram_client)
+        topic_icon_id(
+            store,
+            "\u2705",
+            telegram_client,
+            checkpoint=checkpoint,
+        )
         telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
         icons = telegram.get("forum_topic_icons") if isinstance(telegram, dict) else {}
         by_emoji = icons.get("by_emoji") if isinstance(icons, dict) and isinstance(icons.get("by_emoji"), dict) else {}
     return {str(k): str(v) for k, v in by_emoji.items() if v}
 
 
-def topic_icon_id(store: dict[str, Any], emoji: str, telegram_client: TelegramClient | None = None) -> str:
+def topic_icon_id(
+    store: dict[str, Any],
+    emoji: str,
+    telegram_client: TelegramClient | None = None,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> str:
     telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
     icons = telegram.setdefault("forum_topic_icons", {}) if isinstance(telegram, dict) else {}
     if not isinstance(icons, dict):
@@ -528,8 +544,22 @@ def topic_icon_id(store: dict[str, Any], emoji: str, telegram_client: TelegramCl
     try:
         response = telegram_client.api("getForumTopicIconStickers", {})
     except Exception as exc:  # noqa: BLE001
+        # A guarded read reloads the whole store, so every nested reference
+        # captured before the provider call is stale. Resolve the cache again
+        # before applying this provider fact.
+        telegram = (
+            store.get("telegram")
+            if isinstance(store.get("telegram"), dict)
+            else {}
+        )
+        icons = telegram.setdefault("forum_topic_icons", {})
+        if not isinstance(icons, dict):
+            icons = {}
+            telegram["forum_topic_icons"] = icons
         icons["last_error"] = sanitize_text(str(exc), 300)
         icons["last_error_at"] = _utc_now()
+        if checkpoint is not None:
+            checkpoint()
         return ""
     fresh: dict[str, str] = {}
     for sticker in response.get("result") or []:
@@ -539,10 +569,23 @@ def topic_icon_id(store: dict[str, Any], emoji: str, telegram_client: TelegramCl
         custom_emoji_id = str(sticker.get("custom_emoji_id") or "").strip()
         if sticker_emoji and custom_emoji_id and sticker_emoji not in fresh:
             fresh[sticker_emoji] = custom_emoji_id
+    # The guarded read above reloaded state and invalidated the cache mapping
+    # used for the lookup. Re-resolve it before recording the catalogue.
+    telegram = (
+        store.get("telegram")
+        if isinstance(store.get("telegram"), dict)
+        else {}
+    )
+    icons = telegram.setdefault("forum_topic_icons", {})
+    if not isinstance(icons, dict):
+        icons = {}
+        telegram["forum_topic_icons"] = icons
     icons["by_emoji"] = fresh
     icons["fetched_at"] = _utc_now()
     icons.pop("last_error", None)
     icons.pop("last_error_at", None)
+    if checkpoint is not None:
+        checkpoint()
     return str(fresh.get(emoji) or "")
 
 

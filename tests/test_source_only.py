@@ -3516,6 +3516,133 @@ def _notification_race_store(*, retired=False):
     return store
 
 
+def _ten_notification_entries(*, retired: bool = False):
+    store = _notification_race_store(retired=retired)
+    store["panes"] = {}
+    for index in range(10):
+        key = f"worker:notification-{index}"
+        entry = {
+            "source": "tendwire",
+            "entry_type": "worker",
+            "tendwire_worker_id": f"worker-notification-{index}",
+            "worker_id": f"worker-notification-{index}",
+            "tendwire_space_id": "space-1",
+            "space_id": "space-1",
+            "tendwire_fingerprint": f"fp-notification-{index}",
+            "topic_id": str(770 + index),
+            "topic_name": f"Notification {index}",
+            "status": "retired" if retired else "idle",
+            "tendwire_raw_status": "idle",
+        }
+        if retired:
+            entry.update(
+                {
+                    "routing_retired": True,
+                    "retired_topic_notice_pending": True,
+                }
+            )
+        store["panes"][key] = entry
+    return store
+
+
+def _notification_save_counter(
+    tmp_path, monkeypatch, store, delivery
+) -> int:
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(store, state_path)
+    real_save_state = state.save_state
+    save_calls = 0
+
+    def counted_save(current, path=None):
+        nonlocal save_calls
+        save_calls += 1
+        return real_save_state(current, path=path)
+
+    monkeypatch.setattr(state, "save_state", counted_save)
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                FakeTelegram(),
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(
+                    current, state_path
+                ),
+            ),
+        )
+        delivery(current, runtime)
+    return save_calls
+
+
+def test_ten_topic_pin_deliveries_use_two_durability_barriers_each(
+    tmp_path, monkeypatch
+):
+    def deliver(current, runtime):
+        for key in list(current["panes"]):
+            entry = current["panes"][key]
+            assert source_sync._sync_topic_pinned(
+                current, entry, runtime, chat_id="-100"
+            )
+
+    assert (
+        _notification_save_counter(
+            tmp_path,
+            monkeypatch,
+            _ten_notification_entries(),
+            deliver,
+        )
+        == 20
+    )
+
+
+def test_ten_retired_notices_use_two_durability_barriers_each(
+    tmp_path, monkeypatch
+):
+    def deliver(current, runtime):
+        assert (
+            source_sync._sync_retired_worker_topics(
+                current, runtime, chat_id="-100"
+            )
+            == 10
+        )
+
+    assert (
+        _notification_save_counter(
+            tmp_path,
+            monkeypatch,
+            _ten_notification_entries(retired=True),
+            deliver,
+        )
+        == 20
+    )
+
+
+def test_ten_global_status_deliveries_use_two_durability_barriers_each(
+    tmp_path, monkeypatch
+):
+    def deliver(current, runtime):
+        for _index in range(10):
+            assert source_sync._sync_pinned(
+                current, runtime, chat_id="-100"
+            )
+            telegram = current.setdefault("telegram", {})
+            telegram.pop("pinned_status_message_id", None)
+            telegram.pop("pinned_status_hash", None)
+
+    assert (
+        _notification_save_counter(
+            tmp_path,
+            monkeypatch,
+            _ten_notification_entries(),
+            deliver,
+        )
+        == 20
+    )
+
+
 def test_topic_pin_rebind_checkpoints_and_retires_accepted_card(
     tmp_path, monkeypatch
 ):

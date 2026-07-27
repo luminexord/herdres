@@ -28,7 +28,7 @@ from herdres_connector.source_sync import (
     _sync_sources,
     sync_once,
 )
-from herdres_connector.telegram_delivery import drain_outbox
+from herdres_connector.telegram_delivery import drain_outbox, topic_icon_id
 
 from test_source_only import (
     REQUEST_ID,
@@ -341,6 +341,55 @@ def test_guarded_outbox_checkpoints_before_ack_and_replay_only_acks(
             "delivered_identities"
         ]
     ) == 1
+
+
+def test_guarded_topic_icon_catalog_persists_and_is_reused(
+    tmp_path, monkeypatch
+) -> None:
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    state.save_state(_store(), statepath)
+    telegram = FakeTelegram()
+
+    with state.state_lock(statepath):
+        current = state.load_state(statepath)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                telegram,
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(
+                    current, statepath
+                ),
+            ),
+        )
+        first = topic_icon_id(
+            current,
+            "✅",
+            runtime.telegram,
+            checkpoint=runtime.checkpoint,
+        )
+        assert first == "icon-idle"
+        assert current["telegram"]["forum_topic_icons"]["by_emoji"][
+            "✅"
+        ] == "icon-idle"
+        assert state.load_state(statepath)["telegram"][
+            "forum_topic_icons"
+        ]["by_emoji"]["✅"] == "icon-idle"
+        second = topic_icon_id(
+            current,
+            "✅",
+            runtime.telegram,
+            checkpoint=runtime.checkpoint,
+        )
+
+    assert second == "icon-idle"
+    assert [
+        method
+        for method, _payload, _token in telegram.api_calls
+        if method == "getForumTopicIconStickers"
+    ] == ["getForumTopicIconStickers"]
 
 
 def test_executor_read_rejects_mutator_and_with_token_stays_guarded() -> None:

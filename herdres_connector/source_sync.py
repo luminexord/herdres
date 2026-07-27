@@ -1567,14 +1567,19 @@ def _notification_kind_pending(
 
 def _checkpoint_accepted_notification(
     store: dict[str, Any],
-    runtime: SyncRuntime,
     operation: _OfflockEntryOperation,
     result: Any,
     *,
     kind: str,
     bot_kind: str = MANAGER_BOT_KIND,
 ) -> str:
-    """Record an accepted exact message before owner disposition is known."""
+    """Record an accepted exact message before owner disposition is known.
+
+    This mutates the in-memory receipt journal only.  An APPLY path coalesces
+    its durability with the next guarded provider operation (or its existing
+    terminal checkpoint); a path with no following barrier must call
+    ``_checkpoint_unbarriered_notification`` before returning.
+    """
 
     if not isinstance(result, Mapping) or result.get("ok") is not True:
         return ""
@@ -1603,9 +1608,22 @@ def _checkpoint_accepted_notification(
             "provenance": _operation_provenance(operation),
         },
     )
-    if runtime.checkpoint is not None:
-        runtime.checkpoint()
     return receipt_id
+
+
+def _checkpoint_unbarriered_notification(
+    runtime: SyncRuntime,
+    receipt_id: str,
+    disposition: str,
+) -> None:
+    """Persist an accepted receipt when no APPLY barrier will follow."""
+
+    if (
+        receipt_id
+        and disposition != _OFFLOCK_APPLY
+        and runtime.checkpoint is not None
+    ):
+        runtime.checkpoint()
 
 
 def _complete_accepted_notification(
@@ -2940,7 +2958,11 @@ _RESERVED_STATUS_EMOJIS = frozenset({"\u2753", "\u203c\ufe0f", "\u2705", "\u26a1
 
 def _identity_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime) -> tuple[str, str]:
     """Deterministic per-topic identity icon from the allowed forum icon set."""
-    catalog = topic_icon_catalog(store, runtime.telegram)
+    catalog = topic_icon_catalog(
+        store,
+        runtime.telegram,
+        checkpoint=runtime.checkpoint,
+    )
     choices = sorted(emoji for emoji in catalog if emoji not in _RESERVED_STATUS_EMOJIS)
     if not choices:
         return "", ""
@@ -2966,7 +2988,12 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
     current = str(entry.get("last_topic_icon") or "")
     if status in _ALERT_STATUSES:
         emoji = status_emoji(status)
-        emoji_id = topic_icon_id(store, emoji, runtime.telegram)
+        emoji_id = topic_icon_id(
+            store,
+            emoji,
+            runtime.telegram,
+            checkpoint=runtime.checkpoint,
+        )
     else:
         if current and current not in _RESERVED_STATUS_EMOJIS and entry.get("last_topic_icon_id"):
             return False
@@ -3200,7 +3227,6 @@ def _sync_topic_pinned(
             nonlocal accepted_receipt_id
             accepted_receipt_id = _checkpoint_accepted_notification(
                 store,
-                runtime,
                 operation,
                 result,
                 kind="topic_pinned",
@@ -3219,6 +3245,11 @@ def _sync_topic_pinned(
             acceptance_checkpoint=checkpoint_topic_pin,
         )
         sent, send_resolution = execution.result, execution.resolution
+        _checkpoint_unbarriered_notification(
+            runtime,
+            accepted_receipt_id,
+            send_resolution.disposition,
+        )
         if not sent.get("ok") and _topic_missing(sent.get("error")):
             _repair_provider_gone_topic(
                 store,
@@ -3458,7 +3489,12 @@ def _sync_retired_worker_topics(
             entry.pop(field, None)
 
     changed = 0
-    for entry in state.source_worker_entries(store).values():
+    # Guarded provider calls reload the store, so never carry a nested entry
+    # reference from one retired worker to the next.
+    for entry_key in list(state.source_worker_entries(store)):
+        entry = state.source_worker_entries(store).get(entry_key)
+        if entry is None:
+            continue
         if not state.entry_is_retired(entry):
             continue
         topic_id = str(entry.get("topic_id") or "")
@@ -3495,7 +3531,6 @@ def _sync_retired_worker_topics(
                 accepted_receipt_id = (
                     _checkpoint_accepted_notification(
                         store,
-                        runtime,
                         operation,
                         result,
                         kind="retired_topic_notice",
@@ -3522,6 +3557,11 @@ def _sync_retired_worker_topics(
                 acceptance_checkpoint=checkpoint_retired_notice,
             )
             sent, notice_resolution = execution.result, execution.resolution
+            _checkpoint_unbarriered_notification(
+                runtime,
+                accepted_receipt_id,
+                notice_resolution.disposition,
+            )
             if _topic_missing(sent.get("error")):
                 _repair_provider_gone_topic(
                     store,
@@ -3817,6 +3857,9 @@ def _sync_sources(
             )
             creates_issued += int(topic_created)
             counts["created"] += int(topic_created or topic_needed)
+            entry = state.source_worker_entries(store).get(_key)
+            if entry is None:
+                continue
             counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["panes"] += 1
 
@@ -3868,6 +3911,9 @@ def _sync_sources(
             store, space, entry, runtime, chat_id=chat_id, can_create=creates_issued < create_cap
         )
         creates_issued += int(topic_created)
+        entry = state.source_space_entries(store).get(_key)
+        if entry is None:
+            continue
         counts["created"] += int(created or topic_created or topic_needed)
         counts["updated"] += int(not created and before != entry)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
@@ -3978,12 +4024,22 @@ def _cleanup_topics(
     snapshot_worker_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     result = {"deleted": 0, "failed": 0, "pruned": 0, "changed": False}
+
+    def pop_worker(key: str) -> None:
+        panes = store.get("panes")
+        if isinstance(panes, dict):
+            panes.pop(key, None)
+
+    def pop_space(key: str) -> None:
+        spaces = store.get("spaces")
+        if isinstance(spaces, dict):
+            spaces.pop(key, None)
+
     visible_space_topics = {
         str(entry.get("topic_id"))
         for entry in state.source_space_entries(store).values()
         if entry.get("topic_id")
     }
-    panes = store.get("panes") if isinstance(store.get("panes"), dict) else {}
     deleted_topic_ids: set[str] = set()
     # Bound real topic-delete calls per pass so a first source sync (which can reclassify many legacy
     # per-worker topics at once) amortizes the deletes over ticks instead of one burst under the lock.
@@ -4045,7 +4101,7 @@ def _cleanup_topics(
                 result["changed"] = True
                 continue
             if not topic_id:
-                panes.pop(key, None)  # finished, gone, no topic: dead cruft
+                pop_worker(key)  # finished, gone, no topic: dead cruft
                 result["pruned"] += 1
                 result["changed"] = True
                 continue
@@ -4097,7 +4153,7 @@ def _cleanup_topics(
                 current_key, _kind = _entry_operation_key(
                     store, delete_resolution.entry
                 )
-                panes.pop(current_key, None)
+                pop_worker(current_key)
 
     def finalize_deleted_space_worker_aliases(
         worker_keys: frozenset[str], reason: str
@@ -4107,7 +4163,7 @@ def _cleanup_topics(
             if worker_entry is None:
                 continue
             if _should_delete_done_council_topic(worker_entry):
-                panes.pop(worker_key, None)
+                pop_worker(worker_key)
             else:
                 worker_entry["deleted_topic_reason"] = reason
 
@@ -4165,7 +4221,7 @@ def _cleanup_topics(
                         store, current_entry
                     )
                     if done_council_topic:
-                        panes.pop(current_key, None)
+                        pop_worker(current_key)
                     else:
                         current_entry["deleted_topic_reason"] = reason
                 continue
@@ -4190,10 +4246,9 @@ def _cleanup_topics(
             current_entry = delete_resolution.entry
             current_key, _kind = _entry_operation_key(store, current_entry)
             if done_council_topic:
-                panes.pop(current_key, None)
+                pop_worker(current_key)
             else:
                 current_entry["deleted_topic_reason"] = reason
-    spaces = store.get("spaces") if isinstance(store.get("spaces"), dict) else {}
     for key, entry in list(state.source_space_entries(store).items()):
         if not entry.get("stale_space_topic"):
             continue
@@ -4244,7 +4299,7 @@ def _cleanup_topics(
                         current_key, _kind = _entry_operation_key(
                             store, delete_resolution.entry
                         )
-                        spaces.pop(current_key, None)
+                        pop_space(current_key)
                         result["pruned"] += 1
                     result["changed"] = True
                     continue
@@ -4276,7 +4331,7 @@ def _cleanup_topics(
                 current_key, _kind = _entry_operation_key(
                     store, current_entry
                 )
-                spaces.pop(current_key, None)
+                pop_space(current_key)
                 result["pruned"] += 1
         result["changed"] = True
     return result
@@ -10175,7 +10230,6 @@ def _sync_pinned(
             nonlocal accepted_receipt_id
             accepted_receipt_id = _checkpoint_accepted_notification(
                 store,
-                runtime,
                 captured,
                 result,
                 kind="global_pinned",
@@ -10226,6 +10280,11 @@ def _sync_pinned(
                 acceptance_checkpoint=checkpoint_global_pin,
             )
             result, resolution = execution.result, execution.resolution
+        _checkpoint_unbarriered_notification(
+            runtime,
+            accepted_receipt_id,
+            resolution.disposition,
+        )
         return result, resolution
 
     sent_new = False
