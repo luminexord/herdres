@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import copy
+import ast
 
 import json
 import hashlib
@@ -40,6 +41,1287 @@ REQUEST_ID_2 = derive_telegram_request_id(
     chat_id=-100,
     message_id=9002,
 )
+
+
+def _offlock_protocol_violations(
+    source_text: str,
+    delivery_text: str,
+    decisions_text: str | None = None,
+    tendwire_text: str | None = None,
+    rich_text: str | None = None,
+) -> list[tuple]:
+    """Return structural executor escapes in every capability consumer."""
+
+    source_path = Path(source_sync.__file__)
+    decisions_text = (
+        source_path.with_name("decisions.py").read_text(encoding="utf-8")
+        if decisions_text is None
+        else decisions_text
+    )
+    tendwire_text = (
+        source_path.with_name("tendwire_client.py").read_text(
+            encoding="utf-8"
+        )
+        if tendwire_text is None
+        else tendwire_text
+    )
+    rich_text = (
+        source_path.with_name("rich_delivery.py").read_text(
+            encoding="utf-8"
+        )
+        if rich_text is None
+        else rich_text
+    )
+    read_only_by_provider = source_sync._READ_ONLY_PROVIDER_METHODS
+    read_only = set().union(*read_only_by_provider.values())
+    capabilities = set(source_sync._DIRECT_PROVIDER_CAPABILITIES)
+    capabilities.update(source_sync._ADAPTER_PROVIDER_CAPABILITIES)
+    capability_methods = {
+        capability.split(".", 1)[1] for capability in capabilities
+    }
+    capability_methods.update(
+        {
+        "delete_turn_delivery_message",
+        "edit_feed_item",
+        "edit_turn_delivery_part",
+        "send_feed_item",
+        "send_turn_delivery_part",
+        }
+    )
+    violations: list[tuple] = []
+    reasons: list[str] = []
+
+    def call_name(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return ""
+
+    def root_name(node):
+        current = node
+        while isinstance(current, (ast.Attribute, ast.Subscript)):
+            current = current.value
+        return current.id if isinstance(current, ast.Name) else ""
+
+    def provider_receiver(node):
+        if isinstance(node, ast.Name):
+            return node.id in {"provider", "guarded"}
+        if isinstance(node, ast.Attribute):
+            return (
+                node.attr in {"telegram", "tendwire"}
+                or provider_receiver(node.value)
+            )
+        return False
+
+    def literal_keyword(node, name):
+        value = next(
+            (
+                keyword.value
+                for keyword in node.keywords
+                if keyword.arg == name
+            ),
+            None,
+        )
+        return value.value if isinstance(value, ast.Constant) else None
+
+    source_tree = ast.parse(source_text)
+    parents = {
+        child: parent
+        for parent in ast.walk(source_tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    def source_function_name(node):
+        current = node
+        while current in parents:
+            current = parents[current]
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return current.name
+        return ""
+
+    unsafe_aliases: dict[str, tuple[int, str]] = {}
+    for node in ast.walk(source_tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        targets = (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        )
+        unsafe_name = ""
+        if (
+            isinstance(value, ast.Attribute)
+            and provider_receiver(value.value)
+            and value.attr not in read_only
+        ):
+            unsafe_name = value.attr
+        elif (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "getattr"
+            and len(value.args) >= 2
+            and isinstance(value.args[1], ast.Constant)
+            and provider_receiver(value.args[0])
+            and value.args[1].value not in read_only
+        ):
+            unsafe_name = str(value.args[1].value)
+        if not unsafe_name:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                unsafe_aliases[target.id] = (
+                    node.lineno,
+                    unsafe_name,
+                )
+
+    removed_executor_names = {
+        "_invoke_offlock",
+        "_invoke_provider_mutation",
+        "_offlock_client_internals",
+        "_OFFLOCK_EXECUTOR_TOKEN",
+        "_require_executor_token",
+    }
+    executor_allowed = {
+        "describe": {"__getattr__"},
+        "store": {"__getattr__"},
+        "provider_kind": {"__getattr__"},
+        "with_token": {"__getattr__"},
+        "read": {"__getattr__", "call", "checked_api"},
+        "mutation": {
+            "__getattr__",
+            "_execute_entry_operation",
+            "_execute_exact_provider_operation",
+        },
+        "direct": {
+            "_execute_entry_operation",
+            "_execute_exact_provider_operation",
+        },
+    }
+    executor_aliases: set[str] = set()
+    executor_object_aliases: set[str] = set()
+    sensitive_aliases: set[str] = set()
+    sensitive_names = removed_executor_names | {
+        "_execute_entry_operation",
+        "_execute_exact_provider_operation",
+        "_exact_provider_client",
+        "_provider_mutation",
+    }
+    alias_changed = True
+    while alias_changed:
+        pass_changed = False
+        for node in ast.walk(source_tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            target_names = {
+                target.id
+                for target in targets
+                if isinstance(target, ast.Name)
+            }
+            before = (
+                len(executor_aliases),
+                len(executor_object_aliases),
+                len(sensitive_aliases),
+            )
+            if (
+                isinstance(value, ast.Name)
+                and value.id == "_OFFLOCK_EXECUTOR"
+            ):
+                executor_object_aliases.update(target_names)
+            if (
+                isinstance(value, ast.Attribute)
+                and (
+                    (
+                        isinstance(value.value, ast.Name)
+                        and value.value.id == "_OFFLOCK_EXECUTOR"
+                    )
+                    or (
+                        isinstance(value.value, ast.Name)
+                        and value.value.id in executor_object_aliases
+                    )
+                )
+            ):
+                executor_aliases.update(target_names)
+            if (
+                isinstance(value, ast.Name)
+                and (
+                    value.id in sensitive_names
+                    or value.id in sensitive_aliases
+                    or value.id == "getattr"
+                )
+            ):
+                sensitive_aliases.update(target_names)
+            if (
+                isinstance(value, ast.Attribute)
+                and value.attr in {
+                    "__getattribute__",
+                    "_execute_entry",
+                    "_execute_exact",
+                }
+            ):
+                sensitive_aliases.update(target_names)
+            if before != (
+                len(executor_aliases),
+                len(executor_object_aliases),
+                len(sensitive_aliases),
+            ):
+                pass_changed = True
+        alias_changed = pass_changed
+
+    for node in ast.walk(source_tree):
+        owner = source_function_name(node)
+        if isinstance(node, ast.Name) and node.id in removed_executor_names:
+            violations.append(
+                ("removed_executor_escape", node.lineno, owner, node.id)
+            )
+        if isinstance(node, ast.Attribute) and (
+            node.attr == "_client"
+            or node.attr.startswith("_OfflockClient__provider")
+        ):
+            if owner != "internals":
+                violations.append(
+                    ("raw_client_attribute", node.lineno, owner, node.attr)
+                )
+        if not isinstance(node, ast.Call):
+            continue
+        name = call_name(node.func)
+        if name in removed_executor_names | {
+            "_execute_entry",
+            "_execute_exact",
+        }:
+            violations.append(
+                ("internal_executor_escape", node.lineno, owner, name)
+            )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in executor_aliases
+        ):
+            violations.append(
+                ("executor_alias_escape", node.lineno, owner, node.func.id)
+            )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in sensitive_aliases
+        ):
+            violations.append(
+                (
+                    "sensitive_alias_escape",
+                    node.lineno,
+                    owner,
+                    node.func.id,
+                )
+            )
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in executor_object_aliases
+        ):
+            violations.append(
+                ("executor_object_alias_escape", node.lineno, owner, name)
+            )
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "_OFFLOCK_EXECUTOR"
+            and owner not in executor_allowed.get(name, set())
+        ):
+            violations.append(
+                ("internal_executor_escape", node.lineno, owner, name)
+            )
+        if (
+            name == "__getattribute__"
+            and len(node.args) >= 2
+            and (
+                provider_receiver(node.args[0])
+                or (
+                    isinstance(node.args[1], ast.Constant)
+                    and str(node.args[1].value).startswith(
+                        "_OfflockClient__provider"
+                    )
+                )
+            )
+            and (
+                not isinstance(node.args[1], ast.Constant)
+                or str(node.args[1].value).startswith(
+                    "_OfflockClient__provider"
+                )
+            )
+            and owner != "internals"
+        ):
+            violations.append(
+                ("reflected_raw_provider", node.lineno, owner)
+            )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in unsafe_aliases
+            and owner != "invoke_provider_mutation"
+        ):
+            violations.append(
+                (
+                    "raw_mutation_alias",
+                    node.lineno,
+                    owner,
+                    node.func.id,
+                    unsafe_aliases[node.func.id],
+                )
+            )
+        if name == "_execute_entry_operation":
+            declared = (
+                len(node.args) == 4
+                and (
+                    (
+                        isinstance(node.args[3], ast.Call)
+                        and isinstance(node.args[3].func, ast.Name)
+                        and node.args[3].func.id == "_provider_mutation"
+                    )
+                    or (
+                        owner == "_execute_decision_provider_operation"
+                        and isinstance(node.args[3], ast.Name)
+                        and node.args[3].id == "mutation"
+                    )
+                )
+            )
+            if not declared:
+                violations.append(("entry_without_capability", node.lineno))
+        if name == "_execute_exact_provider_operation":
+            mutation_value = next(
+                (
+                    keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg == "mutation"
+                ),
+                None,
+            )
+            declared = (
+                isinstance(mutation_value, ast.Call)
+                and isinstance(mutation_value.func, ast.Name)
+                and mutation_value.func.id == "_provider_mutation"
+            ) or (
+                owner == "_execute_decision_provider_operation"
+                and isinstance(mutation_value, ast.Name)
+                and mutation_value.id == "mutation"
+            )
+            if not declared:
+                violations.append(("exact_without_capability", node.lineno))
+        if name == "_provider_mutation":
+            capability = (
+                node.args[0].value
+                if node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                else None
+            )
+            reason = literal_keyword(node, "reason")
+            if capability is not None:
+                if not reason or capability not in reason:
+                    violations.append(
+                        ("reason_does_not_name_capability", node.lineno)
+                    )
+                else:
+                    reasons.append(reason)
+            elif owner not in {
+                "_execute_topic_cleanup_targets",
+                "_execute_decision_provider_operation",
+                "__getattr__",
+            }:
+                violations.append(("dynamic_capability", node.lineno))
+        if name == "_exact_provider_client":
+            reason = literal_keyword(node, "reason")
+            if not reason or not any(
+                provider in reason for provider in ("Telegram", "Tendwire")
+            ):
+                violations.append(("exact_client_reason", node.lineno))
+            else:
+                reasons.append(reason)
+        if isinstance(node.func, ast.Attribute):
+            if (
+                provider_receiver(node.func.value)
+                and name not in read_only
+                and owner != "invoke_provider_mutation"
+            ):
+                violations.append(
+                    ("raw_mutation", node.lineno, owner, name)
+                )
+        if (
+            name == "getattr"
+            and len(node.args) >= 2
+            and provider_receiver(node.args[0])
+            and owner not in {
+                "__getattr__",
+                "describe",
+                "read",
+                "invoke_provider_mutation",
+            }
+        ):
+            violations.append(
+                (
+                    (
+                        "computed_provider_getattr"
+                        if not isinstance(node.args[1], ast.Constant)
+                        else "raw_getattr_mutation"
+                    ),
+                    node.lineno,
+                    owner,
+                    (
+                        node.args[1].value
+                        if isinstance(node.args[1], ast.Constant)
+                        else "<computed>"
+                    ),
+                )
+            )
+
+    dispatcher = next(
+        node
+        for node in ast.walk(source_tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "invoke_provider_mutation"
+    )
+    for node in ast.walk(dispatcher):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "provider"
+            and node.func.attr not in {"send_voice", "with_token"}
+        ):
+            violations.append(
+                ("dispatcher_extra_mutation", node.lineno, node.func.attr)
+            )
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {"entry", "store"}
+        ):
+            violations.append(("dispatcher_state_write", node.lineno))
+
+    # telegram_delivery consumes exact-ID capability proxies. Every mutation,
+    # including lease acquisition, is enumerated with a unique written reason.
+    exact_reasons = {
+        ("connector_poll", 0): (
+            "tendwire.connector_poll: acquire attention outbox leases"
+        ),
+        ("connector_ack", 0): (
+            "tendwire.connector_ack: acknowledge duplicate leased attention"
+        ),
+        ("send_message", 0): (
+            "telegram.send_message: deliver leased attention to general thread"
+        ),
+        ("send_message", 1): (
+            "telegram.send_message: deliver leased attention to root fallback"
+        ),
+        ("connector_ack", 1): (
+            "tendwire.connector_ack: acknowledge delivered leased attention"
+        ),
+        ("connector_fail", 0): (
+            "tendwire.connector_fail: fail exact leased attention"
+        ),
+    }
+    delivery_tree = ast.parse(delivery_text)
+    delivery_parents = {
+        child: parent
+        for parent in ast.walk(delivery_tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def delivery_function_name(node):
+        current = node
+        while current in delivery_parents:
+            current = delivery_parents[current]
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return current.name
+        return ""
+
+    delivery_aliases: set[str] = set()
+    for node in ast.walk(delivery_tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        targets = (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        )
+        if not (
+            isinstance(value, ast.Attribute)
+            and root_name(value.value) in {"telegram", "tendwire"}
+            and value.attr not in read_only
+            and value.attr not in {"get", "setdefault"}
+        ):
+            continue
+        delivery_aliases.update(
+            target.id for target in targets if isinstance(target, ast.Name)
+        )
+
+    occurrences: dict[str, int] = {}
+    observed_exact: set[tuple[str, int]] = set()
+    for node in ast.walk(delivery_tree):
+        if not isinstance(node, ast.Call):
+            continue
+        owner = delivery_function_name(node)
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in delivery_aliases
+        ):
+            violations.append(
+                ("delivery_raw_mutation_alias", node.lineno, owner)
+            )
+            continue
+        if (
+            call_name(node.func) == "getattr"
+            and node.args
+            and root_name(node.args[0]) in {"telegram", "tendwire"}
+        ):
+            violations.append(
+                ("delivery_raw_getattr", node.lineno, owner)
+            )
+            continue
+        if not (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr not in read_only
+            and node.func.attr not in {"get", "setdefault"}
+            and root_name(node.func.value) in {"telegram", "tendwire"}
+        ):
+            continue
+        if owner != "drain_outbox":
+            violations.append(
+                ("delivery_raw_mutation", node.lineno, owner, node.func.attr)
+            )
+            continue
+        name = node.func.attr
+        ordinal = occurrences.get(name, 0)
+        occurrences[name] = ordinal + 1
+        key = (name, ordinal)
+        observed_exact.add(key)
+        reason = exact_reasons.get(key)
+        capability = (
+            "tendwire." if name.startswith("connector_") else "telegram."
+        ) + name
+        if not reason or capability not in reason:
+            violations.append(
+                ("undeclared_exact_consumer", node.lineno, name, ordinal)
+            )
+        else:
+            reasons.append(reason)
+    if observed_exact != set(exact_reasons):
+        violations.append(
+            ("exact_consumer_inventory", observed_exact, set(exact_reasons))
+        )
+    decisions_tree = ast.parse(decisions_text)
+    decision_parents = {
+        child: parent
+        for parent in ast.walk(decisions_tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def decision_function_name(node):
+        current = node
+        while current in decision_parents:
+            current = decision_parents[current]
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return current.name
+        return ""
+
+    decision_aliases: set[str] = set()
+    for node in ast.walk(decisions_tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        targets = (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        )
+        if not (
+            isinstance(value, ast.Attribute)
+            and root_name(value.value) in {"telegram", "tendwire"}
+            and value.attr not in read_only
+        ):
+            continue
+        decision_aliases.update(
+            target.id for target in targets if isinstance(target, ast.Name)
+        )
+
+    direct_decision_capabilities = {
+        ("telegram", "send_message"),
+        ("telegram", "edit_message"),
+        ("telegram", "edit_message_reply_markup"),
+        ("telegram", "delete_message"),
+        ("tendwire", "command"),
+    }
+    for node in ast.walk(decisions_tree):
+        owner = decision_function_name(node)
+        if isinstance(node, ast.Attribute) and (
+            node.attr == "_client"
+            or node.attr.startswith("_OfflockClient__provider")
+        ):
+            violations.append(
+                ("decision_raw_client_attribute", node.lineno, owner)
+            )
+        if not isinstance(node, ast.Call):
+            continue
+        name = call_name(node.func)
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in decision_aliases
+        ):
+            violations.append(
+                ("decision_raw_mutation_alias", node.lineno, owner)
+            )
+        if (
+            name == "getattr"
+            and node.args
+            and root_name(node.args[0]) in {"telegram", "tendwire"}
+        ):
+            violations.append(
+                ("decision_raw_getattr", node.lineno, owner)
+            )
+        if (
+            isinstance(node.func, ast.Attribute)
+            and root_name(node.func.value) in {"telegram", "tendwire"}
+            and name not in read_only
+        ):
+            provider = root_name(node.func.value)
+            if (
+                owner != "_execute_direct"
+                or (provider, name) not in direct_decision_capabilities
+            ):
+                violations.append(
+                    ("decision_raw_mutation", node.lineno, owner, name)
+                )
+        if name == "_operation":
+            capability = (
+                node.args[0].value
+                if node.args
+                and isinstance(node.args[0], ast.Constant)
+                else None
+            )
+            reason = literal_keyword(node, "reason")
+            if (
+                not isinstance(capability, str)
+                or not isinstance(reason, str)
+                or capability not in reason
+            ):
+                violations.append(
+                    ("decision_capability_reason", node.lineno)
+                )
+            else:
+                reasons.append(reason)
+
+    direct_dispatcher = next(
+        node
+        for node in decisions_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_execute_direct"
+    )
+    for node in ast.walk(direct_dispatcher):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {"entry", "record", "store"}
+        ):
+            violations.append(
+                ("decision_dispatcher_state_write", node.lineno)
+            )
+
+    # Rich adapters execute inside the raw-provider closure.  Their provider
+    # result may describe a state transition, but the callback itself must not
+    # mutate the live telegram state that will be discarded by reload.
+    rich_tree = ast.parse(rich_text)
+    rich_parents = {
+        child: parent
+        for parent in ast.walk(rich_tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def rich_function_name(node):
+        current = node
+        while current in rich_parents:
+            current = rich_parents[current]
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return current.name
+        return ""
+
+    adapter_roots = {
+        "edit_feed_item",
+        "edit_rich_message",
+        "edit_turn_delivery_part",
+        "send_feed_item",
+        "send_rich_message",
+        "send_turn_delivery_part",
+    }
+    rich_functions = {
+        node.name: node
+        for node in rich_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    reachable = set(adapter_roots)
+    changed = True
+    while changed:
+        changed = False
+        for name in list(reachable):
+            function = rich_functions.get(name)
+            if function is None:
+                continue
+            for node in ast.walk(function):
+                called = (
+                    node.func.id
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    else ""
+                )
+                if called in rich_functions and called not in reachable:
+                    reachable.add(called)
+                    changed = True
+    rich_aliases: dict[str, set[str]] = {}
+    for owner in reachable:
+        function = rich_functions.get(owner)
+        if function is None:
+            continue
+        aliases = rich_aliases.setdefault(owner, set())
+        for node in ast.walk(function):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "rich_telegram_state"
+                and value.args
+                and root_name(value.args[0]) == "telegram"
+            ):
+                aliases.update(
+                    target.id
+                    for target in targets
+                    if isinstance(target, ast.Name)
+                )
+    for node in ast.walk(rich_tree):
+        owner = rich_function_name(node)
+        if owner not in reachable:
+            continue
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and (
+                root_name(node.value) == "telegram"
+                or root_name(node.value) in rich_aliases.get(owner, set())
+            )
+        ):
+            violations.append(
+                ("rich_adapter_state_write", node.lineno, owner)
+            )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and (
+                root_name(node.func.value) == "telegram"
+                or root_name(node.func.value)
+                in rich_aliases.get(owner, set())
+            )
+            and node.func.attr in {
+                "clear",
+                "pop",
+                "setdefault",
+                "update",
+            }
+        ):
+            violations.append(
+                ("rich_adapter_state_write", node.lineno, owner)
+            )
+
+    def public_methods(text, class_name):
+        tree = ast.parse(text)
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        return {
+            node.name
+            for node in cls.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not node.name.startswith("_")
+        }
+
+    telegram_known = set(read_only_by_provider["telegram"]) | {"api"} | {
+        capability.split(".", 1)[1]
+        for capability in capabilities
+        if capability.startswith("telegram.")
+    }
+    tendwire_known = set(read_only_by_provider["tendwire"]) | {
+        capability.split(".", 1)[1]
+        for capability in capabilities
+        if capability.startswith("tendwire.")
+    }
+    for provider, methods, known in (
+        (
+            "telegram",
+            public_methods(delivery_text, "TelegramClient"),
+            telegram_known,
+        ),
+        (
+            "tendwire",
+            public_methods(tendwire_text, "TendwireClient"),
+            tendwire_known,
+        ),
+    ):
+        for method in sorted(methods - known):
+            violations.append(
+                ("unclassified_provider_method", provider, method)
+            )
+
+    duplicates = sorted(
+        reason for reason in set(reasons) if reasons.count(reason) > 1
+    )
+    if duplicates:
+        violations.append(("duplicate_capability_reason", tuple(duplicates)))
+    return violations
+
+
+def test_source_sync_mutations_require_offlock_executor():
+    """The off-lock protocol is enforced structurally, not by convention."""
+
+    source_path = Path(source_sync.__file__)
+    delivery_path = source_path.with_name("telegram_delivery.py")
+    source_text = source_path.read_text(encoding="utf-8")
+    delivery_text = delivery_path.read_text(encoding="utf-8")
+    assert _offlock_protocol_violations(source_text, delivery_text) == []
+
+
+def test_offlock_enforcement_rejects_all_three_demonstrated_bypasses():
+    source_path = Path(source_sync.__file__)
+    delivery_path = source_path.with_name("telegram_delivery.py")
+    source_text = source_path.read_text(encoding="utf-8")
+    delivery_text = delivery_path.read_text(encoding="utf-8")
+
+    tendwire_escape = source_text.replace(
+        "topic_name = entry.get(\"topic_name\")",
+        (
+            "runtime.tendwire.command(\"unsafe\")\n"
+            "    entry[\"last_topic_error\"] = \"unsafe\"\n"
+            "    topic_name = entry.get(\"topic_name\")"
+        ),
+        1,
+    )
+    assert any(
+        violation[0] == "raw_mutation"
+        for violation in _offlock_protocol_violations(
+            tendwire_escape, delivery_text
+        )
+    )
+    aliased_escape = source_text.replace(
+        "topic_name = entry.get(\"topic_name\")",
+        (
+            "unsafe_command = runtime.tendwire.command\n"
+            "    unsafe_command(\"unsafe\")\n"
+            "    entry[\"last_topic_error\"] = \"unsafe\"\n"
+            "    topic_name = entry.get(\"topic_name\")"
+        ),
+        1,
+    )
+    assert any(
+        violation[0] == "raw_mutation_alias"
+        for violation in _offlock_protocol_violations(
+            aliased_escape, delivery_text
+        )
+    )
+    getattr_escape = source_text.replace(
+        "topic_name = entry.get(\"topic_name\")",
+        (
+            "getattr(runtime.tendwire, \"command\")(\"unsafe\")\n"
+            "    entry[\"last_topic_error\"] = \"unsafe\"\n"
+            "    topic_name = entry.get(\"topic_name\")"
+        ),
+        1,
+    )
+    assert any(
+        violation[0] == "raw_getattr_mutation"
+        for violation in _offlock_protocol_violations(
+            getattr_escape, delivery_text
+        )
+    )
+
+    callback_escape = source_text.replace(
+        "if mutation.capability == \"telegram.send_voice_batch\":",
+        (
+            "if mutation.capability == \"telegram.send_voice_batch\":\n"
+            "            entry = {}\n"
+            "            provider.send_message(\"-100\", \"unsafe\")\n"
+            "            entry[\"last_topic_error\"] = \"unsafe\""
+        ),
+        1,
+    )
+    callback_violations = _offlock_protocol_violations(
+        callback_escape, delivery_text
+    )
+    assert any(
+        violation[0] == "dispatcher_extra_mutation"
+        for violation in callback_violations
+    )
+    assert any(
+        violation[0] == "dispatcher_state_write"
+        for violation in callback_violations
+    )
+
+    class MutatingTendwire:
+        calls = 0
+
+        def command(self, *_args, **_kwargs):
+            self.calls += 1
+
+        command_json = command
+        call = command
+
+    tendwire = MutatingTendwire()
+    assert {
+        "tendwire.call",
+        "tendwire.command",
+        "tendwire.command_json",
+        "tendwire.connector_poll",
+        "tendwire.turn_final_poll",
+    } <= set(source_sync._DIRECT_PROVIDER_CAPABILITIES)
+    tendwire_reads = source_sync._READ_ONLY_PROVIDER_METHODS["tendwire"]
+    assert "connector_poll" not in tendwire_reads
+    assert "turn_final_poll" not in tendwire_reads
+    guarded_tendwire = source_sync._OfflockClient(
+        tendwire, _store(), "tendwire"
+    )
+    for method_name in ("command", "command_json", "call"):
+        with pytest.raises(
+            RuntimeError, match="requires _execute_entry_operation"
+        ):
+            getattr(guarded_tendwire, method_name)("unsafe")
+    assert tendwire.calls == 0
+
+    telegram = FakeTelegram()
+    guarded_telegram = source_sync._OfflockClient(
+        telegram, _store(), "telegram"
+    )
+    with pytest.raises(AttributeError, match="raw provider state"):
+        guarded_telegram._client.send_message("-100", "unsafe")
+    with pytest.raises(AttributeError, match="raw provider state"):
+        getattr(guarded_telegram, "_client").send_message("-100", "unsafe")
+    assert telegram.sent == []
+
+
+def test_offlock_enforcement_fails_closed_for_unknown_and_lease_methods():
+    source_path = Path(source_sync.__file__)
+    delivery_path = source_path.with_name("telegram_delivery.py")
+    tendwire_path = source_path.with_name("tendwire_client.py")
+    source_text = source_path.read_text(encoding="utf-8")
+    delivery_text = delivery_path.read_text(encoding="utf-8")
+    tendwire_text = tendwire_path.read_text(encoding="utf-8")
+
+    invented_telegram = delivery_text.replace(
+        "class TelegramClient:",
+        (
+            "class TelegramClient:\n"
+            "    def ban_user(self, user_id):\n"
+            "        return {\"ok\": True, \"user_id\": user_id}\n"
+        ),
+        1,
+    )
+    invented_tendwire = tendwire_text.replace(
+        "class TendwireClient:",
+        (
+            "class TendwireClient:\n"
+            "    def mutate_future_state(self):\n"
+            "        return {\"ok\": True}\n"
+        ),
+        1,
+    )
+    assert (
+        "unclassified_provider_method",
+        "telegram",
+        "ban_user",
+    ) in _offlock_protocol_violations(
+        source_text, invented_telegram, tendwire_text=tendwire_text
+    )
+    assert (
+        "unclassified_provider_method",
+        "tendwire",
+        "mutate_future_state",
+    ) in _offlock_protocol_violations(
+        source_text, delivery_text, tendwire_text=invented_tendwire
+    )
+
+    for method in ("connector_poll", "turn_final_poll"):
+        lease_escape = source_text.replace(
+            "topic_name = entry.get(\"topic_name\")",
+            (
+                f"runtime.tendwire.{method}()\n"
+                "    entry[\"last_topic_error\"] = \"unsafe\"\n"
+                "    topic_name = entry.get(\"topic_name\")"
+            ),
+            1,
+        )
+        lease_violations = _offlock_protocol_violations(
+            lease_escape, delivery_text
+        )
+        assert any(
+            violation[0] == "raw_mutation"
+            and violation[2:] == ("_ensure_topic", method)
+            for violation in lease_violations
+        )
+
+    class FutureProvider:
+        calls = 0
+
+        def ban_user(self):
+            self.calls += 1
+            return {"ok": True}
+
+    provider = FutureProvider()
+    guarded = source_sync._OfflockClient(
+        provider, _store(), "telegram"
+    )
+    with pytest.raises(
+        RuntimeError, match="requires _execute_entry_operation"
+    ):
+        guarded.ban_user()
+    assert provider.calls == 0
+
+
+def test_offlock_internal_entrypoints_reject_bypass_and_capability_replay():
+    source_path = Path(source_sync.__file__)
+    delivery_path = source_path.with_name("telegram_delivery.py")
+    source_text = source_path.read_text(encoding="utf-8")
+    delivery_text = delivery_path.read_text(encoding="utf-8")
+    for injected, expected in (
+        (
+            "runtime.telegram._execute_entry(None, None)",
+            "internal_executor_escape",
+        ),
+        (
+            "source_sync._invoke_offlock(runtime.telegram, lambda p: None)",
+            "internal_executor_escape",
+        ),
+        (
+            (
+                "object.__getattribute__(runtime.telegram, "
+                "\"_OfflockClient__provider\").send_message("
+                "\"-100\", \"unsafe\")"
+            ),
+            "reflected_raw_provider",
+        ),
+    ):
+        escaped = source_text.replace(
+            "topic_name = entry.get(\"topic_name\")",
+            (
+                f"{injected}\n"
+                "    entry[\"last_topic_error\"] = \"unsafe\"\n"
+                "    topic_name = entry.get(\"topic_name\")"
+            ),
+            1,
+        )
+        assert any(
+            violation[0] == expected
+            for violation in _offlock_protocol_violations(
+                escaped, delivery_text
+            )
+        )
+
+    telegram = FakeTelegram()
+    guarded = source_sync._OfflockClient(
+        telegram, _store(), "telegram"
+    )
+    capability = source_sync._provider_mutation(
+        "telegram.send_message",
+        reason="telegram.send_message: single-use replay regression",
+        args=("-100", "once"),
+    )
+    with pytest.raises(RuntimeError, match="private to audited wrappers"):
+        guarded._execute_exact(capability)
+    assert telegram.sent == []
+
+    first = source_sync._execute_exact_provider_operation(
+        guarded, mutation=capability
+    )
+    assert first["ok"] is True
+    with pytest.raises(RuntimeError, match="already consumed"):
+        source_sync._execute_exact_provider_operation(
+            guarded, mutation=capability
+        )
+    assert len(telegram.sent) == 1
+
+
+def test_offlock_alias_computed_method_escape_is_rejected_and_stale_refs_detach(
+    tmp_path, monkeypatch
+):
+    source_path = Path(source_sync.__file__)
+    delivery_path = source_path.with_name("telegram_delivery.py")
+    source_text = source_path.read_text(encoding="utf-8")
+    delivery_text = delivery_path.read_text(encoding="utf-8")
+    escaped = source_text.replace(
+        "topic_name = entry.get(\"topic_name\")",
+        (
+            "unsafe_executor = _OFFLOCK_EXECUTOR.read\n"
+            "    method_name = \"\".join([\"send\", \"_message\"])\n"
+            "    unsafe_executor(runtime.telegram, method_name, "
+            "\"-100\", \"unsafe\")\n"
+            "    dynamic_get = getattr\n"
+            "    dynamic_get(runtime.telegram, method_name)("
+            "\"-100\", \"unsafe-again\")\n"
+            "    reflect = object.__getattribute__\n"
+            "    raw_name = \"\".join([\"_OfflockClient__\", "
+            "\"provider\"])\n"
+            "    reflect(runtime.telegram, raw_name)\n"
+            "    entry[\"last_topic_error\"] = \"unsafe\"\n"
+            "    topic_name = entry.get(\"topic_name\")"
+        ),
+        1,
+    )
+    violations = _offlock_protocol_violations(escaped, delivery_text)
+    assert any(row[0] == "executor_alias_escape" for row in violations)
+    assert sum(row[0] == "sensitive_alias_escape" for row in violations) >= 2
+    assert "_OFFLOCK_EXECUTOR_TOKEN" not in source_text
+    assert "_invoke_offlock" not in source_text
+
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    store = _store()
+    store["panes"]["worker-1"] = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "tendwire_worker_id": "worker-1",
+        "tendwire_stable_key": (
+            "wsk1_" + hashlib.sha256(b"worker-1").hexdigest()
+        ),
+        "tendwire_stable_key_version": 1,
+        "topic_id": "77",
+    }
+    state.save_state(store, state_path)
+
+    class RebindingReadProvider:
+        def configured(self):
+            concurrent = state.load_state(state_path)
+            concurrent["panes"]["worker-1"]["topic_id"] = "88"
+            state.save_state(concurrent, state_path)
+            return True
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        stale_entry = current["panes"]["worker-1"]
+        guarded = source_sync._OfflockClient(
+            RebindingReadProvider(), current, "telegram"
+        )
+        assert guarded.configured() is True
+        reloaded_entry = current["panes"]["worker-1"]
+        assert stale_entry is not reloaded_entry
+        stale_entry["stale_write_on_current"] = "must-not-land"
+
+    assert reloaded_entry["topic_id"] == "88"
+    assert "stale_write_on_current" not in reloaded_entry
+
+
+def test_offlock_invariant_scans_decision_consumers_and_dispatcher():
+    source_path = Path(source_sync.__file__)
+    delivery_path = source_path.with_name("telegram_delivery.py")
+    decisions_path = source_path.with_name("decisions.py")
+    source_text = source_path.read_text(encoding="utf-8")
+    delivery_text = delivery_path.read_text(encoding="utf-8")
+    decisions_text = decisions_path.read_text(encoding="utf-8")
+
+    raw_consumer = decisions_text.replace(
+        (
+            '    """Reconcile active inline keyboards with one '
+            'already-fetched pending list."""'
+        ),
+        (
+            '    """Reconcile active inline keyboards with one '
+            'already-fetched pending list."""\n'
+            '    telegram.send_message(chat_id, "unsafe")'
+        ),
+        1,
+    )
+    assert any(
+        violation[0] == "decision_raw_mutation"
+        for violation in _offlock_protocol_violations(
+            source_text,
+            delivery_text,
+            decisions_text=raw_consumer,
+        )
+    )
+
+    laundered_dispatch = decisions_text.replace(
+        "    kwargs = dict(operation.kwargs)",
+        (
+            "    telegram.send_voice(\"-100\", \"unsafe.ogg\")\n"
+            "    kwargs = dict(operation.kwargs)"
+        ),
+        1,
+    )
+    assert any(
+        violation[0] == "decision_raw_mutation"
+        for violation in _offlock_protocol_violations(
+            source_text,
+            delivery_text,
+            decisions_text=laundered_dispatch,
+        )
+    )
+
+
+def test_offlock_invariant_rejects_rich_adapter_state_writes():
+    source_path = Path(source_sync.__file__)
+    delivery_path = source_path.with_name("telegram_delivery.py")
+    rich_path = source_path.with_name("rich_delivery.py")
+    source_text = source_path.read_text(encoding="utf-8")
+    delivery_text = delivery_path.read_text(encoding="utf-8")
+    rich_text = rich_path.read_text(encoding="utf-8")
+    escaped = rich_text.replace(
+        "    target = _client_for_token(client, api_token)",
+        (
+            "    rich = rich_telegram_state(telegram)\n"
+            "    rich[\"supported\"] = \"no\"\n"
+            "    target = _client_for_token(client, api_token)"
+        ),
+        1,
+    )
+    assert any(
+        row[0] == "rich_adapter_state_write"
+        for row in _offlock_protocol_violations(
+            source_text,
+            delivery_text,
+            rich_text=escaped,
+        )
+    )
+
+
+def test_offlock_invariant_rejects_duplicate_and_mismatched_reasons():
+    source_path = Path(source_sync.__file__)
+    delivery_path = source_path.with_name("telegram_delivery.py")
+    source_text = source_path.read_text(encoding="utf-8")
+    delivery_text = delivery_path.read_text(encoding="utf-8")
+
+    duplicate = source_text.replace(
+        "telegram.send_message: create global status in root fallback",
+        "telegram.send_message: create global status in general thread",
+        1,
+    )
+    assert any(
+        violation[0] == "duplicate_capability_reason"
+        for violation in _offlock_protocol_violations(
+            duplicate, delivery_text
+        )
+    )
+
+    mismatched = source_text.replace(
+        "telegram.create_topic: mint missing pane topic",
+        "telegram.send_message: mint missing pane topic",
+        1,
+    )
+    assert any(
+        violation[0] == "reason_does_not_name_capability"
+        for violation in _offlock_protocol_violations(
+            mismatched, delivery_text
+        )
+    )
 
 
 def _gateway_child(
@@ -288,6 +1570,38 @@ class FakeTelegram:
         message_id = str(900 + len(self.voice_notes))
         self.voice_notes.append((str(chat_id), str(file_path), dict(kwargs), message_id))
         return {"ok": True, "message_id": message_id}
+
+
+class RebindingNotificationTelegram(FakeTelegram):
+    def __init__(self, state_path, mutate_state):
+        super().__init__()
+        self.state_path = state_path
+        self.mutate_state = mutate_state
+        self.rebound = False
+        self.deleted_messages = []
+
+    def send_message(self, chat_id, html, **kwargs):
+        result = super().send_message(chat_id, html, **kwargs)
+        if not self.rebound:
+            concurrent = state.load_state(self.state_path)
+            self.mutate_state(concurrent)
+            state.save_state(concurrent, self.state_path)
+            self.rebound = True
+        return result
+
+    def delete_message(self, chat_id, message_id):
+        self.deleted_messages.append((str(chat_id), str(message_id)))
+        return {"ok": True}
+
+
+class CrashNotificationTelegram(FakeTelegram):
+    def __init__(self):
+        super().__init__()
+        self.deleted_messages = []
+
+    def delete_message(self, chat_id, message_id):
+        self.deleted_messages.append((str(chat_id), str(message_id)))
+        return {"ok": True}
 
 
 def _store():
@@ -1367,6 +2681,14 @@ def test_outbox_attention_falls_back_when_general_thread_missing():
             return super().send_message(chat_id, html, **kwargs)
 
     store = _store()
+    stale_alias = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "topic_id": "1",
+        "topic_name": "stale general alias",
+        "status": "closed",
+    }
+    store["panes"]["worker:stale-general-alias"] = stale_alias
     tendwire = OutboxTendwire()
     telegram = TopicMissingTelegram()
 
@@ -1378,6 +2700,9 @@ def test_outbox_attention_falls_back_when_general_thread_missing():
     assert tendwire.failed == []
     assert tendwire.acked == [("ref-1", {"telegram": "delivered"})]
     assert telegram.sent[-1][2].get("thread_id") is None
+    assert store["telegram_dead_topic_ids"] == ["1"]
+    assert "topic_id" not in stale_alias
+    assert stale_alias["deleted_topic_id"] == "1"
 
 
 def test_long_telegram_send_splits_instead_of_truncating():
@@ -2176,6 +3501,431 @@ def test_topic_pinned_status_reuses_legacy_topic_pin(monkeypatch):
     assert not any(sent[2].get("thread_id") == "77" for sent in telegram.sent)
 
 
+def _notification_race_store(*, retired=False):
+    store = _store()
+    store["panes"]["worker:notification-race"] = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "tendwire_worker_id": "worker-notification",
+        "worker_id": "worker-notification",
+        "tendwire_space_id": "space-1",
+        "space_id": "space-1",
+        "tendwire_fingerprint": "fp-notification",
+        "topic_id": "77",
+        "topic_name": "Notification race",
+        "status": "retired" if retired else "idle",
+        "tendwire_raw_status": "idle",
+    }
+    if retired:
+        store["panes"]["worker:notification-race"].update(
+            {
+                "routing_retired": True,
+                "retired_topic_notice_pending": True,
+            }
+        )
+    return store
+
+
+def _ten_notification_entries(*, retired: bool = False):
+    store = _notification_race_store(retired=retired)
+    store["panes"] = {}
+    for index in range(10):
+        key = f"worker:notification-{index}"
+        entry = {
+            "source": "tendwire",
+            "entry_type": "worker",
+            "tendwire_worker_id": f"worker-notification-{index}",
+            "worker_id": f"worker-notification-{index}",
+            "tendwire_space_id": "space-1",
+            "space_id": "space-1",
+            "tendwire_fingerprint": f"fp-notification-{index}",
+            "topic_id": str(770 + index),
+            "topic_name": f"Notification {index}",
+            "status": "retired" if retired else "idle",
+            "tendwire_raw_status": "idle",
+        }
+        if retired:
+            entry.update(
+                {
+                    "routing_retired": True,
+                    "retired_topic_notice_pending": True,
+                }
+            )
+        store["panes"][key] = entry
+    return store
+
+
+def _notification_save_counter(
+    tmp_path, monkeypatch, store, delivery
+) -> int:
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(store, state_path)
+    real_save_state = state.save_state
+    save_calls = 0
+
+    def counted_save(current, path=None):
+        nonlocal save_calls
+        save_calls += 1
+        return real_save_state(current, path=path)
+
+    monkeypatch.setattr(state, "save_state", counted_save)
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                FakeTelegram(),
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(
+                    current, state_path
+                ),
+            ),
+        )
+        delivery(current, runtime)
+    return save_calls
+
+
+def test_ten_topic_pin_deliveries_use_two_durability_barriers_each(
+    tmp_path, monkeypatch
+):
+    def deliver(current, runtime):
+        for key in list(current["panes"]):
+            entry = current["panes"][key]
+            assert source_sync._sync_topic_pinned(
+                current, entry, runtime, chat_id="-100"
+            )
+
+    assert (
+        _notification_save_counter(
+            tmp_path,
+            monkeypatch,
+            _ten_notification_entries(),
+            deliver,
+        )
+        == 20
+    )
+
+
+def test_ten_retired_notices_use_two_durability_barriers_each(
+    tmp_path, monkeypatch
+):
+    def deliver(current, runtime):
+        assert (
+            source_sync._sync_retired_worker_topics(
+                current, runtime, chat_id="-100"
+            )
+            == 10
+        )
+
+    assert (
+        _notification_save_counter(
+            tmp_path,
+            monkeypatch,
+            _ten_notification_entries(retired=True),
+            deliver,
+        )
+        == 20
+    )
+
+
+def test_ten_global_status_deliveries_use_two_durability_barriers_each(
+    tmp_path, monkeypatch
+):
+    def deliver(current, runtime):
+        for _index in range(10):
+            assert source_sync._sync_pinned(
+                current, runtime, chat_id="-100"
+            )
+            telegram = current.setdefault("telegram", {})
+            telegram.pop("pinned_status_message_id", None)
+            telegram.pop("pinned_status_hash", None)
+
+    assert (
+        _notification_save_counter(
+            tmp_path,
+            monkeypatch,
+            _ten_notification_entries(),
+            deliver,
+        )
+        == 20
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["topic_pinned", "retired_topic_notice", "global_pinned"],
+)
+def test_notification_acceptance_journal_closes_crash_seam(
+    tmp_path, monkeypatch, kind
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(state_path)
+    )
+    initial = _notification_race_store(
+        retired=kind == "retired_topic_notice"
+    )
+    state.save_state(initial, state_path)
+    telegram = CrashNotificationTelegram()
+
+    def crash_after_accept():
+        raise RuntimeError("crash after notification acceptance")
+
+    def deliver(current, runtime):
+        if kind == "topic_pinned":
+            entry = current["panes"]["worker:notification-race"]
+            return source_sync._sync_topic_pinned(
+                current, entry, runtime, chat_id="-100"
+            )
+        if kind == "retired_topic_notice":
+            return bool(
+                source_sync._sync_retired_worker_topics(
+                    current, runtime, chat_id="-100"
+                )
+            )
+        return source_sync._sync_pinned(
+            current, runtime, chat_id="-100"
+        )
+
+    with pytest.raises(
+        RuntimeError, match="crash after notification acceptance"
+    ):
+        with state.state_lock(state_path):
+            current = state.load_state(state_path)
+            runtime = source_sync._offlock_runtime(
+                current,
+                SyncRuntime(
+                    FakeTendwire(),
+                    telegram,
+                    with_outbox=False,
+                    checkpoint=lambda: state.save_state(
+                        current, state_path
+                    ),
+                    after_provider_accept=crash_after_accept,
+                ),
+            )
+            deliver(current, runtime)
+
+    # The 11.7 MB ledger has not crossed another barrier, but the small
+    # acceptance fact is already durable in the sidecar.
+    durable_before_restart = json.loads(
+        state_path.read_text(encoding="utf-8")
+    )
+    assert not durable_before_restart["telegram"].get(
+        "accepted_notification_messages"
+    )
+    assert state.accepted_notification_journal_path(
+        state_path
+    ).exists()
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        assert len(
+            current["telegram"]["accepted_notification_messages"]
+        ) == 1
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                telegram,
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(
+                    current, state_path
+                ),
+            ),
+        )
+        retired, pending = source_sync._drain_accepted_notifications(
+            current, runtime, chat_id="-100"
+        )
+        assert deliver(current, runtime)
+        state.save_state(current, state_path)
+
+    deleted_ids = {message_id for _chat, message_id in telegram.deleted_messages}
+    visible_ids = {
+        str(row[3]) for row in telegram.sent
+    } - deleted_ids
+    assert (retired, pending) == (1, 0)
+    assert visible_ids == {"101"}
+    assert not state.accepted_notification_journal_path(
+        state_path
+    ).exists()
+    assert not state.load_state(state_path)["telegram"].get(
+        "accepted_notification_messages"
+    )
+
+
+def test_topic_pin_rebind_checkpoints_and_retires_accepted_card(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(_notification_race_store(), state_path)
+
+    def rebind(current):
+        current["panes"]["worker:notification-race"]["topic_id"] = "88"
+
+    telegram = RebindingNotificationTelegram(state_path, rebind)
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+        )
+        entry = current["panes"]["worker:notification-race"]
+        assert (
+            source_sync._sync_topic_pinned(
+                current, entry, runtime, chat_id="-100"
+            )
+            is False
+        )
+        assert len(
+            current["telegram"]["accepted_notification_messages"]
+        ) == 1
+        retired, pending = source_sync._drain_accepted_notifications(
+            current, runtime, chat_id="-100"
+        )
+        entry = current["panes"]["worker:notification-race"]
+        assert source_sync._sync_topic_pinned(
+            current, entry, runtime, chat_id="-100"
+        )
+
+    assert (retired, pending) == (1, 0)
+    assert telegram.deleted_messages == [("-100", "100")]
+    assert [row[2]["thread_id"] for row in telegram.sent] == [
+        "77",
+        "88",
+    ]
+    assert current["panes"]["worker:notification-race"][
+        "pinned_status_message_id"
+    ] == "101"
+
+
+def test_retired_notice_rebind_checkpoints_and_retires_accepted_card(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(
+        _notification_race_store(retired=True), state_path
+    )
+
+    def rebind(current):
+        current["panes"]["worker:notification-race"]["topic_id"] = "88"
+
+    telegram = RebindingNotificationTelegram(state_path, rebind)
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+        )
+        assert (
+            source_sync._sync_retired_worker_topics(
+                current, runtime, chat_id="-100"
+            )
+            == 0
+        )
+        retired, pending = source_sync._drain_accepted_notifications(
+            current, runtime, chat_id="-100"
+        )
+        assert (
+            source_sync._sync_retired_worker_topics(
+                current, runtime, chat_id="-100"
+            )
+            == 1
+        )
+
+    assert (retired, pending) == (1, 0)
+    assert telegram.deleted_messages == [("-100", "100")]
+    assert [row[2]["thread_id"] for row in telegram.sent] == [
+        "77",
+        "88",
+    ]
+    entry = current["panes"]["worker:notification-race"]
+    assert entry["retired_topic_notice_message_id"] == "101"
+    assert "retired_topic_notice_pending" not in entry
+
+
+def test_global_pin_rebind_checkpoints_and_retires_accepted_card(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(_notification_race_store(), state_path)
+
+    def rebind(current):
+        current["telegram"]["general_thread_id"] = "2"
+
+    telegram = RebindingNotificationTelegram(state_path, rebind)
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+        )
+        assert (
+            source_sync._sync_pinned(
+                current, runtime, chat_id="-100"
+            )
+            is False
+        )
+        retired, pending = source_sync._drain_accepted_notifications(
+            current, runtime, chat_id="-100"
+        )
+        assert source_sync._sync_pinned(
+            current, runtime, chat_id="-100"
+        )
+
+    assert (retired, pending) == (1, 0)
+    assert telegram.deleted_messages == [("-100", "100")]
+    assert [row[2]["thread_id"] for row in telegram.sent] == ["1", "2"]
+    assert current["telegram"]["pinned_status_message_id"] == "101"
+
+
+def test_topic_pinned_edit_topic_not_found_resends_before_tombstoning(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+
+    class MissingPinnedEditTelegram(FakeTelegram):
+        def edit_message(self, chat_id, message_id, html):
+            if str(message_id) == "55":
+                return {
+                    "ok": False,
+                    "kind": "topic_not_found",
+                    "error": "Bad Request: message thread not found",
+                }
+            return super().edit_message(chat_id, message_id, html)
+
+    store = _store()
+    store["spaces"]["workspace:space-1"] = {
+        "topic_name": "Project",
+        "topic_id": "77",
+        "pinned_status_message_id": "55",
+    }
+    telegram = MissingPinnedEditTelegram()
+
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns={"turns": []}),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+    entry = next(iter(state.source_space_entries(store).values()))
+
+    assert entry["topic_id"] == "77"
+    assert store.get("telegram_dead_topic_ids", []) == []
+    assert entry["pinned_status_message_id"] != "55"
+    assert any(
+        sent[2].get("thread_id") == "77"
+        for sent in telegram.sent
+    )
+
+
 def test_pinned_status_falls_back_when_general_thread_is_missing(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
 
@@ -2790,6 +4540,107 @@ def test_save_state_fsyncs_file_before_replace_and_directory_after(
         "value": "durable",
         "version": 2,
     }
+
+
+def test_save_state_existing_file_keeps_directory_fsync(
+    tmp_path,
+    monkeypatch,
+):
+    state_path = tmp_path / "state.json"
+    state.save_state({"version": 2, "value": "before"}, state_path)
+    calls = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(descriptor):
+        kind = (
+            "directory"
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            else "file"
+        )
+        calls.append(f"fsync:{kind}")
+        real_fsync(descriptor)
+
+    def tracking_replace(source, destination):
+        calls.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(state.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(state.os, "replace", tracking_replace)
+
+    state.save_state(
+        {"version": 2, "value": "after"}, state_path
+    )
+
+    assert calls == ["fsync:file", "replace", "fsync:directory"]
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "value": "after",
+        "version": 2,
+    }
+
+
+def test_save_state_sidecar_clear_keeps_directory_fsync(
+    tmp_path,
+    monkeypatch,
+):
+    state_path = tmp_path / "state.json"
+    current = {"version": 2, "telegram": {}}
+    state.save_state(current, state_path)
+    record = {
+        "kind": "topic_pinned",
+        "topic_id": "77",
+        "message_id": "101",
+        "bot_kind": "manager",
+        "provenance": {},
+    }
+    state.append_accepted_notification_receipt(
+        "receipt-1",
+        record,
+        data=current,
+        path=state_path,
+    )
+    calls = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+    real_unlink = Path.unlink
+    journal_path = state.accepted_notification_journal_path(
+        state_path
+    )
+
+    def tracking_fsync(descriptor):
+        kind = (
+            "directory"
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            else "file"
+        )
+        calls.append(f"fsync:{kind}")
+        real_fsync(descriptor)
+
+    def tracking_replace(source, destination):
+        calls.append("replace")
+        real_replace(source, destination)
+
+    def tracking_unlink(path, *args, **kwargs):
+        if path == journal_path:
+            calls.append("unlink:journal")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(state.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(state.os, "replace", tracking_replace)
+    monkeypatch.setattr(Path, "unlink", tracking_unlink)
+
+    state.save_state(current, state_path)
+
+    assert calls == [
+        "fsync:file",
+        "replace",
+        "fsync:directory",
+        "unlink:journal",
+        "fsync:directory",
+    ]
+    assert not state.accepted_notification_journal_path(
+        state_path
+    ).exists()
 
 
 def test_legacy_duplicate_instruction_is_truthful_non_success():

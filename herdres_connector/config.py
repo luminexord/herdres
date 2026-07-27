@@ -357,6 +357,23 @@ def topic_icon_cache_ttl_seconds(env: Any | None = None) -> int:
         return 86400
 
 
+def topic_icon_error_retry_seconds(env: Any | None = None) -> int:
+    source = os.environ if env is None else env
+    try:
+        value = int(
+            str(
+                source.get(
+                    "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR_RETRY",
+                    "30",
+                )
+                or "30"
+            )
+        )
+    except ValueError:
+        return 30
+    return max(1, min(value, 300))
+
+
 def offlock_interpane_yield_enabled(env: Any | None = None) -> bool:
     """Whether sync_once briefly releases the state lock between delivered turns so a queued inbound
     command can interleave instead of stalling behind the whole delivery loop's Telegram sends (the

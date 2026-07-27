@@ -7,6 +7,7 @@ from herdres_connector import config, source_sync, state
 from herdres_connector.managed_bots import MANAGER_BOT_KIND
 from herdres_connector.rich_delivery import render_turn_item_html
 from herdres_connector.source_sync import SyncRuntime, _sync_turns
+from herdres_connector.telegram_delivery import TelegramError
 
 from test_source_only import FakeTelegram, FakeTendwire, _source_worker, _store
 
@@ -77,9 +78,9 @@ def _folded_store(monkeypatch):
     return store
 
 
-def _run(store, monkeypatch, flag="1"):
+def _run(store, monkeypatch, flag="1", telegram=None):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", flag)
-    telegram = FakeTelegram()
+    telegram = telegram or FakeTelegram()
     runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
     _sync_turns(store, _two_turn_payload(), {"pending": []}, runtime, chat_id="-100")
     return telegram
@@ -100,6 +101,62 @@ def test_fold_idempotent_second_sweep_skips(monkeypatch):
     _run(store, monkeypatch)
     telegram2 = _run(store, monkeypatch)                  # second sweep
     assert not any(mid == "400" for _c, mid, _h in telegram2.edited)  # already folded -> no re-edit
+
+
+def test_fold_topic_not_found_never_tombstones_rebound_live_topic(
+    monkeypatch,
+):
+    store = _folded_store(monkeypatch)
+    entry = next(iter(state.source_worker_entries(store).values()))
+    binding = state.message_bindings(store)["400"]
+    binding["topic_id"] = "15007"
+    entry["topic_id"] = "16000"
+
+    class TopicMissingEditTelegram(FakeTelegram):
+        def api(self, method, payload):
+            if method == "editMessageText":
+                raise TelegramError(
+                    "Bad Request: message thread not found"
+                )
+            return super().api(method, payload)
+
+    _run(
+        store,
+        monkeypatch,
+        telegram=TopicMissingEditTelegram(),
+    )
+
+    assert binding["folded"] is True
+    assert binding["topic_id"] == "15007"
+    assert entry["topic_id"] == "16000"
+    assert not state.topic_id_is_tombstoned(store, "15007")
+    assert not state.topic_id_is_tombstoned(store, "16000")
+    assert "topic_recovery_pending" not in entry
+
+
+def test_fold_message_not_found_never_tombstones_topic(monkeypatch):
+    store = _folded_store(monkeypatch)
+    entry = next(iter(state.source_worker_entries(store).values()))
+    binding = state.message_bindings(store)["400"]
+
+    class MessageMissingEditTelegram(FakeTelegram):
+        def api(self, method, payload):
+            if method == "editMessageText":
+                raise TelegramError(
+                    "Bad Request: message to edit not found"
+                )
+            return super().api(method, payload)
+
+    _run(
+        store,
+        monkeypatch,
+        telegram=MessageMissingEditTelegram(),
+    )
+
+    assert binding["folded"] is True
+    assert entry["topic_id"] == "77"
+    assert store.get("telegram_dead_topic_ids", []) == []
+    assert "topic_recovery_pending" not in entry
 
 
 def test_fold_disabled_without_flag(monkeypatch):

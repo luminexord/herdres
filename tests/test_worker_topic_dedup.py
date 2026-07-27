@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from herdres_connector import config, state
+from herdres_connector import config, source_sync, state
 from herdres_connector.source_sync import (
     SyncRuntime,
     _REAP_ABSENCE_STREAK,
@@ -202,6 +202,66 @@ def test_reaper_respects_delete_cap(monkeypatch):
     _clean(store, rt, present={"live"}, times=3)
     assert sorted(rt.telegram.deleted_topics) == ["100", "101", "102", "103", "104"]
     assert state.source_worker_entries(store) == {}
+
+
+def test_guarded_reaper_reresolves_each_worker_after_delete(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERDRES_REAP_CLOSED_WORKER_TOPICS", "1")
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(statepath)
+    )
+    store = _store_with(
+        [
+            _wentry(
+                "first",
+                100,
+                "first",
+                "closed",
+                reap_miss_count=_REAP_ABSENCE_STREAK - 1,
+            ),
+            _wentry("second", 101, "second", "closed"),
+        ]
+    )
+    state.save_state(store, statepath)
+    telegram = FakeTelegram()
+
+    with state.state_lock(statepath):
+        current = state.load_state(statepath)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                telegram,
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(
+                    current, statepath
+                ),
+            ),
+        )
+        _cleanup_topics(
+            current,
+            runtime,
+            chat_id="-100",
+            snapshot_worker_ids={"other"},
+        )
+        state.save_state(current, statepath)
+
+    assert telegram.deleted_topics == ["100"]
+    survivors = state.source_worker_entries(current)
+    assert len(survivors) == 1
+    second = next(iter(survivors.values()))
+    assert second["tendwire_worker_id"] == "second"
+    assert second["reap_miss_count"] == 1
+    persisted = next(
+        iter(
+            state.source_worker_entries(
+                state.load_state(statepath)
+            ).values()
+        )
+    )
+    assert persisted["reap_miss_count"] == 1
 
 
 def test_reaper_dry_run_previews_without_side_effects(monkeypatch):

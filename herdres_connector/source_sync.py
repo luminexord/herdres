@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
@@ -13,6 +14,9 @@ from . import accounts, config, decisions, ingress_requests, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import (
+    RICH_BAD_REQUEST_LIMIT,
+    RICH_RENDER_VERSION,
+    RICH_STATE_UPDATE_KEY,
     edit_feed_item,
     edit_turn_delivery_part,
     feed_item_requires_send_split,
@@ -55,6 +59,7 @@ _TOPIC_CLEANUP_MIN_RETRY_SECONDS = 60.0
 _TOPIC_CLEANUP_PERMANENT_ERROR_KINDS = frozenset(
     {"bad_request", "bot_access", "capability"}
 )
+_ACCEPTED_NOTIFICATION_LIMIT = 64
 
 
 class _TurnContentError(RuntimeError):
@@ -75,42 +80,947 @@ class SyncRuntime:
     after_provider_accept: Callable[[], None] | None = None
 
 
+@dataclass(frozen=True)
+class _OfflockEntryOperation:
+    """Immutable provenance for one provider request made without the state lock."""
+
+    entry_key: str
+    entry_type: str
+    pane_uuid: str
+    stable_key: str
+    stable_key_version: int
+    space_id: str
+    route_topic_id: str
+    owner_generation: tuple[str, ...]
+    retired: bool
+    routable: bool
+    observed_fields: tuple[tuple[str, Any], ...] = ()
+    message_id: str = ""
+    plan_token: str = ""
+    revision: str = ""
+
+
+@dataclass(frozen=True)
+class _OfflockEntryResolution:
+    disposition: str
+    entry: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _OfflockEntryExecution:
+    """Provider result paired with the only permitted post-call resolution."""
+
+    result: Any
+    resolution: _OfflockEntryResolution
+
+
+_OFFLOCK_APPLY = "apply"
+_OFFLOCK_RECONCILE = "reconcile"
+_OFFLOCK_ABANDON = "abandon"
+
+# Provider calls fail closed. Only these methods are proven read-only; every
+# other callable must be reached through a declared capability. Lease-acquiring
+# polls are intentionally absent because they mutate provider lease state.
+_READ_ONLY_PROVIDER_METHODS = {
+    "telegram": frozenset({"configured", "with_token"}),
+    "tendwire": frozenset(
+        {
+            "doctor",
+            "pending",
+            "snapshot",
+            "turn_content_get",
+            "turn_delta",
+            "turns",
+        }
+    ),
+}
+
+
+@dataclass(frozen=True, eq=False)
+class _ProviderMutation:
+    """One declared provider capability; it never exposes the raw provider."""
+
+    capability: str
+    reason: str
+    args: tuple[Any, ...] = ()
+    kwargs: tuple[tuple[str, Any], ...] = ()
+    api_token: str = ""
+
+
+_DIRECT_PROVIDER_CAPABILITIES = {
+    f"telegram.{name}": name
+    for name in {
+        "answer_callback_query",
+        "close_topic",
+        "close_topic_for_cleanup",
+        "create_topic",
+        "delete_message",
+        "delete_topic",
+        "delete_topic_for_cleanup",
+        "edit_message",
+        "edit_message_reply_markup",
+        "edit_topic_icon",
+        "pin_message",
+        "rename_topic",
+        "reopen_topic",
+        "reopen_topic_for_cleanup",
+        "send_message",
+        "send_photo",
+        "send_voice",
+    }
+} | {
+    f"tendwire.{name}": name
+    for name in {
+        "call",
+        "command",
+        "command_json",
+        "connector_ack",
+        "connector_fail",
+        "connector_poll",
+        "connector_prepare_begin",
+        "connector_prepare_commit",
+        "connector_prepare_part",
+        "connector_prepare_recover",
+        "turn_final_ack",
+        "turn_final_defer",
+        "turn_final_fail",
+        "turn_final_poll",
+    }
+}
+
+_ADAPTER_PROVIDER_CAPABILITIES = frozenset(
+    {
+        "telegram.delete_turn_delivery_message",
+        "telegram.edit_feed_item",
+        "telegram.edit_turn_delivery_part",
+        "telegram.send_feed_item",
+        "telegram.send_turn_delivery_part",
+        "telegram.send_voice_batch",
+    }
+)
+
+def _provider_mutation(
+    capability: str,
+    *,
+    reason: str,
+    args: tuple[Any, ...] = (),
+    kwargs: Mapping[str, Any] | None = None,
+    api_token: str = "",
+) -> _ProviderMutation:
+    capability = str(capability).strip()
+    reason = str(reason).strip()
+    if (
+        capability not in _DIRECT_PROVIDER_CAPABILITIES
+        and capability not in _ADAPTER_PROVIDER_CAPABILITIES
+    ):
+        raise ValueError(f"unknown provider mutation capability: {capability!r}")
+    if not reason or capability not in reason:
+        raise ValueError(
+            "provider mutation reason must name its declared capability"
+        )
+    return _ProviderMutation(
+        capability=capability,
+        reason=reason,
+        args=tuple(args),
+        kwargs=tuple((str(key), value) for key, value in (kwargs or {}).items()),
+        api_token=str(api_token or ""),
+    )
+
+
+def _entry_owner_generation(entry: Mapping[str, Any]) -> tuple[str, ...]:
+    """Fields whose change means the request no longer owns the same route."""
+
+    identity = state.entry_stable_identity(dict(entry))
+    return (
+        state.entry_pane_uuid(dict(entry)),
+        str((identity or ("", 0))[0]),
+        str((identity or ("", 0))[1]),
+        _entry_worker_id(dict(entry)),
+        compact_ws(entry.get("tendwire_fingerprint"), 160),
+        _entry_space_id(dict(entry)),
+        compact_ws(entry.get("active_worker_id"), 160),
+        compact_ws(entry.get("active_worker_fingerprint"), 160),
+        compact_ws(entry.get("active_worker_stable_key"), 160),
+        str(entry.get("active_worker_stable_key_version") or ""),
+    )
+
+
+def _entry_operation_key(
+    store: dict[str, Any], entry: dict[str, Any]
+) -> tuple[str, str]:
+    for entry_key, candidate in state.source_worker_entries(store).items():
+        if candidate is entry:
+            return entry_key, "worker"
+    for entry_key, candidate in state.source_space_entries(store).items():
+        if candidate is entry:
+            return entry_key, "space"
+    # Delivery entries in space mode are worker-shaped views whose route came
+    # from the owning space. Durable worker identity is still the operation
+    # identity, so resolve it rather than falling back to object position.
+    pane_uuid = state.entry_pane_uuid(entry)
+    if pane_uuid:
+        entry_key, candidate = state.find_worker_entry_by_pane_uuid(
+            store, pane_uuid
+        )
+        if entry_key is not None and candidate is not None:
+            return entry_key, "worker"
+    identity = state.entry_stable_identity(entry)
+    if identity is not None:
+        entry_key, candidate = state.find_worker_entry_by_stable_key(
+            store, identity[0]
+        )
+        if entry_key is not None and candidate is not None:
+            return entry_key, "worker"
+    space_id = _entry_space_id(entry)
+    if space_id:
+        entry_key, candidate = state.find_space_entry_by_id(store, space_id)
+        if entry_key is not None and candidate is not None:
+            return entry_key, "space"
+    return "", str(entry.get("entry_type") or "")
+
+
+def _capture_entry_operation(
+    store: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    topic_id: str | None = None,
+    message_id: str = "",
+    plan_token: str = "",
+    revision: str = "",
+    observe: tuple[str, ...] = (),
+) -> _OfflockEntryOperation:
+    """Capture request provenance before an off-lock provider call."""
+
+    entry_key, entry_type = _entry_operation_key(store, entry)
+    identity = state.entry_stable_identity(entry)
+    return _OfflockEntryOperation(
+        entry_key=entry_key,
+        entry_type=entry_type,
+        pane_uuid=state.entry_pane_uuid(entry),
+        stable_key=str((identity or ("", 0))[0]),
+        stable_key_version=int((identity or ("", 0))[1]),
+        space_id=_entry_space_id(entry),
+        route_topic_id=str(
+            (
+                entry.get("topic_id")
+                if topic_id is None
+                else topic_id
+            )
+            or ""
+        ),
+        owner_generation=_entry_owner_generation(entry),
+        retired=state.entry_is_retired(entry),
+        routable=state.entry_is_routable(entry),
+        observed_fields=tuple((field, deepcopy(entry.get(field))) for field in observe),
+        message_id=str(message_id or ""),
+        plan_token=str(plan_token or ""),
+        revision=str(revision or ""),
+    )
+
+
+def _capture_global_operation(
+    store: dict[str, Any],
+    *,
+    topic_id: str,
+    message_id: str = "",
+) -> _OfflockEntryOperation:
+    telegram = _telegram_state(store)
+    return _OfflockEntryOperation(
+        entry_key="telegram:pinned_status",
+        entry_type="global",
+        pane_uuid="",
+        stable_key="",
+        stable_key_version=0,
+        space_id="",
+        route_topic_id=str(topic_id or ""),
+        owner_generation=("",) * 10,
+        retired=False,
+        routable=False,
+        observed_fields=(
+            (
+                "pinned_status_message_id",
+                deepcopy(telegram.get("pinned_status_message_id")),
+            ),
+            (
+                "pinned_status_hash",
+                deepcopy(telegram.get("pinned_status_hash")),
+            ),
+        ),
+        message_id=str(message_id or ""),
+    )
+
+
+def _resolve_operation_entry(
+    store: dict[str, Any], operation: _OfflockEntryOperation
+) -> dict[str, Any] | None:
+    entry: dict[str, Any] | None = None
+    if operation.entry_type == "worker":
+        if operation.pane_uuid:
+            _key, entry = state.find_worker_entry_by_pane_uuid(
+                store, operation.pane_uuid
+            )
+            if entry is None:
+                matches = [
+                    candidate
+                    for candidate in state.source_worker_entries(store).values()
+                    if state.entry_pane_uuid(candidate) == operation.pane_uuid
+                ]
+                entry = matches[0] if len(matches) == 1 else None
+                if (
+                    entry is None
+                    and not operation.routable
+                    and operation.entry_key
+                ):
+                    candidate = state.source_worker_entries(store).get(
+                        operation.entry_key
+                    )
+                    if (
+                        candidate is not None
+                        and state.entry_pane_uuid(candidate)
+                        == operation.pane_uuid
+                    ):
+                        entry = candidate
+        elif operation.stable_key:
+            _key, entry = state.find_worker_entry_by_stable_key(
+                store, operation.stable_key
+            )
+            if entry is None:
+                matches = [
+                    candidate
+                    for candidate in state.source_worker_entries(store).values()
+                    if state.entry_continuity_identity(candidate)
+                    == (operation.stable_key, operation.stable_key_version)
+                ]
+                entry = matches[0] if len(matches) == 1 else None
+                if (
+                    entry is None
+                    and not operation.routable
+                    and operation.entry_key
+                ):
+                    candidate = state.source_worker_entries(store).get(
+                        operation.entry_key
+                    )
+                    if (
+                        candidate is not None
+                        and state.entry_continuity_identity(candidate)
+                        == (
+                            operation.stable_key,
+                            operation.stable_key_version,
+                        )
+                    ):
+                        entry = candidate
+        elif operation.entry_key:
+            entry = state.source_worker_entries(store).get(operation.entry_key)
+    elif operation.entry_type == "space":
+        if operation.space_id:
+            _key, entry = state.find_space_entry_by_id(
+                store, operation.space_id
+            )
+        elif operation.entry_key:
+            entry = state.source_space_entries(store).get(operation.entry_key)
+    elif operation.entry_type == "global":
+        entry = _telegram_state(store)
+    return entry
+
+
+def _compare_and_apply_entry_operation(
+    store: dict[str, Any], operation: _OfflockEntryOperation
+) -> _OfflockEntryResolution:
+    """Resolve the request owner and make the only post-call apply decision.
+
+    Exact provider facts are deliberately applied outside this guard:
+    tombstoning the exact requested topic and retiring the exact operated
+    message remain valid even if the pane moved while the lock was released.
+    """
+
+    entry = _resolve_operation_entry(store, operation)
+    if operation.entry_type == "global":
+        if entry is None:
+            return _OfflockEntryResolution(_OFFLOCK_ABANDON)
+        if (
+            any(
+                entry.get(field) != expected
+                for field, expected in operation.observed_fields
+            )
+            or (
+                operation.route_topic_id
+                and str(config.general_thread_id(store))
+                != operation.route_topic_id
+            )
+        ):
+            return _OfflockEntryResolution(_OFFLOCK_RECONCILE)
+        return _OfflockEntryResolution(_OFFLOCK_APPLY, entry)
+    if entry is None or state.entry_is_retired(entry) != operation.retired:
+        return _OfflockEntryResolution(_OFFLOCK_ABANDON)
+    if (
+        state.entry_is_routable(entry) != operation.routable
+        or _entry_owner_generation(entry) != operation.owner_generation
+        or str(entry.get("topic_id") or "") != operation.route_topic_id
+        or any(
+            entry.get(field) != expected
+            for field, expected in operation.observed_fields
+        )
+        or (
+            operation.plan_token
+            and entry.get("pending_plan_token") != operation.plan_token
+        )
+        or (
+            operation.revision
+            and entry.get("pending_content_revision") != operation.revision
+        )
+    ):
+        return _OfflockEntryResolution(_OFFLOCK_RECONCILE)
+    return _OfflockEntryResolution(_OFFLOCK_APPLY, entry)
+
+
+def _operation_binding_entry(
+    operation: _OfflockEntryOperation,
+) -> dict[str, Any]:
+    """Minimal immutable owner snapshot for an accepted stale message."""
+
+    entry: dict[str, Any] = {
+        "entry_type": operation.entry_type,
+        "topic_id": operation.route_topic_id,
+        "tendwire_worker_id": operation.owner_generation[3],
+        "tendwire_fingerprint": operation.owner_generation[4],
+        "tendwire_space_id": operation.owner_generation[5],
+    }
+    if operation.pane_uuid:
+        entry["pane_uuid"] = operation.pane_uuid
+        entry["pane_uuid_version"] = state.PANE_UUID_VERSION
+    if operation.stable_key:
+        entry["tendwire_stable_key"] = operation.stable_key
+        entry["tendwire_stable_key_version"] = operation.stable_key_version
+    return entry
+
+
+def _operation_provenance(
+    operation: _OfflockEntryOperation,
+) -> dict[str, Any]:
+    """JSON-safe durable identity for locally drainable provider facts."""
+
+    return {
+        "entry_key": operation.entry_key,
+        "entry_type": operation.entry_type,
+        "pane_uuid": operation.pane_uuid,
+        "stable_key": operation.stable_key,
+        "stable_key_version": operation.stable_key_version,
+        "space_id": operation.space_id,
+        "route_topic_id": operation.route_topic_id,
+        "owner_generation": list(operation.owner_generation),
+        "retired": operation.retired,
+        "routable": operation.routable,
+        "observed_fields": [
+            [field, deepcopy(value)]
+            for field, value in operation.observed_fields
+        ],
+        "message_id": operation.message_id,
+        "plan_token": operation.plan_token,
+        "revision": operation.revision,
+    }
+
+
+def _operation_from_provenance(
+    value: Mapping[str, Any],
+) -> _OfflockEntryOperation:
+    owner_generation = value.get("owner_generation")
+    if not isinstance(owner_generation, list):
+        owner_generation = []
+    observed_fields = value.get("observed_fields")
+    return _OfflockEntryOperation(
+        entry_key=str(value.get("entry_key") or ""),
+        entry_type=str(value.get("entry_type") or ""),
+        pane_uuid=str(value.get("pane_uuid") or ""),
+        stable_key=str(value.get("stable_key") or ""),
+        stable_key_version=int(value.get("stable_key_version") or 0),
+        space_id=str(value.get("space_id") or ""),
+        route_topic_id=str(value.get("route_topic_id") or ""),
+        owner_generation=tuple(str(item) for item in owner_generation),
+        retired=bool(value.get("retired")),
+        routable=bool(value.get("routable")),
+        observed_fields=tuple(
+            (str(item[0]), deepcopy(item[1]))
+            for item in (
+                observed_fields
+                if isinstance(observed_fields, list)
+                else []
+            )
+            if isinstance(item, list) and len(item) == 2
+        ),
+        message_id=str(value.get("message_id") or ""),
+        plan_token=str(value.get("plan_token") or ""),
+        revision=str(value.get("revision") or ""),
+    )
+
+
 class _OfflockClient:
     """Release the state flock around one provider call and reload afterwards."""
 
-    def __init__(self, client: Any, store: dict[str, Any]) -> None:
-        self._client = client
-        self._store = store
+    __slots__ = ("__provider", "__provider_kind", "__store")
+
+    def __init__(
+        self,
+        client: Any,
+        store: dict[str, Any],
+        provider_kind: str = "telegram",
+    ) -> None:
+        object.__setattr__(self, "_OfflockClient__provider", client)
+        object.__setattr__(self, "_OfflockClient__store", store)
+        object.__setattr__(
+            self, "_OfflockClient__provider_kind", str(provider_kind)
+        )
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in {
+            "_client",
+            "_store",
+            "_provider",
+            "_raw",
+            "_invoke",
+            "_invoke_read",
+            "_OfflockClient__provider",
+            "_OfflockClient__store",
+        }:
+            raise AttributeError(
+                "raw provider state is private to the capability executor"
+            )
+        return object.__getattribute__(self, name)
+
+    def _execute_entry(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        raise RuntimeError(
+            "low-level off-lock executor is private to audited wrappers"
+        )
+
+    def _execute_exact(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        raise RuntimeError(
+            "low-level off-lock executor is private to audited wrappers"
+        )
 
     def __getattr__(self, name: str) -> Any:
-        attribute = getattr(self._client, name)
-        if not callable(attribute):
-            return attribute
-        if name == "with_token":
-            return lambda *args, **kwargs: _OfflockClient(
-                attribute(*args, **kwargs), self._store
+        if name in {
+            "_client",
+            "_store",
+            "_provider",
+            "_raw",
+            "_invoke",
+            "_invoke_read",
+            "_OfflockClient__provider",
+            "_OfflockClient__store",
+        }:
+            raise AttributeError(
+                "raw provider state is private to the capability executor"
             )
+        callable_attribute, value, provider_kind = (
+            _OFFLOCK_EXECUTOR.describe(self, name)
+        )
+        if not callable_attribute:
+            return value
+        if name == "with_token":
+            return lambda *args, **kwargs: _OFFLOCK_EXECUTOR.with_token(
+                self, *args, **kwargs
+            )
+        if name == "api":
+            def checked_api(method: str, *args: Any, **kwargs: Any) -> Any:
+                if not str(method).startswith("get"):
+                    raise RuntimeError(
+                        "off-lock mutating provider api call requires "
+                        "_execute_entry_operation or "
+                        "_execute_exact_provider_operation"
+                    )
+                return _OFFLOCK_EXECUTOR.read(
+                    self, "api", method, *args, **kwargs
+                )
+
+            return checked_api
+        if name not in _READ_ONLY_PROVIDER_METHODS.get(
+            provider_kind, frozenset()
+        ):
+            def rejected(*_args: Any, **_kwargs: Any) -> Any:
+                raise RuntimeError(
+                    f"off-lock mutating provider method {name!r} requires "
+                    "_execute_entry_operation or "
+                    "_execute_exact_provider_operation"
+                )
+
+            return rejected
 
         def call(*args: Any, **kwargs: Any) -> Any:
-            if not state.lock_actually_held():
-                # An outer phase may already have released the flock.  In that
-                # case a nested save/reload would write the whole stale store
-                # without exclusion and could roll back a lane child commit.
-                return attribute(*args, **kwargs)
-            # Phase 1 persists every state transition that precedes the provider
-            # operation. Phase 2 performs the slow call off-lock. Phase 3 reloads
-            # concurrent command writes before the caller applies the outcome.
-            state.save_state(self._store)
-            try:
-                with state.released_lock():
-                    return attribute(*args, **kwargs)
-            finally:
-                # A provider may raise (notably RateLimited).  The caller can
-                # catch and continue, so it must still see concurrent commits
-                # before any later save under the re-acquired lock.
-                state.reload_state_in_place(self._store)
+            return _OFFLOCK_EXECUTOR.read(self, name, *args, **kwargs)
 
         return call
+
+
+class _ExactOfflockClient:
+    """Reason-scoped capability proxy for exact-id/lease workflows."""
+
+    def __init__(self, client: _OfflockClient, reason: str) -> None:
+        if not str(reason).strip():
+            raise ValueError("exact off-lock client requires a written reason")
+        object.__setattr__(self, "_ExactOfflockClient__guarded", client)
+        object.__setattr__(self, "_ExactOfflockClient__reason", reason)
+
+    def __getattr__(self, name: str) -> Any:
+        guarded = object.__getattribute__(
+            self, "_ExactOfflockClient__guarded"
+        )
+        reason = object.__getattribute__(
+            self, "_ExactOfflockClient__reason"
+        )
+        if name in {"_client", "_provider", "_store"}:
+            raise AttributeError(
+                "raw provider state is private to the capability executor"
+            )
+        if name == "with_token":
+            return lambda *args, **kwargs: _ExactOfflockClient(
+                guarded.with_token(*args, **kwargs),
+                reason,
+            )
+        provider_kind = _OFFLOCK_EXECUTOR.provider_kind(guarded)
+        if name in _READ_ONLY_PROVIDER_METHODS.get(
+            provider_kind, frozenset()
+        ):
+            return getattr(guarded, name)
+        capability = f"{provider_kind}.{name}"
+        return lambda *args, **kwargs: _OFFLOCK_EXECUTOR.mutation(
+            guarded,
+            _provider_mutation(
+                capability,
+                reason=f"{capability}: {reason}",
+                args=args,
+                kwargs=kwargs,
+            ),
+        )
+
+
+def _build_offlock_executor() -> Any:
+    """Create the only raw-provider authority.
+
+    The raw provider and the single-consumption ledger live behind this
+    closure.  There is deliberately no module-visible token that ordinary
+    source code can borrow to turn an arbitrary callback into an executor.
+    """
+
+    consumed: weakref.WeakSet[_ProviderMutation] = weakref.WeakSet()
+
+    def internals(client: _OfflockClient) -> tuple[Any, dict[str, Any], str]:
+        return (
+            object.__getattribute__(client, "_OfflockClient__provider"),
+            object.__getattribute__(client, "_OfflockClient__store"),
+            object.__getattribute__(
+                client, "_OfflockClient__provider_kind"
+            ),
+        )
+
+    def invoke_provider_mutation(
+        provider: Any, mutation: _ProviderMutation
+    ) -> Any:
+        if mutation in consumed:
+            raise RuntimeError(
+                "provider mutation capability was already consumed"
+            )
+        consumed.add(mutation)
+        if mutation.api_token:
+            provider = provider.with_token(mutation.api_token)
+        args = mutation.args
+        kwargs = dict(mutation.kwargs)
+        method_name = _DIRECT_PROVIDER_CAPABILITIES.get(
+            mutation.capability
+        )
+        if method_name is not None:
+            method = getattr(provider, method_name, None)
+            if method is None and method_name.endswith("_for_cleanup"):
+                method = getattr(
+                    provider, method_name.removesuffix("_for_cleanup")
+                )
+            return method(*args, **kwargs)
+        if mutation.capability == "telegram.edit_feed_item":
+            return edit_feed_item(provider, *args, **kwargs)
+        if mutation.capability == "telegram.send_feed_item":
+            return send_feed_item(provider, *args, **kwargs)
+        if mutation.capability == "telegram.edit_turn_delivery_part":
+            return edit_turn_delivery_part(provider, *args, **kwargs)
+        if mutation.capability == "telegram.send_turn_delivery_part":
+            return send_turn_delivery_part(provider, *args, **kwargs)
+        if mutation.capability == "telegram.delete_turn_delivery_message":
+            return delete_turn_delivery_message(provider, *args, **kwargs)
+        if mutation.capability == "telegram.send_voice_batch":
+            (
+                chunks,
+                turn_id,
+                chat_id,
+                thread_id,
+                reply_to,
+            ) = args
+            ids: list[str] = []
+            for index, chunk in enumerate(chunks):
+                try:
+                    dest = (
+                        speech.outbound_speech_dir(prune=(index == 0))
+                        / (
+                            "reply-"
+                            + short_hash(
+                                {"t": turn_id, "i": index, "h": chunk},
+                                16,
+                            )
+                            + ".ogg"
+                        )
+                    )
+                    if not speech.speech_request(
+                        "tts", {"text": chunk, "dest": str(dest)}
+                    ).get("ok"):
+                        continue
+                    sent = provider.send_voice(
+                        chat_id,
+                        dest,
+                        thread_id=thread_id,
+                        reply_to_message_id=(
+                            reply_to if index == 0 else None
+                        ),
+                        notify=False,
+                    )
+                    if sent.get("ok") and sent.get("message_id"):
+                        ids.append(str(sent.get("message_id")))
+                except Exception as exc:
+                    print(
+                        f"herdres speak-reply chunk failed: {exc}",
+                        file=sys.stderr,
+                    )
+            return ids
+        raise AssertionError(
+            "unhandled provider mutation capability: "
+            f"{mutation.capability}"
+        )
+
+    def invoke_offlock(
+        client: _OfflockClient, call: Callable[[Any], Any]
+    ) -> Any:
+        provider, store, _kind = internals(client)
+        if not state.lock_actually_held():
+            return call(provider)
+        state.save_state(store)
+        try:
+            with state.released_lock():
+                return call(provider)
+        finally:
+            # Replace nested state instead of reconciling it in place.  Any
+            # entry reference retained across this provider window is now
+            # detectably stale and cannot mutate the reloaded owner.
+            fresh = state.load_state()
+            store.clear()
+            store.update(fresh)
+
+    class Executor:
+        @staticmethod
+        def describe(
+            client: _OfflockClient, name: str
+        ) -> tuple[bool, Any, str]:
+            provider, _store, provider_kind = internals(client)
+            attribute = getattr(provider, name)
+            return callable(attribute), (
+                None if callable(attribute) else attribute
+            ), provider_kind
+
+        @staticmethod
+        def store(client: _OfflockClient) -> dict[str, Any]:
+            _provider, store, _kind = internals(client)
+            return store
+
+        @staticmethod
+        def provider_kind(client: _OfflockClient) -> str:
+            _provider, _store, provider_kind = internals(client)
+            return provider_kind
+
+        @staticmethod
+        def with_token(
+            client: _OfflockClient, *args: Any, **kwargs: Any
+        ) -> Any:
+            provider, store, provider_kind = internals(client)
+            return _OfflockClient(
+                provider.with_token(*args, **kwargs),
+                store,
+                provider_kind,
+            )
+
+        @staticmethod
+        def read(
+            client: _OfflockClient,
+            method_name: str,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            _provider, _store, provider_kind = internals(client)
+            allowed = method_name in _READ_ONLY_PROVIDER_METHODS.get(
+                provider_kind, frozenset()
+            ) and method_name != "with_token"
+            if method_name == "api":
+                allowed = bool(args and str(args[0]).startswith("get"))
+            if not allowed:
+                raise RuntimeError(
+                    f"off-lock provider method {method_name!r} is not "
+                    "classified read-only"
+                )
+            return invoke_offlock(
+                client,
+                lambda provider: getattr(provider, method_name)(
+                    *args, **kwargs
+                ),
+            )
+
+        @staticmethod
+        def mutation(
+            client: _OfflockClient, mutation: _ProviderMutation
+        ) -> Any:
+            return invoke_offlock(
+                client,
+                lambda provider: invoke_provider_mutation(
+                    provider, mutation
+                ),
+            )
+
+        @staticmethod
+        def direct(
+            provider: Any, mutation: _ProviderMutation
+        ) -> Any:
+            return invoke_provider_mutation(provider, mutation)
+
+    return Executor()
+
+
+_OFFLOCK_EXECUTOR = _build_offlock_executor()
+
+
+def _apply_provider_capability_state(
+    store: dict[str, Any], result: Any
+) -> None:
+    """Apply provider facts returned by pure off-lock adapters after reload."""
+
+    if not isinstance(result, dict):
+        return
+    update = result.get(RICH_STATE_UPDATE_KEY)
+    if not isinstance(update, dict):
+        return
+    transition = str(update.get("transition") or "")
+    reason = compact_ws(update.get("reason"), 300)
+    telegram = _telegram_state(store)
+    rich = telegram.setdefault("rich_messages", {})
+    if not isinstance(rich, dict):
+        rich = {}
+        telegram["rich_messages"] = rich
+    if transition == "supported":
+        rich["supported"] = "yes"
+        rich.pop("disabled_reason", None)
+        rich.pop("bad_request_streak", None)
+        return
+    if transition == "disabled":
+        rich["supported"] = "no"
+        rich["disabled_reason"] = reason
+        rich["disabled_render_version"] = RICH_RENDER_VERSION
+        return
+    if transition != "bad_request":
+        return
+    try:
+        streak = int(rich.get("bad_request_streak") or 0)
+    except (TypeError, ValueError):
+        streak = 0
+    streak += 1
+    rich["bad_request_streak"] = streak
+    if streak >= RICH_BAD_REQUEST_LIMIT:
+        rich["supported"] = "no"
+        rich["disabled_reason"] = f"repeated bad_request: {reason}"
+        rich["disabled_render_version"] = RICH_RENDER_VERSION
+
+
+def _exact_provider_client(client: Any, *, reason: str) -> Any:
+    """Deliberate capability for a documented non-entry provider workflow."""
+
+    if not str(reason).strip():
+        raise ValueError("exact provider client requires a written reason")
+    if isinstance(client, _OfflockClient):
+        return _ExactOfflockClient(client, reason)
+    return client
+
+
+def _execute_entry_operation(
+    store: dict[str, Any],
+    client: Any,
+    operation: _OfflockEntryOperation,
+    mutation: _ProviderMutation,
+    *,
+    acceptance_checkpoint: (
+        Callable[[Any, _OfflockEntryOperation], None] | None
+    ) = None,
+) -> _OfflockEntryExecution:
+    """Execute an entry mutation and resolve its immutable request owner.
+
+    This is the sole entry-targeted mutating provider surface. Callers receive
+    the provider result and disposition together, so post-call code never needs
+    to recover routing provenance from a reloaded entry.
+    """
+
+    if not isinstance(operation, _OfflockEntryOperation):
+        raise TypeError("entry mutation requires _OfflockEntryOperation")
+    if not isinstance(mutation, _ProviderMutation):
+        raise TypeError("entry mutation requires one provider capability")
+    if isinstance(client, _OfflockClient):
+        result = _OFFLOCK_EXECUTOR.mutation(client, mutation)
+    elif state.lock_actually_held():
+        state.save_state(store)
+        try:
+            with state.released_lock():
+                result = _OFFLOCK_EXECUTOR.direct(client, mutation)
+        finally:
+            fresh = state.load_state()
+            store.clear()
+            store.update(fresh)
+    else:
+        result = _OFFLOCK_EXECUTOR.direct(client, mutation)
+    _apply_provider_capability_state(store, result)
+    if acceptance_checkpoint is not None:
+        acceptance_checkpoint(result, operation)
+    return _OfflockEntryExecution(
+        result=result,
+        resolution=_compare_and_apply_entry_operation(store, operation),
+    )
+
+
+def _execute_exact_provider_operation(
+    client: Any,
+    *,
+    mutation: _ProviderMutation,
+    store: dict[str, Any] | None = None,
+) -> Any:
+    """Execute an exact-provider-id mutation independent of pane ownership."""
+
+    if not isinstance(mutation, _ProviderMutation):
+        raise TypeError("exact mutation requires one provider capability")
+    if isinstance(client, _OfflockClient):
+        result = _OFFLOCK_EXECUTOR.mutation(client, mutation)
+        if store is not None:
+            _apply_provider_capability_state(store, result)
+        return result
+    if store is not None and state.lock_actually_held():
+        state.save_state(store)
+        try:
+            with state.released_lock():
+                result = _OFFLOCK_EXECUTOR.direct(client, mutation)
+        finally:
+            fresh = state.load_state()
+            store.clear()
+            store.update(fresh)
+        _apply_provider_capability_state(store, result)
+        return result
+    result = _OFFLOCK_EXECUTOR.direct(client, mutation)
+    if store is not None:
+        _apply_provider_capability_state(store, result)
+    return result
 
 
 def _offlock_runtime(
@@ -121,8 +1031,8 @@ def _offlock_runtime(
     if not state.lock_held() or runtime.dry_run:
         return runtime
     return SyncRuntime(
-        _OfflockClient(runtime.tendwire, store),
-        _OfflockClient(runtime.telegram, store),
+        _OfflockClient(runtime.tendwire, store, "tendwire"),
+        _OfflockClient(runtime.telegram, store, "telegram"),
         dry_run=runtime.dry_run,
         with_outbox=runtime.with_outbox,
         max_sends=runtime.max_sends,
@@ -543,7 +1453,21 @@ def _select_space_worker(workers: list[dict[str, Any]], turn_status_by_worker: d
     return max(workers, key=lambda worker: str(worker.get("last_seen_at") or "")) if workers else {}
 
 
-def _delivery_entry(space_entry: dict[str, Any], worker_entry: dict[str, Any] | None = None) -> dict[str, Any]:
+def _complete_topic_recovery(entry: dict[str, Any], topic_id: str) -> None:
+    recovery = entry.pop("topic_recovery_pending", None)
+    if not isinstance(recovery, dict):
+        return
+    recovery = dict(recovery)
+    recovery["replacement_topic_id"] = topic_id
+    recovery["recovered_at"] = time.time()
+    entry["last_topic_recovery"] = recovery
+
+
+def _delivery_entry(
+    store: dict[str, Any],
+    space_entry: dict[str, Any],
+    worker_entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     worker_entry = worker_entry or {}
     entry = worker_entry
     worker_name = compact_ws(worker_entry.get("worker_name") or worker_entry.get("agent"), 80)
@@ -552,7 +1476,13 @@ def _delivery_entry(space_entry: dict[str, Any], worker_entry: dict[str, Any] | 
         entry["topic_name"] = f"{space_name} · {worker_name}"
     elif space_name:
         entry["topic_name"] = space_name
-    entry["topic_id"] = str(space_entry.get("topic_id") or "")
+    state.discard_tombstoned_topic_binding(store, space_entry)
+    space_topic_id = str(space_entry.get("topic_id") or "")
+    if space_topic_id:
+        entry["topic_id"] = space_topic_id
+        _complete_topic_recovery(entry, space_topic_id)
+    else:
+        entry.pop("topic_id", None)
     entry["tendwire_space_id"] = space_entry.get("tendwire_space_id") or worker_entry.get("tendwire_space_id")
     entry["space_topic_name"] = space_name
     entry["tendwire_worker_id"] = worker_entry.get("tendwire_worker_id") or space_entry.get("active_worker_id")
@@ -603,6 +1533,275 @@ def _telegram_state(store: dict[str, Any]) -> dict[str, Any]:
     return telegram
 
 
+def _accepted_notification_messages(
+    store: dict[str, Any], *, create: bool
+) -> dict[str, dict[str, Any]]:
+    telegram = _telegram_state(store)
+    records = telegram.get("accepted_notification_messages")
+    if not isinstance(records, dict):
+        if not create:
+            return {}
+        records = {}
+        telegram["accepted_notification_messages"] = records
+    return records
+
+
+def _accepted_created_topics(
+    store: dict[str, Any], *, create: bool
+) -> dict[str, dict[str, Any]]:
+    telegram = _telegram_state(store)
+    records = telegram.get("accepted_created_topics")
+    if not isinstance(records, dict):
+        if not create:
+            return {}
+        records = {}
+        telegram["accepted_created_topics"] = records
+    return records
+
+
+def _checkpoint_accepted_created_topic(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    operation: _OfflockEntryOperation,
+    result: Any,
+    *,
+    topic_name: str,
+) -> str:
+    """Journal a non-idempotent accepted topic before owner disposition."""
+
+    if not isinstance(result, Mapping) or result.get("ok") is not True:
+        return ""
+    topic_id = str(result.get("topic_id") or "")
+    if not topic_id:
+        return ""
+    record = {
+        "kind": "created_topic",
+        "topic_id": topic_id,
+        "topic_name": compact_ws(topic_name, 120),
+        "owner": _operation_provenance(operation),
+    }
+    receipt_id = short_hash(record, 32)
+    _accepted_created_topics(store, create=True).setdefault(
+        receipt_id, record
+    )
+    if state.lock_actually_held():
+        state.append_accepted_notification_receipt(
+            receipt_id, record, data=store
+        )
+        _after_provider_accept(runtime)
+    return receipt_id
+
+
+def _complete_accepted_created_topic(
+    store: dict[str, Any], receipt_id: str
+) -> None:
+    if receipt_id:
+        _accepted_created_topics(store, create=False).pop(
+            receipt_id, None
+        )
+
+
+def _recover_accepted_created_topics(
+    store: dict[str, Any], runtime: SyncRuntime
+) -> int:
+    """Adopt or quarantine topic creates recovered from the sidecar."""
+
+    recovered = 0
+    records = list(
+        _accepted_created_topics(store, create=False).items()
+    )
+    for receipt_id, record in records:
+        if not isinstance(record, dict):
+            _complete_accepted_created_topic(store, receipt_id)
+            recovered += 1
+            continue
+        topic_id = str(record.get("topic_id") or "")
+        owner = record.get("owner")
+        operation = (
+            _operation_from_provenance(owner)
+            if isinstance(owner, dict)
+            else None
+        )
+        resolution = (
+            _compare_and_apply_entry_operation(store, operation)
+            if operation is not None
+            else _OfflockEntryResolution(_OFFLOCK_ABANDON)
+        )
+        entry = resolution.entry
+        if (
+            topic_id
+            and resolution.disposition == _OFFLOCK_APPLY
+            and entry is not None
+            and not entry.get("topic_id")
+        ):
+            entry["topic_id"] = topic_id
+            _complete_topic_recovery(entry, topic_id)
+        elif topic_id:
+            state.record_orphaned_created_topic(
+                store,
+                {
+                    "topic_id": topic_id,
+                    "topic_name": compact_ws(
+                        record.get("topic_name"), 120
+                    ),
+                    "owner": deepcopy(owner)
+                    if isinstance(owner, dict)
+                    else {},
+                    "reason": (
+                        "accepted_create_recovery_owner_changed"
+                    ),
+                },
+            )
+        _complete_accepted_created_topic(store, receipt_id)
+        recovered += 1
+    if recovered:
+        if runtime.checkpoint is not None:
+            runtime.checkpoint()
+        elif state.lock_actually_held():
+            state.save_state(store)
+    return recovered
+
+
+def _notification_acceptance_capacity_available(
+    store: dict[str, Any],
+) -> bool:
+    return len(
+        _accepted_notification_messages(store, create=False)
+    ) < _ACCEPTED_NOTIFICATION_LIMIT
+
+
+def _notification_kind_pending(
+    store: dict[str, Any], kind: str
+) -> bool:
+    return any(
+        isinstance(record, dict) and record.get("kind") == kind
+        for record in _accepted_notification_messages(
+            store, create=False
+        ).values()
+    )
+
+
+def _checkpoint_accepted_notification(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    operation: _OfflockEntryOperation,
+    result: Any,
+    *,
+    kind: str,
+    bot_kind: str = MANAGER_BOT_KIND,
+) -> str:
+    """Durably record an accepted exact message before disposition is known.
+
+    The provider acceptance fact crosses a small fsynced sidecar boundary
+    here.  The next canonical full-state barrier absorbs and clears that
+    journal, avoiding another whole-ledger save per notification without
+    reopening the acceptance crash window.
+    """
+
+    if not isinstance(result, Mapping) or result.get("ok") is not True:
+        return ""
+    message_id = str(result.get("message_id") or "")
+    if not message_id or message_id == "0":
+        return ""
+    receipt_id = short_hash(
+        {
+            "kind": kind,
+            "topic_id": operation.route_topic_id,
+            "message_id": message_id,
+            "provenance": _operation_provenance(operation),
+        },
+        32,
+    )
+    records = _accepted_notification_messages(store, create=True)
+    # Capacity gates starting new sends. An already-accepted provider fact is
+    # always admitted, even if a concurrent writer filled the nominal bound.
+    record = {
+        "kind": kind,
+        "topic_id": operation.route_topic_id,
+        "message_id": message_id,
+        "bot_kind": bot_kind,
+        "provenance": _operation_provenance(operation),
+    }
+    records.setdefault(receipt_id, record)
+    # Source-mode production calls run under the state flock. Unit-level
+    # in-memory helpers deliberately have no durable state path to journal.
+    if state.lock_actually_held():
+        state.append_accepted_notification_receipt(
+            receipt_id, record, data=store
+        )
+        _after_provider_accept(runtime)
+    return receipt_id
+
+
+def _complete_accepted_notification(
+    store: dict[str, Any], receipt_id: str
+) -> None:
+    if receipt_id:
+        _accepted_notification_messages(
+            store, create=False
+        ).pop(receipt_id, None)
+
+
+def _drain_accepted_notifications(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+) -> tuple[int, int]:
+    """Delete stale accepted cards before permitting replacement sends."""
+
+    completed = 0
+    pending = 0
+    for receipt_id, raw in list(
+        _accepted_notification_messages(
+            store, create=False
+        ).items()
+    ):
+        if not isinstance(raw, dict):
+            _complete_accepted_notification(store, receipt_id)
+            completed += 1
+            continue
+        message_id = str(raw.get("message_id") or "")
+        if not message_id:
+            _complete_accepted_notification(store, receipt_id)
+            completed += 1
+            continue
+        try:
+            owner_token = _owning_bot_token(
+                store,
+                str(raw.get("bot_kind") or MANAGER_BOT_KIND),
+            )
+            deleted = _execute_exact_provider_operation(
+                runtime.telegram,
+                store=store,
+                mutation=_provider_mutation(
+                    "telegram.delete_message",
+                    reason=(
+                        "telegram.delete_message: retire accepted stale "
+                        "notification"
+                    ),
+                    args=(chat_id, message_id),
+                    api_token=owner_token,
+                ),
+            )
+        except Exception:
+            pending += 1
+            continue
+        if (
+            deleted.get("ok") is not True
+            and classify_telegram_error(deleted.get("error"))
+            != "not_found"
+        ):
+            pending += 1
+            continue
+        _retire_local_message(store, None, message_id)
+        _complete_accepted_notification(store, receipt_id)
+        completed += 1
+        if runtime.checkpoint is not None:
+            runtime.checkpoint()
+    return completed, pending
+
+
 def _delivery_bot(store: dict[str, Any], entry: dict[str, Any]) -> tuple[str | None, str]:
     telegram = _telegram_state(store)
     token = managed_bot_token_for_entry(telegram, entry)
@@ -615,6 +1814,40 @@ def _record_delivery_error(entry: dict[str, Any], result: dict[str, Any], bot_ki
     if bot_kind != MANAGER_BOT_KIND:
         entry["last_managed_bot_kind"] = bot_kind
         entry["last_managed_bot_error"] = error
+
+
+def _repair_provider_gone_topic(
+    store: dict[str, Any],
+    entry: dict[str, Any] | None,
+    result: dict[str, Any],
+    *,
+    topic_id: str,
+) -> bool:
+    """Repair a gone topic only when the failed operation named its id."""
+    kind = str(result.get("kind") or "")
+    classified = classify_telegram_error(result.get("error"))
+    if (
+        result.get("topic_missing") is not True
+        and kind != "topic_not_found"
+        and classified != "topic_not_found"
+    ):
+        return False
+    proven_topic_id = str(topic_id or "")
+    if not proven_topic_id:
+        return False
+    if (
+        entry is not None
+        and str(entry.get("topic_id") or "") == proven_topic_id
+        and state.clear_gone_live_topic(
+            store,
+            entry,
+            error_kind="topic_not_found",
+            error=result.get("error"),
+        )
+    ):
+        return True
+    state.tombstone_dead_topic(store, proven_topic_id)
+    return True
 
 
 def _record_delivery_success(entry: dict[str, Any], bot_kind: str) -> None:
@@ -660,7 +1893,7 @@ def _entry_for_turn(store: dict[str, Any], item: dict[str, Any]) -> tuple[str | 
     )
     if space_entry is None:
         return None, None
-    return key, _delivery_entry(space_entry, worker_entry)
+    return key, _delivery_entry(store, space_entry, worker_entry)
 
 
 def _turn_id(item: dict[str, Any]) -> str:
@@ -1519,16 +2752,31 @@ def _promote_working_to_final(
     # single safe edit, use the send path instead so long responses are split.
     if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(feed_item):
         return False
-    sent = edit_feed_item(
-        runtime.telegram,
-        chat_id,
-        stream_message_id,
-        feed_item,
-        telegram=telegram,
-        api_token=api_token,
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=thread_id,
+        message_id=stream_message_id,
+        observe=("last_stream_message_id",),
     )
-    if not sent.get("ok"):
+    execution = _execute_entry_operation(
+        store,
+        runtime.telegram,
+        operation,
+        _provider_mutation(
+            "telegram.edit_feed_item",
+            reason=(
+                "telegram.edit_feed_item: promote working card to final"
+            ),
+            args=(chat_id, stream_message_id, feed_item),
+            kwargs={"telegram": telegram, "api_token": api_token},
+        ),
+    )
+    sent, resolution = execution.result, execution.resolution
+    if not sent.get("ok") or resolution.disposition != _OFFLOCK_APPLY:
         return False
+    entry = resolution.entry
+    assert entry is not None
     edited_message_id = str(sent.get("message_id") or "").strip()
     message_id = edited_message_id if edited_message_id and edited_message_id != "0" else stream_message_id
     _record_final_delivery_success(
@@ -1569,16 +2817,30 @@ def _replace_changed_final(
     feed_item = _turn_feed_item(item, entry)
     if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(feed_item):
         return False
-    sent = edit_feed_item(
-        runtime.telegram,
-        chat_id,
-        message_ids[0],
-        feed_item,
-        telegram=telegram,
-        api_token=api_token,
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=thread_id,
+        message_id=message_ids[0],
     )
-    if not sent.get("ok"):
+    execution = _execute_entry_operation(
+        store,
+        runtime.telegram,
+        operation,
+        _provider_mutation(
+            "telegram.edit_feed_item",
+            reason=(
+                "telegram.edit_feed_item: replace changed final card"
+            ),
+            args=(chat_id, message_ids[0], feed_item),
+            kwargs={"telegram": telegram, "api_token": api_token},
+        ),
+    )
+    sent, resolution = execution.result, execution.resolution
+    if not sent.get("ok") or resolution.disposition != _OFFLOCK_APPLY:
         return False
+    entry = resolution.entry
+    assert entry is not None
     edited_message_id = str(sent.get("message_id") or "").strip()
     message_id = edited_message_id if edited_message_id and edited_message_id != "0" else message_ids[0]
     _record_final_delivery_success(
@@ -1660,22 +2922,47 @@ def _fold_superseded_final(
         return False
     if fold_state is not None:
         fold_state["issued"] = fold_state.get("issued", 0) + 1
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=str(entry.get("topic_id") or ""),
+        message_id=message_id,
+    )
     try:
-        sent = edit_feed_item(
+        execution = _execute_entry_operation(
+            store,
             runtime.telegram,
-            chat_id,
-            message_id,
-            folded_item,
-            telegram=telegram,
-            api_token=api_token,
+            operation,
+            _provider_mutation(
+                "telegram.edit_feed_item",
+                reason=(
+                    "telegram.edit_feed_item: fold superseded final card"
+                ),
+                args=(chat_id, message_id, folded_item),
+                kwargs={"telegram": telegram, "api_token": api_token},
+            ),
         )
     except Exception as exc:  # a rate-limit/transport blip must not abort the sync pass
         print(f"herdres fold edit failed: {exc}", file=sys.stderr)
-        binding["fold_attempts"] = int(binding.get("fold_attempts") or 0) + 1
+        _compare_and_apply_entry_operation(store, operation)
+        current_binding = state.find_message_binding(store, message_id)
+        if current_binding is not None:
+            current_binding["fold_attempts"] = (
+                int(current_binding.get("fold_attempts") or 0) + 1
+            )
         return True
+    sent = execution.result
+    # Folding is an exact-message cosmetic fact, not routing state. Apply it
+    # to the exact binding even when the pane owner moved during the edit.
+    binding = state.find_message_binding(store, message_id) or binding
     error = str(sent.get("error") or "").lower()
-    if sent.get("ok") or "not found" in error or _topic_missing(sent.get("error")):
+    if sent.get("ok") or _message_missing(sent.get("error")):
         binding["folded"] = True  # done (or the message/topic is gone — nothing left to fold)
+        return True
+    if _topic_missing(sent.get("error")) or "not found" in error:
+        # Edits carry only a message id. They cannot prove which historical
+        # topic is gone, so a cosmetic fold must never tombstone any topic.
+        binding["folded"] = True
         return True
     binding["fold_attempts"] = int(binding.get("fold_attempts") or 0) + 1
     return True
@@ -1694,6 +2981,7 @@ def _ensure_topic(
         and not state.entry_is_routable(entry)
     ):
         return False, False
+    state.discard_tombstoned_topic_binding(store, entry)
     if entry.get("topic_id"):
         return False, False
     if str(entry.get("entry_type") or "") == "worker":
@@ -1701,6 +2989,9 @@ def _ensure_topic(
         if identity is not None and any(
             other is not entry
             and other.get("topic_id")
+            and not state.topic_id_is_tombstoned(
+                store, other.get("topic_id")
+            )
             and state.entry_is_routable(other)
             and state.entry_stable_identity(other) == identity
             for other in state.source_worker_entries(store).values()
@@ -1712,19 +3003,83 @@ def _ensure_topic(
     reused = state.find_legacy_topic_id_by_name(store, entry.get("topic_name") or "")
     if reused:
         entry["topic_id"] = reused
+        _complete_topic_recovery(entry, reused)
         return False, False
     if runtime.dry_run:
         return True, False
-    if not can_create:
+    if (
+        not can_create
+        or len(state.orphaned_created_topics(store))
+        >= state.ORPHANED_CREATED_TOPIC_LIMIT
+    ):
         return True, False   # real create deferred by the per-pass create cap; retry next tick
     topic_name = entry.get("topic_name") or state.topic_name_for_space(source)
-    created = runtime.telegram.create_topic(chat_id, topic_name, icon_color=topic_color_for_name(topic_name))
+    operation = _capture_entry_operation(store, entry)
+    accepted_receipt_id = ""
+
+    def checkpoint_created_topic(
+        result: Any, captured: _OfflockEntryOperation
+    ) -> None:
+        nonlocal accepted_receipt_id
+        accepted_receipt_id = _checkpoint_accepted_created_topic(
+            store,
+            runtime,
+            captured,
+            result,
+            topic_name=str(topic_name),
+        )
+
+    execution = _execute_entry_operation(
+        store,
+        runtime.telegram,
+        operation,
+        _provider_mutation(
+            "telegram.create_topic",
+            reason="telegram.create_topic: mint missing pane topic",
+            args=(chat_id, topic_name),
+            kwargs={"icon_color": topic_color_for_name(topic_name)},
+        ),
+        acceptance_checkpoint=checkpoint_created_topic,
+    )
+    created, resolution = execution.result, execution.resolution
+    if resolution.disposition != _OFFLOCK_APPLY:
+        created_topic_id = str(created.get("topic_id") or "")
+        if created.get("ok") and created_topic_id:
+            state.record_orphaned_created_topic(
+                store,
+                {
+                    "topic_id": created_topic_id,
+                    "topic_name": compact_ws(topic_name, 120),
+                    "owner": _operation_provenance(operation),
+                    "reason": "owner_changed_during_create",
+                },
+            )
+            _complete_accepted_created_topic(
+                store, accepted_receipt_id
+            )
+            if (
+                not state.lock_actually_held()
+                and runtime.checkpoint is not None
+            ):
+                runtime.checkpoint()
+        return False, bool(created.get("ok") and created_topic_id)
+    entry = resolution.entry
+    assert entry is not None
     if created.get("ok") and created.get("topic_id"):
         entry["topic_id"] = str(created["topic_id"])
-        # Topic creation has no provider idempotency key. Persist the returned
-        # identity before any later turn validation can abort this sync pass,
-        # otherwise the next pass can create a duplicate topic.
-        if runtime.checkpoint is not None:
+        _complete_topic_recovery(entry, str(created["topic_id"]))
+        _complete_accepted_created_topic(
+            store, accepted_receipt_id
+        )
+        # Topic creation has no provider idempotency key. Its compact receipt
+        # was fsynced at provider acceptance, so the next ordinary state
+        # barrier can absorb this binding without an extra full-ledger save.
+        # Direct, unlocked helper callers have no sidecar durability context,
+        # so retain their explicit checkpoint contract.
+        if (
+            not state.lock_actually_held()
+            and runtime.checkpoint is not None
+        ):
             runtime.checkpoint()
         return True, True
     entry["last_topic_error"] = compact_ws(created.get("error"), 240)
@@ -1735,14 +3090,29 @@ _ALERT_STATUSES = frozenset({"attention", "failed"})
 _RESERVED_STATUS_EMOJIS = frozenset({"\u2753", "\u203c\ufe0f", "\u2705", "\u26a1\ufe0f", "\u2615\ufe0f"})
 
 
-def _identity_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime) -> tuple[str, str]:
+def _identity_topic_icon(
+    store: dict[str, Any],
+    topic_identity: str,
+    runtime: SyncRuntime,
+) -> tuple[str, str]:
     """Deterministic per-topic identity icon from the allowed forum icon set."""
-    catalog = topic_icon_catalog(store, runtime.telegram)
+    catalog = topic_icon_catalog(
+        store,
+        runtime.telegram,
+        checkpoint=runtime.checkpoint,
+    )
     choices = sorted(emoji for emoji in catalog if emoji not in _RESERVED_STATUS_EMOJIS)
     if not choices:
         return "", ""
-    key = compact_ws(entry.get("topic_name") or entry.get("topic_id"), 80)
-    emoji = choices[int(short_hash({"topic_icon": key}, 8), 16) % len(choices)]
+    emoji = choices[
+        int(
+            short_hash(
+                {"topic_icon": compact_ws(topic_identity, 80)}, 8
+            ),
+            16,
+        )
+        % len(choices)
+    ]
     return emoji, catalog.get(emoji, "")
 
 
@@ -1761,15 +3131,44 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
         return False
     status = normalized_status(entry.get("status") or entry.get("tendwire_status_line"))
     current = str(entry.get("last_topic_icon") or "")
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=thread_id,
+        observe=(
+            "status",
+            "tendwire_status_line",
+            "last_topic_icon",
+            "last_topic_icon_id",
+        ),
+    )
+    topic_identity = str(
+        entry.get("topic_name") or entry.get("topic_id") or ""
+    )
     if status in _ALERT_STATUSES:
         emoji = status_emoji(status)
-        emoji_id = topic_icon_id(store, emoji, runtime.telegram)
+        emoji_id = topic_icon_id(
+            store,
+            emoji,
+            runtime.telegram,
+            checkpoint=runtime.checkpoint,
+        )
     else:
         if current and current not in _RESERVED_STATUS_EMOJIS and entry.get("last_topic_icon_id"):
             return False
-        emoji, emoji_id = _identity_topic_icon(store, entry, runtime)
+        emoji, emoji_id = _identity_topic_icon(
+            store, topic_identity, runtime
+        )
         if not emoji:
             return False
+    # Catalogue reads are guarded provider calls and can replace every nested
+    # state object. Resolve the captured durable owner before any icon field is
+    # inspected or changed; the pre-read ``entry`` is dead from here onward.
+    resolution = _compare_and_apply_entry_operation(store, operation)
+    if resolution.disposition != _OFFLOCK_APPLY:
+        return False
+    entry = resolution.entry
+    assert entry is not None
     if not emoji_id:
         entry["last_topic_icon_missing"] = emoji
         return False
@@ -1780,7 +3179,32 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
         entry["last_topic_icon_id"] = emoji_id
         entry.pop("last_topic_icon_missing", None)
         return True
-    result = runtime.telegram.edit_topic_icon(chat_id, thread_id, emoji_id)
+    operation = _capture_entry_operation(store, entry, topic_id=thread_id)
+    execution = _execute_entry_operation(
+        store,
+        runtime.telegram,
+        operation,
+        _provider_mutation(
+            "telegram.edit_topic_icon",
+            reason="telegram.edit_topic_icon: update pane status icon",
+            args=(chat_id, thread_id, emoji_id),
+        ),
+    )
+    result, resolution = execution.result, execution.resolution
+    if _topic_missing(result.get("error")):
+        _repair_provider_gone_topic(
+            store,
+            resolution.entry
+            if resolution.disposition == _OFFLOCK_APPLY
+            else None,
+            result,
+            topic_id=thread_id,
+        )
+        return False
+    if resolution.disposition != _OFFLOCK_APPLY:
+        return False
+    entry = resolution.entry
+    assert entry is not None
     if result.get("ok") or _topic_not_modified(result.get("error")):
         entry["last_topic_icon"] = emoji
         entry["last_topic_icon_id"] = emoji_id
@@ -1922,31 +3346,123 @@ def _sync_topic_pinned(
         _record_topic_pinned_status(entry, message_id=message_id or "0", content_hash=content_hash, pinned=True)
         return True
     sent: dict[str, Any]
+    accepted_receipt_id = ""
     if message_id:
-        sent = runtime.telegram.edit_message(chat_id, message_id, html)
+        edit_operation = _capture_entry_operation(
+            store,
+            entry,
+            topic_id=thread_id,
+            message_id=message_id,
+            observe=("pinned_status_message_id",),
+        )
+        execution = _execute_entry_operation(
+            store,
+            runtime.telegram,
+            edit_operation,
+            _provider_mutation(
+                "telegram.edit_message",
+                reason="telegram.edit_message: refresh per-topic pin",
+                args=(chat_id, message_id, html),
+            ),
+        )
+        sent, edit_resolution = execution.result, execution.resolution
+        if edit_resolution.disposition != _OFFLOCK_APPLY:
+            return False
+        entry = edit_resolution.entry
+        assert entry is not None
         if sent.get("ok"):
             pass
-        elif _message_missing(sent.get("error")):
+        elif _message_missing(sent.get("error")) or _topic_missing(
+            sent.get("error")
+        ):
             entry.pop("pinned_status_message_id", None)
             message_id = ""
-        elif _topic_missing(sent.get("error")):
-            entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
-            return False
         else:
             entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
             return False
     if not message_id:
-        sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
+        if (
+            not _notification_acceptance_capacity_available(store)
+            or _notification_kind_pending(store, "topic_pinned")
+        ):
+            return False
+        send_operation = _capture_entry_operation(
+            store, entry, topic_id=thread_id
+        )
+
+        def checkpoint_topic_pin(
+            result: Any, operation: _OfflockEntryOperation
+        ) -> None:
+            nonlocal accepted_receipt_id
+            accepted_receipt_id = _checkpoint_accepted_notification(
+                store,
+                runtime,
+                operation,
+                result,
+                kind="topic_pinned",
+            )
+
+        execution = _execute_entry_operation(
+            store,
+            runtime.telegram,
+            send_operation,
+            _provider_mutation(
+                "telegram.send_message",
+                reason="telegram.send_message: create per-topic pin",
+                args=(chat_id, html),
+                kwargs={"thread_id": thread_id, "notify": False},
+            ),
+            acceptance_checkpoint=checkpoint_topic_pin,
+        )
+        sent, send_resolution = execution.result, execution.resolution
+        if not sent.get("ok") and _topic_missing(sent.get("error")):
+            _repair_provider_gone_topic(
+                store,
+                send_resolution.entry
+                if send_resolution.disposition == _OFFLOCK_APPLY
+                else None,
+                sent,
+                topic_id=thread_id,
+            )
+            return False
+        if send_resolution.disposition != _OFFLOCK_APPLY:
+            return False
+        entry = send_resolution.entry
+        assert entry is not None
         if not sent.get("ok"):
-            entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
+            entry["pinned_status_last_error"] = compact_ws(
+                sent.get("error"), 240
+            )
             return False
         message_id = str(sent.get("message_id") or "")
         if not message_id:
             entry["pinned_status_last_error"] = "Telegram returned no message id for topic pinned status"
             return False
-    pin_result = runtime.telegram.pin_message(chat_id, message_id)
+    pin_operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=thread_id,
+        message_id=message_id,
+        observe=("pinned_status_message_id",),
+    )
+    execution = _execute_entry_operation(
+        store,
+        runtime.telegram,
+        pin_operation,
+        _provider_mutation(
+            "telegram.pin_message",
+            reason="telegram.pin_message: pin per-topic status card",
+            args=(chat_id, message_id),
+        ),
+    )
+    pin_result, pin_resolution = execution.result, execution.resolution
+    if pin_resolution.disposition != _OFFLOCK_APPLY:
+        return False
+    entry = pin_resolution.entry
+    assert entry is not None
     pinned = bool(pin_result.get("ok"))
     _record_topic_pinned_status(entry, message_id=message_id, content_hash=content_hash, pinned=pinned)
+    _complete_accepted_notification(store, accepted_receipt_id)
     if not pinned:
         entry["pinned_status_pin_error"] = compact_ws(pin_result.get("error"), 240)
     else:
@@ -2138,7 +3654,12 @@ def _sync_retired_worker_topics(
             entry.pop(field, None)
 
     changed = 0
-    for entry in state.source_worker_entries(store).values():
+    # Guarded provider calls reload the store, so never carry a nested entry
+    # reference from one retired worker to the next.
+    for entry_key in list(state.source_worker_entries(store)):
+        entry = state.source_worker_entries(store).get(entry_key)
+        if entry is None:
+            continue
         if not state.entry_is_retired(entry):
             continue
         topic_id = str(entry.get("topic_id") or "")
@@ -2147,33 +3668,88 @@ def _sync_retired_worker_topics(
         if entry.get("retired_topic_notice_pending"):
             if runtime.dry_run:
                 continue
+            if (
+                not _notification_acceptance_capacity_available(store)
+                or _notification_kind_pending(
+                    store, "retired_topic_notice"
+                )
+            ):
+                continue
             survivor_topic_id = str(entry.get("consolidated_into_topic_id") or "")
             target = (
                 f" (topic {html_escape(survivor_topic_id)})"
                 if survivor_topic_id
                 else ""
             )
-            sent = runtime.telegram.send_message(
-                chat_id,
-                "This duplicate pane topic was retired after its stable pane "
-                f"identity was consolidated into the original topic{target}. "
-                "Please continue there.",
-                thread_id=topic_id,
-                notify=False,
+            notice_operation = _capture_entry_operation(
+                store,
+                entry,
+                topic_id=topic_id,
+                observe=("retired_topic_notice_pending",),
             )
+            accepted_receipt_id = ""
+
+            def checkpoint_retired_notice(
+                result: Any, operation: _OfflockEntryOperation
+            ) -> None:
+                nonlocal accepted_receipt_id
+                accepted_receipt_id = (
+                    _checkpoint_accepted_notification(
+                        store,
+                        runtime,
+                        operation,
+                        result,
+                        kind="retired_topic_notice",
+                    )
+                )
+
+            execution = _execute_entry_operation(
+                store,
+                runtime.telegram,
+                notice_operation,
+                _provider_mutation(
+                    "telegram.send_message",
+                    reason=(
+                        "telegram.send_message: post retired-pane notice"
+                    ),
+                    args=(
+                        chat_id,
+                        "This duplicate pane topic was retired after its stable pane "
+                        f"identity was consolidated into the original topic{target}. "
+                        "Please continue there.",
+                    ),
+                    kwargs={"thread_id": topic_id, "notify": False},
+                ),
+                acceptance_checkpoint=checkpoint_retired_notice,
+            )
+            sent, notice_resolution = execution.result, execution.resolution
+            if _topic_missing(sent.get("error")):
+                _repair_provider_gone_topic(
+                    store,
+                    notice_resolution.entry
+                    if notice_resolution.disposition == _OFFLOCK_APPLY
+                    else None,
+                    sent,
+                    topic_id=topic_id,
+                )
+                changed += 1
+                continue
+            if notice_resolution.disposition != _OFFLOCK_APPLY:
+                continue
+            entry = notice_resolution.entry
+            assert entry is not None
             if sent.get("ok"):
                 entry.pop("retired_topic_notice_pending", None)
                 entry.pop("retired_topic_notice_error", None)
                 entry["retired_topic_notice_message_id"] = str(
                     sent.get("message_id") or ""
                 )
+                _complete_accepted_notification(
+                    store, accepted_receipt_id
+                )
                 changed += 1
                 if runtime.checkpoint is not None:
                     runtime.checkpoint()
-            elif _topic_missing(sent.get("error")):
-                entry.pop("retired_topic_notice_pending", None)
-                entry["retired_topic_missing"] = True
-                changed += 1
             elif classify_telegram_error(sent.get("error")) == "topic_closed":
                 stamp_closed(entry)
                 changed += 1
@@ -2186,17 +3762,47 @@ def _sync_retired_worker_topics(
         if entry.get("retired_topic_rename_pending"):
             if runtime.dry_run:
                 continue
-            renamed = runtime.telegram.rename_topic(
-                chat_id, topic_id, str(entry.get("topic_name") or "📁 Retired pane")
+            rename_operation = _capture_entry_operation(
+                store,
+                entry,
+                topic_id=topic_id,
+                observe=("retired_topic_rename_pending",),
             )
+            retired_topic_name = str(
+                entry.get("topic_name") or "📁 Retired pane"
+            )
+            execution = _execute_entry_operation(
+                store,
+                runtime.telegram,
+                rename_operation,
+                _provider_mutation(
+                    "telegram.rename_topic",
+                    reason=(
+                        "telegram.rename_topic: label retired pane archive"
+                    ),
+                    args=(chat_id, topic_id, retired_topic_name),
+                ),
+            )
+            renamed, rename_resolution = execution.result, execution.resolution
+            if _topic_missing(renamed.get("error")):
+                _repair_provider_gone_topic(
+                    store,
+                    rename_resolution.entry
+                    if rename_resolution.disposition == _OFFLOCK_APPLY
+                    else None,
+                    renamed,
+                    topic_id=topic_id,
+                )
+                changed += 1
+                continue
+            if rename_resolution.disposition != _OFFLOCK_APPLY:
+                continue
+            entry = rename_resolution.entry
+            assert entry is not None
             if renamed.get("ok") or _topic_not_modified(renamed.get("error")):
                 entry.pop("retired_topic_rename_pending", None)
                 entry.pop("retired_topic_rename_error", None)
                 entry["retired_topic_renamed"] = True
-                changed += 1
-            elif _topic_missing(renamed.get("error")):
-                entry.pop("retired_topic_rename_pending", None)
-                entry["retired_topic_missing"] = True
                 changed += 1
             elif classify_telegram_error(renamed.get("error")) == "topic_closed":
                 stamp_closed(entry)
@@ -2218,6 +3824,12 @@ def _sync_sources(
     chat_id: str,
 ) -> dict[str, int]:
     counts = {"created": 0, "updated": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
+    counts["updated"] += _recover_accepted_created_topics(
+        store, runtime
+    )
+    counts["updated"] += _cleanup_orphaned_created_topics(
+        store, runtime, chat_id=chat_id
+    )
     topic_mode = config.source_topic_mode()
     # Bound real topic-create calls per pass so a first source sync (a topic per open worker/space)
     # amortizes creation over ticks instead of one create burst under the state lock.
@@ -2347,18 +3959,48 @@ def _sync_sources(
             and not runtime.dry_run
             and renames_issued < create_cap
         ):
-            renamed = runtime.telegram.rename_topic(
-                chat_id, str(entry["topic_id"]), worker_topic_renames[assignment_key]
+            rename_topic_id = str(entry["topic_id"])
+            rename_operation = _capture_entry_operation(
+                store, entry, topic_id=rename_topic_id
+            )
+            requested_topic_name = worker_topic_renames[assignment_key]
+            execution = _execute_entry_operation(
+                store,
+                runtime.telegram,
+                rename_operation,
+                _provider_mutation(
+                    "telegram.rename_topic",
+                    reason=(
+                        "telegram.rename_topic: apply live pane label"
+                    ),
+                    args=(
+                        chat_id,
+                        rename_topic_id,
+                        requested_topic_name,
+                    ),
+                ),
             )
             renames_issued += 1
+            renamed, rename_resolution = execution.result, execution.resolution
+            if _topic_missing(renamed.get("error")):
+                _repair_provider_gone_topic(
+                    store,
+                    rename_resolution.entry
+                    if rename_resolution.disposition
+                    == _OFFLOCK_APPLY
+                    else None,
+                    renamed,
+                    topic_id=rename_topic_id,
+                )
+            if rename_resolution.disposition != _OFFLOCK_APPLY:
+                continue
+            entry = rename_resolution.entry
+            assert entry is not None
             if renamed.get("ok"):
                 entry["topic_name"] = worker_topic_renames[assignment_key]
                 entry.pop("rename_attempts", None)
                 _stamp_numbered_base(entry, assignment_key, worker_numbered_bases)
             elif _topic_missing(renamed.get("error")):
-                # the topic is gone (hand-deleted): drop the mapping so _ensure_topic recreates it
-                # under the new name instead of renaming a ghost forever.
-                entry.pop("topic_id", None)
                 entry["topic_name"] = worker_topic_renames[assignment_key]
                 entry.pop("rename_attempts", None)
                 _stamp_numbered_base(entry, assignment_key, worker_numbered_bases)
@@ -2379,6 +4021,9 @@ def _sync_sources(
             )
             creates_issued += int(topic_created)
             counts["created"] += int(topic_created or topic_needed)
+            entry = state.source_worker_entries(store).get(_key)
+            if entry is None:
+                continue
             counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["panes"] += 1
 
@@ -2430,6 +4075,9 @@ def _sync_sources(
             store, space, entry, runtime, chat_id=chat_id, can_create=creates_issued < create_cap
         )
         creates_issued += int(topic_created)
+        entry = state.source_space_entries(store).get(_key)
+        if entry is None:
+            continue
         counts["created"] += int(created or topic_created or topic_needed)
         counts["updated"] += int(not created and before != entry)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
@@ -2442,6 +4090,96 @@ def _sync_sources(
     return counts
 
 
+def _record_topic_delete_success(
+    store: dict[str, Any],
+    *,
+    topic_id: str,
+    name: Any,
+    reason: str,
+) -> tuple[frozenset[str], bool]:
+    """Record a deletion and return (cleared worker keys, state changed)."""
+    previous_tombstones = store.get("telegram_dead_topic_ids")
+    previous_tombstones = (
+        list(previous_tombstones)
+        if isinstance(previous_tombstones, list)
+        else None
+    )
+    space_alias_present = any(
+        str(entry.get("topic_id") or "") == topic_id
+        for entry in state.source_space_entries(store).values()
+    )
+    cleared_worker_keys = state.tombstone_dead_topic(store, topic_id)
+    changed = (
+        previous_tombstones != store.get("telegram_dead_topic_ids")
+        or space_alias_present
+        or bool(cleared_worker_keys)
+    )
+    audit = store.get("telegram_deleted_topics")
+    if not isinstance(audit, list):
+        audit = []
+    fact = {
+        "topic_id": topic_id,
+        "name": compact_ws(name, 120),
+        "reason": reason,
+    }
+    if fact not in audit:
+        audit.append(fact)
+        store["telegram_deleted_topics"] = audit[
+            -_TOPIC_CLEANUP_AUDIT_LIMIT:
+        ]
+        changed = True
+    return cleared_worker_keys, changed
+
+
+def _cleanup_orphaned_created_topics(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+) -> int:
+    """Retire accepted create results that lost their owner while off-lock."""
+
+    if runtime.dry_run:
+        return 0
+    changed = 0
+    for record in state.orphaned_created_topics(store)[
+        : max(1, config.source_orphan_delete_cap())
+    ]:
+        topic_id = str(record.get("topic_id") or "")
+        if not topic_id:
+            continue
+        try:
+            deleted = _execute_exact_provider_operation(
+                runtime.telegram,
+                store=store,
+                mutation=_provider_mutation(
+                    "telegram.delete_topic",
+                    reason=(
+                        "telegram.delete_topic: retire orphaned accepted create"
+                    ),
+                    args=(chat_id, topic_id),
+                ),
+            )
+        except RateLimited:
+            break
+        except Exception:
+            continue
+        if not deleted.get("ok") and not _topic_missing(
+            deleted.get("error")
+        ):
+            continue
+        _record_topic_delete_success(
+            store,
+            topic_id=topic_id,
+            name=record.get("topic_name"),
+            reason="orphaned_create_after_owner_change",
+        )
+        changed += int(state.retire_orphaned_created_topic(store, topic_id))
+        if runtime.checkpoint is not None:
+            runtime.checkpoint()
+    return changed
+
+
 def _cleanup_topics(
     store: dict[str, Any],
     runtime: SyncRuntime,
@@ -2450,13 +4188,22 @@ def _cleanup_topics(
     snapshot_worker_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     result = {"deleted": 0, "failed": 0, "pruned": 0, "changed": False}
+
+    def pop_worker(key: str) -> None:
+        panes = store.get("panes")
+        if isinstance(panes, dict):
+            panes.pop(key, None)
+
+    def pop_space(key: str) -> None:
+        spaces = store.get("spaces")
+        if isinstance(spaces, dict):
+            spaces.pop(key, None)
+
     visible_space_topics = {
         str(entry.get("topic_id"))
         for entry in state.source_space_entries(store).values()
         if entry.get("topic_id")
     }
-    panes = store.get("panes") if isinstance(store.get("panes"), dict) else {}
-    audit = store.setdefault("telegram_deleted_topics", [])
     deleted_topic_ids: set[str] = set()
     # Bound real topic-delete calls per pass so a first source sync (which can reclassify many legacy
     # per-worker topics at once) amortizes the deletes over ticks instead of one burst under the lock.
@@ -2491,7 +4238,10 @@ def _cleanup_topics(
         if live_known_ids and not (live_known_ids & snapshot_worker_ids):
             reap_enabled = False
     if reap_enabled:
-        for key, entry in list(state.source_worker_entries(store).items()):
+        for key in list(state.source_worker_entries(store)):
+            entry = state.source_worker_entries(store).get(key)
+            if entry is None:
+                continue
             if state.entry_is_retired(entry):
                 continue
             wid = compact_ws(entry.get("tendwire_worker_id") or entry.get("worker_id"), 160)
@@ -2518,41 +4268,76 @@ def _cleanup_topics(
                 result["changed"] = True
                 continue
             if not topic_id:
-                panes.pop(key, None)  # finished, gone, no topic: dead cruft
+                pop_worker(key)  # finished, gone, no topic: dead cruft
                 result["pruned"] += 1
                 result["changed"] = True
                 continue
             if deletes_issued >= delete_cap:
                 continue  # per-pass delete budget spent; retry next tick (entry still eligible)
             deletes_issued += 1
-            deleted = runtime.telegram.delete_topic(chat_id, topic_id)
+            delete_topic_name = entry.get("topic_name")
+            delete_operation = _capture_entry_operation(
+                store, entry, topic_id=topic_id
+            )
+            execution = _execute_entry_operation(
+                store,
+                runtime.telegram,
+                delete_operation,
+                _provider_mutation(
+                    "telegram.delete_topic",
+                    reason=(
+                        "telegram.delete_topic: reap absent closed worker"
+                    ),
+                    args=(chat_id, topic_id),
+                ),
+            )
+            deleted, delete_resolution = execution.result, execution.resolution
             if not deleted.get("ok") and not _topic_missing(deleted.get("error")):
                 result["failed"] += 1
-                entry["last_topic_delete_error"] = compact_ws(deleted.get("error"), 240)
+                if delete_resolution.disposition == _OFFLOCK_APPLY:
+                    assert delete_resolution.entry is not None
+                    delete_resolution.entry["last_topic_delete_error"] = (
+                        compact_ws(deleted.get("error"), 240)
+                    )
                 continue
+            _record_topic_delete_success(
+                store,
+                topic_id=topic_id,
+                name=delete_topic_name,
+                reason="reaped_closed_worker_topic",
+            )
+            deleted_topic_ids.add(topic_id)
             if deleted.get("ok"):
                 result["deleted"] += 1
-                deleted_topic_ids.add(topic_id)
-                audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": "reaped_closed_worker_topic"})
             # No de-number marker is stamped here: provenance is recorded at NUMBERING time (see
             # _assign_worker_topic_names / _stamp_numbered_base). Reaping merely frees the base name; the
             # live sibling that the connector minted "<base> N" already carries connector_numbered_base and
             # de-numbers on the next assign pass. Stamping by name-pattern at reap time could collapse a
             # user's own "<base> N" label, so it is deliberately gone.
             result["changed"] = True
-            panes.pop(key, None)
+            if delete_resolution.disposition == _OFFLOCK_APPLY:
+                assert delete_resolution.entry is not None
+                current_key, _kind = _entry_operation_key(
+                    store, delete_resolution.entry
+                )
+                pop_worker(current_key)
 
-    def clear_worker_topic_refs(topic_id: str, reason: str) -> None:
-        for worker_key, worker_entry in list(state.source_worker_entries(store).items()):
-            if str(worker_entry.get("topic_id") or "") != topic_id:
+    def finalize_deleted_space_worker_aliases(
+        worker_keys: frozenset[str], reason: str
+    ) -> None:
+        for worker_key in worker_keys:
+            worker_entry = state.source_worker_entries(store).get(worker_key)
+            if worker_entry is None:
                 continue
             if _should_delete_done_council_topic(worker_entry):
-                panes.pop(worker_key, None)
-                continue
-            worker_entry.pop("topic_id", None)
-            worker_entry["deleted_topic_id"] = topic_id
-            worker_entry["deleted_topic_reason"] = reason
-    for key, entry in list(state.source_worker_entries(store).items()):
+                pop_worker(worker_key)
+            else:
+                worker_entry["deleted_topic_reason"] = reason
+
+    for key in list(state.source_worker_entries(store)):
+        entry = state.source_worker_entries(store).get(key)
+        if entry is None:
+            continue
         if state.entry_is_retired(entry):
             continue
         topic_id = str(entry.get("topic_id") or "")
@@ -2574,32 +4359,70 @@ def _cleanup_topics(
         if deletes_issued >= delete_cap:
             continue  # per-pass delete budget spent; retry this topic next tick (record untouched)
         deletes_issued += 1
-        deleted = runtime.telegram.delete_topic(chat_id, topic_id)
+        delete_topic_name = entry.get("topic_name")
+        delete_operation = _capture_entry_operation(
+            store, entry, topic_id=topic_id
+        )
+        execution = _execute_entry_operation(
+            store,
+            runtime.telegram,
+            delete_operation,
+            _provider_mutation(
+                "telegram.delete_topic",
+                reason="telegram.delete_topic: delete stale worker topic",
+                args=(chat_id, topic_id),
+            ),
+        )
+        deleted, delete_resolution = execution.result, execution.resolution
         if not deleted.get("ok"):
             if _topic_missing(deleted.get("error")):
+                _record_topic_delete_success(
+                    store,
+                    topic_id=topic_id,
+                    name=delete_topic_name,
+                    reason=reason,
+                )
+                deleted_topic_ids.add(topic_id)
                 result["changed"] = True
-                if done_council_topic:
-                    panes.pop(key, None)
-                else:
-                    entry.pop("topic_id", None)
-                    entry["deleted_topic_id"] = topic_id
-                    entry["deleted_topic_reason"] = reason
+                if delete_resolution.disposition == _OFFLOCK_APPLY:
+                    assert delete_resolution.entry is not None
+                    current_entry = delete_resolution.entry
+                    current_key, _kind = _entry_operation_key(
+                        store, current_entry
+                    )
+                    if done_council_topic:
+                        pop_worker(current_key)
+                    else:
+                        current_entry["deleted_topic_reason"] = reason
                 continue
             result["failed"] += 1
-            entry["last_topic_delete_error"] = compact_ws(deleted.get("error"), 240)
+            if delete_resolution.disposition == _OFFLOCK_APPLY:
+                assert delete_resolution.entry is not None
+                delete_resolution.entry["last_topic_delete_error"] = (
+                    compact_ws(deleted.get("error"), 240)
+                )
             continue
         result["deleted"] += 1
         deleted_topic_ids.add(topic_id)
         result["changed"] = True
-        audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": reason})
-        if done_council_topic:
-            panes.pop(key, None)
-        else:
-            entry.pop("topic_id", None)
-            entry["deleted_topic_id"] = topic_id
-            entry["deleted_topic_reason"] = reason
-    spaces = store.get("spaces") if isinstance(store.get("spaces"), dict) else {}
-    for key, entry in list(state.source_space_entries(store).items()):
+        _record_topic_delete_success(
+            store,
+            topic_id=topic_id,
+            name=delete_topic_name,
+            reason=reason,
+        )
+        if delete_resolution.disposition == _OFFLOCK_APPLY:
+            assert delete_resolution.entry is not None
+            current_entry = delete_resolution.entry
+            current_key, _kind = _entry_operation_key(store, current_entry)
+            if done_council_topic:
+                pop_worker(current_key)
+            else:
+                current_entry["deleted_topic_reason"] = reason
+    for key in list(state.source_space_entries(store)):
+        entry = state.source_space_entries(store).get(key)
+        if entry is None:
+            continue
         if not entry.get("stale_space_topic"):
             continue
         topic_id = str(entry.get("topic_id") or "")
@@ -2613,27 +4436,77 @@ def _cleanup_topics(
                 result["changed"] = True
                 continue
             deletes_issued += 1
-            deleted = runtime.telegram.delete_topic(chat_id, topic_id)
+            delete_topic_name = entry.get("topic_name")
+            delete_operation = _capture_entry_operation(
+                store, entry, topic_id=topic_id
+            )
+            execution = _execute_entry_operation(
+                store,
+                runtime.telegram,
+                delete_operation,
+                _provider_mutation(
+                    "telegram.delete_topic",
+                    reason=(
+                        "telegram.delete_topic: delete done council space"
+                    ),
+                    args=(chat_id, topic_id),
+                ),
+            )
+            deleted, delete_resolution = execution.result, execution.resolution
             if not deleted.get("ok"):
                 if _topic_missing(deleted.get("error")):
-                    clear_worker_topic_refs(topic_id, "done_council_space_topic")
-                    spaces.pop(key, None)
-                    result["pruned"] += 1
+                    cleared_worker_keys, _changed = (
+                        _record_topic_delete_success(
+                            store,
+                            topic_id=topic_id,
+                            name=delete_topic_name,
+                            reason="done_council_space_topic",
+                        )
+                    )
+                    deleted_topic_ids.add(topic_id)
+                    finalize_deleted_space_worker_aliases(
+                        cleared_worker_keys, "done_council_space_topic"
+                    )
+                    if delete_resolution.disposition == _OFFLOCK_APPLY:
+                        assert delete_resolution.entry is not None
+                        current_key, _kind = _entry_operation_key(
+                            store, delete_resolution.entry
+                        )
+                        pop_space(current_key)
+                        result["pruned"] += 1
                     result["changed"] = True
                     continue
                 result["failed"] += 1
-                entry["last_topic_delete_error"] = compact_ws(deleted.get("error"), 240)
+                if delete_resolution.disposition == _OFFLOCK_APPLY:
+                    assert delete_resolution.entry is not None
+                    delete_resolution.entry["last_topic_delete_error"] = (
+                        compact_ws(deleted.get("error"), 240)
+                    )
                 continue
             result["deleted"] += 1
             deleted_topic_ids.add(topic_id)
-            audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": "done_council_space_topic"})
+            cleared_worker_keys, _changed = _record_topic_delete_success(
+                store,
+                topic_id=topic_id,
+                name=delete_topic_name,
+                reason="done_council_space_topic",
+            )
         if not runtime.dry_run:
             if should_delete:
-                clear_worker_topic_refs(topic_id, "done_council_space_topic")
-            spaces.pop(key, None)
-            result["pruned"] += 1
+                finalize_deleted_space_worker_aliases(
+                    cleared_worker_keys, "done_council_space_topic"
+                )
+            if not should_delete or delete_resolution.disposition == _OFFLOCK_APPLY:
+                current_entry = (
+                    delete_resolution.entry if should_delete else entry
+                )
+                assert current_entry is not None
+                current_key, _kind = _entry_operation_key(
+                    store, current_entry
+                )
+                pop_space(current_key)
+                result["pruned"] += 1
         result["changed"] = True
-    store["telegram_deleted_topics"] = audit[-200:]
     return result
 
 
@@ -2855,9 +4728,13 @@ def _topic_cleanup_targets(
                 "action": action,
                 "entry_key": entry_key,
                 "topic_id": topic_id,
+                "topic_name": compact_ws(entry.get("topic_name"), 120),
                 "since": since,
                 "reason": reason,
                 "target_key": target_key,
+                "_operation": _capture_entry_operation(
+                    store, entry, topic_id=topic_id
+                ),
             }
         )
 
@@ -2926,10 +4803,15 @@ def _topic_cleanup_targets(
 
 def _topic_cleanup_target_still_valid(
     store: dict[str, Any], target: dict[str, Any], *, now: float
-) -> bool:
-    entry = state.source_worker_entries(store).get(str(target["entry_key"]))
-    if not isinstance(entry, dict):
-        return False
+) -> tuple[bool, dict[str, Any] | None]:
+    operation = target.get("_operation")
+    if not isinstance(operation, _OfflockEntryOperation):
+        return False, None
+    resolution = _compare_and_apply_entry_operation(store, operation)
+    if resolution.disposition != _OFFLOCK_APPLY:
+        return False, None
+    entry = resolution.entry
+    assert entry is not None
     topic_id = str(target["topic_id"])
     if (
         str(entry.get("topic_id") or "") != topic_id
@@ -2938,23 +4820,24 @@ def _topic_cleanup_target_still_valid(
             store, include_live=target["action"] != "reopen"
         )
     ):
-        return False
+        return False, None
     if target["action"] == "reopen":
-        return (
+        valid = (
             not state.entry_is_retired(entry)
             and state.entry_is_routable(entry)
             and entry.get("topic_closed_at") is not None
         )
+        return valid, entry if valid else None
     if target["action"] == "close" and entry.get("topic_closed_at") is not None:
-        return False
+        return False, None
     if state.entry_is_retired(entry) and (
         entry.get("retired_topic_notice_pending")
         or entry.get("retired_topic_rename_pending")
     ):
-        return False
+        return False, None
     ttl_seconds = config.close_dormant_after_hours() * 3600.0
     if ttl_seconds <= 0:
-        return False
+        return False, None
     raw_since = (
         entry.get("routing_retired_at")
         if state.entry_is_retired(entry)
@@ -2963,19 +4846,21 @@ def _topic_cleanup_target_still_valid(
     try:
         since = float(raw_since)
     except (TypeError, ValueError):
-        return False
+        return False, None
     if since != float(target["since"]) or now - since < ttl_seconds:
-        return False
-    return state.entry_is_retired(entry) or (
+        return False, None
+    valid = state.entry_is_retired(entry) or (
         not state.entry_is_routable(entry)
         and normalized_status(
             entry.get("status") or entry.get("tendwire_raw_status")
         )
         in {"closed", "failed"}
     )
+    return valid, entry if valid else None
 
 
 def _execute_topic_cleanup_targets(
+    store: dict[str, Any],
     targets: list[dict[str, Any]],
     runtime: SyncRuntime,
     *,
@@ -2992,12 +4877,25 @@ def _execute_topic_cleanup_targets(
             return outcomes, len(targets) - index
         try:
             action = str(target["action"])
-            method = getattr(
-                runtime.telegram, f"{action}_topic_for_cleanup", None
+            operation = target.get("_operation")
+            if not isinstance(operation, _OfflockEntryOperation):
+                raise TypeError("cleanup target lacks off-lock operation")
+
+            capability = f"telegram.{action}_topic_for_cleanup"
+            execution = _execute_entry_operation(
+                store,
+                runtime.telegram,
+                operation,
+                _provider_mutation(
+                    capability,
+                    reason=(
+                        f"{capability}: lifecycle cleanup "
+                        f"{target['topic_id']}"
+                    ),
+                    args=(chat_id, str(target["topic_id"])),
+                ),
             )
-            if method is None:
-                method = getattr(runtime.telegram, f"{action}_topic")
-            response = method(chat_id, str(target["topic_id"]))
+            response = execution.result
         except RateLimited as exc:
             outcomes.append(
                 {
@@ -3045,6 +4943,10 @@ def _execute_topic_cleanup_targets(
                 if response.get("ok") or kind in success_kinds
                 else "failed",
                 "kind": kind,
+                "topic_missing": kind in {
+                    "topic_not_found",
+                    "not_found",
+                },
                 "error": compact_ws(error, 240),
             }
         )
@@ -3123,11 +5025,47 @@ def _apply_topic_cleanup_outcomes(
             result["deferred"] += 1
             result["changed"] = True
             continue
-        if not _topic_cleanup_target_still_valid(store, target, now=now):
+        result["operations"] += 1
+        target_still_valid, resolved_entry = _topic_cleanup_target_still_valid(
+            store, target, now=now
+        )
+        if (
+            outcome["status"] == "success"
+            and target["action"] == "delete"
+        ):
+            # A provider-confirmed deletion remains true even when concurrent
+            # state has rebound the selected pane. Invalidate every alias
+            # before deciding whether the target-specific lifecycle mutation
+            # is still safe to apply.
+            _cleared_worker_keys, provider_fact_changed = (
+                _record_topic_delete_success(
+                    store,
+                    topic_id=str(target["topic_id"]),
+                    name=target.get("topic_name"),
+                    reason=str(target["reason"]),
+                )
+            )
+            result["changed"] = (
+                provider_fact_changed or result["changed"]
+            )
+        elif (
+            outcome["status"] == "success"
+            and outcome.get("topic_missing") is True
+        ):
+            _repair_provider_gone_topic(
+                store,
+                state.source_worker_entries(store).get(
+                    str(target["entry_key"])
+                ),
+                outcome,
+                topic_id=str(target["topic_id"]),
+            )
+            result["changed"] = True
+        if not target_still_valid:
             result["deferred"] += 1
             continue
-        result["operations"] += 1
-        entry = state.source_worker_entries(store)[str(target["entry_key"])]
+        entry = resolved_entry
+        assert entry is not None
         if outcome["status"] == "success":
             attempts.pop(target_key, None)
             retry_after.pop(target_key, None)
@@ -3249,22 +5187,9 @@ def _sync_topic_lifecycle_cleanup(
     if not targets:
         return result
 
-    if state.lock_held():
-        # Phase 1: persist the immutable target basis under lock. Phase 2:
-        # release the lock for slow/rate-limited Telegram calls. Phase 3:
-        # reload concurrent state and apply only still-valid outcomes.
-        state.save_state(store)
-        with state.released_lock():
-            outcomes, deferred = _execute_topic_cleanup_targets(
-                targets, runtime, chat_id=chat_id
-            )
-        fresh = state.load_state()
-        store.clear()
-        store.update(fresh)
-    else:
-        outcomes, deferred = _execute_topic_cleanup_targets(
-            targets, runtime, chat_id=chat_id
-        )
+    outcomes, deferred = _execute_topic_cleanup_targets(
+        store, targets, runtime, chat_id=chat_id
+    )
     result["deferred"] += deferred
     _apply_topic_cleanup_outcomes(store, outcomes, result, now=clock)
     return result
@@ -3402,7 +5327,7 @@ def _deliver_working(
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
     stored_bot_kind = str(entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND)
-    if (
+    edit_attempted = bool(
         entry.get("last_stream_message_id")
         and stored_bot_kind == bot_kind
         and (
@@ -3414,33 +5339,128 @@ def _deliver_working(
                 == submission_id
             )
         )
-    ):
-        sent = edit_feed_item(
+    )
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=thread_id,
+        message_id=str(entry.get("last_stream_message_id") or "")
+        if edit_attempted
+        else "",
+        observe=("last_stream_message_id",) if edit_attempted else (),
+    )
+    if edit_attempted:
+        execution = _execute_entry_operation(
+            store,
             runtime.telegram,
-            chat_id,
-            str(entry["last_stream_message_id"]),
-            feed_item,
-            telegram=telegram,
-            live=True,
-            api_token=api_token,
+            operation,
+            _provider_mutation(
+                "telegram.edit_feed_item",
+                reason="telegram.edit_feed_item: update working card",
+                args=(chat_id, operation.message_id, feed_item),
+                kwargs={
+                    "telegram": telegram,
+                    "live": True,
+                    "api_token": api_token,
+                },
+            ),
         )
     else:
-        sent = send_feed_item(
+        execution = _execute_entry_operation(
+            store,
             runtime.telegram,
-            chat_id,
-            feed_item,
-            telegram=telegram,
-            thread_id=thread_id,
-            notify=False,
-            live=True,
-            api_token=api_token,
+            operation,
+            _provider_mutation(
+                "telegram.send_feed_item",
+                reason="telegram.send_feed_item: create working card",
+                args=(chat_id, feed_item),
+                kwargs={
+                    "telegram": telegram,
+                    "thread_id": thread_id,
+                    "notify": False,
+                    "live": True,
+                    "api_token": api_token,
+                },
+            ),
         )
+    sent, resolution = execution.result, execution.resolution
+    if (
+        edit_attempted
+        and not sent.get("ok")
+        and (
+            str(sent.get("kind") or "")
+            in {"not_found", "topic_not_found"}
+            or classify_telegram_error(sent.get("error"))
+            in {"not_found", "topic_not_found"}
+        )
+    ):
+        # The exact historical message is gone regardless of where its pane
+        # moved. Only an unchanged owner may turn that fact into a resend.
+        _retire_local_message(store, None, operation.message_id)
+        if resolution.disposition != _OFFLOCK_APPLY:
+            return False
+        entry = resolution.entry
+        assert entry is not None
+        _clear_stream_delivery_keys(entry)
+        operation = _capture_entry_operation(
+            store, entry, topic_id=thread_id
+        )
+        execution = _execute_entry_operation(
+            store,
+            runtime.telegram,
+            operation,
+            _provider_mutation(
+                "telegram.send_feed_item",
+                reason=(
+                    "telegram.send_feed_item: replace missing working card"
+                ),
+                args=(chat_id, feed_item),
+                kwargs={
+                    "telegram": telegram,
+                    "thread_id": thread_id,
+                    "notify": False,
+                    "live": True,
+                    "api_token": api_token,
+                },
+            ),
+        )
+        sent, resolution = execution.result, execution.resolution
+    if not sent.get("ok") and _topic_missing(sent.get("error")):
+        _repair_provider_gone_topic(
+            store,
+            resolution.entry
+            if resolution.disposition == _OFFLOCK_APPLY
+            else None,
+            sent,
+            topic_id=operation.route_topic_id,
+        )
+        return False
     if sent.get("ok"):
+        message_id = str(
+            sent.get("message_id")
+            or operation.message_id
+            or ""
+        )
+        if resolution.disposition != _OFFLOCK_APPLY:
+            if message_id:
+                state.bind_message_to_worker(
+                    store,
+                    message_id,
+                    _operation_binding_entry(operation),
+                    topic_id=operation.route_topic_id,
+                    kind="working_stale",
+                    turn_id=turn_id,
+                    bot_kind=bot_kind,
+                    submission_id=submission_id,
+                )
+            return False
+        entry = resolution.entry
+        assert entry is not None
         _set_stream_delivery(
             entry,
             turn_id=turn_id,
             content_hash=content_hash,
-            message_id=str(sent.get("message_id") or entry.get("last_stream_message_id") or ""),
+            message_id=message_id,
             bot_kind=bot_kind,
             submission_id=submission_id,
         )
@@ -3457,6 +5477,10 @@ def _deliver_working(
             submission_id=submission_id,
         )
         return True
+    if resolution.disposition != _OFFLOCK_APPLY:
+        return False
+    entry = resolution.entry
+    assert entry is not None
     _record_delivery_error(entry, sent, bot_kind)
     return False
 
@@ -3789,54 +5813,58 @@ def _speak_reply(
     if not chunks:
         return entry
     api_token, _bot_kind = _delivery_bot(store, entry)
-    client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=thread_id,
+        message_id=str(reply_to or ""),
+    )
 
-    def _synth_and_send() -> list[str]:
-        # Runs OFF the lock: synth to OGG + upload. Touches no `store` state (so a competitor holding
-        # the lock meanwhile can't be clobbered); the returned ids are recorded after we re-acquire.
-        ids: list[str] = []
-        for i, chunk in enumerate(chunks):
-            try:
-                dest = speech.outbound_speech_dir(prune=(i == 0)) / f"reply-{short_hash({'t': _turn_id(item), 'i': i, 'h': chunk}, 16)}.ogg"
-                if not speech.speech_request("tts", {"text": chunk, "dest": str(dest)}).get("ok"):
-                    continue
-                sent = client.send_voice(
-                    chat_id, dest, thread_id=thread_id,
-                    reply_to_message_id=(reply_to if i == 0 else None), notify=False,
-                )
-                if sent.get("ok") and sent.get("message_id"):
-                    ids.append(str(sent.get("message_id")))
-            except Exception as exc:  # one chunk failing must not abort the rest or the text turn
-                print(f"herdres speak-reply chunk failed: {exc}", file=sys.stderr)
-        return ids
+    execution = _execute_entry_operation(
+        store,
+        runtime.telegram,
+        operation,
+        _provider_mutation(
+            "telegram.send_voice_batch",
+            reason="telegram.send_voice_batch: synthesize pane voice reply",
+            args=(
+                tuple(chunks),
+                _turn_id(item),
+                chat_id,
+                thread_id,
+                reply_to,
+            ),
+            api_token=api_token,
+        ),
+    )
+    voice_ids = execution.result
+    resolution = execution.resolution
+    if resolution.disposition == _OFFLOCK_APPLY:
+        target = resolution.entry
+        assert target is not None
+        for voice_id in voice_ids:
+            state.record_voice_reply_message_id(target, voice_id)
+        return target
 
-    if not state.lock_held():
-        # No lock to release (tests / dry callers): synth+send inline and record on the given entry.
-        for vid in _synth_and_send():
-            state.record_voice_reply_message_id(entry, vid)
-        return entry
-
-    # Commit the delivered turn, synth+send OFF the lock, then reload and record on the fresh entry.
-    state.save_state(store)
-    with state.released_lock():
-        voice_ids = _synth_and_send()
-    fresh = state.load_state()
-    store.clear()
-    store.update(fresh)
-    target = _refind_entry(store, entry_key)
-    if target is None:
-        # A competitor pruned this entry during the off-lock synth. The notes were sent, but recording
-        # their ids on the detached pre-reload entry wouldn't persist (save_state writes `store`), so
-        # skip it — leave a breadcrumb rather than silently drop the tracking.
-        if voice_ids:
-            print(f"herdres speak-reply: entry {entry_key} gone after off-lock synth; "
-                  f"{len(voice_ids)} voice id(s) unrecorded", file=sys.stderr)
-        return entry
-    for vid in voice_ids:
-        state.record_voice_reply_message_id(target, vid)
-    if voice_ids:
-        state.save_state(store)
-    return target
+    # Accepted voice notes are exact provider facts. Keep them bound to the
+    # captured owner/route, but never write entry-level voice state onto a
+    # reloaded owner after RECONCILE or ABANDON.
+    binding_entry = _operation_binding_entry(operation)
+    for voice_id in voice_ids:
+        state.bind_message_to_worker(
+            store,
+            voice_id,
+            binding_entry,
+            topic_id=operation.route_topic_id,
+            kind="voice_stale",
+            turn_id=_turn_id(item),
+            bot_kind=_bot_kind,
+        )
+        binding = state.find_message_binding(store, voice_id)
+        if binding is not None:
+            binding["reply_to_message_id"] = operation.message_id
+            binding["provider_fact"] = "accepted_voice"
+    return entry
 
 
 def _content_revision(item: dict[str, Any]) -> str:
@@ -3854,12 +5882,12 @@ def _stage_final_plan(
     runtime: SyncRuntime,
     *,
     source_ref: str | None = None,
-) -> tuple[bool, int]:
+) -> tuple[bool, int, dict[str, Any]]:
     revision = _content_revision(item)
     if not revision:
-        return False, 0
+        return False, 0, entry
 
-    def _prepare_begin(part_count: int) -> dict[str, Any]:
+    def _prepare_begin_kwargs(part_count: int) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "turn_id": _turn_id(item),
             "content_revision": revision,
@@ -3868,20 +5896,20 @@ def _stage_final_plan(
         }
         if source_ref is not None:
             kwargs["source_ref"] = source_ref
-        return runtime.tendwire.connector_prepare_begin(**kwargs)
+        return kwargs
 
-    def _prepare_commit(plan_token: str) -> dict[str, Any]:
+    def _prepare_commit_kwargs(plan_token: str) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"plan_token": plan_token}
         if source_ref is not None:
             kwargs["source_ref"] = source_ref
-        return runtime.tendwire.connector_prepare_commit(**kwargs)
+        return kwargs
 
     if (
         source_ref is None
         and entry.get("last_turn_id") == _turn_id(item)
         and entry.get("last_clean_content_revision") == revision
     ):
-        return False, 0
+        return False, 0, entry
     if (
         entry.get("pending_turn_id") == _turn_id(item)
         and entry.get("pending_content_revision") == revision
@@ -3898,14 +5926,66 @@ def _stage_final_plan(
             raise _TurnContentError(
                 "invalid_pending_plan", "pending plan has invalid part count"
             )
-        observed = _prepare_begin(pending_count)
+        operation = _capture_entry_operation(
+            store,
+            entry,
+            plan_token=pending_token,
+            revision=revision,
+        )
+        execution = _execute_entry_operation(
+            store,
+            runtime.tendwire,
+            operation,
+            _provider_mutation(
+                "tendwire.connector_prepare_begin",
+                reason=(
+                    "tendwire.connector_prepare_begin: reconcile pending plan"
+                ),
+                kwargs=_prepare_begin_kwargs(pending_count),
+            ),
+        )
+        observed, resolution = execution.result, execution.resolution
+        if resolution.disposition != _OFFLOCK_APPLY:
+            raise _TurnContentError(
+                "stale_or_unroutable_turn_plan",
+                "pending plan owner changed during reconciliation",
+                conflict=True,
+            )
+        entry = resolution.entry
+        assert entry is not None
         if observed.get("ok") is False or observed.get("plan_token") != pending_token:
             raise _TurnContentError(
                 str(observed.get("status") or "prepare_failed"),
                 str(observed.get("error") or "pending plan reconciliation failed"),
             )
         if source_ref is not None:
-            observed = _prepare_commit(pending_token)
+            operation = _capture_entry_operation(
+                store,
+                entry,
+                plan_token=pending_token,
+                revision=revision,
+            )
+            execution = _execute_entry_operation(
+                store,
+                runtime.tendwire,
+                operation,
+                _provider_mutation(
+                    "tendwire.connector_prepare_commit",
+                    reason=(
+                        "tendwire.connector_prepare_commit: hand off pending plan"
+                    ),
+                    kwargs=_prepare_commit_kwargs(pending_token),
+                ),
+            )
+            observed, resolution = execution.result, execution.resolution
+            if resolution.disposition != _OFFLOCK_APPLY:
+                raise _TurnContentError(
+                    "stale_or_unroutable_turn_plan",
+                    "pending plan owner changed during handoff",
+                    conflict=True,
+                )
+            entry = resolution.entry
+            assert entry is not None
             if observed.get("ok") is False or observed.get("plan_token") != pending_token:
                 raise _TurnContentError(
                     str(observed.get("status") or "prepare_failed"),
@@ -3941,7 +6021,7 @@ def _stage_final_plan(
                 revision=revision,
             ):
                 _checkpoint_turn_job(runtime)
-        return False, 0
+        return False, 0, entry
 
     page_calls = _materialize_turn_item(item, runtime)
     feed_item = _turn_feed_item(item, entry)
@@ -3968,9 +6048,34 @@ def _stage_final_plan(
             entry["pending_stream_submission_id"] = str(
                 entry["last_stream_submission_id"]
             )
-        return True, page_calls
+        return True, page_calls, entry
 
-    begin = _prepare_begin(len(parts))
+    begin_operation = _capture_entry_operation(
+        store,
+        entry,
+        observe=("pending_plan_token", "pending_content_revision"),
+    )
+    execution = _execute_entry_operation(
+        store,
+        runtime.tendwire,
+        begin_operation,
+        _provider_mutation(
+            "tendwire.connector_prepare_begin",
+            reason=(
+                "tendwire.connector_prepare_begin: stage final delivery plan"
+            ),
+            kwargs=_prepare_begin_kwargs(len(parts)),
+        ),
+    )
+    begin, begin_resolution = execution.result, execution.resolution
+    if begin_resolution.disposition != _OFFLOCK_APPLY:
+        raise _TurnContentError(
+            "stale_or_unroutable_turn_plan",
+            "plan owner changed during preparation",
+            conflict=True,
+        )
+    entry = begin_resolution.entry
+    assert entry is not None
     if begin.get("ok") is False:
         raise _TurnContentError(
             str(begin.get("status") or "prepare_failed"),
@@ -3996,11 +6101,39 @@ def _stage_final_plan(
         )
     if state_name == "preparing":
         for ordinal, part in enumerate(parts):
-            response = runtime.tendwire.connector_prepare_part(
-                plan_token=plan_token,
-                ordinal=ordinal,
-                spans=part["spans"],
+            part_operation = _capture_entry_operation(
+                store,
+                entry,
+                observe=(
+                    "pending_plan_token",
+                    "pending_content_revision",
+                ),
             )
+            execution = _execute_entry_operation(
+                store,
+                runtime.tendwire,
+                part_operation,
+                _provider_mutation(
+                    "tendwire.connector_prepare_part",
+                    reason=(
+                        "tendwire.connector_prepare_part: stage final plan part"
+                    ),
+                    kwargs={
+                        "plan_token": plan_token,
+                        "ordinal": ordinal,
+                        "spans": part["spans"],
+                    },
+                ),
+            )
+            response, part_resolution = execution.result, execution.resolution
+            if part_resolution.disposition != _OFFLOCK_APPLY:
+                raise _TurnContentError(
+                    "stale_or_unroutable_turn_plan",
+                    "plan owner changed during part preparation",
+                    conflict=True,
+                )
+            entry = part_resolution.entry
+            assert entry is not None
             if (
                 response.get("ok") is False
                 or response.get("plan_token") != plan_token
@@ -4010,9 +6143,59 @@ def _stage_final_plan(
                     str(response.get("status") or "prepare_failed"),
                     str(response.get("error") or "connector prepare part failed"),
                 )
-        commit = _prepare_commit(plan_token)
+        commit_operation = _capture_entry_operation(
+            store,
+            entry,
+            observe=("pending_plan_token", "pending_content_revision"),
+        )
+        execution = _execute_entry_operation(
+            store,
+            runtime.tendwire,
+            commit_operation,
+            _provider_mutation(
+                "tendwire.connector_prepare_commit",
+                reason=(
+                    "tendwire.connector_prepare_commit: activate staged plan"
+                ),
+                kwargs=_prepare_commit_kwargs(plan_token),
+            ),
+        )
+        commit, commit_resolution = execution.result, execution.resolution
+        if commit_resolution.disposition != _OFFLOCK_APPLY:
+            raise _TurnContentError(
+                "stale_or_unroutable_turn_plan",
+                "plan owner changed during commit",
+                conflict=True,
+            )
+        entry = commit_resolution.entry
+        assert entry is not None
     elif source_ref is not None:
-        commit = _prepare_commit(plan_token)
+        commit_operation = _capture_entry_operation(
+            store,
+            entry,
+            observe=("pending_plan_token", "pending_content_revision"),
+        )
+        execution = _execute_entry_operation(
+            store,
+            runtime.tendwire,
+            commit_operation,
+            _provider_mutation(
+                "tendwire.connector_prepare_commit",
+                reason=(
+                    "tendwire.connector_prepare_commit: activate handed-off plan"
+                ),
+                kwargs=_prepare_commit_kwargs(plan_token),
+            ),
+        )
+        commit, commit_resolution = execution.result, execution.resolution
+        if commit_resolution.disposition != _OFFLOCK_APPLY:
+            raise _TurnContentError(
+                "stale_or_unroutable_turn_plan",
+                "plan owner changed during commit",
+                conflict=True,
+            )
+        entry = commit_resolution.entry
+        assert entry is not None
     else:
         commit = begin
     if commit.get("ok") is False or commit.get("plan_token") != plan_token:
@@ -4064,7 +6247,7 @@ def _stage_final_plan(
     final_identity = item.get(_TURN_FINAL_IDENTITY_KEY)
     if isinstance(final_identity, str) and final_identity:
         entry["pending_final_identity"] = final_identity
-    return True, page_calls
+    return True, page_calls, entry
 
 
 def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
@@ -4146,21 +6329,61 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
         return True
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
-    sent = send_feed_item(
-        runtime.telegram,
-        chat_id,
-        feed_item,
-        telegram=telegram,
-        thread_id=thread_id,
-        notify=False,
-        api_token=api_token,
+    operation = _capture_entry_operation(
+        store, entry, topic_id=thread_id
     )
+    execution = _execute_entry_operation(
+        store,
+        runtime.telegram,
+        operation,
+        _provider_mutation(
+            "telegram.send_feed_item",
+            reason="telegram.send_feed_item: deliver legacy final",
+            args=(chat_id, feed_item),
+            kwargs={
+                "telegram": telegram,
+                "thread_id": thread_id,
+                "notify": False,
+                "api_token": api_token,
+            },
+        ),
+    )
+    sent, resolution = execution.result, execution.resolution
     if not sent.get("ok"):
-        _record_delivery_error(entry, sent, bot_kind)
+        if _topic_missing(sent.get("error")):
+            _repair_provider_gone_topic(
+                store,
+                resolution.entry
+                if resolution.disposition == _OFFLOCK_APPLY
+                else None,
+                sent,
+                topic_id=thread_id,
+            )
+        elif resolution.disposition == _OFFLOCK_APPLY:
+            assert resolution.entry is not None
+            _record_delivery_error(resolution.entry, sent, bot_kind)
         return False
     message_ids: list[str] = []
     for message_id in split_legacy_message_ids(sent):
         message_ids.append(message_id)
+    if resolution.disposition != _OFFLOCK_APPLY:
+        binding_entry = _operation_binding_entry(operation)
+        for message_id in message_ids:
+            state.bind_message_to_worker(
+                store,
+                message_id,
+                binding_entry,
+                topic_id=thread_id,
+                kind="final",
+                turn_id=turn_id,
+                bot_kind=bot_kind,
+            )
+        # The accepted text remains an exact, tracked provider fact. Let the
+        # optional voice follow-up use its captured thread; routing/delivery
+        # completion itself remains deferred to the current route.
+        return True
+    entry = resolution.entry
+    assert entry is not None
     _record_final_delivery_success(
         store,
         item,
@@ -4190,14 +6413,54 @@ def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncR
     if runtime.dry_run:
         return state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id})
     api_token, bot_kind = _delivery_bot(store, entry)
-    client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
-    sent = client.send_message(chat_id, html, thread_id=thread_id, notify=True)
+    operation = _capture_entry_operation(
+        store, entry, topic_id=thread_id
+    )
+    execution = _execute_entry_operation(
+        store,
+        runtime.telegram,
+        operation,
+        _provider_mutation(
+            "telegram.send_message",
+            reason="telegram.send_message: deliver pending interaction",
+            args=(chat_id, html),
+            kwargs={"thread_id": thread_id, "notify": True},
+            api_token=api_token,
+        ),
+    )
+    sent, resolution = execution.result, execution.resolution
     if sent.get("ok"):
+        if resolution.disposition != _OFFLOCK_APPLY:
+            message_id = str(sent.get("message_id") or "")
+            if message_id:
+                state.bind_message_to_worker(
+                    store,
+                    message_id,
+                    _operation_binding_entry(operation),
+                    topic_id=thread_id,
+                    kind="pending_stale",
+                    turn_id=pending_id,
+                    bot_kind=bot_kind,
+                )
+            return False
+        entry = resolution.entry
+        assert entry is not None
         entry["last_prompt_bot_kind"] = bot_kind
         _record_delivery_success(entry, bot_kind)
         state.bind_message_to_worker(store, sent.get("message_id"), entry, topic_id=thread_id, kind="pending", turn_id=pending_id, bot_kind=bot_kind)
         return state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id})
-    _record_delivery_error(entry, sent, bot_kind)
+    if _topic_missing(sent.get("error")):
+        _repair_provider_gone_topic(
+            store,
+            resolution.entry
+            if resolution.disposition == _OFFLOCK_APPLY
+            else None,
+            sent,
+            topic_id=thread_id,
+        )
+    elif resolution.disposition == _OFFLOCK_APPLY:
+        assert resolution.entry is not None
+        _record_delivery_error(resolution.entry, sent, bot_kind)
     return False
 
 
@@ -4388,7 +6651,7 @@ def _sync_turns(
             seen_final_workers.add(worker_key)
             if _content_revision(item):
                 try:
-                    _staged, page_calls = _stage_final_plan(
+                    _staged, page_calls, entry = _stage_final_plan(
                         store, item, entry, runtime
                     )
                     counts["content_pages"] += page_calls
@@ -4401,14 +6664,50 @@ def _sync_turns(
                     continue
                 delivered = False
             else:
+                delivery_thread_id = str(
+                    entry.get("topic_id") or ""
+                )
+                prior_final_message_ids = {
+                    message_id
+                    for message_id, _binding in (
+                        _final_delivery_bindings(
+                            store,
+                            _turn_id(item),
+                            topic_id=delivery_thread_id,
+                        )
+                    )
+                }
                 delivered = _deliver_final(store, item, entry, runtime, chat_id=chat_id)
                 if delivered:
                     # Legacy inline direct-call compatibility; v2 finals are spoken only after the
                     # complete ordered plan is acknowledged.
+                    delivery_bindings = _final_delivery_bindings(
+                        store,
+                        _turn_id(item),
+                        topic_id=delivery_thread_id,
+                    )
+                    new_delivery_bindings = [
+                        binding
+                        for binding in delivery_bindings
+                        if binding[0]
+                        not in prior_final_message_ids
+                    ]
+                    reply_binding = (
+                        new_delivery_bindings[0]
+                        if new_delivery_bindings
+                        else delivery_bindings[-1]
+                        if delivery_bindings
+                        else None
+                    )
                     entry = _speak_reply(
                         store, item, entry, entry_key, runtime,
-                        chat_id=chat_id, thread_id=str(entry.get("topic_id") or ""),
-                        reply_to=str(entry.get("last_clean_message_id") or "") or None,
+                        chat_id=chat_id,
+                        thread_id=delivery_thread_id,
+                        reply_to=(
+                            reply_binding[0]
+                            if reply_binding is not None
+                            else None
+                        ),
                     )
         elif item.get("assistant_stream_text") or _turn_is_working_placeholder(item, entry):
             if latest_turn_id and _turn_id(item) != latest_turn_id:
@@ -4859,7 +7158,7 @@ def _resolve_final_source_entry(
     )
     if space_entry is None:
         return None, None
-    return entry_key, _delivery_entry(space_entry, worker_entry)
+    return entry_key, _delivery_entry(store, space_entry, worker_entry)
 
 
 def _bind_or_verify_final_source_owner(
@@ -4998,12 +7297,23 @@ def _owning_bot_token(store: dict[str, Any], bot_kind: str) -> str | None:
 
 
 def _retire_local_message(
-    store: dict[str, Any], entry: dict[str, Any], message_id: str
+    store: dict[str, Any],
+    entry: dict[str, Any] | None,
+    message_id: str,
 ) -> None:
+    """Apply the exact provider fact independently of entry disposition."""
+
     state.message_bindings(store).pop(str(message_id), None)
-    _clear_entry_message_reference(entry, str(message_id), "final")
-    if entry.get("last_stream_message_id") == str(message_id):
-        _clear_stream_delivery_keys(entry)
+    candidates = (
+        [entry]
+        if entry is not None
+        else list(state.source_worker_entries(store).values())
+        + list(state.source_space_entries(store).values())
+    )
+    for candidate in candidates:
+        _clear_entry_message_reference(candidate, str(message_id), "final")
+        if candidate.get("last_stream_message_id") == str(message_id):
+            _clear_stream_delivery_keys(candidate)
 
 
 def _current_upsert_candidate(
@@ -5189,6 +7499,11 @@ def _maybe_complete_turn_plan(
     plan_token: str,
     revision: str,
 ) -> bool:
+    if (
+        entry.get("pending_plan_token") != plan_token
+        or entry.get("pending_content_revision") != revision
+    ):
+        return False
     stream_submission_id = str(
         entry.get("pending_stream_submission_id") or ""
     )
@@ -5207,6 +7522,7 @@ def _maybe_complete_turn_plan(
     ]
     if len(receipts) < expected_jobs or any(
         receipt.get("substate") != "acknowledged"
+        or isinstance(receipt.get("post_ack_reconcile"), dict)
         for receipt in receipts
     ):
         return False
@@ -5364,9 +7680,29 @@ def _reconcile_completed_turn_plans(
             or part_count <= 0
         ):
             continue
-        observed = runtime.tendwire.connector_prepare_commit(
-            plan_token=plan_token
+        operation = _capture_entry_operation(
+            store,
+            entry,
+            plan_token=plan_token,
+            revision=revision,
         )
+        execution = _execute_entry_operation(
+            store,
+            runtime.tendwire,
+            operation,
+            _provider_mutation(
+                "tendwire.connector_prepare_commit",
+                reason=(
+                    "tendwire.connector_prepare_commit: reconcile completed plan"
+                ),
+                kwargs={"plan_token": plan_token},
+            ),
+        )
+        observed, resolution = execution.result, execution.resolution
+        if resolution.disposition != _OFFLOCK_APPLY:
+            continue
+        entry = resolution.entry
+        assert entry is not None
         observed_token = observed.get("plan_token")
         plan_not_found = (
             observed.get("ok") is False
@@ -5455,6 +7791,9 @@ def _reconcile_completed_turn_plans(
             ):
                 state.update_tendwire_turn_job(
                     store, job_key, substate="acknowledged"
+                )
+                state.clear_tendwire_turn_job_post_ack_reconcile(
+                    store, job_key
                 )
                 advanced = True
         item = {
@@ -5562,7 +7901,14 @@ def _fail_turn_final(
     reason_code = _turn_final_reason_code(
         reason, uncertain=uncertain
     )
-    response = runtime.tendwire.turn_final_fail(ref, reason_code)
+    response = _execute_exact_provider_operation(
+        runtime.tendwire,
+        mutation=_provider_mutation(
+            "tendwire.turn_final_fail",
+            reason="tendwire.turn_final_fail: reject exact leased final",
+            args=(ref, reason_code),
+        ),
+    )
     result["failed"] += 1
     result["changed"] = True
     result["status"] = reason_code
@@ -5609,10 +7955,14 @@ def _defer_turn_final(
             )
             _checkpoint_turn_job(runtime)
     reason_code = _turn_final_reason_code(reason, deferred=True)
-    response = runtime.tendwire.turn_final_defer(
-        ref,
-        reason_code,
-        delay_seconds=max(1, int(delay_seconds)),
+    response = _execute_exact_provider_operation(
+        runtime.tendwire,
+        mutation=_provider_mutation(
+            "tendwire.turn_final_defer",
+            reason="tendwire.turn_final_defer: defer exact leased final",
+            args=(ref, reason_code),
+            kwargs={"delay_seconds": max(1, int(delay_seconds))},
+        ),
     )
     result["deferred"] += 1
     result["changed"] = True
@@ -5755,6 +8105,7 @@ def _complete_suppressed_turn_plan(
         or len(receipts) < expected_jobs
         or any(
             receipt.get("substate") != "acknowledged"
+            or isinstance(receipt.get("post_ack_reconcile"), dict)
             for receipt in receipts
         )
     ):
@@ -5793,6 +8144,294 @@ def _complete_suppressed_turn_plan(
     return True
 
 
+def _turn_final_ack_obligation(
+    store: dict[str, Any],
+    job_key: str,
+    operation: _OfflockEntryOperation,
+    *,
+    kind: str,
+    turn_id: str,
+    plan_token: str,
+    revision: str,
+    ordinal: int,
+    part_count: int,
+) -> dict[str, Any]:
+    receipt = state.find_tendwire_turn_job(store, job_key) or {}
+    message_id = str(receipt.get("telegram_message_id") or "")
+    binding = state.find_message_binding(store, message_id)
+    return {
+        "status": "ack_inflight",
+        "kind": kind,
+        "owner": _operation_provenance(operation),
+        "turn_id": turn_id,
+        "plan_token": plan_token,
+        "content_revision": revision,
+        "part_ordinal": ordinal,
+        "part_count": part_count,
+        "current_message_id": message_id,
+        "current_topic_id": str(
+            (binding or {}).get("topic_id")
+            or operation.route_topic_id
+            or ""
+        ),
+        "bot_kind": str(
+            (binding or {}).get("bot_kind")
+            or receipt.get("bot_kind")
+            or MANAGER_BOT_KIND
+        ),
+        "stale_copies": [],
+    }
+
+
+def _drain_post_ack_reconciliations(
+    store: dict[str, Any],
+    turns_payload: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    max_operations: int,
+    result: dict[str, Any],
+) -> None:
+    """Drain acknowledged work locally; Tendwire must never be polled again."""
+
+    for job_key, receipt in list(state.tendwire_turn_jobs(store).items()):
+        obligation = (
+            receipt.get("post_ack_reconcile")
+            if isinstance(receipt, dict)
+            else None
+        )
+        if not isinstance(obligation, dict):
+            continue
+        if obligation.get("status") == "ack_inflight":
+            # A crash may have happened on either side of ACK. The normal
+            # observation path will settle this ambiguous receipt.
+            continue
+        owner = obligation.get("owner")
+        if not isinstance(owner, dict):
+            continue
+        captured = _operation_from_provenance(owner)
+        entry = _resolve_operation_entry(store, captured)
+        if entry is None or state.entry_is_retired(entry):
+            state.clear_tendwire_turn_job_post_ack_reconcile(store, job_key)
+            result["changed"] = True
+            _checkpoint_turn_job(runtime)
+            continue
+        plan_token = str(obligation.get("plan_token") or "")
+        revision = str(obligation.get("content_revision") or "")
+        item = _turn_item_by_revision(turns_payload, revision)
+        if obligation.get("kind") == "suppressed":
+            state.clear_tendwire_turn_job_post_ack_reconcile(
+                store, job_key
+            )
+            if item is not None:
+                _complete_suppressed_turn_plan(
+                    store,
+                    item,
+                    entry,
+                    plan_token=plan_token,
+                    revision=revision,
+                )
+            result["changed"] = True
+            _checkpoint_turn_job(runtime)
+            continue
+
+        stale = obligation.get("stale_copies")
+        if not isinstance(stale, list):
+            stale = []
+            obligation["stale_copies"] = stale
+        while stale and result["operations"] < max_operations:
+            copy = stale[0]
+            if not isinstance(copy, dict):
+                stale.pop(0)
+                continue
+            message_id = str(copy.get("message_id") or "")
+            bot_kind = str(copy.get("bot_kind") or MANAGER_BOT_KIND)
+            try:
+                token = _owning_bot_token(store, bot_kind)
+                retired = _execute_exact_provider_operation(
+                    runtime.telegram,
+                    store=store,
+                    mutation=_provider_mutation(
+                        "telegram.delete_turn_delivery_message",
+                        reason=(
+                            "telegram.delete_turn_delivery_message: post-ACK "
+                            "retire stale copy"
+                        ),
+                        args=(chat_id, message_id),
+                        kwargs={"api_token": token},
+                    ),
+                )
+                result["operations"] += 1
+            except RateLimited:
+                return
+            except Exception:
+                return
+            if not retired.get("ok") and _telegram_result_is_transient(retired):
+                return
+            if not retired.get("ok"):
+                return
+            _retire_local_message(store, None, message_id)
+            stale.pop(0)
+            result["changed"] = True
+            _checkpoint_turn_job(runtime)
+        if stale or result["operations"] >= max_operations:
+            return
+
+        current_topic = str(entry.get("topic_id") or "")
+        applied_topic = str(obligation.get("current_topic_id") or "")
+        current_message_id = str(
+            obligation.get("current_message_id") or ""
+        )
+        if not current_topic:
+            continue
+        if current_topic != applied_topic:
+            if item is None:
+                continue
+            _materialize_turn_item(item, runtime)
+            feed_item = _turn_feed_item(item, entry)
+            plans = prepare_turn_delivery_parts(
+                feed_item,
+                rich_transport=rich_message_send_enabled(
+                    _telegram_state(store)
+                ),
+            )
+            ordinal = int(obligation.get("part_ordinal") or 0)
+            if not 0 <= ordinal < len(plans):
+                continue
+            token, bot_kind = _delivery_bot(store, entry)
+            operation = _capture_entry_operation(
+                store,
+                entry,
+                topic_id=current_topic,
+                plan_token=plan_token,
+                revision=revision,
+            )
+            execution = _execute_entry_operation(
+                store,
+                runtime.telegram,
+                operation,
+                _provider_mutation(
+                    "telegram.send_turn_delivery_part",
+                    reason=(
+                        "telegram.send_turn_delivery_part: post-ACK reconcile route"
+                    ),
+                    args=(chat_id, feed_item, plans[ordinal]),
+                    kwargs={
+                        "telegram": _telegram_state(store),
+                        "thread_id": current_topic,
+                        "notify": False,
+                        "api_token": token,
+                    },
+                ),
+            )
+            result["operations"] += 1
+            sent = execution.result
+            if not sent.get("ok"):
+                return
+            new_message_id = str(sent.get("message_id") or "")
+            if not new_message_id:
+                return
+            state.bind_message_to_worker(
+                store,
+                new_message_id,
+                _operation_binding_entry(operation),
+                topic_id=current_topic,
+                kind="final",
+                turn_id=str(obligation.get("turn_id") or ""),
+                bot_kind=bot_kind,
+                content_revision=revision,
+                plan_token=plan_token,
+                part_ordinal=ordinal,
+                part_count=int(obligation.get("part_count") or len(plans)),
+                tendwire_job_key=job_key,
+            )
+            if current_message_id:
+                stale.append(
+                    {
+                        "message_id": current_message_id,
+                        "topic_id": applied_topic,
+                        "bot_kind": str(
+                            obligation.get("bot_kind")
+                            or MANAGER_BOT_KIND
+                        ),
+                    }
+                )
+            obligation["current_message_id"] = new_message_id
+            obligation["current_topic_id"] = current_topic
+            obligation["bot_kind"] = bot_kind
+            result["changed"] = True
+            _checkpoint_turn_job(runtime)
+            if execution.resolution.disposition != _OFFLOCK_APPLY:
+                continue
+            entry = execution.resolution.entry
+            assert entry is not None
+            # Retire the old exact copy in this pass when budget permits.
+            if stale and result["operations"] < max_operations:
+                copy = stale[0]
+                old_message_id = str(copy.get("message_id") or "")
+                old_bot = str(copy.get("bot_kind") or MANAGER_BOT_KIND)
+                try:
+                    old_token = _owning_bot_token(store, old_bot)
+                    retired = _execute_exact_provider_operation(
+                        runtime.telegram,
+                        store=store,
+                        mutation=_provider_mutation(
+                            "telegram.delete_turn_delivery_message",
+                            reason=(
+                                "telegram.delete_turn_delivery_message: "
+                                "post-ACK retire superseded copy"
+                            ),
+                            args=(chat_id, old_message_id),
+                            kwargs={"api_token": old_token},
+                        ),
+                    )
+                    result["operations"] += 1
+                except Exception:
+                    return
+                if not retired.get("ok"):
+                    return
+                _retire_local_message(store, None, old_message_id)
+                stale.pop(0)
+                _checkpoint_turn_job(runtime)
+            if stale:
+                return
+            if (
+                _compare_and_apply_entry_operation(
+                    store, operation
+                ).disposition
+                != _OFFLOCK_APPLY
+            ):
+                continue
+        message_id = str(obligation.get("current_message_id") or "")
+        binding = state.find_message_binding(store, message_id)
+        if binding is not None:
+            binding.update(
+                {
+                    key: value
+                    for key, value in _operation_binding_entry(
+                        _capture_entry_operation(
+                            store, entry, topic_id=current_topic
+                        )
+                    ).items()
+                    if key != "topic_id"
+                }
+            )
+        state.clear_tendwire_turn_job_post_ack_reconcile(store, job_key)
+        if item is not None:
+            _maybe_complete_turn_plan(
+                store,
+                item,
+                entry,
+                plan_token=plan_token,
+                revision=revision,
+            )
+        result["changed"] = True
+        result["post_ack_reconciled"] = (
+            int(result.get("post_ack_reconciled") or 0) + 1
+        )
+        _checkpoint_turn_job(runtime)
+
+
 def _drain_turn_final(
     store: dict[str, Any],
     turns_payload: dict[str, Any],
@@ -5826,6 +8465,16 @@ def _drain_turn_final(
         or runtime.dry_run
     ):
         return result
+    _drain_post_ack_reconciliations(
+        store,
+        turns_payload,
+        runtime,
+        chat_id=chat_id,
+        max_operations=max_operations,
+        result=result,
+    )
+    if result["operations"] >= max_operations:
+        return result
     materialized_sources: dict[
         str, tuple[dict[str, Any], dict[str, Any]]
     ] = {}
@@ -5842,9 +8491,18 @@ def _drain_turn_final(
             break
         if yield_barrier is not None:
             yield_barrier()
-        poll = runtime.tendwire.turn_final_poll(
-            limit=1,
-            lease_seconds=lease_seconds,
+        poll = _execute_exact_provider_operation(
+            runtime.tendwire,
+            mutation=_provider_mutation(
+                "tendwire.turn_final_poll",
+                reason=(
+                    "tendwire.turn_final_poll: acquire exact final-delivery lease"
+                ),
+                kwargs={
+                    "limit": 1,
+                    "lease_seconds": lease_seconds,
+                },
+            ),
         )
         if poll.get("ok") is False:
             result["status"] = str(
@@ -5984,7 +8642,7 @@ def _drain_turn_final(
                 )
                 break
             try:
-                staged, staged_pages = _stage_final_plan(
+                staged, staged_pages, entry = _stage_final_plan(
                     store,
                     item,
                     entry,
@@ -6372,6 +9030,96 @@ def _drain_turn_final(
             break
         substate = str(receipt.get("substate") or "")
         if substate == "retryable":
+            if not state.tendwire_turn_job_has_stale_copy_capacity(
+                receipt
+            ):
+                stale = state.tendwire_turn_job_stale_copies(receipt)[0]
+                if result["operations"] >= max_operations:
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "operation_budget_exhausted",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
+                    break
+                try:
+                    owner_token = _owning_bot_token(
+                        store, stale["bot_kind"]
+                    )
+                    retired = _execute_exact_provider_operation(
+                        runtime.telegram,
+                        store=store,
+                        mutation=_provider_mutation(
+                            "telegram.delete_turn_delivery_message",
+                            reason=(
+                                "telegram.delete_turn_delivery_message: "
+                                "stale-copy backpressure retirement"
+                            ),
+                            args=(chat_id, stale["message_id"]),
+                            kwargs={"api_token": owner_token},
+                        ),
+                    )
+                    result["operations"] += 1
+                except RateLimited as exc:
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "rate_limited",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=exc.retry_after,
+                    )
+                    break
+                except Exception:
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "transient_delivery",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
+                    break
+                if not retired.get("ok"):
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        str(
+                            retired.get("error")
+                            or "stale copy retire failed"
+                        ),
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
+                    break
+                _retire_local_message(
+                    store, None, stale["message_id"]
+                )
+                state.retire_tendwire_turn_job_stale_copy(
+                    store,
+                    job_key,
+                    message_id=stale["message_id"],
+                    topic_id=stale["topic_id"],
+                    bot_kind=stale["bot_kind"],
+                )
+                _checkpoint_turn_job(runtime)
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "stale_copy_backpressure",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=1,
+                )
+                break
             state.update_tendwire_turn_job(
                 store, job_key, substate="reserved"
             )
@@ -6404,17 +9152,129 @@ def _drain_turn_final(
                 )
                 _checkpoint_turn_job(runtime)
                 substate = "suppressed"
-            ack = runtime.tendwire.turn_final_ack(
-                ref,
-                {
-                    "outcome": "applied",
-                    "job_key": job_key,
-                },
+            suppressed_ack_operation = _capture_entry_operation(
+                store,
+                entry,
+                topic_id=str(entry.get("topic_id") or ""),
+                plan_token=plan_token,
+                revision=revision,
             )
-            if ack.get("ok") is False:
-                observed = runtime.tendwire.connector_prepare_commit(
-                    plan_token=plan_token
+            if (
+                _compare_and_apply_entry_operation(
+                    store, suppressed_ack_operation
+                ).disposition
+                != _OFFLOCK_APPLY
+            ):
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "transient_delivery",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=1,
                 )
+                break
+            ack_obligation = _turn_final_ack_obligation(
+                store,
+                job_key,
+                suppressed_ack_operation,
+                kind="suppressed",
+                turn_id=_turn_id(item),
+                plan_token=plan_token,
+                revision=revision,
+                ordinal=ordinal,
+                part_count=part_count,
+            )
+            state.record_tendwire_turn_job_post_ack_reconcile(
+                store,
+                job_key,
+                ack_obligation,
+                acknowledged=False,
+            )
+            _checkpoint_turn_job(runtime)
+            execution = _execute_entry_operation(
+                store,
+                runtime.tendwire,
+                suppressed_ack_operation,
+                _provider_mutation(
+                    "tendwire.turn_final_ack",
+                    reason=(
+                        "tendwire.turn_final_ack: acknowledge suppressed plan"
+                    ),
+                    args=(
+                        ref,
+                        {
+                            "outcome": "applied",
+                            "job_key": job_key,
+                        },
+                    ),
+                ),
+            )
+            ack = execution.result
+            suppressed_ack_resolution = execution.resolution
+            if (
+                suppressed_ack_resolution.disposition
+                != _OFFLOCK_APPLY
+            ):
+                if ack.get("ok") is not False:
+                    ack_obligation["status"] = "reconcile"
+                    state.record_tendwire_turn_job_post_ack_reconcile(
+                        store, job_key, ack_obligation
+                    )
+                    _checkpoint_turn_job(runtime)
+                    result["delivered"] += 1
+                    result["acked"] += 1
+                    result["changed"] = True
+                    continue
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "transient_delivery",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=1,
+                )
+                break
+            entry = suppressed_ack_resolution.entry
+            assert entry is not None
+            if ack.get("ok") is False:
+                observe_operation = _capture_entry_operation(
+                    store,
+                    entry,
+                    topic_id=str(entry.get("topic_id") or ""),
+                    plan_token=plan_token,
+                    revision=revision,
+                )
+                execution = _execute_entry_operation(
+                    store,
+                    runtime.tendwire,
+                    observe_operation,
+                    _provider_mutation(
+                        "tendwire.connector_prepare_commit",
+                        reason=(
+                            "tendwire.connector_prepare_commit: observe "
+                            "suppressed ACK conflict"
+                        ),
+                        kwargs={"plan_token": plan_token},
+                    ),
+                )
+                observed = execution.result
+                observe_resolution = execution.resolution
+                if observe_resolution.disposition != _OFFLOCK_APPLY:
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "transient_delivery",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
+                    break
+                entry = observe_resolution.entry
+                assert entry is not None
                 advanced = False
                 if (
                     observed.get("ok") is True
@@ -6440,6 +9300,9 @@ def _drain_turn_final(
                                 receipt_key,
                                 substate="acknowledged",
                             )
+                            state.clear_tendwire_turn_job_post_ack_reconcile(
+                                store, receipt_key
+                            )
                             advanced = True
                     advanced = (
                         _complete_suppressed_turn_plan(
@@ -6462,7 +9325,10 @@ def _drain_turn_final(
                 state.update_tendwire_turn_job(
                     store, job_key, substate="acknowledged"
                 )
-                _checkpoint_turn_job(runtime)
+            state.clear_tendwire_turn_job_post_ack_reconcile(
+                store, job_key
+            )
+            _checkpoint_turn_job(runtime)
             result["delivered"] += 1
             result["acked"] += 1
             result["changed"] = True
@@ -6495,16 +9361,32 @@ def _drain_turn_final(
                 _checkpoint_turn_job(runtime)
                 substate = "telegram_applied"
             else:
+                retire_operation = _capture_entry_operation(
+                    store,
+                    entry,
+                    topic_id=str(entry.get("topic_id") or ""),
+                    message_id=candidate_id,
+                    plan_token=plan_token,
+                    revision=revision,
+                )
                 try:
                     owner_token = _owning_bot_token(
                         store, candidate_bot
                     )
                     result["operations"] += 1
-                    deleted = delete_turn_delivery_message(
+                    execution = _execute_entry_operation(
+                        store,
                         runtime.telegram,
-                        chat_id,
-                        candidate_id,
-                        api_token=owner_token,
+                        retire_operation,
+                        _provider_mutation(
+                            "telegram.delete_turn_delivery_message",
+                            reason=(
+                                "telegram.delete_turn_delivery_message: "
+                                "retire planned final slot"
+                            ),
+                            args=(chat_id, candidate_id),
+                            kwargs={"api_token": owner_token},
+                        ),
                     )
                 except RateLimited as exc:
                     _defer_turn_final(
@@ -6534,6 +9416,8 @@ def _drain_turn_final(
                         uncertain=True,
                     )
                     break
+                deleted = execution.result
+                retire_resolution = execution.resolution
                 if not deleted.get("ok"):
                     if _telegram_result_is_transient(deleted):
                         _defer_turn_final(
@@ -6559,10 +9443,7 @@ def _drain_turn_final(
                             result,
                         )
                     break
-                _after_provider_accept(runtime)
-                _retire_local_message(
-                    store, entry, candidate_id
-                )
+                _retire_local_message(store, None, candidate_id)
                 state.update_tendwire_turn_job(
                     store,
                     job_key,
@@ -6572,33 +9453,72 @@ def _drain_turn_final(
                     or MANAGER_BOT_KIND,
                 )
                 _checkpoint_turn_job(runtime)
+                _after_provider_accept(runtime)
                 substate = "telegram_applied"
         else:
             assert feed_item is not None and plans
+            attempted_topic_id = str(entry.get("topic_id") or "")
+            if not attempted_topic_id:
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "transient_delivery",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=1,
+                )
+                break
+            delivery_operation = _capture_entry_operation(
+                store,
+                entry,
+                topic_id=attempted_topic_id,
+                message_id=candidate_id if compatible else "",
+                plan_token=plan_token,
+                revision=revision,
+            )
             try:
                 result["operations"] += 1
                 if compatible:
-                    applied = edit_turn_delivery_part(
+                    execution = _execute_entry_operation(
+                        store,
                         runtime.telegram,
-                        chat_id,
-                        candidate_id,
-                        feed_item,
-                        plans[ordinal],
-                        telegram=_telegram_state(store),
-                        api_token=desired_token,
+                        delivery_operation,
+                        _provider_mutation(
+                            "telegram.edit_turn_delivery_part",
+                            reason=(
+                                "telegram.edit_turn_delivery_part: apply compatible final"
+                            ),
+                            args=(
+                                chat_id,
+                                candidate_id,
+                                feed_item,
+                                plans[ordinal],
+                            ),
+                            kwargs={
+                                "telegram": _telegram_state(store),
+                                "api_token": desired_token,
+                            },
+                        ),
                     )
                 else:
-                    applied = send_turn_delivery_part(
+                    execution = _execute_entry_operation(
+                        store,
                         runtime.telegram,
-                        chat_id,
-                        feed_item,
-                        plans[ordinal],
-                        telegram=_telegram_state(store),
-                        thread_id=str(
-                            entry.get("topic_id") or ""
+                        delivery_operation,
+                        _provider_mutation(
+                            "telegram.send_turn_delivery_part",
+                            reason=(
+                                "telegram.send_turn_delivery_part: apply new final"
+                            ),
+                            args=(chat_id, feed_item, plans[ordinal]),
+                            kwargs={
+                                "telegram": _telegram_state(store),
+                                "thread_id": attempted_topic_id,
+                                "notify": False,
+                                "api_token": desired_token,
+                            },
                         ),
-                        notify=False,
-                        api_token=desired_token,
                     )
             except RateLimited as exc:
                 _defer_turn_final(
@@ -6620,6 +9540,8 @@ def _drain_turn_final(
                     uncertain=True,
                 )
                 break
+            applied = execution.result
+            delivery_resolution = execution.resolution
             if not applied.get("ok"):
                 kind = str(applied.get("kind") or "")
                 if _telegram_result_is_transient(applied):
@@ -6641,12 +9563,25 @@ def _drain_turn_final(
                     and kind in {"not_found", "topic_not_found"}
                 )
                 if retry_as_send and kind == "not_found":
-                    _retire_local_message(
-                        store, entry, candidate_id
-                    )
+                    _retire_local_message(store, None, candidate_id)
                     candidate_id = ""
                     compatible = False
                     _checkpoint_turn_job(runtime)
+                if (
+                    retry_as_send
+                    and delivery_resolution.disposition
+                    != _OFFLOCK_APPLY
+                ):
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "transient_delivery",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
+                    break
                 if (
                     retry_as_send
                     and result["operations"] >= max_operations
@@ -6662,19 +9597,46 @@ def _drain_turn_final(
                     )
                     break
                 if retry_as_send:
+                    entry = delivery_resolution.entry
+                    assert entry is not None
+                    attempted_topic_id = str(entry.get("topic_id") or "")
+                    if not attempted_topic_id:
+                        _defer_turn_final(
+                            runtime,
+                            ref,
+                            "transient_delivery",
+                            result,
+                            store,
+                            job_key,
+                            delay_seconds=1,
+                        )
+                        break
+                    delivery_operation = _capture_entry_operation(
+                        store,
+                        entry,
+                        topic_id=attempted_topic_id,
+                        plan_token=plan_token,
+                        revision=revision,
+                    )
                     try:
                         result["operations"] += 1
-                        applied = send_turn_delivery_part(
+                        execution = _execute_entry_operation(
+                            store,
                             runtime.telegram,
-                            chat_id,
-                            feed_item,
-                            plans[ordinal],
-                            telegram=_telegram_state(store),
-                            thread_id=str(
-                                entry.get("topic_id") or ""
+                            delivery_operation,
+                            _provider_mutation(
+                                "telegram.send_turn_delivery_part",
+                                reason=(
+                                    "telegram.send_turn_delivery_part: replace missing final"
+                                ),
+                                args=(chat_id, feed_item, plans[ordinal]),
+                                kwargs={
+                                    "telegram": _telegram_state(store),
+                                    "thread_id": attempted_topic_id,
+                                    "notify": False,
+                                    "api_token": desired_token,
+                                },
                             ),
-                            notify=False,
-                            api_token=desired_token,
                         )
                         compatible = False
                     except RateLimited as exc:
@@ -6697,7 +9659,28 @@ def _drain_turn_final(
                             uncertain=True,
                         )
                         break
+                    applied = execution.result
+                    delivery_resolution = execution.resolution
                 if not applied.get("ok"):
+                    if _repair_provider_gone_topic(
+                        store,
+                        delivery_resolution.entry
+                        if delivery_resolution.disposition
+                        == _OFFLOCK_APPLY
+                        else None,
+                        applied,
+                        topic_id=attempted_topic_id,
+                    ):
+                        _defer_turn_final(
+                            runtime,
+                            ref,
+                            "transient_delivery",
+                            result,
+                            store,
+                            job_key,
+                            delay_seconds=1,
+                        )
+                        break
                     if _telegram_result_is_transient(applied):
                         _defer_turn_final(
                             runtime,
@@ -6736,7 +9719,6 @@ def _drain_turn_final(
                     uncertain=True,
                 )
                 break
-            _after_provider_accept(runtime)
             prior_id = (
                 candidate_id
                 if candidate_id
@@ -6747,8 +9729,8 @@ def _drain_turn_final(
             state.bind_message_to_worker(
                 store,
                 message_id,
-                entry,
-                topic_id=str(entry.get("topic_id") or ""),
+                _operation_binding_entry(delivery_operation),
+                topic_id=attempted_topic_id,
                 kind="final",
                 turn_id=_turn_id(item),
                 bot_kind=desired_bot,
@@ -6758,6 +9740,35 @@ def _drain_turn_final(
                 part_count=part_count,
                 tendwire_job_key=job_key,
             )
+            if delivery_resolution.disposition != _OFFLOCK_APPLY:
+                state.reconcile_tendwire_turn_job_route(
+                    store,
+                    job_key,
+                    message_id=message_id,
+                    topic_id=attempted_topic_id,
+                    bot_kind=desired_bot,
+                )
+                _checkpoint_turn_job(runtime)
+                _after_provider_accept(runtime)
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "transient_delivery",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=1,
+                )
+                break
+            entry = delivery_resolution.entry
+            assert entry is not None
+            if prior_id and any(
+                stale["message_id"] == prior_id
+                for stale in state.tendwire_turn_job_stale_copies(
+                    state.find_tendwire_turn_job(store, job_key)
+                )
+            ):
+                prior_id = None
             state.update_tendwire_turn_job(
                 store,
                 job_key,
@@ -6770,8 +9781,11 @@ def _drain_turn_final(
                 candidate_kind == "working"
                 and message_id == candidate_id
             ):
-                _clear_stream_delivery_keys(entry)
+                _clear_entry_message_reference(
+                    entry, candidate_id, "working"
+                )
             _checkpoint_turn_job(runtime)
+            _after_provider_accept(runtime)
             substate = "telegram_applied"
 
         receipt = state.find_tendwire_turn_job(store, job_key)
@@ -6806,16 +9820,32 @@ def _drain_turn_final(
                     or candidate_bot
                     or MANAGER_BOT_KIND
                 )
+                retire_operation = _capture_entry_operation(
+                    store,
+                    entry,
+                    topic_id=str(entry.get("topic_id") or ""),
+                    message_id=prior_id,
+                    plan_token=plan_token,
+                    revision=revision,
+                )
                 try:
                     owner_token = _owning_bot_token(
                         store, prior_bot
                     )
                     result["operations"] += 1
-                    retired = delete_turn_delivery_message(
+                    execution = _execute_entry_operation(
+                        store,
                         runtime.telegram,
-                        chat_id,
-                        prior_id,
-                        api_token=owner_token,
+                        retire_operation,
+                        _provider_mutation(
+                            "telegram.delete_turn_delivery_message",
+                            reason=(
+                                "telegram.delete_turn_delivery_message: "
+                                "retire replaced final slot"
+                            ),
+                            args=(chat_id, prior_id),
+                            kwargs={"api_token": owner_token},
+                        ),
                     )
                 except RateLimited as exc:
                     _defer_turn_final(
@@ -6845,6 +9875,8 @@ def _drain_turn_final(
                         uncertain=True,
                     )
                     break
+                retired = execution.result
+                retire_resolution = execution.resolution
                 if not retired.get("ok"):
                     if _telegram_result_is_transient(retired):
                         _defer_turn_final(
@@ -6870,24 +9902,312 @@ def _drain_turn_final(
                             result,
                         )
                     break
-                _after_provider_accept(runtime)
-                _retire_local_message(store, entry, prior_id)
+                _retire_local_message(store, None, prior_id)
+                if retire_resolution.disposition != _OFFLOCK_APPLY:
+                    current_binding = state.find_message_binding(
+                        store, message_id
+                    )
+                    current_topic = str(
+                        (current_binding or {}).get("topic_id") or ""
+                    )
+                    current_bot = str(
+                        (current_binding or {}).get("bot_kind")
+                        or receipt.get("bot_kind")
+                        or desired_bot
+                    )
+                    if message_id and current_topic:
+                        state.reconcile_tendwire_turn_job_route(
+                            store,
+                            job_key,
+                            message_id=message_id,
+                            topic_id=current_topic,
+                            bot_kind=current_bot,
+                        )
+                        _checkpoint_turn_job(runtime)
+                    else:
+                        _checkpoint_turn_job(runtime)
+                    _after_provider_accept(runtime)
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "transient_delivery",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
+                    break
+                entry = retire_resolution.entry
+                assert entry is not None
                 state.update_tendwire_turn_job(
                     store,
                     job_key,
                     substate="old_slot_retired",
                 )
                 _checkpoint_turn_job(runtime)
+                _after_provider_accept(runtime)
                 substate = "old_slot_retired"
 
-        ack = runtime.tendwire.turn_final_ack(
-            ref,
-            {"outcome": "applied", "job_key": job_key},
-        )
-        if ack.get("ok") is False:
-            observed = runtime.tendwire.connector_prepare_commit(
-                plan_token=plan_token
+        stale_cleanup_deferred = False
+        while operation == "upsert":
+            receipt = state.find_tendwire_turn_job(store, job_key)
+            stale_copies = state.tendwire_turn_job_stale_copies(receipt)
+            if not stale_copies:
+                break
+            stale = stale_copies[0]
+            if result["operations"] >= max_operations:
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "operation_budget_exhausted",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=1,
+                )
+                stale_cleanup_deferred = True
+                break
+            stale_operation = _capture_entry_operation(
+                store,
+                entry,
+                topic_id=str(entry.get("topic_id") or ""),
+                message_id=stale["message_id"],
+                plan_token=plan_token,
+                revision=revision,
             )
+            try:
+                owner_token = _owning_bot_token(
+                    store, stale["bot_kind"]
+                )
+                result["operations"] += 1
+                execution = _execute_entry_operation(
+                    store,
+                    runtime.telegram,
+                    stale_operation,
+                    _provider_mutation(
+                        "telegram.delete_turn_delivery_message",
+                        reason=(
+                            "telegram.delete_turn_delivery_message: "
+                            "retire tracked stale final copy"
+                        ),
+                        args=(chat_id, stale["message_id"]),
+                        kwargs={"api_token": owner_token},
+                    ),
+                )
+            except RateLimited as exc:
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "rate_limited",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=exc.retry_after,
+                )
+                stale_cleanup_deferred = True
+                break
+            except (_TurnContentError, Exception):
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    "delivery_uncertain",
+                    result,
+                    uncertain=True,
+                )
+                stale_cleanup_deferred = True
+                break
+            retired = execution.result
+            stale_resolution = execution.resolution
+            if not retired.get("ok"):
+                if _telegram_result_is_transient(retired):
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        str(retired.get("error") or "transient delivery"),
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
+                else:
+                    _fail_turn_final(
+                        runtime,
+                        ref,
+                        str(retired.get("error") or "stale copy retire failed"),
+                        result,
+                    )
+                stale_cleanup_deferred = True
+                break
+            _retire_local_message(store, None, stale["message_id"])
+            state.retire_tendwire_turn_job_stale_copy(
+                store,
+                job_key,
+                message_id=stale["message_id"],
+                topic_id=stale["topic_id"],
+                bot_kind=stale["bot_kind"],
+            )
+            _checkpoint_turn_job(runtime)
+            if stale_resolution.disposition != _OFFLOCK_APPLY:
+                receipt = state.find_tendwire_turn_job(store, job_key)
+                current_message_id = str(
+                    (receipt or {}).get("telegram_message_id") or ""
+                )
+                current_binding = state.find_message_binding(
+                    store, current_message_id
+                )
+                current_topic = str(
+                    (current_binding or {}).get("topic_id") or ""
+                )
+                current_bot = str(
+                    (current_binding or {}).get("bot_kind")
+                    or (receipt or {}).get("bot_kind")
+                    or desired_bot
+                )
+                if current_message_id and current_topic:
+                    state.reconcile_tendwire_turn_job_route(
+                        store,
+                        job_key,
+                        message_id=current_message_id,
+                        topic_id=current_topic,
+                        bot_kind=current_bot,
+                    )
+                    _checkpoint_turn_job(runtime)
+                _after_provider_accept(runtime)
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "transient_delivery",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=1,
+                )
+                stale_cleanup_deferred = True
+                break
+            entry = stale_resolution.entry
+            assert entry is not None
+            _after_provider_accept(runtime)
+        if stale_cleanup_deferred:
+            break
+
+        # ACK is allowed only for the same durable owner/route/plan that the
+        # provider operation used, after every accepted stale copy is gone.
+        pre_ack_operation = _capture_entry_operation(
+            store,
+            entry,
+            topic_id=str(entry.get("topic_id") or ""),
+            plan_token=plan_token,
+            revision=revision,
+        )
+        if (
+            _compare_and_apply_entry_operation(
+                store, pre_ack_operation
+            ).disposition
+            != _OFFLOCK_APPLY
+            or state.tendwire_turn_job_stale_copies(
+                state.find_tendwire_turn_job(store, job_key)
+            )
+        ):
+            _defer_turn_final(
+                runtime,
+                ref,
+                "transient_delivery",
+                result,
+                store,
+                job_key,
+                delay_seconds=1,
+            )
+            break
+        ack_obligation = _turn_final_ack_obligation(
+            store,
+            job_key,
+            pre_ack_operation,
+            kind="upsert",
+            turn_id=_turn_id(item),
+            plan_token=plan_token,
+            revision=revision,
+            ordinal=ordinal,
+            part_count=part_count,
+        )
+        state.record_tendwire_turn_job_post_ack_reconcile(
+            store,
+            job_key,
+            ack_obligation,
+            acknowledged=False,
+        )
+        _checkpoint_turn_job(runtime)
+        execution = _execute_entry_operation(
+            store,
+            runtime.tendwire,
+            pre_ack_operation,
+            _provider_mutation(
+                "tendwire.turn_final_ack",
+                reason="tendwire.turn_final_ack: acknowledge applied final",
+                args=(
+                    ref,
+                    {"outcome": "applied", "job_key": job_key},
+                ),
+            ),
+        )
+        ack, ack_resolution = execution.result, execution.resolution
+        if ack_resolution.disposition != _OFFLOCK_APPLY:
+            if ack.get("ok") is not False:
+                ack_obligation["status"] = "reconcile"
+                state.record_tendwire_turn_job_post_ack_reconcile(
+                    store, job_key, ack_obligation
+                )
+                _checkpoint_turn_job(runtime)
+                result["delivered"] += 1
+                result["acked"] += 1
+                result["changed"] = True
+                continue
+            _defer_turn_final(
+                runtime,
+                ref,
+                "transient_delivery",
+                result,
+                store,
+                job_key,
+                delay_seconds=1,
+            )
+            break
+        entry = ack_resolution.entry
+        assert entry is not None
+        if ack.get("ok") is False:
+            observe_operation = _capture_entry_operation(
+                store,
+                entry,
+                topic_id=str(entry.get("topic_id") or ""),
+                plan_token=plan_token,
+                revision=revision,
+            )
+            execution = _execute_entry_operation(
+                store,
+                runtime.tendwire,
+                observe_operation,
+                _provider_mutation(
+                    "tendwire.connector_prepare_commit",
+                    reason=(
+                        "tendwire.connector_prepare_commit: observe applied ACK conflict"
+                    ),
+                    kwargs={"plan_token": plan_token},
+                ),
+            )
+            observed = execution.result
+            observe_resolution = execution.resolution
+            if observe_resolution.disposition != _OFFLOCK_APPLY:
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "transient_delivery",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=1,
+                )
+                break
+            entry = observe_resolution.entry
+            assert entry is not None
             advanced = False
             if (
                 observed.get("ok") is True
@@ -6899,6 +10219,10 @@ def _drain_turn_final(
                     isinstance(observed_count, int)
                     and not isinstance(observed_count, bool)
                     and observed_count > 0
+                    and entry.get("pending_plan_token")
+                    == plan_token
+                    and entry.get("pending_content_revision")
+                    == revision
                 ):
                     entry[
                         "pending_turn_job_count"
@@ -6921,6 +10245,9 @@ def _drain_turn_final(
                             receipt_key,
                             substate="acknowledged",
                         )
+                        state.clear_tendwire_turn_job_post_ack_reconcile(
+                            store, receipt_key
+                        )
                         advanced = True
                 if _maybe_complete_turn_plan(
                     store,
@@ -6941,7 +10268,10 @@ def _drain_turn_final(
             state.update_tendwire_turn_job(
                 store, job_key, substate="acknowledged"
             )
-            _checkpoint_turn_job(runtime)
+        state.clear_tendwire_turn_job_post_ack_reconcile(
+            store, job_key
+        )
+        _checkpoint_turn_job(runtime)
         result["delivered"] += 1
         result["acked"] += 1
         result["changed"] = True
@@ -7034,6 +10364,8 @@ def _sync_pinned(
     )
     if account_html:
         html = f"{html}\n{account_html}"
+    if yield_barrier is not None:
+        yield_barrier()
     telegram = store.setdefault("telegram", {})
     message_id = str(telegram.get("pinned_status_message_id") or "")
     content_hash = short_hash(html, 20)
@@ -7043,27 +10375,149 @@ def _sync_pinned(
         telegram["pinned_status_hash"] = content_hash
         telegram.setdefault("pinned_status_message_id", "0")
         return True
-    if yield_barrier is not None:
-        yield_barrier()
+    general_thread_id = str(config.general_thread_id(store))
+    accepted_receipt_id = ""
+
+    def send_to_general_thread() -> tuple[
+        dict[str, Any], _OfflockEntryResolution
+    ]:
+        nonlocal accepted_receipt_id
+        if (
+            not _notification_acceptance_capacity_available(store)
+            or _notification_kind_pending(store, "global_pinned")
+        ):
+            return (
+                {
+                    "ok": False,
+                    "status": "accepted_artifact_backpressure",
+                },
+                _OfflockEntryResolution(_OFFLOCK_RECONCILE),
+            )
+        operation = _capture_global_operation(
+            store, topic_id=general_thread_id
+        )
+
+        def checkpoint_global_pin(
+            result: Any, captured: _OfflockEntryOperation
+        ) -> None:
+            nonlocal accepted_receipt_id
+            accepted_receipt_id = _checkpoint_accepted_notification(
+                store,
+                runtime,
+                captured,
+                result,
+                kind="global_pinned",
+            )
+
+        execution = _execute_entry_operation(
+            store,
+            runtime.telegram,
+            operation,
+            _provider_mutation(
+                "telegram.send_message",
+                reason=(
+                    "telegram.send_message: create global status in general thread"
+                ),
+                args=(chat_id, html),
+                kwargs={
+                    "thread_id": general_thread_id,
+                    "notify": False,
+                },
+            ),
+            acceptance_checkpoint=checkpoint_global_pin,
+        )
+        result, resolution = execution.result, execution.resolution
+        if not result.get("ok") and _topic_missing(
+            result.get("error")
+        ):
+            _repair_provider_gone_topic(
+                store,
+                None,
+                result,
+                topic_id=general_thread_id,
+            )
+            fallback_operation = _capture_global_operation(
+                store, topic_id=""
+            )
+            execution = _execute_entry_operation(
+                store,
+                runtime.telegram,
+                fallback_operation,
+                _provider_mutation(
+                    "telegram.send_message",
+                    reason=(
+                        "telegram.send_message: create global status in root fallback"
+                    ),
+                    args=(chat_id, html),
+                    kwargs={"notify": False},
+                ),
+                acceptance_checkpoint=checkpoint_global_pin,
+            )
+            result, resolution = execution.result, execution.resolution
+        return result, resolution
+
+    sent_new = False
     if message_id:
-        sent = runtime.telegram.edit_message(chat_id, message_id, html)
-        if not sent.get("ok") and _message_missing(sent.get("error")):
-            sent = runtime.telegram.send_message(chat_id, html, thread_id=config.general_thread_id(store), notify=False)
-            if not sent.get("ok") and _topic_missing(sent.get("error")):
-                sent = runtime.telegram.send_message(chat_id, html, notify=False)
-            if sent.get("ok") and sent.get("message_id"):
-                runtime.telegram.pin_message(chat_id, str(sent["message_id"]))
+        operation = _capture_global_operation(
+            store,
+            topic_id=general_thread_id,
+            message_id=message_id,
+        )
+        execution = _execute_entry_operation(
+            store,
+            runtime.telegram,
+            operation,
+            _provider_mutation(
+                "telegram.edit_message",
+                reason="telegram.edit_message: refresh global status",
+                args=(chat_id, message_id, html),
+            ),
+        )
+        sent, resolution = execution.result, execution.resolution
+        if not sent.get("ok") and (
+            _message_missing(sent.get("error"))
+            or _topic_missing(sent.get("error"))
+        ):
+            sent, resolution = send_to_general_thread()
+            sent_new = True
     else:
-        sent = runtime.telegram.send_message(chat_id, html, thread_id=config.general_thread_id(store), notify=False)
-        if not sent.get("ok") and _topic_missing(sent.get("error")):
-            sent = runtime.telegram.send_message(chat_id, html, notify=False)
-        if sent.get("ok") and sent.get("message_id"):
-            runtime.telegram.pin_message(chat_id, str(sent["message_id"]))
+        sent, resolution = send_to_general_thread()
+        sent_new = True
+    if resolution.disposition != _OFFLOCK_APPLY:
+        return False
+    telegram = resolution.entry
+    assert telegram is not None
+    if sent_new and sent.get("ok") and sent.get("message_id"):
+        pin_operation = _capture_global_operation(
+            store,
+            topic_id=general_thread_id
+            if general_thread_id not in state.dead_topic_ids(store)
+            else "",
+            message_id=str(sent["message_id"]),
+        )
+        execution = _execute_entry_operation(
+            store,
+            runtime.telegram,
+            pin_operation,
+            _provider_mutation(
+                "telegram.pin_message",
+                reason="telegram.pin_message: pin global status",
+                args=(chat_id, str(sent["message_id"])),
+            ),
+        )
+        pin_resolution = execution.resolution
+        if pin_resolution.disposition != _OFFLOCK_APPLY:
+            return False
+        telegram = pin_resolution.entry
+        assert telegram is not None
     if sent.get("ok"):
         telegram["pinned_status_hash"] = content_hash
         if sent.get("message_id"):
             telegram["pinned_status_message_id"] = str(sent["message_id"])
         telegram.pop("pinned_status_last_error", None)
+        _complete_accepted_notification(
+            store, accepted_receipt_id
+        )
         return True
     telegram["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
     return False
@@ -7094,6 +10548,108 @@ def _sync_topic_pinned_statuses(
             )
         )
     return updated
+
+
+def _decision_provider_executor(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+) -> decisions.ProviderExecutor:
+    """Bind decision operations to the same immutable owner guard as panes."""
+
+    def _execute_decision_provider_operation(
+        request: decisions.ProviderOperation,
+    ) -> decisions.ProviderExecution:
+        if not decisions.provider_acceptance_capacity_available(
+            store, request
+        ):
+            return decisions.ProviderExecution(
+                {"ok": False, "status": "accepted_artifact_backpressure"},
+                _OFFLOCK_ABANDON,
+            )
+        operation: _OfflockEntryOperation | None = None
+        if request.provenance:
+            operation = _operation_from_provenance(request.provenance)
+        else:
+            entry = state.source_worker_entries(store).get(
+                request.entry_key
+            )
+            if (
+                entry is not None
+                and request.worker_id
+                and _entry_worker_id(entry) != request.worker_id
+            ):
+                entry = None
+            if entry is None and request.worker_id:
+                _key, entry = state.find_worker_entry_by_id(
+                    store, request.worker_id
+                )
+            if (
+                entry is None
+                or str(entry.get("topic_id") or "") != request.topic_id
+            ):
+                return decisions.ProviderExecution(
+                    {"ok": False, "status": "owner_changed"},
+                    _OFFLOCK_ABANDON,
+                )
+            operation = _capture_entry_operation(
+                store,
+                entry,
+                topic_id=request.topic_id,
+                message_id=request.message_id,
+            )
+        client = (
+            runtime.tendwire
+            if request.capability.startswith("tendwire.")
+            else runtime.telegram
+        )
+        mutation = _provider_mutation(
+            request.capability,
+            reason=request.reason,
+            args=request.args,
+            kwargs=dict(request.kwargs),
+        )
+        provenance = _operation_provenance(operation)
+        receipt_id = ""
+
+        def checkpoint_acceptance(
+            result: Any, _operation: _OfflockEntryOperation
+        ) -> None:
+            nonlocal receipt_id
+            receipt_id = decisions.checkpoint_provider_acceptance(
+                store,
+                request,
+                result if isinstance(result, Mapping) else {},
+                provenance,
+            )
+            if receipt_id and runtime.checkpoint is not None:
+                runtime.checkpoint()
+
+        if request.scope == "exact":
+            provider_result = _execute_exact_provider_operation(
+                client, mutation=mutation, store=store
+            )
+            checkpoint_acceptance(provider_result, operation)
+            resolution = _compare_and_apply_entry_operation(
+                store, operation
+            )
+        else:
+            execution = _execute_entry_operation(
+                store,
+                client,
+                operation,
+                mutation,
+                acceptance_checkpoint=checkpoint_acceptance,
+            )
+            provider_result = execution.result
+            resolution = execution.resolution
+        return decisions.ProviderExecution(
+            dict(provider_result),
+            resolution.disposition,
+            provenance=provenance,
+            receipt_id=receipt_id,
+        )
+
+    return _execute_decision_provider_operation
 
 
 def _deliver_decisions(
@@ -7127,6 +10683,9 @@ def _deliver_decisions(
             runtime.telegram,
             chat_id=chat_id,
             dry_run=runtime.dry_run,
+            provider_executor=_decision_provider_executor(
+                store, runtime
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - decisions are additive to the core sync loop
         return {
@@ -8103,11 +11662,20 @@ def drain_outbound_once(
     )
     attention_result = drain_outbox(
         store,
-        effective_runtime.telegram,
-        effective_runtime.tendwire,
+        _exact_provider_client(
+            effective_runtime.telegram,
+            reason=(
+                "outbound attention Telegram exact identifiers"
+            ),
+        ),
+        _exact_provider_client(
+            effective_runtime.tendwire,
+            reason="outbound attention Tendwire exact leased references",
+        ),
         chat_id=chat_id,
         max_sends=remaining,
         dry_run=effective_runtime.dry_run,
+        ack_barrier_persists_state=True,
     )
     return {
         "ok": True,
@@ -8156,6 +11724,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             # are converted to bounded row-local outcomes by validation.
             return _tendwire_non_success(runtime, exc.status)
     runtime = _offlock_runtime(store, runtime)
+    with state.lock_phase("sync.accepted_notifications"):
+        (
+            accepted_notifications_retired,
+            _accepted_notifications_pending,
+        ) = _drain_accepted_notifications(
+            store,
+            runtime,
+            chat_id=chat_id,
+        )
 
     def _yield_between_turns() -> None:
         if not state.lock_held():
@@ -8194,7 +11771,10 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             turns_payload,
             observed_at=observed_at,
         )
-    changed = generation_resolution_changed
+    changed = bool(
+        generation_resolution_changed
+        or accepted_notifications_retired
+    )
     with state.lock_phase("sync.sources"):
         source_counts = _sync_sources(
             store, snapshot, turns_payload, runtime, chat_id=chat_id
@@ -8497,12 +12077,23 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             )
             outbox_result = drain_outbox(
                 store,
-                runtime.telegram,
-                runtime.tendwire,
+                _exact_provider_client(
+                    runtime.telegram,
+                    reason=(
+                        "sync attention Telegram exact identifiers"
+                    ),
+                ),
+                _exact_provider_client(
+                    runtime.tendwire,
+                    reason=(
+                        "sync attention Tendwire exact leased references"
+                    ),
+                ),
                 chat_id=chat_id,
                 max_sends=remaining,
                 dry_run=runtime.dry_run,
                 yield_barrier=yield_barrier,
+                ack_barrier_persists_state=True,
             )
         changed = changed or bool(turn_final_result.get("changed")) or bool(outbox_result.get("changed"))
     return {

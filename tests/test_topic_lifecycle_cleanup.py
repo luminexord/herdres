@@ -301,6 +301,10 @@ def test_delete_mode_deletes_dormant_and_retired_topics_once_at_ttl(
     assert "topic_id" not in dormant
     assert "topic_id" not in retired
     assert retired["retired_topic_deleted"] is True
+    assert store["telegram_dead_topic_ids"] == ["42", "43"]
+    assert [
+        item["topic_id"] for item in store["telegram_deleted_topics"]
+    ] == ["42", "43"]
     assert [
         item["action"] for item in store["telegram_topic_cleanup_audit"]
     ] == ["delete", "delete"]
@@ -408,6 +412,8 @@ def test_already_gone_delete_is_terminal_success(monkeypatch):
     assert telegram.deleted == ["53"]
     assert "topic_id" not in entry
     assert entry["retired_topic_missing"] is True
+    assert store["telegram_dead_topic_ids"] == ["53"]
+    assert store["telegram_deleted_topics"][0]["topic_id"] == "53"
 
 
 def test_pre_lifecycle_retired_close_marker_is_adopted_without_api_call():
@@ -722,6 +728,117 @@ def test_phase3_real_reload_discards_close_for_concurrently_revived_pane(
     assert result["deferred"] == 1
     assert revived["status"] == "idle"
     assert "topic_closed_at" not in revived
+
+
+def test_phase3_delete_records_provider_fact_after_concurrent_rebind(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
+    entry = _entry("22000", dormant_at=NOW - DAY)
+    store = _store(("pane:one", entry))
+    state.save_state(store, state_path)
+
+    class RebindingDeleteTelegram(CleanupTelegram):
+        def delete_topic(self, chat_id, topic_id):
+            result = super().delete_topic(chat_id, topic_id)
+            concurrent = state.load_state(state_path)
+            rebound = concurrent["panes"]["pane:one"]
+            rebound["topic_id"] = "22001"
+            rebound["topic_name"] = "Rebound pane"
+            concurrent["spaces"]["space:live-alias"] = {
+                "source": "tendwire",
+                "entry_type": "space",
+                "tendwire_space_id": "live-alias",
+                "topic_id": "22000",
+                "topic_name": "Live alias",
+            }
+            state.save_state(concurrent, state_path)
+            return result
+
+    telegram = RebindingDeleteTelegram()
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        result = _cleanup(current, telegram)
+
+    rebound = current["panes"]["pane:one"]
+    alias = current["spaces"]["space:live-alias"]
+    assert telegram.deleted == ["22000"]
+    assert result["operations"] == 1
+    assert result["deleted"] == 0
+    assert result["deferred"] == 1
+    assert result["changed"] is True
+    assert rebound["topic_id"] == "22001"
+    assert rebound["topic_name"] == "Rebound pane"
+    assert "topic_id" not in alias
+    assert alias["deleted_topic_id"] == "22000"
+    assert current["telegram_dead_topic_ids"] == ["22000"]
+    assert current["telegram_deleted_topics"] == [
+        {
+            "topic_id": "22000",
+            "name": "Topic 22000",
+            "reason": "dormant_pane_ttl",
+        }
+    ]
+    assert state.find_legacy_topic_id_by_name(current, "Live alias") == ""
+
+
+def test_delete_outcome_receipt_replay_is_idempotent(monkeypatch):
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
+    entry = _entry("79", dormant_at=NOW - DAY)
+    store = _store(("pane:one", entry))
+    store["telegram_dead_topic_ids"] = ["900", "901"]
+    targets, _abandoned, _delayed = source_sync._topic_cleanup_targets(
+        store, now=NOW, preview=False
+    )
+    outcome = {
+        "target": targets[0],
+        "status": "success",
+        "kind": "",
+        "error": "",
+    }
+
+    first = source_sync._topic_cleanup_empty_result()
+    source_sync._apply_topic_cleanup_outcomes(
+        store, [outcome], first, now=NOW
+    )
+    after_first = copy.deepcopy(store)
+    deletion_audit_length = len(store["telegram_deleted_topics"])
+
+    replay = source_sync._topic_cleanup_empty_result()
+    source_sync._apply_topic_cleanup_outcomes(
+        store, [outcome], replay, now=NOW
+    )
+
+    assert first["operations"] == 1
+    assert first["deleted"] == 1
+    assert first["changed"] is True
+    assert replay["operations"] == 1
+    assert replay["deleted"] == 0
+    assert replay["deferred"] == 1
+    assert replay["changed"] is False
+    assert store == after_first
+    assert store["telegram_dead_topic_ids"] == ["900", "901", "79"]
+    assert len(store["telegram_deleted_topics"]) == deletion_audit_length
+
+    store["spaces"]["space:late-alias"] = {
+        "source": "tendwire",
+        "entry_type": "space",
+        "topic_id": "79",
+        "topic_name": "Late alias",
+    }
+    alias_replay = source_sync._topic_cleanup_empty_result()
+    source_sync._apply_topic_cleanup_outcomes(
+        store, [outcome], alias_replay, now=NOW
+    )
+
+    late_alias = store["spaces"]["space:late-alias"]
+    assert alias_replay["changed"] is True
+    assert "topic_id" not in late_alias
+    assert late_alias["deleted_topic_id"] == "79"
+    assert store["telegram_dead_topic_ids"] == ["900", "901", "79"]
+    assert len(store["telegram_deleted_topics"]) == deletion_audit_length
 
 
 def test_rate_limit_backoff_uses_receipt_time_even_after_conflict(

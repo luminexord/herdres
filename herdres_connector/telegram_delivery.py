@@ -497,21 +497,37 @@ def delete_turn_delivery_message(
 TOPIC_ICON_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
 
 
-def topic_icon_catalog(store: dict[str, Any], telegram_client: TelegramClient | None = None) -> dict[str, str]:
+def topic_icon_catalog(
+    store: dict[str, Any],
+    telegram_client: TelegramClient | None = None,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[str, str]:
     """Return the emoji -> custom_emoji_id map of the forum topic icon set."""
     telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
     icons = telegram.get("forum_topic_icons") if isinstance(telegram, dict) else {}
     by_emoji = icons.get("by_emoji") if isinstance(icons, dict) and isinstance(icons.get("by_emoji"), dict) else {}
     if not by_emoji:
         # Populate the cache through the existing fetch path.
-        topic_icon_id(store, "\u2705", telegram_client)
+        topic_icon_id(
+            store,
+            "\u2705",
+            telegram_client,
+            checkpoint=checkpoint,
+        )
         telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
         icons = telegram.get("forum_topic_icons") if isinstance(telegram, dict) else {}
         by_emoji = icons.get("by_emoji") if isinstance(icons, dict) and isinstance(icons.get("by_emoji"), dict) else {}
     return {str(k): str(v) for k, v in by_emoji.items() if v}
 
 
-def topic_icon_id(store: dict[str, Any], emoji: str, telegram_client: TelegramClient | None = None) -> str:
+def topic_icon_id(
+    store: dict[str, Any],
+    emoji: str,
+    telegram_client: TelegramClient | None = None,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> str:
     telegram = store.get("telegram") if isinstance(store.get("telegram"), dict) else {}
     icons = telegram.setdefault("forum_topic_icons", {}) if isinstance(telegram, dict) else {}
     if not isinstance(icons, dict):
@@ -523,13 +539,35 @@ def topic_icon_id(store: dict[str, Any], emoji: str, telegram_client: TelegramCl
         return cached
     if telegram_client is None or getattr(telegram_client, "dry_run", False):
         return ""
-    if by_emoji and _cache_fresh(str(icons.get("fetched_at") or ""), config.topic_icon_cache_ttl_seconds()):
+    if _cache_fresh(
+        str(icons.get("fetched_at") or ""),
+        config.topic_icon_cache_ttl_seconds(),
+    ):
+        return ""
+    if _cache_fresh(
+        str(icons.get("last_error_at") or ""),
+        config.topic_icon_error_retry_seconds(),
+    ):
         return ""
     try:
         response = telegram_client.api("getForumTopicIconStickers", {})
     except Exception as exc:  # noqa: BLE001
+        # A guarded read reloads the whole store, so every nested reference
+        # captured before the provider call is stale. Resolve the cache again
+        # before applying this provider fact.
+        telegram = (
+            store.get("telegram")
+            if isinstance(store.get("telegram"), dict)
+            else {}
+        )
+        icons = telegram.setdefault("forum_topic_icons", {})
+        if not isinstance(icons, dict):
+            icons = {}
+            telegram["forum_topic_icons"] = icons
         icons["last_error"] = sanitize_text(str(exc), 300)
         icons["last_error_at"] = _utc_now()
+        if checkpoint is not None:
+            checkpoint()
         return ""
     fresh: dict[str, str] = {}
     for sticker in response.get("result") or []:
@@ -539,10 +577,23 @@ def topic_icon_id(store: dict[str, Any], emoji: str, telegram_client: TelegramCl
         custom_emoji_id = str(sticker.get("custom_emoji_id") or "").strip()
         if sticker_emoji and custom_emoji_id and sticker_emoji not in fresh:
             fresh[sticker_emoji] = custom_emoji_id
+    # The guarded read above reloaded state and invalidated the cache mapping
+    # used for the lookup. Re-resolve it before recording the catalogue.
+    telegram = (
+        store.get("telegram")
+        if isinstance(store.get("telegram"), dict)
+        else {}
+    )
+    icons = telegram.setdefault("forum_topic_icons", {})
+    if not isinstance(icons, dict):
+        icons = {}
+        telegram["forum_topic_icons"] = icons
     icons["by_emoji"] = fresh
     icons["fetched_at"] = _utc_now()
     icons.pop("last_error", None)
     icons.pop("last_error_at", None)
+    if checkpoint is not None:
+        checkpoint()
     return str(fresh.get(emoji) or "")
 
 
@@ -555,6 +606,7 @@ def drain_outbox(
     max_sends: int,
     dry_run: bool = False,
     yield_barrier: Callable[[], None] | None = None,
+    ack_barrier_persists_state: bool = False,
 ) -> dict[str, Any]:
     result = {"enabled": True, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
     if max_sends <= 0:
@@ -567,9 +619,34 @@ def drain_outbox(
         return result
     items = [item for item in poll.get("items", []) if isinstance(item, dict)]
     result["polled"] = len(items)
-    audit = store.setdefault("tendwire_outbox", {})
-    delivered = audit.setdefault("delivered_identities", [])
-    delivered_set = {str(item) for item in delivered}
+    def current_audit() -> dict[str, Any]:
+        audit = store.setdefault("tendwire_outbox", {})
+        if not isinstance(audit, dict):
+            audit = {}
+            store["tendwire_outbox"] = audit
+        return audit
+
+    def delivered_identities() -> list[str]:
+        audit = current_audit()
+        delivered = audit.get("delivered_identities")
+        if not isinstance(delivered, list):
+            delivered = []
+            audit["delivered_identities"] = delivered
+        return delivered
+
+    def checkpoint_delivery(identity: str) -> bool:
+        # Guarded calls replace nested state objects after reloading. Resolve
+        # the audit again before asking Tendwire to consume its lease.
+        delivered = delivered_identities()
+        if identity in {str(value) for value in delivered}:
+            return False
+        delivered.append(identity)
+        current_audit()["delivered_identities"] = delivered[-200:]
+        return True
+
+    delivered_set = {
+        str(item) for item in delivered_identities()
+    }
     for item in items[:max_sends]:
         if yield_barrier is not None:
             yield_barrier()
@@ -578,7 +655,13 @@ def drain_outbox(
         identity = short_hash({"key": item.get("key"), "payload": payload}, 24)
         if identity in delivered_set:
             if ref and not dry_run:
-                tendwire.connector_ack(ref, {"duplicate": True})
+                acknowledged = tendwire.connector_ack(
+                    ref, {"duplicate": True}
+                )
+                if acknowledged.get("ok") is not True:
+                    result["deferred"] += 1
+                    result["changed"] = True
+                    continue
             result["acked"] += 1
             result["changed"] = True
             continue
@@ -586,20 +669,41 @@ def drain_outbox(
         thread_id = config.general_thread_id(store)
         sent = {"ok": True, "message_id": "0"} if dry_run else telegram.send_message(chat_id, html, thread_id=thread_id, notify=True)
         if not dry_run and not sent.get("ok") and thread_id and _topic_missing(sent.get("error")):
+            state.tombstone_dead_topic(store, str(thread_id))
             sent = telegram.send_message(chat_id, html, notify=True)
             if sent.get("ok"):
                 sent["fallback_reason"] = "general_thread_missing"
         if sent.get("ok"):
             result["delivered"] += 1
-            result["acked"] += 1
             result["changed"] = True
-            delivered.append(identity)
+            identity_changed = checkpoint_delivery(identity)
             delivered_set.add(identity)
+            if (
+                identity_changed
+                and not dry_run
+                and (
+                    not ref
+                    or not ack_barrier_persists_state
+                )
+                and state.lock_actually_held()
+            ):
+                state.save_state(store)
             if ref and not dry_run:
-                tendwire.connector_ack(ref, {"telegram": "delivered"})
+                # Guarded Tendwire clients save the now-checkpointed identity
+                # as their existing pre-provider durability barrier. This
+                # coalesces the acceptance checkpoint with ACK instead of
+                # adding another whole-ledger fsync per item.
+                acknowledged = tendwire.connector_ack(
+                    ref, {"telegram": "delivered"}
+                )
+                if acknowledged.get("ok") is not True:
+                    result["deferred"] += 1
+                    continue
+            result["acked"] += 1
         else:
             result["failed"] += 1
             result["changed"] = True
+            audit = current_audit()
             recent = audit.setdefault("recent", [])
             if isinstance(recent, list):
                 recent.append(
@@ -613,5 +717,7 @@ def drain_outbox(
                 audit["recent"] = recent[-50:]
             if ref and not dry_run:
                 tendwire.connector_fail(ref, str(sent.get("error") or "Telegram delivery failed"))
-    audit["delivered_identities"] = delivered[-200:]
+    current_audit()["delivered_identities"] = (
+        delivered_identities()[-200:]
+    )
     return result

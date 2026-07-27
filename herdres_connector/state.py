@@ -12,6 +12,7 @@ import time
 import uuid
 from copy import deepcopy
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, NamedTuple
@@ -22,6 +23,8 @@ from .safe import compact_ws, short_hash
 
 DELIVERED_TURN_LEDGER_LIMIT = 10000
 TENDWIRE_TURN_JOB_LIMIT = 20001
+TENDWIRE_TURN_JOB_STALE_COPY_LIMIT = 8
+ORPHANED_CREATED_TOPIC_LIMIT = 200
 TENDWIRE_TURN_JOB_SUBSTATES = frozenset(
     {
         "reserved",
@@ -42,27 +45,231 @@ _TENDWIRE_TURN_JOB_KEY_RE = re.compile(
 STABLE_WORKER_KEY_VERSION = 1
 STABLE_WORKER_KEY_RE = re.compile(r"^wsk1_[0-9a-f]{64}$")
 WORKER_REBIND_AUDIT_LIMIT = 200
+TOPIC_BINDING_AUDIT_LIMIT = 200
+DEAD_TOPIC_TOMBSTONE_LIMIT = 200
+DUPLICATE_LIVE_ACTIVITY_SECONDS = 24 * 60 * 60
 PANE_UUID_VERSION = 1
 PANE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+ACCEPTED_NOTIFICATION_JOURNAL_APPLIED_LIMIT = 200
+_ACCEPTED_JOURNAL_PENDING_KEY = "_herdres_accepted_journal_pending"
+
+
+def accepted_notification_journal_path(path: Path | None = None) -> Path:
+    state_file = path or config.state_path()
+    return state_file.with_suffix(
+        state_file.suffix + ".accepted-notifications"
+    )
+
+
+def _load_accepted_notification_journal(
+    path: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    journal_file = accepted_notification_journal_path(path)
+    if not journal_file.exists():
+        return {}
+    try:
+        payload = json.loads(journal_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            "Herdres accepted-notification journal is corrupt"
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise RuntimeError(
+            "Herdres accepted-notification journal is corrupt"
+        )
+    receipts = payload.get("receipts")
+    if not isinstance(receipts, dict):
+        raise RuntimeError(
+            "Herdres accepted-notification journal is corrupt"
+        )
+    if not all(
+        isinstance(receipt_id, str) and isinstance(record, dict)
+        for receipt_id, record in receipts.items()
+    ):
+        raise RuntimeError(
+            "Herdres accepted-notification journal is corrupt"
+        )
+    return receipts
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def append_accepted_notification_receipt(
+    receipt_id: str,
+    record: Mapping[str, Any],
+    *,
+    data: dict[str, Any] | None = None,
+    path: Path | None = None,
+) -> None:
+    """Durably append one small provider-acceptance fact.
+
+    The journal is intentionally separate from the large state ledger.  The
+    provider has already accepted the message, so this few-hundred-byte fsync
+    must complete before the acceptance callback returns.  The next canonical
+    state save absorbs the fact and removes the sidecar.
+    """
+
+    if not receipt_id or not isinstance(record, Mapping):
+        return
+    state_file = path or config.state_path()
+    journal_file = accepted_notification_journal_path(state_file)
+    journal_file.parent.mkdir(parents=True, exist_ok=True)
+    receipts = _load_accepted_notification_journal(state_file)
+    if data is not None:
+        telegram = (
+            data.get("telegram")
+            if isinstance(data.get("telegram"), dict)
+            else {}
+        )
+        applied = telegram.get("accepted_notification_journal_applied")
+        applied_ids = {
+            str(item)
+            for item in (applied if isinstance(applied, list) else [])
+            if item
+        }
+        receipts = {
+            key: value
+            for key, value in receipts.items()
+            if key not in applied_ids
+        }
+    receipts.setdefault(receipt_id, deepcopy(dict(record)))
+    if data is not None:
+        pending = data.get(_ACCEPTED_JOURNAL_PENDING_KEY)
+        pending_ids = {
+            str(item)
+            for item in (pending if isinstance(pending, list) else [])
+            if item
+        }
+        pending_ids.update(receipts)
+        data[_ACCEPTED_JOURNAL_PENDING_KEY] = sorted(pending_ids)
+    tmp = journal_file.with_suffix(journal_file.suffix + ".tmp")
+    payload = (
+        json.dumps(
+            {"version": 1, "receipts": receipts},
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, journal_file)
+        _fsync_directory(journal_file.parent)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _merge_accepted_notification_journal(
+    data: dict[str, Any], path: Path | None = None
+) -> None:
+    receipts = _load_accepted_notification_journal(path)
+    if not receipts:
+        return
+    data[_ACCEPTED_JOURNAL_PENDING_KEY] = sorted(receipts)
+    telegram = data.setdefault("telegram", {})
+    if not isinstance(telegram, dict):
+        telegram = {}
+        data["telegram"] = telegram
+    records = telegram.setdefault("accepted_notification_messages", {})
+    if not isinstance(records, dict):
+        records = {}
+        telegram["accepted_notification_messages"] = records
+    applied = telegram.get("accepted_notification_journal_applied")
+    applied_ids = {
+        str(item)
+        for item in (applied if isinstance(applied, list) else [])
+        if item
+    }
+    for receipt_id, record in receipts.items():
+        if receipt_id in applied_ids:
+            continue
+        if record.get("kind") == "created_topic":
+            created = telegram.setdefault("accepted_created_topics", {})
+            if not isinstance(created, dict):
+                created = {}
+                telegram["accepted_created_topics"] = created
+            created.setdefault(receipt_id, deepcopy(record))
+        else:
+            records.setdefault(receipt_id, deepcopy(record))
+
+
+def _mark_accepted_notification_journal_applied(
+    data: dict[str, Any], receipt_ids: list[str]
+) -> bool:
+    if not receipt_ids:
+        return False
+    telegram = data.setdefault("telegram", {})
+    if not isinstance(telegram, dict):
+        telegram = {}
+        data["telegram"] = telegram
+    applied = telegram.get("accepted_notification_journal_applied")
+    applied_ids = [
+        str(item)
+        for item in (applied if isinstance(applied, list) else [])
+        if item
+    ]
+    for receipt_id in receipt_ids:
+        if receipt_id not in applied_ids:
+            applied_ids.append(receipt_id)
+    telegram["accepted_notification_journal_applied"] = applied_ids[
+        -ACCEPTED_NOTIFICATION_JOURNAL_APPLIED_LIMIT:
+    ]
+    return True
+
+
+def _clear_accepted_notification_journal(
+    path: Path | None = None,
+) -> None:
+    journal_file = accepted_notification_journal_path(path)
+    if not journal_file.exists():
+        return
+    journal_file.unlink()
+    _fsync_directory(journal_file.parent)
 
 
 def load_state(path: Path | None = None) -> dict[str, Any]:
     state_file = path or config.state_path()
     if not state_file.exists():
-        return {"version": 2, "enabled": True, "telegram": {}, "panes": {}, "spaces": {}}
-    try:
-        data = json.loads(state_file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise RuntimeError("Herdres state file is corrupt") from exc
-    if not isinstance(data, dict):
-        raise RuntimeError("Herdres state file is corrupt")
+        data = {
+            "version": 2,
+            "enabled": True,
+            "telegram": {},
+            "panes": {},
+            "spaces": {},
+        }
+    else:
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RuntimeError("Herdres state file is corrupt") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("Herdres state file is corrupt")
     data.setdefault("version", 2)
     data.setdefault("enabled", True)
     data.setdefault("telegram", {})
     data.setdefault("panes", {})
     data.setdefault("spaces", {})
+    _merge_accepted_notification_journal(data, state_file)
     return data
 
 
@@ -70,6 +277,18 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
     state_file = path or config.state_path()
     state_file.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_file.with_suffix(state_file.suffix + ".tmp")
+    raw_pending = data.pop(_ACCEPTED_JOURNAL_PENDING_KEY, [])
+    pending_receipt_ids = [
+        str(item)
+        for item in (
+            raw_pending if isinstance(raw_pending, list) else []
+        )
+        if item
+    ]
+    journal_pending = _mark_accepted_notification_journal_applied(
+        data, pending_receipt_ids
+    )
+    journal_cleared = False
     # This file is an internal durability boundary, not a hand-edited config.
     # Compact separators cut serialization and fsync bytes on the live state
     # ledger; inbound commands cross this boundary before and after Tendwire,
@@ -89,17 +308,19 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, state_file)
-        directory_fd = os.open(
-            state_file.parent,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        # Every canonical state replace is a durability boundary. Commit the
+        # directory entry before any accepted-provider receipt can disappear.
+        _fsync_directory(state_file.parent)
+        if journal_pending:
+            # Receipt absorption has two ordered directory barriers: the
+            # canonical state rename above, then the sidecar unlink here.
+            _clear_accepted_notification_journal(state_file)
+            journal_cleared = True
     finally:
+        if pending_receipt_ids and not journal_cleared:
+            data[_ACCEPTED_JOURNAL_PENDING_KEY] = (
+                pending_receipt_ids
+            )
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
@@ -561,6 +782,137 @@ def entry_is_retired(entry: dict[str, Any]) -> bool:
     value must never accidentally make an old route live again.
     """
     return "routing_retired" in entry
+
+
+def dead_topic_ids(data: dict[str, Any]) -> frozenset[str]:
+    """Return provider topic ids that Telegram has proven no longer exist."""
+    raw = data.get("telegram_dead_topic_ids")
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(
+        compact_ws(topic_id, 80)
+        for topic_id in raw
+        if compact_ws(topic_id, 80)
+    )
+
+
+def topic_id_is_tombstoned(data: dict[str, Any], topic_id: Any) -> bool:
+    normalized = compact_ws(topic_id, 80)
+    return bool(normalized and normalized in dead_topic_ids(data))
+
+
+def _drop_topic_binding(entry: dict[str, Any], *, topic_id: str) -> bool:
+    if str(entry.get("topic_id") or "") != topic_id:
+        return False
+    entry.pop("topic_id", None)
+    entry["deleted_topic_id"] = topic_id
+    for field in (
+        "last_topic_icon",
+        "last_topic_icon_id",
+        "last_topic_icon_missing",
+        "last_topic_icon_error",
+        "pinned_status_message_id",
+        "pinned_status_hash",
+        "pinned_status_pinned",
+        "pinned_status_last_error",
+        "rename_attempts",
+        "topic_closed_at",
+        "topic_auto_closed_at",
+    ):
+        entry.pop(field, None)
+    if entry_is_retired(entry):
+        entry["retired_topic_id"] = topic_id
+        entry["retired_topic_missing"] = True
+        for field in (
+            "retired_topic_notice_pending",
+            "retired_topic_notice_error",
+            "retired_topic_rename_pending",
+            "retired_topic_rename_error",
+            "retired_topic_close_pending",
+            "retired_topic_close_error",
+        ):
+            entry.pop(field, None)
+    return True
+
+
+def discard_tombstoned_topic_binding(
+    data: dict[str, Any], entry: dict[str, Any]
+) -> bool:
+    """Drop a persisted binding when its provider id is known dead."""
+    topic_id = str(entry.get("topic_id") or "")
+    if not topic_id_is_tombstoned(data, topic_id):
+        return False
+    _drop_topic_binding(entry, topic_id=topic_id)
+    return True
+
+
+def tombstone_dead_topic(
+    data: dict[str, Any], topic_id: str
+) -> frozenset[str]:
+    raw = data.get("telegram_dead_topic_ids")
+    tombstones: list[str] = []
+    seen: set[str] = set()
+    for value in raw if isinstance(raw, list) else []:
+        normalized = compact_ws(value, 80)
+        if not normalized or normalized in seen:
+            continue
+        tombstones.append(normalized)
+        seen.add(normalized)
+    if topic_id not in seen:
+        tombstones.append(topic_id)
+    data["telegram_dead_topic_ids"] = tombstones[-DEAD_TOPIC_TOMBSTONE_LIMIT:]
+    # Space-mode delivery uses a worker-shaped view of its owning space.
+    # Clear every persisted alias now so neither side can seed the dead id
+    # before the next source pass mints a replacement.
+    for candidate in source_space_entries(data).values():
+        _drop_topic_binding(candidate, topic_id=topic_id)
+    cleared_worker_keys = {
+        entry_key
+        for entry_key, candidate in source_worker_entries(data).items()
+        if _drop_topic_binding(candidate, topic_id=topic_id)
+    }
+    return frozenset(cleared_worker_keys)
+
+
+def clear_gone_live_topic(
+    data: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    error_kind: str,
+    error: Any,
+    observed_at: float | None = None,
+) -> bool:
+    """Release a live route whose Telegram topic was proven gone.
+
+    Delivery ledgers deliberately survive: a completed turn may be retried on
+    the replacement topic, while a later pass remains idempotent after that
+    retry succeeds. Only topic-scoped presentation caches are reset.
+    """
+    if entry_is_retired(entry) or not _entry_is_live(entry):
+        return False
+    topic_id = str(entry.get("topic_id") or "")
+    if not topic_id:
+        return False
+    repaired_at = time.time() if observed_at is None else float(observed_at)
+    tombstone_dead_topic(data, topic_id)
+    note = {
+        "topic_id": topic_id,
+        "worker_id": str(
+            entry.get("tendwire_worker_id") or entry.get("worker_id") or ""
+        ),
+        "stable_key": str(entry.get("tendwire_stable_key") or ""),
+        "reason": "live_delivery_topic_gone",
+        "error_kind": compact_ws(error_kind, 80),
+        "error": compact_ws(error, 240),
+        "observed_at": repaired_at,
+    }
+    entry["topic_recovery_pending"] = dict(note)
+    audit = data.get("telegram_topic_binding_audit")
+    if not isinstance(audit, list):
+        audit = []
+    audit.append(note)
+    data["telegram_topic_binding_audit"] = audit[-TOPIC_BINDING_AUDIT_LIMIT:]
+    return True
 
 
 def _entry_identity_is_allowed(entry: dict[str, Any]) -> bool:
@@ -1582,6 +1934,24 @@ def _topic_age_key(entry_key: str, entry: dict[str, Any]) -> tuple[int, int | st
     return 1, topic_id, entry_key
 
 
+def _entry_has_recent_live_activity(
+    entry: dict[str, Any], *, observed_at: float
+) -> bool:
+    if not _entry_is_live(entry):
+        return False
+    raw = entry.get("tendwire_last_seen_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return True
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        age = observed_at - parsed.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return True
+    return age <= DUPLICATE_LIVE_ACTIVITY_SECONDS
+
+
 _CONSOLIDATION_HEALABLE_QUARANTINE_REASONS = frozenset(
     {
         "closed_stable_key_reuse",
@@ -1687,9 +2057,10 @@ def consolidate_worker_entries_by_stable_key(
 
     Consolidation is intentionally limited to a stable key with exactly one
     live snapshot observation.  Conflicting source claims remain fail-closed.
-    The oldest topic survives; newer duplicate topics remain as retired history
-    long enough for source sync to post a visible notice, rename, and close
-    them.  Topicless duplicates are removed immediately.
+    A group with exactly one topic owner is a duplicate live claim: that owner
+    survives and topicless twins are explicitly retired. Multiple different
+    topics with recent activity remain fail-closed. Historical multi-topic
+    duplicates retain the older consolidation behavior.
     """
     observed_workers: dict[str, list[dict[str, Any]]] = {}
     for worker in workers:
@@ -1709,6 +2080,7 @@ def consolidate_worker_entries_by_stable_key(
     panes = data.setdefault("panes", {})
     bindings = data.get("telegram_message_bindings")
     changed = 0
+    observed_at = time.time()
     for stable_key in sorted(by_stable_key):
         entry_keys = by_stable_key[stable_key]
         current_workers = observed_workers.get(stable_key, [])
@@ -1720,7 +2092,32 @@ def consolidate_worker_entries_by_stable_key(
         ):
             continue
         worker = current_workers[0]
+        live_entry_keys = [
+            key for key in entry_keys if not entry_is_retired(entries[key])
+        ]
+        live_topic_holders = [
+            key for key in live_entry_keys if entries[key].get("topic_id")
+        ]
         topic_holders = [key for key in entry_keys if entries[key].get("topic_id")]
+        distinct_topic_ids = {
+            str(entries[key].get("topic_id") or "")
+            for key in live_topic_holders
+        }
+        distinct_topic_ids.discard("")
+        if (
+            len(distinct_topic_ids) > 1
+            and sum(
+                _entry_has_recent_live_activity(
+                    entries[key], observed_at=observed_at
+                )
+                for key in live_topic_holders
+            )
+            > 1
+        ):
+            continue
+        duplicate_live_claim = (
+            len(live_entry_keys) > 1 and len(live_topic_holders) == 1
+        )
         survivor_key = min(
             topic_holders or entry_keys,
             key=lambda key: _topic_age_key(key, entries[key]),
@@ -1749,6 +2146,8 @@ def consolidate_worker_entries_by_stable_key(
             "topic_name",
             "tendwire_stable_key",
             "tendwire_stable_key_version",
+            "pane_uuid",
+            "pane_uuid_version",
             "routing_retired",
             "routing_retired_reason",
             "stable_key_quarantined",
@@ -1812,7 +2211,21 @@ def consolidate_worker_entries_by_stable_key(
                 continue
             duplicate = entries[entry_key]
             topic_id = str(duplicate.get("topic_id") or "")
-            if topic_id and topic_id != survivor_topic_id:
+            if duplicate_live_claim and entry_key in live_entry_keys:
+                _retire_rekey_entry(
+                    duplicate,
+                    reason="duplicate_live_claim",
+                    archive_topic=False,
+                )
+                duplicate["routing_retired_reason"] = "duplicate_live_claim"
+                duplicate["consolidated_into_entry_key"] = survivor_key
+                duplicate["consolidated_into_topic_id"] = survivor_topic_id
+                duplicate["tendwire_stable_identity_class"] = (
+                    "retired_duplicate_live_claim"
+                )
+                duplicate.pop("tendwire_stable_key", None)
+                duplicate.pop("tendwire_stable_key_version", None)
+            elif topic_id and topic_id != survivor_topic_id:
                 _retire_rekey_entry(
                     duplicate,
                     reason="stable_key_duplicate_consolidated",
@@ -1908,6 +2321,15 @@ def finalize_worker_rekey_topic_handoff(
     topic_id = str(stale.get("topic_id") or "")
     if not topic_id:
         return False
+    if topic_id_is_tombstoned(data, topic_id):
+        stale["retired_topic_id"] = topic_id
+        stale["retired_topic_missing"] = True
+        for field in _TOPIC_BINDING_FIELDS:
+            stale.pop(field, None)
+        stale.pop("retired_topic_rename_pending", None)
+        stale.pop("retired_topic_close_pending", None)
+        return False
+    discard_tombstoned_topic_binding(data, current_entry)
     if current_entry.get("topic_id"):
         # A concurrently-created live topic wins; preserve and close the old
         # history rather than deleting either side.
@@ -2825,7 +3247,9 @@ def find_legacy_topic_id_by_name(data: dict[str, Any], name: str) -> str:
     matches = {
         str(entry["topic_id"])
         for entry in eligible_entries
-        if compact_ws(entry.get("topic_name"), 120).casefold() == wanted and entry.get("topic_id")
+        if compact_ws(entry.get("topic_name"), 120).casefold() == wanted
+        and entry.get("topic_id")
+        and not topic_id_is_tombstoned(data, entry.get("topic_id"))
     }
     return next(iter(matches)) if len(matches) == 1 else ""
 
@@ -3506,6 +3930,8 @@ def cleanup_tendwire_turn_jobs(
             continue
         if receipt.get("substate") not in _TENDWIRE_TURN_JOB_TERMINAL_SUBSTATES:
             continue
+        if isinstance(receipt.get("post_ack_reconcile"), dict):
+            continue
         if (
             job_key in job_refs
             or receipt.get("plan_token") in plan_refs
@@ -3676,6 +4102,218 @@ def update_tendwire_turn_job(
         receipt["substate"] = substate
         receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
     return receipt
+
+
+def tendwire_turn_job_stale_copies(
+    receipt: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Return the ordered, validated provider-accepted stale copies."""
+
+    values = (receipt or {}).get("stale_applied_copies")
+    if not isinstance(values, list):
+        return []
+    copies: list[dict[str, str]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        message_id = str(value.get("message_id") or "")
+        topic_id = str(value.get("topic_id") or "")
+        bot_kind = str(value.get("bot_kind") or "")
+        if not message_id or not topic_id:
+            continue
+        copies.append(
+            {
+                "message_id": message_id,
+                "topic_id": topic_id,
+                "bot_kind": bot_kind,
+            }
+        )
+    return copies
+
+
+def tendwire_turn_job_has_stale_copy_capacity(
+    receipt: dict[str, Any] | None,
+) -> bool:
+    return (
+        len(tendwire_turn_job_stale_copies(receipt))
+        < TENDWIRE_TURN_JOB_STALE_COPY_LIMIT
+    )
+
+
+def reconcile_tendwire_turn_job_route(
+    data: dict[str, Any],
+    job_key: str,
+    *,
+    message_id: str,
+    topic_id: str,
+    bot_kind: str,
+) -> dict[str, Any]:
+    """Checkpoint an accepted stale copy and make the intent retryable.
+
+    The ordered collection is the receipt's single reconciliation authority.
+    Unlike the legacy immutable prior slot it can represent any number of
+    consecutive route changes without losing an accepted provider outcome.
+    """
+
+    receipt = find_tendwire_turn_job(data, job_key)
+    if receipt is None:
+        raise KeyError(job_key)
+    copy = {
+        "message_id": _tendwire_job_outcome_value(
+            message_id, field="message_id", limit=80
+        ),
+        "topic_id": _tendwire_job_outcome_value(
+            topic_id, field="topic_id", limit=80
+        ),
+        "bot_kind": _tendwire_job_outcome_value(
+            bot_kind or "manager", field="bot_kind", limit=40
+        ),
+    }
+    copies = tendwire_turn_job_stale_copies(receipt)
+    if not any(
+        item["message_id"] == copy["message_id"]
+        and item["topic_id"] == copy["topic_id"]
+        and item["bot_kind"] == copy["bot_kind"]
+        for item in copies
+    ):
+        if len(copies) >= TENDWIRE_TURN_JOB_STALE_COPY_LIMIT:
+            raise RuntimeError("tendwire turn job stale-copy ledger is full")
+        copies.append(copy)
+    receipt["stale_applied_copies"] = copies
+    receipt.pop("telegram_message_id", None)
+    receipt.pop("prior_message_id", None)
+    receipt.pop("bot_kind", None)
+    receipt["substate"] = "retryable"
+    receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
+    return receipt
+
+
+def retire_tendwire_turn_job_stale_copy(
+    data: dict[str, Any],
+    job_key: str,
+    *,
+    message_id: str,
+    topic_id: str,
+    bot_kind: str,
+) -> bool:
+    """Remove one exact stale copy after its provider retirement succeeds."""
+
+    receipt = find_tendwire_turn_job(data, job_key)
+    if receipt is None:
+        raise KeyError(job_key)
+    copies = tendwire_turn_job_stale_copies(receipt)
+    for index, item in enumerate(copies):
+        if (
+            item["message_id"] == str(message_id)
+            and item["topic_id"] == str(topic_id)
+            and item["bot_kind"] == str(bot_kind)
+        ):
+            copies.pop(index)
+            if copies:
+                receipt["stale_applied_copies"] = copies
+            else:
+                receipt.pop("stale_applied_copies", None)
+            receipt["checkpoint_sequence"] = (
+                _next_tendwire_turn_job_checkpoint(data)
+            )
+            return True
+    return False
+
+
+def record_tendwire_turn_job_post_ack_reconcile(
+    data: dict[str, Any],
+    job_key: str,
+    obligation: Mapping[str, Any],
+    *,
+    acknowledged: bool = True,
+) -> dict[str, Any]:
+    """Checkpoint locally drainable work after Tendwire already accepted ACK."""
+
+    receipt = find_tendwire_turn_job(data, job_key)
+    if receipt is None:
+        raise KeyError(job_key)
+    clean = deepcopy(dict(obligation))
+    existing = receipt.get("post_ack_reconcile")
+    replace_inflight = (
+        isinstance(existing, dict)
+        and existing.get("status") == "ack_inflight"
+        and clean.get("status") in {"ack_inflight", "reconcile"}
+    )
+    if (
+        isinstance(existing, dict)
+        and existing != clean
+        and not replace_inflight
+    ):
+        raise ValueError("conflicting post-ACK reconciliation obligation")
+    if acknowledged:
+        receipt["substate"] = "acknowledged"
+    if existing != clean:
+        receipt["post_ack_reconcile"] = clean
+        receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
+    return receipt
+
+
+def clear_tendwire_turn_job_post_ack_reconcile(
+    data: dict[str, Any], job_key: str
+) -> bool:
+    receipt = find_tendwire_turn_job(data, job_key)
+    if receipt is None or not isinstance(
+        receipt.get("post_ack_reconcile"), dict
+    ):
+        return False
+    receipt.pop("post_ack_reconcile", None)
+    receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
+    return True
+
+
+def orphaned_created_topics(data: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = data.get("telegram_orphaned_created_topics")
+    if not isinstance(raw, list):
+        return []
+    return [
+        deepcopy(item)
+        for item in raw
+        if isinstance(item, dict)
+        and compact_ws(item.get("topic_id"), 80)
+    ]
+
+
+def record_orphaned_created_topic(
+    data: dict[str, Any], record: Mapping[str, Any]
+) -> bool:
+    """Persist an accepted create before any owner-specific apply decision."""
+
+    clean = deepcopy(dict(record))
+    topic_id = compact_ws(clean.get("topic_id"), 80)
+    if not topic_id:
+        raise ValueError("orphaned created topic requires topic id")
+    clean["topic_id"] = topic_id
+    records = orphaned_created_topics(data)
+    if any(item.get("topic_id") == topic_id for item in records):
+        return False
+    # The creator preflights the bound before making a non-idempotent request.
+    # If another lane fills the ledger while that request is off-lock, retain
+    # the accepted fact anyway; the exact cleanup pass drains the transient
+    # overflow. Provider acceptance must never be discarded to enforce a cap.
+    records.append(clean)
+    data["telegram_orphaned_created_topics"] = records
+    return True
+
+
+def retire_orphaned_created_topic(
+    data: dict[str, Any], topic_id: str
+) -> bool:
+    records = orphaned_created_topics(data)
+    kept = [
+        item for item in records if item.get("topic_id") != str(topic_id)
+    ]
+    if len(kept) == len(records):
+        return False
+    if kept:
+        data["telegram_orphaned_created_topics"] = kept
+    else:
+        data.pop("telegram_orphaned_created_topics", None)
+    return True
 
 
 def message_bindings(data: dict[str, Any]) -> dict[str, Any]:
