@@ -3885,6 +3885,111 @@ def update_tendwire_turn_job(
     return receipt
 
 
+def tendwire_turn_job_stale_copies(
+    receipt: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Return the ordered, validated provider-accepted stale copies."""
+
+    values = (receipt or {}).get("stale_applied_copies")
+    if not isinstance(values, list):
+        return []
+    copies: list[dict[str, str]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        message_id = str(value.get("message_id") or "")
+        topic_id = str(value.get("topic_id") or "")
+        bot_kind = str(value.get("bot_kind") or "")
+        if not message_id or not topic_id:
+            continue
+        copies.append(
+            {
+                "message_id": message_id,
+                "topic_id": topic_id,
+                "bot_kind": bot_kind,
+            }
+        )
+    return copies
+
+
+def reconcile_tendwire_turn_job_route(
+    data: dict[str, Any],
+    job_key: str,
+    *,
+    message_id: str,
+    topic_id: str,
+    bot_kind: str,
+) -> dict[str, Any]:
+    """Checkpoint an accepted stale copy and make the intent retryable.
+
+    The ordered collection is the receipt's single reconciliation authority.
+    Unlike the legacy immutable prior slot it can represent any number of
+    consecutive route changes without losing an accepted provider outcome.
+    """
+
+    receipt = find_tendwire_turn_job(data, job_key)
+    if receipt is None:
+        raise KeyError(job_key)
+    copy = {
+        "message_id": _tendwire_job_outcome_value(
+            message_id, field="message_id", limit=80
+        ),
+        "topic_id": _tendwire_job_outcome_value(
+            topic_id, field="topic_id", limit=80
+        ),
+        "bot_kind": _tendwire_job_outcome_value(
+            bot_kind or "manager", field="bot_kind", limit=40
+        ),
+    }
+    copies = tendwire_turn_job_stale_copies(receipt)
+    if not any(
+        item["message_id"] == copy["message_id"]
+        and item["topic_id"] == copy["topic_id"]
+        and item["bot_kind"] == copy["bot_kind"]
+        for item in copies
+    ):
+        copies.append(copy)
+    receipt["stale_applied_copies"] = copies
+    receipt.pop("telegram_message_id", None)
+    receipt.pop("prior_message_id", None)
+    receipt.pop("bot_kind", None)
+    receipt["substate"] = "retryable"
+    receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
+    return receipt
+
+
+def retire_tendwire_turn_job_stale_copy(
+    data: dict[str, Any],
+    job_key: str,
+    *,
+    message_id: str,
+    topic_id: str,
+    bot_kind: str,
+) -> bool:
+    """Remove one exact stale copy after its provider retirement succeeds."""
+
+    receipt = find_tendwire_turn_job(data, job_key)
+    if receipt is None:
+        raise KeyError(job_key)
+    copies = tendwire_turn_job_stale_copies(receipt)
+    for index, item in enumerate(copies):
+        if (
+            item["message_id"] == str(message_id)
+            and item["topic_id"] == str(topic_id)
+            and item["bot_kind"] == str(bot_kind)
+        ):
+            copies.pop(index)
+            if copies:
+                receipt["stale_applied_copies"] = copies
+            else:
+                receipt.pop("stale_applied_copies", None)
+            receipt["checkpoint_sequence"] = (
+                _next_tendwire_turn_job_checkpoint(data)
+            )
+            return True
+    return False
+
+
 def message_bindings(data: dict[str, Any]) -> dict[str, Any]:
     bindings = data.get("telegram_message_bindings")
     if not isinstance(bindings, dict):

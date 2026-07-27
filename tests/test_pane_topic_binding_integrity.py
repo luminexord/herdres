@@ -1282,3 +1282,78 @@ def test_healthy_noop_sync_pass_does_not_write_state():
 
     assert result["changed"] is False
     assert store == before
+
+
+def test_offlock_guard_rejects_replaced_working_message_id():
+    store = _store()
+    _key, entry = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-live",
+        topic_id="15007",
+    )
+    entry["last_stream_message_id"] = "400"
+    operation = source_sync._capture_entry_operation(
+        store,
+        entry,
+        topic_id="15007",
+        message_id="400",
+        observe=("last_stream_message_id",),
+    )
+
+    entry["last_stream_message_id"] = "401"
+
+    resolution = source_sync._compare_and_apply_entry_operation(
+        store, operation
+    )
+    assert resolution.disposition == "reconcile"
+    assert resolution.entry is None
+
+
+def test_offlock_guard_rejects_plan_revision_change():
+    store = _store()
+    _key, entry = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-live",
+        topic_id="15007",
+    )
+    entry["pending_plan_token"] = "twplan1.guard"
+    entry["pending_content_revision"] = "twrev1.before"
+    operation = source_sync._capture_entry_operation(
+        store,
+        entry,
+        topic_id="15007",
+        plan_token="twplan1.guard",
+        revision="twrev1.before",
+    )
+
+    entry["pending_content_revision"] = "twrev1.after"
+
+    resolution = source_sync._compare_and_apply_entry_operation(
+        store, operation
+    )
+    assert resolution.disposition == "reconcile"
+    assert resolution.entry is None
+
+
+def test_offlock_guard_rejects_owner_generation_change_on_same_topic():
+    store = _store()
+    _key, entry = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-live",
+        topic_id="15007",
+    )
+    operation = source_sync._capture_entry_operation(
+        store, entry, topic_id="15007"
+    )
+
+    entry["tendwire_fingerprint"] = "fp-rebound"
+
+    resolution = source_sync._compare_and_apply_entry_operation(
+        store, operation
+    )
+    assert entry["topic_id"] == "15007"
+    assert resolution.disposition == "reconcile"
+    assert resolution.entry is None
