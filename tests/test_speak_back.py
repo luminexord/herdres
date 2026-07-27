@@ -250,6 +250,106 @@ def test_speak_seam_offlock_synth_no_clobber(tmp_path, monkeypatch):
     assert store["panes"][worker_key].get("voice_reply_message_ids") == ["900"]   # recorded on fresh entry
 
 
+def test_speak_seam_uses_text_binding_topic_after_concurrent_rebind(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0"
+    )
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0"
+    )
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(statepath)
+    )
+    store = _store()
+    _worker_key, _entry = _persist_worker(
+        store, speak_next_reply=True
+    )
+    state.save_state(store, statepath)
+    worker = _source_worker(
+        {
+            "id": "w1",
+            "name": "worker",
+            "status": "working",
+            "space_id": "s1",
+            "fingerprint": "fp1",
+        }
+    )
+    tendwire = FakeTendwire(
+        turns=_turns_of(_final_item()),
+        workers=[worker],
+        spaces=[],
+    )
+
+    class RebindingTextTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.rebound = False
+
+        def send_message(self, chat_id, html, **kwargs):
+            result = super().send_message(
+                chat_id, html, **kwargs
+            )
+            if (
+                not self.rebound
+                and "All done deploying the branch." in html
+            ):
+                concurrent = state.load_state(statepath)
+                rebound = next(
+                    entry
+                    for entry in state.source_worker_entries(
+                        concurrent
+                    ).values()
+                    if entry.get("tendwire_worker_id") == "w1"
+                )
+                rebound["topic_id"] = "88"
+                state.save_state(concurrent, statepath)
+                self.rebound = True
+            return result
+
+    telegram = RebindingTextTelegram()
+    runtime = SyncRuntime(
+        tendwire, telegram, with_outbox=False
+    )
+    monkeypatch.setattr(
+        speech,
+        "speech_request",
+        lambda _ep, payload: {
+            "ok": True,
+            "path": payload.get("dest"),
+        },
+    )
+
+    with state.state_lock(path=statepath):
+        current = state.load_state(statepath)
+        source_sync.sync_once(current, runtime)
+
+    text_message_id = telegram.sent[0][3]
+    text_binding = state.find_message_binding(
+        current, text_message_id
+    )
+    current_entry = next(
+        entry
+        for entry in state.source_worker_entries(current).values()
+        if entry.get("tendwire_worker_id") == "w1"
+    )
+    assert telegram.sent[0][2]["thread_id"] == "77"
+    assert text_binding is not None
+    assert text_binding["topic_id"] == "77"
+    assert current_entry["topic_id"] == "88"
+    assert len(telegram.voice_notes) == 1
+    assert telegram.voice_notes[0][2]["thread_id"] == "77"
+    assert (
+        telegram.voice_notes[0][2]["reply_to_message_id"]
+        == text_message_id
+    )
+
+
 def test_speak_seam_offlock_entry_pruned_during_synth(tmp_path, monkeypatch):
     # If a competitor prunes the entry during off-lock synth, the seam must not crash or resurrect it;
     # the voice notes were sent but their ids can't persist (entry gone) — handled gracefully.

@@ -4626,14 +4626,50 @@ def _sync_turns(
                     continue
                 delivered = False
             else:
+                delivery_thread_id = str(
+                    entry.get("topic_id") or ""
+                )
+                prior_final_message_ids = {
+                    message_id
+                    for message_id, _binding in (
+                        _final_delivery_bindings(
+                            store,
+                            _turn_id(item),
+                            topic_id=delivery_thread_id,
+                        )
+                    )
+                }
                 delivered = _deliver_final(store, item, entry, runtime, chat_id=chat_id)
                 if delivered:
                     # Legacy inline direct-call compatibility; v2 finals are spoken only after the
                     # complete ordered plan is acknowledged.
+                    delivery_bindings = _final_delivery_bindings(
+                        store,
+                        _turn_id(item),
+                        topic_id=delivery_thread_id,
+                    )
+                    new_delivery_bindings = [
+                        binding
+                        for binding in delivery_bindings
+                        if binding[0]
+                        not in prior_final_message_ids
+                    ]
+                    reply_binding = (
+                        new_delivery_bindings[0]
+                        if new_delivery_bindings
+                        else delivery_bindings[-1]
+                        if delivery_bindings
+                        else None
+                    )
                     entry = _speak_reply(
                         store, item, entry, entry_key, runtime,
-                        chat_id=chat_id, thread_id=str(entry.get("topic_id") or ""),
-                        reply_to=str(entry.get("last_clean_message_id") or "") or None,
+                        chat_id=chat_id,
+                        thread_id=delivery_thread_id,
+                        reply_to=(
+                            reply_binding[0]
+                            if reply_binding is not None
+                            else None
+                        ),
                     )
         elif item.get("assistant_stream_text") or _turn_is_working_placeholder(item, entry):
             if latest_turn_id and _turn_id(item) != latest_turn_id:
@@ -5414,6 +5450,11 @@ def _maybe_complete_turn_plan(
     plan_token: str,
     revision: str,
 ) -> bool:
+    if (
+        entry.get("pending_plan_token") != plan_token
+        or entry.get("pending_content_revision") != revision
+    ):
+        return False
     stream_submission_id = str(
         entry.get("pending_stream_submission_id") or ""
     )
@@ -6801,6 +6842,24 @@ def _drain_turn_final(
         else:
             assert feed_item is not None and plans
             attempted_topic_id = ""
+            applied_topic_id = candidate_topic if compatible else ""
+            applied_entry = dict(entry)
+            if not compatible:
+                attempted_topic_id = str(
+                    entry.get("topic_id") or ""
+                )
+                if not attempted_topic_id:
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "transient_delivery",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
+                    break
+                applied_topic_id = attempted_topic_id
             try:
                 result["operations"] += 1
                 if compatible:
@@ -6814,9 +6873,6 @@ def _drain_turn_final(
                         api_token=desired_token,
                     )
                 else:
-                    attempted_topic_id = str(
-                        entry.get("topic_id") or ""
-                    )
                     applied = send_turn_delivery_part(
                         runtime.telegram,
                         chat_id,
@@ -6889,11 +6945,24 @@ def _drain_turn_final(
                     )
                     break
                 if retry_as_send:
+                    attempted_topic_id = str(
+                        entry.get("topic_id") or ""
+                    )
+                    if not attempted_topic_id:
+                        _defer_turn_final(
+                            runtime,
+                            ref,
+                            "transient_delivery",
+                            result,
+                            store,
+                            job_key,
+                            delay_seconds=1,
+                        )
+                        break
+                    applied_topic_id = attempted_topic_id
+                    applied_entry = dict(entry)
                     try:
                         result["operations"] += 1
-                        attempted_topic_id = str(
-                            entry.get("topic_id") or ""
-                        )
                         applied = send_turn_delivery_part(
                             runtime.telegram,
                             chat_id,
@@ -6991,8 +7060,8 @@ def _drain_turn_final(
             state.bind_message_to_worker(
                 store,
                 message_id,
-                entry,
-                topic_id=str(entry.get("topic_id") or ""),
+                applied_entry,
+                topic_id=applied_topic_id,
                 kind="final",
                 turn_id=_turn_id(item),
                 bot_kind=desired_bot,
@@ -7002,6 +7071,27 @@ def _drain_turn_final(
                 part_count=part_count,
                 tendwire_job_key=job_key,
             )
+            if (
+                str(entry.get("topic_id") or "")
+                != applied_topic_id
+            ):
+                state.update_tendwire_turn_job(
+                    store,
+                    job_key,
+                    substate="reserved",
+                    prior_message_id=message_id,
+                    bot_kind=desired_bot,
+                )
+                _defer_turn_final(
+                    runtime,
+                    ref,
+                    "transient_delivery",
+                    result,
+                    store,
+                    job_key,
+                    delay_seconds=1,
+                )
+                break
             state.update_tendwire_turn_job(
                 store,
                 job_key,
@@ -7014,7 +7104,9 @@ def _drain_turn_final(
                 candidate_kind == "working"
                 and message_id == candidate_id
             ):
-                _clear_stream_delivery_keys(entry)
+                _clear_entry_message_reference(
+                    entry, candidate_id, "working"
+                )
             _checkpoint_turn_job(runtime)
             substate = "telegram_applied"
 
@@ -7143,6 +7235,10 @@ def _drain_turn_final(
                     isinstance(observed_count, int)
                     and not isinstance(observed_count, bool)
                     and observed_count > 0
+                    and entry.get("pending_plan_token")
+                    == plan_token
+                    and entry.get("pending_content_revision")
+                    == revision
                 ):
                     entry[
                         "pending_turn_job_count"
