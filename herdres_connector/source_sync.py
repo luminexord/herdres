@@ -11447,6 +11447,7 @@ def drain_outbound_once(
         chat_id=chat_id,
         max_sends=remaining,
         dry_run=effective_runtime.dry_run,
+        ack_barrier_persists_state=True,
     )
     return {
         "ok": True,
@@ -11864,6 +11865,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 max_sends=remaining,
                 dry_run=runtime.dry_run,
                 yield_barrier=yield_barrier,
+                ack_barrier_persists_state=True,
             )
         changed = changed or bool(turn_final_result.get("changed")) or bool(outbox_result.get("changed"))
     return {

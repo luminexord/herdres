@@ -555,6 +555,7 @@ def drain_outbox(
     max_sends: int,
     dry_run: bool = False,
     yield_barrier: Callable[[], None] | None = None,
+    ack_barrier_persists_state: bool = False,
 ) -> dict[str, Any]:
     result = {"enabled": True, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
     if max_sends <= 0:
@@ -582,16 +583,15 @@ def drain_outbox(
             audit["delivered_identities"] = delivered
         return delivered
 
-    def checkpoint_delivery(identity: str) -> None:
+    def checkpoint_delivery(identity: str) -> bool:
         # Guarded calls replace nested state objects after reloading. Resolve
-        # the audit again and persist the provider-accepted delivery before
-        # asking Tendwire to consume its lease.
+        # the audit again before asking Tendwire to consume its lease.
         delivered = delivered_identities()
-        if identity not in {str(value) for value in delivered}:
-            delivered.append(identity)
+        if identity in {str(value) for value in delivered}:
+            return False
+        delivered.append(identity)
         current_audit()["delivered_identities"] = delivered[-200:]
-        if state.lock_actually_held():
-            state.save_state(store)
+        return True
 
     delivered_set = {
         str(item) for item in delivered_identities()
@@ -625,9 +625,23 @@ def drain_outbox(
         if sent.get("ok"):
             result["delivered"] += 1
             result["changed"] = True
-            checkpoint_delivery(identity)
+            identity_changed = checkpoint_delivery(identity)
             delivered_set.add(identity)
+            if (
+                identity_changed
+                and not dry_run
+                and (
+                    not ref
+                    or not ack_barrier_persists_state
+                )
+                and state.lock_actually_held()
+            ):
+                state.save_state(store)
             if ref and not dry_run:
+                # Guarded Tendwire clients save the now-checkpointed identity
+                # as their existing pre-provider durability barrier. This
+                # coalesces the acceptance checkpoint with ACK instead of
+                # adding another whole-ledger fsync per item.
                 acknowledged = tendwire.connector_ack(
                     ref, {"telegram": "delivered"}
                 )

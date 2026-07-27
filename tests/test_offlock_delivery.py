@@ -248,6 +248,15 @@ def test_guarded_outbox_checkpoints_before_ack_and_replay_only_acks(
     statepath = tmp_path / "state.json"
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
     state.save_state(_store(), statepath)
+    real_save_state = state.save_state
+    save_calls = 0
+
+    def counted_save(store, path=None):
+        nonlocal save_calls
+        save_calls += 1
+        return real_save_state(store, path=path)
+
+    monkeypatch.setattr(state, "save_state", counted_save)
 
     class ReplayTendwire(FakeTendwire):
         def __init__(self):
@@ -300,6 +309,7 @@ def test_guarded_outbox_checkpoints_before_ack_and_replay_only_acks(
             ),
             chat_id="-100",
             max_sends=1,
+            ack_barrier_persists_state=True,
         )
         second = drain_outbox(
             current,
@@ -313,8 +323,8 @@ def test_guarded_outbox_checkpoints_before_ack_and_replay_only_acks(
             ),
             chat_id="-100",
             max_sends=1,
+            ack_barrier_persists_state=True,
         )
-        state.save_state(current, statepath)
 
     assert first["delivered"] == 1
     assert first["acked"] == 0
@@ -323,6 +333,9 @@ def test_guarded_outbox_checkpoints_before_ack_and_replay_only_acks(
     assert second["acked"] == 1
     assert len(telegram.sent) == 1
     assert tendwire.acks == 2
+    # poll/send/ack, then poll/duplicate-ack: no extra whole-state save for
+    # the identity because each guarded ACK already supplies that barrier.
+    assert save_calls == 5
     assert len(
         state.load_state(statepath)["tendwire_outbox"][
             "delivered_identities"
