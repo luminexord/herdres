@@ -4542,6 +4542,91 @@ def test_save_state_fsyncs_file_before_replace_and_directory_after(
     }
 
 
+def test_save_state_existing_file_skips_shared_directory_fsync(
+    tmp_path,
+    monkeypatch,
+):
+    state_path = tmp_path / "state.json"
+    state.save_state({"version": 2, "value": "before"}, state_path)
+    calls = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(descriptor):
+        kind = (
+            "directory"
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            else "file"
+        )
+        calls.append(f"fsync:{kind}")
+        real_fsync(descriptor)
+
+    def tracking_replace(source, destination):
+        calls.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(state.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(state.os, "replace", tracking_replace)
+
+    state.save_state(
+        {"version": 2, "value": "after"}, state_path
+    )
+
+    assert calls == ["fsync:file", "replace"]
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "value": "after",
+        "version": 2,
+    }
+
+
+def test_save_state_sidecar_clear_keeps_directory_fsync(
+    tmp_path,
+    monkeypatch,
+):
+    state_path = tmp_path / "state.json"
+    current = {"version": 2, "telegram": {}}
+    state.save_state(current, state_path)
+    record = {
+        "kind": "topic_pinned",
+        "topic_id": "77",
+        "message_id": "101",
+        "bot_kind": "manager",
+        "provenance": {},
+    }
+    state.append_accepted_notification_receipt(
+        "receipt-1",
+        record,
+        data=current,
+        path=state_path,
+    )
+    calls = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(descriptor):
+        kind = (
+            "directory"
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            else "file"
+        )
+        calls.append(f"fsync:{kind}")
+        real_fsync(descriptor)
+
+    def tracking_replace(source, destination):
+        calls.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(state.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(state.os, "replace", tracking_replace)
+
+    state.save_state(current, state_path)
+
+    assert calls == ["fsync:file", "replace", "fsync:directory"]
+    assert not state.accepted_notification_journal_path(
+        state_path
+    ).exists()
+
+
 def test_legacy_duplicate_instruction_is_truthful_non_success():
     response = {
         "ok": True,

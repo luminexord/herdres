@@ -258,6 +258,7 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
 def save_state(data: dict[str, Any], path: Path | None = None) -> None:
     state_file = path or config.state_path()
     state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file_is_new = not state_file.exists()
     tmp = state_file.with_suffix(state_file.suffix + ".tmp")
     journal_pending = _mark_accepted_notification_journal_applied(
         data, state_file
@@ -281,9 +282,16 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, state_file)
-        _fsync_directory(state_file.parent)
         if journal_pending:
+            # Clearing the sidecar fsyncs this directory after the state
+            # replace, covering both directory mutations with one barrier.
             _clear_accepted_notification_journal(state_file)
+        elif state_file_is_new:
+            # First creation adds the durable state filename. Replacing an
+            # existing state file deliberately skips this shared hot-path
+            # barrier: an interrupted rename leaves the previous valid ledger,
+            # whose delivery journals drive safe replay.
+            _fsync_directory(state_file.parent)
     finally:
         try:
             tmp.unlink(missing_ok=True)
