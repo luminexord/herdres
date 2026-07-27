@@ -543,7 +543,11 @@ def _select_space_worker(workers: list[dict[str, Any]], turn_status_by_worker: d
     return max(workers, key=lambda worker: str(worker.get("last_seen_at") or "")) if workers else {}
 
 
-def _delivery_entry(space_entry: dict[str, Any], worker_entry: dict[str, Any] | None = None) -> dict[str, Any]:
+def _delivery_entry(
+    store: dict[str, Any],
+    space_entry: dict[str, Any],
+    worker_entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     worker_entry = worker_entry or {}
     entry = worker_entry
     worker_name = compact_ws(worker_entry.get("worker_name") or worker_entry.get("agent"), 80)
@@ -552,7 +556,12 @@ def _delivery_entry(space_entry: dict[str, Any], worker_entry: dict[str, Any] | 
         entry["topic_name"] = f"{space_name} · {worker_name}"
     elif space_name:
         entry["topic_name"] = space_name
-    entry["topic_id"] = str(space_entry.get("topic_id") or "")
+    state.discard_tombstoned_topic_binding(store, space_entry)
+    space_topic_id = str(space_entry.get("topic_id") or "")
+    if space_topic_id:
+        entry["topic_id"] = space_topic_id
+    else:
+        entry.pop("topic_id", None)
     entry["tendwire_space_id"] = space_entry.get("tendwire_space_id") or worker_entry.get("tendwire_space_id")
     entry["space_topic_name"] = space_name
     entry["tendwire_worker_id"] = worker_entry.get("tendwire_worker_id") or space_entry.get("active_worker_id")
@@ -682,7 +691,7 @@ def _entry_for_turn(store: dict[str, Any], item: dict[str, Any]) -> tuple[str | 
     )
     if space_entry is None:
         return None, None
-    return key, _delivery_entry(space_entry, worker_entry)
+    return key, _delivery_entry(store, space_entry, worker_entry)
 
 
 def _turn_id(item: dict[str, Any]) -> str:
@@ -1725,6 +1734,7 @@ def _ensure_topic(
         and not state.entry_is_routable(entry)
     ):
         return False, False
+    state.discard_tombstoned_topic_binding(store, entry)
     if entry.get("topic_id"):
         return False, False
     if str(entry.get("entry_type") or "") == "worker":
@@ -1732,6 +1742,9 @@ def _ensure_topic(
         if identity is not None and any(
             other is not entry
             and other.get("topic_id")
+            and not state.topic_id_is_tombstoned(
+                store, other.get("topic_id")
+            )
             and state.entry_is_routable(other)
             and state.entry_stable_identity(other) == identity
             for other in state.source_worker_entries(store).values()
@@ -3437,7 +3450,7 @@ def _deliver_working(
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
     stored_bot_kind = str(entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND)
-    if (
+    edit_attempted = bool(
         entry.get("last_stream_message_id")
         and stored_bot_kind == bot_kind
         and (
@@ -3449,7 +3462,8 @@ def _deliver_working(
                 == submission_id
             )
         )
-    ):
+    )
+    if edit_attempted:
         sent = edit_feed_item(
             runtime.telegram,
             chat_id,
@@ -3460,6 +3474,27 @@ def _deliver_working(
             api_token=api_token,
         )
     else:
+        sent = send_feed_item(
+            runtime.telegram,
+            chat_id,
+            feed_item,
+            telegram=telegram,
+            thread_id=thread_id,
+            notify=False,
+            live=True,
+            api_token=api_token,
+        )
+    if (
+        edit_attempted
+        and not sent.get("ok")
+        and (
+            str(sent.get("kind") or "") == "not_found"
+            or classify_telegram_error(sent.get("error")) == "not_found"
+        )
+    ):
+        stale_message_id = str(entry.get("last_stream_message_id") or "")
+        state.message_bindings(store).pop(stale_message_id, None)
+        _clear_stream_delivery_keys(entry)
         sent = send_feed_item(
             runtime.telegram,
             chat_id,
@@ -4897,7 +4932,7 @@ def _resolve_final_source_entry(
     )
     if space_entry is None:
         return None, None
-    return entry_key, _delivery_entry(space_entry, worker_entry)
+    return entry_key, _delivery_entry(store, space_entry, worker_entry)
 
 
 def _bind_or_verify_final_source_owner(

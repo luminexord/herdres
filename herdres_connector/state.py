@@ -44,6 +44,7 @@ STABLE_WORKER_KEY_VERSION = 1
 STABLE_WORKER_KEY_RE = re.compile(r"^wsk1_[0-9a-f]{64}$")
 WORKER_REBIND_AUDIT_LIMIT = 200
 TOPIC_BINDING_AUDIT_LIMIT = 200
+DEAD_TOPIC_TOMBSTONE_LIMIT = 200
 DUPLICATE_LIVE_ACTIVITY_SECONDS = 24 * 60 * 60
 PANE_UUID_VERSION = 1
 PANE_UUID_RE = re.compile(
@@ -566,6 +567,74 @@ def entry_is_retired(entry: dict[str, Any]) -> bool:
     return "routing_retired" in entry
 
 
+def dead_topic_ids(data: dict[str, Any]) -> frozenset[str]:
+    """Return provider topic ids that Telegram has proven no longer exist."""
+    raw = data.get("telegram_dead_topic_ids")
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(
+        compact_ws(topic_id, 80)
+        for topic_id in raw
+        if compact_ws(topic_id, 80)
+    )
+
+
+def topic_id_is_tombstoned(data: dict[str, Any], topic_id: Any) -> bool:
+    normalized = compact_ws(topic_id, 80)
+    return bool(normalized and normalized in dead_topic_ids(data))
+
+
+def _drop_topic_binding(entry: dict[str, Any], *, topic_id: str) -> None:
+    if str(entry.get("topic_id") or "") != topic_id:
+        return
+    entry.pop("topic_id", None)
+    entry["deleted_topic_id"] = topic_id
+    for field in (
+        "last_topic_icon",
+        "last_topic_icon_id",
+        "last_topic_icon_missing",
+        "last_topic_icon_error",
+        "pinned_status_message_id",
+        "pinned_status_hash",
+        "pinned_status_pinned",
+        "pinned_status_last_error",
+        "rename_attempts",
+        "topic_closed_at",
+        "topic_auto_closed_at",
+    ):
+        entry.pop(field, None)
+
+
+def discard_tombstoned_topic_binding(
+    data: dict[str, Any], entry: dict[str, Any]
+) -> bool:
+    """Drop a persisted binding when its provider id is known dead."""
+    topic_id = str(entry.get("topic_id") or "")
+    if not topic_id_is_tombstoned(data, topic_id):
+        return False
+    _drop_topic_binding(entry, topic_id=topic_id)
+    return True
+
+
+def _tombstone_dead_topic(data: dict[str, Any], topic_id: str) -> None:
+    raw = data.get("telegram_dead_topic_ids")
+    tombstones = (
+        [compact_ws(value, 80) for value in raw]
+        if isinstance(raw, list)
+        else []
+    )
+    tombstones = [value for value in tombstones if value and value != topic_id]
+    tombstones.append(topic_id)
+    data["telegram_dead_topic_ids"] = tombstones[-DEAD_TOPIC_TOMBSTONE_LIMIT:]
+    # Space-mode delivery uses a worker-shaped view of its owning space.
+    # Clear every persisted alias now so neither side can seed the dead id
+    # before the next source pass mints a replacement.
+    for candidate in source_space_entries(data).values():
+        _drop_topic_binding(candidate, topic_id=topic_id)
+    for candidate in source_worker_entries(data).values():
+        _drop_topic_binding(candidate, topic_id=topic_id)
+
+
 def clear_gone_live_topic(
     data: dict[str, Any],
     entry: dict[str, Any],
@@ -586,22 +655,7 @@ def clear_gone_live_topic(
     if not topic_id:
         return False
     repaired_at = time.time() if observed_at is None else float(observed_at)
-    entry.pop("topic_id", None)
-    entry["deleted_topic_id"] = topic_id
-    for field in (
-        "last_topic_icon",
-        "last_topic_icon_id",
-        "last_topic_icon_missing",
-        "last_topic_icon_error",
-        "pinned_status_message_id",
-        "pinned_status_hash",
-        "pinned_status_pinned",
-        "pinned_status_last_error",
-        "rename_attempts",
-        "topic_closed_at",
-        "topic_auto_closed_at",
-    ):
-        entry.pop(field, None)
+    _tombstone_dead_topic(data, topic_id)
     note = {
         "topic_id": topic_id,
         "worker_id": str(
@@ -1648,15 +1702,15 @@ def _entry_has_recent_live_activity(
         return False
     raw = entry.get("tendwire_last_seen_at")
     if not isinstance(raw, str) or not raw.strip():
-        return False
+        return True
     try:
         parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    age = observed_at - parsed.timestamp()
-    return 0 <= age <= DUPLICATE_LIVE_ACTIVITY_SECONDS
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        age = observed_at - parsed.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return True
+    return age <= DUPLICATE_LIVE_ACTIVITY_SECONDS
 
 
 _CONSOLIDATION_HEALABLE_QUARANTINE_REASONS = frozenset(
@@ -2028,6 +2082,15 @@ def finalize_worker_rekey_topic_handoff(
     topic_id = str(stale.get("topic_id") or "")
     if not topic_id:
         return False
+    if topic_id_is_tombstoned(data, topic_id):
+        stale["retired_topic_id"] = topic_id
+        stale["retired_topic_missing"] = True
+        for field in _TOPIC_BINDING_FIELDS:
+            stale.pop(field, None)
+        stale.pop("retired_topic_rename_pending", None)
+        stale.pop("retired_topic_close_pending", None)
+        return False
+    discard_tombstoned_topic_binding(data, current_entry)
     if current_entry.get("topic_id"):
         # A concurrently-created live topic wins; preserve and close the old
         # history rather than deleting either side.
@@ -2945,7 +3008,9 @@ def find_legacy_topic_id_by_name(data: dict[str, Any], name: str) -> str:
     matches = {
         str(entry["topic_id"])
         for entry in eligible_entries
-        if compact_ws(entry.get("topic_name"), 120).casefold() == wanted and entry.get("topic_id")
+        if compact_ws(entry.get("topic_name"), 120).casefold() == wanted
+        and entry.get("topic_id")
+        and not topic_id_is_tombstoned(data, entry.get("topic_id"))
     }
     return next(iter(matches)) if len(matches) == 1 else ""
 

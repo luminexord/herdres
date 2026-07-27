@@ -1219,6 +1219,7 @@ def test_persisted_duplicate_stable_key_consolidates_to_oldest_topic():
     for entry in (entry_a, entry_b):
         entry["tendwire_stable_key"] = KEY_A
         entry["tendwire_stable_key_version"] = 1
+        entry["tendwire_last_seen_at"] = "2000-01-01T00:00:00+00:00"
     telegram = FakeTelegram()
 
     sync_once(
@@ -1253,6 +1254,7 @@ def test_duplicate_consolidation_redelivers_newest_final_to_surviving_topic_once
     for entry in (old_owner, newer_owner):
         entry["tendwire_stable_key"] = KEY_A
         entry["tendwire_stable_key_version"] = 1
+        entry["tendwire_last_seen_at"] = "2000-01-01T00:00:00+00:00"
 
     old_owner.update(
         {
@@ -1802,6 +1804,8 @@ def test_preflight_duplicate_key_consolidates_bindings_and_is_repeat_idempotent(
     )
     other_owner["tendwire_stable_key"] = KEY_A
     other_owner["tendwire_stable_key_version"] = 1
+    exact_owner["tendwire_last_seen_at"] = "2000-01-01T00:00:00+00:00"
+    other_owner["tendwire_last_seen_at"] = "2000-01-01T00:00:00+00:00"
     state.bind_message_to_worker(
         store, "500", exact_owner, topic_id="26", kind="final"
     )
@@ -2250,6 +2254,7 @@ def test_duplicate_consolidation_preserves_non_identity_quarantine():
     for entry in (survivor, duplicate):
         entry["tendwire_stable_key"] = KEY_A
         entry["tendwire_stable_key_version"] = 1
+        entry["tendwire_last_seen_at"] = "2000-01-01T00:00:00+00:00"
     state.quarantine_worker_entry(store, survivor_key, reason="operator_hold")
     state.bind_message_to_worker(
         store, "500", survivor, topic_id="26", kind="final"

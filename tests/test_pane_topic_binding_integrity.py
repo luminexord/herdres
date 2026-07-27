@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -59,6 +59,16 @@ def _final(worker_id: str = "claude-live") -> dict:
     }
 
 
+def _working(worker_id: str = "claude-live") -> dict:
+    return {
+        "id": "turn-working",
+        "worker_id": worker_id,
+        "space_id": "workspace-1",
+        "assistant_stream_text": "Checking the pane/topic repair.",
+        "complete": False,
+    }
+
+
 def _entry(
     store: dict,
     *,
@@ -106,6 +116,23 @@ class DeletedTopicTelegram(FakeTelegram):
                 "error": "Bad Request: message thread not found",
             }
         return super().send_message(chat_id, html, **kwargs)
+
+
+class DeletedWorkingTopicTelegram(DeletedTopicTelegram):
+    def __init__(self, dead_topic_id: str, stale_message_id: str):
+        super().__init__(dead_topic_id)
+        self.stale_message_id = stale_message_id
+        self.failed_working_edits = 0
+
+    def edit_message(self, chat_id, message_id, html):
+        if str(message_id) == self.stale_message_id:
+            self.failed_working_edits += 1
+            return {
+                "ok": False,
+                "kind": "not_found",
+                "error": "Bad Request: message to edit not found",
+            }
+        return super().edit_message(chat_id, message_id, html)
 
 
 def test_deleted_live_topic_is_reminted_and_next_final_delivered_once():
@@ -193,6 +220,7 @@ def test_deleted_topic_defers_durable_final_until_remint_then_acks_once():
     assert tendwire.defer_calls == [
         ("twref1.lease1", "transient_delivery")
     ]
+    assert tendwire.defer_delay_seconds == [1]
     assert tendwire.ack_calls == []
     assert "topic_id" not in entry
 
@@ -321,6 +349,296 @@ def test_recent_distinct_topic_claims_remain_fail_closed():
     )
     assert telegram.sent == []
     assert telegram.topics == []
+
+
+@pytest.mark.parametrize("last_seen_at", [None, "", "not-a-timestamp"])
+def test_unknown_distinct_live_topic_claims_fail_closed_across_passes(
+    last_seen_at,
+):
+    store = _store()
+    first_key, first = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-a",
+        topic_id="16756",
+    )
+    second_key, second = _duplicate_entry(
+        store,
+        first,
+        key="worker:claude-live:second-topic",
+        fingerprint="fp-b",
+        topic_id="16910",
+    )
+    for key, entry in ((first_key, first), (second_key, second)):
+        entry["tendwire_stable_key"] = STABLE_KEY
+        entry["tendwire_stable_key_version"] = 1
+        if last_seen_at is None:
+            entry.pop("tendwire_last_seen_at", None)
+        else:
+            entry["tendwire_last_seen_at"] = last_seen_at
+        state.quarantine_worker_entry(
+            store, key, reason="preflight_stable_key_conflict"
+        )
+    runtime = SyncRuntime(
+        FakeTendwire(
+            workers=[_worker("claude-live", fingerprint="fp-a")],
+            turns={"turns": [_final("claude-live")]},
+            spaces=[],
+        ),
+        FakeTelegram(),
+        with_outbox=False,
+    )
+
+    first_result = sync_once(store, runtime)
+    after_first = deepcopy(store)
+    second_result = sync_once(store, runtime)
+
+    assert first_result["feed_sent"] == second_result["feed_sent"] == 0
+    assert store == after_first
+    assert not state.entry_is_retired(first)
+    assert not state.entry_is_retired(second)
+    assert state.entry_is_quarantined(first)
+    assert state.entry_is_quarantined(second)
+    assert runtime.telegram.sent == []
+    assert runtime.telegram.topics == []
+
+
+def test_future_dated_distinct_live_topic_claims_fail_closed():
+    store = _store()
+    first_key, first = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-a",
+        topic_id="16756",
+    )
+    second_key, second = _duplicate_entry(
+        store,
+        first,
+        key="worker:claude-live:second-topic",
+        fingerprint="fp-b",
+        topic_id="16910",
+    )
+    future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    for key, entry in ((first_key, first), (second_key, second)):
+        entry["tendwire_stable_key"] = STABLE_KEY
+        entry["tendwire_stable_key_version"] = 1
+        entry["tendwire_last_seen_at"] = future
+        state.quarantine_worker_entry(
+            store, key, reason="preflight_stable_key_conflict"
+        )
+    telegram = FakeTelegram()
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=[_worker("claude-live", fingerprint="fp-a")],
+                turns={"turns": [_final("claude-live")]},
+                spaces=[],
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert result["feed_sent"] == 0
+    assert not state.entry_is_retired(first)
+    assert not state.entry_is_retired(second)
+    assert telegram.sent == []
+    assert telegram.topics == []
+
+
+def test_retired_distinct_topic_duplicate_with_unknown_liveness_consolidates():
+    store = _store()
+    first_key, first = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-live",
+        topic_id="16756",
+    )
+    second_key, second = _duplicate_entry(
+        store,
+        first,
+        key="worker:claude-old-b:second-topic",
+        fingerprint="fp-b",
+        topic_id="16910",
+    )
+    for entry in (first, second):
+        entry["tendwire_stable_key"] = STABLE_KEY
+        entry["tendwire_stable_key_version"] = 1
+        entry["tendwire_last_seen_at"] = ""
+    second["routing_retired"] = True
+    second["routing_retired_reason"] = "historical_duplicate"
+    second["status"] = "closed"
+    telegram = FakeTelegram()
+
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=[_worker("claude-live", fingerprint="fp-live")],
+                turns={"turns": []},
+                spaces=[],
+            ),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+
+    assert state.worker_entry_is_uniquely_routable(store, first_key, first)
+    assert set(state.source_worker_entries(store)) == {first_key, second_key}
+    assert state.entry_is_retired(second)
+    assert second["routing_retired_reason"] == "historical_duplicate"
+    assert state.entry_stable_identity(second) is None
+
+
+@pytest.mark.parametrize("topic_mode", ["worker", "space"])
+def test_deleted_topic_tombstone_blocks_space_alias_resurrection_across_passes(
+    monkeypatch, topic_mode
+):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", topic_mode)
+    store = _store()
+    dead_topic_id = "15007"
+    worker = _worker()
+    _key, entry = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-live",
+        topic_id=dead_topic_id if topic_mode == "worker" else None,
+    )
+    space = {
+        "id": "workspace-1",
+        "name": "discovery-calls",
+        "status": "active",
+        "fingerprint": "space-fp",
+    }
+    _space_key, space_entry, _created = state.upsert_space_entry(
+        store,
+        space,
+        topic_id=dead_topic_id,
+    )
+    space_entry["topic_name"] = "discovery-calls"
+    telegram = DeletedTopicTelegram(dead_topic_id)
+    runtime = SyncRuntime(
+        FakeTendwire(
+            workers=[worker],
+            turns={"turns": [_final()]},
+            spaces=[space],
+        ),
+        telegram,
+        with_outbox=False,
+    )
+
+    first = sync_once(store, runtime)
+    assert first["feed_sent"] == 0
+    assert telegram.failed_topic_sends == 1
+    assert dead_topic_id not in {
+        str(candidate.get("topic_id") or "")
+        for candidate in state.source_entries(store).values()
+    }
+    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
+
+    second = sync_once(store, runtime)
+    replacement_topic_id = str(
+        (
+            entry
+            if topic_mode == "worker"
+            else next(iter(state.source_space_entries(store).values()))
+        )["topic_id"]
+    )
+    audit_after_recovery = deepcopy(store["telegram_topic_binding_audit"])
+
+    third = sync_once(store, runtime)
+
+    assert second["feed_sent"] == 1
+    assert third["feed_sent"] == 0
+    assert replacement_topic_id != dead_topic_id
+    assert telegram.topics == ["discovery-calls"]
+    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
+    assert store["telegram_topic_binding_audit"] == audit_after_recovery
+    assert len(audit_after_recovery) == 1
+    successful_finals = [
+        sent
+        for sent in telegram.sent
+        if sent[2].get("thread_id") == replacement_topic_id
+        and "Pane/topic binding repaired." in sent[1]
+    ]
+    assert len(successful_finals) == 1
+
+
+def test_working_edit_not_found_resends_to_prove_dead_topic_then_remints_once():
+    store = _store()
+    dead_topic_id = "15007"
+    stale_message_id = "15333"
+    _key, entry = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-live",
+        topic_id=dead_topic_id,
+    )
+    entry.update(
+        {
+            "last_stream_turn_id": "turn-working",
+            "last_stream_hash": "stale-working-hash",
+            "last_stream_message_id": stale_message_id,
+            "last_stream_bot_kind": "manager",
+        }
+    )
+    state.bind_message_to_worker(
+        store,
+        stale_message_id,
+        entry,
+        topic_id=dead_topic_id,
+        kind="working",
+        turn_id="turn-working",
+        bot_kind="manager",
+    )
+    telegram = DeletedWorkingTopicTelegram(
+        dead_topic_id,
+        stale_message_id,
+    )
+    runtime = SyncRuntime(
+        FakeTendwire(
+            workers=[_worker()],
+            turns={"turns": [_working()]},
+            spaces=[],
+        ),
+        telegram,
+        with_outbox=False,
+    )
+
+    first = sync_once(store, runtime)
+
+    assert first["feed_sent"] == 0
+    assert telegram.failed_working_edits == 1
+    assert telegram.failed_topic_sends == 1
+    assert state.find_message_binding(store, stale_message_id) is None
+    assert "last_stream_message_id" not in entry
+    assert "topic_id" not in entry
+    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
+
+    second = sync_once(store, runtime)
+    replacement_topic_id = entry["topic_id"]
+    third = sync_once(store, runtime)
+
+    assert second["feed_sent"] == 1
+    assert third["feed_sent"] == 0
+    assert replacement_topic_id != dead_topic_id
+    assert telegram.topics == ["discovery-calls"]
+    working_cards = [
+        sent
+        for sent in telegram.sent
+        if sent[2].get("thread_id") == replacement_topic_id
+        and "Checking the pane/topic repair." in sent[1]
+    ]
+    assert len(working_cards) == 1
+    assert entry["last_stream_message_id"] == working_cards[0][3]
+    working_bindings = [
+        binding
+        for binding in state.message_bindings(store).values()
+        if binding.get("kind") == "working"
+    ]
+    assert len(working_bindings) == 1
 
 
 def test_healthy_noop_sync_pass_does_not_write_state():

@@ -113,6 +113,7 @@ class TurnFinalTendwire:
         self.ack_calls = []
         self.fail_calls = []
         self.defer_calls = []
+        self.defer_delay_seconds = []
         self.source_prepare_refs = []
         self._plans = {}
         self._plan_by_revision = {}
@@ -654,8 +655,9 @@ class TurnFinalTendwire:
             "status": "retry_scheduled",
         }
 
-    def turn_final_defer(self, ref, reason="", **_kwargs):
+    def turn_final_defer(self, ref, reason="", **kwargs):
         self.defer_calls.append((ref, reason))
+        self.defer_delay_seconds.append(kwargs.get("delay_seconds"))
         self._requeue_ref(ref)
         return {
             "ok": True,
