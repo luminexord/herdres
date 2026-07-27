@@ -9,7 +9,7 @@ requiring the owner to finish the prompt at the desk.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping
 
 from . import config, state
@@ -327,7 +327,7 @@ def checkpoint_provider_acceptance(
         or ""
     )
     accepted = (
-        kind == "decision_card"
+        kind in {"decision_card", "decision_notice"}
         and result.get("ok") is True
         and bool(accepted_message_id)
     ) or (
@@ -353,10 +353,9 @@ def checkpoint_provider_acceptance(
         32,
     )
     artifacts = _accepted_artifacts(store, create=True)
-    if receipt_id not in artifacts and len(artifacts) >= (
-        ACCEPTED_ARTIFACT_LIMIT
-    ):
-        raise RuntimeError("decision accepted-artifact ledger is full")
+    # Capacity controls whether new provider work may start. Once the provider
+    # has accepted an artefact, that fact must be recordable even if a
+    # concurrent writer filled the nominal ledger while the lock was released.
     artifacts.setdefault(
         receipt_id,
         {
@@ -536,7 +535,7 @@ def _drain_accepted_artifacts(
             "message_id": str(raw.get("message_id") or ""),
             "provider_provenance": dict(raw.get("provenance") or {}),
         }
-        if kind == "decision_card":
+        if kind in {"decision_card", "decision_notice"}:
             execution = _execute(
                 _operation(
                     "telegram.delete_message",
@@ -758,6 +757,7 @@ def _failure_text(result: dict[str, Any]) -> str:
 
 
 def _send_failure(
+    store: dict[str, Any],
     telegram: TelegramClient,
     chat_id: str,
     topic_id: str,
@@ -766,12 +766,13 @@ def _send_failure(
     *,
     provider_executor: ProviderExecutor | None = None,
 ) -> None:
-    _execute(
+    execution = _execute(
         _operation(
             "telegram.send_message",
             reason="telegram.send_message: report decision callback failure",
             record=record,
             topic_id=topic_id,
+            artifact_kind="decision_notice",
             args=(chat_id, html_escape(text, 300)),
             kwargs={
                 "thread_id": topic_id,
@@ -784,6 +785,30 @@ def _send_failure(
         telegram=telegram,
         provider_executor=provider_executor,
     )
+    if (
+        execution.disposition == "apply"
+        and execution.result.get("ok") is True
+    ):
+        message_id = str(
+            execution.result.get("message_id")
+            or execution.result.get("reply_markup_message_id")
+            or ""
+        )
+        if message_id:
+            bucket = store.setdefault("decisions", {})
+            notices = bucket.setdefault("failure_notices", [])
+            if isinstance(notices, list):
+                notices.append(
+                    {
+                        "decision_id": str(
+                            record.get("decision_id") or ""
+                        ),
+                        "topic_id": topic_id,
+                        "message_id": message_id,
+                    }
+                )
+                bucket["failure_notices"] = notices[-64:]
+        complete_provider_acceptance(store, execution.receipt_id)
 
 
 def _answer_request(
@@ -881,6 +906,7 @@ def _submit(
     if status == "answer_in_progress":
         if callback:
             _send_failure(
+                store,
                 telegram,
                 chat_id,
                 topic_id,
@@ -924,6 +950,7 @@ def _submit(
     error = _failure_text(result)
     if callback:
         _send_failure(
+            store,
             telegram,
             chat_id,
             topic_id,
@@ -1009,30 +1036,64 @@ def handle_callback(
             toast = "Choice selected."
         preview = dict(record)
         preview["selected"] = selected
-        execution = _execute(
-            _operation(
-                "telegram.edit_message_reply_markup",
-                reason=(
-                    "telegram.edit_message_reply_markup: toggle decision choice"
-                ),
-                record=record,
-                topic_id=topic_id,
-                message_id=str(record.get("message_id") or ""),
-                scope="exact",
-                args=(
-                    chat_id,
-                    str(record.get("message_id") or ""),
-                    inline_keyboard(preview),
-                ),
+        toggle_operation = _operation(
+            "telegram.edit_message_reply_markup",
+            reason=(
+                "telegram.edit_message_reply_markup: toggle decision choice"
             ),
+            record=record,
+            topic_id=topic_id,
+            message_id=str(record.get("message_id") or ""),
+            scope="exact",
+            args=(
+                chat_id,
+                str(record.get("message_id") or ""),
+                inline_keyboard(preview),
+            ),
+        )
+        execution = _execute(
+            toggle_operation,
             telegram=telegram,
             provider_executor=provider_executor,
         )
         edited = execution.result
-        if (
-            execution.disposition != "apply"
-            or not edited.get("ok")
-        ):
+        if execution.disposition != "apply":
+            if edited.get("ok") and toggle_operation.message_id:
+                stale_operation = replace(
+                    toggle_operation,
+                    artifact_kind="decision_card",
+                )
+                checkpoint_provider_acceptance(
+                    store,
+                    stale_operation,
+                    {
+                        "ok": True,
+                        "message_id": toggle_operation.message_id,
+                    },
+                    execution.provenance,
+                )
+                active = _active_records(store, create=True)
+                for active_topic, active_record in list(
+                    active.items()
+                ):
+                    if (
+                        isinstance(active_record, dict)
+                        and str(active_record.get("message_id") or "")
+                        == toggle_operation.message_id
+                        and str(
+                            active_record.get("decision_id") or ""
+                        )
+                        == str(record.get("decision_id") or "")
+                    ):
+                        active.pop(active_topic, None)
+            return {
+                "handled": True,
+                "changed": bool(edited.get("ok")),
+                "toast": "Could not update choices.",
+                "reply": "",
+                "status": "telegram_edit_failed",
+            }
+        if not edited.get("ok"):
             return {
                 "handled": True,
                 "changed": False,

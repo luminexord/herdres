@@ -59,6 +59,7 @@ _TOPIC_CLEANUP_MIN_RETRY_SECONDS = 60.0
 _TOPIC_CLEANUP_PERMANENT_ERROR_KINDS = frozenset(
     {"bad_request", "bot_access", "capability"}
 )
+_ACCEPTED_NOTIFICATION_LIMIT = 64
 
 
 class _TurnContentError(RuntimeError):
@@ -623,10 +624,8 @@ class _OfflockClient:
         if not callable_attribute:
             return value
         if name == "with_token":
-            return lambda *args, **kwargs: _OfflockClient(
-                _OFFLOCK_EXECUTOR.with_token(self, *args, **kwargs),
-                _OFFLOCK_EXECUTOR.store(self),
-                provider_kind,
+            return lambda *args, **kwargs: _OFFLOCK_EXECUTOR.with_token(
+                self, *args, **kwargs
             )
         if name == "api":
             def checked_api(method: str, *args: Any, **kwargs: Any) -> Any:
@@ -843,8 +842,12 @@ def _build_offlock_executor() -> Any:
         def with_token(
             client: _OfflockClient, *args: Any, **kwargs: Any
         ) -> Any:
-            provider, _store, _kind = internals(client)
-            return provider.with_token(*args, **kwargs)
+            provider, store, provider_kind = internals(client)
+            return _OfflockClient(
+                provider.with_token(*args, **kwargs),
+                store,
+                provider_kind,
+            )
 
         @staticmethod
         def read(
@@ -853,6 +856,17 @@ def _build_offlock_executor() -> Any:
             *args: Any,
             **kwargs: Any,
         ) -> Any:
+            _provider, _store, provider_kind = internals(client)
+            allowed = method_name in _READ_ONLY_PROVIDER_METHODS.get(
+                provider_kind, frozenset()
+            ) and method_name != "with_token"
+            if method_name == "api":
+                allowed = bool(args and str(args[0]).startswith("get"))
+            if not allowed:
+                raise RuntimeError(
+                    f"off-lock provider method {method_name!r} is not "
+                    "classified read-only"
+                )
             return invoke_offlock(
                 client,
                 lambda provider: getattr(provider, method_name)(
@@ -1517,6 +1531,150 @@ def _telegram_state(store: dict[str, Any]) -> dict[str, Any]:
         telegram = {}
         store["telegram"] = telegram
     return telegram
+
+
+def _accepted_notification_messages(
+    store: dict[str, Any], *, create: bool
+) -> dict[str, dict[str, Any]]:
+    telegram = _telegram_state(store)
+    records = telegram.get("accepted_notification_messages")
+    if not isinstance(records, dict):
+        if not create:
+            return {}
+        records = {}
+        telegram["accepted_notification_messages"] = records
+    return records
+
+
+def _notification_acceptance_capacity_available(
+    store: dict[str, Any],
+) -> bool:
+    return len(
+        _accepted_notification_messages(store, create=False)
+    ) < _ACCEPTED_NOTIFICATION_LIMIT
+
+
+def _notification_kind_pending(
+    store: dict[str, Any], kind: str
+) -> bool:
+    return any(
+        isinstance(record, dict) and record.get("kind") == kind
+        for record in _accepted_notification_messages(
+            store, create=False
+        ).values()
+    )
+
+
+def _checkpoint_accepted_notification(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    operation: _OfflockEntryOperation,
+    result: Any,
+    *,
+    kind: str,
+    bot_kind: str = MANAGER_BOT_KIND,
+) -> str:
+    """Record an accepted exact message before owner disposition is known."""
+
+    if not isinstance(result, Mapping) or result.get("ok") is not True:
+        return ""
+    message_id = str(result.get("message_id") or "")
+    if not message_id or message_id == "0":
+        return ""
+    receipt_id = short_hash(
+        {
+            "kind": kind,
+            "topic_id": operation.route_topic_id,
+            "message_id": message_id,
+            "provenance": _operation_provenance(operation),
+        },
+        32,
+    )
+    records = _accepted_notification_messages(store, create=True)
+    # Capacity gates starting new sends. An already-accepted provider fact is
+    # always admitted, even if a concurrent writer filled the nominal bound.
+    records.setdefault(
+        receipt_id,
+        {
+            "kind": kind,
+            "topic_id": operation.route_topic_id,
+            "message_id": message_id,
+            "bot_kind": bot_kind,
+            "provenance": _operation_provenance(operation),
+        },
+    )
+    if runtime.checkpoint is not None:
+        runtime.checkpoint()
+    return receipt_id
+
+
+def _complete_accepted_notification(
+    store: dict[str, Any], receipt_id: str
+) -> None:
+    if receipt_id:
+        _accepted_notification_messages(
+            store, create=False
+        ).pop(receipt_id, None)
+
+
+def _drain_accepted_notifications(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+) -> tuple[int, int]:
+    """Delete stale accepted cards before permitting replacement sends."""
+
+    completed = 0
+    pending = 0
+    for receipt_id, raw in list(
+        _accepted_notification_messages(
+            store, create=False
+        ).items()
+    ):
+        if not isinstance(raw, dict):
+            _complete_accepted_notification(store, receipt_id)
+            completed += 1
+            continue
+        message_id = str(raw.get("message_id") or "")
+        if not message_id:
+            _complete_accepted_notification(store, receipt_id)
+            completed += 1
+            continue
+        try:
+            owner_token = _owning_bot_token(
+                store,
+                str(raw.get("bot_kind") or MANAGER_BOT_KIND),
+            )
+            deleted = _execute_exact_provider_operation(
+                runtime.telegram,
+                store=store,
+                mutation=_provider_mutation(
+                    "telegram.delete_message",
+                    reason=(
+                        "telegram.delete_message: retire accepted stale "
+                        "notification"
+                    ),
+                    args=(chat_id, message_id),
+                    api_token=owner_token,
+                ),
+            )
+        except Exception:
+            pending += 1
+            continue
+        if (
+            deleted.get("ok") is not True
+            and classify_telegram_error(deleted.get("error"))
+            != "not_found"
+        ):
+            pending += 1
+            continue
+        _retire_local_message(store, None, message_id)
+        _complete_accepted_notification(store, receipt_id)
+        completed += 1
+        if runtime.checkpoint is not None:
+            runtime.checkpoint()
+    return completed, pending
 
 
 def _delivery_bot(store: dict[str, Any], entry: dict[str, Any]) -> tuple[str | None, str]:
@@ -2992,6 +3150,7 @@ def _sync_topic_pinned(
         _record_topic_pinned_status(entry, message_id=message_id or "0", content_hash=content_hash, pinned=True)
         return True
     sent: dict[str, Any]
+    accepted_receipt_id = ""
     if message_id:
         edit_operation = _capture_entry_operation(
             store,
@@ -3026,9 +3185,27 @@ def _sync_topic_pinned(
             entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
             return False
     if not message_id:
+        if (
+            not _notification_acceptance_capacity_available(store)
+            or _notification_kind_pending(store, "topic_pinned")
+        ):
+            return False
         send_operation = _capture_entry_operation(
             store, entry, topic_id=thread_id
         )
+
+        def checkpoint_topic_pin(
+            result: Any, operation: _OfflockEntryOperation
+        ) -> None:
+            nonlocal accepted_receipt_id
+            accepted_receipt_id = _checkpoint_accepted_notification(
+                store,
+                runtime,
+                operation,
+                result,
+                kind="topic_pinned",
+            )
+
         execution = _execute_entry_operation(
             store,
             runtime.telegram,
@@ -3039,6 +3216,7 @@ def _sync_topic_pinned(
                 args=(chat_id, html),
                 kwargs={"thread_id": thread_id, "notify": False},
             ),
+            acceptance_checkpoint=checkpoint_topic_pin,
         )
         sent, send_resolution = execution.result, execution.resolution
         if not sent.get("ok") and _topic_missing(sent.get("error")):
@@ -3088,6 +3266,7 @@ def _sync_topic_pinned(
     assert entry is not None
     pinned = bool(pin_result.get("ok"))
     _record_topic_pinned_status(entry, message_id=message_id, content_hash=content_hash, pinned=pinned)
+    _complete_accepted_notification(store, accepted_receipt_id)
     if not pinned:
         entry["pinned_status_pin_error"] = compact_ws(pin_result.get("error"), 240)
     else:
@@ -3288,6 +3467,13 @@ def _sync_retired_worker_topics(
         if entry.get("retired_topic_notice_pending"):
             if runtime.dry_run:
                 continue
+            if (
+                not _notification_acceptance_capacity_available(store)
+                or _notification_kind_pending(
+                    store, "retired_topic_notice"
+                )
+            ):
+                continue
             survivor_topic_id = str(entry.get("consolidated_into_topic_id") or "")
             target = (
                 f" (topic {html_escape(survivor_topic_id)})"
@@ -3300,6 +3486,22 @@ def _sync_retired_worker_topics(
                 topic_id=topic_id,
                 observe=("retired_topic_notice_pending",),
             )
+            accepted_receipt_id = ""
+
+            def checkpoint_retired_notice(
+                result: Any, operation: _OfflockEntryOperation
+            ) -> None:
+                nonlocal accepted_receipt_id
+                accepted_receipt_id = (
+                    _checkpoint_accepted_notification(
+                        store,
+                        runtime,
+                        operation,
+                        result,
+                        kind="retired_topic_notice",
+                    )
+                )
+
             execution = _execute_entry_operation(
                 store,
                 runtime.telegram,
@@ -3317,6 +3519,7 @@ def _sync_retired_worker_topics(
                     ),
                     kwargs={"thread_id": topic_id, "notify": False},
                 ),
+                acceptance_checkpoint=checkpoint_retired_notice,
             )
             sent, notice_resolution = execution.result, execution.resolution
             if _topic_missing(sent.get("error")):
@@ -3339,6 +3542,9 @@ def _sync_retired_worker_topics(
                 entry.pop("retired_topic_notice_error", None)
                 entry["retired_topic_notice_message_id"] = str(
                     sent.get("message_id") or ""
+                )
+                _complete_accepted_notification(
+                    store, accepted_receipt_id
                 )
                 changed += 1
                 if runtime.checkpoint is not None:
@@ -5448,10 +5654,10 @@ def _stage_final_plan(
     runtime: SyncRuntime,
     *,
     source_ref: str | None = None,
-) -> tuple[bool, int]:
+) -> tuple[bool, int, dict[str, Any]]:
     revision = _content_revision(item)
     if not revision:
-        return False, 0
+        return False, 0, entry
 
     def _prepare_begin_kwargs(part_count: int) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -5475,7 +5681,7 @@ def _stage_final_plan(
         and entry.get("last_turn_id") == _turn_id(item)
         and entry.get("last_clean_content_revision") == revision
     ):
-        return False, 0
+        return False, 0, entry
     if (
         entry.get("pending_turn_id") == _turn_id(item)
         and entry.get("pending_content_revision") == revision
@@ -5587,7 +5793,7 @@ def _stage_final_plan(
                 revision=revision,
             ):
                 _checkpoint_turn_job(runtime)
-        return False, 0
+        return False, 0, entry
 
     page_calls = _materialize_turn_item(item, runtime)
     feed_item = _turn_feed_item(item, entry)
@@ -5614,7 +5820,7 @@ def _stage_final_plan(
             entry["pending_stream_submission_id"] = str(
                 entry["last_stream_submission_id"]
             )
-        return True, page_calls
+        return True, page_calls, entry
 
     begin_operation = _capture_entry_operation(
         store,
@@ -5813,7 +6019,7 @@ def _stage_final_plan(
     final_identity = item.get(_TURN_FINAL_IDENTITY_KEY)
     if isinstance(final_identity, str) and final_identity:
         entry["pending_final_identity"] = final_identity
-    return True, page_calls
+    return True, page_calls, entry
 
 
 def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
@@ -6217,7 +6423,7 @@ def _sync_turns(
             seen_final_workers.add(worker_key)
             if _content_revision(item):
                 try:
-                    _staged, page_calls = _stage_final_plan(
+                    _staged, page_calls, entry = _stage_final_plan(
                         store, item, entry, runtime
                     )
                     counts["content_pages"] += page_calls
@@ -8208,7 +8414,7 @@ def _drain_turn_final(
                 )
                 break
             try:
-                staged, staged_pages = _stage_final_plan(
+                staged, staged_pages, entry = _stage_final_plan(
                     store,
                     item,
                     entry,
@@ -9930,6 +10136,8 @@ def _sync_pinned(
     )
     if account_html:
         html = f"{html}\n{account_html}"
+    if yield_barrier is not None:
+        yield_barrier()
     telegram = store.setdefault("telegram", {})
     message_id = str(telegram.get("pinned_status_message_id") or "")
     content_hash = short_hash(html, 20)
@@ -9939,16 +10147,40 @@ def _sync_pinned(
         telegram["pinned_status_hash"] = content_hash
         telegram.setdefault("pinned_status_message_id", "0")
         return True
-    if yield_barrier is not None:
-        yield_barrier()
     general_thread_id = str(config.general_thread_id(store))
+    accepted_receipt_id = ""
 
     def send_to_general_thread() -> tuple[
         dict[str, Any], _OfflockEntryResolution
     ]:
+        nonlocal accepted_receipt_id
+        if (
+            not _notification_acceptance_capacity_available(store)
+            or _notification_kind_pending(store, "global_pinned")
+        ):
+            return (
+                {
+                    "ok": False,
+                    "status": "accepted_artifact_backpressure",
+                },
+                _OfflockEntryResolution(_OFFLOCK_RECONCILE),
+            )
         operation = _capture_global_operation(
             store, topic_id=general_thread_id
         )
+
+        def checkpoint_global_pin(
+            result: Any, captured: _OfflockEntryOperation
+        ) -> None:
+            nonlocal accepted_receipt_id
+            accepted_receipt_id = _checkpoint_accepted_notification(
+                store,
+                runtime,
+                captured,
+                result,
+                kind="global_pinned",
+            )
+
         execution = _execute_entry_operation(
             store,
             runtime.telegram,
@@ -9964,6 +10196,7 @@ def _sync_pinned(
                     "notify": False,
                 },
             ),
+            acceptance_checkpoint=checkpoint_global_pin,
         )
         result, resolution = execution.result, execution.resolution
         if not result.get("ok") and _topic_missing(
@@ -9990,6 +10223,7 @@ def _sync_pinned(
                     args=(chat_id, html),
                     kwargs={"notify": False},
                 ),
+                acceptance_checkpoint=checkpoint_global_pin,
             )
             result, resolution = execution.result, execution.resolution
         return result, resolution
@@ -10053,6 +10287,9 @@ def _sync_pinned(
         if sent.get("message_id"):
             telegram["pinned_status_message_id"] = str(sent["message_id"])
         telegram.pop("pinned_status_last_error", None)
+        _complete_accepted_notification(
+            store, accepted_receipt_id
+        )
         return True
     telegram["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
     return False
@@ -11258,6 +11495,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             # are converted to bounded row-local outcomes by validation.
             return _tendwire_non_success(runtime, exc.status)
     runtime = _offlock_runtime(store, runtime)
+    with state.lock_phase("sync.accepted_notifications"):
+        (
+            accepted_notifications_retired,
+            _accepted_notifications_pending,
+        ) = _drain_accepted_notifications(
+            store,
+            runtime,
+            chat_id=chat_id,
+        )
 
     def _yield_between_turns() -> None:
         if not state.lock_held():
@@ -11296,7 +11542,10 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             turns_payload,
             observed_at=observed_at,
         )
-    changed = generation_resolution_changed
+    changed = bool(
+        generation_resolution_changed
+        or accepted_notifications_retired
+    )
     with state.lock_phase("sync.sources"):
         source_counts = _sync_sources(
             store, snapshot, turns_payload, runtime, chat_id=chat_id

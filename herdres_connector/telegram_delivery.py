@@ -567,9 +567,35 @@ def drain_outbox(
         return result
     items = [item for item in poll.get("items", []) if isinstance(item, dict)]
     result["polled"] = len(items)
-    audit = store.setdefault("tendwire_outbox", {})
-    delivered = audit.setdefault("delivered_identities", [])
-    delivered_set = {str(item) for item in delivered}
+    def current_audit() -> dict[str, Any]:
+        audit = store.setdefault("tendwire_outbox", {})
+        if not isinstance(audit, dict):
+            audit = {}
+            store["tendwire_outbox"] = audit
+        return audit
+
+    def delivered_identities() -> list[str]:
+        audit = current_audit()
+        delivered = audit.get("delivered_identities")
+        if not isinstance(delivered, list):
+            delivered = []
+            audit["delivered_identities"] = delivered
+        return delivered
+
+    def checkpoint_delivery(identity: str) -> None:
+        # Guarded calls replace nested state objects after reloading. Resolve
+        # the audit again and persist the provider-accepted delivery before
+        # asking Tendwire to consume its lease.
+        delivered = delivered_identities()
+        if identity not in {str(value) for value in delivered}:
+            delivered.append(identity)
+        current_audit()["delivered_identities"] = delivered[-200:]
+        if state.lock_actually_held():
+            state.save_state(store)
+
+    delivered_set = {
+        str(item) for item in delivered_identities()
+    }
     for item in items[:max_sends]:
         if yield_barrier is not None:
             yield_barrier()
@@ -578,7 +604,13 @@ def drain_outbox(
         identity = short_hash({"key": item.get("key"), "payload": payload}, 24)
         if identity in delivered_set:
             if ref and not dry_run:
-                tendwire.connector_ack(ref, {"duplicate": True})
+                acknowledged = tendwire.connector_ack(
+                    ref, {"duplicate": True}
+                )
+                if acknowledged.get("ok") is not True:
+                    result["deferred"] += 1
+                    result["changed"] = True
+                    continue
             result["acked"] += 1
             result["changed"] = True
             continue
@@ -592,15 +624,21 @@ def drain_outbox(
                 sent["fallback_reason"] = "general_thread_missing"
         if sent.get("ok"):
             result["delivered"] += 1
-            result["acked"] += 1
             result["changed"] = True
-            delivered.append(identity)
+            checkpoint_delivery(identity)
             delivered_set.add(identity)
             if ref and not dry_run:
-                tendwire.connector_ack(ref, {"telegram": "delivered"})
+                acknowledged = tendwire.connector_ack(
+                    ref, {"telegram": "delivered"}
+                )
+                if acknowledged.get("ok") is not True:
+                    result["deferred"] += 1
+                    continue
+            result["acked"] += 1
         else:
             result["failed"] += 1
             result["changed"] = True
+            audit = current_audit()
             recent = audit.setdefault("recent", [])
             if isinstance(recent, list):
                 recent.append(
@@ -614,5 +652,7 @@ def drain_outbox(
                 audit["recent"] = recent[-50:]
             if ref and not dry_run:
                 tendwire.connector_fail(ref, str(sent.get("error") or "Telegram delivery failed"))
-    audit["delivered_identities"] = delivered[-200:]
+    current_audit()["delivered_identities"] = (
+        delivered_identities()[-200:]
+    )
     return result

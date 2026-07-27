@@ -1572,6 +1572,28 @@ class FakeTelegram:
         return {"ok": True, "message_id": message_id}
 
 
+class RebindingNotificationTelegram(FakeTelegram):
+    def __init__(self, state_path, mutate_state):
+        super().__init__()
+        self.state_path = state_path
+        self.mutate_state = mutate_state
+        self.rebound = False
+        self.deleted_messages = []
+
+    def send_message(self, chat_id, html, **kwargs):
+        result = super().send_message(chat_id, html, **kwargs)
+        if not self.rebound:
+            concurrent = state.load_state(self.state_path)
+            self.mutate_state(concurrent)
+            state.save_state(concurrent, self.state_path)
+            self.rebound = True
+        return result
+
+    def delete_message(self, chat_id, message_id):
+        self.deleted_messages.append((str(chat_id), str(message_id)))
+        return {"ok": True}
+
+
 def _store():
     return {
         "enabled": True,
@@ -3467,6 +3489,159 @@ def test_topic_pinned_status_reuses_legacy_topic_pin(monkeypatch):
     assert ("-100", "55") in telegram.pins
     assert any(edit[1] == "55" for edit in telegram.edited)
     assert not any(sent[2].get("thread_id") == "77" for sent in telegram.sent)
+
+
+def _notification_race_store(*, retired=False):
+    store = _store()
+    store["panes"]["worker:notification-race"] = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "tendwire_worker_id": "worker-notification",
+        "worker_id": "worker-notification",
+        "tendwire_space_id": "space-1",
+        "space_id": "space-1",
+        "tendwire_fingerprint": "fp-notification",
+        "topic_id": "77",
+        "topic_name": "Notification race",
+        "status": "retired" if retired else "idle",
+        "tendwire_raw_status": "idle",
+    }
+    if retired:
+        store["panes"]["worker:notification-race"].update(
+            {
+                "routing_retired": True,
+                "retired_topic_notice_pending": True,
+            }
+        )
+    return store
+
+
+def test_topic_pin_rebind_checkpoints_and_retires_accepted_card(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(_notification_race_store(), state_path)
+
+    def rebind(current):
+        current["panes"]["worker:notification-race"]["topic_id"] = "88"
+
+    telegram = RebindingNotificationTelegram(state_path, rebind)
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+        )
+        entry = current["panes"]["worker:notification-race"]
+        assert (
+            source_sync._sync_topic_pinned(
+                current, entry, runtime, chat_id="-100"
+            )
+            is False
+        )
+        assert len(
+            current["telegram"]["accepted_notification_messages"]
+        ) == 1
+        retired, pending = source_sync._drain_accepted_notifications(
+            current, runtime, chat_id="-100"
+        )
+        entry = current["panes"]["worker:notification-race"]
+        assert source_sync._sync_topic_pinned(
+            current, entry, runtime, chat_id="-100"
+        )
+
+    assert (retired, pending) == (1, 0)
+    assert telegram.deleted_messages == [("-100", "100")]
+    assert [row[2]["thread_id"] for row in telegram.sent] == [
+        "77",
+        "88",
+    ]
+    assert current["panes"]["worker:notification-race"][
+        "pinned_status_message_id"
+    ] == "101"
+
+
+def test_retired_notice_rebind_checkpoints_and_retires_accepted_card(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(
+        _notification_race_store(retired=True), state_path
+    )
+
+    def rebind(current):
+        current["panes"]["worker:notification-race"]["topic_id"] = "88"
+
+    telegram = RebindingNotificationTelegram(state_path, rebind)
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+        )
+        assert (
+            source_sync._sync_retired_worker_topics(
+                current, runtime, chat_id="-100"
+            )
+            == 0
+        )
+        retired, pending = source_sync._drain_accepted_notifications(
+            current, runtime, chat_id="-100"
+        )
+        assert (
+            source_sync._sync_retired_worker_topics(
+                current, runtime, chat_id="-100"
+            )
+            == 1
+        )
+
+    assert (retired, pending) == (1, 0)
+    assert telegram.deleted_messages == [("-100", "100")]
+    assert [row[2]["thread_id"] for row in telegram.sent] == [
+        "77",
+        "88",
+    ]
+    entry = current["panes"]["worker:notification-race"]
+    assert entry["retired_topic_notice_message_id"] == "101"
+    assert "retired_topic_notice_pending" not in entry
+
+
+def test_global_pin_rebind_checkpoints_and_retires_accepted_card(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(_notification_race_store(), state_path)
+
+    def rebind(current):
+        current["telegram"]["general_thread_id"] = "2"
+
+    telegram = RebindingNotificationTelegram(state_path, rebind)
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+        )
+        assert (
+            source_sync._sync_pinned(
+                current, runtime, chat_id="-100"
+            )
+            is False
+        )
+        retired, pending = source_sync._drain_accepted_notifications(
+            current, runtime, chat_id="-100"
+        )
+        assert source_sync._sync_pinned(
+            current, runtime, chat_id="-100"
+        )
+
+    assert (retired, pending) == (1, 0)
+    assert telegram.deleted_messages == [("-100", "100")]
+    assert [row[2]["thread_id"] for row in telegram.sent] == ["1", "2"]
+    assert current["telegram"]["pinned_status_message_id"] == "101"
 
 
 def test_topic_pinned_edit_topic_not_found_resends_before_tombstoning(

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import herdres
 import pytest
-from herdres_connector import config, state
+from herdres_connector import config, source_sync, state
 from herdres_connector.source_sync import PRESENTATION_VERSION, SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import RateLimited, TelegramClient, TelegramError
 from test_source_only import FakeTelegram, _source_worker, _store
@@ -2211,6 +2211,60 @@ def test_suppressed_turn_final_rebind_during_ack_reconciles_locally(
     assert stable["tendwire_turn_final"]["polled"] == 0
     assert stable["tendwire_turn_final"]["acked"] == 0
     assert len(tendwire.ack_calls) == 1
+
+
+def test_stage_final_plan_returns_current_owner_for_suppression_marker(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    turn_id = "turn-stage-suppressed-owner"
+    revision = "twrev1.stage_suppressed_owner"
+    item = _turn_row(turn_id, revision, "historical answer")
+    tendwire = TurnFinalTendwire(item)
+    initial = _store()
+    _key, initial_entry, _created = state.upsert_worker_entry(
+        initial,
+        _source_worker(tendwire.snapshot()["workers"][0]),
+    )
+    initial_entry["topic_id"] = "77"
+    state.save_state(initial, state_path)
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        _key, old_entry = state.find_worker_entry_by_stable_key(
+            current, _stable_key("worker-1")
+        )
+        assert old_entry is not None
+        runtime = source_sync._offlock_runtime(
+            current,
+            _runtime(tendwire, DeletingTelegram(), max_sends=8),
+        )
+        staged, _pages, entry = source_sync._stage_final_plan(
+            current, item, old_entry, runtime
+        )
+        assert staged is True
+        assert entry is not old_entry
+        entry["pending_turn_suppressed"] = {
+            "plan_token": str(entry["pending_plan_token"]),
+            "turn_id": turn_id,
+            "content_revision": revision,
+            "reason": "rebind_catchup_older_than_bound",
+        }
+        assert source_sync._suppressed_turn_plan(
+            entry,
+            str(entry["pending_plan_token"]),
+            revision,
+        )
+        state.save_state(current, state_path)
+
+    persisted = state.load_state(state_path)
+    _key, persisted_entry = state.find_worker_entry_by_stable_key(
+        persisted, _stable_key("worker-1")
+    )
+    assert persisted_entry is not None
+    assert persisted_entry["pending_turn_suppressed"]["turn_id"] == turn_id
 
 
 def test_turn_final_revalidates_after_old_copy_retirement(

@@ -28,6 +28,7 @@ from herdres_connector.source_sync import (
     _sync_sources,
     sync_once,
 )
+from herdres_connector.telegram_delivery import drain_outbox
 
 from test_source_only import (
     REQUEST_ID,
@@ -239,6 +240,114 @@ def test_nested_offlock_client_does_not_rollback_lane_child_commit(
 
     assert current["child_commit_survived"] is True
     assert state.load_state(statepath)["child_commit_survived"] is True
+
+
+def test_guarded_outbox_checkpoints_before_ack_and_replay_only_acks(
+    tmp_path, monkeypatch
+) -> None:
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    state.save_state(_store(), statepath)
+
+    class ReplayTendwire(FakeTendwire):
+        def __init__(self):
+            super().__init__()
+            self.acks = 0
+
+        def connector_poll(self, **_kwargs):
+            return {
+                "ok": True,
+                "items": [
+                    {
+                        "ref": "outbox-ref",
+                        "key": "attention:1",
+                        "payload": {
+                            "event_type": "attention_created",
+                            "attention": {
+                                "severity": "warning",
+                                "reason": "Needs input",
+                            },
+                        },
+                    }
+                ],
+            }
+
+        def connector_ack(self, _ref, _response):
+            self.acks += 1
+            return {"ok": self.acks > 1}
+
+    telegram = FakeTelegram()
+    tendwire = ReplayTendwire()
+    with state.state_lock(statepath):
+        current = state.load_state(statepath)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                tendwire=tendwire,
+                telegram=telegram,
+                with_outbox=True,
+            ),
+        )
+        first = drain_outbox(
+            current,
+            source_sync._exact_provider_client(
+                runtime.telegram,
+                reason="test outbox Telegram exact identifiers",
+            ),
+            source_sync._exact_provider_client(
+                runtime.tendwire,
+                reason="test outbox Tendwire exact lease",
+            ),
+            chat_id="-100",
+            max_sends=1,
+        )
+        second = drain_outbox(
+            current,
+            source_sync._exact_provider_client(
+                runtime.telegram,
+                reason="test outbox Telegram exact identifiers",
+            ),
+            source_sync._exact_provider_client(
+                runtime.tendwire,
+                reason="test outbox Tendwire exact lease",
+            ),
+            chat_id="-100",
+            max_sends=1,
+        )
+        state.save_state(current, statepath)
+
+    assert first["delivered"] == 1
+    assert first["acked"] == 0
+    assert first["deferred"] == 1
+    assert second["delivered"] == 0
+    assert second["acked"] == 1
+    assert len(telegram.sent) == 1
+    assert tendwire.acks == 2
+    assert len(
+        state.load_state(statepath)["tendwire_outbox"][
+            "delivered_identities"
+        ]
+    ) == 1
+
+
+def test_executor_read_rejects_mutator_and_with_token_stays_guarded() -> None:
+    store = _store()
+    guarded = _OfflockClient(FakeTelegram(), store, "telegram")
+
+    with pytest.raises(RuntimeError, match="not classified read-only"):
+        source_sync._OFFLOCK_EXECUTOR.read(
+            guarded,
+            "send_message",
+            "-100",
+            "unsafe",
+        )
+
+    rebound = source_sync._OFFLOCK_EXECUTOR.with_token(
+        guarded, "another-token"
+    )
+    assert isinstance(rebound, _OfflockClient)
+    with pytest.raises(RuntimeError, match="requires"):
+        rebound.send_message("-100", "still unsafe")
 
 
 def test_raising_offlock_provider_reloads_before_caller_continues(

@@ -278,6 +278,27 @@ class RebindingTendwire(FakeTendwire):
         return result
 
 
+class FillingAcceptanceLedgerTendwire(FakeTendwire):
+    def __init__(self, state_path) -> None:
+        super().__init__()
+        self.state_path = state_path
+
+    def command(self, request):
+        result = super().command(request)
+        concurrent = state.load_state(self.state_path)
+        artifacts = concurrent.setdefault("decisions", {}).setdefault(
+            "accepted_artifacts", {}
+        )
+        artifacts["concurrent-64"] = {
+            "kind": "decision_card",
+            "decision_id": "concurrent",
+            "topic_id": "99",
+            "message_id": "999",
+        }
+        state.save_state(concurrent, self.state_path)
+        return result
+
+
 def _post(store: dict, telegram: FakeTelegram, payload: dict) -> dict:
     result = decisions.sync_decisions(
         store, payload, telegram, chat_id="-100"
@@ -873,11 +894,24 @@ def test_guarded_decision_toggle_rebind_does_not_write_rebound_owner(
                 current, runtime
             ),
         )
+        reconciled = source_sync._deliver_decisions(
+            current, _pending(kind="multi"), runtime, chat_id="-100"
+        )
 
     assert result["status"] == "telegram_edit_failed"
+    assert result["changed"] is True
     assert current["panes"]["worker-entry"]["topic_id"] == "88"
-    stale = decisions.active_decision(current, "77")
-    assert stale is not None and stale["selected"] == []
+    assert reconciled["posted"] == 1
+    assert telegram.deleted == [
+        {"chat_id": "-100", "message_id": "101"}
+    ]
+    assert [row["kwargs"]["thread_id"] for row in telegram.sent] == [
+        "77",
+        "88",
+    ]
+    assert decisions.active_decision(current, "77") is None
+    live = decisions.active_decision(current, "88")
+    assert live is not None and live["message_id"] == "102"
 
 
 def test_guarded_decision_submit_rebind_tracks_acceptance_once(
@@ -915,6 +949,50 @@ def test_guarded_decision_submit_rebind_tracks_acceptance_once(
     assert current["panes"]["worker-entry"]["topic_id"] == "88"
     assert current["decisions"]["active"] == {}
     assert current["decisions"]["accepted_artifacts"] == {}
+
+
+def test_accepted_submission_can_checkpoint_after_concurrent_capacity_fill(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(_store(), state_path)
+    telegram = FakeTelegram()
+    tendwire = FillingAcceptanceLedgerTendwire(state_path)
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = _guarded_runtime(current, telegram, tendwire)
+        source_sync._deliver_decisions(
+            current, _pending(), runtime, chat_id="-100"
+        )
+        record = decisions.active_decision(current, "77")
+        assert record is not None
+        current.setdefault("decisions", {})["accepted_artifacts"] = {
+            f"existing-{index}": {
+                "kind": "decision_card",
+                "decision_id": f"old-{index}",
+                "topic_id": "99",
+                "message_id": str(1000 + index),
+            }
+            for index in range(63)
+        }
+        result = decisions.handle_callback(
+            current,
+            callback_data=_button(record, "2"),
+            topic_id="77",
+            chat_id="-100",
+            request_id=_request_id(update_id=107, message_id=9007),
+            telegram=runtime.telegram,
+            tendwire=runtime.tendwire,
+            provider_executor=source_sync._decision_provider_executor(
+                current, runtime
+            ),
+        )
+
+    assert result["status"] == "accepted"
+    assert len(tendwire.commands) == 1
+    assert len(current["decisions"]["accepted_artifacts"]) == 64
 
 
 def test_dry_run_decision_sync_has_no_telegram_or_state_writes() -> None:
