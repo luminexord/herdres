@@ -2423,8 +2423,9 @@ def _sync_sources(
             and not runtime.dry_run
             and renames_issued < create_cap
         ):
+            rename_topic_id = str(entry["topic_id"])
             renamed = runtime.telegram.rename_topic(
-                chat_id, str(entry["topic_id"]), worker_topic_renames[assignment_key]
+                chat_id, rename_topic_id, worker_topic_renames[assignment_key]
             )
             renames_issued += 1
             if renamed.get("ok"):
@@ -2436,7 +2437,7 @@ def _sync_sources(
                     store,
                     entry,
                     renamed,
-                    topic_id=str(entry.get("topic_id") or ""),
+                    topic_id=rename_topic_id,
                 )
                 entry["topic_name"] = worker_topic_renames[assignment_key]
                 entry.pop("rename_attempts", None)
@@ -6799,6 +6800,7 @@ def _drain_turn_final(
                 substate = "telegram_applied"
         else:
             assert feed_item is not None and plans
+            attempted_topic_id = ""
             try:
                 result["operations"] += 1
                 if compatible:
@@ -6812,15 +6814,16 @@ def _drain_turn_final(
                         api_token=desired_token,
                     )
                 else:
+                    attempted_topic_id = str(
+                        entry.get("topic_id") or ""
+                    )
                     applied = send_turn_delivery_part(
                         runtime.telegram,
                         chat_id,
                         feed_item,
                         plans[ordinal],
                         telegram=_telegram_state(store),
-                        thread_id=str(
-                            entry.get("topic_id") or ""
-                        ),
+                        thread_id=attempted_topic_id,
                         notify=False,
                         api_token=desired_token,
                     )
@@ -6888,15 +6891,16 @@ def _drain_turn_final(
                 if retry_as_send:
                     try:
                         result["operations"] += 1
+                        attempted_topic_id = str(
+                            entry.get("topic_id") or ""
+                        )
                         applied = send_turn_delivery_part(
                             runtime.telegram,
                             chat_id,
                             feed_item,
                             plans[ordinal],
                             telegram=_telegram_state(store),
-                            thread_id=str(
-                                entry.get("topic_id") or ""
-                            ),
+                            thread_id=attempted_topic_id,
                             notify=False,
                             api_token=desired_token,
                         )
@@ -6926,7 +6930,7 @@ def _drain_turn_final(
                         store,
                         entry,
                         applied,
-                        topic_id=str(entry.get("topic_id") or ""),
+                        topic_id=attempted_topic_id,
                     ):
                         _defer_turn_final(
                             runtime,

@@ -1554,6 +1554,156 @@ def test_not_found_edit_uses_drain_floor_to_retry_as_send_in_same_pass(monkeypat
     assert resumed["tendwire_turn_final"]["acked"] == 0
 
 
+def test_turn_final_resend_tombstones_requested_topic_after_concurrent_rebind(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0"
+    )
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0"
+    )
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(state_path)
+    )
+    requested_topic_id = "15007"
+    rebound_topic_id = "16000"
+    tendwire = TurnFinalTendwire(
+        _turn_row(
+            "turn-concurrent-topic-rebind",
+            "twrev1.before_rebind",
+            "before rebind",
+        )
+    )
+    store = _store()
+    state.save_state(store, state_path)
+
+    class ConcurrentRebindFinalTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.fail_revision = False
+            self.edit_attempts = 0
+            self.resend_topic_ids = []
+
+        def edit_message(self, chat_id, message_id, html):
+            if self.fail_revision:
+                self.edit_attempts += 1
+                return {
+                    "ok": False,
+                    "kind": "topic_not_found",
+                    "topic_missing": True,
+                    "error": (
+                        "Bad Request: message thread not found"
+                    ),
+                }
+            return super().edit_message(
+                chat_id, message_id, html
+            )
+
+        def send_message(self, chat_id, html, **kwargs):
+            thread_id = str(kwargs.get("thread_id") or "")
+            if (
+                self.fail_revision
+                and thread_id == requested_topic_id
+            ):
+                self.resend_topic_ids.append(thread_id)
+                concurrent = state.load_state(state_path)
+                _entry_key, rebound = (
+                    state.find_worker_entry_by_stable_key(
+                        concurrent, _stable_key("worker-1")
+                    )
+                )
+                assert rebound is not None
+                rebound["topic_id"] = rebound_topic_id
+                concurrent["spaces"][
+                    "space:concurrent-final-alias"
+                ] = {
+                    "source": "tendwire",
+                    "entry_type": "space",
+                    "tendwire_space_id": (
+                        "concurrent-final-alias"
+                    ),
+                    "topic_id": requested_topic_id,
+                    "topic_name": "Concurrent final alias",
+                }
+                state.save_state(concurrent, state_path)
+                return {
+                    "ok": False,
+                    "kind": "topic_not_found",
+                    "topic_missing": True,
+                    "error": (
+                        "Bad Request: message thread not found"
+                    ),
+                }
+            return super().send_message(
+                chat_id, html, **kwargs
+            )
+
+    telegram = ConcurrentRebindFinalTelegram()
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        first = sync_once(
+            current, _runtime(tendwire, telegram, max_sends=2)
+        )
+
+    assert first["tendwire_turn_final"]["acked"] == 1
+    _first_key, first_entry = state.find_worker_entry_by_stable_key(
+        current, _stable_key("worker-1")
+    )
+    assert first_entry is not None
+    first_entry["topic_id"] = requested_topic_id
+    for binding in state.message_bindings(current).values():
+        if (
+            isinstance(binding, dict)
+            and binding.get("turn_id")
+            == "turn-concurrent-topic-rebind"
+        ):
+            binding["topic_id"] = requested_topic_id
+            binding.pop("routing_quarantined", None)
+    ack_count = len(tendwire.ack_calls)
+    tendwire.row = _turn_row(
+        "turn-concurrent-topic-rebind",
+        "twrev1.after_rebind",
+        "after rebind",
+    )
+    telegram.fail_revision = True
+    state.save_state(current, state_path)
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        failed = sync_once(
+            current, _runtime(tendwire, telegram, max_sends=2)
+        )
+
+    _entry_key, rebound = state.find_worker_entry_by_stable_key(
+        current, _stable_key("worker-1")
+    )
+    old_topic_refs = [
+        candidate
+        for candidate in state.source_entries(current).values()
+        if str(candidate.get("topic_id") or "")
+        == requested_topic_id
+    ]
+    assert telegram.edit_attempts == 1
+    assert telegram.resend_topic_ids == [requested_topic_id]
+    assert failed["tendwire_turn_final"]["deferred"] == 1
+    assert failed["tendwire_turn_final"]["acked"] == 0
+    assert len(tendwire.ack_calls) == ack_count
+    assert rebound is not None
+    assert rebound["topic_id"] == rebound_topic_id
+    assert state.topic_id_is_tombstoned(
+        current, requested_topic_id
+    )
+    assert not state.topic_id_is_tombstoned(
+        current, rebound_topic_id
+    )
+    assert old_topic_refs == []
+
+
 class RateLimitedOnceTelegram(DeletingTelegram):
     def __init__(self):
         super().__init__()

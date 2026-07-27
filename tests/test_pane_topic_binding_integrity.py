@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import inspect
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from herdres_connector import state
+from herdres_connector import source_sync, state
 from herdres_connector.source_sync import SyncRuntime, sync_once
 
 from test_source_only import FakeTelegram, FakeTendwire, _store
@@ -253,6 +254,19 @@ def _current_topic_refs(store: dict, topic_id: str) -> list[dict]:
     ]
 
 
+def test_provider_gone_repair_requires_explicit_keyword_topic_id():
+    parameter = inspect.signature(
+        source_sync._repair_provider_gone_topic
+    ).parameters["topic_id"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+    with pytest.raises(TypeError):
+        source_sync._repair_provider_gone_topic(
+            {}, None, {"kind": "topic_not_found"}
+        )
+
+
 def test_deleted_live_topic_is_reminted_and_next_final_delivered_once():
     store = _store()
     _key, entry = _entry(
@@ -378,6 +392,88 @@ def test_missing_live_rename_tombstones_aliases_before_second_pass():
         for worker in state.source_worker_entries(store).values()
     )
     assert telegram.topics == ["discovery-calls", "alias-label"]
+
+
+def test_live_rename_tombstones_requested_topic_after_concurrent_rebind(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(state_path)
+    )
+    requested_topic_id = "15007"
+    rebound_topic_id = "16000"
+    store = _store()
+    _key, entry = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-live",
+        topic_id=requested_topic_id,
+    )
+    entry["topic_name"] = "old-label"
+    state.save_state(store, state_path)
+
+    class ConcurrentRebindRenameTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.requested_topic_ids = []
+
+        def rename_topic(self, chat_id, thread_id, name):
+            self.requested_topic_ids.append(str(thread_id))
+            concurrent = state.load_state(state_path)
+            _entry_key, rebound = (
+                state.find_worker_entry_by_stable_key(
+                    concurrent, STABLE_KEY
+                )
+            )
+            assert rebound is not None
+            rebound["topic_id"] = rebound_topic_id
+            concurrent["spaces"]["space:concurrent-old-alias"] = {
+                "source": "tendwire",
+                "entry_type": "space",
+                "tendwire_space_id": "concurrent-old-alias",
+                "topic_id": requested_topic_id,
+                "topic_name": "Concurrent old alias",
+            }
+            state.save_state(concurrent, state_path)
+            return {
+                "ok": False,
+                "kind": "topic_not_found",
+                "error": "Bad Request: message thread not found",
+            }
+
+    telegram = ConcurrentRebindRenameTelegram()
+    runtime = SyncRuntime(
+        FakeTendwire(
+            workers=[_worker()],
+            turns={"turns": []},
+            spaces=[],
+        ),
+        telegram,
+        with_outbox=False,
+    )
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        sync_once(current, runtime)
+
+    _entry_key, rebound = state.find_worker_entry_by_stable_key(
+        current, STABLE_KEY
+    )
+    assert telegram.requested_topic_ids == [requested_topic_id]
+    assert rebound is not None
+    assert rebound["topic_id"] == rebound_topic_id
+    assert state.topic_id_is_tombstoned(
+        current, requested_topic_id
+    )
+    assert not state.topic_id_is_tombstoned(
+        current, rebound_topic_id
+    )
+    assert _current_topic_refs(current, requested_topic_id) == []
+    assert _current_topic_refs(current, rebound_topic_id) == [
+        rebound
+    ]
+    assert telegram.topics == []
 
 
 def test_missing_topic_icon_tombstones_aliases_and_remints_once(
