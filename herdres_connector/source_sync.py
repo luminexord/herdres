@@ -119,8 +119,13 @@ _OFFLOCK_ABANDON = "abandon"
 # narrower _execute_exact_provider_operation escape hatch.
 _MUTATING_PROVIDER_METHODS = frozenset(
     {
+        "call",
         "close_topic",
         "close_topic_for_cleanup",
+        "command",
+        "command_json",
+        "connector_ack",
+        "connector_fail",
         "connector_prepare_begin",
         "connector_prepare_commit",
         "connector_prepare_part",
@@ -141,8 +146,100 @@ _MUTATING_PROVIDER_METHODS = frozenset(
         "send_photo",
         "send_voice",
         "turn_final_ack",
+        "turn_final_defer",
+        "turn_final_fail",
     }
 )
+
+
+@dataclass(frozen=True)
+class _ProviderMutation:
+    """One declared provider capability; it never exposes the raw provider."""
+
+    capability: str
+    reason: str
+    args: tuple[Any, ...] = ()
+    kwargs: tuple[tuple[str, Any], ...] = ()
+    api_token: str = ""
+
+
+_DIRECT_PROVIDER_CAPABILITIES = {
+    f"telegram.{name}": name
+    for name in {
+        "answer_callback_query",
+        "close_topic",
+        "close_topic_for_cleanup",
+        "create_topic",
+        "delete_message",
+        "delete_topic",
+        "delete_topic_for_cleanup",
+        "edit_message",
+        "edit_message_reply_markup",
+        "edit_topic_icon",
+        "pin_message",
+        "rename_topic",
+        "reopen_topic",
+        "reopen_topic_for_cleanup",
+        "send_message",
+        "send_photo",
+        "send_voice",
+    }
+} | {
+    f"tendwire.{name}": name
+    for name in {
+        "call",
+        "command",
+        "command_json",
+        "connector_ack",
+        "connector_fail",
+        "connector_prepare_begin",
+        "connector_prepare_commit",
+        "connector_prepare_part",
+        "connector_prepare_recover",
+        "turn_final_ack",
+        "turn_final_defer",
+        "turn_final_fail",
+    }
+}
+
+_ADAPTER_PROVIDER_CAPABILITIES = frozenset(
+    {
+        "telegram.delete_turn_delivery_message",
+        "telegram.edit_feed_item",
+        "telegram.edit_turn_delivery_part",
+        "telegram.send_feed_item",
+        "telegram.send_turn_delivery_part",
+        "telegram.send_voice_batch",
+    }
+)
+
+
+def _provider_mutation(
+    capability: str,
+    *,
+    reason: str,
+    args: tuple[Any, ...] = (),
+    kwargs: Mapping[str, Any] | None = None,
+    api_token: str = "",
+) -> _ProviderMutation:
+    capability = str(capability).strip()
+    reason = str(reason).strip()
+    if (
+        capability not in _DIRECT_PROVIDER_CAPABILITIES
+        and capability not in _ADAPTER_PROVIDER_CAPABILITIES
+    ):
+        raise ValueError(f"unknown provider mutation capability: {capability!r}")
+    if not reason or capability not in reason:
+        raise ValueError(
+            "provider mutation reason must name its declared capability"
+        )
+    return _ProviderMutation(
+        capability=capability,
+        reason=reason,
+        args=tuple(args),
+        kwargs=tuple((str(key), value) for key, value in (kwargs or {}).items()),
+        api_token=str(api_token or ""),
+    )
 
 
 def _entry_owner_generation(entry: Mapping[str, Any]) -> tuple[str, ...]:
@@ -471,47 +568,180 @@ def _operation_from_provenance(
     )
 
 
+def _invoke_provider_mutation(
+    provider: Any, mutation: _ProviderMutation
+) -> Any:
+    """Internal dispatcher: the only code that receives a raw provider."""
+
+    if mutation.api_token:
+        provider = provider.with_token(mutation.api_token)
+    args = mutation.args
+    kwargs = dict(mutation.kwargs)
+    method_name = _DIRECT_PROVIDER_CAPABILITIES.get(mutation.capability)
+    if method_name is not None:
+        method = getattr(provider, method_name, None)
+        if method is None and method_name.endswith("_for_cleanup"):
+            method = getattr(provider, method_name.removesuffix("_for_cleanup"))
+        return method(*args, **kwargs)
+    if mutation.capability == "telegram.edit_feed_item":
+        return edit_feed_item(provider, *args, **kwargs)
+    if mutation.capability == "telegram.send_feed_item":
+        return send_feed_item(provider, *args, **kwargs)
+    if mutation.capability == "telegram.edit_turn_delivery_part":
+        return edit_turn_delivery_part(provider, *args, **kwargs)
+    if mutation.capability == "telegram.send_turn_delivery_part":
+        return send_turn_delivery_part(provider, *args, **kwargs)
+    if mutation.capability == "telegram.delete_turn_delivery_message":
+        return delete_turn_delivery_message(provider, *args, **kwargs)
+    if mutation.capability == "telegram.send_voice_batch":
+        (
+            chunks,
+            turn_id,
+            chat_id,
+            thread_id,
+            reply_to,
+        ) = args
+        ids: list[str] = []
+        for index, chunk in enumerate(chunks):
+            try:
+                dest = (
+                    speech.outbound_speech_dir(prune=(index == 0))
+                    / (
+                        "reply-"
+                        + short_hash(
+                            {"t": turn_id, "i": index, "h": chunk}, 16
+                        )
+                        + ".ogg"
+                    )
+                )
+                if not speech.speech_request(
+                    "tts", {"text": chunk, "dest": str(dest)}
+                ).get("ok"):
+                    continue
+                sent = provider.send_voice(
+                    chat_id,
+                    dest,
+                    thread_id=thread_id,
+                    reply_to_message_id=(
+                        reply_to if index == 0 else None
+                    ),
+                    notify=False,
+                )
+                if sent.get("ok") and sent.get("message_id"):
+                    ids.append(str(sent.get("message_id")))
+            except Exception as exc:
+                print(
+                    f"herdres speak-reply chunk failed: {exc}",
+                    file=sys.stderr,
+                )
+        return ids
+    raise AssertionError(
+        f"unhandled provider mutation capability: {mutation.capability}"
+    )
+
+
+def _offlock_client_internals(
+    client: "_OfflockClient",
+) -> tuple[Any, dict[str, Any], str]:
+    """Executor-only access to the guarded provider and reloadable store."""
+
+    return (
+        object.__getattribute__(client, "_OfflockClient__provider"),
+        object.__getattribute__(client, "_OfflockClient__store"),
+        object.__getattribute__(
+            client, "_OfflockClient__provider_kind"
+        ),
+    )
+
+
+def _invoke_offlock(
+    client: "_OfflockClient", call: Callable[[Any], Any]
+) -> Any:
+    provider, store, _kind = _offlock_client_internals(client)
+    if not state.lock_actually_held():
+        # An outer phase may already have released the flock. In that case a
+        # nested save/reload could roll back a lane child commit.
+        return call(provider)
+    state.save_state(store)
+    try:
+        with state.released_lock():
+            return call(provider)
+    finally:
+        state.reload_state_in_place(store)
+
+
 class _OfflockClient:
     """Release the state flock around one provider call and reload afterwards."""
 
-    def __init__(self, client: Any, store: dict[str, Any]) -> None:
-        self._client = client
-        self._store = store
+    __slots__ = ("__provider", "__provider_kind", "__store")
 
-    def _invoke(self, call: Callable[[Any], Any]) -> Any:
-        if not state.lock_actually_held():
-            # An outer phase may already have released the flock.  In that
-            # case a nested save/reload would write the whole stale store
-            # without exclusion and could roll back a lane child commit.
-            return call(self._client)
-        state.save_state(self._store)
-        try:
-            with state.released_lock():
-                return call(self._client)
-        finally:
-            state.reload_state_in_place(self._store)
+    def __init__(
+        self,
+        client: Any,
+        store: dict[str, Any],
+        provider_kind: str = "telegram",
+    ) -> None:
+        object.__setattr__(self, "_OfflockClient__provider", client)
+        object.__setattr__(self, "_OfflockClient__store", store)
+        object.__setattr__(
+            self, "_OfflockClient__provider_kind", str(provider_kind)
+        )
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in {
+            "_client",
+            "_store",
+            "_provider",
+            "_raw",
+            "_invoke",
+            "_invoke_read",
+            "_OfflockClient__provider",
+            "_OfflockClient__store",
+        }:
+            raise AttributeError(
+                "raw provider state is private to the capability executor"
+            )
+        return object.__getattribute__(self, name)
 
     def _execute_entry(
         self,
         operation: _OfflockEntryOperation,
-        call: Callable[[Any], Any],
+        mutation: _ProviderMutation,
     ) -> Any:
         if not isinstance(operation, _OfflockEntryOperation):
             raise TypeError("entry mutation requires _OfflockEntryOperation")
-        return self._invoke(call)
+        return _invoke_offlock(
+            self,
+            lambda provider: _invoke_provider_mutation(provider, mutation)
+        )
 
-    def _execute_exact(self, reason: str, call: Callable[[Any], Any]) -> Any:
-        if not str(reason).strip():
-            raise ValueError("exact provider mutation requires a reason")
-        return self._invoke(call)
+    def _execute_exact(self, mutation: _ProviderMutation) -> Any:
+        return _invoke_offlock(
+            self,
+            lambda provider: _invoke_provider_mutation(provider, mutation)
+        )
 
     def __getattr__(self, name: str) -> Any:
-        attribute = getattr(self._client, name)
+        if name in {
+            "_client",
+            "_store",
+            "_provider",
+            "_raw",
+            "_invoke",
+            "_invoke_read",
+            "_OfflockClient__provider",
+            "_OfflockClient__store",
+        }:
+            raise AttributeError(
+                "raw provider state is private to the capability executor"
+            )
+        provider, store, provider_kind = _offlock_client_internals(self)
+        attribute = getattr(provider, name)
         if not callable(attribute):
             return attribute
         if name == "with_token":
             return lambda *args, **kwargs: _OfflockClient(
-                attribute(*args, **kwargs), self._store
+                attribute(*args, **kwargs), store, provider_kind
             )
         if name == "api":
             def checked_api(method: str, *args: Any, **kwargs: Any) -> Any:
@@ -521,7 +751,8 @@ class _OfflockClient:
                         "_execute_entry_operation or "
                         "_execute_exact_provider_operation"
                     )
-                return self._invoke(
+                return _invoke_offlock(
+                    self,
                     lambda _client: attribute(method, *args, **kwargs)
                 )
 
@@ -537,34 +768,52 @@ class _OfflockClient:
             return rejected
 
         def call(*args: Any, **kwargs: Any) -> Any:
-            return self._invoke(lambda _client: attribute(*args, **kwargs))
+            return _invoke_offlock(
+                self,
+                lambda _client: attribute(*args, **kwargs)
+            )
 
         return call
 
 
 class _ExactOfflockClient:
-    """Reason-scoped client for non-entry exact-id/lease workflows."""
+    """Reason-scoped capability proxy for exact-id/lease workflows."""
 
     def __init__(self, client: _OfflockClient, reason: str) -> None:
         if not str(reason).strip():
             raise ValueError("exact off-lock client requires a written reason")
-        self._client = client
-        self._reason = reason
+        object.__setattr__(self, "_ExactOfflockClient__guarded", client)
+        object.__setattr__(self, "_ExactOfflockClient__reason", reason)
 
     def __getattr__(self, name: str) -> Any:
-        attribute = getattr(self._client._client, name)
-        if not callable(attribute):
-            return attribute
+        guarded = object.__getattribute__(
+            self, "_ExactOfflockClient__guarded"
+        )
+        reason = object.__getattribute__(
+            self, "_ExactOfflockClient__reason"
+        )
+        if name in {"_client", "_provider", "_store"}:
+            raise AttributeError(
+                "raw provider state is private to the capability executor"
+            )
         if name == "with_token":
             return lambda *args, **kwargs: _ExactOfflockClient(
-                _OfflockClient(
-                    attribute(*args, **kwargs), self._client._store
-                ),
-                self._reason,
+                guarded.with_token(*args, **kwargs),
+                reason,
             )
-        return lambda *args, **kwargs: self._client._execute_exact(
-            self._reason,
-            lambda _provider: attribute(*args, **kwargs),
+        if name not in _MUTATING_PROVIDER_METHODS:
+            return getattr(guarded, name)
+        _provider, _store, provider_kind = _offlock_client_internals(
+            guarded
+        )
+        capability = f"{provider_kind}.{name}"
+        return lambda *args, **kwargs: guarded._execute_exact(
+            _provider_mutation(
+                capability,
+                reason=f"{capability}: {reason}",
+                args=args,
+                kwargs=kwargs,
+            )
         )
 
 
@@ -582,7 +831,7 @@ def _execute_entry_operation(
     store: dict[str, Any],
     client: Any,
     operation: _OfflockEntryOperation,
-    call: Callable[[Any], Any],
+    mutation: _ProviderMutation,
 ) -> _OfflockEntryExecution:
     """Execute an entry mutation and resolve its immutable request owner.
 
@@ -593,19 +842,21 @@ def _execute_entry_operation(
 
     if not isinstance(operation, _OfflockEntryOperation):
         raise TypeError("entry mutation requires _OfflockEntryOperation")
+    if not isinstance(mutation, _ProviderMutation):
+        raise TypeError("entry mutation requires one provider capability")
     if isinstance(client, _OfflockClient):
-        result = client._execute_entry(operation, call)
+        result = client._execute_entry(operation, mutation)
     elif state.lock_actually_held():
         state.save_state(store)
         try:
             with state.released_lock():
-                result = call(client)
+                result = _invoke_provider_mutation(client, mutation)
         finally:
             fresh = state.load_state()
             store.clear()
             store.update(fresh)
     else:
-        result = call(client)
+        result = _invoke_provider_mutation(client, mutation)
     return _OfflockEntryExecution(
         result=result,
         resolution=_compare_and_apply_entry_operation(store, operation),
@@ -615,26 +866,25 @@ def _execute_entry_operation(
 def _execute_exact_provider_operation(
     client: Any,
     *,
-    reason: str,
-    call: Callable[[Any], Any],
+    mutation: _ProviderMutation,
     store: dict[str, Any] | None = None,
 ) -> Any:
     """Execute an exact-provider-id mutation independent of pane ownership."""
 
-    if not str(reason).strip():
-        raise ValueError("exact provider mutation requires a written reason")
+    if not isinstance(mutation, _ProviderMutation):
+        raise TypeError("exact mutation requires one provider capability")
     if isinstance(client, _OfflockClient):
-        return client._execute_exact(reason, call)
+        return client._execute_exact(mutation)
     if store is not None and state.lock_actually_held():
         state.save_state(store)
         try:
             with state.released_lock():
-                return call(client)
+                return _invoke_provider_mutation(client, mutation)
         finally:
             fresh = state.load_state()
             store.clear()
             store.update(fresh)
-    return call(client)
+    return _invoke_provider_mutation(client, mutation)
 
 
 def _offlock_runtime(
@@ -645,8 +895,8 @@ def _offlock_runtime(
     if not state.lock_held() or runtime.dry_run:
         return runtime
     return SyncRuntime(
-        _OfflockClient(runtime.tendwire, store),
-        _OfflockClient(runtime.telegram, store),
+        _OfflockClient(runtime.tendwire, store, "tendwire"),
+        _OfflockClient(runtime.telegram, store, "telegram"),
         dry_run=runtime.dry_run,
         with_outbox=runtime.with_outbox,
         max_sends=runtime.max_sends,
@@ -2108,13 +2358,13 @@ def _promote_working_to_final(
         store,
         runtime.telegram,
         operation,
-        lambda provider: edit_feed_item(
-            provider,
-            chat_id,
-            stream_message_id,
-            feed_item,
-            telegram=telegram,
-            api_token=api_token,
+        _provider_mutation(
+            "telegram.edit_feed_item",
+            reason=(
+                "telegram.edit_feed_item: promote working card to final"
+            ),
+            args=(chat_id, stream_message_id, feed_item),
+            kwargs={"telegram": telegram, "api_token": api_token},
         ),
     )
     sent, resolution = execution.result, execution.resolution
@@ -2172,13 +2422,13 @@ def _replace_changed_final(
         store,
         runtime.telegram,
         operation,
-        lambda provider: edit_feed_item(
-            provider,
-            chat_id,
-            message_ids[0],
-            feed_item,
-            telegram=telegram,
-            api_token=api_token,
+        _provider_mutation(
+            "telegram.edit_feed_item",
+            reason=(
+                "telegram.edit_feed_item: replace changed final card"
+            ),
+            args=(chat_id, message_ids[0], feed_item),
+            kwargs={"telegram": telegram, "api_token": api_token},
         ),
     )
     sent, resolution = execution.result, execution.resolution
@@ -2278,13 +2528,13 @@ def _fold_superseded_final(
             store,
             runtime.telegram,
             operation,
-            lambda provider: edit_feed_item(
-                provider,
-                chat_id,
-                message_id,
-                folded_item,
-                telegram=telegram,
-                api_token=api_token,
+            _provider_mutation(
+                "telegram.edit_feed_item",
+                reason=(
+                    "telegram.edit_feed_item: fold superseded final card"
+                ),
+                args=(chat_id, message_id, folded_item),
+                kwargs={"telegram": telegram, "api_token": api_token},
             ),
         )
     except Exception as exc:  # a rate-limit/transport blip must not abort the sync pass
@@ -2364,10 +2614,11 @@ def _ensure_topic(
         store,
         runtime.telegram,
         operation,
-        lambda provider: provider.create_topic(
-            chat_id,
-            topic_name,
-            icon_color=topic_color_for_name(topic_name),
+        _provider_mutation(
+            "telegram.create_topic",
+            reason="telegram.create_topic: mint missing pane topic",
+            args=(chat_id, topic_name),
+            kwargs={"icon_color": topic_color_for_name(topic_name)},
         ),
     )
     created, resolution = execution.result, execution.resolution
@@ -2457,8 +2708,10 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
         store,
         runtime.telegram,
         operation,
-        lambda provider: provider.edit_topic_icon(
-            chat_id, thread_id, emoji_id
+        _provider_mutation(
+            "telegram.edit_topic_icon",
+            reason="telegram.edit_topic_icon: update pane status icon",
+            args=(chat_id, thread_id, emoji_id),
         ),
     )
     result, resolution = execution.result, execution.resolution
@@ -2629,8 +2882,10 @@ def _sync_topic_pinned(
             store,
             runtime.telegram,
             edit_operation,
-            lambda provider: provider.edit_message(
-                chat_id, message_id, html
+            _provider_mutation(
+                "telegram.edit_message",
+                reason="telegram.edit_message: refresh per-topic pin",
+                args=(chat_id, message_id, html),
             ),
         )
         sent, edit_resolution = execution.result, execution.resolution
@@ -2656,11 +2911,11 @@ def _sync_topic_pinned(
             store,
             runtime.telegram,
             send_operation,
-            lambda provider: provider.send_message(
-                chat_id,
-                html,
-                thread_id=thread_id,
-                notify=False,
+            _provider_mutation(
+                "telegram.send_message",
+                reason="telegram.send_message: create per-topic pin",
+                args=(chat_id, html),
+                kwargs={"thread_id": thread_id, "notify": False},
             ),
         )
         sent, send_resolution = execution.result, execution.resolution
@@ -2698,7 +2953,11 @@ def _sync_topic_pinned(
         store,
         runtime.telegram,
         pin_operation,
-        lambda provider: provider.pin_message(chat_id, message_id),
+        _provider_mutation(
+            "telegram.pin_message",
+            reason="telegram.pin_message: pin per-topic status card",
+            args=(chat_id, message_id),
+        ),
     )
     pin_result, pin_resolution = execution.result, execution.resolution
     if pin_resolution.disposition != _OFFLOCK_APPLY:
@@ -2923,13 +3182,18 @@ def _sync_retired_worker_topics(
                 store,
                 runtime.telegram,
                 notice_operation,
-                lambda provider: provider.send_message(
-                    chat_id,
-                    "This duplicate pane topic was retired after its stable pane "
-                    f"identity was consolidated into the original topic{target}. "
-                    "Please continue there.",
-                    thread_id=topic_id,
-                    notify=False,
+                _provider_mutation(
+                    "telegram.send_message",
+                    reason=(
+                        "telegram.send_message: post retired-pane notice"
+                    ),
+                    args=(
+                        chat_id,
+                        "This duplicate pane topic was retired after its stable pane "
+                        f"identity was consolidated into the original topic{target}. "
+                        "Please continue there.",
+                    ),
+                    kwargs={"thread_id": topic_id, "notify": False},
                 ),
             )
             sent, notice_resolution = execution.result, execution.resolution
@@ -2982,8 +3246,12 @@ def _sync_retired_worker_topics(
                 store,
                 runtime.telegram,
                 rename_operation,
-                lambda provider: provider.rename_topic(
-                    chat_id, topic_id, retired_topic_name
+                _provider_mutation(
+                    "telegram.rename_topic",
+                    reason=(
+                        "telegram.rename_topic: label retired pane archive"
+                    ),
+                    args=(chat_id, topic_id, retired_topic_name),
                 ),
             )
             renamed, rename_resolution = execution.result, execution.resolution
@@ -3168,8 +3436,16 @@ def _sync_sources(
                 store,
                 runtime.telegram,
                 rename_operation,
-                lambda provider: provider.rename_topic(
-                    chat_id, rename_topic_id, requested_topic_name
+                _provider_mutation(
+                    "telegram.rename_topic",
+                    reason=(
+                        "telegram.rename_topic: apply live pane label"
+                    ),
+                    args=(
+                        chat_id,
+                        rename_topic_id,
+                        requested_topic_name,
+                    ),
                 ),
             )
             renames_issued += 1
@@ -3338,12 +3614,12 @@ def _cleanup_orphaned_created_topics(
             deleted = _execute_exact_provider_operation(
                 runtime.telegram,
                 store=store,
-                reason=(
-                    "accepted create lost its owner; delete the exact returned "
-                    "provider topic id"
-                ),
-                call=lambda provider, topic_id=topic_id: provider.delete_topic(
-                    chat_id, topic_id
+                mutation=_provider_mutation(
+                    "telegram.delete_topic",
+                    reason=(
+                        "telegram.delete_topic: retire orphaned accepted create"
+                    ),
+                    args=(chat_id, topic_id),
                 ),
             )
         except RateLimited:
@@ -3456,7 +3732,13 @@ def _cleanup_topics(
                 store,
                 runtime.telegram,
                 delete_operation,
-                lambda provider: provider.delete_topic(chat_id, topic_id),
+                _provider_mutation(
+                    "telegram.delete_topic",
+                    reason=(
+                        "telegram.delete_topic: reap absent closed worker"
+                    ),
+                    args=(chat_id, topic_id),
+                ),
             )
             deleted, delete_resolution = execution.result, execution.resolution
             if not deleted.get("ok") and not _topic_missing(deleted.get("error")):
@@ -3531,7 +3813,11 @@ def _cleanup_topics(
             store,
             runtime.telegram,
             delete_operation,
-            lambda provider: provider.delete_topic(chat_id, topic_id),
+            _provider_mutation(
+                "telegram.delete_topic",
+                reason="telegram.delete_topic: delete stale worker topic",
+                args=(chat_id, topic_id),
+            ),
         )
         deleted, delete_resolution = execution.result, execution.resolution
         if not deleted.get("ok"):
@@ -3602,7 +3888,13 @@ def _cleanup_topics(
                 store,
                 runtime.telegram,
                 delete_operation,
-                lambda provider: provider.delete_topic(chat_id, topic_id),
+                _provider_mutation(
+                    "telegram.delete_topic",
+                    reason=(
+                        "telegram.delete_topic: delete done council space"
+                    ),
+                    args=(chat_id, topic_id),
+                ),
             )
             deleted, delete_resolution = execution.result, execution.resolution
             if not deleted.get("ok"):
@@ -4033,16 +4325,19 @@ def _execute_topic_cleanup_targets(
             if not isinstance(operation, _OfflockEntryOperation):
                 raise TypeError("cleanup target lacks off-lock operation")
 
-            def invoke(provider: Any) -> dict[str, Any]:
-                method = getattr(
-                    provider, f"{action}_topic_for_cleanup", None
-                )
-                if method is None:
-                    method = getattr(provider, f"{action}_topic")
-                return method(chat_id, str(target["topic_id"]))
-
+            capability = f"telegram.{action}_topic_for_cleanup"
             execution = _execute_entry_operation(
-                store, runtime.telegram, operation, invoke
+                store,
+                runtime.telegram,
+                operation,
+                _provider_mutation(
+                    capability,
+                    reason=(
+                        f"{capability}: lifecycle cleanup "
+                        f"{target['topic_id']}"
+                    ),
+                    args=(chat_id, str(target["topic_id"])),
+                ),
             )
             response = execution.result
         except RateLimited as exc:
@@ -4503,14 +4798,15 @@ def _deliver_working(
             store,
             runtime.telegram,
             operation,
-            lambda provider: edit_feed_item(
-                provider,
-                chat_id,
-                operation.message_id,
-                feed_item,
-                telegram=telegram,
-                live=True,
-                api_token=api_token,
+            _provider_mutation(
+                "telegram.edit_feed_item",
+                reason="telegram.edit_feed_item: update working card",
+                args=(chat_id, operation.message_id, feed_item),
+                kwargs={
+                    "telegram": telegram,
+                    "live": True,
+                    "api_token": api_token,
+                },
             ),
         )
     else:
@@ -4518,15 +4814,17 @@ def _deliver_working(
             store,
             runtime.telegram,
             operation,
-            lambda provider: send_feed_item(
-                provider,
-                chat_id,
-                feed_item,
-                telegram=telegram,
-                thread_id=thread_id,
-                notify=False,
-                live=True,
-                api_token=api_token,
+            _provider_mutation(
+                "telegram.send_feed_item",
+                reason="telegram.send_feed_item: create working card",
+                args=(chat_id, feed_item),
+                kwargs={
+                    "telegram": telegram,
+                    "thread_id": thread_id,
+                    "notify": False,
+                    "live": True,
+                    "api_token": api_token,
+                },
             ),
         )
     sent, resolution = execution.result, execution.resolution
@@ -4555,15 +4853,19 @@ def _deliver_working(
             store,
             runtime.telegram,
             operation,
-            lambda provider: send_feed_item(
-                provider,
-                chat_id,
-                feed_item,
-                telegram=telegram,
-                thread_id=thread_id,
-                notify=False,
-                live=True,
-                api_token=api_token,
+            _provider_mutation(
+                "telegram.send_feed_item",
+                reason=(
+                    "telegram.send_feed_item: replace missing working card"
+                ),
+                args=(chat_id, feed_item),
+                kwargs={
+                    "telegram": telegram,
+                    "thread_id": thread_id,
+                    "notify": False,
+                    "live": True,
+                    "api_token": api_token,
+                },
             ),
         )
         sent, resolution = execution.result, execution.resolution
@@ -4955,7 +5257,6 @@ def _speak_reply(
     if not chunks:
         return entry
     api_token, _bot_kind = _delivery_bot(store, entry)
-    client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
     operation = _capture_entry_operation(
         store,
         entry,
@@ -4963,30 +5264,22 @@ def _speak_reply(
         message_id=str(reply_to or ""),
     )
 
-    def _synth_and_send(provider: Any) -> list[str]:
-        # Runs OFF the lock: synth to OGG + upload. Touches no `store` state (so a competitor holding
-        # the lock meanwhile can't be clobbered); the returned ids are recorded after we re-acquire.
-        ids: list[str] = []
-        for i, chunk in enumerate(chunks):
-            try:
-                dest = speech.outbound_speech_dir(prune=(i == 0)) / f"reply-{short_hash({'t': _turn_id(item), 'i': i, 'h': chunk}, 16)}.ogg"
-                if not speech.speech_request("tts", {"text": chunk, "dest": str(dest)}).get("ok"):
-                    continue
-                sent = provider.send_voice(
-                    chat_id, dest, thread_id=thread_id,
-                    reply_to_message_id=(reply_to if i == 0 else None), notify=False,
-                )
-                if sent.get("ok") and sent.get("message_id"):
-                    ids.append(str(sent.get("message_id")))
-            except Exception as exc:  # one chunk failing must not abort the rest or the text turn
-                print(f"herdres speak-reply chunk failed: {exc}", file=sys.stderr)
-        return ids
-
     execution = _execute_entry_operation(
         store,
-        client,
+        runtime.telegram,
         operation,
-        _synth_and_send,
+        _provider_mutation(
+            "telegram.send_voice_batch",
+            reason="telegram.send_voice_batch: synthesize pane voice reply",
+            args=(
+                tuple(chunks),
+                _turn_id(item),
+                chat_id,
+                thread_id,
+                reply_to,
+            ),
+            api_token=api_token,
+        ),
     )
     voice_ids = execution.result
     resolution = execution.resolution
@@ -5038,7 +5331,7 @@ def _stage_final_plan(
     if not revision:
         return False, 0
 
-    def _prepare_begin(provider: Any, part_count: int) -> dict[str, Any]:
+    def _prepare_begin_kwargs(part_count: int) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "turn_id": _turn_id(item),
             "content_revision": revision,
@@ -5047,13 +5340,13 @@ def _stage_final_plan(
         }
         if source_ref is not None:
             kwargs["source_ref"] = source_ref
-        return provider.connector_prepare_begin(**kwargs)
+        return kwargs
 
-    def _prepare_commit(provider: Any, plan_token: str) -> dict[str, Any]:
+    def _prepare_commit_kwargs(plan_token: str) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"plan_token": plan_token}
         if source_ref is not None:
             kwargs["source_ref"] = source_ref
-        return provider.connector_prepare_commit(**kwargs)
+        return kwargs
 
     if (
         source_ref is None
@@ -5087,7 +5380,13 @@ def _stage_final_plan(
             store,
             runtime.tendwire,
             operation,
-            lambda provider: _prepare_begin(provider, pending_count),
+            _provider_mutation(
+                "tendwire.connector_prepare_begin",
+                reason=(
+                    "tendwire.connector_prepare_begin: reconcile pending plan"
+                ),
+                kwargs=_prepare_begin_kwargs(pending_count),
+            ),
         )
         observed, resolution = execution.result, execution.resolution
         if resolution.disposition != _OFFLOCK_APPLY:
@@ -5114,7 +5413,13 @@ def _stage_final_plan(
                 store,
                 runtime.tendwire,
                 operation,
-                lambda provider: _prepare_commit(provider, pending_token),
+                _provider_mutation(
+                    "tendwire.connector_prepare_commit",
+                    reason=(
+                        "tendwire.connector_prepare_commit: hand off pending plan"
+                    ),
+                    kwargs=_prepare_commit_kwargs(pending_token),
+                ),
             )
             observed, resolution = execution.result, execution.resolution
             if resolution.disposition != _OFFLOCK_APPLY:
@@ -5198,7 +5503,13 @@ def _stage_final_plan(
         store,
         runtime.tendwire,
         begin_operation,
-        lambda provider: _prepare_begin(provider, len(parts)),
+        _provider_mutation(
+            "tendwire.connector_prepare_begin",
+            reason=(
+                "tendwire.connector_prepare_begin: stage final delivery plan"
+            ),
+            kwargs=_prepare_begin_kwargs(len(parts)),
+        ),
     )
     begin, begin_resolution = execution.result, execution.resolution
     if begin_resolution.disposition != _OFFLOCK_APPLY:
@@ -5246,10 +5557,16 @@ def _stage_final_plan(
                 store,
                 runtime.tendwire,
                 part_operation,
-                lambda provider: provider.connector_prepare_part(
-                    plan_token=plan_token,
-                    ordinal=ordinal,
-                    spans=part["spans"],
+                _provider_mutation(
+                    "tendwire.connector_prepare_part",
+                    reason=(
+                        "tendwire.connector_prepare_part: stage final plan part"
+                    ),
+                    kwargs={
+                        "plan_token": plan_token,
+                        "ordinal": ordinal,
+                        "spans": part["spans"],
+                    },
                 ),
             )
             response, part_resolution = execution.result, execution.resolution
@@ -5279,7 +5596,13 @@ def _stage_final_plan(
             store,
             runtime.tendwire,
             commit_operation,
-            lambda provider: _prepare_commit(provider, plan_token),
+            _provider_mutation(
+                "tendwire.connector_prepare_commit",
+                reason=(
+                    "tendwire.connector_prepare_commit: activate staged plan"
+                ),
+                kwargs=_prepare_commit_kwargs(plan_token),
+            ),
         )
         commit, commit_resolution = execution.result, execution.resolution
         if commit_resolution.disposition != _OFFLOCK_APPLY:
@@ -5300,7 +5623,13 @@ def _stage_final_plan(
             store,
             runtime.tendwire,
             commit_operation,
-            lambda provider: _prepare_commit(provider, plan_token),
+            _provider_mutation(
+                "tendwire.connector_prepare_commit",
+                reason=(
+                    "tendwire.connector_prepare_commit: activate handed-off plan"
+                ),
+                kwargs=_prepare_commit_kwargs(plan_token),
+            ),
         )
         commit, commit_resolution = execution.result, execution.resolution
         if commit_resolution.disposition != _OFFLOCK_APPLY:
@@ -5451,14 +5780,16 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
         store,
         runtime.telegram,
         operation,
-        lambda provider: send_feed_item(
-            provider,
-            chat_id,
-            feed_item,
-            telegram=telegram,
-            thread_id=thread_id,
-            notify=False,
-            api_token=api_token,
+        _provider_mutation(
+            "telegram.send_feed_item",
+            reason="telegram.send_feed_item: deliver legacy final",
+            args=(chat_id, feed_item),
+            kwargs={
+                "telegram": telegram,
+                "thread_id": thread_id,
+                "notify": False,
+                "api_token": api_token,
+            },
         ),
     )
     sent, resolution = execution.result, execution.resolution
@@ -5526,16 +5857,19 @@ def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncR
     if runtime.dry_run:
         return state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id})
     api_token, bot_kind = _delivery_bot(store, entry)
-    client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
     operation = _capture_entry_operation(
         store, entry, topic_id=thread_id
     )
     execution = _execute_entry_operation(
         store,
-        client,
+        runtime.telegram,
         operation,
-        lambda provider: provider.send_message(
-            chat_id, html, thread_id=thread_id, notify=True
+        _provider_mutation(
+            "telegram.send_message",
+            reason="telegram.send_message: deliver pending interaction",
+            args=(chat_id, html),
+            kwargs={"thread_id": thread_id, "notify": True},
+            api_token=api_token,
         ),
     )
     sent, resolution = execution.result, execution.resolution
@@ -6800,8 +7134,12 @@ def _reconcile_completed_turn_plans(
             store,
             runtime.tendwire,
             operation,
-            lambda provider: provider.connector_prepare_commit(
-                plan_token=plan_token
+            _provider_mutation(
+                "tendwire.connector_prepare_commit",
+                reason=(
+                    "tendwire.connector_prepare_commit: reconcile completed plan"
+                ),
+                kwargs={"plan_token": plan_token},
             ),
         )
         observed, resolution = execution.result, execution.resolution
@@ -7007,7 +7345,14 @@ def _fail_turn_final(
     reason_code = _turn_final_reason_code(
         reason, uncertain=uncertain
     )
-    response = runtime.tendwire.turn_final_fail(ref, reason_code)
+    response = _execute_exact_provider_operation(
+        runtime.tendwire,
+        mutation=_provider_mutation(
+            "tendwire.turn_final_fail",
+            reason="tendwire.turn_final_fail: reject exact leased final",
+            args=(ref, reason_code),
+        ),
+    )
     result["failed"] += 1
     result["changed"] = True
     result["status"] = reason_code
@@ -7054,10 +7399,14 @@ def _defer_turn_final(
             )
             _checkpoint_turn_job(runtime)
     reason_code = _turn_final_reason_code(reason, deferred=True)
-    response = runtime.tendwire.turn_final_defer(
-        ref,
-        reason_code,
-        delay_seconds=max(1, int(delay_seconds)),
+    response = _execute_exact_provider_operation(
+        runtime.tendwire,
+        mutation=_provider_mutation(
+            "tendwire.turn_final_defer",
+            reason="tendwire.turn_final_defer: defer exact leased final",
+            args=(ref, reason_code),
+            kwargs={"delay_seconds": max(1, int(delay_seconds))},
+        ),
     )
     result["deferred"] += 1
     result["changed"] = True
@@ -7346,17 +7695,14 @@ def _drain_post_ack_reconciliations(
                 retired = _execute_exact_provider_operation(
                     runtime.telegram,
                     store=store,
-                    reason=(
-                        "post-ACK reconciliation retires the exact stale "
-                        "provider message id"
-                    ),
-                    call=lambda provider, message_id=message_id, token=token: (
-                        delete_turn_delivery_message(
-                            provider,
-                            chat_id,
-                            message_id,
-                            api_token=token,
-                        )
+                    mutation=_provider_mutation(
+                        "telegram.delete_turn_delivery_message",
+                        reason=(
+                            "telegram.delete_turn_delivery_message: post-ACK "
+                            "retire stale copy"
+                        ),
+                        args=(chat_id, message_id),
+                        kwargs={"api_token": token},
                     ),
                 )
                 result["operations"] += 1
@@ -7408,15 +7754,18 @@ def _drain_post_ack_reconciliations(
                 store,
                 runtime.telegram,
                 operation,
-                lambda provider: send_turn_delivery_part(
-                    provider,
-                    chat_id,
-                    feed_item,
-                    plans[ordinal],
-                    telegram=_telegram_state(store),
-                    thread_id=current_topic,
-                    notify=False,
-                    api_token=token,
+                _provider_mutation(
+                    "telegram.send_turn_delivery_part",
+                    reason=(
+                        "telegram.send_turn_delivery_part: post-ACK reconcile route"
+                    ),
+                    args=(chat_id, feed_item, plans[ordinal]),
+                    kwargs={
+                        "telegram": _telegram_state(store),
+                        "thread_id": current_topic,
+                        "notify": False,
+                        "api_token": token,
+                    },
                 ),
             )
             result["operations"] += 1
@@ -7470,15 +7819,14 @@ def _drain_post_ack_reconciliations(
                     retired = _execute_exact_provider_operation(
                         runtime.telegram,
                         store=store,
-                        reason=(
-                            "post-ACK reconciliation retires the exact "
-                            "superseded provider message id"
-                        ),
-                        call=lambda provider: delete_turn_delivery_message(
-                            provider,
-                            chat_id,
-                            old_message_id,
-                            api_token=old_token,
+                        mutation=_provider_mutation(
+                            "telegram.delete_turn_delivery_message",
+                            reason=(
+                                "telegram.delete_turn_delivery_message: "
+                                "post-ACK retire superseded copy"
+                            ),
+                            args=(chat_id, old_message_id),
+                            kwargs={"api_token": old_token},
                         ),
                     )
                     result["operations"] += 1
@@ -8139,15 +8487,14 @@ def _drain_turn_final(
                     retired = _execute_exact_provider_operation(
                         runtime.telegram,
                         store=store,
-                        reason=(
-                            "stale-copy backpressure retires one exact "
-                            "accepted provider message before another send"
-                        ),
-                        call=lambda provider: delete_turn_delivery_message(
-                            provider,
-                            chat_id,
-                            stale["message_id"],
-                            api_token=owner_token,
+                        mutation=_provider_mutation(
+                            "telegram.delete_turn_delivery_message",
+                            reason=(
+                                "telegram.delete_turn_delivery_message: "
+                                "stale-copy backpressure retirement"
+                            ),
+                            args=(chat_id, stale["message_id"]),
+                            kwargs={"api_token": owner_token},
                         ),
                     )
                     result["operations"] += 1
@@ -8285,12 +8632,18 @@ def _drain_turn_final(
                 store,
                 runtime.tendwire,
                 suppressed_ack_operation,
-                lambda provider: provider.turn_final_ack(
-                    ref,
-                    {
-                        "outcome": "applied",
-                        "job_key": job_key,
-                    },
+                _provider_mutation(
+                    "tendwire.turn_final_ack",
+                    reason=(
+                        "tendwire.turn_final_ack: acknowledge suppressed plan"
+                    ),
+                    args=(
+                        ref,
+                        {
+                            "outcome": "applied",
+                            "job_key": job_key,
+                        },
+                    ),
                 ),
             )
             ack = execution.result
@@ -8333,8 +8686,13 @@ def _drain_turn_final(
                     store,
                     runtime.tendwire,
                     observe_operation,
-                    lambda provider: provider.connector_prepare_commit(
-                        plan_token=plan_token
+                    _provider_mutation(
+                        "tendwire.connector_prepare_commit",
+                        reason=(
+                            "tendwire.connector_prepare_commit: observe "
+                            "suppressed ACK conflict"
+                        ),
+                        kwargs={"plan_token": plan_token},
                     ),
                 )
                 observed = execution.result
@@ -8455,11 +8813,14 @@ def _drain_turn_final(
                         store,
                         runtime.telegram,
                         retire_operation,
-                        lambda provider: delete_turn_delivery_message(
-                            provider,
-                            chat_id,
-                            candidate_id,
-                            api_token=owner_token,
+                        _provider_mutation(
+                            "telegram.delete_turn_delivery_message",
+                            reason=(
+                                "telegram.delete_turn_delivery_message: "
+                                "retire planned final slot"
+                            ),
+                            args=(chat_id, candidate_id),
+                            kwargs={"api_token": owner_token},
                         ),
                     )
                 except RateLimited as exc:
@@ -8558,14 +8919,21 @@ def _drain_turn_final(
                         store,
                         runtime.telegram,
                         delivery_operation,
-                        lambda provider: edit_turn_delivery_part(
-                            provider,
-                            chat_id,
-                            candidate_id,
-                            feed_item,
-                            plans[ordinal],
-                            telegram=_telegram_state(store),
-                            api_token=desired_token,
+                        _provider_mutation(
+                            "telegram.edit_turn_delivery_part",
+                            reason=(
+                                "telegram.edit_turn_delivery_part: apply compatible final"
+                            ),
+                            args=(
+                                chat_id,
+                                candidate_id,
+                                feed_item,
+                                plans[ordinal],
+                            ),
+                            kwargs={
+                                "telegram": _telegram_state(store),
+                                "api_token": desired_token,
+                            },
                         ),
                     )
                 else:
@@ -8573,15 +8941,18 @@ def _drain_turn_final(
                         store,
                         runtime.telegram,
                         delivery_operation,
-                        lambda provider: send_turn_delivery_part(
-                            provider,
-                            chat_id,
-                            feed_item,
-                            plans[ordinal],
-                            telegram=_telegram_state(store),
-                            thread_id=attempted_topic_id,
-                            notify=False,
-                            api_token=desired_token,
+                        _provider_mutation(
+                            "telegram.send_turn_delivery_part",
+                            reason=(
+                                "telegram.send_turn_delivery_part: apply new final"
+                            ),
+                            args=(chat_id, feed_item, plans[ordinal]),
+                            kwargs={
+                                "telegram": _telegram_state(store),
+                                "thread_id": attempted_topic_id,
+                                "notify": False,
+                                "api_token": desired_token,
+                            },
                         ),
                     )
             except RateLimited as exc:
@@ -8688,15 +9059,18 @@ def _drain_turn_final(
                             store,
                             runtime.telegram,
                             delivery_operation,
-                            lambda provider: send_turn_delivery_part(
-                                provider,
-                                chat_id,
-                                feed_item,
-                                plans[ordinal],
-                                telegram=_telegram_state(store),
-                                thread_id=attempted_topic_id,
-                                notify=False,
-                                api_token=desired_token,
+                            _provider_mutation(
+                                "telegram.send_turn_delivery_part",
+                                reason=(
+                                    "telegram.send_turn_delivery_part: replace missing final"
+                                ),
+                                args=(chat_id, feed_item, plans[ordinal]),
+                                kwargs={
+                                    "telegram": _telegram_state(store),
+                                    "thread_id": attempted_topic_id,
+                                    "notify": False,
+                                    "api_token": desired_token,
+                                },
                             ),
                         )
                         compatible = False
@@ -8898,11 +9272,14 @@ def _drain_turn_final(
                         store,
                         runtime.telegram,
                         retire_operation,
-                        lambda provider: delete_turn_delivery_message(
-                            provider,
-                            chat_id,
-                            prior_id,
-                            api_token=owner_token,
+                        _provider_mutation(
+                            "telegram.delete_turn_delivery_message",
+                            reason=(
+                                "telegram.delete_turn_delivery_message: "
+                                "retire replaced final slot"
+                            ),
+                            args=(chat_id, prior_id),
+                            kwargs={"api_token": owner_token},
                         ),
                     )
                 except RateLimited as exc:
@@ -9042,11 +9419,14 @@ def _drain_turn_final(
                     store,
                     runtime.telegram,
                     stale_operation,
-                    lambda provider: delete_turn_delivery_message(
-                        provider,
-                        chat_id,
-                        stale["message_id"],
-                        api_token=owner_token,
+                    _provider_mutation(
+                        "telegram.delete_turn_delivery_message",
+                        reason=(
+                            "telegram.delete_turn_delivery_message: "
+                            "retire tracked stale final copy"
+                        ),
+                        args=(chat_id, stale["message_id"]),
+                        kwargs={"api_token": owner_token},
                     ),
                 )
             except RateLimited as exc:
@@ -9195,9 +9575,13 @@ def _drain_turn_final(
             store,
             runtime.tendwire,
             pre_ack_operation,
-            lambda provider: provider.turn_final_ack(
-                ref,
-                {"outcome": "applied", "job_key": job_key},
+            _provider_mutation(
+                "tendwire.turn_final_ack",
+                reason="tendwire.turn_final_ack: acknowledge applied final",
+                args=(
+                    ref,
+                    {"outcome": "applied", "job_key": job_key},
+                ),
             ),
         )
         ack, ack_resolution = execution.result, execution.resolution
@@ -9236,8 +9620,12 @@ def _drain_turn_final(
                 store,
                 runtime.tendwire,
                 observe_operation,
-                lambda provider: provider.connector_prepare_commit(
-                    plan_token=plan_token
+                _provider_mutation(
+                    "tendwire.connector_prepare_commit",
+                    reason=(
+                        "tendwire.connector_prepare_commit: observe applied ACK conflict"
+                    ),
+                    kwargs={"plan_token": plan_token},
                 ),
             )
             observed = execution.result
@@ -9434,11 +9822,16 @@ def _sync_pinned(
             store,
             runtime.telegram,
             operation,
-            lambda provider: provider.send_message(
-                chat_id,
-                html,
-                thread_id=general_thread_id,
-                notify=False,
+            _provider_mutation(
+                "telegram.send_message",
+                reason=(
+                    "telegram.send_message: create global status in general thread"
+                ),
+                args=(chat_id, html),
+                kwargs={
+                    "thread_id": general_thread_id,
+                    "notify": False,
+                },
             ),
         )
         result, resolution = execution.result, execution.resolution
@@ -9458,8 +9851,13 @@ def _sync_pinned(
                 store,
                 runtime.telegram,
                 fallback_operation,
-                lambda provider: provider.send_message(
-                    chat_id, html, notify=False
+                _provider_mutation(
+                    "telegram.send_message",
+                    reason=(
+                        "telegram.send_message: create global status in root fallback"
+                    ),
+                    args=(chat_id, html),
+                    kwargs={"notify": False},
                 ),
             )
             result, resolution = execution.result, execution.resolution
@@ -9476,8 +9874,10 @@ def _sync_pinned(
             store,
             runtime.telegram,
             operation,
-            lambda provider: provider.edit_message(
-                chat_id, message_id, html
+            _provider_mutation(
+                "telegram.edit_message",
+                reason="telegram.edit_message: refresh global status",
+                args=(chat_id, message_id, html),
             ),
         )
         sent, resolution = execution.result, execution.resolution
@@ -9506,8 +9906,10 @@ def _sync_pinned(
             store,
             runtime.telegram,
             pin_operation,
-            lambda provider: provider.pin_message(
-                chat_id, str(sent["message_id"])
+            _provider_mutation(
+                "telegram.pin_message",
+                reason="telegram.pin_message: pin global status",
+                args=(chat_id, str(sent["message_id"])),
             ),
         )
         pin_resolution = execution.resolution
@@ -10562,11 +10964,13 @@ def drain_outbound_once(
         _exact_provider_client(
             effective_runtime.telegram,
             reason=(
-                "attention outbox owns explicit general-thread and exact "
-                "leased-ref provider identifiers"
+                "outbound attention Telegram exact identifiers"
             ),
         ),
-        effective_runtime.tendwire,
+        _exact_provider_client(
+            effective_runtime.tendwire,
+            reason="outbound attention Tendwire exact leased references",
+        ),
         chat_id=chat_id,
         max_sends=remaining,
         dry_run=effective_runtime.dry_run,
@@ -10962,11 +11366,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 _exact_provider_client(
                     runtime.telegram,
                     reason=(
-                        "attention outbox owns explicit general-thread and "
-                        "exact leased-ref provider identifiers"
+                        "sync attention Telegram exact identifiers"
                     ),
                 ),
-                runtime.tendwire,
+                _exact_provider_client(
+                    runtime.tendwire,
+                    reason=(
+                        "sync attention Tendwire exact leased references"
+                    ),
+                ),
                 chat_id=chat_id,
                 max_sends=remaining,
                 dry_run=runtime.dry_run,

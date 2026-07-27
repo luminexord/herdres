@@ -2096,6 +2096,123 @@ def test_turn_final_rebind_during_ack_records_local_reconciliation(
     assert bindings[0]["topic_id"] == "16000"
 
 
+def test_suppressed_turn_final_rebind_during_ack_reconciles_locally(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0"
+    )
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(state_path)
+    )
+    turn_id = "turn-suppressed-rebind-during-ack"
+    revision = "twrev1.suppressed_rebind_during_ack"
+
+    class RebindingSuppressedAckTendwire(TurnFinalTendwire):
+        def __init__(self, row):
+            super().__init__(row)
+            self.rebound = False
+
+        def turn_final_ack(self, ref, response=None):
+            result = super().turn_final_ack(ref, response)
+            if not self.rebound:
+                concurrent = state.load_state(state_path)
+                _key, entry = state.find_worker_entry_by_stable_key(
+                    concurrent, _stable_key("worker-1")
+                )
+                assert entry is not None
+                entry["topic_id"] = "16000"
+                state.save_state(concurrent, state_path)
+                self.rebound = True
+            return result
+
+    tendwire = RebindingSuppressedAckTendwire(
+        _turn_row(turn_id, revision, "suppressed answer")
+    )
+    telegram = DeletingTelegram()
+    state.save_state(_store(), state_path)
+
+    # Stage the real durable plan without draining its job, then mark the
+    # historical-plan suppression that the real catch-up path consumes.
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        staged = sync_once(
+            current,
+            SyncRuntime(
+                tendwire,
+                telegram,
+                with_outbox=False,
+                max_sends=8,
+            ),
+        )
+        _key, entry = state.find_worker_entry_by_stable_key(
+            current, _stable_key("worker-1")
+        )
+        assert entry is not None
+        plan_token = str(entry["pending_plan_token"])
+        entry["pending_turn_suppressed"] = {
+            "plan_token": plan_token,
+            "turn_id": turn_id,
+            "content_revision": revision,
+            "reason": "test_historical_suppression",
+        }
+        state.save_state(current, state_path)
+
+    assert staged["tendwire_turn_final"]["polled"] == 0
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        raced = sync_once(
+            current, _runtime(tendwire, telegram, max_sends=8)
+        )
+
+    receipt = next(iter(state.tendwire_turn_jobs(current).values()))
+    assert raced["tendwire_turn_final"]["acked"] == 1
+    assert raced["tendwire_turn_final"]["deferred"] == 0
+    assert tendwire.defer_calls == []
+    assert len(tendwire.ack_calls) == 1
+    assert receipt["substate"] == "acknowledged"
+    assert receipt["post_ack_reconcile"]["kind"] == "suppressed"
+    assert receipt["post_ack_reconcile"]["status"] == "reconcile"
+    assert telegram.sent == []
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        healed = sync_once(
+            current, _runtime(tendwire, telegram, max_sends=8)
+        )
+
+    receipt = next(iter(state.tendwire_turn_jobs(current).values()))
+    _key, entry = state.find_worker_entry_by_stable_key(
+        current, _stable_key("worker-1")
+    )
+    assert entry is not None
+    assert healed["tendwire_turn_final"]["polled"] == 0
+    assert len(tendwire.ack_calls) == 1
+    assert tendwire.defer_calls == []
+    assert receipt["substate"] == "acknowledged"
+    assert receipt.get("post_ack_reconcile") is None
+    assert entry["topic_id"] == "16000"
+    assert "pending_turn_suppressed" not in entry
+    assert "pending_plan_token" not in entry
+    delivered = state.delivered_turns(current)
+    assert delivered[f"final:{turn_id}:{revision}"]["suppressed"] is True
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        stable = sync_once(
+            current, _runtime(tendwire, telegram, max_sends=8)
+        )
+    assert stable["tendwire_turn_final"]["polled"] == 0
+    assert stable["tendwire_turn_final"]["acked"] == 0
+    assert len(tendwire.ack_calls) == 1
+
+
 def test_turn_final_revalidates_after_old_copy_retirement(
     tmp_path, monkeypatch
 ):
