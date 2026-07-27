@@ -543,6 +543,16 @@ def _select_space_worker(workers: list[dict[str, Any]], turn_status_by_worker: d
     return max(workers, key=lambda worker: str(worker.get("last_seen_at") or "")) if workers else {}
 
 
+def _complete_topic_recovery(entry: dict[str, Any], topic_id: str) -> None:
+    recovery = entry.pop("topic_recovery_pending", None)
+    if not isinstance(recovery, dict):
+        return
+    recovery = dict(recovery)
+    recovery["replacement_topic_id"] = topic_id
+    recovery["recovered_at"] = time.time()
+    entry["last_topic_recovery"] = recovery
+
+
 def _delivery_entry(
     store: dict[str, Any],
     space_entry: dict[str, Any],
@@ -560,6 +570,7 @@ def _delivery_entry(
     space_topic_id = str(space_entry.get("topic_id") or "")
     if space_topic_id:
         entry["topic_id"] = space_topic_id
+        _complete_topic_recovery(entry, space_topic_id)
     else:
         entry.pop("topic_id", None)
     entry["tendwire_space_id"] = space_entry.get("tendwire_space_id") or worker_entry.get("tendwire_space_id")
@@ -1720,15 +1731,6 @@ def _ensure_topic(
     chat_id: str,
     can_create: bool = True,
 ) -> tuple[bool, bool]:
-    def stamp_replacement(topic_id: str) -> None:
-        recovery = entry.pop("topic_recovery_pending", None)
-        if not isinstance(recovery, dict):
-            return
-        recovery = dict(recovery)
-        recovery["replacement_topic_id"] = topic_id
-        recovery["recovered_at"] = time.time()
-        entry["last_topic_recovery"] = recovery
-
     if (
         str(entry.get("entry_type") or "") == "worker"
         and not state.entry_is_routable(entry)
@@ -1756,7 +1758,7 @@ def _ensure_topic(
     reused = state.find_legacy_topic_id_by_name(store, entry.get("topic_name") or "")
     if reused:
         entry["topic_id"] = reused
-        stamp_replacement(reused)
+        _complete_topic_recovery(entry, reused)
         return False, False
     if runtime.dry_run:
         return True, False
@@ -1766,7 +1768,7 @@ def _ensure_topic(
     created = runtime.telegram.create_topic(chat_id, topic_name, icon_color=topic_color_for_name(topic_name))
     if created.get("ok") and created.get("topic_id"):
         entry["topic_id"] = str(created["topic_id"])
-        stamp_replacement(str(created["topic_id"]))
+        _complete_topic_recovery(entry, str(created["topic_id"]))
         # Topic creation has no provider idempotency key. Persist the returned
         # identity before any later turn validation can abort this sync pass,
         # otherwise the next pass can create a duplicate topic.
@@ -2490,6 +2492,28 @@ def _sync_sources(
     return counts
 
 
+def _record_topic_delete_success(
+    store: dict[str, Any],
+    *,
+    topic_id: str,
+    name: Any,
+    reason: str,
+) -> None:
+    """Atomically record provider-confirmed deletion and invalidate aliases."""
+    state.tombstone_dead_topic(store, topic_id)
+    audit = store.get("telegram_deleted_topics")
+    if not isinstance(audit, list):
+        audit = []
+    audit.append(
+        {
+            "topic_id": topic_id,
+            "name": compact_ws(name, 120),
+            "reason": reason,
+        }
+    )
+    store["telegram_deleted_topics"] = audit[-_TOPIC_CLEANUP_AUDIT_LIMIT:]
+
+
 def _cleanup_topics(
     store: dict[str, Any],
     runtime: SyncRuntime,
@@ -2504,7 +2528,6 @@ def _cleanup_topics(
         if entry.get("topic_id")
     }
     panes = store.get("panes") if isinstance(store.get("panes"), dict) else {}
-    audit = store.setdefault("telegram_deleted_topics", [])
     deleted_topic_ids: set[str] = set()
     # Bound real topic-delete calls per pass so a first source sync (which can reclassify many legacy
     # per-worker topics at once) amortizes the deletes over ticks instead of one burst under the lock.
@@ -2578,10 +2601,15 @@ def _cleanup_topics(
                 result["failed"] += 1
                 entry["last_topic_delete_error"] = compact_ws(deleted.get("error"), 240)
                 continue
+            _record_topic_delete_success(
+                store,
+                topic_id=topic_id,
+                name=entry.get("topic_name"),
+                reason="reaped_closed_worker_topic",
+            )
+            deleted_topic_ids.add(topic_id)
             if deleted.get("ok"):
                 result["deleted"] += 1
-                deleted_topic_ids.add(topic_id)
-                audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": "reaped_closed_worker_topic"})
             # No de-number marker is stamped here: provenance is recorded at NUMBERING time (see
             # _assign_worker_topic_names / _stamp_numbered_base). Reaping merely frees the base name; the
             # live sibling that the connector minted "<base> N" already carries connector_numbered_base and
@@ -2590,16 +2618,19 @@ def _cleanup_topics(
             result["changed"] = True
             panes.pop(key, None)
 
-    def clear_worker_topic_refs(topic_id: str, reason: str) -> None:
-        for worker_key, worker_entry in list(state.source_worker_entries(store).items()):
-            if str(worker_entry.get("topic_id") or "") != topic_id:
+    def finalize_deleted_space_worker_aliases(
+        topic_id: str, reason: str
+    ) -> None:
+        for worker_key, worker_entry in list(
+            state.source_worker_entries(store).items()
+        ):
+            if str(worker_entry.get("deleted_topic_id") or "") != topic_id:
                 continue
             if _should_delete_done_council_topic(worker_entry):
                 panes.pop(worker_key, None)
-                continue
-            worker_entry.pop("topic_id", None)
-            worker_entry["deleted_topic_id"] = topic_id
-            worker_entry["deleted_topic_reason"] = reason
+            else:
+                worker_entry["deleted_topic_reason"] = reason
+
     for key, entry in list(state.source_worker_entries(store).items()):
         if state.entry_is_retired(entry):
             continue
@@ -2625,12 +2656,17 @@ def _cleanup_topics(
         deleted = runtime.telegram.delete_topic(chat_id, topic_id)
         if not deleted.get("ok"):
             if _topic_missing(deleted.get("error")):
+                _record_topic_delete_success(
+                    store,
+                    topic_id=topic_id,
+                    name=entry.get("topic_name"),
+                    reason=reason,
+                )
+                deleted_topic_ids.add(topic_id)
                 result["changed"] = True
                 if done_council_topic:
                     panes.pop(key, None)
                 else:
-                    entry.pop("topic_id", None)
-                    entry["deleted_topic_id"] = topic_id
                     entry["deleted_topic_reason"] = reason
                 continue
             result["failed"] += 1
@@ -2639,12 +2675,15 @@ def _cleanup_topics(
         result["deleted"] += 1
         deleted_topic_ids.add(topic_id)
         result["changed"] = True
-        audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": reason})
+        _record_topic_delete_success(
+            store,
+            topic_id=topic_id,
+            name=entry.get("topic_name"),
+            reason=reason,
+        )
         if done_council_topic:
             panes.pop(key, None)
         else:
-            entry.pop("topic_id", None)
-            entry["deleted_topic_id"] = topic_id
             entry["deleted_topic_reason"] = reason
     spaces = store.get("spaces") if isinstance(store.get("spaces"), dict) else {}
     for key, entry in list(state.source_space_entries(store).items()):
@@ -2664,7 +2703,16 @@ def _cleanup_topics(
             deleted = runtime.telegram.delete_topic(chat_id, topic_id)
             if not deleted.get("ok"):
                 if _topic_missing(deleted.get("error")):
-                    clear_worker_topic_refs(topic_id, "done_council_space_topic")
+                    _record_topic_delete_success(
+                        store,
+                        topic_id=topic_id,
+                        name=entry.get("topic_name"),
+                        reason="done_council_space_topic",
+                    )
+                    deleted_topic_ids.add(topic_id)
+                    finalize_deleted_space_worker_aliases(
+                        topic_id, "done_council_space_topic"
+                    )
                     spaces.pop(key, None)
                     result["pruned"] += 1
                     result["changed"] = True
@@ -2674,14 +2722,20 @@ def _cleanup_topics(
                 continue
             result["deleted"] += 1
             deleted_topic_ids.add(topic_id)
-            audit.append({"topic_id": topic_id, "name": compact_ws(entry.get("topic_name"), 120), "reason": "done_council_space_topic"})
+            _record_topic_delete_success(
+                store,
+                topic_id=topic_id,
+                name=entry.get("topic_name"),
+                reason="done_council_space_topic",
+            )
         if not runtime.dry_run:
             if should_delete:
-                clear_worker_topic_refs(topic_id, "done_council_space_topic")
+                finalize_deleted_space_worker_aliases(
+                    topic_id, "done_council_space_topic"
+                )
             spaces.pop(key, None)
             result["pruned"] += 1
         result["changed"] = True
-    store["telegram_deleted_topics"] = audit[-200:]
     return result
 
 
@@ -3181,6 +3235,12 @@ def _apply_topic_cleanup_outcomes(
             retry_after.pop(target_key, None)
             kind = str(outcome.get("kind") or "")
             if target["action"] == "delete":
+                _record_topic_delete_success(
+                    store,
+                    topic_id=str(target["topic_id"]),
+                    name=entry.get("topic_name"),
+                    reason=str(target["reason"]),
+                )
                 _record_lifecycle_topic_deleted(
                     entry,
                     topic_id=str(target["topic_id"]),

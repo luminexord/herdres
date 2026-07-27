@@ -135,6 +135,38 @@ class DeletedWorkingTopicTelegram(DeletedTopicTelegram):
         return super().edit_message(chat_id, message_id, html)
 
 
+class MissingWorkingCardTelegram(FakeTelegram):
+    def __init__(self, stale_message_id: str):
+        super().__init__()
+        self.stale_message_id = stale_message_id
+        self.failed_working_edits = 0
+
+    def edit_message(self, chat_id, message_id, html):
+        if str(message_id) == self.stale_message_id:
+            self.failed_working_edits += 1
+            return {
+                "ok": False,
+                "kind": "not_found",
+                "error": "Bad Request: message to edit not found",
+            }
+        return super().edit_message(chat_id, message_id, html)
+
+
+class CleanupDeletedTopicTelegram(FakeTelegram):
+    def __init__(self, *, already_missing: bool):
+        super().__init__()
+        self.already_missing = already_missing
+
+    def delete_topic(self, chat_id, thread_id):
+        result = super().delete_topic(chat_id, thread_id)
+        if self.already_missing:
+            return {
+                "ok": False,
+                "error": "Bad Request: message thread not found",
+            }
+        return result
+
+
 def test_deleted_live_topic_is_reminted_and_next_final_delivered_once():
     store = _store()
     _key, entry = _entry(
@@ -195,6 +227,112 @@ def test_deleted_live_topic_is_reminted_and_next_final_delivered_once():
         == 1
     )
     assert telegram.failed_topic_sends == 1
+
+
+@pytest.mark.parametrize("already_missing", [False, True])
+def test_cleanup_delete_tombstones_shared_live_space_and_retired_aliases(
+    monkeypatch, already_missing
+):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "space")
+    store = _store()
+    dead_topic_id = "15007"
+    live_space = {
+        "id": "workspace-1",
+        "name": "discovery-calls",
+        "status": "active",
+        "fingerprint": "live-space-fp",
+    }
+    _live_key, live_entry, _created = state.upsert_space_entry(
+        store,
+        live_space,
+        topic_id=dead_topic_id,
+    )
+    _stale_key, stale_entry, _created = state.upsert_space_entry(
+        store,
+        {
+            "id": "stale-council",
+            "name": "gitmoot · local-as",
+            "status": "active",
+            "fingerprint": "stale-space-fp",
+        },
+        topic_id=dead_topic_id,
+    )
+    stale_entry["stale_space_topic"] = True
+    retired = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "topic_id": dead_topic_id,
+        "topic_name": "📁 retired duplicate",
+        "routing_retired": True,
+        "routing_retired_reason": "stable_key_duplicate_consolidated",
+        "status": "closed",
+        "retired_topic_notice_pending": True,
+        "retired_topic_notice_error": "old notice error",
+        "retired_topic_rename_pending": True,
+        "retired_topic_rename_error": "old rename error",
+        "retired_topic_close_pending": True,
+        "retired_topic_close_error": "old close error",
+    }
+    store["panes"]["worker:retired-alias"] = retired
+    telegram = CleanupDeletedTopicTelegram(
+        already_missing=already_missing
+    )
+    runtime = SyncRuntime(
+        FakeTendwire(
+            workers=[_worker()],
+            turns={"turns": []},
+            spaces=[live_space],
+        ),
+        telegram,
+        with_outbox=False,
+    )
+
+    first = sync_once(store, runtime)
+
+    assert telegram.deleted_topics == [dead_topic_id]
+    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
+    assert store["telegram_deleted_topics"] == [
+        {
+            "topic_id": dead_topic_id,
+            "name": "gitmoot · local-as",
+            "reason": "done_council_space_topic",
+        }
+    ]
+    assert "topic_id" not in live_entry
+    assert state.find_legacy_topic_id_by_name(
+        store, "discovery-calls"
+    ) == ""
+    assert "topic_id" not in retired
+    assert retired["retired_topic_id"] == dead_topic_id
+    assert retired["retired_topic_missing"] is True
+    assert not any(
+        field in retired
+        for field in (
+            "retired_topic_notice_pending",
+            "retired_topic_notice_error",
+            "retired_topic_rename_pending",
+            "retired_topic_rename_error",
+            "retired_topic_close_pending",
+            "retired_topic_close_error",
+        )
+    )
+    assert all(
+        entry.get("tendwire_space_id") != "stale-council"
+        for entry in state.source_space_entries(store).values()
+    )
+
+    second = sync_once(store, runtime)
+    replacement_topic_id = live_entry["topic_id"]
+    third = sync_once(store, runtime)
+
+    assert first["topic_cleanup"]["failed"] == 0
+    assert second["topic_cleanup"]["deleted"] == 0
+    assert third["topic_cleanup"]["deleted"] == 0
+    assert replacement_topic_id != dead_topic_id
+    assert telegram.topics == ["discovery-calls"]
+    assert telegram.deleted_topics == [dead_topic_id]
+    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
+    assert len(store["telegram_deleted_topics"]) == 1
 
 
 def test_deleted_topic_defers_durable_final_until_remint_then_acks_once():
@@ -564,6 +702,12 @@ def test_deleted_topic_tombstone_blocks_space_alias_resurrection_across_passes(
         and "Pane/topic binding repaired." in sent[1]
     ]
     assert len(successful_finals) == 1
+    if topic_mode == "space":
+        assert "topic_recovery_pending" not in entry
+        assert entry["last_topic_recovery"]["topic_id"] == dead_topic_id
+        assert entry["last_topic_recovery"]["replacement_topic_id"] == (
+            replacement_topic_id
+        )
 
 
 def test_working_edit_not_found_resends_to_prove_dead_topic_then_remints_once():
@@ -629,6 +773,69 @@ def test_working_edit_not_found_resends_to_prove_dead_topic_then_remints_once():
         sent
         for sent in telegram.sent
         if sent[2].get("thread_id") == replacement_topic_id
+        and "Checking the pane/topic repair." in sent[1]
+    ]
+    assert len(working_cards) == 1
+    assert entry["last_stream_message_id"] == working_cards[0][3]
+    working_bindings = [
+        binding
+        for binding in state.message_bindings(store).values()
+        if binding.get("kind") == "working"
+    ]
+    assert len(working_bindings) == 1
+
+
+def test_working_edit_not_found_resends_once_when_topic_is_alive():
+    store = _store()
+    topic_id = "15007"
+    stale_message_id = "15333"
+    _key, entry = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-live",
+        topic_id=topic_id,
+    )
+    entry.update(
+        {
+            "last_stream_turn_id": "turn-working",
+            "last_stream_hash": "stale-working-hash",
+            "last_stream_message_id": stale_message_id,
+            "last_stream_bot_kind": "manager",
+        }
+    )
+    state.bind_message_to_worker(
+        store,
+        stale_message_id,
+        entry,
+        topic_id=topic_id,
+        kind="working",
+        turn_id="turn-working",
+        bot_kind="manager",
+    )
+    telegram = MissingWorkingCardTelegram(stale_message_id)
+    runtime = SyncRuntime(
+        FakeTendwire(
+            workers=[_worker()],
+            turns={"turns": [_working()]},
+            spaces=[],
+        ),
+        telegram,
+        with_outbox=False,
+    )
+
+    first = sync_once(store, runtime)
+    second = sync_once(store, runtime)
+
+    assert first["feed_sent"] == 1
+    assert second["feed_sent"] == 0
+    assert telegram.failed_working_edits == 1
+    assert entry["topic_id"] == topic_id
+    assert store.get("telegram_dead_topic_ids") in (None, [])
+    assert state.find_message_binding(store, stale_message_id) is None
+    working_cards = [
+        sent
+        for sent in telegram.sent
+        if sent[2].get("thread_id") == topic_id
         and "Checking the pane/topic repair." in sent[1]
     ]
     assert len(working_cards) == 1

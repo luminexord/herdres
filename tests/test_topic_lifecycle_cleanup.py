@@ -301,6 +301,10 @@ def test_delete_mode_deletes_dormant_and_retired_topics_once_at_ttl(
     assert "topic_id" not in dormant
     assert "topic_id" not in retired
     assert retired["retired_topic_deleted"] is True
+    assert store["telegram_dead_topic_ids"] == ["42", "43"]
+    assert [
+        item["topic_id"] for item in store["telegram_deleted_topics"]
+    ] == ["42", "43"]
     assert [
         item["action"] for item in store["telegram_topic_cleanup_audit"]
     ] == ["delete", "delete"]
@@ -408,6 +412,8 @@ def test_already_gone_delete_is_terminal_success(monkeypatch):
     assert telegram.deleted == ["53"]
     assert "topic_id" not in entry
     assert entry["retired_topic_missing"] is True
+    assert store["telegram_dead_topic_ids"] == ["53"]
+    assert store["telegram_deleted_topics"][0]["topic_id"] == "53"
 
 
 def test_pre_lifecycle_retired_close_marker_is_adopted_without_api_call():

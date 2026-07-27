@@ -603,6 +603,18 @@ def _drop_topic_binding(entry: dict[str, Any], *, topic_id: str) -> None:
         "topic_auto_closed_at",
     ):
         entry.pop(field, None)
+    if entry_is_retired(entry):
+        entry["retired_topic_id"] = topic_id
+        entry["retired_topic_missing"] = True
+        for field in (
+            "retired_topic_notice_pending",
+            "retired_topic_notice_error",
+            "retired_topic_rename_pending",
+            "retired_topic_rename_error",
+            "retired_topic_close_pending",
+            "retired_topic_close_error",
+        ):
+            entry.pop(field, None)
 
 
 def discard_tombstoned_topic_binding(
@@ -616,7 +628,7 @@ def discard_tombstoned_topic_binding(
     return True
 
 
-def _tombstone_dead_topic(data: dict[str, Any], topic_id: str) -> None:
+def tombstone_dead_topic(data: dict[str, Any], topic_id: str) -> None:
     raw = data.get("telegram_dead_topic_ids")
     tombstones = (
         [compact_ws(value, 80) for value in raw]
@@ -655,7 +667,7 @@ def clear_gone_live_topic(
     if not topic_id:
         return False
     repaired_at = time.time() if observed_at is None else float(observed_at)
-    _tombstone_dead_topic(data, topic_id)
+    tombstone_dead_topic(data, topic_id)
     note = {
         "topic_id": topic_id,
         "worker_id": str(
