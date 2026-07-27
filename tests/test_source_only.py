@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import copy
+import ast
 
 import json
 import hashlib
@@ -40,6 +41,124 @@ REQUEST_ID_2 = derive_telegram_request_id(
     chat_id=-100,
     message_id=9002,
 )
+
+
+def test_source_sync_mutations_require_offlock_executor():
+    """The off-lock protocol is enforced structurally, not by convention."""
+
+    tree = ast.parse(Path(source_sync.__file__).read_text(encoding="utf-8"))
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    mutating = set(source_sync._MUTATING_PROVIDER_METHODS) | {
+        "edit_feed_item",
+        "send_feed_item",
+        "edit_turn_delivery_part",
+        "send_turn_delivery_part",
+        "delete_turn_delivery_message",
+    }
+    callback_allowlist = {
+        "_prepare_begin": (
+            "nested plan callback receives only the executor's raw capability"
+        ),
+        "_prepare_commit": (
+            "nested plan callback receives only the executor's raw capability"
+        ),
+        "_synth_and_send": (
+            "nested voice callback receives only the executor's raw capability"
+        ),
+    }
+    read_or_lease_allowlist = {
+        "connector_prepare_get": "read-only plan observation",
+        "pending": "read-only source snapshot",
+        "snapshot": "read-only source snapshot",
+        "turn_content_get": "read-only immutable content paging",
+        "turn_delta": "read-only source delta observation",
+        "turn_final_defer": "exact leased-ref disposition, not entry state",
+        "turn_final_fail": "exact leased-ref disposition, not entry state",
+        "turn_final_poll": "lease acquisition before an entry is resolved",
+        "turns": "read-only source snapshot",
+        "with_token": "returns a scoped client without provider mutation",
+    }
+    assert all(read_or_lease_allowlist.values())
+
+    def call_name(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return ""
+
+    violations = []
+    exact_without_reason = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = call_name(node.func)
+        if name in callback_allowlist:
+            current = node
+            while current in parents:
+                current = parents[current]
+                if isinstance(current, ast.Call) and call_name(
+                    current.func
+                ) == "_execute_entry_operation":
+                    break
+                if isinstance(
+                    current, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    violations.append(
+                        (node.lineno, "callback_escape", name)
+                    )
+                    break
+        if name in {
+            "_execute_exact_provider_operation",
+            "_exact_provider_client",
+        }:
+            reason = next(
+                (
+                    keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg == "reason"
+                ),
+                None,
+            )
+            if not (
+                isinstance(reason, ast.Constant)
+                and isinstance(reason.value, str)
+                and reason.value.strip()
+            ):
+                exact_without_reason.append(node.lineno)
+        if name not in mutating:
+            continue
+        current = node
+        protected = False
+        function_name = ""
+        while current in parents:
+            current = parents[current]
+            if isinstance(current, ast.Call) and call_name(
+                current.func
+            ) in {
+                "_execute_entry_operation",
+                "_execute_exact_provider_operation",
+            }:
+                protected = True
+                break
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                function_name = current.name
+                break
+        if not protected and function_name not in callback_allowlist:
+            violations.append((node.lineno, function_name, name))
+
+    assert exact_without_reason == []
+    assert violations == []
+
+    guarded = source_sync._OfflockClient(FakeTelegram(), _store())
+    with pytest.raises(RuntimeError, match="requires _execute_entry_operation"):
+        guarded.send_message("-100", "unsafe")
+    with pytest.raises(RuntimeError, match="requires _execute_entry_operation"):
+        guarded.api("sendMessage", {})
 
 
 def _gateway_child(

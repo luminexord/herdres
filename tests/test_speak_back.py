@@ -348,6 +348,14 @@ def test_speak_seam_uses_text_binding_topic_after_concurrent_rebind(
         telegram.voice_notes[0][2]["reply_to_message_id"]
         == text_message_id
     )
+    assert current_entry.get("voice_reply_message_ids") in (None, [])
+    voice_message_id = telegram.voice_notes[0][3]
+    voice_binding = state.find_message_binding(
+        current, voice_message_id
+    )
+    assert voice_binding is not None
+    assert voice_binding["kind"] == "voice_stale"
+    assert voice_binding["topic_id"] == "77"
 
 
 def test_speak_seam_offlock_entry_pruned_during_synth(tmp_path, monkeypatch):
@@ -375,6 +383,10 @@ def test_speak_seam_offlock_entry_pruned_during_synth(tmp_path, monkeypatch):
 
     assert worker_key not in store["panes"]           # competitor prune survived, not resurrected
     assert len(telegram.voice_notes) == 1              # note was still sent, no crash
+    voice_id = telegram.voice_notes[0][3]
+    voice_binding = state.find_message_binding(store, voice_id)
+    assert voice_binding is not None
+    assert voice_binding["kind"] == "voice_stale"
 
 
 # --- outbound-speech dir hygiene ---------------------------------------------

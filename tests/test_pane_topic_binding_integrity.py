@@ -476,6 +476,63 @@ def test_live_rename_tombstones_requested_topic_after_concurrent_rebind(
     assert telegram.topics == []
 
 
+def test_concurrent_rebind_during_create_checkpoints_accepted_topic(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(state_path)
+    )
+    store = _store()
+    store["panes"] = {}
+    state.save_state(store, state_path)
+
+    class RebindDuringCreateTelegram(FakeTelegram):
+        def create_topic(self, chat_id, name, icon_color=None):
+            created = super().create_topic(
+                chat_id, name, icon_color=icon_color
+            )
+            concurrent = state.load_state(state_path)
+            entry = next(
+                iter(state.source_worker_entries(concurrent).values())
+            )
+            entry["topic_id"] = "16000"
+            state.save_state(concurrent, state_path)
+            return created
+
+    telegram = RebindDuringCreateTelegram()
+    runtime = SyncRuntime(
+        FakeTendwire(
+            workers=[_worker()],
+            turns={"turns": []},
+            spaces=[],
+        ),
+        telegram,
+        with_outbox=False,
+    )
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        sync_once(current, runtime)
+
+    orphaned = state.orphaned_created_topics(current)
+    entry = next(iter(state.source_worker_entries(current).values()))
+    assert entry["topic_id"] == "16000"
+    assert [item["topic_id"] for item in orphaned] == ["77"]
+    assert "77" not in state.dead_topic_ids(current)
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        sync_once(current, runtime)
+
+    assert telegram.deleted_topics == ["77"]
+    assert state.orphaned_created_topics(current) == []
+    assert state.topic_id_is_tombstoned(current, "77")
+    assert next(iter(state.source_worker_entries(current).values()))[
+        "topic_id"
+    ] == "16000"
+
+
 def test_missing_topic_icon_tombstones_aliases_and_remints_once(
     monkeypatch,
 ):

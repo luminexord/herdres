@@ -23,6 +23,8 @@ from .safe import compact_ws, short_hash
 
 DELIVERED_TURN_LEDGER_LIMIT = 10000
 TENDWIRE_TURN_JOB_LIMIT = 20001
+TENDWIRE_TURN_JOB_STALE_COPY_LIMIT = 8
+ORPHANED_CREATED_TOPIC_LIMIT = 200
 TENDWIRE_TURN_JOB_SUBSTATES = frozenset(
     {
         "reserved",
@@ -3713,6 +3715,8 @@ def cleanup_tendwire_turn_jobs(
             continue
         if receipt.get("substate") not in _TENDWIRE_TURN_JOB_TERMINAL_SUBSTATES:
             continue
+        if isinstance(receipt.get("post_ack_reconcile"), dict):
+            continue
         if (
             job_key in job_refs
             or receipt.get("plan_token") in plan_refs
@@ -3912,6 +3916,15 @@ def tendwire_turn_job_stale_copies(
     return copies
 
 
+def tendwire_turn_job_has_stale_copy_capacity(
+    receipt: dict[str, Any] | None,
+) -> bool:
+    return (
+        len(tendwire_turn_job_stale_copies(receipt))
+        < TENDWIRE_TURN_JOB_STALE_COPY_LIMIT
+    )
+
+
 def reconcile_tendwire_turn_job_route(
     data: dict[str, Any],
     job_key: str,
@@ -3948,6 +3961,8 @@ def reconcile_tendwire_turn_job_route(
         and item["bot_kind"] == copy["bot_kind"]
         for item in copies
     ):
+        if len(copies) >= TENDWIRE_TURN_JOB_STALE_COPY_LIMIT:
+            raise RuntimeError("tendwire turn job stale-copy ledger is full")
         copies.append(copy)
     receipt["stale_applied_copies"] = copies
     receipt.pop("telegram_message_id", None)
@@ -3988,6 +4003,102 @@ def retire_tendwire_turn_job_stale_copy(
             )
             return True
     return False
+
+
+def record_tendwire_turn_job_post_ack_reconcile(
+    data: dict[str, Any],
+    job_key: str,
+    obligation: Mapping[str, Any],
+    *,
+    acknowledged: bool = True,
+) -> dict[str, Any]:
+    """Checkpoint locally drainable work after Tendwire already accepted ACK."""
+
+    receipt = find_tendwire_turn_job(data, job_key)
+    if receipt is None:
+        raise KeyError(job_key)
+    clean = deepcopy(dict(obligation))
+    existing = receipt.get("post_ack_reconcile")
+    replace_inflight = (
+        isinstance(existing, dict)
+        and existing.get("status") == "ack_inflight"
+        and clean.get("status") in {"ack_inflight", "reconcile"}
+    )
+    if (
+        isinstance(existing, dict)
+        and existing != clean
+        and not replace_inflight
+    ):
+        raise ValueError("conflicting post-ACK reconciliation obligation")
+    if acknowledged:
+        receipt["substate"] = "acknowledged"
+    if existing != clean:
+        receipt["post_ack_reconcile"] = clean
+        receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
+    return receipt
+
+
+def clear_tendwire_turn_job_post_ack_reconcile(
+    data: dict[str, Any], job_key: str
+) -> bool:
+    receipt = find_tendwire_turn_job(data, job_key)
+    if receipt is None or not isinstance(
+        receipt.get("post_ack_reconcile"), dict
+    ):
+        return False
+    receipt.pop("post_ack_reconcile", None)
+    receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
+    return True
+
+
+def orphaned_created_topics(data: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = data.get("telegram_orphaned_created_topics")
+    if not isinstance(raw, list):
+        return []
+    return [
+        deepcopy(item)
+        for item in raw
+        if isinstance(item, dict)
+        and compact_ws(item.get("topic_id"), 80)
+    ]
+
+
+def record_orphaned_created_topic(
+    data: dict[str, Any], record: Mapping[str, Any]
+) -> bool:
+    """Persist an accepted create before any owner-specific apply decision."""
+
+    clean = deepcopy(dict(record))
+    topic_id = compact_ws(clean.get("topic_id"), 80)
+    if not topic_id:
+        raise ValueError("orphaned created topic requires topic id")
+    clean["topic_id"] = topic_id
+    records = orphaned_created_topics(data)
+    if any(item.get("topic_id") == topic_id for item in records):
+        return False
+    # The creator preflights the bound before making a non-idempotent request.
+    # If another lane fills the ledger while that request is off-lock, retain
+    # the accepted fact anyway; the exact cleanup pass drains the transient
+    # overflow. Provider acceptance must never be discarded to enforce a cap.
+    records.append(clean)
+    data["telegram_orphaned_created_topics"] = records
+    return True
+
+
+def retire_orphaned_created_topic(
+    data: dict[str, Any], topic_id: str
+) -> bool:
+    records = orphaned_created_topics(data)
+    kept = [
+        item for item in records if item.get("topic_id") != str(topic_id)
+    ]
+    if len(kept) == len(records):
+        return False
+    if kept:
+        data["telegram_orphaned_created_topics"] = kept
+    else:
+        data.pop("telegram_orphaned_created_topics", None)
+    return True
 
 
 def message_bindings(data: dict[str, Any]) -> dict[str, Any]:
