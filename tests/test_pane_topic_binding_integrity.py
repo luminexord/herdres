@@ -258,6 +258,17 @@ def test_cleanup_delete_tombstones_shared_live_space_and_retired_aliases(
         topic_id=dead_topic_id,
     )
     stale_entry["stale_space_topic"] = True
+    rebound_space = {
+        "id": "rebound-space",
+        "name": "active-rebound-space",
+        "status": "active",
+        "fingerprint": "rebound-space-fp",
+    }
+    _rebound_space_key, _rebound_space_entry, _created = (
+        state.upsert_space_entry(
+            store, rebound_space, topic_id="16000"
+        )
+    )
     retired = {
         "source": "tendwire",
         "entry_type": "worker",
@@ -274,14 +285,30 @@ def test_cleanup_delete_tombstones_shared_live_space_and_retired_aliases(
         "retired_topic_close_error": "old close error",
     }
     store["panes"]["worker:retired-alias"] = retired
+    rebound = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "topic_id": "16000",
+        "deleted_topic_id": dead_topic_id,
+        "topic_name": "Council · rebound",
+        "worker_name": "gm-local-as",
+        "status": "closed",
+        "tendwire_raw_status": "closed",
+    }
+    store["panes"]["worker:rebound-council"] = rebound
+    rebound_live_worker = _worker(
+        "rebound-live", fingerprint="rebound-live-fp"
+    )
+    rebound_live_worker["space_id"] = "rebound-space"
+    rebound_live_worker["meta"]["stable_key"] = "wsk1_" + "e" * 64
     telegram = CleanupDeletedTopicTelegram(
         already_missing=already_missing
     )
     runtime = SyncRuntime(
         FakeTendwire(
-            workers=[_worker()],
+            workers=[_worker(), rebound_live_worker],
             turns={"turns": []},
-            spaces=[live_space],
+            spaces=[live_space, rebound_space],
         ),
         telegram,
         with_outbox=False,
@@ -298,6 +325,9 @@ def test_cleanup_delete_tombstones_shared_live_space_and_retired_aliases(
             "reason": "done_council_space_topic",
         }
     ]
+    assert store["panes"]["worker:rebound-council"] is rebound
+    assert rebound["topic_id"] == "16000"
+    assert rebound["deleted_topic_id"] == dead_topic_id
     assert "topic_id" not in live_entry
     assert state.find_legacy_topic_id_by_name(
         store, "discovery-calls"

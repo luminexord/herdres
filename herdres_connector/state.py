@@ -584,9 +584,9 @@ def topic_id_is_tombstoned(data: dict[str, Any], topic_id: Any) -> bool:
     return bool(normalized and normalized in dead_topic_ids(data))
 
 
-def _drop_topic_binding(entry: dict[str, Any], *, topic_id: str) -> None:
+def _drop_topic_binding(entry: dict[str, Any], *, topic_id: str) -> bool:
     if str(entry.get("topic_id") or "") != topic_id:
-        return
+        return False
     entry.pop("topic_id", None)
     entry["deleted_topic_id"] = topic_id
     for field in (
@@ -615,6 +615,7 @@ def _drop_topic_binding(entry: dict[str, Any], *, topic_id: str) -> None:
             "retired_topic_close_error",
         ):
             entry.pop(field, None)
+    return True
 
 
 def discard_tombstoned_topic_binding(
@@ -628,7 +629,9 @@ def discard_tombstoned_topic_binding(
     return True
 
 
-def tombstone_dead_topic(data: dict[str, Any], topic_id: str) -> None:
+def tombstone_dead_topic(
+    data: dict[str, Any], topic_id: str
+) -> frozenset[str]:
     raw = data.get("telegram_dead_topic_ids")
     tombstones = (
         [compact_ws(value, 80) for value in raw]
@@ -643,8 +646,12 @@ def tombstone_dead_topic(data: dict[str, Any], topic_id: str) -> None:
     # before the next source pass mints a replacement.
     for candidate in source_space_entries(data).values():
         _drop_topic_binding(candidate, topic_id=topic_id)
-    for candidate in source_worker_entries(data).values():
-        _drop_topic_binding(candidate, topic_id=topic_id)
+    cleared_worker_keys = {
+        entry_key
+        for entry_key, candidate in source_worker_entries(data).items()
+        if _drop_topic_binding(candidate, topic_id=topic_id)
+    }
+    return frozenset(cleared_worker_keys)
 
 
 def clear_gone_live_topic(

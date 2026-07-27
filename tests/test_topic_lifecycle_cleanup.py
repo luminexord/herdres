@@ -730,6 +730,59 @@ def test_phase3_real_reload_discards_close_for_concurrently_revived_pane(
     assert "topic_closed_at" not in revived
 
 
+def test_phase3_delete_records_provider_fact_after_concurrent_rebind(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("HERDRES_TOPIC_CLEANUP_ACTION", "delete")
+    entry = _entry("22000", dormant_at=NOW - DAY)
+    store = _store(("pane:one", entry))
+    state.save_state(store, state_path)
+
+    class RebindingDeleteTelegram(CleanupTelegram):
+        def delete_topic(self, chat_id, topic_id):
+            result = super().delete_topic(chat_id, topic_id)
+            concurrent = state.load_state(state_path)
+            rebound = concurrent["panes"]["pane:one"]
+            rebound["topic_id"] = "22001"
+            rebound["topic_name"] = "Rebound pane"
+            concurrent["spaces"]["space:live-alias"] = {
+                "source": "tendwire",
+                "entry_type": "space",
+                "tendwire_space_id": "live-alias",
+                "topic_id": "22000",
+                "topic_name": "Live alias",
+            }
+            state.save_state(concurrent, state_path)
+            return result
+
+    telegram = RebindingDeleteTelegram()
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        result = _cleanup(current, telegram)
+
+    rebound = current["panes"]["pane:one"]
+    alias = current["spaces"]["space:live-alias"]
+    assert telegram.deleted == ["22000"]
+    assert result["deleted"] == 0
+    assert result["deferred"] == 1
+    assert result["changed"] is True
+    assert rebound["topic_id"] == "22001"
+    assert rebound["topic_name"] == "Rebound pane"
+    assert "topic_id" not in alias
+    assert alias["deleted_topic_id"] == "22000"
+    assert current["telegram_dead_topic_ids"] == ["22000"]
+    assert current["telegram_deleted_topics"] == [
+        {
+            "topic_id": "22000",
+            "name": "Topic 22000",
+            "reason": "dormant_pane_ttl",
+        }
+    ]
+    assert state.find_legacy_topic_id_by_name(current, "Live alias") == ""
+
+
 def test_rate_limit_backoff_uses_receipt_time_even_after_conflict(
     tmp_path, monkeypatch
 ):

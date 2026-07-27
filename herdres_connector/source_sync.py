@@ -2498,9 +2498,9 @@ def _record_topic_delete_success(
     topic_id: str,
     name: Any,
     reason: str,
-) -> None:
+) -> frozenset[str]:
     """Atomically record provider-confirmed deletion and invalidate aliases."""
-    state.tombstone_dead_topic(store, topic_id)
+    cleared_worker_keys = state.tombstone_dead_topic(store, topic_id)
     audit = store.get("telegram_deleted_topics")
     if not isinstance(audit, list):
         audit = []
@@ -2512,6 +2512,7 @@ def _record_topic_delete_success(
         }
     )
     store["telegram_deleted_topics"] = audit[-_TOPIC_CLEANUP_AUDIT_LIMIT:]
+    return cleared_worker_keys
 
 
 def _cleanup_topics(
@@ -2619,12 +2620,11 @@ def _cleanup_topics(
             panes.pop(key, None)
 
     def finalize_deleted_space_worker_aliases(
-        topic_id: str, reason: str
+        worker_keys: frozenset[str], reason: str
     ) -> None:
-        for worker_key, worker_entry in list(
-            state.source_worker_entries(store).items()
-        ):
-            if str(worker_entry.get("deleted_topic_id") or "") != topic_id:
+        for worker_key in worker_keys:
+            worker_entry = state.source_worker_entries(store).get(worker_key)
+            if worker_entry is None:
                 continue
             if _should_delete_done_council_topic(worker_entry):
                 panes.pop(worker_key, None)
@@ -2703,7 +2703,7 @@ def _cleanup_topics(
             deleted = runtime.telegram.delete_topic(chat_id, topic_id)
             if not deleted.get("ok"):
                 if _topic_missing(deleted.get("error")):
-                    _record_topic_delete_success(
+                    cleared_worker_keys = _record_topic_delete_success(
                         store,
                         topic_id=topic_id,
                         name=entry.get("topic_name"),
@@ -2711,7 +2711,7 @@ def _cleanup_topics(
                     )
                     deleted_topic_ids.add(topic_id)
                     finalize_deleted_space_worker_aliases(
-                        topic_id, "done_council_space_topic"
+                        cleared_worker_keys, "done_council_space_topic"
                     )
                     spaces.pop(key, None)
                     result["pruned"] += 1
@@ -2722,7 +2722,7 @@ def _cleanup_topics(
                 continue
             result["deleted"] += 1
             deleted_topic_ids.add(topic_id)
-            _record_topic_delete_success(
+            cleared_worker_keys = _record_topic_delete_success(
                 store,
                 topic_id=topic_id,
                 name=entry.get("topic_name"),
@@ -2731,7 +2731,7 @@ def _cleanup_topics(
         if not runtime.dry_run:
             if should_delete:
                 finalize_deleted_space_worker_aliases(
-                    topic_id, "done_council_space_topic"
+                    cleared_worker_keys, "done_council_space_topic"
                 )
             spaces.pop(key, None)
             result["pruned"] += 1
@@ -2957,6 +2957,7 @@ def _topic_cleanup_targets(
                 "action": action,
                 "entry_key": entry_key,
                 "topic_id": topic_id,
+                "topic_name": compact_ws(entry.get("topic_name"), 120),
                 "since": since,
                 "reason": reason,
                 "target_key": target_key,
@@ -3225,7 +3226,25 @@ def _apply_topic_cleanup_outcomes(
             result["deferred"] += 1
             result["changed"] = True
             continue
-        if not _topic_cleanup_target_still_valid(store, target, now=now):
+        target_still_valid = _topic_cleanup_target_still_valid(
+            store, target, now=now
+        )
+        if (
+            outcome["status"] == "success"
+            and target["action"] == "delete"
+        ):
+            # A provider-confirmed deletion remains true even when concurrent
+            # state has rebound the selected pane. Invalidate every alias
+            # before deciding whether the target-specific lifecycle mutation
+            # is still safe to apply.
+            _record_topic_delete_success(
+                store,
+                topic_id=str(target["topic_id"]),
+                name=target.get("topic_name"),
+                reason=str(target["reason"]),
+            )
+            result["changed"] = True
+        if not target_still_valid:
             result["deferred"] += 1
             continue
         result["operations"] += 1
@@ -3235,12 +3254,6 @@ def _apply_topic_cleanup_outcomes(
             retry_after.pop(target_key, None)
             kind = str(outcome.get("kind") or "")
             if target["action"] == "delete":
-                _record_topic_delete_success(
-                    store,
-                    topic_id=str(target["topic_id"]),
-                    name=entry.get("topic_name"),
-                    reason=str(target["reason"]),
-                )
                 _record_lifecycle_topic_deleted(
                     entry,
                     topic_id=str(target["topic_id"]),
