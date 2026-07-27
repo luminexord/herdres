@@ -136,9 +136,17 @@ class DeletedWorkingTopicTelegram(DeletedTopicTelegram):
 
 
 class MissingWorkingCardTelegram(FakeTelegram):
-    def __init__(self, stale_message_id: str):
+    def __init__(
+        self,
+        stale_message_id: str,
+        *,
+        kind: str = "not_found",
+        error: str = "Bad Request: message to edit not found",
+    ):
         super().__init__()
         self.stale_message_id = stale_message_id
+        self.kind = kind
+        self.error = error
         self.failed_working_edits = 0
 
     def edit_message(self, chat_id, message_id, html):
@@ -146,8 +154,8 @@ class MissingWorkingCardTelegram(FakeTelegram):
             self.failed_working_edits += 1
             return {
                 "ok": False,
-                "kind": "not_found",
-                "error": "Bad Request: message to edit not found",
+                "kind": self.kind,
+                "error": self.error,
             }
         return super().edit_message(chat_id, message_id, html)
 
@@ -1074,7 +1082,19 @@ def test_working_edit_not_found_resends_to_prove_dead_topic_then_remints_once():
     assert len(working_bindings) == 1
 
 
-def test_working_edit_not_found_resends_once_when_topic_is_alive():
+@pytest.mark.parametrize(
+    ("edit_kind", "edit_error"),
+    [
+        ("not_found", "Bad Request: message to edit not found"),
+        (
+            "topic_not_found",
+            "Bad Request: message thread not found",
+        ),
+    ],
+)
+def test_working_edit_not_found_resends_once_when_topic_is_alive(
+    edit_kind, edit_error
+):
     store = _store()
     topic_id = "15007"
     stale_message_id = "15333"
@@ -1101,7 +1121,11 @@ def test_working_edit_not_found_resends_once_when_topic_is_alive():
         turn_id="turn-working",
         bot_kind="manager",
     )
-    telegram = MissingWorkingCardTelegram(stale_message_id)
+    telegram = MissingWorkingCardTelegram(
+        stale_message_id,
+        kind=edit_kind,
+        error=edit_error,
+    )
     runtime = SyncRuntime(
         FakeTendwire(
             workers=[_worker()],

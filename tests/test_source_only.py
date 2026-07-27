@@ -1367,6 +1367,14 @@ def test_outbox_attention_falls_back_when_general_thread_missing():
             return super().send_message(chat_id, html, **kwargs)
 
     store = _store()
+    stale_alias = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "topic_id": "1",
+        "topic_name": "stale general alias",
+        "status": "closed",
+    }
+    store["panes"]["worker:stale-general-alias"] = stale_alias
     tendwire = OutboxTendwire()
     telegram = TopicMissingTelegram()
 
@@ -1378,6 +1386,9 @@ def test_outbox_attention_falls_back_when_general_thread_missing():
     assert tendwire.failed == []
     assert tendwire.acked == [("ref-1", {"telegram": "delivered"})]
     assert telegram.sent[-1][2].get("thread_id") is None
+    assert store["telegram_dead_topic_ids"] == ["1"]
+    assert "topic_id" not in stale_alias
+    assert stale_alias["deleted_topic_id"] == "1"
 
 
 def test_long_telegram_send_splits_instead_of_truncating():
@@ -2174,6 +2185,48 @@ def test_topic_pinned_status_reuses_legacy_topic_pin(monkeypatch):
     assert ("-100", "55") in telegram.pins
     assert any(edit[1] == "55" for edit in telegram.edited)
     assert not any(sent[2].get("thread_id") == "77" for sent in telegram.sent)
+
+
+def test_topic_pinned_edit_topic_not_found_resends_before_tombstoning(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+
+    class MissingPinnedEditTelegram(FakeTelegram):
+        def edit_message(self, chat_id, message_id, html):
+            if str(message_id) == "55":
+                return {
+                    "ok": False,
+                    "kind": "topic_not_found",
+                    "error": "Bad Request: message thread not found",
+                }
+            return super().edit_message(chat_id, message_id, html)
+
+    store = _store()
+    store["spaces"]["workspace:space-1"] = {
+        "topic_name": "Project",
+        "topic_id": "77",
+        "pinned_status_message_id": "55",
+    }
+    telegram = MissingPinnedEditTelegram()
+
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns={"turns": []}),
+            telegram,
+            with_outbox=False,
+        ),
+    )
+    entry = next(iter(state.source_space_entries(store).values()))
+
+    assert entry["topic_id"] == "77"
+    assert store.get("telegram_dead_topic_ids", []) == []
+    assert entry["pinned_status_message_id"] != "55"
+    assert any(
+        sent[2].get("thread_id") == "77"
+        for sent in telegram.sent
+    )
 
 
 def test_pinned_status_falls_back_when_general_thread_is_missing(monkeypatch):

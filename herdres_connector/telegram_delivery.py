@@ -586,6 +586,7 @@ def drain_outbox(
         thread_id = config.general_thread_id(store)
         sent = {"ok": True, "message_id": "0"} if dry_run else telegram.send_message(chat_id, html, thread_id=thread_id, notify=True)
         if not dry_run and not sent.get("ok") and thread_id and _topic_missing(sent.get("error")):
+            state.tombstone_dead_topic(store, str(thread_id))
             sent = telegram.send_message(chat_id, html, notify=True)
             if sent.get("ok"):
                 sent["fallback_reason"] = "general_thread_missing"
