@@ -107,6 +107,7 @@ class FakeTelegram:
         self.edited: list[dict] = []
         self.markup_edits: list[dict] = []
         self.callback_answers: list[dict] = []
+        self.deleted: list[dict] = []
 
     def send_message(self, chat_id, html, **kwargs):
         message_id = str(101 + len(self.sent))
@@ -139,6 +140,15 @@ class FakeTelegram:
             }
         )
         return {"ok": True, "message_id": str(message_id)}
+
+    def delete_message(self, chat_id, message_id):
+        self.deleted.append(
+            {
+                "chat_id": str(chat_id),
+                "message_id": str(message_id),
+            }
+        )
+        return {"ok": True}
 
     def answer_callback_query(self, callback_query_id, text="", **kwargs):
         self.callback_answers.append(
@@ -214,6 +224,58 @@ class FakeTendwire:
             "error": None,
             "warnings": [],
         }
+
+
+def _rebind_state(state_path, topic_id: str = "88") -> None:
+    concurrent = state.load_state(state_path)
+    concurrent["panes"]["worker-entry"]["topic_id"] = topic_id
+    state.save_state(concurrent, state_path)
+
+
+class RebindingTelegram(FakeTelegram):
+    def __init__(self, state_path, *, on: str) -> None:
+        super().__init__()
+        self.state_path = state_path
+        self.on = on
+        self.rebound = False
+
+    def _maybe_rebind(self, operation: str) -> None:
+        if not self.rebound and self.on == operation:
+            self.rebound = True
+            _rebind_state(self.state_path)
+
+    def send_message(self, chat_id, html, **kwargs):
+        result = super().send_message(chat_id, html, **kwargs)
+        self._maybe_rebind("send")
+        return result
+
+    def edit_message(self, chat_id, message_id, html):
+        result = super().edit_message(chat_id, message_id, html)
+        self._maybe_rebind("edit")
+        return result
+
+    def edit_message_reply_markup(
+        self, chat_id, message_id, reply_markup
+    ):
+        result = super().edit_message_reply_markup(
+            chat_id, message_id, reply_markup
+        )
+        self._maybe_rebind("markup")
+        return result
+
+
+class RebindingTendwire(FakeTendwire):
+    def __init__(self, state_path) -> None:
+        super().__init__()
+        self.state_path = state_path
+        self.rebound = False
+
+    def command(self, request):
+        result = super().command(request)
+        if not self.rebound:
+            self.rebound = True
+            _rebind_state(self.state_path)
+        return result
 
 
 def _post(store: dict, telegram: FakeTelegram, payload: dict) -> dict:
@@ -704,6 +766,155 @@ def test_production_guarded_runtime_posts_callbacks_and_retracts(
     assert len(tendwire.commands) == 1
     assert len(telegram.markup_edits) == 3
     assert len(telegram.edited) == 2
+
+
+def _guarded_runtime(current, telegram, tendwire=None):
+    return source_sync._offlock_runtime(
+        current,
+        source_sync.SyncRuntime(
+            tendwire=tendwire or FakeTendwire(),
+            telegram=telegram,
+            with_outbox=False,
+        ),
+    )
+
+
+def test_guarded_decision_post_rebind_tracks_and_retires_stale_card(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(_store(), state_path)
+    telegram = RebindingTelegram(state_path, on="send")
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = _guarded_runtime(current, telegram)
+        first = source_sync._deliver_decisions(
+            current, _pending(), runtime, chat_id="-100"
+        )
+        assert first["posted"] == 0
+        assert first["changed"] is True
+        artifacts = current["decisions"]["accepted_artifacts"]
+        assert [row["message_id"] for row in artifacts.values()] == ["101"]
+        assert decisions.active_decision(current, "77") is None
+
+        second = source_sync._deliver_decisions(
+            current, _pending(), runtime, chat_id="-100"
+        )
+
+    assert second["posted"] == 1
+    assert telegram.deleted == [{"chat_id": "-100", "message_id": "101"}]
+    assert [
+        row["kwargs"]["thread_id"] for row in telegram.sent
+    ] == ["77", "88"]
+    active = decisions.active_decision(current, "88")
+    assert active is not None and active["message_id"] == "102"
+    assert current["decisions"]["accepted_artifacts"] == {}
+
+
+def test_guarded_decision_retract_rebind_finishes_exact_old_card(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(_store(), state_path)
+    telegram = RebindingTelegram(state_path, on="markup")
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = _guarded_runtime(current, telegram)
+        telegram.on = "never"
+        posted = source_sync._deliver_decisions(
+            current, _pending(), runtime, chat_id="-100"
+        )
+        assert posted["posted"] == 1
+        telegram.on = "markup"
+        retracted = source_sync._deliver_decisions(
+            current,
+            {"pending_interactions": []},
+            runtime,
+            chat_id="-100",
+        )
+
+    assert retracted["retracted"] == 1
+    assert current["panes"]["worker-entry"]["topic_id"] == "88"
+    assert current["decisions"]["active"] == {}
+    assert telegram.markup_edits[-1]["message_id"] == "101"
+    assert telegram.edited[-1]["message_id"] == "101"
+
+
+def test_guarded_decision_toggle_rebind_does_not_write_rebound_owner(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(_store(), state_path)
+    telegram = RebindingTelegram(state_path, on="never")
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = _guarded_runtime(current, telegram)
+        source_sync._deliver_decisions(
+            current, _pending(kind="multi"), runtime, chat_id="-100"
+        )
+        record = decisions.active_decision(current, "77")
+        assert record is not None
+        telegram.on = "markup"
+        result = decisions.handle_callback(
+            current,
+            callback_data=_button(record, "1"),
+            topic_id="77",
+            chat_id="-100",
+            request_id=_request_id(),
+            telegram=runtime.telegram,
+            tendwire=runtime.tendwire,
+            provider_executor=source_sync._decision_provider_executor(
+                current, runtime
+            ),
+        )
+
+    assert result["status"] == "telegram_edit_failed"
+    assert current["panes"]["worker-entry"]["topic_id"] == "88"
+    stale = decisions.active_decision(current, "77")
+    assert stale is not None and stale["selected"] == []
+
+
+def test_guarded_decision_submit_rebind_tracks_acceptance_once(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(_store(), state_path)
+    telegram = FakeTelegram()
+    tendwire = RebindingTendwire(state_path)
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = _guarded_runtime(current, telegram, tendwire)
+        source_sync._deliver_decisions(
+            current, _pending(), runtime, chat_id="-100"
+        )
+        record = decisions.active_decision(current, "77")
+        assert record is not None
+        result = decisions.handle_callback(
+            current,
+            callback_data=_button(record, "2"),
+            topic_id="77",
+            chat_id="-100",
+            request_id=_request_id(update_id=106, message_id=9006),
+            telegram=runtime.telegram,
+            tendwire=runtime.tendwire,
+            provider_executor=source_sync._decision_provider_executor(
+                current, runtime
+            ),
+        )
+
+    assert result["status"] == "accepted"
+    assert len(tendwire.commands) == 1
+    assert current["panes"]["worker-entry"]["topic_id"] == "88"
+    assert current["decisions"]["active"] == {}
+    assert current["decisions"]["accepted_artifacts"] == {}
 
 
 def test_dry_run_decision_sync_has_no_telegram_or_state_writes() -> None:

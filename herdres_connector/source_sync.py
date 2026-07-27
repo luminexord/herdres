@@ -14,6 +14,9 @@ from . import accounts, config, decisions, ingress_requests, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import (
+    RICH_BAD_REQUEST_LIMIT,
+    RICH_RENDER_VERSION,
+    RICH_STATE_UPDATE_KEY,
     edit_feed_item,
     edit_turn_delivery_part,
     feed_item_requires_send_split,
@@ -194,19 +197,6 @@ _ADAPTER_PROVIDER_CAPABILITIES = frozenset(
         "telegram.send_voice_batch",
     }
 )
-
-_OFFLOCK_EXECUTOR_TOKEN = object()
-_CONSUMED_PROVIDER_MUTATIONS: weakref.WeakSet[_ProviderMutation] = (
-    weakref.WeakSet()
-)
-
-
-def _require_executor_token(token: object) -> None:
-    if token is not _OFFLOCK_EXECUTOR_TOKEN:
-        raise RuntimeError(
-            "low-level off-lock executor is private to audited wrappers"
-        )
-
 
 def _provider_mutation(
     capability: str,
@@ -562,124 +552,6 @@ def _operation_from_provenance(
     )
 
 
-def _invoke_provider_mutation(
-    provider: Any,
-    mutation: _ProviderMutation,
-    *,
-    _token: object,
-) -> Any:
-    """Internal dispatcher: the only code that receives a raw provider."""
-
-    _require_executor_token(_token)
-    if mutation in _CONSUMED_PROVIDER_MUTATIONS:
-        raise RuntimeError("provider mutation capability was already consumed")
-    _CONSUMED_PROVIDER_MUTATIONS.add(mutation)
-    if mutation.api_token:
-        provider = provider.with_token(mutation.api_token)
-    args = mutation.args
-    kwargs = dict(mutation.kwargs)
-    method_name = _DIRECT_PROVIDER_CAPABILITIES.get(mutation.capability)
-    if method_name is not None:
-        method = getattr(provider, method_name, None)
-        if method is None and method_name.endswith("_for_cleanup"):
-            method = getattr(provider, method_name.removesuffix("_for_cleanup"))
-        return method(*args, **kwargs)
-    if mutation.capability == "telegram.edit_feed_item":
-        return edit_feed_item(provider, *args, **kwargs)
-    if mutation.capability == "telegram.send_feed_item":
-        return send_feed_item(provider, *args, **kwargs)
-    if mutation.capability == "telegram.edit_turn_delivery_part":
-        return edit_turn_delivery_part(provider, *args, **kwargs)
-    if mutation.capability == "telegram.send_turn_delivery_part":
-        return send_turn_delivery_part(provider, *args, **kwargs)
-    if mutation.capability == "telegram.delete_turn_delivery_message":
-        return delete_turn_delivery_message(provider, *args, **kwargs)
-    if mutation.capability == "telegram.send_voice_batch":
-        (
-            chunks,
-            turn_id,
-            chat_id,
-            thread_id,
-            reply_to,
-        ) = args
-        ids: list[str] = []
-        for index, chunk in enumerate(chunks):
-            try:
-                dest = (
-                    speech.outbound_speech_dir(prune=(index == 0))
-                    / (
-                        "reply-"
-                        + short_hash(
-                            {"t": turn_id, "i": index, "h": chunk}, 16
-                        )
-                        + ".ogg"
-                    )
-                )
-                if not speech.speech_request(
-                    "tts", {"text": chunk, "dest": str(dest)}
-                ).get("ok"):
-                    continue
-                sent = provider.send_voice(
-                    chat_id,
-                    dest,
-                    thread_id=thread_id,
-                    reply_to_message_id=(
-                        reply_to if index == 0 else None
-                    ),
-                    notify=False,
-                )
-                if sent.get("ok") and sent.get("message_id"):
-                    ids.append(str(sent.get("message_id")))
-            except Exception as exc:
-                print(
-                    f"herdres speak-reply chunk failed: {exc}",
-                    file=sys.stderr,
-                )
-        return ids
-    raise AssertionError(
-        f"unhandled provider mutation capability: {mutation.capability}"
-    )
-
-
-def _offlock_client_internals(
-    client: "_OfflockClient",
-    *,
-    _token: object,
-) -> tuple[Any, dict[str, Any], str]:
-    """Executor-only access to the guarded provider and reloadable store."""
-
-    _require_executor_token(_token)
-    return (
-        object.__getattribute__(client, "_OfflockClient__provider"),
-        object.__getattribute__(client, "_OfflockClient__store"),
-        object.__getattribute__(
-            client, "_OfflockClient__provider_kind"
-        ),
-    )
-
-
-def _invoke_offlock(
-    client: "_OfflockClient",
-    call: Callable[[Any], Any],
-    *,
-    _token: object,
-) -> Any:
-    _require_executor_token(_token)
-    provider, store, _kind = _offlock_client_internals(
-        client, _token=_OFFLOCK_EXECUTOR_TOKEN
-    )
-    if not state.lock_actually_held():
-        # An outer phase may already have released the flock. In that case a
-        # nested save/reload could roll back a lane child commit.
-        return call(provider)
-    state.save_state(store)
-    try:
-        with state.released_lock():
-            return call(provider)
-    finally:
-        state.reload_state_in_place(store)
-
-
 class _OfflockClient:
     """Release the state flock around one provider call and reload afterwards."""
 
@@ -715,39 +587,20 @@ class _OfflockClient:
 
     def _execute_entry(
         self,
-        operation: _OfflockEntryOperation,
-        mutation: _ProviderMutation,
-        *,
-        _token: object = None,
+        *_args: Any,
+        **_kwargs: Any,
     ) -> Any:
-        _require_executor_token(_token)
-        if not isinstance(operation, _OfflockEntryOperation):
-            raise TypeError("entry mutation requires _OfflockEntryOperation")
-        return _invoke_offlock(
-            self,
-            lambda provider: _invoke_provider_mutation(
-                provider,
-                mutation,
-                _token=_OFFLOCK_EXECUTOR_TOKEN,
-            ),
-            _token=_OFFLOCK_EXECUTOR_TOKEN,
+        raise RuntimeError(
+            "low-level off-lock executor is private to audited wrappers"
         )
 
     def _execute_exact(
         self,
-        mutation: _ProviderMutation,
-        *,
-        _token: object = None,
+        *_args: Any,
+        **_kwargs: Any,
     ) -> Any:
-        _require_executor_token(_token)
-        return _invoke_offlock(
-            self,
-            lambda provider: _invoke_provider_mutation(
-                provider,
-                mutation,
-                _token=_OFFLOCK_EXECUTOR_TOKEN,
-            ),
-            _token=_OFFLOCK_EXECUTOR_TOKEN,
+        raise RuntimeError(
+            "low-level off-lock executor is private to audited wrappers"
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -764,15 +617,16 @@ class _OfflockClient:
             raise AttributeError(
                 "raw provider state is private to the capability executor"
             )
-        provider, store, provider_kind = _offlock_client_internals(
-            self, _token=_OFFLOCK_EXECUTOR_TOKEN
+        callable_attribute, value, provider_kind = (
+            _OFFLOCK_EXECUTOR.describe(self, name)
         )
-        attribute = getattr(provider, name)
-        if not callable(attribute):
-            return attribute
+        if not callable_attribute:
+            return value
         if name == "with_token":
             return lambda *args, **kwargs: _OfflockClient(
-                attribute(*args, **kwargs), store, provider_kind
+                _OFFLOCK_EXECUTOR.with_token(self, *args, **kwargs),
+                _OFFLOCK_EXECUTOR.store(self),
+                provider_kind,
             )
         if name == "api":
             def checked_api(method: str, *args: Any, **kwargs: Any) -> Any:
@@ -782,10 +636,8 @@ class _OfflockClient:
                         "_execute_entry_operation or "
                         "_execute_exact_provider_operation"
                     )
-                return _invoke_offlock(
-                    self,
-                    lambda _client: attribute(method, *args, **kwargs),
-                    _token=_OFFLOCK_EXECUTOR_TOKEN,
+                return _OFFLOCK_EXECUTOR.read(
+                    self, "api", method, *args, **kwargs
                 )
 
             return checked_api
@@ -802,11 +654,7 @@ class _OfflockClient:
             return rejected
 
         def call(*args: Any, **kwargs: Any) -> Any:
-            return _invoke_offlock(
-                self,
-                lambda _client: attribute(*args, **kwargs),
-                _token=_OFFLOCK_EXECUTOR_TOKEN,
-            )
+            return _OFFLOCK_EXECUTOR.read(self, name, *args, **kwargs)
 
         return call
 
@@ -836,23 +684,244 @@ class _ExactOfflockClient:
                 guarded.with_token(*args, **kwargs),
                 reason,
             )
-        _provider, _store, provider_kind = _offlock_client_internals(
-            guarded, _token=_OFFLOCK_EXECUTOR_TOKEN
-        )
+        provider_kind = _OFFLOCK_EXECUTOR.provider_kind(guarded)
         if name in _READ_ONLY_PROVIDER_METHODS.get(
             provider_kind, frozenset()
         ):
             return getattr(guarded, name)
         capability = f"{provider_kind}.{name}"
-        return lambda *args, **kwargs: guarded._execute_exact(
+        return lambda *args, **kwargs: _OFFLOCK_EXECUTOR.mutation(
+            guarded,
             _provider_mutation(
                 capability,
                 reason=f"{capability}: {reason}",
                 args=args,
                 kwargs=kwargs,
             ),
-            _token=_OFFLOCK_EXECUTOR_TOKEN,
         )
+
+
+def _build_offlock_executor() -> Any:
+    """Create the only raw-provider authority.
+
+    The raw provider and the single-consumption ledger live behind this
+    closure.  There is deliberately no module-visible token that ordinary
+    source code can borrow to turn an arbitrary callback into an executor.
+    """
+
+    consumed: weakref.WeakSet[_ProviderMutation] = weakref.WeakSet()
+
+    def internals(client: _OfflockClient) -> tuple[Any, dict[str, Any], str]:
+        return (
+            object.__getattribute__(client, "_OfflockClient__provider"),
+            object.__getattribute__(client, "_OfflockClient__store"),
+            object.__getattribute__(
+                client, "_OfflockClient__provider_kind"
+            ),
+        )
+
+    def invoke_provider_mutation(
+        provider: Any, mutation: _ProviderMutation
+    ) -> Any:
+        if mutation in consumed:
+            raise RuntimeError(
+                "provider mutation capability was already consumed"
+            )
+        consumed.add(mutation)
+        if mutation.api_token:
+            provider = provider.with_token(mutation.api_token)
+        args = mutation.args
+        kwargs = dict(mutation.kwargs)
+        method_name = _DIRECT_PROVIDER_CAPABILITIES.get(
+            mutation.capability
+        )
+        if method_name is not None:
+            method = getattr(provider, method_name, None)
+            if method is None and method_name.endswith("_for_cleanup"):
+                method = getattr(
+                    provider, method_name.removesuffix("_for_cleanup")
+                )
+            return method(*args, **kwargs)
+        if mutation.capability == "telegram.edit_feed_item":
+            return edit_feed_item(provider, *args, **kwargs)
+        if mutation.capability == "telegram.send_feed_item":
+            return send_feed_item(provider, *args, **kwargs)
+        if mutation.capability == "telegram.edit_turn_delivery_part":
+            return edit_turn_delivery_part(provider, *args, **kwargs)
+        if mutation.capability == "telegram.send_turn_delivery_part":
+            return send_turn_delivery_part(provider, *args, **kwargs)
+        if mutation.capability == "telegram.delete_turn_delivery_message":
+            return delete_turn_delivery_message(provider, *args, **kwargs)
+        if mutation.capability == "telegram.send_voice_batch":
+            (
+                chunks,
+                turn_id,
+                chat_id,
+                thread_id,
+                reply_to,
+            ) = args
+            ids: list[str] = []
+            for index, chunk in enumerate(chunks):
+                try:
+                    dest = (
+                        speech.outbound_speech_dir(prune=(index == 0))
+                        / (
+                            "reply-"
+                            + short_hash(
+                                {"t": turn_id, "i": index, "h": chunk},
+                                16,
+                            )
+                            + ".ogg"
+                        )
+                    )
+                    if not speech.speech_request(
+                        "tts", {"text": chunk, "dest": str(dest)}
+                    ).get("ok"):
+                        continue
+                    sent = provider.send_voice(
+                        chat_id,
+                        dest,
+                        thread_id=thread_id,
+                        reply_to_message_id=(
+                            reply_to if index == 0 else None
+                        ),
+                        notify=False,
+                    )
+                    if sent.get("ok") and sent.get("message_id"):
+                        ids.append(str(sent.get("message_id")))
+                except Exception as exc:
+                    print(
+                        f"herdres speak-reply chunk failed: {exc}",
+                        file=sys.stderr,
+                    )
+            return ids
+        raise AssertionError(
+            "unhandled provider mutation capability: "
+            f"{mutation.capability}"
+        )
+
+    def invoke_offlock(
+        client: _OfflockClient, call: Callable[[Any], Any]
+    ) -> Any:
+        provider, store, _kind = internals(client)
+        if not state.lock_actually_held():
+            return call(provider)
+        state.save_state(store)
+        try:
+            with state.released_lock():
+                return call(provider)
+        finally:
+            # Replace nested state instead of reconciling it in place.  Any
+            # entry reference retained across this provider window is now
+            # detectably stale and cannot mutate the reloaded owner.
+            fresh = state.load_state()
+            store.clear()
+            store.update(fresh)
+
+    class Executor:
+        @staticmethod
+        def describe(
+            client: _OfflockClient, name: str
+        ) -> tuple[bool, Any, str]:
+            provider, _store, provider_kind = internals(client)
+            attribute = getattr(provider, name)
+            return callable(attribute), (
+                None if callable(attribute) else attribute
+            ), provider_kind
+
+        @staticmethod
+        def store(client: _OfflockClient) -> dict[str, Any]:
+            _provider, store, _kind = internals(client)
+            return store
+
+        @staticmethod
+        def provider_kind(client: _OfflockClient) -> str:
+            _provider, _store, provider_kind = internals(client)
+            return provider_kind
+
+        @staticmethod
+        def with_token(
+            client: _OfflockClient, *args: Any, **kwargs: Any
+        ) -> Any:
+            provider, _store, _kind = internals(client)
+            return provider.with_token(*args, **kwargs)
+
+        @staticmethod
+        def read(
+            client: _OfflockClient,
+            method_name: str,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            return invoke_offlock(
+                client,
+                lambda provider: getattr(provider, method_name)(
+                    *args, **kwargs
+                ),
+            )
+
+        @staticmethod
+        def mutation(
+            client: _OfflockClient, mutation: _ProviderMutation
+        ) -> Any:
+            return invoke_offlock(
+                client,
+                lambda provider: invoke_provider_mutation(
+                    provider, mutation
+                ),
+            )
+
+        @staticmethod
+        def direct(
+            provider: Any, mutation: _ProviderMutation
+        ) -> Any:
+            return invoke_provider_mutation(provider, mutation)
+
+    return Executor()
+
+
+_OFFLOCK_EXECUTOR = _build_offlock_executor()
+
+
+def _apply_provider_capability_state(
+    store: dict[str, Any], result: Any
+) -> None:
+    """Apply provider facts returned by pure off-lock adapters after reload."""
+
+    if not isinstance(result, dict):
+        return
+    update = result.get(RICH_STATE_UPDATE_KEY)
+    if not isinstance(update, dict):
+        return
+    transition = str(update.get("transition") or "")
+    reason = compact_ws(update.get("reason"), 300)
+    telegram = _telegram_state(store)
+    rich = telegram.setdefault("rich_messages", {})
+    if not isinstance(rich, dict):
+        rich = {}
+        telegram["rich_messages"] = rich
+    if transition == "supported":
+        rich["supported"] = "yes"
+        rich.pop("disabled_reason", None)
+        rich.pop("bad_request_streak", None)
+        return
+    if transition == "disabled":
+        rich["supported"] = "no"
+        rich["disabled_reason"] = reason
+        rich["disabled_render_version"] = RICH_RENDER_VERSION
+        return
+    if transition != "bad_request":
+        return
+    try:
+        streak = int(rich.get("bad_request_streak") or 0)
+    except (TypeError, ValueError):
+        streak = 0
+    streak += 1
+    rich["bad_request_streak"] = streak
+    if streak >= RICH_BAD_REQUEST_LIMIT:
+        rich["supported"] = "no"
+        rich["disabled_reason"] = f"repeated bad_request: {reason}"
+        rich["disabled_render_version"] = RICH_RENDER_VERSION
 
 
 def _exact_provider_client(client: Any, *, reason: str) -> Any:
@@ -870,6 +939,10 @@ def _execute_entry_operation(
     client: Any,
     operation: _OfflockEntryOperation,
     mutation: _ProviderMutation,
+    *,
+    acceptance_checkpoint: (
+        Callable[[Any, _OfflockEntryOperation], None] | None
+    ) = None,
 ) -> _OfflockEntryExecution:
     """Execute an entry mutation and resolve its immutable request owner.
 
@@ -883,30 +956,21 @@ def _execute_entry_operation(
     if not isinstance(mutation, _ProviderMutation):
         raise TypeError("entry mutation requires one provider capability")
     if isinstance(client, _OfflockClient):
-        result = client._execute_entry(
-            operation,
-            mutation,
-            _token=_OFFLOCK_EXECUTOR_TOKEN,
-        )
+        result = _OFFLOCK_EXECUTOR.mutation(client, mutation)
     elif state.lock_actually_held():
         state.save_state(store)
         try:
             with state.released_lock():
-                result = _invoke_provider_mutation(
-                    client,
-                    mutation,
-                    _token=_OFFLOCK_EXECUTOR_TOKEN,
-                )
+                result = _OFFLOCK_EXECUTOR.direct(client, mutation)
         finally:
             fresh = state.load_state()
             store.clear()
             store.update(fresh)
     else:
-        result = _invoke_provider_mutation(
-            client,
-            mutation,
-            _token=_OFFLOCK_EXECUTOR_TOKEN,
-        )
+        result = _OFFLOCK_EXECUTOR.direct(client, mutation)
+    _apply_provider_capability_state(store, result)
+    if acceptance_checkpoint is not None:
+        acceptance_checkpoint(result, operation)
     return _OfflockEntryExecution(
         result=result,
         resolution=_compare_and_apply_entry_operation(store, operation),
@@ -924,27 +988,25 @@ def _execute_exact_provider_operation(
     if not isinstance(mutation, _ProviderMutation):
         raise TypeError("exact mutation requires one provider capability")
     if isinstance(client, _OfflockClient):
-        return client._execute_exact(
-            mutation, _token=_OFFLOCK_EXECUTOR_TOKEN
-        )
+        result = _OFFLOCK_EXECUTOR.mutation(client, mutation)
+        if store is not None:
+            _apply_provider_capability_state(store, result)
+        return result
     if store is not None and state.lock_actually_held():
         state.save_state(store)
         try:
             with state.released_lock():
-                return _invoke_provider_mutation(
-                    client,
-                    mutation,
-                    _token=_OFFLOCK_EXECUTOR_TOKEN,
-                )
+                result = _OFFLOCK_EXECUTOR.direct(client, mutation)
         finally:
             fresh = state.load_state()
             store.clear()
             store.update(fresh)
-    return _invoke_provider_mutation(
-        client,
-        mutation,
-        _token=_OFFLOCK_EXECUTOR_TOKEN,
-    )
+        _apply_provider_capability_state(store, result)
+        return result
+    result = _OFFLOCK_EXECUTOR.direct(client, mutation)
+    if store is not None:
+        _apply_provider_capability_state(store, result)
+    return result
 
 
 def _offlock_runtime(
@@ -10032,50 +10094,94 @@ def _decision_provider_executor(
     def _execute_decision_provider_operation(
         request: decisions.ProviderOperation,
     ) -> decisions.ProviderExecution:
-        entry = state.source_worker_entries(store).get(request.entry_key)
-        if (
-            entry is not None
-            and request.worker_id
-            and _entry_worker_id(entry) != request.worker_id
-        ):
-            entry = None
-        if entry is None and request.worker_id:
-            _key, entry = state.find_worker_entry_by_id(
-                store, request.worker_id
-            )
-        if (
-            entry is None
-            or str(entry.get("topic_id") or "") != request.topic_id
+        if not decisions.provider_acceptance_capacity_available(
+            store, request
         ):
             return decisions.ProviderExecution(
-                {"ok": False, "status": "owner_changed"},
+                {"ok": False, "status": "accepted_artifact_backpressure"},
                 _OFFLOCK_ABANDON,
             )
-        operation = _capture_entry_operation(
-            store,
-            entry,
-            topic_id=request.topic_id,
-            message_id=request.message_id,
-        )
+        operation: _OfflockEntryOperation | None = None
+        if request.provenance:
+            operation = _operation_from_provenance(request.provenance)
+        else:
+            entry = state.source_worker_entries(store).get(
+                request.entry_key
+            )
+            if (
+                entry is not None
+                and request.worker_id
+                and _entry_worker_id(entry) != request.worker_id
+            ):
+                entry = None
+            if entry is None and request.worker_id:
+                _key, entry = state.find_worker_entry_by_id(
+                    store, request.worker_id
+                )
+            if (
+                entry is None
+                or str(entry.get("topic_id") or "") != request.topic_id
+            ):
+                return decisions.ProviderExecution(
+                    {"ok": False, "status": "owner_changed"},
+                    _OFFLOCK_ABANDON,
+                )
+            operation = _capture_entry_operation(
+                store,
+                entry,
+                topic_id=request.topic_id,
+                message_id=request.message_id,
+            )
         client = (
             runtime.tendwire
             if request.capability.startswith("tendwire.")
             else runtime.telegram
         )
-        execution = _execute_entry_operation(
-            store,
-            client,
-            operation,
-            _provider_mutation(
-                request.capability,
-                reason=request.reason,
-                args=request.args,
-                kwargs=dict(request.kwargs),
-            ),
+        mutation = _provider_mutation(
+            request.capability,
+            reason=request.reason,
+            args=request.args,
+            kwargs=dict(request.kwargs),
         )
+        provenance = _operation_provenance(operation)
+        receipt_id = ""
+
+        def checkpoint_acceptance(
+            result: Any, _operation: _OfflockEntryOperation
+        ) -> None:
+            nonlocal receipt_id
+            receipt_id = decisions.checkpoint_provider_acceptance(
+                store,
+                request,
+                result if isinstance(result, Mapping) else {},
+                provenance,
+            )
+            if receipt_id and runtime.checkpoint is not None:
+                runtime.checkpoint()
+
+        if request.scope == "exact":
+            provider_result = _execute_exact_provider_operation(
+                client, mutation=mutation, store=store
+            )
+            checkpoint_acceptance(provider_result, operation)
+            resolution = _compare_and_apply_entry_operation(
+                store, operation
+            )
+        else:
+            execution = _execute_entry_operation(
+                store,
+                client,
+                operation,
+                mutation,
+                acceptance_checkpoint=checkpoint_acceptance,
+            )
+            provider_result = execution.result
+            resolution = execution.resolution
         return decisions.ProviderExecution(
-            dict(execution.result),
-            execution.resolution.disposition,
+            dict(provider_result),
+            resolution.disposition,
+            provenance=provenance,
+            receipt_id=receipt_id,
         )
 
     return _execute_decision_provider_operation

@@ -60,6 +60,7 @@ WORKING_ICON = "⚙️"
 RESPONSE_ICON = "✅"
 RICH_RENDER_VERSION = 27
 RICH_BAD_REQUEST_LIMIT = 3
+RICH_STATE_UPDATE_KEY = "_herdres_rich_state_update"
 
 FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
 HRULE_RE = re.compile(r"^\s*([-*_])(?:[ \t]*\1){2,}[ \t]*$")
@@ -684,10 +685,8 @@ def item_plain_text(item: dict[str, Any]) -> str:
 def rich_telegram_state(telegram: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(telegram, dict):
         return {}
-    rich = telegram.setdefault("rich_messages", {})
-    if not isinstance(rich, dict):
-        rich = {}
-        telegram["rich_messages"] = rich
+    current = telegram.get("rich_messages")
+    rich = dict(current) if isinstance(current, dict) else {}
     rich.setdefault("supported", "unknown")
     return rich
 
@@ -709,10 +708,6 @@ def rich_enabled(telegram: dict[str, Any] | None) -> bool:
     disabled_version = int(disabled_version_text) if disabled_version_text.isdigit() else 0
     if disabled_version == RICH_RENDER_VERSION:
         return False
-    rich["supported"] = "unknown"
-    rich.pop("disabled_reason", None)
-    rich.pop("bad_request_streak", None)
-    rich.pop("disabled_render_version", None)
     return True
 
 
@@ -720,34 +715,19 @@ def rich_message_send_enabled(telegram: dict[str, Any] | None) -> bool:
     return isinstance(telegram, dict) and rich_enabled(telegram)
 
 
-def mark_rich_supported(telegram: dict[str, Any] | None) -> None:
-    rich = rich_telegram_state(telegram)
-    if rich:
-        rich["supported"] = "yes"
-        rich.pop("disabled_reason", None)
-        rich.pop("bad_request_streak", None)
+def _with_rich_state_update(
+    result: dict[str, Any],
+    transition: str,
+    *,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Attach a pure provider fact for guarded post-reload application."""
 
-
-def mark_rich_disabled(telegram: dict[str, Any] | None, reason: str) -> None:
-    rich = rich_telegram_state(telegram)
-    if rich:
-        rich["supported"] = "no"
-        rich["disabled_reason"] = sanitize_text(reason, 300)
-        rich["disabled_render_version"] = RICH_RENDER_VERSION
-
-
-def note_rich_bad_request(telegram: dict[str, Any] | None, reason: str) -> None:
-    rich = rich_telegram_state(telegram)
-    if not rich:
-        return
-    try:
-        streak = int(rich.get("bad_request_streak") or 0)
-    except (TypeError, ValueError):
-        streak = 0
-    streak += 1
-    rich["bad_request_streak"] = streak
-    if streak >= RICH_BAD_REQUEST_LIMIT:
-        mark_rich_disabled(telegram, f"repeated bad_request: {reason}")
+    result[RICH_STATE_UPDATE_KEY] = {
+        "transition": transition,
+        "reason": sanitize_text(reason, 300),
+    }
+    return result
 
 
 def _client_for_token(client: TelegramClient, api_token: str | None) -> TelegramClient:
@@ -856,10 +836,6 @@ def send_rich_message(
         kind = _classify_telegram_error(exc)
         if kind == "transient":
             return _retry_rich_delivery(kind, exc)
-        if kind == "capability":
-            mark_rich_disabled(telegram, str(exc))
-        elif kind == "bad_request":
-            note_rich_bad_request(telegram, str(exc))
         elif api_token and kind == "bot_access":
             return {"ok": False, "format": "rich", "kind": kind, "error": str(exc)}
         fallback_result = _fallback_send(
@@ -872,9 +848,23 @@ def send_rich_message(
             require_single_operation=require_single_operation,
         )
         fallback_result["fallback_reason"] = kind
+        if kind == "capability":
+            _with_rich_state_update(
+                fallback_result, "disabled", reason=str(exc)
+            )
+        elif kind == "bad_request":
+            _with_rich_state_update(
+                fallback_result, "bad_request", reason=str(exc)
+            )
         return fallback_result
-    mark_rich_supported(telegram)
-    return {"ok": True, "format": "rich", "message_id": _telegram_message_id(response)}
+    return _with_rich_state_update(
+        {
+            "ok": True,
+            "format": "rich",
+            "message_id": _telegram_message_id(response),
+        },
+        "supported",
+    )
 
 
 def edit_rich_message(
@@ -933,25 +923,54 @@ def edit_rich_message(
         if kind == "transient":
             return _retry_rich_delivery(kind, exc)
         if kind == "not_modified":
-            return {"ok": True, "format": "rich", "kind": kind, "message_id": str(message_id)}
+            return _with_rich_state_update(
+                {
+                    "ok": True,
+                    "format": "rich",
+                    "kind": kind,
+                    "message_id": str(message_id),
+                },
+                "supported",
+            )
         if kind in {"not_found", "topic_not_found"}:
             return {"ok": False, "format": "rich", "kind": kind, "not_found": kind == "not_found", "topic_missing": kind == "topic_not_found", "error": str(exc)}
-        if kind == "capability":
-            mark_rich_disabled(telegram, str(exc))
-        elif kind == "bad_request":
-            note_rich_bad_request(telegram, str(exc))
         if not fallback_allowed:
-            return {
+            result = {
                 "ok": False,
                 "format": "plain",
                 "kind": "presentation_transport_changed",
                 "error": "presentation transport changed",
             }
+            if kind == "capability":
+                return _with_rich_state_update(
+                    result, "disabled", reason=str(exc)
+                )
+            if kind == "bad_request":
+                return _with_rich_state_update(
+                    result, "bad_request", reason=str(exc)
+                )
+            return result
         legacy = target.edit_message(chat_id, message_id, fallback)
         legacy["fallback_reason"] = kind
+        if kind == "capability":
+            _with_rich_state_update(
+                legacy, "disabled", reason=str(exc)
+            )
+        elif kind == "bad_request":
+            _with_rich_state_update(
+                legacy, "bad_request", reason=str(exc)
+            )
         return legacy
-    mark_rich_supported(telegram)
-    return {"ok": True, "format": "rich", "kind": "edited", "message_id": _telegram_message_id(response) or str(message_id)}
+    return _with_rich_state_update(
+        {
+            "ok": True,
+            "format": "rich",
+            "kind": "edited",
+            "message_id": _telegram_message_id(response)
+            or str(message_id),
+        },
+        "supported",
+    )
 
 
 def send_turn_delivery_part(
@@ -1064,13 +1083,17 @@ def send_feed_item(
             return result
         message_ids.extend(split_legacy_message_ids(result))
         formats.append(str(result.get("format") or ""))
-    return {
+    combined = {
         "ok": True,
         "format": "rich-split",
         "formats": formats,
         "message_id": message_ids[0] if message_ids else str(last_result.get("message_id") or ""),
         "message_ids": message_ids,
     }
+    update = last_result.get(RICH_STATE_UPDATE_KEY)
+    if isinstance(update, dict):
+        combined[RICH_STATE_UPDATE_KEY] = dict(update)
+    return combined
 
 
 def edit_feed_item(

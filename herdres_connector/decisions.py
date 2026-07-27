@@ -9,13 +9,13 @@ requiring the owner to finish the prompt at the desk.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from . import config, state
 from .ingress_identity import validate_request_id
 from .safe import compact_ws, html_escape, sanitize_text, short_hash
-from .telegram_delivery import TelegramClient
+from .telegram_delivery import TelegramClient, classify_telegram_error
 from .tendwire_client import TendwireClient
 
 
@@ -28,6 +28,7 @@ CALLBACK_DATA_LIMIT = 64
 ANSWER_IN_PROGRESS_REPLY = (
     "That prompt is being answered right now — try again in a moment."
 )
+ACCEPTED_ARTIFACT_LIMIT = 64
 
 
 @dataclass(frozen=True)
@@ -39,7 +40,11 @@ class ProviderOperation:
     entry_key: str
     worker_id: str
     topic_id: str
+    decision_id: str
     message_id: str = ""
+    scope: str = "entry"
+    artifact_kind: str = ""
+    provenance: Mapping[str, Any] | None = None
     args: tuple[Any, ...] = ()
     kwargs: tuple[tuple[str, Any], ...] = ()
 
@@ -48,6 +53,8 @@ class ProviderOperation:
 class ProviderExecution:
     result: dict[str, Any]
     disposition: str
+    provenance: dict[str, Any] = field(default_factory=dict)
+    receipt_id: str = ""
 
 
 ProviderExecutor = Callable[[ProviderOperation], ProviderExecution]
@@ -60,6 +67,8 @@ def _operation(
     record: Mapping[str, Any],
     topic_id: str,
     message_id: str = "",
+    scope: str = "entry",
+    artifact_kind: str = "",
     args: tuple[Any, ...] = (),
     kwargs: Mapping[str, Any] | None = None,
 ) -> ProviderOperation:
@@ -73,7 +82,15 @@ def _operation(
         entry_key=str(record.get("entry_key") or ""),
         worker_id=str(record.get("worker_id") or ""),
         topic_id=str(topic_id or ""),
+        decision_id=str(record.get("decision_id") or ""),
         message_id=str(message_id or ""),
+        scope=str(scope or "entry"),
+        artifact_kind=str(artifact_kind or ""),
+        provenance=(
+            dict(record.get("provider_provenance"))
+            if isinstance(record.get("provider_provenance"), Mapping)
+            else None
+        ),
         args=tuple(args),
         kwargs=tuple((str(key), value) for key, value in (kwargs or {}).items()),
     )
@@ -99,6 +116,9 @@ def _execute_direct(
         result = telegram.edit_message_reply_markup(
             *operation.args, **kwargs
         )
+    elif operation.capability == "telegram.delete_message":
+        assert telegram is not None
+        result = telegram.delete_message(*operation.args, **kwargs)
     elif operation.capability == "tendwire.command":
         assert tendwire is not None
         result = tendwire.command(*operation.args, **kwargs)
@@ -106,7 +126,11 @@ def _execute_direct(
         raise ValueError(
             f"unsupported decision capability: {operation.capability}"
         )
-    return ProviderExecution(dict(result), "apply")
+    return ProviderExecution(
+        dict(result),
+        "apply",
+        provenance=dict(operation.provenance or {}),
+    )
 
 
 def _execute(
@@ -260,6 +284,101 @@ def _active_records(
     return active
 
 
+def _accepted_artifacts(
+    store: dict[str, Any], *, create: bool
+) -> dict[str, dict[str, Any]]:
+    bucket = store.get("decisions")
+    if not isinstance(bucket, dict):
+        if not create:
+            return {}
+        bucket = {}
+        store["decisions"] = bucket
+    artifacts = bucket.get("accepted_artifacts")
+    if not isinstance(artifacts, dict):
+        if not create:
+            return {}
+        artifacts = {}
+        bucket["accepted_artifacts"] = artifacts
+    return artifacts
+
+
+def provider_acceptance_capacity_available(
+    store: dict[str, Any], operation: ProviderOperation
+) -> bool:
+    if not operation.artifact_kind:
+        return True
+    return len(_accepted_artifacts(store, create=False)) < (
+        ACCEPTED_ARTIFACT_LIMIT
+    )
+
+
+def checkpoint_provider_acceptance(
+    store: dict[str, Any],
+    operation: ProviderOperation,
+    result: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> str:
+    """Durably name a provider-accepted artifact before disposition handling."""
+
+    kind = operation.artifact_kind
+    accepted_message_id = str(
+        result.get("reply_markup_message_id")
+        or result.get("message_id")
+        or ""
+    )
+    accepted = (
+        kind == "decision_card"
+        and result.get("ok") is True
+        and bool(accepted_message_id)
+    ) or (
+        kind == "decision_submission"
+        and result.get("ok") is True
+        and str(result.get("status") or "") == "accepted"
+    )
+    if not accepted:
+        return ""
+    receipt_id = short_hash(
+        {
+            "kind": kind,
+            "decision_id": operation.decision_id,
+            "worker_id": operation.worker_id,
+            "topic_id": operation.topic_id,
+            "message_id": accepted_message_id,
+            "request": (
+                operation.args[0]
+                if kind == "decision_submission" and operation.args
+                else None
+            ),
+        },
+        32,
+    )
+    artifacts = _accepted_artifacts(store, create=True)
+    if receipt_id not in artifacts and len(artifacts) >= (
+        ACCEPTED_ARTIFACT_LIMIT
+    ):
+        raise RuntimeError("decision accepted-artifact ledger is full")
+    artifacts.setdefault(
+        receipt_id,
+        {
+            "kind": kind,
+            "decision_id": operation.decision_id,
+            "worker_id": operation.worker_id,
+            "entry_key": operation.entry_key,
+            "topic_id": operation.topic_id,
+            "message_id": accepted_message_id or operation.message_id,
+            "provenance": dict(provenance),
+        },
+    )
+    return receipt_id
+
+
+def complete_provider_acceptance(
+    store: dict[str, Any], receipt_id: str
+) -> None:
+    if receipt_id:
+        _accepted_artifacts(store, create=False).pop(receipt_id, None)
+
+
 def active_decision(store: dict[str, Any], topic_id: str | int) -> dict[str, Any] | None:
     record = _active_records(store, create=False).get(str(topic_id))
     return record if isinstance(record, dict) else None
@@ -268,8 +387,13 @@ def active_decision(store: dict[str, Any], topic_id: str | int) -> dict[str, Any
 def needs_sync(store: dict[str, Any], pending_payload: dict[str, Any]) -> bool:
     """Return whether a pass can post or retract a decision keyboard."""
 
-    return bool(_active_records(store, create=False)) or any(
-        _decision_blob(item) is not None for item in _pending_items(pending_payload)
+    return (
+        bool(_active_records(store, create=False))
+        or bool(_accepted_artifacts(store, create=False))
+        or any(
+            _decision_blob(item) is not None
+            for item in _pending_items(pending_payload)
+        )
     )
 
 
@@ -357,15 +481,13 @@ def _retract(
             record=record,
             topic_id=topic_id,
             message_id=message_id,
+            scope="exact",
             args=(chat_id, message_id, {"inline_keyboard": []}),
         ),
         telegram=telegram,
         provider_executor=provider_executor,
     )
-    if (
-        markup.disposition != "apply"
-        or markup.result.get("ok") is not True
-    ):
+    if markup.result.get("ok") is not True:
         return False
     edited = _execute(
         _operation(
@@ -374,6 +496,7 @@ def _retract(
             record=record,
             topic_id=topic_id,
             message_id=message_id,
+            scope="exact",
             args=(
                 chat_id,
                 message_id,
@@ -383,10 +506,91 @@ def _retract(
         telegram=telegram,
         provider_executor=provider_executor,
     )
-    return bool(
-        edited.disposition == "apply"
-        and edited.result.get("ok") is True
-    )
+    return bool(edited.result.get("ok") is True)
+
+
+def _drain_accepted_artifacts(
+    store: dict[str, Any],
+    telegram: TelegramClient,
+    *,
+    chat_id: str,
+    provider_executor: ProviderExecutor | None,
+) -> tuple[int, int]:
+    """Retire accepted stale cards and finish accepted submissions first."""
+
+    completed = 0
+    pending = 0
+    for receipt_id, raw in list(
+        _accepted_artifacts(store, create=False).items()
+    ):
+        if not isinstance(raw, dict):
+            complete_provider_acceptance(store, receipt_id)
+            completed += 1
+            continue
+        kind = str(raw.get("kind") or "")
+        topic_id = str(raw.get("topic_id") or "")
+        record = {
+            "decision_id": str(raw.get("decision_id") or ""),
+            "worker_id": str(raw.get("worker_id") or ""),
+            "entry_key": str(raw.get("entry_key") or ""),
+            "message_id": str(raw.get("message_id") or ""),
+            "provider_provenance": dict(raw.get("provenance") or {}),
+        }
+        if kind == "decision_card":
+            execution = _execute(
+                _operation(
+                    "telegram.delete_message",
+                    reason=(
+                        "telegram.delete_message: retire accepted stale "
+                        "decision card"
+                    ),
+                    record=record,
+                    topic_id=topic_id,
+                    message_id=record["message_id"],
+                    scope="exact",
+                    args=(chat_id, record["message_id"]),
+                ),
+                telegram=telegram,
+                provider_executor=provider_executor,
+            )
+            if (
+                execution.result.get("ok") is not True
+                and classify_telegram_error(
+                    execution.result.get("error")
+                )
+                != "not_found"
+            ):
+                pending += 1
+                continue
+            complete_provider_acceptance(store, receipt_id)
+            completed += 1
+            continue
+        if kind == "decision_submission":
+            active = active_decision(store, topic_id)
+            if active is not None and not _retract(
+                telegram,
+                chat_id,
+                topic_id,
+                active,
+                "✅ Answered.",
+                provider_executor=provider_executor,
+            ):
+                pending += 1
+                continue
+            active = _active_records(store, create=True)
+            current = active.get(topic_id)
+            if (
+                not isinstance(current, dict)
+                or str(current.get("decision_id") or "")
+                == record["decision_id"]
+            ):
+                active.pop(topic_id, None)
+            complete_provider_acceptance(store, receipt_id)
+            completed += 1
+            continue
+        complete_provider_acceptance(store, receipt_id)
+        completed += 1
+    return completed, pending
 
 
 def sync_decisions(
@@ -413,12 +617,29 @@ def sync_decisions(
             "dry_run": True,
         }
     if not resolved and not _active_records(store, create=False):
+        if not _accepted_artifacts(store, create=False):
+            return {
+                "enabled": True,
+                "changed": False,
+                "posted": 0,
+                "retracted": 0,
+                "resolved": 0,
+            }
+    artifact_completed, artifact_pending = _drain_accepted_artifacts(
+        store,
+        telegram,
+        chat_id=chat_id,
+        provider_executor=provider_executor,
+    )
+    if artifact_pending:
         return {
             "enabled": True,
-            "changed": False,
+            "changed": bool(artifact_completed),
             "posted": 0,
             "retracted": 0,
-            "resolved": 0,
+            "resolved": len(resolved),
+            "artifact_reconciled": artifact_completed,
+            "artifact_pending": artifact_pending,
         }
     active = _active_records(store, create=True)
     desired = {row["topic_id"]: row for row in resolved}
@@ -431,7 +652,7 @@ def sync_decisions(
     raw_pending_ids.discard("")
     posted = 0
     retracted = 0
-    changed = False
+    changed = bool(artifact_completed)
 
     for topic_id, raw_record in list(active.items()):
         if not isinstance(raw_record, dict):
@@ -484,6 +705,7 @@ def sync_decisions(
                 reason="telegram.send_message: post decision keyboard",
                 record=record,
                 topic_id=topic_id,
+                artifact_kind="decision_card",
                 args=(chat_id, render_decision(record)),
                 kwargs={
                     "thread_id": topic_id,
@@ -496,14 +718,18 @@ def sync_decisions(
         )
         sent = execution.result
         if execution.disposition != "apply":
+            changed = changed or bool(execution.receipt_id)
             continue
         if not sent.get("ok"):
             continue
         record["message_id"] = str(
             sent.get("reply_markup_message_id") or sent.get("message_id") or ""
         )
+        if execution.provenance:
+            record["provider_provenance"] = dict(execution.provenance)
         active = _active_records(store, create=True)
         active[topic_id] = record
+        complete_provider_acceptance(store, execution.receipt_id)
         posted += 1
         changed = True
     return {
@@ -512,6 +738,7 @@ def sync_decisions(
         "posted": posted,
         "retracted": retracted,
         "resolved": len(resolved),
+        "artifact_reconciled": artifact_completed,
     }
 
 
@@ -597,6 +824,7 @@ def _submit(
                 reason="tendwire.command: submit remote decision answer",
                 record=record,
                 topic_id=topic_id,
+                artifact_kind="decision_submission",
                 args=(
                     _answer_request(record, request_id, selection),
                 ),
@@ -605,7 +833,13 @@ def _submit(
             provider_executor=provider_executor,
         )
         result = execution.result
-        if execution.disposition != "apply":
+        if (
+            execution.disposition != "apply"
+            and not (
+                result.get("ok") is True
+                and result.get("status") == "accepted"
+            )
+        ):
             result = {
                 "ok": False,
                 "status": "owner_changed",
@@ -635,6 +869,7 @@ def _submit(
             }
         active = _active_records(store, create=True)
         active.pop(topic_id, None)
+        complete_provider_acceptance(store, execution.receipt_id)
         return {
             "handled": True,
             "changed": True,
@@ -783,6 +1018,7 @@ def handle_callback(
                 record=record,
                 topic_id=topic_id,
                 message_id=str(record.get("message_id") or ""),
+                scope="exact",
                 args=(
                     chat_id,
                     str(record.get("message_id") or ""),

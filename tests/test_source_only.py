@@ -48,6 +48,7 @@ def _offlock_protocol_violations(
     delivery_text: str,
     decisions_text: str | None = None,
     tendwire_text: str | None = None,
+    rich_text: str | None = None,
 ) -> list[tuple]:
     """Return structural executor escapes in every capability consumer."""
 
@@ -63,6 +64,13 @@ def _offlock_protocol_violations(
         )
         if tendwire_text is None
         else tendwire_text
+    )
+    rich_text = (
+        source_path.with_name("rich_delivery.py").read_text(
+            encoding="utf-8"
+        )
+        if rich_text is None
+        else rich_text
     )
     read_only_by_provider = source_sync._READ_ONLY_PROVIDER_METHODS
     read_only = set().union(*read_only_by_provider.values())
@@ -92,7 +100,7 @@ def _offlock_protocol_violations(
 
     def root_name(node):
         current = node
-        while isinstance(current, ast.Attribute):
+        while isinstance(current, (ast.Attribute, ast.Subscript)):
             current = current.value
         return current.id if isinstance(current, ast.Name) else ""
 
@@ -165,56 +173,184 @@ def _offlock_protocol_violations(
                     unsafe_name,
                 )
 
-    internal_allowed = {
-        "_execute_entry": {"_execute_entry_operation"},
-        "_execute_exact": {
+    removed_executor_names = {
+        "_invoke_offlock",
+        "_invoke_provider_mutation",
+        "_offlock_client_internals",
+        "_OFFLOCK_EXECUTOR_TOKEN",
+        "_require_executor_token",
+    }
+    executor_allowed = {
+        "describe": {"__getattr__"},
+        "store": {"__getattr__"},
+        "provider_kind": {"__getattr__"},
+        "with_token": {"__getattr__"},
+        "read": {"__getattr__", "call", "checked_api"},
+        "mutation": {
             "__getattr__",
-            "_execute_exact_provider_operation",
-        },
-        "_invoke_offlock": {
-            "__getattr__",
-            "call",
-            "checked_api",
-            "_execute_entry",
-            "_execute_exact",
-        },
-        "_invoke_provider_mutation": {
-            "_execute_entry",
-            "_execute_exact",
             "_execute_entry_operation",
             "_execute_exact_provider_operation",
         },
-        "_offlock_client_internals": {
-            "__getattr__",
-            "_invoke_offlock",
+        "direct": {
+            "_execute_entry_operation",
+            "_execute_exact_provider_operation",
         },
     }
+    executor_aliases: set[str] = set()
+    executor_object_aliases: set[str] = set()
+    sensitive_aliases: set[str] = set()
+    sensitive_names = removed_executor_names | {
+        "_execute_entry_operation",
+        "_execute_exact_provider_operation",
+        "_exact_provider_client",
+        "_provider_mutation",
+    }
+    alias_changed = True
+    while alias_changed:
+        pass_changed = False
+        for node in ast.walk(source_tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            target_names = {
+                target.id
+                for target in targets
+                if isinstance(target, ast.Name)
+            }
+            before = (
+                len(executor_aliases),
+                len(executor_object_aliases),
+                len(sensitive_aliases),
+            )
+            if (
+                isinstance(value, ast.Name)
+                and value.id == "_OFFLOCK_EXECUTOR"
+            ):
+                executor_object_aliases.update(target_names)
+            if (
+                isinstance(value, ast.Attribute)
+                and (
+                    (
+                        isinstance(value.value, ast.Name)
+                        and value.value.id == "_OFFLOCK_EXECUTOR"
+                    )
+                    or (
+                        isinstance(value.value, ast.Name)
+                        and value.value.id in executor_object_aliases
+                    )
+                )
+            ):
+                executor_aliases.update(target_names)
+            if (
+                isinstance(value, ast.Name)
+                and (
+                    value.id in sensitive_names
+                    or value.id in sensitive_aliases
+                    or value.id == "getattr"
+                )
+            ):
+                sensitive_aliases.update(target_names)
+            if (
+                isinstance(value, ast.Attribute)
+                and value.attr in {
+                    "__getattribute__",
+                    "_execute_entry",
+                    "_execute_exact",
+                }
+            ):
+                sensitive_aliases.update(target_names)
+            if before != (
+                len(executor_aliases),
+                len(executor_object_aliases),
+                len(sensitive_aliases),
+            ):
+                pass_changed = True
+        alias_changed = pass_changed
 
     for node in ast.walk(source_tree):
         owner = source_function_name(node)
+        if isinstance(node, ast.Name) and node.id in removed_executor_names:
+            violations.append(
+                ("removed_executor_escape", node.lineno, owner, node.id)
+            )
         if isinstance(node, ast.Attribute) and (
             node.attr == "_client"
             or node.attr.startswith("_OfflockClient__provider")
         ):
-            if owner != "_offlock_client_internals":
+            if owner != "internals":
                 violations.append(
                     ("raw_client_attribute", node.lineno, owner, node.attr)
                 )
         if not isinstance(node, ast.Call):
             continue
         name = call_name(node.func)
-        if name in internal_allowed and owner not in internal_allowed[name]:
+        if name in removed_executor_names | {
+            "_execute_entry",
+            "_execute_exact",
+        }:
+            violations.append(
+                ("internal_executor_escape", node.lineno, owner, name)
+            )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in executor_aliases
+        ):
+            violations.append(
+                ("executor_alias_escape", node.lineno, owner, node.func.id)
+            )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in sensitive_aliases
+        ):
+            violations.append(
+                (
+                    "sensitive_alias_escape",
+                    node.lineno,
+                    owner,
+                    node.func.id,
+                )
+            )
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in executor_object_aliases
+        ):
+            violations.append(
+                ("executor_object_alias_escape", node.lineno, owner, name)
+            )
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "_OFFLOCK_EXECUTOR"
+            and owner not in executor_allowed.get(name, set())
+        ):
             violations.append(
                 ("internal_executor_escape", node.lineno, owner, name)
             )
         if (
             name == "__getattribute__"
             and len(node.args) >= 2
-            and isinstance(node.args[1], ast.Constant)
-            and str(node.args[1].value).startswith(
-                "_OfflockClient__provider"
+            and (
+                provider_receiver(node.args[0])
+                or (
+                    isinstance(node.args[1], ast.Constant)
+                    and str(node.args[1].value).startswith(
+                        "_OfflockClient__provider"
+                    )
+                )
             )
-            and owner != "_offlock_client_internals"
+            and (
+                not isinstance(node.args[1], ast.Constant)
+                or str(node.args[1].value).startswith(
+                    "_OfflockClient__provider"
+                )
+            )
+            and owner != "internals"
         ):
             violations.append(
                 ("reflected_raw_provider", node.lineno, owner)
@@ -222,7 +358,7 @@ def _offlock_protocol_violations(
         if (
             isinstance(node.func, ast.Name)
             and node.func.id in unsafe_aliases
-            and owner != "_invoke_provider_mutation"
+            and owner != "invoke_provider_mutation"
         ):
             violations.append(
                 (
@@ -236,19 +372,38 @@ def _offlock_protocol_violations(
         if name == "_execute_entry_operation":
             declared = (
                 len(node.args) == 4
-                and isinstance(node.args[3], ast.Call)
-                and isinstance(node.args[3].func, ast.Name)
-                and node.args[3].func.id == "_provider_mutation"
+                and (
+                    (
+                        isinstance(node.args[3], ast.Call)
+                        and isinstance(node.args[3].func, ast.Name)
+                        and node.args[3].func.id == "_provider_mutation"
+                    )
+                    or (
+                        owner == "_execute_decision_provider_operation"
+                        and isinstance(node.args[3], ast.Name)
+                        and node.args[3].id == "mutation"
+                    )
+                )
             )
             if not declared:
                 violations.append(("entry_without_capability", node.lineno))
         if name == "_execute_exact_provider_operation":
-            declared = any(
-                keyword.arg == "mutation"
-                and isinstance(keyword.value, ast.Call)
-                and isinstance(keyword.value.func, ast.Name)
-                and keyword.value.func.id == "_provider_mutation"
-                for keyword in node.keywords
+            mutation_value = next(
+                (
+                    keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg == "mutation"
+                ),
+                None,
+            )
+            declared = (
+                isinstance(mutation_value, ast.Call)
+                and isinstance(mutation_value.func, ast.Name)
+                and mutation_value.func.id == "_provider_mutation"
+            ) or (
+                owner == "_execute_decision_provider_operation"
+                and isinstance(mutation_value, ast.Name)
+                and mutation_value.id == "mutation"
             )
             if not declared:
                 violations.append(("exact_without_capability", node.lineno))
@@ -286,8 +441,7 @@ def _offlock_protocol_violations(
             if (
                 provider_receiver(node.func.value)
                 and name not in read_only
-                and name not in internal_allowed
-                and owner != "_invoke_provider_mutation"
+                and owner != "invoke_provider_mutation"
             ):
                 violations.append(
                     ("raw_mutation", node.lineno, owner, name)
@@ -295,25 +449,36 @@ def _offlock_protocol_violations(
         if (
             name == "getattr"
             and len(node.args) >= 2
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value not in read_only
             and provider_receiver(node.args[0])
-            and owner != "_invoke_provider_mutation"
+            and owner not in {
+                "__getattr__",
+                "describe",
+                "read",
+                "invoke_provider_mutation",
+            }
         ):
             violations.append(
                 (
-                    "raw_getattr_mutation",
+                    (
+                        "computed_provider_getattr"
+                        if not isinstance(node.args[1], ast.Constant)
+                        else "raw_getattr_mutation"
+                    ),
                     node.lineno,
                     owner,
-                    node.args[1].value,
+                    (
+                        node.args[1].value
+                        if isinstance(node.args[1], ast.Constant)
+                        else "<computed>"
+                    ),
                 )
             )
 
     dispatcher = next(
         node
-        for node in source_tree.body
+        for node in ast.walk(source_tree)
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_invoke_provider_mutation"
+        and node.name == "invoke_provider_mutation"
     )
     for node in ast.walk(dispatcher):
         if (
@@ -481,6 +646,7 @@ def _offlock_protocol_violations(
         ("telegram", "send_message"),
         ("telegram", "edit_message"),
         ("telegram", "edit_message_reply_markup"),
+        ("telegram", "delete_message"),
         ("tendwire", "command"),
     }
     for node in ast.walk(decisions_tree):
@@ -557,6 +723,116 @@ def _offlock_protocol_violations(
         ):
             violations.append(
                 ("decision_dispatcher_state_write", node.lineno)
+            )
+
+    # Rich adapters execute inside the raw-provider closure.  Their provider
+    # result may describe a state transition, but the callback itself must not
+    # mutate the live telegram state that will be discarded by reload.
+    rich_tree = ast.parse(rich_text)
+    rich_parents = {
+        child: parent
+        for parent in ast.walk(rich_tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def rich_function_name(node):
+        current = node
+        while current in rich_parents:
+            current = rich_parents[current]
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return current.name
+        return ""
+
+    adapter_roots = {
+        "edit_feed_item",
+        "edit_rich_message",
+        "edit_turn_delivery_part",
+        "send_feed_item",
+        "send_rich_message",
+        "send_turn_delivery_part",
+    }
+    rich_functions = {
+        node.name: node
+        for node in rich_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    reachable = set(adapter_roots)
+    changed = True
+    while changed:
+        changed = False
+        for name in list(reachable):
+            function = rich_functions.get(name)
+            if function is None:
+                continue
+            for node in ast.walk(function):
+                called = (
+                    node.func.id
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    else ""
+                )
+                if called in rich_functions and called not in reachable:
+                    reachable.add(called)
+                    changed = True
+    rich_aliases: dict[str, set[str]] = {}
+    for owner in reachable:
+        function = rich_functions.get(owner)
+        if function is None:
+            continue
+        aliases = rich_aliases.setdefault(owner, set())
+        for node in ast.walk(function):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "rich_telegram_state"
+                and value.args
+                and root_name(value.args[0]) == "telegram"
+            ):
+                aliases.update(
+                    target.id
+                    for target in targets
+                    if isinstance(target, ast.Name)
+                )
+    for node in ast.walk(rich_tree):
+        owner = rich_function_name(node)
+        if owner not in reachable:
+            continue
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and (
+                root_name(node.value) == "telegram"
+                or root_name(node.value) in rich_aliases.get(owner, set())
+            )
+        ):
+            violations.append(
+                ("rich_adapter_state_write", node.lineno, owner)
+            )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and (
+                root_name(node.func.value) == "telegram"
+                or root_name(node.func.value)
+                in rich_aliases.get(owner, set())
+            )
+            and node.func.attr in {
+                "clear",
+                "pop",
+                "setdefault",
+                "update",
+            }
+        ):
+            violations.append(
+                ("rich_adapter_state_write", node.lineno, owner)
             )
 
     def public_methods(text, class_name):
@@ -675,9 +951,9 @@ def test_offlock_enforcement_rejects_all_three_demonstrated_bypasses():
         "if mutation.capability == \"telegram.send_voice_batch\":",
         (
             "if mutation.capability == \"telegram.send_voice_batch\":\n"
-            "        entry = {}\n"
-            "        provider.send_message(\"-100\", \"unsafe\")\n"
-            "        entry[\"last_topic_error\"] = \"unsafe\""
+            "            entry = {}\n"
+            "            provider.send_message(\"-100\", \"unsafe\")\n"
+            "            entry[\"last_topic_error\"] = \"unsafe\""
         ),
         1,
     )
@@ -875,6 +1151,75 @@ def test_offlock_internal_entrypoints_reject_bypass_and_capability_replay():
     assert len(telegram.sent) == 1
 
 
+def test_offlock_alias_computed_method_escape_is_rejected_and_stale_refs_detach(
+    tmp_path, monkeypatch
+):
+    source_path = Path(source_sync.__file__)
+    delivery_path = source_path.with_name("telegram_delivery.py")
+    source_text = source_path.read_text(encoding="utf-8")
+    delivery_text = delivery_path.read_text(encoding="utf-8")
+    escaped = source_text.replace(
+        "topic_name = entry.get(\"topic_name\")",
+        (
+            "unsafe_executor = _OFFLOCK_EXECUTOR.read\n"
+            "    method_name = \"\".join([\"send\", \"_message\"])\n"
+            "    unsafe_executor(runtime.telegram, method_name, "
+            "\"-100\", \"unsafe\")\n"
+            "    dynamic_get = getattr\n"
+            "    dynamic_get(runtime.telegram, method_name)("
+            "\"-100\", \"unsafe-again\")\n"
+            "    reflect = object.__getattribute__\n"
+            "    raw_name = \"\".join([\"_OfflockClient__\", "
+            "\"provider\"])\n"
+            "    reflect(runtime.telegram, raw_name)\n"
+            "    entry[\"last_topic_error\"] = \"unsafe\"\n"
+            "    topic_name = entry.get(\"topic_name\")"
+        ),
+        1,
+    )
+    violations = _offlock_protocol_violations(escaped, delivery_text)
+    assert any(row[0] == "executor_alias_escape" for row in violations)
+    assert sum(row[0] == "sensitive_alias_escape" for row in violations) >= 2
+    assert "_OFFLOCK_EXECUTOR_TOKEN" not in source_text
+    assert "_invoke_offlock" not in source_text
+
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    store = _store()
+    store["panes"]["worker-1"] = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "tendwire_worker_id": "worker-1",
+        "tendwire_stable_key": (
+            "wsk1_" + hashlib.sha256(b"worker-1").hexdigest()
+        ),
+        "tendwire_stable_key_version": 1,
+        "topic_id": "77",
+    }
+    state.save_state(store, state_path)
+
+    class RebindingReadProvider:
+        def configured(self):
+            concurrent = state.load_state(state_path)
+            concurrent["panes"]["worker-1"]["topic_id"] = "88"
+            state.save_state(concurrent, state_path)
+            return True
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        stale_entry = current["panes"]["worker-1"]
+        guarded = source_sync._OfflockClient(
+            RebindingReadProvider(), current, "telegram"
+        )
+        assert guarded.configured() is True
+        reloaded_entry = current["panes"]["worker-1"]
+        assert stale_entry is not reloaded_entry
+        stale_entry["stale_write_on_current"] = "must-not-land"
+
+    assert reloaded_entry["topic_id"] == "88"
+    assert "stale_write_on_current" not in reloaded_entry
+
+
 def test_offlock_invariant_scans_decision_consumers_and_dispatcher():
     source_path = Path(source_sync.__file__)
     delivery_path = source_path.with_name("telegram_delivery.py")
@@ -918,6 +1263,32 @@ def test_offlock_invariant_scans_decision_consumers_and_dispatcher():
             source_text,
             delivery_text,
             decisions_text=laundered_dispatch,
+        )
+    )
+
+
+def test_offlock_invariant_rejects_rich_adapter_state_writes():
+    source_path = Path(source_sync.__file__)
+    delivery_path = source_path.with_name("telegram_delivery.py")
+    rich_path = source_path.with_name("rich_delivery.py")
+    source_text = source_path.read_text(encoding="utf-8")
+    delivery_text = delivery_path.read_text(encoding="utf-8")
+    rich_text = rich_path.read_text(encoding="utf-8")
+    escaped = rich_text.replace(
+        "    target = _client_for_token(client, api_token)",
+        (
+            "    rich = rich_telegram_state(telegram)\n"
+            "    rich[\"supported\"] = \"no\"\n"
+            "    target = _client_for_token(client, api_token)"
+        ),
+        1,
+    )
+    assert any(
+        row[0] == "rich_adapter_state_write"
+        for row in _offlock_protocol_violations(
+            source_text,
+            delivery_text,
+            rich_text=escaped,
         )
     )
 
