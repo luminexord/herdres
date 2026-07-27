@@ -632,6 +632,80 @@ def test_decision_sync_failure_is_exception_isolated(monkeypatch) -> None:
     assert result["changed"] is False
 
 
+def test_production_guarded_runtime_posts_callbacks_and_retracts(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    store = _store()
+    state.save_state(store, state_path)
+    telegram = FakeTelegram()
+    tendwire = FakeTendwire()
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = source_sync._offlock_runtime(
+            current,
+            source_sync.SyncRuntime(
+                tendwire=tendwire,
+                telegram=telegram,
+                with_outbox=False,
+            ),
+        )
+        posted = source_sync._deliver_decisions(
+            current, _pending(kind="multi"), runtime, chat_id="-100"
+        )
+        record = decisions.active_decision(current, "77")
+        assert record is not None
+        toggled = decisions.handle_callback(
+            current,
+            callback_data=_button(record, "1"),
+            topic_id="77",
+            chat_id="-100",
+            request_id=_request_id(),
+            telegram=runtime.telegram,
+            tendwire=runtime.tendwire,
+            provider_executor=source_sync._decision_provider_executor(
+                current, runtime
+            ),
+        )
+        retracted = source_sync._deliver_decisions(
+            current,
+            {"pending_interactions": []},
+            runtime,
+            chat_id="-100",
+        )
+
+        reposted = source_sync._deliver_decisions(
+            current, _pending(), runtime, chat_id="-100"
+        )
+        record = decisions.active_decision(current, "77")
+        assert record is not None
+        submitted = decisions.handle_callback(
+            current,
+            callback_data=_button(record, "2"),
+            topic_id="77",
+            chat_id="-100",
+            request_id=_request_id(update_id=105, message_id=9005),
+            telegram=runtime.telegram,
+            tendwire=runtime.tendwire,
+            provider_executor=source_sync._decision_provider_executor(
+                current, runtime
+            ),
+        )
+
+    assert posted["posted"] == 1
+    assert toggled["status"] == "toggled"
+    assert retracted["retracted"] == 1
+    assert reposted["posted"] == 1
+    assert submitted["status"] == "accepted"
+    assert decisions.active_decision(current, "77") is None
+    assert len(telegram.sent) == 2
+    assert len(tendwire.commands) == 1
+    assert len(telegram.markup_edits) == 3
+    assert len(telegram.edited) == 2
+
+
 def test_dry_run_decision_sync_has_no_telegram_or_state_writes() -> None:
     store = _store()
     telegram = FakeTelegram()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
@@ -113,46 +114,25 @@ _OFFLOCK_APPLY = "apply"
 _OFFLOCK_RECONCILE = "reconcile"
 _OFFLOCK_ABANDON = "abandon"
 
-# These methods mutate provider state and therefore may not be reached through
-# _OfflockClient.__getattr__. Entry-targeted calls require
-# _execute_entry_operation; exact-id cleanup calls require the deliberately
-# narrower _execute_exact_provider_operation escape hatch.
-_MUTATING_PROVIDER_METHODS = frozenset(
-    {
-        "call",
-        "close_topic",
-        "close_topic_for_cleanup",
-        "command",
-        "command_json",
-        "connector_ack",
-        "connector_fail",
-        "connector_prepare_begin",
-        "connector_prepare_commit",
-        "connector_prepare_part",
-        "connector_prepare_recover",
-        "create_topic",
-        "answer_callback_query",
-        "delete_message",
-        "delete_topic",
-        "delete_topic_for_cleanup",
-        "edit_message",
-        "edit_message_reply_markup",
-        "edit_topic_icon",
-        "pin_message",
-        "rename_topic",
-        "reopen_topic",
-        "reopen_topic_for_cleanup",
-        "send_message",
-        "send_photo",
-        "send_voice",
-        "turn_final_ack",
-        "turn_final_defer",
-        "turn_final_fail",
-    }
-)
+# Provider calls fail closed. Only these methods are proven read-only; every
+# other callable must be reached through a declared capability. Lease-acquiring
+# polls are intentionally absent because they mutate provider lease state.
+_READ_ONLY_PROVIDER_METHODS = {
+    "telegram": frozenset({"configured", "with_token"}),
+    "tendwire": frozenset(
+        {
+            "doctor",
+            "pending",
+            "snapshot",
+            "turn_content_get",
+            "turn_delta",
+            "turns",
+        }
+    ),
+}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class _ProviderMutation:
     """One declared provider capability; it never exposes the raw provider."""
 
@@ -192,6 +172,7 @@ _DIRECT_PROVIDER_CAPABILITIES = {
         "command_json",
         "connector_ack",
         "connector_fail",
+        "connector_poll",
         "connector_prepare_begin",
         "connector_prepare_commit",
         "connector_prepare_part",
@@ -199,6 +180,7 @@ _DIRECT_PROVIDER_CAPABILITIES = {
         "turn_final_ack",
         "turn_final_defer",
         "turn_final_fail",
+        "turn_final_poll",
     }
 }
 
@@ -212,6 +194,18 @@ _ADAPTER_PROVIDER_CAPABILITIES = frozenset(
         "telegram.send_voice_batch",
     }
 )
+
+_OFFLOCK_EXECUTOR_TOKEN = object()
+_CONSUMED_PROVIDER_MUTATIONS: weakref.WeakSet[_ProviderMutation] = (
+    weakref.WeakSet()
+)
+
+
+def _require_executor_token(token: object) -> None:
+    if token is not _OFFLOCK_EXECUTOR_TOKEN:
+        raise RuntimeError(
+            "low-level off-lock executor is private to audited wrappers"
+        )
 
 
 def _provider_mutation(
@@ -569,10 +563,17 @@ def _operation_from_provenance(
 
 
 def _invoke_provider_mutation(
-    provider: Any, mutation: _ProviderMutation
+    provider: Any,
+    mutation: _ProviderMutation,
+    *,
+    _token: object,
 ) -> Any:
     """Internal dispatcher: the only code that receives a raw provider."""
 
+    _require_executor_token(_token)
+    if mutation in _CONSUMED_PROVIDER_MUTATIONS:
+        raise RuntimeError("provider mutation capability was already consumed")
+    _CONSUMED_PROVIDER_MUTATIONS.add(mutation)
     if mutation.api_token:
         provider = provider.with_token(mutation.api_token)
     args = mutation.args
@@ -642,9 +643,12 @@ def _invoke_provider_mutation(
 
 def _offlock_client_internals(
     client: "_OfflockClient",
+    *,
+    _token: object,
 ) -> tuple[Any, dict[str, Any], str]:
     """Executor-only access to the guarded provider and reloadable store."""
 
+    _require_executor_token(_token)
     return (
         object.__getattribute__(client, "_OfflockClient__provider"),
         object.__getattribute__(client, "_OfflockClient__store"),
@@ -655,9 +659,15 @@ def _offlock_client_internals(
 
 
 def _invoke_offlock(
-    client: "_OfflockClient", call: Callable[[Any], Any]
+    client: "_OfflockClient",
+    call: Callable[[Any], Any],
+    *,
+    _token: object,
 ) -> Any:
-    provider, store, _kind = _offlock_client_internals(client)
+    _require_executor_token(_token)
+    provider, store, _kind = _offlock_client_internals(
+        client, _token=_OFFLOCK_EXECUTOR_TOKEN
+    )
     if not state.lock_actually_held():
         # An outer phase may already have released the flock. In that case a
         # nested save/reload could roll back a lane child commit.
@@ -707,18 +717,37 @@ class _OfflockClient:
         self,
         operation: _OfflockEntryOperation,
         mutation: _ProviderMutation,
+        *,
+        _token: object = None,
     ) -> Any:
+        _require_executor_token(_token)
         if not isinstance(operation, _OfflockEntryOperation):
             raise TypeError("entry mutation requires _OfflockEntryOperation")
         return _invoke_offlock(
             self,
-            lambda provider: _invoke_provider_mutation(provider, mutation)
+            lambda provider: _invoke_provider_mutation(
+                provider,
+                mutation,
+                _token=_OFFLOCK_EXECUTOR_TOKEN,
+            ),
+            _token=_OFFLOCK_EXECUTOR_TOKEN,
         )
 
-    def _execute_exact(self, mutation: _ProviderMutation) -> Any:
+    def _execute_exact(
+        self,
+        mutation: _ProviderMutation,
+        *,
+        _token: object = None,
+    ) -> Any:
+        _require_executor_token(_token)
         return _invoke_offlock(
             self,
-            lambda provider: _invoke_provider_mutation(provider, mutation)
+            lambda provider: _invoke_provider_mutation(
+                provider,
+                mutation,
+                _token=_OFFLOCK_EXECUTOR_TOKEN,
+            ),
+            _token=_OFFLOCK_EXECUTOR_TOKEN,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -735,7 +764,9 @@ class _OfflockClient:
             raise AttributeError(
                 "raw provider state is private to the capability executor"
             )
-        provider, store, provider_kind = _offlock_client_internals(self)
+        provider, store, provider_kind = _offlock_client_internals(
+            self, _token=_OFFLOCK_EXECUTOR_TOKEN
+        )
         attribute = getattr(provider, name)
         if not callable(attribute):
             return attribute
@@ -753,11 +784,14 @@ class _OfflockClient:
                     )
                 return _invoke_offlock(
                     self,
-                    lambda _client: attribute(method, *args, **kwargs)
+                    lambda _client: attribute(method, *args, **kwargs),
+                    _token=_OFFLOCK_EXECUTOR_TOKEN,
                 )
 
             return checked_api
-        if name in _MUTATING_PROVIDER_METHODS:
+        if name not in _READ_ONLY_PROVIDER_METHODS.get(
+            provider_kind, frozenset()
+        ):
             def rejected(*_args: Any, **_kwargs: Any) -> Any:
                 raise RuntimeError(
                     f"off-lock mutating provider method {name!r} requires "
@@ -770,7 +804,8 @@ class _OfflockClient:
         def call(*args: Any, **kwargs: Any) -> Any:
             return _invoke_offlock(
                 self,
-                lambda _client: attribute(*args, **kwargs)
+                lambda _client: attribute(*args, **kwargs),
+                _token=_OFFLOCK_EXECUTOR_TOKEN,
             )
 
         return call
@@ -801,11 +836,13 @@ class _ExactOfflockClient:
                 guarded.with_token(*args, **kwargs),
                 reason,
             )
-        if name not in _MUTATING_PROVIDER_METHODS:
-            return getattr(guarded, name)
         _provider, _store, provider_kind = _offlock_client_internals(
-            guarded
+            guarded, _token=_OFFLOCK_EXECUTOR_TOKEN
         )
+        if name in _READ_ONLY_PROVIDER_METHODS.get(
+            provider_kind, frozenset()
+        ):
+            return getattr(guarded, name)
         capability = f"{provider_kind}.{name}"
         return lambda *args, **kwargs: guarded._execute_exact(
             _provider_mutation(
@@ -813,7 +850,8 @@ class _ExactOfflockClient:
                 reason=f"{capability}: {reason}",
                 args=args,
                 kwargs=kwargs,
-            )
+            ),
+            _token=_OFFLOCK_EXECUTOR_TOKEN,
         )
 
 
@@ -845,18 +883,30 @@ def _execute_entry_operation(
     if not isinstance(mutation, _ProviderMutation):
         raise TypeError("entry mutation requires one provider capability")
     if isinstance(client, _OfflockClient):
-        result = client._execute_entry(operation, mutation)
+        result = client._execute_entry(
+            operation,
+            mutation,
+            _token=_OFFLOCK_EXECUTOR_TOKEN,
+        )
     elif state.lock_actually_held():
         state.save_state(store)
         try:
             with state.released_lock():
-                result = _invoke_provider_mutation(client, mutation)
+                result = _invoke_provider_mutation(
+                    client,
+                    mutation,
+                    _token=_OFFLOCK_EXECUTOR_TOKEN,
+                )
         finally:
             fresh = state.load_state()
             store.clear()
             store.update(fresh)
     else:
-        result = _invoke_provider_mutation(client, mutation)
+        result = _invoke_provider_mutation(
+            client,
+            mutation,
+            _token=_OFFLOCK_EXECUTOR_TOKEN,
+        )
     return _OfflockEntryExecution(
         result=result,
         resolution=_compare_and_apply_entry_operation(store, operation),
@@ -874,17 +924,27 @@ def _execute_exact_provider_operation(
     if not isinstance(mutation, _ProviderMutation):
         raise TypeError("exact mutation requires one provider capability")
     if isinstance(client, _OfflockClient):
-        return client._execute_exact(mutation)
+        return client._execute_exact(
+            mutation, _token=_OFFLOCK_EXECUTOR_TOKEN
+        )
     if store is not None and state.lock_actually_held():
         state.save_state(store)
         try:
             with state.released_lock():
-                return _invoke_provider_mutation(client, mutation)
+                return _invoke_provider_mutation(
+                    client,
+                    mutation,
+                    _token=_OFFLOCK_EXECUTOR_TOKEN,
+                )
         finally:
             fresh = state.load_state()
             store.clear()
             store.update(fresh)
-    return _invoke_provider_mutation(client, mutation)
+    return _invoke_provider_mutation(
+        client,
+        mutation,
+        _token=_OFFLOCK_EXECUTOR_TOKEN,
+    )
 
 
 def _offlock_runtime(
@@ -7935,9 +7995,18 @@ def _drain_turn_final(
             break
         if yield_barrier is not None:
             yield_barrier()
-        poll = runtime.tendwire.turn_final_poll(
-            limit=1,
-            lease_seconds=lease_seconds,
+        poll = _execute_exact_provider_operation(
+            runtime.tendwire,
+            mutation=_provider_mutation(
+                "tendwire.turn_final_poll",
+                reason=(
+                    "tendwire.turn_final_poll: acquire exact final-delivery lease"
+                ),
+                kwargs={
+                    "limit": 1,
+                    "lease_seconds": lease_seconds,
+                },
+            ),
         )
         if poll.get("ok") is False:
             result["status"] = str(
@@ -9954,6 +10023,64 @@ def _sync_topic_pinned_statuses(
     return updated
 
 
+def _decision_provider_executor(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+) -> decisions.ProviderExecutor:
+    """Bind decision operations to the same immutable owner guard as panes."""
+
+    def _execute_decision_provider_operation(
+        request: decisions.ProviderOperation,
+    ) -> decisions.ProviderExecution:
+        entry = state.source_worker_entries(store).get(request.entry_key)
+        if (
+            entry is not None
+            and request.worker_id
+            and _entry_worker_id(entry) != request.worker_id
+        ):
+            entry = None
+        if entry is None and request.worker_id:
+            _key, entry = state.find_worker_entry_by_id(
+                store, request.worker_id
+            )
+        if (
+            entry is None
+            or str(entry.get("topic_id") or "") != request.topic_id
+        ):
+            return decisions.ProviderExecution(
+                {"ok": False, "status": "owner_changed"},
+                _OFFLOCK_ABANDON,
+            )
+        operation = _capture_entry_operation(
+            store,
+            entry,
+            topic_id=request.topic_id,
+            message_id=request.message_id,
+        )
+        client = (
+            runtime.tendwire
+            if request.capability.startswith("tendwire.")
+            else runtime.telegram
+        )
+        execution = _execute_entry_operation(
+            store,
+            client,
+            operation,
+            _provider_mutation(
+                request.capability,
+                reason=request.reason,
+                args=request.args,
+                kwargs=dict(request.kwargs),
+            ),
+        )
+        return decisions.ProviderExecution(
+            dict(execution.result),
+            execution.resolution.disposition,
+        )
+
+    return _execute_decision_provider_operation
+
+
 def _deliver_decisions(
     store: dict[str, Any],
     pending_payload: dict[str, Any],
@@ -9985,6 +10112,9 @@ def _deliver_decisions(
             runtime.telegram,
             chat_id=chat_id,
             dry_run=runtime.dry_run,
+            provider_executor=_decision_provider_executor(
+                store, runtime
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - decisions are additive to the core sync loop
         return {

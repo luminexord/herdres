@@ -183,7 +183,7 @@ def test_slow_provider_call_does_not_hold_state_lock(tmp_path, monkeypatch):
     release = threading.Event()
 
     class SlowProvider:
-        def send(self):
+        def configured(self):
             entered.set()
             assert release.wait(3)
             return {"ok": True}
@@ -193,7 +193,7 @@ def test_slow_provider_call_does_not_hold_state_lock(tmp_path, monkeypatch):
     def invoke():
         with state.state_lock(path=statepath):
             client = _OfflockClient(SlowProvider(), store)
-            assert client.send()["ok"] is True
+            assert client.configured()["ok"] is True
         finished.set()
 
     thread = threading.Thread(target=invoke)
@@ -224,7 +224,7 @@ def test_nested_offlock_client_does_not_rollback_lane_child_commit(
     state.save_state(_store(), statepath)
 
     class Provider:
-        def send(self):
+        def configured(self):
             return {"ok": True}
 
     with state.state_lock(path=statepath):
@@ -234,7 +234,7 @@ def test_nested_offlock_client_does_not_rollback_lane_child_commit(
             child = state.load_state(statepath)
             child["child_commit_survived"] = True
             state.save_state(child, statepath)
-            assert client.send()["ok"] is True
+            assert client.configured()["ok"] is True
         state.reload_state_in_place(current, statepath)
 
     assert current["child_commit_survived"] is True
@@ -253,7 +253,7 @@ def test_raising_offlock_provider_reloads_before_caller_continues(
     finished = threading.Event()
 
     class RaisingProvider:
-        def send(self):
+        def configured(self):
             entered.set()
             assert concurrent_committed.wait(2)
             raise RuntimeError("provider rate limited")
@@ -262,7 +262,7 @@ def test_raising_offlock_provider_reloads_before_caller_continues(
         with state.state_lock(path=statepath):
             current = state.load_state(statepath)
             try:
-                _OfflockClient(RaisingProvider(), current).send()
+                _OfflockClient(RaisingProvider(), current).configured()
             except RuntimeError:
                 current["caller_continued"] = True
                 state.save_state(current, statepath)

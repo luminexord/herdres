@@ -9,7 +9,8 @@ requiring the owner to finish the prompt at the desk.
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
 
 from . import config, state
 from .ingress_identity import validate_request_id
@@ -27,6 +28,99 @@ CALLBACK_DATA_LIMIT = 64
 ANSWER_IN_PROGRESS_REPLY = (
     "That prompt is being answered right now — try again in a moment."
 )
+
+
+@dataclass(frozen=True)
+class ProviderOperation:
+    """Immutable decision-provider request with captured pane provenance."""
+
+    capability: str
+    reason: str
+    entry_key: str
+    worker_id: str
+    topic_id: str
+    message_id: str = ""
+    args: tuple[Any, ...] = ()
+    kwargs: tuple[tuple[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class ProviderExecution:
+    result: dict[str, Any]
+    disposition: str
+
+
+ProviderExecutor = Callable[[ProviderOperation], ProviderExecution]
+
+
+def _operation(
+    capability: str,
+    *,
+    reason: str,
+    record: Mapping[str, Any],
+    topic_id: str,
+    message_id: str = "",
+    args: tuple[Any, ...] = (),
+    kwargs: Mapping[str, Any] | None = None,
+) -> ProviderOperation:
+    if not reason or capability not in reason:
+        raise ValueError(
+            "decision provider reason must name its capability"
+        )
+    return ProviderOperation(
+        capability=capability,
+        reason=reason,
+        entry_key=str(record.get("entry_key") or ""),
+        worker_id=str(record.get("worker_id") or ""),
+        topic_id=str(topic_id or ""),
+        message_id=str(message_id or ""),
+        args=tuple(args),
+        kwargs=tuple((str(key), value) for key, value in (kwargs or {}).items()),
+    )
+
+
+def _execute_direct(
+    operation: ProviderOperation,
+    *,
+    telegram: TelegramClient | None,
+    tendwire: TendwireClient | None,
+) -> ProviderExecution:
+    """Synchronous non-offlock adapter used by gateway and unit-test callers."""
+
+    kwargs = dict(operation.kwargs)
+    if operation.capability == "telegram.send_message":
+        assert telegram is not None
+        result = telegram.send_message(*operation.args, **kwargs)
+    elif operation.capability == "telegram.edit_message":
+        assert telegram is not None
+        result = telegram.edit_message(*operation.args, **kwargs)
+    elif operation.capability == "telegram.edit_message_reply_markup":
+        assert telegram is not None
+        result = telegram.edit_message_reply_markup(
+            *operation.args, **kwargs
+        )
+    elif operation.capability == "tendwire.command":
+        assert tendwire is not None
+        result = tendwire.command(*operation.args, **kwargs)
+    else:
+        raise ValueError(
+            f"unsupported decision capability: {operation.capability}"
+        )
+    return ProviderExecution(dict(result), "apply")
+
+
+def _execute(
+    operation: ProviderOperation,
+    *,
+    telegram: TelegramClient | None = None,
+    tendwire: TendwireClient | None = None,
+    provider_executor: ProviderExecutor | None = None,
+) -> ProviderExecution:
+    if provider_executor is not None:
+        return provider_executor(operation)
+    return _execute_direct(
+        operation, telegram=telegram, tendwire=tendwire
+    )
 
 
 def _ref56(decision_id: str) -> str:
@@ -248,19 +342,50 @@ def _retract(
     topic_id: str,
     record: dict[str, Any],
     note: str,
-) -> None:
+    *,
+    provider_executor: ProviderExecutor | None = None,
+) -> bool:
     message_id = str(record.get("message_id") or "")
     if not message_id:
-        return
-    telegram.edit_message_reply_markup(
-        chat_id,
-        message_id,
-        {"inline_keyboard": []},
+        return False
+    markup = _execute(
+        _operation(
+            "telegram.edit_message_reply_markup",
+            reason=(
+                "telegram.edit_message_reply_markup: retract decision keyboard"
+            ),
+            record=record,
+            topic_id=topic_id,
+            message_id=message_id,
+            args=(chat_id, message_id, {"inline_keyboard": []}),
+        ),
+        telegram=telegram,
+        provider_executor=provider_executor,
     )
-    telegram.edit_message(
-        chat_id,
-        message_id,
-        f"{render_decision(record)}\n\n{html_escape(note, 240)}",
+    if (
+        markup.disposition != "apply"
+        or markup.result.get("ok") is not True
+    ):
+        return False
+    edited = _execute(
+        _operation(
+            "telegram.edit_message",
+            reason="telegram.edit_message: annotate retracted decision",
+            record=record,
+            topic_id=topic_id,
+            message_id=message_id,
+            args=(
+                chat_id,
+                message_id,
+                f"{render_decision(record)}\n\n{html_escape(note, 240)}",
+            ),
+        ),
+        telegram=telegram,
+        provider_executor=provider_executor,
+    )
+    return bool(
+        edited.disposition == "apply"
+        and edited.result.get("ok") is True
     )
 
 
@@ -271,6 +396,7 @@ def sync_decisions(
     *,
     chat_id: str,
     dry_run: bool = False,
+    provider_executor: ProviderExecutor | None = None,
 ) -> dict[str, Any]:
     """Reconcile active inline keyboards with one already-fetched pending list."""
 
@@ -325,7 +451,16 @@ def sync_decisions(
             if str(raw_record.get("decision_id") or "") in raw_pending_ids
             else "✅ Answered."
         )
-        _retract(telegram, chat_id, topic_id, raw_record, note)
+        if not _retract(
+            telegram,
+            chat_id,
+            topic_id,
+            raw_record,
+            note,
+            provider_executor=provider_executor,
+        ):
+            continue
+        active = _active_records(store, create=True)
         active.pop(topic_id, None)
         retracted += 1
         changed = True
@@ -343,18 +478,31 @@ def sync_decisions(
             "await_freeform": False,
             "content_hash": candidate["content_hash"],
         }
-        sent = telegram.send_message(
-            chat_id,
-            render_decision(record),
-            thread_id=topic_id,
-            notify=True,
-            reply_markup=inline_keyboard(record),
+        execution = _execute(
+            _operation(
+                "telegram.send_message",
+                reason="telegram.send_message: post decision keyboard",
+                record=record,
+                topic_id=topic_id,
+                args=(chat_id, render_decision(record)),
+                kwargs={
+                    "thread_id": topic_id,
+                    "notify": True,
+                    "reply_markup": inline_keyboard(record),
+                },
+            ),
+            telegram=telegram,
+            provider_executor=provider_executor,
         )
+        sent = execution.result
+        if execution.disposition != "apply":
+            continue
         if not sent.get("ok"):
             continue
         record["message_id"] = str(
             sent.get("reply_markup_message_id") or sent.get("message_id") or ""
         )
+        active = _active_records(store, create=True)
         active[topic_id] = record
         posted += 1
         changed = True
@@ -388,13 +536,26 @@ def _send_failure(
     topic_id: str,
     record: dict[str, Any],
     text: str,
+    *,
+    provider_executor: ProviderExecutor | None = None,
 ) -> None:
-    telegram.send_message(
-        chat_id,
-        html_escape(text, 300),
-        thread_id=topic_id,
-        reply_to_message_id=str(record.get("message_id") or "") or None,
-        notify=True,
+    _execute(
+        _operation(
+            "telegram.send_message",
+            reason="telegram.send_message: report decision callback failure",
+            record=record,
+            topic_id=topic_id,
+            args=(chat_id, html_escape(text, 300)),
+            kwargs={
+                "thread_id": topic_id,
+                "reply_to_message_id": (
+                    str(record.get("message_id") or "") or None
+                ),
+                "notify": True,
+            },
+        ),
+        telegram=telegram,
+        provider_executor=provider_executor,
     )
 
 
@@ -427,9 +588,28 @@ def _submit(
     tendwire: TendwireClient,
     chat_id: str,
     callback: bool,
+    provider_executor: ProviderExecutor | None = None,
 ) -> dict[str, Any]:
     try:
-        result = tendwire.command(_answer_request(record, request_id, selection))
+        execution = _execute(
+            _operation(
+                "tendwire.command",
+                reason="tendwire.command: submit remote decision answer",
+                record=record,
+                topic_id=topic_id,
+                args=(
+                    _answer_request(record, request_id, selection),
+                ),
+            ),
+            tendwire=tendwire,
+            provider_executor=provider_executor,
+        )
+        result = execution.result
+        if execution.disposition != "apply":
+            result = {
+                "ok": False,
+                "status": "owner_changed",
+            }
     except Exception as exc:  # noqa: BLE001 - the keyboard must survive every submit failure
         result = {
             "ok": False,
@@ -438,7 +618,22 @@ def _submit(
         }
     active = _active_records(store, create=True)
     if result.get("ok") is True and result.get("status") == "accepted":
-        _retract(telegram, chat_id, topic_id, record, "✅ Answered.")
+        if not _retract(
+            telegram,
+            chat_id,
+            topic_id,
+            record,
+            "✅ Answered.",
+            provider_executor=provider_executor,
+        ):
+            return {
+                "handled": True,
+                "changed": False,
+                "toast": "Answer accepted; card reconciliation pending.",
+                "reply": "",
+                "status": "accepted_reconcile",
+            }
+        active = _active_records(store, create=True)
         active.pop(topic_id, None)
         return {
             "handled": True,
@@ -456,6 +651,7 @@ def _submit(
                 topic_id,
                 record,
                 ANSWER_IN_PROGRESS_REPLY,
+                provider_executor=provider_executor,
             )
         return {
             "handled": True,
@@ -466,7 +662,22 @@ def _submit(
         }
     if status == "decision_not_pending":
         note = "⚠️ That prompt is no longer pending (answered at the desk?)"
-        _retract(telegram, chat_id, topic_id, record, note)
+        if not _retract(
+            telegram,
+            chat_id,
+            topic_id,
+            record,
+            note,
+            provider_executor=provider_executor,
+        ):
+            return {
+                "handled": True,
+                "changed": False,
+                "toast": "Prompt ended; card reconciliation pending.",
+                "reply": "" if callback else note,
+                "status": "decision_not_pending_reconcile",
+            }
+        active = _active_records(store, create=True)
         active.pop(topic_id, None)
         return {
             "handled": True,
@@ -477,7 +688,14 @@ def _submit(
         }
     error = _failure_text(result)
     if callback:
-        _send_failure(telegram, chat_id, topic_id, record, error)
+        _send_failure(
+            telegram,
+            chat_id,
+            topic_id,
+            record,
+            error,
+            provider_executor=provider_executor,
+        )
     return {
         "handled": True,
         "changed": False,
@@ -496,6 +714,7 @@ def handle_callback(
     request_id: str,
     telegram: TelegramClient,
     tendwire: TendwireClient,
+    provider_executor: ProviderExecutor | None = None,
 ) -> dict[str, Any]:
     """Select, toggle, submit, or arm write-in for one Telegram callback."""
 
@@ -555,12 +774,29 @@ def handle_callback(
             toast = "Choice selected."
         preview = dict(record)
         preview["selected"] = selected
-        edited = telegram.edit_message_reply_markup(
-            chat_id,
-            str(record.get("message_id") or ""),
-            inline_keyboard(preview),
+        execution = _execute(
+            _operation(
+                "telegram.edit_message_reply_markup",
+                reason=(
+                    "telegram.edit_message_reply_markup: toggle decision choice"
+                ),
+                record=record,
+                topic_id=topic_id,
+                message_id=str(record.get("message_id") or ""),
+                args=(
+                    chat_id,
+                    str(record.get("message_id") or ""),
+                    inline_keyboard(preview),
+                ),
+            ),
+            telegram=telegram,
+            provider_executor=provider_executor,
         )
-        if not edited.get("ok"):
+        edited = execution.result
+        if (
+            execution.disposition != "apply"
+            or not edited.get("ok")
+        ):
             return {
                 "handled": True,
                 "changed": False,
@@ -568,7 +804,20 @@ def handle_callback(
                 "reply": "",
                 "status": "telegram_edit_failed",
             }
-        record["selected"] = selected
+        current = active_decision(store, topic_id)
+        if (
+            current is None
+            or str(current.get("decision_id") or "")
+            != str(record.get("decision_id") or "")
+        ):
+            return {
+                "handled": True,
+                "changed": False,
+                "toast": "That button has expired.",
+                "reply": "",
+                "status": "expired",
+            }
+        current["selected"] = selected
         return {
             "handled": True,
             "changed": True,
@@ -594,6 +843,7 @@ def handle_callback(
             tendwire=tendwire,
             chat_id=chat_id,
             callback=True,
+            provider_executor=provider_executor,
         )
     if kind in {"single", "plan"} and option_ref in option_refs:
         return _submit(
@@ -606,6 +856,7 @@ def handle_callback(
             tendwire=tendwire,
             chat_id=chat_id,
             callback=True,
+            provider_executor=provider_executor,
         )
     return {
         "handled": True,
