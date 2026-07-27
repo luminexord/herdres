@@ -53,6 +53,7 @@ PANE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 ACCEPTED_NOTIFICATION_JOURNAL_APPLIED_LIMIT = 200
+_ACCEPTED_JOURNAL_PENDING_KEY = "_herdres_accepted_journal_pending"
 
 
 def accepted_notification_journal_path(path: Path | None = None) -> Path:
@@ -145,6 +146,15 @@ def append_accepted_notification_receipt(
             if key not in applied_ids
         }
     receipts.setdefault(receipt_id, deepcopy(dict(record)))
+    if data is not None:
+        pending = data.get(_ACCEPTED_JOURNAL_PENDING_KEY)
+        pending_ids = {
+            str(item)
+            for item in (pending if isinstance(pending, list) else [])
+            if item
+        }
+        pending_ids.update(receipts)
+        data[_ACCEPTED_JOURNAL_PENDING_KEY] = sorted(pending_ids)
     tmp = journal_file.with_suffix(journal_file.suffix + ".tmp")
     payload = (
         json.dumps(
@@ -175,6 +185,7 @@ def _merge_accepted_notification_journal(
     receipts = _load_accepted_notification_journal(path)
     if not receipts:
         return
+    data[_ACCEPTED_JOURNAL_PENDING_KEY] = sorted(receipts)
     telegram = data.setdefault("telegram", {})
     if not isinstance(telegram, dict):
         telegram = {}
@@ -190,15 +201,22 @@ def _merge_accepted_notification_journal(
         if item
     }
     for receipt_id, record in receipts.items():
-        if receipt_id not in applied_ids:
+        if receipt_id in applied_ids:
+            continue
+        if record.get("kind") == "created_topic":
+            created = telegram.setdefault("accepted_created_topics", {})
+            if not isinstance(created, dict):
+                created = {}
+                telegram["accepted_created_topics"] = created
+            created.setdefault(receipt_id, deepcopy(record))
+        else:
             records.setdefault(receipt_id, deepcopy(record))
 
 
 def _mark_accepted_notification_journal_applied(
-    data: dict[str, Any], path: Path | None = None
+    data: dict[str, Any], receipt_ids: list[str]
 ) -> bool:
-    receipts = _load_accepted_notification_journal(path)
-    if not receipts:
+    if not receipt_ids:
         return False
     telegram = data.setdefault("telegram", {})
     if not isinstance(telegram, dict):
@@ -210,7 +228,7 @@ def _mark_accepted_notification_journal_applied(
         for item in (applied if isinstance(applied, list) else [])
         if item
     ]
-    for receipt_id in receipts:
+    for receipt_id in receipt_ids:
         if receipt_id not in applied_ids:
             applied_ids.append(receipt_id)
     telegram["accepted_notification_journal_applied"] = applied_ids[
@@ -258,11 +276,19 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
 def save_state(data: dict[str, Any], path: Path | None = None) -> None:
     state_file = path or config.state_path()
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file_is_new = not state_file.exists()
     tmp = state_file.with_suffix(state_file.suffix + ".tmp")
+    raw_pending = data.pop(_ACCEPTED_JOURNAL_PENDING_KEY, [])
+    pending_receipt_ids = [
+        str(item)
+        for item in (
+            raw_pending if isinstance(raw_pending, list) else []
+        )
+        if item
+    ]
     journal_pending = _mark_accepted_notification_journal_applied(
-        data, state_file
+        data, pending_receipt_ids
     )
+    journal_cleared = False
     # This file is an internal durability boundary, not a hand-edited config.
     # Compact separators cut serialization and fsync bytes on the live state
     # ledger; inbound commands cross this boundary before and after Tendwire,
@@ -282,17 +308,19 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, state_file)
+        # Every canonical state replace is a durability boundary. Commit the
+        # directory entry before any accepted-provider receipt can disappear.
+        _fsync_directory(state_file.parent)
         if journal_pending:
-            # Clearing the sidecar fsyncs this directory after the state
-            # replace, covering both directory mutations with one barrier.
+            # Receipt absorption has two ordered directory barriers: the
+            # canonical state rename above, then the sidecar unlink here.
             _clear_accepted_notification_journal(state_file)
-        elif state_file_is_new:
-            # First creation adds the durable state filename. Replacing an
-            # existing state file deliberately skips this shared hot-path
-            # barrier: an interrupted rename leaves the previous valid ledger,
-            # whose delivery journals drive safe replay.
-            _fsync_directory(state_file.parent)
+            journal_cleared = True
     finally:
+        if pending_receipt_ids and not journal_cleared:
+            data[_ACCEPTED_JOURNAL_PENDING_KEY] = (
+                pending_receipt_ids
+            )
         try:
             tmp.unlink(missing_ok=True)
         except OSError:

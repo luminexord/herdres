@@ -1546,6 +1546,122 @@ def _accepted_notification_messages(
     return records
 
 
+def _accepted_created_topics(
+    store: dict[str, Any], *, create: bool
+) -> dict[str, dict[str, Any]]:
+    telegram = _telegram_state(store)
+    records = telegram.get("accepted_created_topics")
+    if not isinstance(records, dict):
+        if not create:
+            return {}
+        records = {}
+        telegram["accepted_created_topics"] = records
+    return records
+
+
+def _checkpoint_accepted_created_topic(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    operation: _OfflockEntryOperation,
+    result: Any,
+    *,
+    topic_name: str,
+) -> str:
+    """Journal a non-idempotent accepted topic before owner disposition."""
+
+    if not isinstance(result, Mapping) or result.get("ok") is not True:
+        return ""
+    topic_id = str(result.get("topic_id") or "")
+    if not topic_id:
+        return ""
+    record = {
+        "kind": "created_topic",
+        "topic_id": topic_id,
+        "topic_name": compact_ws(topic_name, 120),
+        "owner": _operation_provenance(operation),
+    }
+    receipt_id = short_hash(record, 32)
+    _accepted_created_topics(store, create=True).setdefault(
+        receipt_id, record
+    )
+    if state.lock_actually_held():
+        state.append_accepted_notification_receipt(
+            receipt_id, record, data=store
+        )
+        _after_provider_accept(runtime)
+    return receipt_id
+
+
+def _complete_accepted_created_topic(
+    store: dict[str, Any], receipt_id: str
+) -> None:
+    if receipt_id:
+        _accepted_created_topics(store, create=False).pop(
+            receipt_id, None
+        )
+
+
+def _recover_accepted_created_topics(
+    store: dict[str, Any], runtime: SyncRuntime
+) -> int:
+    """Adopt or quarantine topic creates recovered from the sidecar."""
+
+    recovered = 0
+    records = list(
+        _accepted_created_topics(store, create=False).items()
+    )
+    for receipt_id, record in records:
+        if not isinstance(record, dict):
+            _complete_accepted_created_topic(store, receipt_id)
+            recovered += 1
+            continue
+        topic_id = str(record.get("topic_id") or "")
+        owner = record.get("owner")
+        operation = (
+            _operation_from_provenance(owner)
+            if isinstance(owner, dict)
+            else None
+        )
+        resolution = (
+            _compare_and_apply_entry_operation(store, operation)
+            if operation is not None
+            else _OfflockEntryResolution(_OFFLOCK_ABANDON)
+        )
+        entry = resolution.entry
+        if (
+            topic_id
+            and resolution.disposition == _OFFLOCK_APPLY
+            and entry is not None
+            and not entry.get("topic_id")
+        ):
+            entry["topic_id"] = topic_id
+            _complete_topic_recovery(entry, topic_id)
+        elif topic_id:
+            state.record_orphaned_created_topic(
+                store,
+                {
+                    "topic_id": topic_id,
+                    "topic_name": compact_ws(
+                        record.get("topic_name"), 120
+                    ),
+                    "owner": deepcopy(owner)
+                    if isinstance(owner, dict)
+                    else {},
+                    "reason": (
+                        "accepted_create_recovery_owner_changed"
+                    ),
+                },
+            )
+        _complete_accepted_created_topic(store, receipt_id)
+        recovered += 1
+    if recovered:
+        if runtime.checkpoint is not None:
+            runtime.checkpoint()
+        elif state.lock_actually_held():
+            state.save_state(store)
+    return recovered
+
+
 def _notification_acceptance_capacity_available(
     store: dict[str, Any],
 ) -> bool:
@@ -2899,6 +3015,20 @@ def _ensure_topic(
         return True, False   # real create deferred by the per-pass create cap; retry next tick
     topic_name = entry.get("topic_name") or state.topic_name_for_space(source)
     operation = _capture_entry_operation(store, entry)
+    accepted_receipt_id = ""
+
+    def checkpoint_created_topic(
+        result: Any, captured: _OfflockEntryOperation
+    ) -> None:
+        nonlocal accepted_receipt_id
+        accepted_receipt_id = _checkpoint_accepted_created_topic(
+            store,
+            runtime,
+            captured,
+            result,
+            topic_name=str(topic_name),
+        )
+
     execution = _execute_entry_operation(
         store,
         runtime.telegram,
@@ -2909,6 +3039,7 @@ def _ensure_topic(
             args=(chat_id, topic_name),
             kwargs={"icon_color": topic_color_for_name(topic_name)},
         ),
+        acceptance_checkpoint=checkpoint_created_topic,
     )
     created, resolution = execution.result, execution.resolution
     if resolution.disposition != _OFFLOCK_APPLY:
@@ -2923,20 +3054,32 @@ def _ensure_topic(
                     "reason": "owner_changed_during_create",
                 },
             )
-            if runtime.checkpoint is not None:
+            _complete_accepted_created_topic(
+                store, accepted_receipt_id
+            )
+            if (
+                not state.lock_actually_held()
+                and runtime.checkpoint is not None
+            ):
                 runtime.checkpoint()
-            elif state.lock_actually_held():
-                state.save_state(store)
         return False, bool(created.get("ok") and created_topic_id)
     entry = resolution.entry
     assert entry is not None
     if created.get("ok") and created.get("topic_id"):
         entry["topic_id"] = str(created["topic_id"])
         _complete_topic_recovery(entry, str(created["topic_id"]))
-        # Topic creation has no provider idempotency key. Persist the returned
-        # identity before any later turn validation can abort this sync pass,
-        # otherwise the next pass can create a duplicate topic.
-        if runtime.checkpoint is not None:
+        _complete_accepted_created_topic(
+            store, accepted_receipt_id
+        )
+        # Topic creation has no provider idempotency key. Its compact receipt
+        # was fsynced at provider acceptance, so the next ordinary state
+        # barrier can absorb this binding without an extra full-ledger save.
+        # Direct, unlocked helper callers have no sidecar durability context,
+        # so retain their explicit checkpoint contract.
+        if (
+            not state.lock_actually_held()
+            and runtime.checkpoint is not None
+        ):
             runtime.checkpoint()
         return True, True
     entry["last_topic_error"] = compact_ws(created.get("error"), 240)
@@ -3681,6 +3824,9 @@ def _sync_sources(
     chat_id: str,
 ) -> dict[str, int]:
     counts = {"created": 0, "updated": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
+    counts["updated"] += _recover_accepted_created_topics(
+        store, runtime
+    )
     counts["updated"] += _cleanup_orphaned_created_topics(
         store, runtime, chat_id=chat_id
     )

@@ -533,6 +533,92 @@ def test_concurrent_rebind_during_create_checkpoints_accepted_topic(
     ] == "16000"
 
 
+def test_accepted_topic_create_survives_crash_before_state_barrier(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(state_path)
+    )
+    store = _store()
+    store["panes"] = {}
+    state.save_state(store, state_path)
+
+    class SequencedCreateTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.created_topic_ids: list[str] = []
+
+        def create_topic(self, chat_id, name, icon_color=None):
+            topic_id = str(700 + len(self.created_topic_ids))
+            self.created_topic_ids.append(topic_id)
+            self.topics.append(name)
+            return {"ok": True, "topic_id": topic_id}
+
+    telegram = SequencedCreateTelegram()
+    tendwire = FakeTendwire(
+        workers=[_worker()],
+        turns={"turns": []},
+        spaces=[],
+    )
+
+    def crash_after_accept():
+        raise RuntimeError("crash after accepted topic")
+
+    with pytest.raises(
+        RuntimeError, match="crash after accepted topic"
+    ):
+        with state.state_lock(path=state_path):
+            current = state.load_state(state_path)
+            sync_once(
+                current,
+                SyncRuntime(
+                    tendwire,
+                    telegram,
+                    with_outbox=False,
+                    after_provider_accept=crash_after_accept,
+                ),
+            )
+
+    durable_before_restart = state.load_state(state_path)
+    entry = next(
+        iter(state.source_worker_entries(durable_before_restart).values())
+    )
+    assert not entry.get("topic_id")
+    assert telegram.created_topic_ids == ["700"]
+    assert state.accepted_notification_journal_path(
+        state_path
+    ).exists()
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        assert len(
+            current["telegram"]["accepted_created_topics"]
+        ) == 1
+        sync_once(
+            current,
+            SyncRuntime(
+                tendwire,
+                telegram,
+                with_outbox=False,
+            ),
+        )
+
+    entry = next(iter(state.source_worker_entries(current).values()))
+    assert entry["topic_id"] == "700"
+    assert telegram.created_topic_ids == ["700"]
+    assert not current["telegram"].get("accepted_created_topics")
+    assert not state.accepted_notification_journal_path(
+        state_path
+    ).exists()
+    persisted = state.load_state(state_path)
+    persisted_entry = next(
+        iter(state.source_worker_entries(persisted).values())
+    )
+    assert persisted_entry["topic_id"] == "700"
+    assert not persisted["telegram"].get("accepted_created_topics")
+
+
 def test_missing_topic_icon_tombstones_aliases_and_remints_once(
     monkeypatch,
 ):

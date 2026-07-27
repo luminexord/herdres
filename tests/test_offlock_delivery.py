@@ -617,32 +617,59 @@ def test_guarded_cleanup_prunes_from_reloaded_bucket(
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", topic_mode)
     store = _store()
     if topic_mode == "worker":
-        store["panes"]["worker:council"] = {
-            "source": "tendwire",
-            "entry_type": "worker",
-            "tendwire_worker_id": "council",
-            "worker_id": "council",
-            "topic_id": "77",
-            "topic_name": "Council · cleanup",
-            "worker_name": "gm-local-as",
-            "status": "closed",
-            "tendwire_raw_status": "closed",
-        }
-    else:
-        _key, entry, _created = state.upsert_space_entry(
-            store,
-            {
-                "id": "council-space",
-                "name": "Council · cleanup",
+        for index, topic_id in enumerate(("77", "78"), start=1):
+            worker_id = f"council-{index}"
+            store["panes"][f"worker:{worker_id}"] = {
+                "source": "tendwire",
+                "entry_type": "worker",
+                "tendwire_worker_id": worker_id,
+                "worker_id": worker_id,
+                "tendwire_fingerprint": f"worker-fp-{index}",
+                "topic_id": topic_id,
+                "topic_name": f"Council · cleanup {index}",
+                "worker_name": "gm-local-as",
                 "status": "closed",
-                "fingerprint": "council-space-fp",
-            },
-            topic_id="77",
-        )
-        entry["stale_space_topic"] = True
-        entry["space_topic_name"] = "Council · cleanup"
+                "tendwire_raw_status": "closed",
+            }
+    else:
+        for index, topic_id in enumerate(("77", "78"), start=1):
+            _key, entry, _created = state.upsert_space_entry(
+                store,
+                {
+                    "id": f"council-space-{index}",
+                    "name": f"Council · cleanup {index}",
+                    "status": "closed",
+                    "fingerprint": f"space-fp-{index}",
+                },
+                topic_id=topic_id,
+            )
+            entry["stale_space_topic"] = True
+            entry["space_topic_name"] = (
+                f"Council · cleanup {index}"
+            )
     state.save_state(store, statepath)
-    telegram = FakeTelegram()
+
+    class RebindSecondEntryOnFirstDelete(FakeTelegram):
+        def delete_topic(self, chat_id, thread_id):
+            if str(thread_id) == "77":
+                concurrent = state.load_state(statepath)
+                bucket = (
+                    state.source_worker_entries(concurrent)
+                    if topic_mode == "worker"
+                    else state.source_space_entries(concurrent)
+                )
+                second = next(
+                    entry
+                    for entry in bucket.values()
+                    if str(entry.get("topic_id") or "") == "78"
+                )
+                second["tendwire_fingerprint"] = (
+                    "concurrently-rebound-fingerprint"
+                )
+                state.save_state(concurrent, statepath)
+            return super().delete_topic(chat_id, thread_id)
+
+    telegram = RebindSecondEntryOnFirstDelete()
 
     with state.state_lock(statepath):
         current = state.load_state(statepath)
@@ -675,9 +702,11 @@ def test_guarded_cleanup_prunes_from_reloaded_bucket(
         if topic_mode == "worker"
         else state.source_space_entries(state.load_state(statepath))
     )
-    assert result["deleted"] == 1
-    assert result["pruned"] == int(topic_mode == "space")
-    assert telegram.deleted_topics == ["77"]
+    assert result["deleted"] == 2
+    assert result["pruned"] == (
+        2 if topic_mode == "space" else 0
+    )
+    assert telegram.deleted_topics == ["77", "78"]
     assert bucket == {}
     assert persisted_bucket == {}
 

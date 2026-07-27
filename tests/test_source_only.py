@@ -4542,7 +4542,7 @@ def test_save_state_fsyncs_file_before_replace_and_directory_after(
     }
 
 
-def test_save_state_existing_file_skips_shared_directory_fsync(
+def test_save_state_existing_file_keeps_directory_fsync(
     tmp_path,
     monkeypatch,
 ):
@@ -4572,7 +4572,7 @@ def test_save_state_existing_file_skips_shared_directory_fsync(
         {"version": 2, "value": "after"}, state_path
     )
 
-    assert calls == ["fsync:file", "replace"]
+    assert calls == ["fsync:file", "replace", "fsync:directory"]
     assert json.loads(state_path.read_text(encoding="utf-8")) == {
         "value": "after",
         "version": 2,
@@ -4602,6 +4602,10 @@ def test_save_state_sidecar_clear_keeps_directory_fsync(
     calls = []
     real_fsync = os.fsync
     real_replace = os.replace
+    real_unlink = Path.unlink
+    journal_path = state.accepted_notification_journal_path(
+        state_path
+    )
 
     def tracking_fsync(descriptor):
         kind = (
@@ -4616,12 +4620,24 @@ def test_save_state_sidecar_clear_keeps_directory_fsync(
         calls.append("replace")
         real_replace(source, destination)
 
+    def tracking_unlink(path, *args, **kwargs):
+        if path == journal_path:
+            calls.append("unlink:journal")
+        return real_unlink(path, *args, **kwargs)
+
     monkeypatch.setattr(state.os, "fsync", tracking_fsync)
     monkeypatch.setattr(state.os, "replace", tracking_replace)
+    monkeypatch.setattr(Path, "unlink", tracking_unlink)
 
     state.save_state(current, state_path)
 
-    assert calls == ["fsync:file", "replace", "fsync:directory"]
+    assert calls == [
+        "fsync:file",
+        "replace",
+        "fsync:directory",
+        "unlink:journal",
+        "fsync:directory",
+    ]
     assert not state.accepted_notification_journal_path(
         state_path
     ).exists()
