@@ -167,6 +167,84 @@ class CleanupDeletedTopicTelegram(FakeTelegram):
         return result
 
 
+class MissingRenameTopicTelegram(FakeTelegram):
+    def __init__(self, dead_topic_id: str):
+        super().__init__()
+        self.dead_topic_id = dead_topic_id
+        self.missing_renames = 0
+
+    def rename_topic(self, chat_id, thread_id, name):
+        if str(thread_id) == self.dead_topic_id:
+            self.missing_renames += 1
+            return {
+                "ok": False,
+                "error": "Bad Request: message thread not found",
+            }
+        return super().rename_topic(chat_id, thread_id, name)
+
+
+class MissingIconTopicTelegram(FakeTelegram):
+    def __init__(self, dead_topic_id: str):
+        super().__init__()
+        self.dead_topic_id = dead_topic_id
+        self.missing_icon_edits = 0
+
+    def edit_topic_icon(self, chat_id, thread_id, emoji_id):
+        if str(thread_id) == self.dead_topic_id:
+            self.missing_icon_edits += 1
+            return {
+                "ok": False,
+                "error": "Bad Request: message thread not found",
+            }
+        return super().edit_topic_icon(
+            chat_id, thread_id, emoji_id
+        )
+
+
+class MissingRetiredTopicTelegram(FakeTelegram):
+    def __init__(self, dead_topic_id: str, path: str):
+        super().__init__()
+        self.dead_topic_id = dead_topic_id
+        self.path = path
+        self.missing_operations = 0
+
+    def send_message(self, chat_id, html, **kwargs):
+        if (
+            self.path == "notice"
+            and str(kwargs.get("thread_id") or "")
+            == self.dead_topic_id
+        ):
+            self.missing_operations += 1
+            return {
+                "ok": False,
+                "error": "Bad Request: message thread not found",
+            }
+        return super().send_message(chat_id, html, **kwargs)
+
+    def rename_topic(self, chat_id, thread_id, name):
+        if (
+            self.path == "rename"
+            and str(thread_id) == self.dead_topic_id
+        ):
+            self.missing_operations += 1
+            return {
+                "ok": False,
+                "error": "Bad Request: message thread not found",
+            }
+        return super().rename_topic(chat_id, thread_id, name)
+
+
+def _current_topic_refs(store: dict, topic_id: str) -> list[dict]:
+    return [
+        entry
+        for entry in (
+            list(state.source_worker_entries(store).values())
+            + list(state.source_space_entries(store).values())
+        )
+        if str(entry.get("topic_id") or "") == topic_id
+    ]
+
+
 def test_deleted_live_topic_is_reminted_and_next_final_delivered_once():
     store = _store()
     _key, entry = _entry(
@@ -227,6 +305,187 @@ def test_deleted_live_topic_is_reminted_and_next_final_delivered_once():
         == 1
     )
     assert telegram.failed_topic_sends == 1
+
+
+def test_missing_live_rename_tombstones_aliases_before_second_pass():
+    store = _store()
+    dead_topic_id = "15007"
+    _key, entry = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-live",
+        topic_id=dead_topic_id,
+    )
+    entry["topic_name"] = "old-label"
+    state.upsert_space_entry(
+        store,
+        {
+            "id": "stale-alias",
+            "name": "alias-label",
+            "status": "active",
+            "fingerprint": "alias-fp",
+        },
+        topic_id=dead_topic_id,
+    )
+    telegram = MissingRenameTopicTelegram(dead_topic_id)
+    runtime = SyncRuntime(
+        FakeTendwire(
+            workers=[_worker()],
+            turns={"turns": []},
+            spaces=[],
+        ),
+        telegram,
+        with_outbox=False,
+    )
+
+    sync_once(store, runtime)
+    replacement_topic_id = entry["topic_id"]
+
+    assert telegram.missing_renames == 1
+    assert replacement_topic_id != dead_topic_id
+    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
+    assert _current_topic_refs(store, dead_topic_id) == []
+    assert telegram.topics == ["discovery-calls"]
+    assert entry["last_topic_recovery"]["replacement_topic_id"] == (
+        replacement_topic_id
+    )
+
+    alias_worker = _worker(
+        "alias-worker", fingerprint="alias-worker-fp"
+    )
+    alias_worker["meta"]["label"] = "alias-label"
+    alias_worker["meta"]["stable_key"] = "wsk1_" + "f" * 64
+    runtime.tendwire = FakeTendwire(
+        workers=[_worker(), alias_worker],
+        turns={"turns": []},
+        spaces=[],
+    )
+
+    sync_once(store, runtime)
+
+    assert entry["topic_id"] == replacement_topic_id
+    assert _current_topic_refs(store, dead_topic_id) == []
+    assert all(
+        worker.get("topic_id") != dead_topic_id
+        for worker in state.source_worker_entries(store).values()
+    )
+    assert telegram.topics == ["discovery-calls", "alias-label"]
+
+
+def test_missing_topic_icon_tombstones_aliases_and_remints_once(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "1")
+    store = _store()
+    dead_topic_id = "15007"
+    _key, entry = _entry(
+        store,
+        worker_id="claude-live",
+        fingerprint="fp-live",
+        topic_id=dead_topic_id,
+    )
+    state.upsert_space_entry(
+        store,
+        {
+            "id": "stale-icon-alias",
+            "name": "icon-alias",
+            "status": "active",
+            "fingerprint": "icon-alias-fp",
+        },
+        topic_id=dead_topic_id,
+    )
+    telegram = MissingIconTopicTelegram(dead_topic_id)
+    runtime = SyncRuntime(
+        FakeTendwire(
+            workers=[_worker()],
+            turns={"turns": []},
+            spaces=[],
+        ),
+        telegram,
+        with_outbox=False,
+    )
+
+    sync_once(store, runtime)
+
+    assert telegram.missing_icon_edits == 1
+    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
+    assert _current_topic_refs(store, dead_topic_id) == []
+    assert telegram.topics == []
+
+    sync_once(store, runtime)
+    replacement_topic_id = entry["topic_id"]
+    sync_once(store, runtime)
+
+    assert replacement_topic_id != dead_topic_id
+    assert telegram.topics == ["discovery-calls"]
+    assert telegram.missing_icon_edits == 1
+    assert _current_topic_refs(store, dead_topic_id) == []
+    assert entry["last_topic_recovery"]["replacement_topic_id"] == (
+        replacement_topic_id
+    )
+
+
+@pytest.mark.parametrize("path", ["notice", "rename"])
+def test_missing_retired_topic_operation_tombstones_every_alias(path):
+    store = _store()
+    dead_topic_id = "15007"
+    retired = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "topic_id": dead_topic_id,
+        "topic_name": "📁 retired pane",
+        "routing_retired": True,
+        "routing_retired_reason": "stable_key_duplicate_consolidated",
+        "status": "closed",
+        f"retired_topic_{path}_pending": True,
+        f"retired_topic_{path}_error": "old error",
+    }
+    store["panes"]["worker:retired-provider-missing"] = retired
+    state.upsert_space_entry(
+        store,
+        {
+            "id": "retired-alias",
+            "name": "retired-alias",
+            "status": "active",
+            "fingerprint": "retired-alias-fp",
+        },
+        topic_id=dead_topic_id,
+    )
+    telegram = MissingRetiredTopicTelegram(dead_topic_id, path)
+    runtime = SyncRuntime(
+        FakeTendwire(
+            workers=[],
+            turns={"turns": []},
+            spaces=[],
+        ),
+        telegram,
+        with_outbox=False,
+    )
+
+    sync_once(store, runtime)
+
+    assert telegram.missing_operations == 1
+    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
+    assert _current_topic_refs(store, dead_topic_id) == []
+    assert "topic_id" not in retired
+    assert retired["retired_topic_id"] == dead_topic_id
+    assert retired["retired_topic_missing"] is True
+    assert not any(
+        field in retired
+        for field in (
+            "retired_topic_notice_pending",
+            "retired_topic_notice_error",
+            "retired_topic_rename_pending",
+            "retired_topic_rename_error",
+            "retired_topic_close_pending",
+            "retired_topic_close_error",
+        )
+    )
+
+    sync_once(store, runtime)
+
+    assert telegram.missing_operations == 1
+    assert telegram.topics == []
 
 
 @pytest.mark.parametrize("already_missing", [False, True])

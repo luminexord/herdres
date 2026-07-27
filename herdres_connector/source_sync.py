@@ -637,10 +637,12 @@ def _record_delivery_error(entry: dict[str, Any], result: dict[str, Any], bot_ki
         entry["last_managed_bot_error"] = error
 
 
-def _repair_gone_delivery_topic(
+def _repair_provider_gone_topic(
     store: dict[str, Any],
-    entry: dict[str, Any],
+    entry: dict[str, Any] | None,
     result: dict[str, Any],
+    *,
+    topic_id: str = "",
 ) -> bool:
     kind = str(result.get("kind") or "")
     classified = classify_telegram_error(result.get("error"))
@@ -650,13 +652,24 @@ def _repair_gone_delivery_topic(
         and classified != "topic_not_found"
     ):
         return False
-    kind = "topic_not_found"
-    return state.clear_gone_live_topic(
-        store,
-        entry,
-        error_kind=kind,
-        error=result.get("error"),
+    proven_topic_id = topic_id or str(
+        (entry or {}).get("topic_id") or ""
     )
+    if not proven_topic_id:
+        return False
+    if (
+        entry is not None
+        and str(entry.get("topic_id") or "") == proven_topic_id
+        and state.clear_gone_live_topic(
+            store,
+            entry,
+            error_kind="topic_not_found",
+            error=result.get("error"),
+        )
+    ):
+        return True
+    state.tombstone_dead_topic(store, proven_topic_id)
+    return True
 
 
 def _record_delivery_success(entry: dict[str, Any], bot_kind: str) -> None:
@@ -1716,8 +1729,15 @@ def _fold_superseded_final(
         binding["fold_attempts"] = int(binding.get("fold_attempts") or 0) + 1
         return True
     error = str(sent.get("error") or "").lower()
-    if sent.get("ok") or "not found" in error or _topic_missing(sent.get("error")):
+    if sent.get("ok") or _message_missing(sent.get("error")):
         binding["folded"] = True  # done (or the message/topic is gone — nothing left to fold)
+        return True
+    if _topic_missing(sent.get("error")):
+        _repair_provider_gone_topic(store, entry, sent)
+        binding["folded"] = True
+        return True
+    if "not found" in error:
+        binding["folded"] = True
         return True
     binding["fold_attempts"] = int(binding.get("fold_attempts") or 0) + 1
     return True
@@ -1835,6 +1855,11 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
         entry.pop("last_topic_icon_missing", None)
         entry.pop("last_topic_icon_error", None)
         return True
+    if _topic_missing(result.get("error")):
+        _repair_provider_gone_topic(
+            store, entry, result, topic_id=thread_id
+        )
+        return False
     entry["last_topic_icon_error"] = compact_ws(result.get("error"), 240)
     return False
 
@@ -1978,8 +2003,9 @@ def _sync_topic_pinned(
             entry.pop("pinned_status_message_id", None)
             message_id = ""
         elif _topic_missing(sent.get("error")):
-            entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
-            _repair_gone_delivery_topic(store, entry, sent)
+            _repair_provider_gone_topic(
+                store, entry, sent, topic_id=thread_id
+            )
             return False
         else:
             entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
@@ -1987,8 +2013,12 @@ def _sync_topic_pinned(
     if not message_id:
         sent = runtime.telegram.send_message(chat_id, html, thread_id=thread_id, notify=False)
         if not sent.get("ok"):
-            entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
-            _repair_gone_delivery_topic(store, entry, sent)
+            if not _repair_provider_gone_topic(
+                store, entry, sent, topic_id=thread_id
+            ):
+                entry["pinned_status_last_error"] = compact_ws(
+                    sent.get("error"), 240
+                )
             return False
         message_id = str(sent.get("message_id") or "")
         if not message_id:
@@ -2221,8 +2251,9 @@ def _sync_retired_worker_topics(
                 if runtime.checkpoint is not None:
                     runtime.checkpoint()
             elif _topic_missing(sent.get("error")):
-                entry.pop("retired_topic_notice_pending", None)
-                entry["retired_topic_missing"] = True
+                _repair_provider_gone_topic(
+                    store, entry, sent, topic_id=topic_id
+                )
                 changed += 1
             elif classify_telegram_error(sent.get("error")) == "topic_closed":
                 stamp_closed(entry)
@@ -2245,8 +2276,9 @@ def _sync_retired_worker_topics(
                 entry["retired_topic_renamed"] = True
                 changed += 1
             elif _topic_missing(renamed.get("error")):
-                entry.pop("retired_topic_rename_pending", None)
-                entry["retired_topic_missing"] = True
+                _repair_provider_gone_topic(
+                    store, entry, renamed, topic_id=topic_id
+                )
                 changed += 1
             elif classify_telegram_error(renamed.get("error")) == "topic_closed":
                 stamp_closed(entry)
@@ -2406,9 +2438,12 @@ def _sync_sources(
                 entry.pop("rename_attempts", None)
                 _stamp_numbered_base(entry, assignment_key, worker_numbered_bases)
             elif _topic_missing(renamed.get("error")):
-                # the topic is gone (hand-deleted): drop the mapping so _ensure_topic recreates it
-                # under the new name instead of renaming a ghost forever.
-                entry.pop("topic_id", None)
+                _repair_provider_gone_topic(
+                    store,
+                    entry,
+                    renamed,
+                    topic_id=str(entry.get("topic_id") or ""),
+                )
                 entry["topic_name"] = worker_topic_renames[assignment_key]
                 entry.pop("rename_attempts", None)
                 _stamp_numbered_base(entry, assignment_key, worker_numbered_bases)
@@ -3168,6 +3203,10 @@ def _execute_topic_cleanup_targets(
                 if response.get("ok") or kind in success_kinds
                 else "failed",
                 "kind": kind,
+                "topic_missing": kind in {
+                    "topic_not_found",
+                    "not_found",
+                },
                 "error": compact_ws(error, 240),
             }
         )
@@ -3269,6 +3308,19 @@ def _apply_topic_cleanup_outcomes(
             result["changed"] = (
                 provider_fact_changed or result["changed"]
             )
+        elif (
+            outcome["status"] == "success"
+            and outcome.get("topic_missing") is True
+        ):
+            _repair_provider_gone_topic(
+                store,
+                state.source_worker_entries(store).get(
+                    str(target["entry_key"])
+                ),
+                outcome,
+                topic_id=str(target["topic_id"]),
+            )
+            result["changed"] = True
         if not target_still_valid:
             result["deferred"] += 1
             continue
@@ -3625,7 +3677,7 @@ def _deliver_working(
         )
         return True
     _record_delivery_error(entry, sent, bot_kind)
-    _repair_gone_delivery_topic(store, entry, sent)
+    _repair_provider_gone_topic(store, entry, sent)
     return False
 
 
@@ -4325,7 +4377,7 @@ def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str,
     )
     if not sent.get("ok"):
         _record_delivery_error(entry, sent, bot_kind)
-        _repair_gone_delivery_topic(store, entry, sent)
+        _repair_provider_gone_topic(store, entry, sent)
         return False
     message_ids: list[str] = []
     for message_id in split_legacy_message_ids(sent):
@@ -4367,7 +4419,7 @@ def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncR
         state.bind_message_to_worker(store, sent.get("message_id"), entry, topic_id=thread_id, kind="pending", turn_id=pending_id, bot_kind=bot_kind)
         return state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id})
     _record_delivery_error(entry, sent, bot_kind)
-    _repair_gone_delivery_topic(store, entry, sent)
+    _repair_provider_gone_topic(store, entry, sent)
     return False
 
 
@@ -6868,7 +6920,9 @@ def _drain_turn_final(
                         )
                         break
                 if not applied.get("ok"):
-                    if _repair_gone_delivery_topic(store, entry, applied):
+                    if _repair_provider_gone_topic(
+                        store, entry, applied
+                    ):
                         _defer_turn_final(
                             runtime,
                             ref,
@@ -7231,12 +7285,38 @@ def _sync_pinned(
         if not sent.get("ok") and _message_missing(sent.get("error")):
             sent = runtime.telegram.send_message(chat_id, html, thread_id=config.general_thread_id(store), notify=False)
             if not sent.get("ok") and _topic_missing(sent.get("error")):
+                _repair_provider_gone_topic(
+                    store,
+                    None,
+                    sent,
+                    topic_id=str(config.general_thread_id(store)),
+                )
                 sent = runtime.telegram.send_message(chat_id, html, notify=False)
             if sent.get("ok") and sent.get("message_id"):
                 runtime.telegram.pin_message(chat_id, str(sent["message_id"]))
+        elif not sent.get("ok") and _topic_missing(sent.get("error")):
+            _repair_provider_gone_topic(
+                store,
+                None,
+                sent,
+                topic_id=str(config.general_thread_id(store)),
+            )
+            sent = runtime.telegram.send_message(
+                chat_id, html, notify=False
+            )
+            if sent.get("ok") and sent.get("message_id"):
+                runtime.telegram.pin_message(
+                    chat_id, str(sent["message_id"])
+                )
     else:
         sent = runtime.telegram.send_message(chat_id, html, thread_id=config.general_thread_id(store), notify=False)
         if not sent.get("ok") and _topic_missing(sent.get("error")):
+            _repair_provider_gone_topic(
+                store,
+                None,
+                sent,
+                topic_id=str(config.general_thread_id(store)),
+            )
             sent = runtime.telegram.send_message(chat_id, html, notify=False)
         if sent.get("ok") and sent.get("message_id"):
             runtime.telegram.pin_message(chat_id, str(sent["message_id"]))
