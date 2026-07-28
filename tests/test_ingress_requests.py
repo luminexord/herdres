@@ -762,49 +762,6 @@ def _removed_ingress_result_reads(
                 and _call_name(node.func) in factories
             )
 
-        derived_aliases: set[str] = set()
-
-        def is_ingress_derived(node: ast.AST) -> bool:
-            if is_result(node):
-                return True
-            if isinstance(node, ast.Name):
-                return node.id in derived_aliases
-            if not isinstance(node, ast.Call):
-                return False
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "to_wire_dict"
-            ):
-                return False
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"items", "keys", "values"}
-                and is_ingress_derived(node.func.value)
-            ):
-                return True
-            return any(is_ingress_derived(argument) for argument in node.args) or any(
-                is_ingress_derived(keyword.value) for keyword in node.keywords
-            )
-
-        changed = True
-        while changed:
-            changed = False
-            for node in nodes:
-                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    continue
-                targets = (
-                    node.targets if isinstance(node, ast.Assign) else [node.target]
-                )
-                if not is_ingress_derived(node.value):
-                    continue
-                for target in targets:
-                    if (
-                        isinstance(target, ast.Name)
-                        and target.id not in derived_aliases
-                    ):
-                        derived_aliases.add(target.id)
-                        changed = True
-
         def is_mapping_constructor(node: ast.Call) -> bool:
             name = _call_name(node.func)
             if name == "from_mapping":
@@ -851,6 +808,23 @@ def _removed_ingress_result_reads(
                 key = node.attr
                 owner = node.value
             if (
+                isinstance(node, ast.Attribute)
+                and node.attr in {"items", "keys", "values"}
+                and is_result(node.value)
+                and scope_name != "to_wire_dict"
+            ):
+                # Tracking every place a derived view can flow is unbounded and
+                # repeatedly proved incomplete. Forbid creating the view
+                # instead; legitimate iteration crosses the explicit
+                # to_wire_dict boundary first.
+                violations.append(
+                    (
+                        filename,
+                        node.lineno,
+                        f"ingress_result.{node.attr} extraction",
+                    )
+                )
+            if (
                 key in _REMOVED_INGRESS_RESULT_KEYS
                 and owner is not None
                 and is_result(owner)
@@ -865,7 +839,7 @@ def _removed_ingress_result_reads(
                 if (
                     is_mapping_constructor(node)
                     and any(
-                        is_ingress_derived(argument)
+                        is_result(argument)
                         for argument in [
                             *node.args,
                             *(keyword.value for keyword in node.keywords),
@@ -1147,6 +1121,103 @@ def test_ingress_result_guard_rejects_chainmap_wrapper() -> None:
 def consumer():
     result = command_reply({})
     return collections.ChainMap(result)
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_view_passed_to_local_helper() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def rebuild(pairs):
+    return dict(pairs)
+
+def consumer():
+    result = command_reply({})
+    plain = rebuild(result.items())
+    return plain.get("disposition", "terminal_accepted")
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_view_stored_then_unpacked() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    stored = [result.items()]
+    pairs, = stored
+    plain = dict(pairs)
+    return plain.get("disposition", "terminal_accepted")
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_comprehension_over_aliased_view() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    pairs = result.items()
+    plain = {key: value for key, value in pairs}
+    return plain.get("disposition", "terminal_accepted")
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_view_in_conditional_expression() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer(enabled):
+    result = command_reply({})
+    pairs = result.items() if enabled else ()
+    plain = dict(pairs)
+    return plain.get("disposition", "terminal_accepted")
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_view_in_walrus_expression() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    if pairs := result.items():
+        plain = dict(pairs)
+    else:
+        plain = {}
+    return plain.get("disposition", "terminal_accepted")
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_view_in_destructuring_assignment() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    pairs, = (result.items(),)
+    plain = dict(pairs)
+    return plain.get("disposition", "terminal_accepted")
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_view_in_augmented_assignment() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    pairs = []
+    pairs += result.items()
+    plain = dict(pairs)
+    return plain.get("disposition", "terminal_accepted")
 """
     )
     assert violations
