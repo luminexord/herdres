@@ -836,11 +836,11 @@ def test_blocked_sync_observation_does_not_delay_command_submission(
     release.set()
     thread.join(6)
 
-    assert reply["checkpoint"] == "advance"
-    assert reply["disposition"] == "terminal_accepted"
-    # This direct caller has no gateway instant-ack evidence, so lane mode alone
-    # must not suppress the terminal success reply.
-    assert reply["reply"] == "Sent to Tendwire worker."
+    assert reply["checkpoint"] == "hold"
+    assert reply["transport_disposition"] == "written_to_pty"
+    assert reply["request_phase"] == "accepted_unverified"
+    assert reply["terminal_outcome"] == "delivery_unknown"
+    assert reply["reply"] == ""
     assert len(submitted) == 1
     assert elapsed < 5.0
     assert not thread.is_alive()
@@ -1159,7 +1159,8 @@ def test_full_busy_pass_flock_p99_and_concurrent_canonical_commit_budget(
     assert not sync_error
     assert not sync_thread.is_alive()
     assert sync_result["ok"] is True
-    assert reply["disposition"] == "terminal_accepted"
+    assert reply["transport_disposition"] == "written_to_pty"
+    assert reply["terminal_outcome"] == "delivery_unknown"
     assert canonical_commit_seconds < 3.0
     assert holds
     hold_seconds = sorted(float(hold["hold_seconds"]) for hold in holds)

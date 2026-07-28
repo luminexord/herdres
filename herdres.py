@@ -374,7 +374,7 @@ def _submit_ingress_command_record(
     *,
     instant_ack_posted: bool = False,
     gateway_success_ack_enabled: bool = True,
-) -> dict[str, Any]:
+) -> ingress_requests.IngressResult:
     """Replay durable bytes off-lock and reduce authoritative dispositions.
 
     ``command_reply`` enters with the connector state lock held.  The canonical
@@ -467,7 +467,7 @@ def _submit_ingress_command_record(
         if migrated:
             state.save_state(store)
         if record["state"] in {"terminal", "quarantined"}:
-            return copy.deepcopy(record["outcome"])
+            return ingress_requests.IngressResult.from_mapping(record["outcome"])
         if record.get("request_json") != request_json:
             outcome = ingress_requests.quarantine_request(
                 record, "conflicting ingress request", now=transitioned_at
@@ -1091,7 +1091,13 @@ def cmd_command(_args: argparse.Namespace) -> int:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
         payload = {}
-    return _json(command_reply(payload if isinstance(payload, dict) else {}))
+    result = command_reply(payload if isinstance(payload, dict) else {})
+    wire_result = (
+        result.to_wire_dict()
+        if isinstance(result, ingress_requests.IngressResult)
+        else result
+    )
+    return _json(wire_result)
 
 
 def cmd_callback(_args: argparse.Namespace) -> int:
@@ -1974,6 +1980,24 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     return _json({"ok": True, **result})
 
 
+def cmd_ingress_status(_args: argparse.Namespace) -> int:
+    """Print the operator-facing delivery truth without prompt contents."""
+
+    config.load_env_file()
+    store = state.load_state()
+    rows = ingress_requests.operator_status_rows(store, now=time.time())
+    return _json(
+        {
+            "ok": True,
+            "schema_version": 1,
+            "attention_required": sum(
+                1 for row in rows if row["operator_attention_required"]
+            ),
+            "requests": rows,
+        }
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="herdres")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1983,6 +2007,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("command").set_defaults(func=cmd_command)
     sub.add_parser("callback").set_defaults(func=cmd_callback)
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+    sub.add_parser("ingress-status").set_defaults(func=cmd_ingress_status)
     sub.add_parser("version").set_defaults(func=lambda _args: (print(VERSION), 0)[1])
     speech_parser = sub.add_parser("speech")
     speech_parser.add_argument("action", nargs="?", default="check", choices=["check", "install"])

@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS lane_items (
     kind TEXT NOT NULL,
     update_json TEXT NOT NULL,
     route_json TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('pending','processing','done')),
+    state TEXT NOT NULL CHECK(state IN ('pending','processing','blocked','done')),
     attempts INTEGER NOT NULL DEFAULT 0,
     first_seen_at REAL NOT NULL,
     next_attempt_at REAL NOT NULL,
@@ -124,6 +124,77 @@ class IngressLaneSpool:
             # eight-worker wake into seconds of SQLite contention.
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
+            self._migrate_blocked_state(connection)
+
+    @staticmethod
+    def _migrate_blocked_state(connection: sqlite3.Connection) -> None:
+        """Add the non-claimable hold state to pre-#200 spool databases."""
+
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lane_items'"
+        ).fetchone()
+        sql = str(row["sql"] or "") if row is not None else ""
+        if "'blocked'" in sql:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("DROP INDEX IF EXISTS lane_items_open_by_lane")
+            connection.execute("DROP INDEX IF EXISTS lane_items_pending_by_attempt")
+            connection.execute("DROP INDEX IF EXISTS lane_items_processing_by_lease")
+            connection.execute("ALTER TABLE lane_items RENAME TO lane_items_before_hold")
+            connection.execute(
+                """
+                CREATE TABLE lane_items (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL UNIQUE,
+                    receiver_kind TEXT NOT NULL,
+                    update_id INTEGER NOT NULL,
+                    lane_key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    update_json TEXT NOT NULL,
+                    route_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('pending','processing','blocked','done')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    first_seen_at REAL NOT NULL,
+                    next_attempt_at REAL NOT NULL,
+                    deadline_at REAL NOT NULL,
+                    lease_owner TEXT,
+                    lease_until REAL,
+                    notify_state TEXT NOT NULL DEFAULT 'pending',
+                    updated_at REAL NOT NULL,
+                    UNIQUE(receiver_kind, update_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO lane_items
+                SELECT * FROM lane_items_before_hold
+                """
+            )
+            connection.execute("DROP TABLE lane_items_before_hold")
+            connection.execute(
+                """
+                CREATE INDEX lane_items_open_by_lane
+                    ON lane_items(lane_key, seq) WHERE state != 'done'
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX lane_items_pending_by_attempt
+                    ON lane_items(next_attempt_at, seq) WHERE state = 'pending'
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX lane_items_processing_by_lease
+                    ON lane_items(lease_until) WHERE state = 'processing'
+                """
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -540,6 +611,28 @@ class IngressLaneSpool:
                     int(seq),
                     str(lease_owner),
                 ),
+            ).rowcount
+        return changed == 1
+
+    def mark_blocked(
+        self,
+        seq: int,
+        lease_owner: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Hold a lane head without timer-driven redispatch."""
+
+        timestamp = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE lane_items
+                SET state = 'blocked', lease_owner = NULL, lease_until = NULL,
+                    updated_at = ?
+                WHERE seq = ? AND state = 'processing' AND lease_owner = ?
+                """,
+                (timestamp, int(seq), str(lease_owner)),
             ).rowcount
         return changed == 1
 
