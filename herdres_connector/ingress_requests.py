@@ -199,6 +199,37 @@ _DEDUP_PROVIDER_VERDICTS = frozenset(
 )
 
 
+class IngressResult(dict[str, Any]):
+    """JSON-compatible child result that rejects removed vocabulary at runtime."""
+
+    _REMOVED_FIELDS = frozenset({"disposition", "last_disposition"})
+
+    @classmethod
+    def _reject_removed(cls, key: object) -> None:
+        if key in cls._REMOVED_FIELDS:
+            raise KeyError(f"removed ingress result field: {key}")
+
+    def __getitem__(self, key: object) -> Any:
+        self._reject_removed(key)
+        return super().__getitem__(key)
+
+    def get(self, key: object, default: Any = None) -> Any:
+        self._reject_removed(key)
+        return super().get(key, default)
+
+    def pop(self, key: object, *default: Any) -> Any:
+        self._reject_removed(key)
+        return super().pop(key, *default)
+
+    def setdefault(self, key: object, default: Any = None) -> Any:
+        self._reject_removed(key)
+        return super().setdefault(key, default)
+
+    def __getattr__(self, name: str) -> Any:
+        self._reject_removed(name)
+        raise AttributeError(name)
+
+
 
 
 
@@ -242,7 +273,7 @@ def child_result(
     terminal_outcome: str | None,
     reply: str = "",
     handled: bool = True,
-) -> dict[str, Any]:
+) -> IngressResult:
     """Build the exact child envelope consumed by the Telegram gateway."""
 
     request_id = validate_request_id(request_id)
@@ -282,7 +313,7 @@ def child_result(
             raise ValueError("invalid held request phase")
         if not handled and (transport is not None or reply):
             raise ValueError("unhandled outcome cannot carry command details")
-    return {
+    return IngressResult({
         "schema_version": CHILD_SCHEMA_VERSION,
         "handled": handled,
         "request_id": request_id,
@@ -291,7 +322,11 @@ def child_result(
         "request_phase": request_phase,
         "terminal_outcome": terminal_outcome,
         "reply": _fixed_reply(reply),
-    }
+    })
+
+
+def _copy_child_result(value: dict[str, Any]) -> IngressResult:
+    return IngressResult(copy.deepcopy(value))
 
 
 def _valid_child(value: Any, request_id: str) -> bool:
@@ -855,10 +890,19 @@ def _migrate_v2_to_v3(value: Any, request_id: str) -> dict[str, Any] | None:
 
 def _historical_outcome(
     old_disposition: Any,
-) -> tuple[str | None, str, str, str]:
-    """Map v3 history without upgrading transport acceptance into delivery."""
+    *,
+    linked_submission: bool,
+) -> tuple[str | None, str, str, str | None]:
+    """Map v3 history according to its retained authoritative evidence."""
 
     if old_disposition == "terminal_accepted":
+        if linked_submission:
+            return (
+                "submitted",
+                "terminal",
+                "delivered",
+                None,
+            )
         return (
             "written_to_pty",
             "accepted_unverified",
@@ -905,9 +949,17 @@ def _migrate_v3_record(value: Any, request_id: str) -> dict[str, Any] | None:
     elif migrated["state"] == "retryable":
         migrated["request_phase"] = "retryable"
     else:
-        transport, phase, terminal_outcome, reason = _historical_outcome(
-            old_disposition
+        linked_submission = (
+            old_disposition == "terminal_accepted"
+            and migrated.get("submission_state") == "linked"
+            and isinstance(migrated.get("turn_id"), str)
+            and bool(migrated["turn_id"].strip())
         )
+        transport, phase, terminal_outcome, reason = _historical_outcome(
+            old_disposition,
+            linked_submission=linked_submission,
+        )
+        delivered = terminal_outcome == "delivered"
         migrated.update(
             {
                 "state": "terminal",
@@ -915,9 +967,13 @@ def _migrate_v3_record(value: Any, request_id: str) -> dict[str, Any] | None:
                 "request_phase": phase,
                 "terminal_outcome": terminal_outcome,
                 "checkpoint_already_advanced": True,
-                "operator_attention_required": True,
+                "operator_attention_required": not delivered,
                 "blocked_reason": reason,
-                "next_action": "inspect historical ingress evidence",
+                "next_action": (
+                    None
+                    if delivered
+                    else "inspect historical ingress evidence"
+                ),
                 "terminal_at": (
                     migrated.get("terminal_at")
                     or migrated.get("quarantined_at")
@@ -927,7 +983,7 @@ def _migrate_v3_record(value: Any, request_id: str) -> dict[str, Any] | None:
                 "quarantine_reason": None,
                 "outcome": child_result(
                     request_id,
-                    checkpoint="hold",
+                    checkpoint="advance" if delivered else "hold",
                     transport_disposition=transport,
                     request_phase=phase,
                     terminal_outcome=terminal_outcome,
@@ -1051,7 +1107,7 @@ def _validated_records_mapping(
 
 def cached_terminal_outcome(
     store: dict[str, Any], request_id: str, *, now: float
-) -> dict[str, Any] | None:
+) -> IngressResult | None:
     """Read a validated terminal/quarantine outcome without mutating state."""
 
     request_id = validate_request_id(request_id)
@@ -1068,7 +1124,7 @@ def cached_terminal_outcome(
         return None
     if record["state"] not in {"terminal", "quarantined"}:
         return None
-    return copy.deepcopy(record["outcome"])
+    return _copy_child_result(record["outcome"])
 
 
 def quarantine_request(
@@ -1126,7 +1182,7 @@ def quarantine_request(
     record["quarantined_at"] = timestamp
     record["quarantine_reason"] = blocked_reason
     record["outcome"] = outcome
-    return copy.deepcopy(outcome)
+    return _copy_child_result(outcome)
 
 
 def ensure_request_shell(
@@ -1204,7 +1260,7 @@ def preflight_request(
         retention=retention,
     )
     if record["state"] in {"terminal", "quarantined"}:
-        return record, copy.deepcopy(record["outcome"]), changed
+        return record, _copy_child_result(record["outcome"]), changed
     if float(now) >= record["deadline_at"]:
         outcome = quarantine_request(record, "request deadline reached", now=now)
         return record, outcome, True
@@ -1336,7 +1392,7 @@ def record_terminal_outcome(
     record["quarantined_at"] = None
     record["quarantine_reason"] = None
     record["outcome"] = outcome
-    return copy.deepcopy(outcome)
+    return _copy_child_result(outcome)
 
 
 def mark_terminal(

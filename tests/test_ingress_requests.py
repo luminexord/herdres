@@ -146,6 +146,7 @@ def _old_v3_record(
     *,
     now: float = 100.0,
     terminal_disposition: str | None = None,
+    linked: bool = False,
 ) -> dict[str, object]:
     current = _record(
         request_id,
@@ -195,6 +196,20 @@ def _old_v3_record(
                 else "Could not send safely."
             ),
         }
+        if linked:
+            current.update(
+                {
+                    "submission_id": "submission-verified",
+                    "submission_state": "linked",
+                    "turn_id": "turn-verified",
+                    "target_owner": {
+                        "stable_key": f"wsk1_{'a' * 64}",
+                        "stable_key_version": 1,
+                    },
+                    "submitted_at": now + 1,
+                    "linked_at": now + 2,
+                }
+            )
     return current
 
 
@@ -531,104 +546,367 @@ def test_terminal_accepted_can_never_be_a_terminal_outcome() -> None:
     assert "disposition" not in outcome
 
 
-def test_ingress_result_consumers_do_not_read_removed_disposition_keys() -> None:
-    """Reject old flat-key reads from values known to be ingress results."""
+_INGRESS_RESULT_FACTORIES = {
+    "child_result",
+    "command_reply",
+    "mark_retryable",
+    "mark_terminal",
+    "quarantine_request",
+    "record_terminal_outcome",
+    "run_herdres_command",
+    "_submit_ingress_command_record",
+}
+_REMOVED_INGRESS_RESULT_KEYS = {"disposition", "last_disposition"}
 
-    result_factories = {
-        "child_result",
-        "command_reply",
-        "mark_retryable",
-        "mark_terminal",
-        "quarantine_request",
-        "record_terminal_outcome",
-        "run_herdres_command",
-        "_submit_ingress_command_record",
+
+def _local_nodes(scope: ast.AST) -> list[ast.AST]:
+    """Walk one lexical scope without borrowing aliases from nested scopes."""
+
+    roots = list(getattr(scope, "body", []))
+    found: list[ast.AST] = []
+    pending = list(reversed(roots))
+    while pending:
+        node = pending.pop()
+        found.append(node)
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+        ):
+            continue
+        pending.extend(reversed(list(ast.iter_child_nodes(node))))
+    return found
+
+
+def _call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _scope_facts(
+    scope: ast.AST,
+    *,
+    factories: set[str],
+    parameter_aliases: set[str],
+) -> tuple[list[ast.AST], set[str], dict[str, str]]:
+    nodes = _local_nodes(scope)
+    aliases = set(parameter_aliases)
+    constant_values: dict[str, set[str]] = {}
+    constant_aliases: list[tuple[str, str]] = []
+    for node in nodes:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if isinstance(node.value, ast.Constant) and isinstance(
+                node.value.value, str
+            ):
+                constant_values.setdefault(target.id, set()).add(node.value.value)
+            elif isinstance(node.value, ast.Name):
+                constant_aliases.append((target.id, node.value.id))
+    changed = True
+    while changed:
+        changed = False
+        for target, source in constant_aliases:
+            inherited = constant_values.get(source, set())
+            values = constant_values.setdefault(target, set())
+            before = len(values)
+            values.update(inherited)
+            changed = changed or len(values) != before
+    constants = {
+        name: next(iter(values))
+        for name, values in constant_values.items()
+        if len(values) == 1
     }
-    removed_keys = {"disposition", "last_disposition"}
+    changed = True
+    while changed:
+        changed = False
+        for node in nodes:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                is_result = (
+                    isinstance(value, ast.Call)
+                    and _call_name(value.func) in factories
+                ) or (isinstance(value, ast.Name) and value.id in aliases)
+                if is_result and target.id not in aliases:
+                    aliases.add(target.id)
+                    changed = True
+    return nodes, aliases, constants
+
+
+def _removed_ingress_result_reads(
+    source: str,
+    *,
+    filename: str = "<snippet>",
+) -> list[tuple[str, int, str]]:
+    tree = ast.parse(source, filename=filename)
+    definitions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    factories = set(_INGRESS_RESULT_FACTORIES)
+    parameter_aliases: dict[str, set[str]] = {
+        name: set() for name in definitions
+    }
+
+    # Resolve factory wrappers and argument flow together. A helper that returns
+    # an ingress result remains a factory, and a parameter receiving one remains
+    # an ingress-result alias inside that helper.
+    changed = True
+    while changed:
+        changed = False
+        scopes: list[ast.AST] = [tree, *definitions.values()]
+        for scope in scopes:
+            scope_name = getattr(scope, "name", "")
+            nodes, aliases, _constants = _scope_facts(
+                scope,
+                factories=factories,
+                parameter_aliases=parameter_aliases.get(scope_name, set()),
+            )
+            if scope_name and scope_name not in factories:
+                if any(
+                    isinstance(node, ast.Return)
+                    and node.value is not None
+                    and (
+                        (
+                            isinstance(node.value, ast.Call)
+                            and _call_name(node.value.func) in factories
+                        )
+                        or (
+                            isinstance(node.value, ast.Name)
+                            and node.value.id in aliases
+                        )
+                    )
+                    for node in nodes
+                ):
+                    factories.add(scope_name)
+                    changed = True
+            for node in nodes:
+                if not isinstance(node, ast.Call):
+                    continue
+                definition = definitions.get(_call_name(node.func))
+                if definition is None:
+                    continue
+                positional = list(definition.args.posonlyargs) + list(
+                    definition.args.args
+                )
+                for argument, parameter in zip(node.args, positional):
+                    is_result = (
+                        isinstance(argument, ast.Call)
+                        and _call_name(argument.func) in factories
+                    ) or (
+                        isinstance(argument, ast.Name)
+                        and argument.id in aliases
+                    )
+                    if (
+                        is_result
+                        and parameter.arg
+                        not in parameter_aliases[definition.name]
+                    ):
+                        parameter_aliases[definition.name].add(parameter.arg)
+                        changed = True
+                keyword_parameters = {
+                    parameter.arg: parameter
+                    for parameter in (
+                        list(definition.args.posonlyargs)
+                        + list(definition.args.args)
+                        + list(definition.args.kwonlyargs)
+                    )
+                }
+                for keyword in node.keywords:
+                    parameter = keyword_parameters.get(keyword.arg or "")
+                    is_result = (
+                        isinstance(keyword.value, ast.Call)
+                        and _call_name(keyword.value.func) in factories
+                    ) or (
+                        isinstance(keyword.value, ast.Name)
+                        and keyword.value.id in aliases
+                    )
+                    if (
+                        parameter is not None
+                        and is_result
+                        and parameter.arg
+                        not in parameter_aliases[definition.name]
+                    ):
+                        parameter_aliases[definition.name].add(parameter.arg)
+                        changed = True
+
     violations: list[tuple[str, int, str]] = []
+    for scope in [tree, *definitions.values()]:
+        scope_name = getattr(scope, "name", "")
+        nodes, aliases, constants = _scope_facts(
+            scope,
+            factories=factories,
+            parameter_aliases=parameter_aliases.get(scope_name, set()),
+        )
 
-    def call_name(node: ast.AST) -> str:
-        if isinstance(node, ast.Name):
-            return node.id
-        if isinstance(node, ast.Attribute):
-            return node.attr
-        return ""
+        def is_result(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Name) and node.id in aliases
+            ) or (
+                isinstance(node, ast.Call)
+                and _call_name(node.func) in factories
+            )
 
-    def literal_key(node: ast.AST) -> str | None:
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return node.value
-        return None
+        def key_value(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.Name):
+                return constants.get(node.id)
+            return None
 
-    def result_name(node: ast.AST, aliases: set[str]) -> bool:
-        if isinstance(node, ast.Name):
-            return node.id in aliases
-        return isinstance(node, ast.Call) and call_name(node.func) in result_factories
+        for node in nodes:
+            key = None
+            owner = None
+            if isinstance(node, ast.Subscript):
+                key = key_value(node.slice)
+                owner = node.value
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and node.args
+            ):
+                key = key_value(node.args[0])
+                owner = node.func.value
+            elif (
+                isinstance(node, ast.Call)
+                and _call_name(node.func) == "getattr"
+                and len(node.args) >= 2
+            ):
+                key = key_value(node.args[1])
+                owner = node.args[0]
+            elif (
+                isinstance(node, ast.Attribute)
+                and node.attr in _REMOVED_INGRESS_RESULT_KEYS
+            ):
+                key = node.attr
+                owner = node.value
+            if (
+                key in _REMOVED_INGRESS_RESULT_KEYS
+                and owner is not None
+                and is_result(owner)
+            ):
+                violations.append((filename, node.lineno, str(key)))
+            if isinstance(node, ast.Call):
+                for keyword in node.keywords:
+                    if keyword.arg is None and is_result(keyword.value):
+                        violations.append(
+                            (filename, keyword.value.lineno, "**ingress_result")
+                        )
+    return sorted(set(violations))
+
+
+def test_ingress_result_consumers_do_not_read_removed_disposition_keys() -> None:
+    """Reject old flat-key reads across every ordinary repository module."""
 
     repository = Path(__file__).resolve().parents[1]
+    violations: list[tuple[str, int, str]] = []
     for path in sorted(repository.rglob("*.py")):
         if any(part.startswith(".") for part in path.relative_to(repository).parts):
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        scopes: list[ast.AST] = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
-        for scope in scopes:
-            aliases: set[str] = set()
-            changed = True
-            while changed:
-                changed = False
-                for node in ast.walk(scope):
-                    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                        continue
-                    value = node.value
-                    if not (
-                        (
-                            isinstance(value, ast.Call)
-                            and call_name(value.func) in result_factories
-                        )
-                        or (isinstance(value, ast.Name) and value.id in aliases)
-                    ):
-                        continue
-                    targets = (
-                        node.targets
-                        if isinstance(node, ast.Assign)
-                        else [node.target]
-                    )
-                    for target in targets:
-                        if isinstance(target, ast.Name) and target.id not in aliases:
-                            aliases.add(target.id)
-                            changed = True
-            for node in ast.walk(scope):
-                key = None
-                owner = None
-                if isinstance(node, ast.Subscript):
-                    key = literal_key(node.slice)
-                    owner = node.value
-                elif (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "get"
-                    and node.args
-                ):
-                    key = literal_key(node.args[0])
-                    owner = node.func.value
-                if key in removed_keys and owner is not None and result_name(
-                    owner, aliases
-                ):
-                    violations.append(
-                        (
-                            str(path.relative_to(repository)),
-                            node.lineno,
-                            str(key),
-                        )
-                    )
-
+        relative = str(path.relative_to(repository))
+        violations.extend(
+            _removed_ingress_result_reads(
+                path.read_text(encoding="utf-8"),
+                filename=relative,
+            )
+        )
     assert violations == []
 
 
-def test_historical_terminal_accepted_migrates_to_unknown_not_delivered() -> None:
+def _structured_ingress_result() -> ingress_requests.IngressResult:
+    return ingress_requests.child_result(
+        REQUEST_ID,
+        checkpoint="hold",
+        transport_disposition="written_to_pty",
+        request_phase="accepted_unverified",
+        terminal_outcome="delivery_unknown",
+    )
+
+
+def test_ingress_result_guard_tracks_computed_removed_keys() -> None:
+    result = _structured_ingress_result()
+    key = "disposition"
+    with pytest.raises(KeyError, match="removed ingress result field"):
+        eval("result.get(key)", {"result": result, "key": key})
+
+
+def test_cached_ingress_result_restores_structured_removed_key_guard() -> None:
+    record = _record(REQUEST_ID, terminal=True)
+    store = {
+        ingress_requests.RECORDS_KEY: {
+            REQUEST_ID: json.loads(json.dumps(record))
+        }
+    }
+
+    result = ingress_requests.cached_terminal_outcome(
+        store,
+        REQUEST_ID,
+        now=103.0,
+    )
+
+    assert isinstance(result, ingress_requests.IngressResult)
+    with pytest.raises(KeyError, match="removed ingress result field"):
+        eval("result.get('disposition')", {"result": result})
+
+
+def test_ingress_result_guard_rejects_kwargs_expansion() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def helper(**values):
+    return values
+
+def consumer():
+    return helper(**command_reply({}))
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_tracks_call_argument_flow() -> None:
+    namespace: dict[str, object] = {}
+    exec(
+        "def helper(result):\n    return result.get('disposition')",
+        namespace,
+    )
+    with pytest.raises(KeyError, match="removed ingress result field"):
+        namespace["helper"](_structured_ingress_result())
+
+
+def test_ingress_result_guard_tracks_helper_returns() -> None:
+    def wrapper():
+        return _structured_ingress_result()
+
+    with pytest.raises(KeyError, match="removed ingress result field"):
+        eval("wrapper().get('disposition')", {"wrapper": wrapper})
+
+
+def test_ingress_result_guard_rejects_getattr_reads() -> None:
+    with pytest.raises(KeyError, match="removed ingress result field"):
+        eval(
+            "getattr(result, 'disposition', None)",
+            {"result": _structured_ingress_result()},
+        )
+
+
+def test_ingress_result_guard_scans_module_scope() -> None:
+    namespace = {"result": _structured_ingress_result()}
+    with pytest.raises(KeyError, match="removed ingress result field"):
+        exec("removed = result.get('disposition')", namespace)
+
+
+def test_unlinked_historical_terminal_accepted_migrates_to_unknown() -> None:
     legacy = _old_v3_record(
         REQUEST_ID,
         terminal_disposition="terminal_accepted",
@@ -652,6 +930,44 @@ def test_historical_terminal_accepted_migrates_to_unknown_not_delivered() -> Non
     assert migrated["checkpoint_already_advanced"] is True
     assert migrated["outcome"]["checkpoint"] == "hold"
     assert migrated["operator_attention_required"] is True
+
+
+def test_linked_historical_terminal_accepted_migrates_to_delivered() -> None:
+    legacy = _old_v3_record(
+        REQUEST_ID,
+        terminal_disposition="terminal_accepted",
+        linked=True,
+    )
+    store = {ingress_requests.RECORDS_KEY: {REQUEST_ID: legacy}}
+
+    migrated, changed = ingress_requests.ensure_request_shell(
+        store,
+        REQUEST_ID,
+        now=130.0,
+        retry_horizon=60,
+        retention=120,
+    )
+
+    assert changed is True
+    assert migrated["schema_version"] == 4
+    assert migrated["transport_disposition"] == "submitted"
+    assert migrated["request_phase"] == "terminal"
+    assert migrated["terminal_outcome"] == "delivered"
+    assert migrated["checkpoint_already_advanced"] is True
+    assert migrated["outcome"]["checkpoint"] == "advance"
+    assert migrated["operator_attention_required"] is False
+    assert migrated["blocked_reason"] is None
+    assert migrated["next_action"] is None
+
+    same, changed = ingress_requests.ensure_request_shell(
+        store,
+        REQUEST_ID,
+        now=131.0,
+        retry_horizon=60,
+        retention=120,
+    )
+    assert same is migrated
+    assert changed is False
 
 
 @pytest.mark.parametrize(
