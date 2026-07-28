@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -526,6 +528,104 @@ def test_terminal_accepted_can_never_be_a_terminal_outcome() -> None:
     assert outcome["transport_disposition"] == "written_to_pty"
     assert outcome["terminal_outcome"] == "delivery_unknown"
     assert outcome["checkpoint"] == "hold"
+    assert "disposition" not in outcome
+
+
+def test_ingress_result_consumers_do_not_read_removed_disposition_keys() -> None:
+    """Reject old flat-key reads from values known to be ingress results."""
+
+    result_factories = {
+        "child_result",
+        "command_reply",
+        "mark_retryable",
+        "mark_terminal",
+        "quarantine_request",
+        "record_terminal_outcome",
+        "run_herdres_command",
+        "_submit_ingress_command_record",
+    }
+    removed_keys = {"disposition", "last_disposition"}
+    violations: list[tuple[str, int, str]] = []
+
+    def call_name(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return ""
+
+    def literal_key(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    def result_name(node: ast.AST, aliases: set[str]) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in aliases
+        return isinstance(node, ast.Call) and call_name(node.func) in result_factories
+
+    repository = Path(__file__).resolve().parents[1]
+    for path in sorted(repository.rglob("*.py")):
+        if any(part.startswith(".") for part in path.relative_to(repository).parts):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        scopes: list[ast.AST] = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for scope in scopes:
+            aliases: set[str] = set()
+            changed = True
+            while changed:
+                changed = False
+                for node in ast.walk(scope):
+                    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                        continue
+                    value = node.value
+                    if not (
+                        (
+                            isinstance(value, ast.Call)
+                            and call_name(value.func) in result_factories
+                        )
+                        or (isinstance(value, ast.Name) and value.id in aliases)
+                    ):
+                        continue
+                    targets = (
+                        node.targets
+                        if isinstance(node, ast.Assign)
+                        else [node.target]
+                    )
+                    for target in targets:
+                        if isinstance(target, ast.Name) and target.id not in aliases:
+                            aliases.add(target.id)
+                            changed = True
+            for node in ast.walk(scope):
+                key = None
+                owner = None
+                if isinstance(node, ast.Subscript):
+                    key = literal_key(node.slice)
+                    owner = node.value
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get"
+                    and node.args
+                ):
+                    key = literal_key(node.args[0])
+                    owner = node.func.value
+                if key in removed_keys and owner is not None and result_name(
+                    owner, aliases
+                ):
+                    violations.append(
+                        (
+                            str(path.relative_to(repository)),
+                            node.lineno,
+                            str(key),
+                        )
+                    )
+
+    assert violations == []
 
 
 def test_historical_terminal_accepted_migrates_to_unknown_not_delivered() -> None:

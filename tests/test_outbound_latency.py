@@ -102,7 +102,14 @@ def test_submission_acceptance_delivers_working_card_within_three_seconds(
         }
     )
 
-    assert result["disposition"] == "terminal_accepted"
+    # Submission acceptance is a transport fact. It proves the terminal took
+    # the bytes and triggers the working card, but it is deliberately not the
+    # verified-delivery outcome that advances the inbound checkpoint.
+    assert result["transport_disposition"] == "written_to_pty"
+    assert result["request_phase"] == "accepted_unverified"
+    assert result["terminal_outcome"] == "delivery_unknown"
+    assert result["checkpoint"] == "hold"
+    assert "disposition" not in result
     assert len(delivered_at) == 1
     assert delivered_at[0] - accepted_at < 3.0
     persisted = state.load_state(state_path)
