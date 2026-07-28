@@ -16,21 +16,78 @@ from .ingress_identity import validate_request_id
 from .safe import sanitize_text
 
 RECORDS_KEY = "tendwire_ingress_command_requests"
-RECORD_SCHEMA_VERSION = 3
-PREVIOUS_RECORD_SCHEMA_VERSION = 2
-CHILD_SCHEMA_VERSION = 1
+RECORD_SCHEMA_VERSION = 4
+PREVIOUS_RECORD_SCHEMA_VERSION = 3
+LEGACY_RECORD_SCHEMA_VERSION = 2
+CHILD_SCHEMA_VERSION = 2
 RECORD_STATES = frozenset({"resolving", "retryable", "terminal", "quarantined"})
-DISPOSITIONS = frozenset(
+TRANSPORT_DISPOSITIONS = frozenset(
     {
         "no_receipt",
         "in_progress",
         "terminal_accepted",
         "terminal_rejected",
         "terminal_uncertain",
+        "written_to_pty",
+        "submitted",
+        "agent_prompt_not_received",
+        "agent_prompt_unsubmitted",
+        "agent_prompt_stalled",
+        "agent_input_pending",
     }
 )
+PERSISTED_TRANSPORT_DISPOSITIONS = TRANSPORT_DISPOSITIONS - {"terminal_accepted"}
 RETRYABLE_DISPOSITIONS = frozenset({"no_receipt", "in_progress"})
-TERMINAL_DISPOSITIONS = frozenset({"terminal_accepted", "terminal_rejected"})
+_LEGACY_TERMINAL_DISPOSITIONS = frozenset(
+    {"terminal_accepted", "terminal_rejected"}
+)
+REQUEST_PHASES = frozenset(
+    {
+        "resolving",
+        "ready",
+        "retryable",
+        "retry_authorized",
+        "accepted_unverified",
+        "queued",
+        "terminal",
+    }
+)
+TERMINAL_OUTCOMES = frozenset(
+    {"delivered", "not_delivered", "delivery_unknown"}
+)
+HOLD_OUTCOMES = frozenset({"not_delivered", "delivery_unknown"})
+TERMINAL_OUTCOME_TRANSPORTS = {
+    "delivered": frozenset({"submitted"}),
+    "not_delivered": frozenset(
+        {
+            None,
+            "no_receipt",
+            "terminal_rejected",
+            "agent_prompt_not_received",
+            "agent_prompt_unsubmitted",
+            "agent_input_pending",
+        }
+    ),
+    "delivery_unknown": frozenset(
+        {
+            None,
+            "written_to_pty",
+            "terminal_uncertain",
+            "agent_prompt_stalled",
+        }
+    ),
+}
+TERMINAL_OUTCOME_PHASES = {
+    "delivered": frozenset({"terminal"}),
+    "not_delivered": frozenset({"terminal"}),
+    "delivery_unknown": frozenset(
+        {"accepted_unverified", "queued", "terminal"}
+    ),
+}
+# Public response validation still consumes Tendwire's legacy spelling. Records
+# never persist it: ``terminal_accepted`` is normalized to Herdr's
+# ``written_to_pty`` transport verdict at the reduction boundary.
+DISPOSITIONS = TRANSPORT_DISPOSITIONS
 QUARANTINE_REPLY = "Could not send safely. Refresh status and choose the target again."
 _CORRUPT_RECORDS_ERROR = "ingress request record store is corrupt"
 
@@ -44,7 +101,14 @@ _RECORD_FIELDS = frozenset(
         "retain_until",
         "state",
         "request_json",
-        "last_disposition",
+        "transport_disposition",
+        "request_phase",
+        "terminal_outcome",
+        "checkpoint_already_advanced",
+        "operator_attention_required",
+        "blocked_reason",
+        "next_action",
+        "dedup_witness",
         "stale_target_refreshed",
         "terminal_at",
         "quarantined_at",
@@ -58,7 +122,20 @@ _RECORD_FIELDS = frozenset(
         "linked_at",
     }
 )
-_V2_RECORD_FIELDS = _RECORD_FIELDS - {
+_V3_RECORD_FIELDS = (
+    _RECORD_FIELDS
+    - {
+        "transport_disposition",
+        "request_phase",
+        "terminal_outcome",
+        "checkpoint_already_advanced",
+        "operator_attention_required",
+        "blocked_reason",
+        "next_action",
+        "dedup_witness",
+    }
+) | {"last_disposition"}
+_V2_RECORD_FIELDS = _V3_RECORD_FIELDS - {
     "submission_id",
     "submission_state",
     "turn_id",
@@ -72,7 +149,9 @@ _CHILD_FIELDS = frozenset(
         "handled",
         "request_id",
         "checkpoint",
-        "disposition",
+        "transport_disposition",
+        "request_phase",
+        "terminal_outcome",
         "reply",
     }
 )
@@ -97,6 +176,27 @@ _SUBMISSION_STATES = frozenset(
     {"pending_observation", "observed", "complete", "linked"}
 )
 _TARGET_OWNER_FIELDS = frozenset({"stable_key", "stable_key_version"})
+_DEDUP_WITNESS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "prompt_fingerprint",
+        "composer_fingerprint",
+        "comparison",
+        "provider_verdict",
+        "owner_generation",
+        "observed_at",
+        "automatic_replay_authorized",
+    }
+)
+_DEDUP_COMPARISONS = frozenset({"match", "different", "unreadable"})
+_DEDUP_PROVIDER_VERDICTS = frozenset(
+    {
+        "agent_prompt_not_received",
+        "agent_prompt_unsubmitted",
+        "agent_prompt_stalled",
+        "written_to_pty",
+    }
+)
 
 
 
@@ -123,11 +223,23 @@ def _fixed_reply(value: Any) -> str:
     return sanitize_text(value, 160)
 
 
+def normalize_transport_disposition(value: Any) -> str | None:
+    """Return the persisted Herdr-aligned spelling for one transport fact."""
+
+    if value is None:
+        return None
+    if value == "terminal_accepted":
+        return "written_to_pty"
+    return str(value) if value in PERSISTED_TRANSPORT_DISPOSITIONS else None
+
+
 def child_result(
     request_id: str,
     *,
     checkpoint: str,
-    disposition: str | None,
+    transport_disposition: str | None,
+    request_phase: str,
+    terminal_outcome: str | None,
     reply: str = "",
     handled: bool = True,
 ) -> dict[str, Any]:
@@ -136,25 +248,48 @@ def child_result(
     request_id = validate_request_id(request_id)
     if type(handled) is not bool:
         raise ValueError("handled must be a boolean")
-    if checkpoint not in {"retry", "advance"}:
+    if checkpoint not in {"retry", "hold", "advance"}:
         raise ValueError("invalid ingress checkpoint decision")
-    if disposition is not None and disposition not in DISPOSITIONS:
-        raise ValueError("invalid command disposition")
+    transport = normalize_transport_disposition(transport_disposition)
+    if transport_disposition is not None and transport is None:
+        raise ValueError("invalid transport disposition")
+    if request_phase not in REQUEST_PHASES:
+        raise ValueError("invalid ingress request phase")
+    if terminal_outcome is not None and terminal_outcome not in TERMINAL_OUTCOMES:
+        raise ValueError("invalid terminal outcome")
     if checkpoint == "retry":
-        if not handled or disposition not in {None, "no_receipt", "in_progress"}:
+        if (
+            not handled
+            or transport not in {None, "no_receipt", "in_progress"}
+            or request_phase not in {"ready", "retryable", "retry_authorized"}
+            or terminal_outcome is not None
+        ):
             raise ValueError("invalid retry child outcome")
         reply = ""
+    elif checkpoint == "advance":
+        if (
+            terminal_outcome != "delivered"
+            or request_phase not in TERMINAL_OUTCOME_PHASES["delivered"]
+            or transport not in TERMINAL_OUTCOME_TRANSPORTS["delivered"]
+        ):
+            raise ValueError("only verified delivery may advance checkpoint")
     else:
-        if disposition in RETRYABLE_DISPOSITIONS:
-            raise ValueError("retryable disposition cannot advance checkpoint")
-        if not handled and (disposition is not None or reply):
+        if terminal_outcome not in HOLD_OUTCOMES:
+            raise ValueError("held checkpoint requires a non-success outcome")
+        if transport not in TERMINAL_OUTCOME_TRANSPORTS[terminal_outcome]:
+            raise ValueError("transport disposition cannot produce terminal outcome")
+        if request_phase not in TERMINAL_OUTCOME_PHASES[terminal_outcome]:
+            raise ValueError("invalid held request phase")
+        if not handled and (transport is not None or reply):
             raise ValueError("unhandled outcome cannot carry command details")
     return {
         "schema_version": CHILD_SCHEMA_VERSION,
         "handled": handled,
         "request_id": request_id,
         "checkpoint": checkpoint,
-        "disposition": disposition,
+        "transport_disposition": transport,
+        "request_phase": request_phase,
+        "terminal_outcome": terminal_outcome,
         "reply": _fixed_reply(reply),
     }
 
@@ -166,15 +301,34 @@ def _valid_child(value: Any, request_id: str) -> bool:
         value.get("schema_version") != CHILD_SCHEMA_VERSION
         or type(value.get("handled")) is not bool
         or value.get("request_id") != request_id
-        or value.get("checkpoint") != "advance"
-        or value.get("disposition")
-        not in TERMINAL_DISPOSITIONS | {"terminal_uncertain", None}
+        or value.get("checkpoint") not in {"hold", "advance"}
+        or value.get("transport_disposition")
+        not in PERSISTED_TRANSPORT_DISPOSITIONS | {None}
+        or value.get("request_phase") not in REQUEST_PHASES
+        or value.get("terminal_outcome") not in TERMINAL_OUTCOMES
         or not isinstance(value.get("reply"), str)
         or value["reply"] != _fixed_reply(value["reply"])
     ):
         return False
+    if value["checkpoint"] == "advance":
+        if (
+            value["terminal_outcome"] != "delivered"
+            or value["request_phase"]
+            not in TERMINAL_OUTCOME_PHASES["delivered"]
+            or value["transport_disposition"]
+            not in TERMINAL_OUTCOME_TRANSPORTS["delivered"]
+        ):
+            return False
+    elif (
+        value["terminal_outcome"] not in HOLD_OUTCOMES
+        or value["transport_disposition"]
+        not in TERMINAL_OUTCOME_TRANSPORTS[value["terminal_outcome"]]
+        or value["request_phase"]
+        not in TERMINAL_OUTCOME_PHASES[value["terminal_outcome"]]
+    ):
+        return False
     if value["handled"] is False and (
-        value["disposition"] is not None or value["reply"]
+        value["transport_disposition"] is not None or value["reply"]
     ):
         return False
     return True
@@ -307,7 +461,91 @@ def _valid_submission_fields(record: dict[str, Any]) -> bool:
     )
 
 
-def _valid_record_version(
+def _valid_legacy_child(value: Any, request_id: str) -> bool:
+    fields = frozenset(
+        {
+            "schema_version",
+            "handled",
+            "request_id",
+            "checkpoint",
+            "disposition",
+            "reply",
+        }
+    )
+    return (
+        isinstance(value, dict)
+        and frozenset(value) == fields
+        and value.get("schema_version") == 1
+        and type(value.get("handled")) is bool
+        and value.get("request_id") == request_id
+        and value.get("checkpoint") == "advance"
+        and value.get("disposition")
+        in {"terminal_accepted", "terminal_rejected", "terminal_uncertain", None}
+        and isinstance(value.get("reply"), str)
+        and value["reply"] == _fixed_reply(value["reply"])
+        and not (
+            value["handled"] is False
+            and (value["disposition"] is not None or value["reply"])
+        )
+    )
+
+
+def _valid_dedup_witness(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict) or frozenset(value) != _DEDUP_WITNESS_FIELDS:
+        return False
+    prompt_fingerprint = value.get("prompt_fingerprint")
+    composer_fingerprint = value.get("composer_fingerprint")
+    comparison = value.get("comparison")
+    provider_verdict = value.get("provider_verdict")
+    owner_generation = value.get("owner_generation")
+    if (
+        value.get("schema_version") != 1
+        or not isinstance(prompt_fingerprint, str)
+        or not prompt_fingerprint
+        or len(prompt_fingerprint) > 200
+        or (
+            composer_fingerprint is not None
+            and (
+                not isinstance(composer_fingerprint, str)
+                or not composer_fingerprint
+                or len(composer_fingerprint) > 200
+            )
+        )
+        or comparison not in _DEDUP_COMPARISONS
+        or provider_verdict not in _DEDUP_PROVIDER_VERDICTS
+        or (
+            owner_generation is not None
+            and (
+                not isinstance(owner_generation, str)
+                or not owner_generation
+                or len(owner_generation) > 200
+            )
+        )
+        or _timestamp(value.get("observed_at")) is None
+        or type(value.get("automatic_replay_authorized")) is not bool
+    ):
+        return False
+    if comparison == "unreadable":
+        return (
+            composer_fingerprint is None
+            and value["automatic_replay_authorized"] is False
+        )
+    if composer_fingerprint is None:
+        return False
+    if comparison == "match" and composer_fingerprint != prompt_fingerprint:
+        return False
+    if comparison == "different" and composer_fingerprint == prompt_fingerprint:
+        return False
+    expected_authorization = (
+        provider_verdict == "agent_prompt_not_received"
+        and comparison == "different"
+    )
+    return not value["automatic_replay_authorized"] or expected_authorization
+
+
+def _valid_legacy_record_version(
     record: Any,
     request_id: str,
     *,
@@ -342,7 +580,7 @@ def _valid_record_version(
         return False
     if request_json is not None and _request_id_from_json(request_json) != request_id:
         return False
-    if schema_version == RECORD_SCHEMA_VERSION and not _valid_submission_fields(record):
+    if schema_version == PREVIOUS_RECORD_SCHEMA_VERSION and not _valid_submission_fields(record):
         return False
     if record["stale_target_refreshed"] and not isinstance(request_json, str):
         return False
@@ -370,16 +608,16 @@ def _valid_record_version(
         terminal_timestamp = _timestamp(terminal_at)
         return (
             isinstance(request_json, str)
-            and last_disposition in TERMINAL_DISPOSITIONS
+            and last_disposition in _LEGACY_TERMINAL_DISPOSITIONS
             and terminal_timestamp is not None
             and terminal_timestamp <= updated_at
             and (
-                schema_version == RECORD_SCHEMA_VERSION
+                schema_version == PREVIOUS_RECORD_SCHEMA_VERSION
                 or terminal_timestamp == updated_at
             )
             and quarantined_at is None
             and record.get("quarantine_reason") is None
-            and _valid_child(outcome, request_id)
+            and _valid_legacy_child(outcome, request_id)
             and outcome.get("disposition") == last_disposition
         )
     quarantine_timestamp = _timestamp(quarantined_at)
@@ -393,25 +631,156 @@ def _valid_record_version(
         and quarantine_timestamp == updated_at
         and isinstance(record.get("quarantine_reason"), str)
         and bool(record["quarantine_reason"])
-        and _valid_child(outcome, request_id)
+        and _valid_legacy_child(outcome, request_id)
         and outcome.get("disposition") == last_disposition
     )
 
 
 def _valid_record(record: Any, request_id: str) -> bool:
-    return _valid_record_version(
+    if not isinstance(record, dict) or frozenset(record) != _RECORD_FIELDS:
+        return False
+    created_at = _timestamp(record.get("created_at"))
+    updated_at = _timestamp(record.get("updated_at"))
+    deadline_at = _timestamp(record.get("deadline_at"))
+    retain_until = _timestamp(record.get("retain_until"))
+    request_json = record.get("request_json")
+    state = record.get("state")
+    transport = record.get("transport_disposition")
+    phase = record.get("request_phase")
+    terminal_outcome = record.get("terminal_outcome")
+    terminal_at = record.get("terminal_at")
+    quarantined_at = record.get("quarantined_at")
+    outcome = record.get("outcome")
+    blocked_reason = record.get("blocked_reason")
+    next_action = record.get("next_action")
+    if (
+        record.get("schema_version") != RECORD_SCHEMA_VERSION
+        or record.get("request_id") != request_id
+        or created_at is None
+        or updated_at is None
+        or deadline_at is None
+        or retain_until is None
+        or not created_at <= updated_at
+        or not created_at < deadline_at < retain_until
+        or state not in RECORD_STATES
+        or transport not in PERSISTED_TRANSPORT_DISPOSITIONS | {None}
+        or phase not in REQUEST_PHASES
+        or terminal_outcome not in TERMINAL_OUTCOMES | {None}
+        or type(record.get("checkpoint_already_advanced")) is not bool
+        or type(record.get("operator_attention_required")) is not bool
+        or (
+            blocked_reason is not None
+            and (
+                not isinstance(blocked_reason, str)
+                or not blocked_reason
+                or blocked_reason != _fixed_reply(blocked_reason)
+            )
+        )
+        or (
+            next_action is not None
+            and (
+                not isinstance(next_action, str)
+                or not next_action
+                or next_action != _fixed_reply(next_action)
+            )
+        )
+        or not _valid_dedup_witness(record.get("dedup_witness"))
+        or not _valid_submission_fields(record)
+        or type(record.get("stale_target_refreshed")) is not bool
+    ):
+        return False
+    if request_json is not None and _request_id_from_json(request_json) != request_id:
+        return False
+    if record["stale_target_refreshed"] and not isinstance(request_json, str):
+        return False
+    if terminal_outcome == "delivery_unknown":
+        witness = record.get("dedup_witness")
+        if isinstance(witness, dict) and witness.get("automatic_replay_authorized") is True:
+            return False
+    if terminal_outcome in HOLD_OUTCOMES:
+        if (
+            record.get("operator_attention_required") is not True
+            or blocked_reason is None
+            or next_action is None
+        ):
+            return False
+    elif record.get("operator_attention_required") is True:
+        return False
+
+    if state == "resolving":
+        return (
+            request_json is None
+            and updated_at == created_at
+            and transport is None
+            and phase == "resolving"
+            and terminal_outcome is None
+            and record["checkpoint_already_advanced"] is False
+            and record["operator_attention_required"] is False
+            and blocked_reason is None
+            and next_action is None
+            and record.get("dedup_witness") is None
+            and record["stale_target_refreshed"] is False
+            and terminal_at is None
+            and quarantined_at is None
+            and record.get("quarantine_reason") is None
+            and outcome is None
+        )
+    if state == "retryable":
+        return (
+            isinstance(request_json, str)
+            and transport in RETRYABLE_DISPOSITIONS | {None}
+            and phase in {"ready", "retryable", "retry_authorized"}
+            and terminal_outcome is None
+            and record["checkpoint_already_advanced"] is False
+            and record["operator_attention_required"] is False
+            and blocked_reason is None
+            and next_action is None
+            and terminal_at is None
+            and quarantined_at is None
+            and record.get("quarantine_reason") is None
+            and outcome is None
+        )
+
+    terminal_timestamp = _timestamp(terminal_at)
+    if (
+        terminal_timestamp is None
+        or terminal_timestamp > updated_at
+        or not _valid_child(outcome, request_id)
+        or outcome.get("transport_disposition") != transport
+        or outcome.get("request_phase") != phase
+        or outcome.get("terminal_outcome") != terminal_outcome
+    ):
+        return False
+    if state == "terminal":
+        return (
+            isinstance(request_json, str)
+            and quarantined_at is None
+            and record.get("quarantine_reason") is None
+        )
+    quarantine_timestamp = _timestamp(quarantined_at)
+    return (
+        (isinstance(request_json, str) or (request_json is None and transport is None))
+        and
+        quarantine_timestamp == updated_at
+        and isinstance(record.get("quarantine_reason"), str)
+        and bool(record["quarantine_reason"])
+    )
+
+
+def _valid_v3_record(record: Any, request_id: str) -> bool:
+    return _valid_legacy_record_version(
         record,
         request_id,
-        schema_version=RECORD_SCHEMA_VERSION,
-        fields=_RECORD_FIELDS,
+        schema_version=PREVIOUS_RECORD_SCHEMA_VERSION,
+        fields=_V3_RECORD_FIELDS,
     )
 
 
 def _valid_v2_record(record: Any, request_id: str) -> bool:
-    return _valid_record_version(
+    return _valid_legacy_record_version(
         record,
         request_id,
-        schema_version=PREVIOUS_RECORD_SCHEMA_VERSION,
+        schema_version=LEGACY_RECORD_SCHEMA_VERSION,
         fields=_V2_RECORD_FIELDS,
     )
 
@@ -444,7 +813,14 @@ def _new_record(
         "retain_until": retain_until,
         "state": "resolving",
         "request_json": None,
-        "last_disposition": None,
+        "transport_disposition": None,
+        "request_phase": "resolving",
+        "terminal_outcome": None,
+        "checkpoint_already_advanced": False,
+        "operator_attention_required": False,
+        "blocked_reason": None,
+        "next_action": None,
+        "dedup_witness": None,
         "stale_target_refreshed": False,
         "terminal_at": None,
         "quarantined_at": None,
@@ -459,13 +835,13 @@ def _new_record(
     }
 
 
-def _migrate_v2_record(value: Any, request_id: str) -> dict[str, Any] | None:
+def _migrate_v2_to_v3(value: Any, request_id: str) -> dict[str, Any] | None:
     if not _valid_v2_record(value, request_id):
         return None
     migrated = copy.deepcopy(value)
     migrated.update(
         {
-            "schema_version": RECORD_SCHEMA_VERSION,
+            "schema_version": PREVIOUS_RECORD_SCHEMA_VERSION,
             "submission_id": None,
             "submission_state": None,
             "turn_id": None,
@@ -474,7 +850,96 @@ def _migrate_v2_record(value: Any, request_id: str) -> dict[str, Any] | None:
             "linked_at": None,
         }
     )
+    return migrated if _valid_v3_record(migrated, request_id) else None
+
+
+def _historical_outcome(
+    old_disposition: Any,
+) -> tuple[str | None, str, str, str]:
+    """Map v3 history without upgrading transport acceptance into delivery."""
+
+    if old_disposition == "terminal_accepted":
+        return (
+            "written_to_pty",
+            "accepted_unverified",
+            "delivery_unknown",
+            "historical_terminal_accepted_unverified",
+        )
+    if old_disposition == "terminal_rejected":
+        return (
+            "terminal_rejected",
+            "terminal",
+            "not_delivered",
+            "historical_provider_rejection",
+        )
+    return (
+        normalize_transport_disposition(old_disposition),
+        "terminal",
+        "delivery_unknown",
+        "historical_delivery_truth_unrecoverable",
+    )
+
+
+def _migrate_v3_record(value: Any, request_id: str) -> dict[str, Any] | None:
+    if not _valid_v3_record(value, request_id):
+        return None
+    migrated = copy.deepcopy(value)
+    old_disposition = migrated.pop("last_disposition")
+    migrated["schema_version"] = RECORD_SCHEMA_VERSION
+    migrated.update(
+        {
+            "transport_disposition": normalize_transport_disposition(
+                old_disposition
+            ),
+            "request_phase": "resolving",
+            "terminal_outcome": None,
+            "checkpoint_already_advanced": False,
+            "operator_attention_required": False,
+            "blocked_reason": None,
+            "next_action": None,
+            "dedup_witness": None,
+        }
+    )
+    if migrated["state"] == "resolving":
+        pass
+    elif migrated["state"] == "retryable":
+        migrated["request_phase"] = "retryable"
+    else:
+        transport, phase, terminal_outcome, reason = _historical_outcome(
+            old_disposition
+        )
+        migrated.update(
+            {
+                "state": "terminal",
+                "transport_disposition": transport,
+                "request_phase": phase,
+                "terminal_outcome": terminal_outcome,
+                "checkpoint_already_advanced": True,
+                "operator_attention_required": True,
+                "blocked_reason": reason,
+                "next_action": "inspect historical ingress evidence",
+                "terminal_at": (
+                    migrated.get("terminal_at")
+                    or migrated.get("quarantined_at")
+                    or migrated["updated_at"]
+                ),
+                "quarantined_at": None,
+                "quarantine_reason": None,
+                "outcome": child_result(
+                    request_id,
+                    checkpoint="hold",
+                    transport_disposition=transport,
+                    request_phase=phase,
+                    terminal_outcome=terminal_outcome,
+                ),
+            }
+        )
     return migrated if _valid_record(migrated, request_id) else None
+
+
+def _migrate_v2_record(value: Any, request_id: str) -> dict[str, Any] | None:
+    v3 = _migrate_v2_to_v3(value, request_id)
+    return _migrate_v3_record(v3, request_id) if v3 is not None else None
 
 
 def _legacy_request_json(
@@ -549,6 +1014,7 @@ def _legacy_record(
     record["updated_at"] = updated_at
     record["state"] = "retryable"
     record["request_json"] = request_json
+    record["request_phase"] = "retryable"
     # Legacy status text is deliberately not authoritative finality evidence.
     return record
 
@@ -574,6 +1040,7 @@ def _validated_records_mapping(
             canonical_id != request_id
             or (
                 not _valid_record(record, canonical_id)
+                and not _valid_v3_record(record, canonical_id)
                 and not _valid_v2_record(record, canonical_id)
                 and _legacy_request_json(record, canonical_id, now=now) is None
             )
@@ -595,11 +1062,9 @@ def cached_terminal_outcome(
     if records is None or request_id not in records:
         return None
     record = records[request_id]
-    if not (
-        _valid_record(record, request_id)
-        or _valid_v2_record(record, request_id)
-    ):
-        # Pre-v2 legacy records are retry evidence, never terminal authority.
+    if not _valid_record(record, request_id):
+        # Pre-v4 records require conservative migration before their old
+        # checkpoint semantics can be interpreted.
         return None
     if record["state"] not in {"terminal", "quarantined"}:
         return None
@@ -615,7 +1080,7 @@ def quarantine_request(
     reply: str = QUARANTINE_REPLY,
     handled: bool = True,
 ) -> dict[str, Any]:
-    """Make uncertainty terminal locally and cache its fixed child outcome."""
+    """Make a local failure representable without claiming delivery."""
 
     if disposition not in {None, "terminal_uncertain"}:
         raise ValueError("invalid quarantine disposition")
@@ -623,19 +1088,43 @@ def quarantine_request(
     timestamp = _timestamp(now)
     if timestamp is None:
         raise ValueError("invalid quarantine timestamp")
+    transport = normalize_transport_disposition(disposition)
+    terminal_outcome = (
+        "delivery_unknown"
+        if transport in {"terminal_uncertain", "written_to_pty"}
+        else "not_delivered"
+    )
+    blocked_reason = _fixed_reply(reason) or (
+        "delivery truth unavailable"
+        if terminal_outcome == "delivery_unknown"
+        else "request was not delivered"
+    )
+    next_action = (
+        "inspect ingress evidence and resolve manually"
+        if terminal_outcome == "delivery_unknown"
+        else "review the failure before requesting a retry"
+    )
     outcome = child_result(
         request_id,
-        checkpoint="advance",
-        disposition=disposition,
+        checkpoint="hold",
+        transport_disposition=transport,
+        request_phase="terminal",
+        terminal_outcome=terminal_outcome,
         reply=reply,
         handled=handled,
     )
     record["state"] = "quarantined"
     record["updated_at"] = timestamp
-    record["last_disposition"] = disposition
-    record["terminal_at"] = None
+    record["transport_disposition"] = transport
+    record["request_phase"] = "terminal"
+    record["terminal_outcome"] = terminal_outcome
+    record["checkpoint_already_advanced"] = False
+    record["operator_attention_required"] = True
+    record["blocked_reason"] = blocked_reason
+    record["next_action"] = next_action
+    record["terminal_at"] = timestamp
     record["quarantined_at"] = timestamp
-    record["quarantine_reason"] = _fixed_reply(reason) or "uncertain"
+    record["quarantine_reason"] = blocked_reason
     record["outcome"] = outcome
     return copy.deepcopy(outcome)
 
@@ -676,6 +1165,10 @@ def ensure_request_shell(
     current = raw_records[request_id]
     if _valid_record(current, request_id):
         return current, False
+    migrated_v3 = _migrate_v3_record(current, request_id)
+    if migrated_v3 is not None:
+        raw_records[request_id] = migrated_v3
+        return migrated_v3, True
     migrated_v2 = _migrate_v2_record(current, request_id)
     if migrated_v2 is not None:
         raw_records[request_id] = migrated_v2
@@ -738,6 +1231,7 @@ def attach_request_json(
         raise ValueError("invalid ingress timestamp")
     record["request_json"] = request_json
     record["state"] = "retryable"
+    record["request_phase"] = "ready"
     record["updated_at"] = timestamp
     return True
 
@@ -754,14 +1248,95 @@ def mark_retryable(
         raise ValueError("invalid ingress timestamp")
     record["state"] = "retryable"
     record["updated_at"] = timestamp
-    record["last_disposition"] = disposition
+    record["transport_disposition"] = normalize_transport_disposition(disposition)
+    record["request_phase"] = "retryable"
+    record["terminal_outcome"] = None
+    record["checkpoint_already_advanced"] = False
+    record["operator_attention_required"] = False
+    record["blocked_reason"] = None
+    record["next_action"] = None
     record["terminal_at"] = None
     record["quarantined_at"] = None
     record["quarantine_reason"] = None
     record["outcome"] = None
     return child_result(
-        record["request_id"], checkpoint="retry", disposition=disposition
+        record["request_id"],
+        checkpoint="retry",
+        transport_disposition=disposition,
+        request_phase="retryable",
+        terminal_outcome=None,
     )
+
+
+def record_terminal_outcome(
+    record: dict[str, Any],
+    *,
+    transport_disposition: str | None,
+    request_phase: str,
+    terminal_outcome: str,
+    now: float,
+    reply: str = "",
+    blocked_reason: str = "",
+    next_action: str = "",
+    handled: bool = True,
+) -> dict[str, Any]:
+    """Persist one user-visible truth; only verified delivery advances."""
+
+    if terminal_outcome not in TERMINAL_OUTCOMES:
+        raise ValueError("invalid terminal outcome")
+    transport = normalize_transport_disposition(transport_disposition)
+    if transport not in TERMINAL_OUTCOME_TRANSPORTS[terminal_outcome]:
+        raise ValueError("transport disposition cannot produce terminal outcome")
+    if not isinstance(record.get("request_json"), str):
+        raise ValueError("terminal result requires durable request JSON")
+    timestamp = _timestamp(now)
+    if timestamp is None:
+        raise ValueError("invalid ingress timestamp")
+    if terminal_outcome == "delivered":
+        if request_phase not in TERMINAL_OUTCOME_PHASES["delivered"]:
+            raise ValueError("verified delivery must use terminal request phase")
+        checkpoint = "advance"
+        attention = False
+        blocked = ""
+        action = ""
+    else:
+        if request_phase not in TERMINAL_OUTCOME_PHASES[terminal_outcome]:
+            raise ValueError("non-success outcome has invalid request phase")
+        checkpoint = "hold"
+        attention = True
+        blocked = _fixed_reply(blocked_reason) or (
+            "delivery truth unavailable"
+            if terminal_outcome == "delivery_unknown"
+            else "request was not delivered"
+        )
+        action = _fixed_reply(next_action) or (
+            "inspect ingress evidence and resolve manually"
+            if terminal_outcome == "delivery_unknown"
+            else "review the failure before requesting a retry"
+        )
+    outcome = child_result(
+        record["request_id"],
+        checkpoint=checkpoint,
+        transport_disposition=transport,
+        request_phase=request_phase,
+        terminal_outcome=terminal_outcome,
+        reply=reply if checkpoint == "advance" else "",
+        handled=handled,
+    )
+    record["state"] = "terminal"
+    record["updated_at"] = timestamp
+    record["transport_disposition"] = transport
+    record["request_phase"] = request_phase
+    record["terminal_outcome"] = terminal_outcome
+    record["checkpoint_already_advanced"] = False
+    record["operator_attention_required"] = attention
+    record["blocked_reason"] = blocked or None
+    record["next_action"] = action or None
+    record["terminal_at"] = timestamp
+    record["quarantined_at"] = None
+    record["quarantine_reason"] = None
+    record["outcome"] = outcome
+    return copy.deepcopy(outcome)
 
 
 def mark_terminal(
@@ -771,27 +1346,29 @@ def mark_terminal(
     now: float,
     reply: str,
 ) -> dict[str, Any]:
-    if disposition not in TERMINAL_DISPOSITIONS:
-        raise ValueError("invalid terminal disposition")
-    if not isinstance(record.get("request_json"), str):
-        raise ValueError("terminal result requires durable request JSON")
-    timestamp = _timestamp(now)
-    if timestamp is None:
-        raise ValueError("invalid ingress timestamp")
-    outcome = child_result(
-        record["request_id"],
-        checkpoint="advance",
-        disposition=disposition,
-        reply=reply,
-    )
-    record["state"] = "terminal"
-    record["updated_at"] = timestamp
-    record["last_disposition"] = disposition
-    record["terminal_at"] = timestamp
-    record["quarantined_at"] = None
-    record["quarantine_reason"] = None
-    record["outcome"] = outcome
-    return copy.deepcopy(outcome)
+    """Reduce the legacy Tendwire response without treating transport as truth."""
+
+    if disposition == "terminal_accepted":
+        return record_terminal_outcome(
+            record,
+            transport_disposition="written_to_pty",
+            request_phase="accepted_unverified",
+            terminal_outcome="delivery_unknown",
+            now=now,
+            blocked_reason="transport accepted but submission was not verified",
+            next_action="inspect the composer before any replay",
+        )
+    if disposition == "terminal_rejected":
+        return record_terminal_outcome(
+            record,
+            transport_disposition=disposition,
+            request_phase="terminal",
+            terminal_outcome="not_delivered",
+            now=now,
+            blocked_reason="provider rejected the instruction",
+            next_action="review the rejection before requesting a retry",
+        )
+    raise ValueError("invalid terminal transport disposition")
 
 
 def attach_target_owner(
@@ -920,7 +1497,7 @@ def link_submission(
 def retained_submission_records(
     store: dict[str, Any], *, now: float
 ) -> list[dict[str, Any]]:
-    """Return validated v3 receipt records; older records are inert fallback."""
+    """Return validated receipt records; older records are inert fallback."""
 
     timestamp = _timestamp(now)
     if timestamp is None:
@@ -933,8 +1510,187 @@ def retained_submission_records(
         for request_id, record in records.items()
         if _valid_record(record, request_id)
         and isinstance(record.get("submission_id"), str)
-        and record.get("last_disposition") == "terminal_accepted"
+        and (
+            record.get("transport_disposition") == "written_to_pty"
+            or record.get("terminal_outcome") == "delivered"
+        )
     ]
+
+
+def record_dedup_witness(
+    record: dict[str, Any],
+    *,
+    prompt_fingerprint: str,
+    composer_fingerprint: str | None,
+    composer_readable: bool,
+    provider_verdict: str,
+    owner_generation: str | None,
+    now: float,
+) -> bool:
+    """Persist Herdr-owned evidence used before a future replay.
+
+    Herdres treats both fingerprints as opaque. It does not reproduce Herdr's
+    classifier or hash algorithm. A replay is automatically eligible only when
+    the provider positively proved non-receipt *and* a readable composer does
+    not contain the prompt fingerprint. Delivery-unknown always overrides that
+    eligibility and requires an operator decision.
+    """
+
+    timestamp = _timestamp(now)
+    if (
+        timestamp is None
+        or not isinstance(prompt_fingerprint, str)
+        or not prompt_fingerprint
+        or len(prompt_fingerprint) > 200
+        or provider_verdict not in _DEDUP_PROVIDER_VERDICTS
+        or (
+            owner_generation is not None
+            and (
+                not isinstance(owner_generation, str)
+                or not owner_generation
+                or len(owner_generation) > 200
+            )
+        )
+    ):
+        raise ValueError("invalid dedup witness")
+    if composer_readable:
+        if (
+            not isinstance(composer_fingerprint, str)
+            or not composer_fingerprint
+            or len(composer_fingerprint) > 200
+        ):
+            raise ValueError("readable composer requires a fingerprint")
+        comparison = (
+            "match"
+            if composer_fingerprint == prompt_fingerprint
+            else "different"
+        )
+    else:
+        if composer_fingerprint is not None:
+            raise ValueError("unreadable composer cannot carry a fingerprint")
+        comparison = "unreadable"
+    automatic = (
+        provider_verdict == "agent_prompt_not_received"
+        and comparison == "different"
+        and record.get("terminal_outcome") != "delivery_unknown"
+    )
+    witness = {
+        "schema_version": 1,
+        "prompt_fingerprint": prompt_fingerprint,
+        "composer_fingerprint": composer_fingerprint,
+        "comparison": comparison,
+        "provider_verdict": provider_verdict,
+        "owner_generation": owner_generation,
+        "observed_at": timestamp,
+        "automatic_replay_authorized": automatic,
+    }
+    if not _valid_dedup_witness(witness):
+        raise ValueError("invalid dedup witness")
+    before = record.get("dedup_witness")
+    if before == witness:
+        return False
+    record["dedup_witness"] = witness
+    record["updated_at"] = timestamp
+    if comparison == "unreadable":
+        record["operator_attention_required"] = True
+        record["blocked_reason"] = "composer could not be read"
+        record["next_action"] = "inspect the pane before any replay"
+    return True
+
+
+def dedup_witness_request(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the opaque evidence a future replay caller must refresh."""
+
+    return {
+        "schema_version": 1,
+        "request_id": validate_request_id(record.get("request_id")),
+        "target_owner": copy.deepcopy(record.get("target_owner")),
+        "terminal_outcome": record.get("terminal_outcome"),
+        "transport_disposition": record.get("transport_disposition"),
+        "prior_witness": copy.deepcopy(record.get("dedup_witness")),
+        "required_observation": "herdr_composer_prompt_fingerprint",
+    }
+
+
+def automatic_replay_authorized(record: dict[str, Any]) -> bool:
+    """Return whether current evidence positively permits an automatic replay."""
+
+    if record.get("terminal_outcome") == "delivery_unknown":
+        return False
+    witness = record.get("dedup_witness")
+    return (
+        record.get("terminal_outcome") == "not_delivered"
+        and isinstance(witness, dict)
+        and witness.get("provider_verdict") == "agent_prompt_not_received"
+        and witness.get("comparison") == "different"
+        and witness.get("automatic_replay_authorized") is True
+    )
+
+
+def operator_status_rows(
+    store: dict[str, Any], *, now: float
+) -> list[dict[str, Any]]:
+    """Return public-safe ingress state without prompt or composer content."""
+
+    timestamp = _timestamp(now)
+    if timestamp is None:
+        raise ValueError("invalid ingress timestamp")
+    records = _validated_records_mapping(store, now=timestamp)
+    if records is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    for request_id, raw in records.items():
+        record = raw if _valid_record(raw, request_id) else None
+        if record is None:
+            migrated = _migrate_v3_record(raw, request_id)
+            if migrated is None:
+                migrated = _migrate_v2_record(raw, request_id)
+            record = migrated
+        if record is None:
+            continue
+        witness = record.get("dedup_witness")
+        rows.append(
+            {
+                "request_id": request_id,
+                "age_seconds": max(0.0, timestamp - float(record["created_at"])),
+                "state": record["state"],
+                "transport_disposition": record["transport_disposition"],
+                "request_phase": record["request_phase"],
+                "terminal_outcome": record["terminal_outcome"],
+                "checkpoint_already_advanced": record[
+                    "checkpoint_already_advanced"
+                ],
+                "operator_attention_required": record[
+                    "operator_attention_required"
+                ],
+                "blocked_reason": record["blocked_reason"],
+                "next_action": record["next_action"],
+                "submission_id": record["submission_id"],
+                "turn_id": record["turn_id"],
+                "target_owner": copy.deepcopy(record["target_owner"]),
+                "dedup_witness": (
+                    {
+                        "comparison": witness["comparison"],
+                        "provider_verdict": witness["provider_verdict"],
+                        "owner_generation": witness["owner_generation"],
+                        "observed_at": witness["observed_at"],
+                        "automatic_replay_authorized": witness[
+                            "automatic_replay_authorized"
+                        ],
+                    }
+                    if isinstance(witness, dict)
+                    else None
+                ),
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            not bool(row["operator_attention_required"]),
+            -float(row["age_seconds"]),
+            str(row["request_id"]),
+        ),
+    )
 
 
 def stale_target_refresh_json(record: dict[str, Any], *, now: float) -> str | None:
@@ -961,7 +1717,8 @@ def stale_target_refresh_json(record: dict[str, Any], *, now: float) -> str | No
     record["request_json"] = refreshed_json
     record["stale_target_refreshed"] = True
     record["updated_at"] = timestamp
-    record["last_disposition"] = "no_receipt"
+    record["transport_disposition"] = "no_receipt"
+    record["request_phase"] = "retryable"
     return refreshed_json
 
 
@@ -976,6 +1733,11 @@ def prune_requests(store: dict[str, Any], *, now: float) -> bool:
         return False
     changed = False
     for request_id, record in list(records.items()):
+        migrated = _migrate_v3_record(record, request_id)
+        if migrated is not None:
+            records[request_id] = migrated
+            changed = True
+            continue
         migrated = _migrate_v2_record(record, request_id)
         if migrated is not None:
             records[request_id] = migrated

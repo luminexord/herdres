@@ -1974,6 +1974,24 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     return _json({"ok": True, **result})
 
 
+def cmd_ingress_status(_args: argparse.Namespace) -> int:
+    """Print the operator-facing delivery truth without prompt contents."""
+
+    config.load_env_file()
+    store = state.load_state()
+    rows = ingress_requests.operator_status_rows(store, now=time.time())
+    return _json(
+        {
+            "ok": True,
+            "schema_version": 1,
+            "attention_required": sum(
+                1 for row in rows if row["operator_attention_required"]
+            ),
+            "requests": rows,
+        }
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="herdres")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1983,6 +2001,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("command").set_defaults(func=cmd_command)
     sub.add_parser("callback").set_defaults(func=cmd_callback)
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+    sub.add_parser("ingress-status").set_defaults(func=cmd_ingress_status)
     sub.add_parser("version").set_defaults(func=lambda _args: (print(VERSION), 0)[1])
     speech_parser = sub.add_parser("speech")
     speech_parser.add_argument("action", nargs="?", default="check", choices=["check", "install"])

@@ -1332,12 +1332,39 @@ def _gateway_child(
     reply="",
     handled=True,
 ):
+    transport = (
+        "written_to_pty" if disposition == "terminal_accepted" else disposition
+    )
+    if checkpoint == herdres_gateway.CHECKPOINT_RETRY:
+        request_phase = "retryable"
+        terminal_outcome = None
+        reply = ""
+    elif disposition == "terminal_accepted":
+        checkpoint = herdres_gateway.CHECKPOINT_HOLD
+        request_phase = "accepted_unverified"
+        terminal_outcome = "delivery_unknown"
+        reply = ""
+    elif disposition == "terminal_rejected":
+        checkpoint = herdres_gateway.CHECKPOINT_HOLD
+        request_phase = "terminal"
+        terminal_outcome = "not_delivered"
+        reply = ""
+    elif disposition == "terminal_uncertain":
+        checkpoint = herdres_gateway.CHECKPOINT_HOLD
+        request_phase = "terminal"
+        terminal_outcome = "delivery_unknown"
+    else:
+        request_phase = "terminal"
+        terminal_outcome = "delivered"
+        transport = "submitted" if transport is None else transport
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "handled": handled,
         "request_id": request_id,
         "checkpoint": checkpoint,
-        "disposition": disposition,
+        "transport_disposition": transport,
+        "request_phase": request_phase,
+        "terminal_outcome": terminal_outcome,
         "reply": reply,
     }
 
@@ -5374,7 +5401,7 @@ def test_gateway_pretranscribes_voice_before_command(monkeypatch, tmp_path):
 
     assert seen["_speech_pretranscribed"] is True
     assert seen["_speech_transcript"] == "from voice"
-    assert checkpoint == herdres_gateway.CHECKPOINT_ADVANCE
+    assert checkpoint == herdres_gateway.CHECKPOINT_HOLD
 
 
 def test_gateway_same_update_retries_byte_identical_and_distinct_update_differs(
@@ -5452,9 +5479,9 @@ def test_gateway_same_update_retries_byte_identical_and_distinct_update_differs(
 
     assert checkpoints == [
         herdres_gateway.CHECKPOINT_RETRY,
-        herdres_gateway.CHECKPOINT_ADVANCE,
-        herdres_gateway.CHECKPOINT_ADVANCE,
-        herdres_gateway.CHECKPOINT_ADVANCE,
+        herdres_gateway.CHECKPOINT_HOLD,
+        herdres_gateway.CHECKPOINT_HOLD,
+        herdres_gateway.CHECKPOINT_HOLD,
     ]
 
     assert len(requests) == 3
@@ -5562,7 +5589,7 @@ def test_gateway_replays_cached_request_after_route_disappears(
     )
 
     assert first == herdres_gateway.CHECKPOINT_RETRY
-    assert replay == herdres_gateway.CHECKPOINT_ADVANCE
+    assert replay == herdres_gateway.CHECKPOINT_HOLD
     assert len(tendwire_calls) == 2
     assert tendwire_calls[0] == tendwire_calls[1]
     assert child_payloads[1] == {
@@ -5570,7 +5597,7 @@ def test_gateway_replays_cached_request_after_route_disappears(
     }
 
 
-def test_gateway_unknown_message_caches_local_advance_without_tendwire_mutation(
+def test_gateway_unknown_message_holds_without_tendwire_mutation(
     tmp_path,
     monkeypatch,
 ):
@@ -5608,7 +5635,7 @@ def test_gateway_unknown_message_caches_local_advance_without_tendwire_mutation(
         request_id_key=REQUEST_ID_KEY,
     )
 
-    assert checkpoint == herdres_gateway.CHECKPOINT_ADVANCE
+    assert checkpoint == herdres_gateway.CHECKPOINT_HOLD
     assert set(child_payloads[0]) == {"request_id"}
     after = state.load_state()
     records = after.pop(ingress_requests.RECORDS_KEY)
@@ -5616,23 +5643,15 @@ def test_gateway_unknown_message_caches_local_advance_without_tendwire_mutation(
     record = records[child_payloads[0]["request_id"]]
     assert record["state"] == "quarantined"
     assert record["request_json"] is None
-    assert record["outcome"] == _gateway_child(
+    assert record["outcome"] == ingress_requests.child_result(
         child_payloads[0]["request_id"],
+        checkpoint="hold",
+        transport_disposition=None,
+        request_phase="terminal",
+        terminal_outcome="not_delivered",
         reply=herdres.REKEYED_TOPIC_QUARANTINE_REPLY,
     )
-    assert telegram.sent == [
-        (
-            "-100",
-            herdres.REKEYED_TOPIC_QUARANTINE_REPLY,
-            {
-                "thread_id": "999",
-                "reply_to_message_id": "11",
-                "notify": True,
-                "token": "fake",
-            },
-            "100",
-        )
-    ]
+    assert telegram.sent == []
 
 
 @pytest.mark.parametrize(
@@ -5641,19 +5660,19 @@ def test_gateway_unknown_message_caches_local_advance_without_tendwire_mutation(
         (_gateway_child(REQUEST_ID), herdres_gateway.CHECKPOINT_ADVANCE),
         (
             _gateway_child(REQUEST_ID, handled=False),
-            herdres_gateway.CHECKPOINT_ADVANCE,
+            herdres_gateway.CHECKPOINT_RETRY,
         ),
         (
             _gateway_child(REQUEST_ID, disposition="terminal_accepted"),
-            herdres_gateway.CHECKPOINT_ADVANCE,
+            herdres_gateway.CHECKPOINT_HOLD,
         ),
         (
             _gateway_child(REQUEST_ID, disposition="terminal_rejected"),
-            herdres_gateway.CHECKPOINT_ADVANCE,
+            herdres_gateway.CHECKPOINT_HOLD,
         ),
         (
             _gateway_child(REQUEST_ID, disposition="terminal_uncertain"),
-            herdres_gateway.CHECKPOINT_ADVANCE,
+            herdres_gateway.CHECKPOINT_HOLD,
         ),
         (
             _gateway_child(
@@ -5889,7 +5908,7 @@ def test_gateway_fsyncs_first_seen_shell_before_route_or_child(
     assert checkpoint == herdres_gateway.CHECKPOINT_RETRY
     assert [kind for kind, _record in observations] == ["route", "child"]
     for _kind, record in observations:
-        assert record["schema_version"] == 3
+        assert record["schema_version"] == 4
         assert record["request_id"] == request_id
         assert record["created_at"] == 100.0
         assert record["updated_at"] == 100.0
@@ -5899,7 +5918,7 @@ def test_gateway_fsyncs_first_seen_shell_before_route_or_child(
         assert record["request_json"] is None
 
 
-def test_gateway_restart_uses_equality_quarantine_and_advances_without_child(
+def test_gateway_restart_uses_equality_quarantine_and_holds_without_child(
     monkeypatch,
     tmp_path,
 ):
@@ -5925,9 +5944,12 @@ def test_gateway_restart_uses_equality_quarantine_and_advances_without_child(
         now=160.0,
     )
     assert first_outcome is None
-    assert equality_outcome == _gateway_child(
+    assert equality_outcome == ingress_requests.child_result(
         request_id,
-        disposition=None,
+        checkpoint="hold",
+        transport_disposition=None,
+        request_phase="terminal",
+        terminal_outcome="not_delivered",
         reply=ingress_requests.QUARANTINE_REPLY,
     )
     assert record["state"] == "quarantined"
@@ -5982,7 +6004,7 @@ def test_gateway_restart_uses_equality_quarantine_and_advances_without_child(
     )
 
     assert child_calls == []
-    assert saved_offsets == [(45, "manager")]
+    assert saved_offsets == []
     restarted = state.load_state()[ingress_requests.RECORDS_KEY][request_id]
     assert restarted["state"] == "quarantined"
     assert restarted["updated_at"] == 160.0
@@ -6061,7 +6083,7 @@ def test_gateway_corrupt_existing_record_is_preserved_global_barrier(
     )
 
 
-def test_gateway_terminal_uncertain_update_advances_then_processes_next(
+def test_gateway_terminal_uncertain_update_holds_checkpoint_and_next_update(
     monkeypatch,
     tmp_path,
 ):
@@ -6149,17 +6171,15 @@ def test_gateway_terminal_uncertain_update_advances_then_processes_next(
         request_id_key=REQUEST_ID_KEY,
     )
 
-    assert len(command_requests) == 2
-    assert command_requests[0]["request_id"] != command_requests[1]["request_id"]
-    assert saved_offsets == [(45, "manager"), (46, "manager")]
+    assert len(command_requests) == 1
+    assert saved_offsets == []
     records = state.load_state()[ingress_requests.RECORDS_KEY]
     first = records[command_requests[0]["request_id"]]
-    second = records[command_requests[1]["request_id"]]
     assert first["state"] == "quarantined"
-    assert first["last_disposition"] == "terminal_uncertain"
-    assert first["outcome"]["checkpoint"] == herdres_gateway.CHECKPOINT_ADVANCE
-    assert second["state"] == "terminal"
-    assert second["last_disposition"] == "terminal_accepted"
+    assert first["transport_disposition"] == "terminal_uncertain"
+    assert first["terminal_outcome"] == "delivery_unknown"
+    assert first["outcome"]["checkpoint"] == herdres_gateway.CHECKPOINT_HOLD
+    assert first["operator_attention_required"] is True
 
 
 @pytest.mark.parametrize("delivery_failure", ["explicit", "raised"])
@@ -6170,7 +6190,7 @@ def test_gateway_terminal_uncertain_update_advances_then_processes_next(
         ("quarantine", "quarantined"),
     ],
 )
-def test_gateway_terminal_notification_failure_advances_and_redelivery_is_cached(
+def test_gateway_unverified_outcome_holds_and_redelivery_is_cached(
     monkeypatch,
     tmp_path,
     delivery_failure,
@@ -6272,20 +6292,14 @@ def test_gateway_terminal_notification_failure_advances_and_redelivery_is_cached
             request_id_key=REQUEST_ID_KEY,
         )
 
-    assert saved_offsets == [
-        (45, "manager"),
-        (46, "manager"),
-        (45, "manager"),
-        (46, "manager"),
-    ]
+    assert saved_offsets == []
     assert len(backend_requests) == 1
     request_id = backend_requests[0]["request_id"]
     cached = state.load_state()[ingress_requests.RECORDS_KEY][request_id]
     assert cached["state"] == record_state
-    assert cached["outcome"]["checkpoint"] == herdres_gateway.CHECKPOINT_ADVANCE
-    assert cached["outcome"]["reply"]
-    assert len(reply_attempts) == 2
-    assert {attempt[1] for attempt in reply_attempts} == {cached["outcome"]["reply"]}
+    assert cached["outcome"]["checkpoint"] == herdres_gateway.CHECKPOINT_HOLD
+    assert cached["operator_attention_required"] is True
+    assert reply_attempts == []
 
 
 def test_gateway_uncertain_result_is_not_acknowledged(monkeypatch, tmp_path):

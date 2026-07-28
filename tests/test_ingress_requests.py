@@ -74,12 +74,36 @@ def _child(
     disposition: str | None,
     reply: str = "",
 ) -> dict[str, object]:
+    transport = ingress_requests.normalize_transport_disposition(disposition)
+    if disposition == "terminal_accepted":
+        checkpoint = "hold"
+        phase = "accepted_unverified"
+        terminal_outcome = "delivery_unknown"
+        reply = ""
+    elif disposition == "terminal_rejected":
+        checkpoint = "hold"
+        phase = "terminal"
+        terminal_outcome = "not_delivered"
+        reply = ""
+    elif disposition == "terminal_uncertain":
+        checkpoint = "hold"
+        phase = "terminal"
+        terminal_outcome = "delivery_unknown"
+    elif checkpoint == "advance":
+        checkpoint = "hold"
+        phase = "terminal"
+        terminal_outcome = "not_delivered"
+    else:
+        phase = "retryable"
+        terminal_outcome = None
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "handled": True,
         "request_id": request_id,
         "checkpoint": checkpoint,
-        "disposition": disposition,
+        "transport_disposition": transport,
+        "request_phase": phase,
+        "terminal_outcome": terminal_outcome,
         "reply": reply,
     }
 
@@ -113,6 +137,63 @@ def _record(
             reply="Sent to Tendwire worker.",
         )
     return record
+
+
+def _old_v3_record(
+    request_id: str,
+    *,
+    now: float = 100.0,
+    terminal_disposition: str | None = None,
+) -> dict[str, object]:
+    current = _record(
+        request_id,
+        now=now,
+        with_request=True,
+    )
+    for field in (
+        "transport_disposition",
+        "request_phase",
+        "terminal_outcome",
+        "checkpoint_already_advanced",
+        "operator_attention_required",
+        "blocked_reason",
+        "next_action",
+        "dedup_witness",
+    ):
+        current.pop(field)
+    current["schema_version"] = 3
+    current["last_disposition"] = terminal_disposition
+    if terminal_disposition is not None:
+        current["state"] = (
+            "quarantined"
+            if terminal_disposition == "terminal_uncertain"
+            else "terminal"
+        )
+        current["updated_at"] = now + 2
+        current["terminal_at"] = (
+            None if current["state"] == "quarantined" else now + 2
+        )
+        current["quarantined_at"] = (
+            now + 2 if current["state"] == "quarantined" else None
+        )
+        current["quarantine_reason"] = (
+            "legacy uncertainty"
+            if current["state"] == "quarantined"
+            else None
+        )
+        current["outcome"] = {
+            "schema_version": 1,
+            "handled": True,
+            "request_id": request_id,
+            "checkpoint": "advance",
+            "disposition": terminal_disposition,
+            "reply": (
+                "Sent to Tendwire worker."
+                if terminal_disposition == "terminal_accepted"
+                else "Could not send safely."
+            ),
+        }
+    return current
 
 
 def test_record_bounds_do_not_slide_and_deadline_equality_quarantines() -> None:
@@ -216,7 +297,7 @@ def test_legacy_record_migrates_once_without_status_finality() -> None:
     )
     assert changed is True
     assert record["state"] == "retryable"
-    assert record["last_disposition"] is None
+    assert record["transport_disposition"] is None
     assert record["outcome"] is None
     assert record["request_json"] == ingress_requests.canonical_request_json(
         legacy_request
@@ -238,8 +319,8 @@ def test_legacy_record_migrates_once_without_status_finality() -> None:
     assert changed is False
 
 
-def test_v2_record_migrates_additively_to_submission_capable_v3() -> None:
-    original = _record(REQUEST_ID, with_request=True)
+def test_v2_record_migrates_additively_to_current_schema() -> None:
+    original = _old_v3_record(REQUEST_ID)
     v2 = {
         key: copy.deepcopy(value)
         for key, value in original.items()
@@ -265,7 +346,7 @@ def test_v2_record_migrates_additively_to_submission_capable_v3() -> None:
     )
 
     assert changed is True
-    assert migrated["schema_version"] == 3
+    assert migrated["schema_version"] == 4
     assert migrated["request_json"] == v2["request_json"]
     assert {
         key: migrated[key]
@@ -285,6 +366,254 @@ def test_v2_record_migrates_additively_to_submission_capable_v3() -> None:
         "submitted_at": None,
         "linked_at": None,
     }
+
+
+def test_not_delivered_outcome_leaves_checkpoint_unadvanced() -> None:
+    record = _record(REQUEST_ID, with_request=True)
+
+    outcome = ingress_requests.record_terminal_outcome(
+        record,
+        transport_disposition="terminal_rejected",
+        request_phase="terminal",
+        terminal_outcome="not_delivered",
+        now=103.0,
+        blocked_reason="provider rejected the request",
+        next_action="review before retry",
+    )
+
+    assert outcome["checkpoint"] == "hold"
+    assert outcome["terminal_outcome"] == "not_delivered"
+    assert record["checkpoint_already_advanced"] is False
+    assert record["operator_attention_required"] is True
+
+
+def test_delivery_unknown_leaves_checkpoint_unadvanced_and_never_retries() -> None:
+    record = _record(REQUEST_ID, terminal=True)
+
+    assert record["terminal_outcome"] == "delivery_unknown"
+    assert record["outcome"]["checkpoint"] == "hold"
+    assert record["checkpoint_already_advanced"] is False
+    assert ingress_requests.automatic_replay_authorized(record) is False
+
+    # Even evidence that would authorize a replay of a proven non-delivery
+    # cannot silently resolve an already-unknown outcome.
+    ingress_requests.record_dedup_witness(
+        record,
+        prompt_fingerprint="herdr-prompt-fingerprint",
+        composer_fingerprint="different-composer-fingerprint",
+        composer_readable=True,
+        provider_verdict="agent_prompt_not_received",
+        owner_generation="pane-generation-1",
+        now=104.0,
+    )
+    assert record["dedup_witness"]["automatic_replay_authorized"] is False
+    assert ingress_requests.automatic_replay_authorized(record) is False
+
+
+def test_delivery_unknown_is_loud_in_operator_readable_state() -> None:
+    store: dict[str, object] = {}
+    record, _ = ingress_requests.ensure_request_shell(
+        store,
+        REQUEST_ID,
+        now=100.0,
+        retry_horizon=60,
+        retention=120,
+    )
+    ingress_requests.attach_request_json(
+        record,
+        ingress_requests.canonical_request_json(_request()),
+        now=101.0,
+    )
+    ingress_requests.mark_terminal(
+        record,
+        "terminal_accepted",
+        now=102.0,
+        reply="must not be emitted",
+    )
+
+    rows = ingress_requests.operator_status_rows(store, now=110.0)
+
+    assert rows == [
+        {
+            "request_id": REQUEST_ID,
+            "age_seconds": 10.0,
+            "state": "terminal",
+            "transport_disposition": "written_to_pty",
+            "request_phase": "accepted_unverified",
+            "terminal_outcome": "delivery_unknown",
+            "checkpoint_already_advanced": False,
+            "operator_attention_required": True,
+            "blocked_reason": "transport accepted but submission was not verified",
+            "next_action": "inspect the composer before any replay",
+            "submission_id": None,
+            "turn_id": None,
+            "target_owner": None,
+            "dedup_witness": None,
+        }
+    ]
+    assert "original instruction" not in json.dumps(rows)
+
+
+def test_ingress_status_cli_surfaces_unknown_without_prompt_text(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    state_path = tmp_path / "state.json"
+    monkeypatch.setattr(herdres.config, "load_env_file", lambda: None)
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    store = _store()
+    record, _ = ingress_requests.ensure_request_shell(
+        store,
+        REQUEST_ID,
+        now=100.0,
+        retry_horizon=60,
+        retention=120,
+    )
+    ingress_requests.attach_request_json(
+        record,
+        ingress_requests.canonical_request_json(_request()),
+        now=101.0,
+    )
+    ingress_requests.mark_terminal(
+        record,
+        "terminal_accepted",
+        now=102.0,
+        reply="must not be emitted",
+    )
+    state.save_state(store, path=state_path)
+    monkeypatch.setattr(herdres.time, "time", lambda: 110.0)
+
+    assert herdres.cmd_ingress_status(None) == 0
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert payload["attention_required"] == 1
+    assert payload["requests"][0]["terminal_outcome"] == "delivery_unknown"
+    assert payload["requests"][0]["next_action"] == (
+        "inspect the composer before any replay"
+    )
+    assert "original instruction" not in output
+
+
+def test_terminal_accepted_can_never_be_a_terminal_outcome() -> None:
+    record = _record(REQUEST_ID, with_request=True)
+
+    with pytest.raises(
+        ValueError, match="only verified delivery may advance checkpoint"
+    ):
+        ingress_requests.child_result(
+            REQUEST_ID,
+            checkpoint="advance",
+            transport_disposition="terminal_accepted",
+            request_phase="terminal",
+            terminal_outcome="delivered",
+        )
+
+    with pytest.raises(ValueError, match="invalid terminal outcome"):
+        ingress_requests.record_terminal_outcome(
+            record,
+            transport_disposition="terminal_accepted",
+            request_phase="terminal",
+            terminal_outcome="terminal_accepted",
+            now=103.0,
+        )
+
+    outcome = ingress_requests.mark_terminal(
+        record,
+        "terminal_accepted",
+        now=103.0,
+        reply="must not advance",
+    )
+    assert outcome["transport_disposition"] == "written_to_pty"
+    assert outcome["terminal_outcome"] == "delivery_unknown"
+    assert outcome["checkpoint"] == "hold"
+
+
+def test_historical_terminal_accepted_migrates_to_unknown_not_delivered() -> None:
+    legacy = _old_v3_record(
+        REQUEST_ID,
+        terminal_disposition="terminal_accepted",
+    )
+    store = {ingress_requests.RECORDS_KEY: {REQUEST_ID: legacy}}
+
+    migrated, changed = ingress_requests.ensure_request_shell(
+        store,
+        REQUEST_ID,
+        now=130.0,
+        retry_horizon=60,
+        retention=120,
+    )
+
+    assert changed is True
+    assert migrated["schema_version"] == 4
+    assert migrated["transport_disposition"] == "written_to_pty"
+    assert migrated["request_phase"] == "accepted_unverified"
+    assert migrated["terminal_outcome"] == "delivery_unknown"
+    assert migrated["terminal_outcome"] != "delivered"
+    assert migrated["checkpoint_already_advanced"] is True
+    assert migrated["outcome"]["checkpoint"] == "hold"
+    assert migrated["operator_attention_required"] is True
+
+
+@pytest.mark.parametrize(
+    ("legacy_disposition", "transport", "terminal_outcome"),
+    [
+        ("terminal_rejected", "terminal_rejected", "not_delivered"),
+        ("terminal_uncertain", "terminal_uncertain", "delivery_unknown"),
+    ],
+)
+def test_historical_non_success_receipts_migrate_without_rewriting_truth(
+    legacy_disposition, transport, terminal_outcome
+) -> None:
+    store = {
+        ingress_requests.RECORDS_KEY: {
+            REQUEST_ID: _old_v3_record(
+                REQUEST_ID,
+                terminal_disposition=legacy_disposition,
+            )
+        }
+    }
+
+    migrated, changed = ingress_requests.ensure_request_shell(
+        store,
+        REQUEST_ID,
+        now=130.0,
+        retry_horizon=60,
+        retention=120,
+    )
+
+    assert changed is True
+    assert migrated["transport_disposition"] == transport
+    assert migrated["terminal_outcome"] == terminal_outcome
+    assert migrated["checkpoint_already_advanced"] is True
+    assert migrated["outcome"]["checkpoint"] == "hold"
+    assert migrated["operator_attention_required"] is True
+
+
+def test_dedup_witness_contract_authorizes_only_positive_nonreceipt() -> None:
+    record = _record(REQUEST_ID, with_request=True)
+    ingress_requests.record_terminal_outcome(
+        record,
+        transport_disposition="agent_prompt_not_received",
+        request_phase="terminal",
+        terminal_outcome="not_delivered",
+        now=103.0,
+    )
+
+    ingress_requests.record_dedup_witness(
+        record,
+        prompt_fingerprint="prompt-fingerprint",
+        composer_fingerprint="empty-composer-fingerprint",
+        composer_readable=True,
+        provider_verdict="agent_prompt_not_received",
+        owner_generation="owner-generation-1",
+        now=104.0,
+    )
+
+    assert ingress_requests.automatic_replay_authorized(record) is True
+    request = ingress_requests.dedup_witness_request(record)
+    assert request["required_observation"] == "herdr_composer_prompt_fingerprint"
+    assert request["prior_witness"]["comparison"] == "different"
+    assert "original instruction" not in json.dumps(request)
 def test_corrupt_current_record_is_a_non_destructive_global_barrier() -> None:
     private = "123456:abcdefghijklmnopqrstuvwxyz_PRIVATE"
     corrupt_record = {
@@ -390,7 +719,7 @@ def test_backend_unavailable_authority_comes_only_from_disposition(
 ) -> None:
     outcomes = [
         (REQUEST_ID, "no_receipt", "retry"),
-        (REQUEST_ID_2, "terminal_rejected", "advance"),
+        (REQUEST_ID_2, "terminal_rejected", "hold"),
     ]
     for index, (request_id, disposition, checkpoint) in enumerate(outcomes):
         case_path = tmp_path / str(index)
@@ -410,10 +739,10 @@ def test_backend_unavailable_authority_comes_only_from_disposition(
         monkeypatch.setattr(herdres, "TendwireClient", Client)
         result = herdres.command_reply(_payload(request_id))
         assert result["checkpoint"] == checkpoint
-        assert result["disposition"] == disposition
-        assert result["reply"] == (
-            "" if checkpoint == "retry" else herdres.SAFE_SEND_FAILURE_REPLY
+        assert result["transport_disposition"] == (
+            ingress_requests.normalize_transport_disposition(disposition)
         )
+        assert result["reply"] == ""
         assert len(calls) == 1
 
 
@@ -439,8 +768,9 @@ def test_in_progress_receipt_gets_one_inline_idempotent_poll(
 
     result = herdres.command_reply(_payload())
 
-    assert result["checkpoint"] == "advance"
-    assert result["disposition"] == "terminal_accepted"
+    assert result["checkpoint"] == "hold"
+    assert result["transport_disposition"] == "written_to_pty"
+    assert result["terminal_outcome"] == "delivery_unknown"
     assert len(calls) == 2
     assert calls[0] == calls[1]
 
@@ -535,7 +865,7 @@ def test_v2_command_does_not_attach_submission_owner(tmp_path, monkeypatch) -> N
 
     result = herdres.command_reply(_payload())
 
-    assert result["disposition"] == "terminal_accepted"
+    assert result["transport_disposition"] == "written_to_pty"
     record = state.load_state()[ingress_requests.RECORDS_KEY][REQUEST_ID]
     assert record["target_owner"] is None
 
@@ -565,7 +895,7 @@ def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
 
     monkeypatch.setattr(herdres, "TendwireClient", V3Client)
     accepted = herdres.command_reply(_payload())
-    assert accepted["disposition"] == "terminal_accepted"
+    assert accepted["transport_disposition"] == "written_to_pty"
     assert calls[0]["response_schema_version"] == 3
 
     submission_store = state.load_state()
@@ -785,8 +1115,8 @@ def test_exact_bytes_recover_accepted_response_loss_with_one_backend_send(
     second = herdres.command_reply(
         {"request_id": REQUEST_ID, "topic_id": "gone", "text": "changed"}
     )
-    assert second["checkpoint"] == "advance"
-    assert second["disposition"] == "terminal_accepted"
+    assert second["checkpoint"] == "hold"
+    assert second["transport_disposition"] == "written_to_pty"
     assert child_starts[0] == child_starts[1]
     assert backend_sends == 1
     assert "private stderr" not in json.dumps(first, sort_keys=True)
@@ -831,7 +1161,7 @@ def test_v3_ack_loss_replays_submission_once_without_duplicate_working(
     first = herdres.command_reply(_payload())
     second = herdres.command_reply(_payload())
     assert first["checkpoint"] == "retry"
-    assert second["disposition"] == "terminal_accepted"
+    assert second["transport_disposition"] == "written_to_pty"
     assert backend_sends == 1
     assert child_starts == 2
 
@@ -893,7 +1223,7 @@ def test_stale_refresh_uses_real_client_validation_and_persists_second_bytes(
 
     monkeypatch.setattr(tendwire_client.subprocess, "run", run)
     result = herdres.command_reply(_payload())
-    assert result["disposition"] == "terminal_accepted"
+    assert result["transport_disposition"] == "written_to_pty"
     assert len(child_starts) == 2
     first = json.loads(child_starts[0])
     second = json.loads(child_starts[1])

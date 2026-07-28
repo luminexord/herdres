@@ -35,27 +35,38 @@ WORKER_RECONCILE_SECONDS = float(os.getenv("HERDRES_GATEWAY_WORKER_RECONCILE_SEC
 MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,64})")
 CHECKPOINT_ADVANCE = "advance"
 CHECKPOINT_RETRY = "retry"
-_CHILD_SCHEMA_VERSION = 1
+CHECKPOINT_HOLD = "hold"
+_CHILD_SCHEMA_VERSION = 2
 _CHILD_RESPONSE_FIELDS = frozenset(
     {
         "schema_version",
         "handled",
         "request_id",
         "checkpoint",
-        "disposition",
+        "transport_disposition",
+        "request_phase",
+        "terminal_outcome",
         "reply",
     }
 )
-_COMMAND_DISPOSITIONS = frozenset(
+_TRANSPORT_DISPOSITIONS = frozenset(
     {
         "no_receipt",
         "in_progress",
-        "terminal_accepted",
         "terminal_rejected",
         "terminal_uncertain",
+        "written_to_pty",
+        "submitted",
+        "agent_prompt_not_received",
+        "agent_prompt_unsubmitted",
+        "agent_prompt_stalled",
+        "agent_input_pending",
     }
 )
 _RETRY_DISPOSITIONS = frozenset({"no_receipt", "in_progress"})
+_TERMINAL_OUTCOMES = frozenset(
+    {"delivered", "not_delivered", "delivery_unknown"}
+)
 _TERMINAL_SUCCESS_REPLIES = frozenset(
     {
         "Sent to Tendwire worker.",
@@ -362,11 +373,13 @@ def _payload_for_message(message: dict[str, Any], store: dict[str, Any], *, bot_
 
 
 def _cached_ingress_terminal(store: dict[str, Any], request_id: str) -> bool:
+    outcome = ingress_requests.cached_terminal_outcome(
+        store, request_id, now=time.time()
+    )
     return (
-        ingress_requests.cached_terminal_outcome(
-            store, request_id, now=time.time()
-        )
-        is not None
+        isinstance(outcome, dict)
+        and outcome.get("terminal_outcome") == "delivered"
+        and outcome.get("checkpoint") == CHECKPOINT_ADVANCE
     )
 
 
@@ -544,7 +557,9 @@ def _private_retry_child_result(request_id: str) -> dict[str, Any]:
         "handled": True,
         "request_id": request_id,
         "checkpoint": CHECKPOINT_RETRY,
-        "disposition": None,
+        "transport_disposition": None,
+        "request_phase": "retryable",
+        "terminal_outcome": None,
         "reply": "",
     }
 
@@ -561,25 +576,56 @@ def _validated_child_response(
         or value["schema_version"] != _CHILD_SCHEMA_VERSION
         or type(value.get("handled")) is not bool
         or value.get("request_id") != request_id
-        or value.get("checkpoint") not in {CHECKPOINT_RETRY, CHECKPOINT_ADVANCE}
+        or value.get("checkpoint")
+        not in {CHECKPOINT_RETRY, CHECKPOINT_HOLD, CHECKPOINT_ADVANCE}
         or (
-            value.get("disposition") is not None
-            and value.get("disposition") not in _COMMAND_DISPOSITIONS
+            value.get("transport_disposition") is not None
+            and value.get("transport_disposition") not in _TRANSPORT_DISPOSITIONS
         )
+        or value.get("request_phase")
+        not in {
+            "resolving",
+            "ready",
+            "retryable",
+            "retry_authorized",
+            "accepted_unverified",
+            "queued",
+            "terminal",
+        }
+        or value.get("terminal_outcome") not in _TERMINAL_OUTCOMES | {None}
         or not isinstance(value.get("reply"), str)
         or sanitize_text(value["reply"], _CHILD_REPLY_LIMIT) != value["reply"]
     ):
         return None
     checkpoint = value["checkpoint"]
-    disposition = value["disposition"]
+    disposition = value["transport_disposition"]
+    terminal_outcome = value["terminal_outcome"]
     if checkpoint == CHECKPOINT_RETRY:
-        if disposition not in _RETRY_DISPOSITIONS and disposition is not None:
+        if (
+            disposition not in _RETRY_DISPOSITIONS
+            and disposition is not None
+        ) or terminal_outcome is not None:
             return None
         if value["reply"]:
             return None
         return value
-    if disposition in _RETRY_DISPOSITIONS:
-        return None
+    if checkpoint == CHECKPOINT_ADVANCE:
+        if (
+            terminal_outcome != "delivered"
+            or value["request_phase"]
+            not in ingress_requests.TERMINAL_OUTCOME_PHASES["delivered"]
+            or disposition != "submitted"
+        ):
+            return None
+    else:
+        if (
+            terminal_outcome not in ingress_requests.HOLD_OUTCOMES
+            or disposition
+            not in ingress_requests.TERMINAL_OUTCOME_TRANSPORTS[terminal_outcome]
+            or value["request_phase"]
+            not in ingress_requests.TERMINAL_OUTCOME_PHASES[terminal_outcome]
+        ):
+            return None
     if value["handled"] is False and (
         disposition is not None or value["reply"]
     ):
@@ -752,12 +798,12 @@ def handle_message(
         result,
         request_id=request_id,
     )
-    if checkpoint == CHECKPOINT_RETRY:
+    if checkpoint != CHECKPOINT_ADVANCE:
         return checkpoint
     reply = result["reply"].strip()
     if (
         not inbound_success_ack
-        and result.get("disposition") == "terminal_accepted"
+        and result.get("terminal_outcome") == "delivered"
         and reply in _TERMINAL_SUCCESS_REPLIES
     ):
         # Covers terminal records written before this policy existed. New
@@ -765,7 +811,7 @@ def handle_message(
         reply = ""
     if (
         instant_ack_posted
-        and result.get("disposition") == "terminal_accepted"
+        and result.get("terminal_outcome") == "delivered"
         and reply != "Submitted to busy Tendwire worker."
     ):
         reply = ""
@@ -1501,6 +1547,15 @@ class _InboundLaneDispatcher:
             )
             _timing_log(
                 "lane_done",
+                request_id=item.request_id,
+                update_id=item.update_id,
+                seq=item.seq,
+                elapsed_from_receive=time.time() - item.first_seen_at,
+            )
+        elif checkpoint == CHECKPOINT_HOLD:
+            self.spool.mark_blocked(item.seq, lease_owner)
+            _timing_log(
+                "lane_blocked",
                 request_id=item.request_id,
                 update_id=item.update_id,
                 seq=item.seq,

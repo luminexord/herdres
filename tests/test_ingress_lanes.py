@@ -230,7 +230,7 @@ def test_lease_heartbeat_covers_slow_voice_pretranscription(
     dispatcher.start()
     try:
         assert pretranscription_started.wait(1.0)
-        _wait_for(lambda: spool.rows()[0]["state"] == "done")
+        _wait_for(lambda: spool.rows()[0]["state"] == "blocked")
     finally:
         dispatcher.stop()
 
@@ -437,19 +437,17 @@ def test_poison_head_quarantines_visibly_without_delaying_other_lane(
     dispatcher.update_specs([("manager", "token", 0)])
     dispatcher.start()
     try:
-        _wait_for(lambda: all(row["state"] == "done" for row in spool.rows()))
+        _wait_for(lambda: all(row["state"] == "blocked" for row in spool.rows()))
     finally:
         dispatcher.stop()
 
-    b_at = next(at for worker, at in backend_events if worker == "worker-b")
-    quarantine = next(
-        item for item in notices if item[1] == ingress_requests.QUARANTINE_REPLY
-    )
-    assert quarantine[0] == "77"
-    assert b_at < quarantine[2]
+    assert next(at for worker, at in backend_events if worker == "worker-b")
+    assert notices == []
     records = state.load_state()[ingress_requests.RECORDS_KEY]
     poison = records[_request_id(_update(30, 77, "poison A"))]
     assert poison["state"] == "quarantined"
+    assert poison["terminal_outcome"] == "not_delivered"
+    assert poison["operator_attention_required"] is True
 
 
 def test_lane_overflow_notifies_once_and_advances_cursor(tmp_path, monkeypatch) -> None:
@@ -598,7 +596,7 @@ def test_first_lane_start_migrates_legacy_receiver_cursor(tmp_path, monkeypatch)
     assert spool.cursor("manager") == 91
 
 
-def test_terminal_ingress_cache_marks_refetched_update_done_without_dispatch(
+def test_unverified_ingress_cache_never_marks_refetched_update_done(
     tmp_path, monkeypatch
 ) -> None:
     spool = IngressLaneSpool(tmp_path / "spool.db")
@@ -640,8 +638,8 @@ def test_terminal_ingress_cache_marks_refetched_update_done_without_dispatch(
 
     rows = spool.rows()
     assert len(rows) == 1
-    assert rows[0]["state"] == "done"
-    assert rows[0]["notify_state"] == "cached"
+    assert rows[0]["state"] == "pending"
+    assert rows[0]["notify_state"] == "pending"
 
 
 def test_feature_flag_off_uses_legacy_synchronous_path(tmp_path, monkeypatch) -> None:
@@ -708,11 +706,11 @@ def _kill_stage_child(
             bot_key="manager",
             ingress_first_seen_at=item.first_seen_at,
         )
-        assert checkpoint == herdres_gateway.CHECKPOINT_ADVANCE
+        assert checkpoint == herdres_gateway.CHECKPOINT_HOLD
         if stage == "after_dispatch":
             ready.send("terminal-cached")
         elif stage == "after_done":
-            assert spool.mark_done(item.seq, "killed-dispatcher")
+            assert spool.mark_blocked(item.seq, "killed-dispatcher")
             ready.send("done")
     time.sleep(60)
 
@@ -823,7 +821,7 @@ def test_kill_9_restart_submits_each_request_exactly_once(
     dispatcher.start()
     try:
         _wait_for(
-            lambda: all(row["state"] == "done" for row in dispatcher.spool.rows())
+            lambda: all(row["state"] == "blocked" for row in dispatcher.spool.rows())
         )
     finally:
         dispatcher.stop()
@@ -876,7 +874,10 @@ def test_tendwire_submit_releases_state_lock_and_preserves_concurrent_write(
     release.set()
     thread.join(3.0)
 
-    assert result["checkpoint"] == herdres_gateway.CHECKPOINT_ADVANCE
+    assert result["checkpoint"] == herdres_gateway.CHECKPOINT_HOLD
+    assert result["transport_disposition"] == "written_to_pty"
+    assert result["request_phase"] == "accepted_unverified"
+    assert result["terminal_outcome"] == "delivery_unknown"
     final = state.load_state()
     assert final["concurrent_write"] is True
     assert final[ingress_requests.RECORDS_KEY][
@@ -981,8 +982,11 @@ def test_direct_command_keeps_success_reply_without_instant_ack(
         }
     )
 
-    assert result["disposition"] == "terminal_accepted"
-    assert result["reply"] == "Sent to Tendwire worker."
+    assert result["checkpoint"] == herdres_gateway.CHECKPOINT_HOLD
+    assert result["transport_disposition"] == "written_to_pty"
+    assert result["request_phase"] == "accepted_unverified"
+    assert result["terminal_outcome"] == "delivery_unknown"
+    assert result["reply"] == ""
 
 
 def test_gateway_default_suppresses_terminal_success_and_cached_replay(
@@ -1032,7 +1036,7 @@ def test_gateway_default_suppresses_terminal_success_and_cached_replay(
                 request_id_key=REQUEST_ID_KEY,
                 deferred_reply=replies.append,
             )
-            == herdres_gateway.CHECKPOINT_ADVANCE
+            == herdres_gateway.CHECKPOINT_HOLD
         )
 
     request_id = _request_id(update)
@@ -1177,9 +1181,7 @@ def test_production_lane_ack_order_and_terminal_reply_policy(
     dispatcher.update_specs([("manager", "token", 0)])
     dispatcher.start()
     try:
-        _wait_for(lambda: spool.rows()[0]["state"] == "done")
-        if expected_reply:
-            _wait_for(lambda: any(event.startswith("telegram:") for event in events))
+        _wait_for(lambda: spool.rows()[0]["state"] == "blocked")
     finally:
         dispatcher.stop()
 
@@ -1187,12 +1189,11 @@ def test_production_lane_ack_order_and_terminal_reply_policy(
     record = state.load_state(state_path)[ingress_requests.RECORDS_KEY][
         _request_id(update)
     ]
-    assert events == (
-        ["submit", f"telegram:{expected_reply}"]
-        if expected_reply
-        else ["submit"]
+    assert events == ["submit"]
+    assert record["outcome"]["reply"] == (
+        herdres.SAFE_SEND_FAILURE_REPLY if outcome == "uncertain" else ""
     )
-    assert record["outcome"]["reply"] == expected_reply
+    assert record["outcome"]["checkpoint"] == "hold"
 
 
 def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
@@ -1591,6 +1592,21 @@ def test_single_lane_acceptance_cadence_claim_and_service_stay_under_two_seconds
         command_saves += 1
         return real_save_state(store, path=path)
 
+    def verified_command(payload):
+        # This is a throughput test for the durable lane path. Model the
+        # second-half verifier after the current command has persisted its
+        # transport receipt so an unverified receipt does not intentionally
+        # block the remainder of this synthetic same-lane cohort.
+        transport_result = herdres.command_reply(payload)
+        assert transport_result["terminal_outcome"] == "delivery_unknown"
+        return ingress_requests.child_result(
+            payload["request_id"],
+            checkpoint="advance",
+            transport_disposition="submitted",
+            request_phase="terminal",
+            terminal_outcome="delivered",
+        )
+
     monkeypatch.setattr(herdres_gateway, "_timing_log", capture_timing)
     monkeypatch.setattr(
         herdres_gateway,
@@ -1602,7 +1618,7 @@ def test_single_lane_acceptance_cadence_claim_and_service_stay_under_two_seconds
     monkeypatch.setattr(
         herdres_gateway,
         "run_herdres_command",
-        lambda payload: herdres.command_reply(payload),
+        verified_command,
     )
     dispatcher = herdres_gateway._InboundLaneDispatcher(
         spool,
