@@ -555,6 +555,10 @@ _INGRESS_RESULT_FACTORIES = {
     "record_terminal_outcome",
     "run_herdres_command",
     "_submit_ingress_command_record",
+    "_private_retry_child_result",
+    "_validated_child_response",
+    "_copy_child_result",
+    "from_mapping",
 }
 _REMOVED_INGRESS_RESULT_KEYS = {"disposition", "last_disposition"}
 
@@ -804,6 +808,85 @@ def _removed_ingress_result_reads(
                         violations.append(
                             (filename, keyword.value.lineno, "**ingress_result")
                         )
+                if (
+                    _call_name(node.func) == "dict"
+                    and node.args
+                    and (
+                        is_result(node.args[0])
+                        or (
+                            isinstance(node.args[0], ast.Call)
+                            and isinstance(node.args[0].func, ast.Attribute)
+                            and node.args[0].func.attr == "items"
+                            and is_result(node.args[0].func.value)
+                        )
+                    )
+                ):
+                    violations.append(
+                        (filename, node.lineno, "dict(ingress_result)")
+                    )
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "copy"
+                    and is_result(node.func.value)
+                ):
+                    violations.append(
+                        (filename, node.lineno, "ingress_result.copy()")
+                    )
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "dict"
+                    and node.args
+                    and is_result(node.args[0])
+                ):
+                    violations.append(
+                        (
+                            filename,
+                            node.lineno,
+                            f"dict.{node.func.attr}(ingress_result)",
+                        )
+                    )
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "json"
+                    and node.func.attr in {"dump", "dumps"}
+                    and node.args
+                    and is_result(node.args[0])
+                ):
+                    violations.append(
+                        (filename, node.lineno, "implicit ingress serialization")
+                    )
+            if isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if key is None and is_result(value):
+                        violations.append(
+                            (filename, value.lineno, "{**ingress_result}")
+                        )
+            if (
+                isinstance(node, ast.BinOp)
+                and isinstance(node.op, ast.BitOr)
+                and (is_result(node.left) or is_result(node.right))
+            ):
+                violations.append(
+                    (filename, node.lineno, "ingress_result dict union")
+                )
+            if isinstance(node, (ast.DictComp, ast.ListComp, ast.SetComp)):
+                for generator in node.generators:
+                    iterator = generator.iter
+                    if (
+                        isinstance(iterator, ast.Call)
+                        and isinstance(iterator.func, ast.Attribute)
+                        and iterator.func.attr == "items"
+                        and is_result(iterator.func.value)
+                    ):
+                        violations.append(
+                            (
+                                filename,
+                                node.lineno,
+                                "ingress_result.items() reconstruction",
+                            )
+                        )
     return sorted(set(violations))
 
 
@@ -872,6 +955,114 @@ def consumer():
 """
     )
     assert violations
+
+
+def test_ingress_result_guard_rejects_dict_construction() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    return dict(command_reply({}))
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_copy_shedding() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    return result.copy()
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_dict_unpacking() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    return {**result}
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_dict_unions() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    left = result | {}
+    right = {} | result
+    return left, right
+"""
+    )
+    assert len(violations) == 2
+
+
+def test_ingress_result_guard_rejects_fromkeys() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    return dict.fromkeys(result)
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_json_round_trip() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    return json.loads(json.dumps(result))
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_items_reconstruction() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    return dict(result.items())
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_unbound_dict_methods() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    return dict.get(result, "disposition", None)
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_explicit_wire_serialization_is_allowed() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def process_boundary():
+    result = command_reply({})
+    return json.dumps(result.to_wire_dict())
+"""
+    )
+    assert violations == []
+
+    result = _structured_ingress_result()
+    wire = result.to_wire_dict()
+    assert type(wire) is dict
+    assert json.loads(json.dumps(wire)) == wire
+    restored = ingress_requests.IngressResult.from_mapping(wire)
+    with pytest.raises(KeyError, match="removed ingress result field"):
+        eval("restored.get('disposition')", {"restored": restored})
 
 
 def test_ingress_result_guard_tracks_call_argument_flow() -> None:
@@ -1266,6 +1457,41 @@ def test_terminal_accepted_cache_survives_restart_and_route_loss(
     assert len(calls) == 1
 
 
+def test_concurrent_terminal_reload_returns_structured_ingress_result(
+    tmp_path, monkeypatch
+) -> None:
+    _setup_command_state(tmp_path, monkeypatch)
+
+    class ConcurrentTerminalClient:
+        def command_json(self, request_json):
+            concurrent = state.load_state()
+            record = concurrent[ingress_requests.RECORDS_KEY][REQUEST_ID]
+            ingress_requests.mark_terminal(
+                record,
+                "terminal_accepted",
+                now=float(record["updated_at"]) + 0.01,
+                reply="must remain guarded",
+            )
+            state.save_state(concurrent)
+            return _failed_command_response(
+                json.loads(request_json),
+                status="pending",
+                disposition="in_progress",
+            )
+
+    monkeypatch.setattr(herdres, "TendwireClient", ConcurrentTerminalClient)
+
+    result = herdres.command_reply(_payload())
+
+    assert isinstance(result, ingress_requests.IngressResult)
+    for removed_name in ("disposition", "last_disposition"):
+        with pytest.raises(KeyError, match="removed ingress result field"):
+            eval(
+                "result.get(removed_name, 'DEFAULT')",
+                {"result": result, "removed_name": removed_name},
+            )
+
+
 def test_v2_command_does_not_attach_submission_owner(tmp_path, monkeypatch) -> None:
     _setup_command_state(tmp_path, monkeypatch)
 
@@ -1535,7 +1761,10 @@ def test_exact_bytes_recover_accepted_response_loss_with_one_backend_send(
     assert second["transport_disposition"] == "written_to_pty"
     assert child_starts[0] == child_starts[1]
     assert backend_sends == 1
-    assert "private stderr" not in json.dumps(first, sort_keys=True)
+    assert "private stderr" not in json.dumps(
+        first.to_wire_dict(),
+        sort_keys=True,
+    )
 
 
 def test_v3_ack_loss_replays_submission_once_without_duplicate_working(

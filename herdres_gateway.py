@@ -551,8 +551,10 @@ def _script_path() -> str:
     return os.getenv("HERDR_TELEGRAM_TOPICS_SCRIPT", str(Path.home() / ".local/bin/herdres"))
 
 
-def _private_retry_child_result(request_id: str) -> dict[str, Any]:
-    return {
+def _private_retry_child_result(
+    request_id: str,
+) -> ingress_requests.IngressResult:
+    return ingress_requests.IngressResult.from_mapping({
         "schema_version": _CHILD_SCHEMA_VERSION,
         "handled": True,
         "request_id": request_id,
@@ -561,14 +563,14 @@ def _private_retry_child_result(request_id: str) -> dict[str, Any]:
         "request_phase": "retryable",
         "terminal_outcome": None,
         "reply": "",
-    }
+    })
 
 
 def _validated_child_response(
     value: Any,
     *,
     request_id: str,
-) -> dict[str, Any] | None:
+) -> ingress_requests.IngressResult | None:
     if (
         not isinstance(value, dict)
         or set(value) != _CHILD_RESPONSE_FIELDS
@@ -608,7 +610,7 @@ def _validated_child_response(
             return None
         if value["reply"]:
             return None
-        return value
+        return ingress_requests.IngressResult.from_mapping(value)
     if checkpoint == CHECKPOINT_ADVANCE:
         if (
             terminal_outcome != "delivered"
@@ -630,10 +632,12 @@ def _validated_child_response(
         disposition is not None or value["reply"]
     ):
         return None
-    return value
+    return ingress_requests.IngressResult.from_mapping(value)
 
 
-def run_herdres_command(payload: dict[str, Any]) -> dict[str, Any]:
+def run_herdres_command(
+    payload: dict[str, Any],
+) -> ingress_requests.IngressResult:
     try:
         request_id = validate_request_id(payload.get("request_id"))
     except ValueError:

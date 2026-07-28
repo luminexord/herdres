@@ -5784,9 +5784,11 @@ def test_gateway_child_exit_shape_and_correlation_fail_closed(
         lambda *_args, **_kwargs: completed,
     )
 
-    assert herdres_gateway.run_herdres_command(
+    result = herdres_gateway.run_herdres_command(
         {"request_id": REQUEST_ID}
-    ) == _gateway_child(
+    )
+    assert isinstance(result, ingress_requests.IngressResult)
+    assert result == _gateway_child(
         REQUEST_ID,
         checkpoint=herdres_gateway.CHECKPOINT_RETRY,
     )
@@ -5813,9 +5815,11 @@ def test_gateway_accepts_exact_correlated_child_envelope(monkeypatch):
         lambda *_args, **_kwargs: completed,
     )
 
-    assert herdres_gateway.run_herdres_command(
+    result = herdres_gateway.run_herdres_command(
         {"request_id": REQUEST_ID}
-    ) == expected
+    )
+    assert isinstance(result, ingress_requests.IngressResult)
+    assert result == expected
 
 
 def test_gateway_invalid_utf8_child_output_is_uncertain(monkeypatch):
@@ -5832,6 +5836,7 @@ def test_gateway_invalid_utf8_child_output_is_uncertain(monkeypatch):
 
     result = herdres_gateway.run_herdres_command({"request_id": REQUEST_ID})
 
+    assert isinstance(result, ingress_requests.IngressResult)
     assert result == _gateway_child(
         REQUEST_ID,
         checkpoint=herdres_gateway.CHECKPOINT_RETRY,

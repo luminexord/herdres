@@ -374,7 +374,7 @@ def _submit_ingress_command_record(
     *,
     instant_ack_posted: bool = False,
     gateway_success_ack_enabled: bool = True,
-) -> dict[str, Any]:
+) -> ingress_requests.IngressResult:
     """Replay durable bytes off-lock and reduce authoritative dispositions.
 
     ``command_reply`` enters with the connector state lock held.  The canonical
@@ -467,7 +467,7 @@ def _submit_ingress_command_record(
         if migrated:
             state.save_state(store)
         if record["state"] in {"terminal", "quarantined"}:
-            return copy.deepcopy(record["outcome"])
+            return ingress_requests.IngressResult.from_mapping(record["outcome"])
         if record.get("request_json") != request_json:
             outcome = ingress_requests.quarantine_request(
                 record, "conflicting ingress request", now=transitioned_at
@@ -1091,7 +1091,13 @@ def cmd_command(_args: argparse.Namespace) -> int:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
         payload = {}
-    return _json(command_reply(payload if isinstance(payload, dict) else {}))
+    result = command_reply(payload if isinstance(payload, dict) else {})
+    wire_result = (
+        result.to_wire_dict()
+        if isinstance(result, ingress_requests.IngressResult)
+        else result
+    )
+    return _json(wire_result)
 
 
 def cmd_callback(_args: argparse.Namespace) -> int:

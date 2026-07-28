@@ -200,7 +200,17 @@ _DEDUP_PROVIDER_VERDICTS = frozenset(
 
 
 class IngressResult(dict[str, Any]):
-    """JSON-compatible child result that rejects removed vocabulary at runtime."""
+    """Compatibility guard for the current dict-shaped ingress result.
+
+    This subtype is one layer of two, alongside the repository AST invariant;
+    neither is the durable non-dict boundary planned in issue #203. Ordinary
+    dict reconstruction, unpacking, unions, ``dict``'s unbound methods, and
+    serialize/reparse cycles can erase the subtype. The invariant rejects those
+    forms in repository code, but deliberate dynamic evaluation, aliased
+    builtins, native extensions, and third-party reconstruction remain outside
+    its static coverage. Process boundaries must use ``to_wire_dict`` and
+    ``from_mapping`` explicitly.
+    """
 
     _REMOVED_FIELDS = frozenset({"disposition", "last_disposition"})
 
@@ -228,6 +238,17 @@ class IngressResult(dict[str, Any]):
     def __getattr__(self, name: str) -> Any:
         self._reject_removed(name)
         raise AttributeError(name)
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> IngressResult:
+        """Wrap one already-validated child mapping at a public boundary."""
+
+        return cls(copy.deepcopy(value))
+
+    def to_wire_dict(self) -> dict[str, Any]:
+        """Return plain JSON data explicitly for a process boundary."""
+
+        return copy.deepcopy(dict(self))
 
 
 
@@ -326,7 +347,7 @@ def child_result(
 
 
 def _copy_child_result(value: dict[str, Any]) -> IngressResult:
-    return IngressResult(copy.deepcopy(value))
+    return IngressResult.from_mapping(value)
 
 
 def _valid_child(value: Any, request_id: str) -> bool:
@@ -1135,7 +1156,7 @@ def quarantine_request(
     disposition: str | None = None,
     reply: str = QUARANTINE_REPLY,
     handled: bool = True,
-) -> dict[str, Any]:
+) -> IngressResult:
     """Make a local failure representable without claiming delivery."""
 
     if disposition not in {None, "terminal_uncertain"}:
@@ -1249,7 +1270,7 @@ def preflight_request(
     now: float,
     retry_horizon: float,
     retention: float,
-) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+) -> tuple[dict[str, Any], IngressResult | None, bool]:
     """Resolve cache/deadline before route reconstruction or child creation."""
 
     record, changed = ensure_request_shell(
@@ -1294,7 +1315,7 @@ def attach_request_json(
 
 def mark_retryable(
     record: dict[str, Any], disposition: str | None, *, now: float
-) -> dict[str, Any]:
+) -> IngressResult:
     if disposition not in RETRYABLE_DISPOSITIONS | {None}:
         raise ValueError("invalid retry disposition")
     if not isinstance(record.get("request_json"), str):
@@ -1335,7 +1356,7 @@ def record_terminal_outcome(
     blocked_reason: str = "",
     next_action: str = "",
     handled: bool = True,
-) -> dict[str, Any]:
+) -> IngressResult:
     """Persist one user-visible truth; only verified delivery advances."""
 
     if terminal_outcome not in TERMINAL_OUTCOMES:
@@ -1401,7 +1422,7 @@ def mark_terminal(
     *,
     now: float,
     reply: str,
-) -> dict[str, Any]:
+) -> IngressResult:
     """Reduce the legacy Tendwire response without treating transport as truth."""
 
     if disposition == "terminal_accepted":
