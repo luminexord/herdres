@@ -762,6 +762,60 @@ def _removed_ingress_result_reads(
                 and _call_name(node.func) in factories
             )
 
+        derived_aliases: set[str] = set()
+
+        def is_ingress_derived(node: ast.AST) -> bool:
+            if is_result(node):
+                return True
+            if isinstance(node, ast.Name):
+                return node.id in derived_aliases
+            if not isinstance(node, ast.Call):
+                return False
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to_wire_dict"
+            ):
+                return False
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"items", "keys", "values"}
+                and is_ingress_derived(node.func.value)
+            ):
+                return True
+            return any(is_ingress_derived(argument) for argument in node.args) or any(
+                is_ingress_derived(keyword.value) for keyword in node.keywords
+            )
+
+        changed = True
+        while changed:
+            changed = False
+            for node in nodes:
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                if not is_ingress_derived(node.value):
+                    continue
+                for target in targets:
+                    if (
+                        isinstance(target, ast.Name)
+                        and target.id not in derived_aliases
+                    ):
+                        derived_aliases.add(target.id)
+                        changed = True
+
+        def is_mapping_constructor(node: ast.Call) -> bool:
+            name = _call_name(node.func)
+            if name == "from_mapping":
+                return False
+            lowered = name.lower()
+            return bool(
+                name == "dict"
+                or name[:1].isupper()
+                or lowered.endswith(("dict", "mapping", "map"))
+            )
+
         def key_value(node: ast.AST) -> str | None:
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 return node.value
@@ -808,6 +862,23 @@ def _removed_ingress_result_reads(
                         violations.append(
                             (filename, keyword.value.lineno, "**ingress_result")
                         )
+                if (
+                    is_mapping_constructor(node)
+                    and any(
+                        is_ingress_derived(argument)
+                        for argument in [
+                            *node.args,
+                            *(keyword.value for keyword in node.keywords),
+                        ]
+                    )
+                ):
+                    violations.append(
+                        (
+                            filename,
+                            node.lineno,
+                            "ingress-derived mapping constructor input",
+                        )
+                    )
                 if (
                     _call_name(node.func) == "dict"
                     and node.args
@@ -1030,6 +1101,52 @@ def test_ingress_result_guard_rejects_items_reconstruction() -> None:
 def consumer():
     result = command_reply({})
     return dict(result.items())
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_aliased_items_view() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    pairs = result.items()
+    plain = dict(pairs)
+    return plain.get("disposition", "terminal_accepted")
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_zipped_mapping_views() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    return dict(zip(result.keys(), result.values()))
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_userdict_wrapper() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    return collections.UserDict(result)
+"""
+    )
+    assert violations
+
+
+def test_ingress_result_guard_rejects_chainmap_wrapper() -> None:
+    violations = _removed_ingress_result_reads(
+        """
+def consumer():
+    result = command_reply({})
+    return collections.ChainMap(result)
 """
     )
     assert violations

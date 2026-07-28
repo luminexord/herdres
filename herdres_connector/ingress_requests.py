@@ -205,9 +205,11 @@ class IngressResult(dict[str, Any]):
     This subtype is one layer of two, alongside the repository AST invariant;
     neither is the durable non-dict boundary planned in issue #203. Ordinary
     dict reconstruction, unpacking, unions, ``dict``'s unbound methods, and
-    serialize/reparse cycles can erase the subtype. The invariant rejects those
-    forms in repository code, but deliberate dynamic evaluation, aliased
-    builtins, native extensions, and third-party reconstruction remain outside
+    serialize/reparse cycles can erase the subtype. The invariant rejects
+    repository code that feeds a result or any derived mapping view into a
+    recognizable mapping constructor. Deliberate dynamic evaluation, aliased
+    builtins or constructors, native extensions, and opaque third-party
+    factories whose mapping behavior is not visible in the AST remain outside
     its static coverage. Process boundaries must use ``to_wire_dict`` and
     ``from_mapping`` explicitly.
     """
