@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import signal
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -136,6 +137,25 @@ def test_pending_lane_is_spool_eligible_even_while_its_head_is_processing(
     assert snapshot.eligible_lane_count == 1
     assert snapshot.claimable_lane_count == 0
     assert snapshot.first_claimable_lane == ""
+
+
+def test_existing_spool_backfills_state_transition_clock(tmp_path) -> None:
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
+    _enqueue(
+        spool,
+        _update(2, 77, "pre-migration"),
+        "77",
+        first_seen_at=1_000.0,
+    )
+    with sqlite3.connect(spool_path) as connection:
+        connection.execute("ALTER TABLE lane_items DROP COLUMN state_since")
+
+    migrated = IngressLaneSpool(spool_path)
+    rows = migrated.rows()
+
+    assert len(rows) == 1
+    assert rows[0]["state_since"] == rows[0]["updated_at"] == 1_000.0
 
 
 def test_bounded_hold_terminalizes_before_follower_and_preserves_fifo(
@@ -315,6 +335,84 @@ def test_stalled_lane_is_a_structured_doctor_signal(tmp_path, monkeypatch) -> No
     assert signal["stalled_lanes"] == 1
     assert signal["first_stalled_lane"] == lane_key("manager", "77")
     assert signal["oldest_stalled_seconds"] == 5.0
+
+
+def test_stall_age_tracks_continuous_head_obstruction_and_clears_on_drain(
+    tmp_path, monkeypatch
+) -> None:
+    """Old followers do not age a lane before its current head obstructs it."""
+
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
+    follower_age_started = 1_000.0
+    obstruction_started = 2_000.0
+    _enqueue(
+        spool,
+        _update(12, 77, "old head"),
+        "77",
+        first_seen_at=follower_age_started,
+        deadline_at=follower_age_started + 86_400,
+    )
+    _enqueue(
+        spool,
+        _update(13, 77, "old follower"),
+        "77",
+        first_seen_at=follower_age_started,
+        deadline_at=follower_age_started + 86_400,
+    )
+
+    head = spool.claim("worker", now=obstruction_started, lease_seconds=30)
+    assert head is not None
+    healthy = doctor.inbound_lanes(
+        spool_path,
+        now=obstruction_started + 0.001,
+        stall_after_seconds=5,
+    )
+    assert healthy["ok"] is True
+    assert healthy["signal"] == ""
+    assert healthy["pending"] == 1
+    assert healthy["claimable"] == 0
+    assert healthy["stalled_lanes"] == 0
+
+    # Lease heartbeats preserve the original processing transition time.
+    assert spool.renew_lease(
+        head.seq,
+        "worker",
+        lease_seconds=30,
+        now=obstruction_started + 4,
+    )
+    stalled = doctor.inbound_lanes(
+        spool_path,
+        now=obstruction_started + 5,
+        stall_after_seconds=5,
+    )
+    assert stalled["ok"] is False
+    assert stalled["signal"] == "inbound_lane_stalled"
+    assert stalled["oldest_stalled_seconds"] == 5.0
+
+    assert spool.mark_done(head.seq, "worker", now=obstruction_started + 5.1)
+    follower = spool.claim(
+        "worker",
+        now=obstruction_started + 5.1,
+        lease_seconds=30,
+    )
+    assert follower is not None
+    assert spool.mark_done(
+        follower.seq,
+        "worker",
+        now=obstruction_started + 5.2,
+    )
+    drained = doctor.inbound_lanes(
+        spool_path,
+        now=obstruction_started + 6,
+        stall_after_seconds=5,
+    )
+    assert drained["ok"] is True
+    assert drained["signal"] == ""
+    assert drained["pending"] == 0
+    assert drained["stalled_lanes"] == 0
+    assert drained["oldest_stalled_seconds"] == 0.0
 
 
 def test_busy_lane_does_not_delay_another_agent_under_two_seconds(
@@ -613,20 +711,44 @@ def test_poison_head_quarantines_visibly_without_delaying_other_lane(
     dispatcher = herdres_gateway._InboundLaneDispatcher(
         spool, REQUEST_ID_KEY, workers=2, backoff_seconds=0.05, lease_seconds=2
     )
+
+    def durable_spool_outcomes() -> bool:
+        states = {row["update_id"]: row["state"] for row in spool.rows()}
+        return states.get(30) in {"blocked", "done"} and states.get(31) == "blocked"
+
     dispatcher.update_specs([("manager", "token", 0)])
     dispatcher.start()
     try:
-        _wait_for(lambda: all(row["state"] == "blocked" for row in spool.rows()))
+        _wait_for(durable_spool_outcomes)
     finally:
         dispatcher.stop()
 
-    assert next(at for worker, at in backend_events if worker == "worker-b")
+    backend_workers = [worker for worker, _at in backend_events]
+    assert set(backend_workers) == {"worker-a", "worker-b"}
+    assert backend_workers.count("worker-b") == 1
     assert notices == []
     records = state.load_state()[ingress_requests.RECORDS_KEY]
     poison = records[_request_id(_update(30, 77, "poison A"))]
+    healthy = records[_request_id(_update(31, 88, "healthy B"))]
     assert poison["state"] == "quarantined"
     assert poison["terminal_outcome"] == "not_delivered"
     assert poison["operator_attention_required"] is True
+    assert poison["outcome"]["checkpoint"] == "hold"
+    assert healthy["state"] == "terminal"
+    assert healthy["request_phase"] == "accepted_unverified"
+    assert healthy["transport_disposition"] == "written_to_pty"
+    assert healthy["terminal_outcome"] == "delivery_unknown"
+    assert healthy["outcome"]["checkpoint"] == "hold"
+
+    rows = {row["update_id"]: row for row in spool.rows()}
+    assert rows[30]["state"] in {"blocked", "done"}
+    assert rows[30]["next_attempt_at"] == rows[30]["deadline_at"]
+    assert rows[30]["lease_owner"] is None
+    assert rows[30]["lease_until"] is None
+    assert rows[31]["state"] == "blocked"
+    assert rows[31]["next_attempt_at"] > rows[31]["first_seen_at"]
+    assert rows[31]["lease_owner"] is None
+    assert rows[31]["lease_until"] is None
 
 
 def test_lane_overflow_notifies_once_and_advances_cursor(tmp_path, monkeypatch) -> None:
