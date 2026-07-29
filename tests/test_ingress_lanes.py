@@ -171,6 +171,57 @@ def _prior_enqueue_shape(
     return int(inserted.lastrowid or 0), int(cursor[0])
 
 
+def _prior_retry_shape(
+    spool_path: Path,
+    seq: int,
+    lease_owner: str,
+    *,
+    now: float,
+    backoff_seconds: float,
+) -> None:
+    """Retry with the exact pre-retry_obstructed_since UPDATE shape."""
+
+    with sqlite3.connect(spool_path, isolation_level=None) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                """
+                SELECT attempts, deadline_at FROM lane_items
+                WHERE seq = ? AND state = 'processing' AND lease_owner = ?
+                """,
+                (seq, lease_owner),
+            ).fetchone()
+            assert row is not None
+            attempts = int(row[0]) + 1
+            delay = min(
+                300.0,
+                backoff_seconds * (2 ** min(attempts - 1, 16)),
+            )
+            next_attempt = min(now + delay, float(row[1]))
+            changed = connection.execute(
+                """
+                UPDATE lane_items
+                SET state = 'pending', attempts = ?, next_attempt_at = ?,
+                    lease_owner = NULL, lease_until = NULL,
+                    state_since = ?, updated_at = ?
+                WHERE seq = ? AND state = 'processing' AND lease_owner = ?
+                """,
+                (
+                    attempts,
+                    next_attempt,
+                    now,
+                    now,
+                    seq,
+                    lease_owner,
+                ),
+            ).rowcount
+            assert changed == 1
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+
 def _wait_for(predicate, timeout: float = 3.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -530,6 +581,93 @@ def test_successive_retries_preserve_continuous_obstruction_clock(
     assert obstructed["oldest_retry_obstructed_seconds"] == 5.0
     assert obstructed["stalled_lanes"] == 0
     assert _healthy_or_stalled(obstructed) == "stalled"
+
+
+def test_mixed_version_retry_clock_survives_current_claim_and_retry(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
+    _enqueue(
+        spool,
+        _update(60, 77, "rollback retry head"),
+        "77",
+        first_seen_at=0.0,
+        deadline_at=1_000.0,
+    )
+    _enqueue(
+        spool,
+        _update(61, 77, "continuously starved follower"),
+        "77",
+        first_seen_at=0.0,
+        deadline_at=1_000.0,
+    )
+    rollback_head = spool.claim(
+        "rollback-worker",
+        now=0.0,
+        lease_seconds=30.0,
+    )
+    assert rollback_head is not None
+    _prior_retry_shape(
+        spool_path,
+        rollback_head.seq,
+        "rollback-worker",
+        now=0.0,
+        backoff_seconds=10.0,
+    )
+    rollback_row = spool.rows()[0]
+    assert rollback_row["attempts"] == 1
+    assert rollback_row["updated_at"] == 0.0
+    assert rollback_row["retry_obstructed_since"] is None
+
+    fallback = doctor.inbound_lanes(
+        spool_path,
+        now=9.999,
+        stall_after_seconds=5.0,
+    )
+    assert fallback["ok"] is False
+    assert fallback["signal"] == "inbound_lane_retry_obstructed"
+    assert fallback["oldest_retry_obstructed_seconds"] == 9.999
+
+    current_head = spool.claim(
+        "current-worker",
+        now=10.0,
+        lease_seconds=30.0,
+    )
+    assert current_head is not None
+    claimed_row = spool.rows()[0]
+    assert claimed_row["state"] == "processing"
+    assert claimed_row["updated_at"] == 10.0
+    assert claimed_row["retry_obstructed_since"] == 0.0
+    during_claim = doctor.inbound_lanes(
+        spool_path,
+        now=10.0,
+        stall_after_seconds=5.0,
+    )
+    assert during_claim["ok"] is False
+    assert during_claim["signal"] == "inbound_lane_retry_obstructed"
+    assert during_claim["oldest_retry_obstructed_seconds"] == 10.0
+
+    assert spool.retry(
+        current_head.seq,
+        "current-worker",
+        now=10.0,
+        backoff_seconds=10.0,
+    )
+    retried_row = spool.rows()[0]
+    assert retried_row["state"] == "pending"
+    assert retried_row["updated_at"] == 10.0
+    assert retried_row["retry_obstructed_since"] == 0.0
+    after_retry = doctor.inbound_lanes(
+        spool_path,
+        now=14.999,
+        stall_after_seconds=5.0,
+    )
+    assert after_retry["ok"] is False
+    assert after_retry["signal"] == "inbound_lane_retry_obstructed"
+    assert after_retry["oldest_retry_obstructed_seconds"] == 14.999
+    assert _healthy_or_stalled(after_retry) == "stalled"
 
 
 def test_migrated_spool_remains_writable_by_prior_release(tmp_path) -> None:

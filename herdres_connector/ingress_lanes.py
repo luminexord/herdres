@@ -506,17 +506,33 @@ class IngressLaneSpool:
                     connection.commit()
                     return None
                 lease_until = timestamp + max(0.1, float(lease_seconds))
+                # A rollback writer cannot populate the durable retry clock.
+                # Promote its pre-claim updated_at before this UPDATE replaces
+                # that read-only fallback with the claim timestamp.
+                retry_obstructed_since = (
+                    float(row["retry_obstructed_since"])
+                    if row["retry_obstructed_since"] is not None
+                    else (
+                        float(row["updated_at"])
+                        if int(row["attempts"]) > 0
+                        else None
+                    )
+                )
                 changed = connection.execute(
                     """
                     UPDATE lane_items
                     SET state = 'processing', lease_owner = ?, lease_until = ?,
-                        state_since = ?, updated_at = ?
+                        state_since = ?,
+                        retry_obstructed_since =
+                            COALESCE(retry_obstructed_since, ?),
+                        updated_at = ?
                     WHERE seq = ? AND state = 'pending'
                     """,
                     (
                         str(lease_owner),
                         lease_until,
                         timestamp,
+                        retry_obstructed_since,
                         timestamp,
                         int(row["seq"]),
                     ),
