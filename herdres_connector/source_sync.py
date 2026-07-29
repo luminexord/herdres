@@ -199,6 +199,178 @@ _ADAPTER_PROVIDER_CAPABILITIES = frozenset(
     }
 )
 
+_TELEGRAM_RATE_LIMIT_MAX_RETRIES = 1
+_TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS = 15
+_TELEGRAM_RATE_LIMIT_EVENT_LIMIT = 64
+_PROVIDER_BACKPRESSURE_KEY = "_herdres_backpressure_events"
+_TELEGRAM_NO_RETRY_CAPABILITIES = frozenset(
+    {
+        "telegram.send_feed_item",
+        "telegram.send_message",
+        "telegram.send_photo",
+        "telegram.send_turn_delivery_part",
+        "telegram.send_voice",
+        "telegram.send_voice_batch",
+    }
+)
+_TELEGRAM_DEDICATED_BACKPRESSURE_CAPABILITIES = frozenset(
+    {
+        "telegram.close_topic_for_cleanup",
+        "telegram.delete_topic_for_cleanup",
+        "telegram.reopen_topic_for_cleanup",
+    }
+)
+_TELEGRAM_API_METHOD_BY_CAPABILITY = {
+    "telegram.answer_callback_query": "answerCallbackQuery",
+    "telegram.close_topic": "closeForumTopic",
+    "telegram.close_topic_for_cleanup": "closeForumTopic",
+    "telegram.create_topic": "createForumTopic",
+    "telegram.delete_message": "deleteMessage",
+    "telegram.delete_topic": "deleteForumTopic",
+    "telegram.delete_topic_for_cleanup": "deleteForumTopic",
+    "telegram.delete_turn_delivery_message": "deleteMessage",
+    "telegram.edit_feed_item": "editMessageText",
+    "telegram.edit_message": "editMessageText",
+    "telegram.edit_message_reply_markup": "editMessageReplyMarkup",
+    "telegram.edit_topic_icon": "editForumTopic",
+    "telegram.edit_turn_delivery_part": "editMessageText",
+    "telegram.pin_message": "pinChatMessage",
+    "telegram.rename_topic": "editForumTopic",
+    "telegram.reopen_topic": "reopenForumTopic",
+    "telegram.reopen_topic_for_cleanup": "reopenForumTopic",
+    "telegram.send_feed_item": "sendMessage",
+    "telegram.send_message": "sendMessage",
+    "telegram.send_photo": "sendPhoto",
+    "telegram.send_turn_delivery_part": "sendMessage",
+    "telegram.send_voice": "sendVoice",
+    "telegram.send_voice_batch": "sendVoice",
+}
+
+
+def _telegram_rate_limit_from_result(
+    result: Any,
+) -> tuple[int, str, str] | None:
+    if not isinstance(result, dict) or result.get("rate_limited") is not True:
+        return None
+    try:
+        retry_after = max(1, int(result.get("retry_after") or 1))
+    except (TypeError, ValueError):
+        retry_after = 1
+    return (
+        retry_after,
+        compact_ws(result.get("error"), 300)
+        or "Telegram rate limited",
+        str(result.get("method") or ""),
+    )
+
+
+def _telegram_rate_limit_failure(
+    *,
+    status: str,
+    error: str,
+    method: str,
+    retry_after: int,
+    retries: int,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": status,
+        "error": compact_ws(error, 300),
+        "rate_limited": True,
+        "retry_after": retry_after,
+        "method": method,
+        "retry_attempts": retries,
+        "retry_exhausted": status == "telegram_rate_limit_exhausted",
+        _PROVIDER_BACKPRESSURE_KEY: events,
+    }
+
+
+def _record_telegram_backpressure(
+    store: dict[str, Any],
+    result: Any,
+) -> Any:
+    """Absorb executor telemetry into bounded operator-readable state."""
+
+    if not isinstance(result, dict):
+        return result
+    events = result.pop(_PROVIDER_BACKPRESSURE_KEY, None)
+    if not isinstance(events, list) or not events:
+        return result
+    telegram = _telegram_state(store)
+    backpressure = telegram.get("rate_limit_backpressure")
+    if not isinstance(backpressure, dict):
+        backpressure = {"sequence": 0, "events": []}
+        telegram["rate_limit_backpressure"] = backpressure
+    existing = backpressure.get("events")
+    if not isinstance(existing, list):
+        existing = []
+    for raw in events:
+        if not isinstance(raw, dict):
+            continue
+        sequence = int(backpressure.get("sequence") or 0) + 1
+        backpressure["sequence"] = sequence
+        existing.append(
+            {
+                "sequence": sequence,
+                "observed_at": float(raw.get("observed_at") or time.time()),
+                "method": compact_ws(raw.get("method"), 80),
+                "capability": compact_ws(raw.get("capability"), 120),
+                "retry_after": int(raw.get("retry_after") or 1),
+                "observed_wait_seconds": float(
+                    raw.get("observed_wait_seconds") or 0
+                ),
+                "outcome": compact_ws(raw.get("outcome"), 80),
+            }
+        )
+    backpressure["events"] = existing[-_TELEGRAM_RATE_LIMIT_EVENT_LIMIT:]
+    backpressure["last"] = deepcopy(backpressure["events"][-1])
+    return result
+
+
+def _telegram_backpressure_sequence(store: dict[str, Any]) -> int:
+    telegram = store.get("telegram")
+    if not isinstance(telegram, dict):
+        return 0
+    backpressure = telegram.get("rate_limit_backpressure")
+    if not isinstance(backpressure, dict):
+        return 0
+    try:
+        return max(0, int(backpressure.get("sequence") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _telegram_backpressure_since(
+    store: dict[str, Any],
+    sequence: int,
+) -> dict[str, Any]:
+    telegram = store.get("telegram")
+    backpressure = (
+        telegram.get("rate_limit_backpressure")
+        if isinstance(telegram, dict)
+        else None
+    )
+    events = (
+        backpressure.get("events")
+        if isinstance(backpressure, dict)
+        and isinstance(backpressure.get("events"), list)
+        else []
+    )
+    current = _telegram_backpressure_sequence(store)
+    return {
+        "count": max(0, current - sequence),
+        "events": [
+            deepcopy(event)
+            for event in events
+            if isinstance(event, dict)
+            and int(event.get("sequence") or 0) > sequence
+        ],
+        "max_retries": _TELEGRAM_RATE_LIMIT_MAX_RETRIES,
+        "max_wait_seconds": _TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS,
+    }
+
+
 def _provider_mutation(
     capability: str,
     *,
@@ -722,11 +894,6 @@ def _build_offlock_executor() -> Any:
     def invoke_provider_mutation(
         provider: Any, mutation: _ProviderMutation
     ) -> Any:
-        if mutation in consumed:
-            raise RuntimeError(
-                "provider mutation capability was already consumed"
-            )
-        consumed.add(mutation)
         if mutation.api_token:
             provider = provider.with_token(mutation.api_token)
         args = mutation.args
@@ -798,6 +965,103 @@ def _build_offlock_executor() -> Any:
             "unhandled provider mutation capability: "
             f"{mutation.capability}"
         )
+
+    def invoke_provider_mutation_with_backpressure(
+        provider: Any, mutation: _ProviderMutation
+    ) -> Any:
+        """Consume one capability with bounded Telegram backpressure.
+
+        A capability is single-use from the caller's perspective, but grants
+        the executor one bounded replay for non-message Telegram operations.
+        Message-producing calls are never replayed because their 429 response
+        is not a receiver-side idempotency witness.
+        """
+
+        if mutation in consumed:
+            raise RuntimeError(
+                "provider mutation capability was already consumed"
+            )
+        consumed.add(mutation)
+        if not mutation.capability.startswith("telegram."):
+            return invoke_provider_mutation(provider, mutation)
+        if (
+            mutation.capability
+            in _TELEGRAM_DEDICATED_BACKPRESSURE_CAPABILITIES
+        ):
+            # Topic lifecycle cleanup already persists retry_after per exact
+            # target and skips it until due. Preserve that specialized
+            # cooldown instead of layering an immediate retry over it.
+            return invoke_provider_mutation(provider, mutation)
+
+        retries = 0
+        events: list[dict[str, Any]] = []
+        default_method = _TELEGRAM_API_METHOD_BY_CAPABILITY.get(
+            mutation.capability,
+            mutation.capability.removeprefix("telegram."),
+        )
+        while True:
+            try:
+                result = invoke_provider_mutation(provider, mutation)
+                rate_limit = _telegram_rate_limit_from_result(result)
+                if rate_limit is None:
+                    if events and isinstance(result, dict):
+                        events[-1]["outcome"] = "recovered"
+                        result = dict(result)
+                        result[_PROVIDER_BACKPRESSURE_KEY] = events
+                    return result
+                retry_after, error, result_method = rate_limit
+                method = result_method or default_method
+            except RateLimited as exc:
+                retry_after = exc.retry_after
+                error = compact_ws(str(exc), 300)
+                method = str(exc.method or default_method)
+
+            event = {
+                "observed_at": time.time(),
+                "method": method,
+                "capability": mutation.capability,
+                "retry_after": retry_after,
+                "observed_wait_seconds": 0.0,
+                "outcome": "",
+            }
+            events.append(event)
+            if mutation.capability in _TELEGRAM_NO_RETRY_CAPABILITIES:
+                event["outcome"] = "not_retried_message_send"
+                return _telegram_rate_limit_failure(
+                    status="telegram_rate_limited",
+                    error=error,
+                    method=method,
+                    retry_after=retry_after,
+                    retries=retries,
+                    events=events,
+                )
+            if retries >= _TELEGRAM_RATE_LIMIT_MAX_RETRIES:
+                event["outcome"] = "retry_exhausted"
+                return _telegram_rate_limit_failure(
+                    status="telegram_rate_limit_exhausted",
+                    error=error,
+                    method=method,
+                    retry_after=retry_after,
+                    retries=retries,
+                    events=events,
+                )
+            if retry_after > _TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS:
+                event["outcome"] = "wait_exceeds_ceiling"
+                return _telegram_rate_limit_failure(
+                    status="telegram_rate_limit_wait_exceeds_ceiling",
+                    error=error,
+                    method=method,
+                    retry_after=retry_after,
+                    retries=retries,
+                    events=events,
+                )
+            started = time.monotonic()
+            time.sleep(retry_after)
+            event["observed_wait_seconds"] = max(
+                0.0, time.monotonic() - started
+            )
+            event["outcome"] = "retrying"
+            retries += 1
 
     def invoke_offlock(
         client: _OfflockClient, call: Callable[[Any], Any]
@@ -878,18 +1142,22 @@ def _build_offlock_executor() -> Any:
         def mutation(
             client: _OfflockClient, mutation: _ProviderMutation
         ) -> Any:
-            return invoke_offlock(
+            result = invoke_offlock(
                 client,
-                lambda provider: invoke_provider_mutation(
+                lambda provider: invoke_provider_mutation_with_backpressure(
                     provider, mutation
                 ),
             )
+            _provider, store, _kind = internals(client)
+            return _record_telegram_backpressure(store, result)
 
         @staticmethod
         def direct(
             provider: Any, mutation: _ProviderMutation
         ) -> Any:
-            return invoke_provider_mutation(provider, mutation)
+            return invoke_provider_mutation_with_backpressure(
+                provider, mutation
+            )
 
     return Executor()
 
@@ -982,6 +1250,7 @@ def _execute_entry_operation(
             store.update(fresh)
     else:
         result = _OFFLOCK_EXECUTOR.direct(client, mutation)
+    result = _record_telegram_backpressure(store, result)
     _apply_provider_capability_state(store, result)
     if acceptance_checkpoint is not None:
         acceptance_checkpoint(result, operation)
@@ -1015,10 +1284,12 @@ def _execute_exact_provider_operation(
             fresh = state.load_state()
             store.clear()
             store.update(fresh)
+        result = _record_telegram_backpressure(store, result)
         _apply_provider_capability_state(store, result)
         return result
     result = _OFFLOCK_EXECUTOR.direct(client, mutation)
     if store is not None:
+        result = _record_telegram_backpressure(store, result)
         _apply_provider_capability_state(store, result)
     return result
 
@@ -4916,6 +5187,32 @@ def _execute_topic_cleanup_targets(
             )
             response = execution.result
         except RateLimited as exc:
+            method = str(
+                exc.method
+                or _TELEGRAM_API_METHOD_BY_CAPABILITY.get(
+                    capability, capability
+                )
+            )
+            _record_telegram_backpressure(
+                store,
+                _telegram_rate_limit_failure(
+                    status="telegram_rate_limited",
+                    error=str(exc),
+                    method=method,
+                    retry_after=exc.retry_after,
+                    retries=0,
+                    events=[
+                        {
+                            "observed_at": time.time(),
+                            "method": method,
+                            "capability": capability,
+                            "retry_after": exc.retry_after,
+                            "observed_wait_seconds": 0.0,
+                            "outcome": "dedicated_cooldown",
+                        }
+                    ],
+                ),
+            )
             outcomes.append(
                 {
                     "target": target,
@@ -4927,11 +5224,38 @@ def _execute_topic_cleanup_targets(
             )
             return outcomes, len(targets) - index - 1
         if response.get("rate_limited"):
+            method = str(
+                response.get("method")
+                or _TELEGRAM_API_METHOD_BY_CAPABILITY.get(
+                    capability, capability
+                )
+            )
+            retry_after = int(response.get("retry_after") or 1)
+            _record_telegram_backpressure(
+                store,
+                _telegram_rate_limit_failure(
+                    status="telegram_rate_limited",
+                    error=str(response.get("error") or ""),
+                    method=method,
+                    retry_after=retry_after,
+                    retries=0,
+                    events=[
+                        {
+                            "observed_at": time.time(),
+                            "method": method,
+                            "capability": capability,
+                            "retry_after": retry_after,
+                            "observed_wait_seconds": 0.0,
+                            "outcome": "dedicated_cooldown",
+                        }
+                    ],
+                ),
+            )
             outcomes.append(
                 {
                     "target": target,
                     "status": "rate_limited",
-                    "retry_after": response.get("retry_after") or 1,
+                    "retry_after": retry_after,
                     "received_at": time.time(),
                     "error": compact_ws(response.get("error"), 240),
                 }
@@ -7964,10 +8288,23 @@ def _fail_turn_final(
 
 
 def _telegram_result_is_transient(result: dict[str, Any]) -> bool:
+    if result.get("rate_limited") is True:
+        return True
     if str(result.get("kind") or "") == "transient":
         return True
     error = str(result.get("error") or "").lower()
     return any(marker in error for marker in ("rate limit", "too many requests", "retry after"))
+
+
+def _telegram_result_retry_after(
+    result: dict[str, Any],
+    *,
+    default: int = 1,
+) -> int:
+    try:
+        return max(1, int(result.get("retry_after") or default))
+    except (TypeError, ValueError):
+        return max(1, int(default))
 
 
 def _defer_turn_final(
@@ -9485,7 +9822,9 @@ def _drain_turn_final(
                             result,
                             store,
                             job_key,
-                            delay_seconds=1,
+                            delay_seconds=_telegram_result_retry_after(
+                                deleted
+                            ),
                         )
                     else:
                         _fail_turn_final(
@@ -9610,7 +9949,9 @@ def _drain_turn_final(
                         result,
                         store,
                         job_key,
-                        delay_seconds=1,
+                        delay_seconds=_telegram_result_retry_after(
+                            applied
+                        ),
                     )
                     break
                 retry_as_send = (
@@ -9747,7 +10088,9 @@ def _drain_turn_final(
                             result,
                             store,
                             job_key,
-                            delay_seconds=1,
+                            delay_seconds=_telegram_result_retry_after(
+                                applied
+                            ),
                         )
                     else:
                         _fail_turn_final(
@@ -9944,7 +10287,9 @@ def _drain_turn_final(
                             result,
                             store,
                             job_key,
-                            delay_seconds=1,
+                            delay_seconds=_telegram_result_retry_after(
+                                retired
+                            ),
                         )
                     else:
                         _fail_turn_final(
@@ -10082,7 +10427,9 @@ def _drain_turn_final(
                         result,
                         store,
                         job_key,
-                        delay_seconds=1,
+                        delay_seconds=_telegram_result_retry_after(
+                            retired
+                        ),
                     )
                 else:
                     _fail_turn_final(
@@ -11686,6 +12033,7 @@ def drain_outbound_once(
     This path deliberately performs no snapshot, pending, topic, or pane scan.
     """
 
+    backpressure_sequence = _telegram_backpressure_sequence(store)
     effective_runtime = _offlock_runtime(store, runtime)
     operation_limit = max(
         1,
@@ -11732,19 +12080,25 @@ def drain_outbound_once(
         dry_run=effective_runtime.dry_run,
         ack_barrier_persists_state=True,
     )
+    telegram_backpressure = _telegram_backpressure_since(
+        store, backpressure_sequence
+    )
     return {
         "ok": True,
         "changed": bool(
             turn_final_result.get("changed")
             or attention_result.get("changed")
+            or telegram_backpressure["count"]
         ),
         "tendwire_turn_final": turn_final_result,
         "tendwire_outbox": attention_result,
+        "telegram_backpressure": telegram_backpressure,
     }
 
 
 def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     config.require_source_mode()
+    backpressure_sequence = _telegram_backpressure_sequence(store)
     observed_at = time.time()
     with state.lock_phase("sync.observe"):
         observed = _observe_sync_inputs(store, runtime, now=observed_at)
@@ -12151,6 +12505,10 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 ack_barrier_persists_state=True,
             )
         changed = changed or bool(turn_final_result.get("changed")) or bool(outbox_result.get("changed"))
+    telegram_backpressure = _telegram_backpressure_since(
+        store, backpressure_sequence
+    )
+    changed = changed or bool(telegram_backpressure["count"])
     return {
         "ok": True,
         "changed": changed,
@@ -12180,4 +12538,5 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "remote_decisions": decision_result,
         "tendwire_turn_final": turn_final_result,
         "tendwire_outbox": outbox_result,
+        "telegram_backpressure": telegram_backpressure,
     }

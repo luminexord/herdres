@@ -23,9 +23,31 @@ class TelegramError(RuntimeError):
 
 
 class RateLimited(TelegramError):
-    def __init__(self, retry_after: int, message: str = "Telegram rate limited") -> None:
+    def __init__(
+        self,
+        retry_after: int,
+        message: str = "Telegram rate limited",
+        *,
+        method: str = "",
+    ) -> None:
         super().__init__(message)
         self.retry_after = max(1, int(retry_after or 1))
+        self.method = str(method or "")
+
+
+def _rate_limited_result(
+    error: RateLimited,
+    *,
+    method: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "telegram_rate_limited",
+        "error": sanitize_text(str(error), 300),
+        "rate_limited": True,
+        "retry_after": error.retry_after,
+        "method": str(error.method or method),
+    }
 
 
 MESSAGE_TEXT_LIMIT = 3900
@@ -122,7 +144,11 @@ class TelegramClient:
                 data = {}
             params = data.get("parameters") if isinstance(data.get("parameters"), dict) else {}
             if exc.code == 429:
-                raise RateLimited(int(params.get("retry_after") or 1), sanitize_text(data.get("description") or detail, 300)) from exc
+                raise RateLimited(
+                    int(params.get("retry_after") or 1),
+                    sanitize_text(data.get("description") or detail, 300),
+                    method=method,
+                ) from exc
             raise TelegramError(sanitize_text(data.get("description") or detail or str(exc), 300)) from exc
         except Exception as exc:  # noqa: BLE001
             raise TelegramError(sanitize_text(str(exc), 300)) from exc
@@ -131,6 +157,21 @@ class TelegramClient:
         except json.JSONDecodeError as exc:
             raise TelegramError("Telegram returned non-json response") from exc
         if not data.get("ok"):
+            params = (
+                data.get("parameters")
+                if isinstance(data.get("parameters"), dict)
+                else {}
+            )
+            if str(data.get("error_code") or "") == "429":
+                raise RateLimited(
+                    int(params.get("retry_after") or 1),
+                    sanitize_text(
+                        data.get("description")
+                        or "Telegram rate limited",
+                        300,
+                    ),
+                    method=method,
+                )
             raise TelegramError(sanitize_text(data.get("description") or "Telegram API error", 300))
         return data
 
@@ -263,7 +304,14 @@ class TelegramClient:
                 parsed = {}
             params = parsed.get("parameters") if isinstance(parsed.get("parameters"), dict) else {}
             if exc.code == 429:
-                raise RateLimited(int(params.get("retry_after") or 1), sanitize_text(parsed.get("description") or detail, 300)) from exc
+                raise RateLimited(
+                    int(params.get("retry_after") or 1),
+                    sanitize_text(
+                        parsed.get("description") or detail,
+                        300,
+                    ),
+                    method="sendVoice",
+                ) from exc
             raise TelegramError(sanitize_text(parsed.get("description") or detail or str(exc), 300)) from exc
         except Exception as exc:  # noqa: BLE001
             raise TelegramError(sanitize_text(str(exc), 300)) from exc
@@ -375,6 +423,8 @@ class TelegramClient:
         try:
             result = self.api("createForumTopic", payload).get("result") or {}
             return {"ok": True, "topic_id": str(result.get("message_thread_id") or "")}
+        except RateLimited as exc:
+            return _rate_limited_result(exc, method="createForumTopic")
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
@@ -382,6 +432,8 @@ class TelegramClient:
         try:
             self.api("editForumTopic", {"chat_id": chat_id, "message_thread_id": str(thread_id), "name": sanitize_text(name, 128)})
             return {"ok": True}
+        except RateLimited as exc:
+            return _rate_limited_result(exc, method="editForumTopic")
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
@@ -391,6 +443,8 @@ class TelegramClient:
         try:
             self.api("editForumTopic", {"chat_id": chat_id, "message_thread_id": str(thread_id), "icon_custom_emoji_id": emoji_id})
             return {"ok": True}
+        except RateLimited as exc:
+            return _rate_limited_result(exc, method="editForumTopic")
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
@@ -470,6 +524,8 @@ class TelegramClient:
         try:
             self.api("pinChatMessage", {"chat_id": chat_id, "message_id": str(message_id), "disable_notification": "true"})
             return {"ok": True}
+        except RateLimited as exc:
+            return _rate_limited_result(exc, method="pinChatMessage")
         except TelegramError as exc:
             return {"ok": False, "error": sanitize_text(str(exc), 300)}
 
