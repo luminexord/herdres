@@ -224,16 +224,22 @@ def test_speak_seam_chunks_long_reply_into_multiple_notes(monkeypatch):
     assert len(entry.get("voice_reply_message_ids") or []) == len(telegram.voice_notes)  # all recorded
 
 
-def test_speak_seam_retires_partial_batch_before_full_retry(
+def test_speak_seam_keeps_partial_batch_without_replay(
     tmp_path, monkeypatch
 ):
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(statepath)
+    )
     store, entry = _worker_store(
         monkeypatch, speak_next_reply=True
     )
+    entry_key = next(iter(store["panes"]))
+    state.save_state(store, statepath)
     monkeypatch.setattr(
         speech,
         "speech_reply_chunks",
-        lambda _text: ["first", "second", "must not run"],
+        lambda _text: ["first", "second", "third"],
     )
     monkeypatch.setattr(
         speech,
@@ -254,11 +260,10 @@ def test_speak_seam_retires_partial_batch_before_full_retry(
             super().__init__()
             self.attempts = 0
             self.next_id = 900
-            self.deleted_messages = []
 
         def send_voice(self, *args, **kwargs):
             self.attempts += 1
-            if self.attempts == 2:
+            if self.attempts == 3:
                 raise RateLimited(
                     5,
                     "Too Many Requests: retry after 5",
@@ -276,50 +281,56 @@ def test_speak_seam_retires_partial_batch_before_full_retry(
             )
             return {"ok": True, "message_id": message_id}
 
-        def delete_message(self, chat_id, message_id):
-            self.deleted_messages.append(
-                (str(chat_id), str(message_id))
-            )
-            self.voice_notes[:] = [
-                note
-                for note in self.voice_notes
-                if note[3] != str(message_id)
-            ]
-            return {"ok": True}
-
     telegram = PartialVoice()
     runtime = SyncRuntime(
         FakeTendwire(), telegram, with_outbox=False
     )
-    delivery_attempts = [0]
+    saves = 0
+    real_save_state = state.save_state
 
-    def deliver_once(*_args, **_kwargs):
-        delivery_attempts[0] += 1
-        return delivery_attempts[0] == 1
+    def counted_save_state(*args, **kwargs):
+        nonlocal saves
+        saves += 1
+        return real_save_state(*args, **kwargs)
 
-    monkeypatch.setattr(
-        source_sync, "_deliver_final", deliver_once
-    )
-    _run_turns(store, _final_item(), runtime)
+    monkeypatch.setattr(state, "save_state", counted_save_state)
+    with state.state_lock(path=statepath):
+        current = source_sync._speak_reply(
+            store,
+            _final_item(),
+            entry,
+            entry_key,
+            runtime,
+            chat_id="-100",
+            thread_id="77",
+            reply_to="42",
+        )
 
-    assert telegram.voice_notes == []
-    assert telegram.deleted_messages == [("-100", "900")]
-    assert entry["pending_voice_reply"]["status"] == "retry_ready"
-
-    # A later sync pass retries from chunk one even though the final text is
-    # already delivered; the owner never sees a proper subset of the batch.
-    _run_turns(store, _final_item(), runtime)
+    # Voice is strictly additive beneath the already-complete text reply.
+    # Keep the accepted prefix, stop on backpressure, and never create a
+    # distributed deletion/replay obligation for cosmetic incompleteness.
     assert [note[3] for note in telegram.voice_notes] == [
+        "900",
         "901",
-        "902",
-        "903",
     ]
-    assert entry["voice_reply_message_ids"] == [
+    assert current["voice_reply_message_ids"] == [
+        "900",
         "901",
-        "902",
-        "903",
     ]
-    assert "pending_voice_reply" not in entry
+    assert "pending_voice_reply" not in current
+    assert (
+        store.get("telegram", {}).get(
+            "accepted_notification_messages"
+        )
+        in (None, {})
+    )
+    assert saves == 1
+
+    # The one-shot speak flag was committed before the off-lock batch. Even
+    # if a later delivery branch reports success, it must not replay voice.
+    monkeypatch.setattr(
+        source_sync, "_deliver_final", lambda *_a, **_k: True
+    )
     attempts = telegram.attempts
     _run_turns(store, _final_item(), runtime)
     assert telegram.attempts == attempts

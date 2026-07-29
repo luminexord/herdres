@@ -556,7 +556,129 @@ def test_voice_batch_generic_telegram_error_stops_as_unknown(
         == "telegram_voice_batch_delivery_unknown"
     )
     assert result["accepted_message_ids"] == ["801"]
-    assert result["automatic_replay_authorized"] is False
+    assert "automatic_replay_authorized" not in result
+
+
+def test_voice_batch_respects_suppressed_rate_limit_context(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        source_sync.speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+    monkeypatch.setattr(
+        source_sync.speech,
+        "speech_request",
+        lambda _operation, payload: {
+            "ok": True,
+            "path": payload["dest"],
+        },
+    )
+
+    class SuppressedLimit:
+        def send_voice(self, *_args, **_kwargs):
+            try:
+                raise RateLimited(
+                    7,
+                    "Too Many Requests: retry after 7",
+                    method="sendVoice",
+                )
+            except RateLimited:
+                raise TelegramError("independent failure") from None
+
+    store = _store()
+    result = source_sync._execute_exact_provider_operation(
+        SuppressedLimit(),
+        store=store,
+        mutation=source_sync._provider_mutation(
+            "telegram.send_voice_batch",
+            reason=(
+                "telegram.send_voice_batch: suppressed context "
+                "must not be attributed"
+            ),
+            args=(
+                ("first", "must not run"),
+                "turn-1",
+                "-100",
+                "77",
+                "42",
+            ),
+        ),
+    )
+
+    assert (
+        result["status"]
+        == "telegram_voice_batch_delivery_unknown"
+    )
+    assert "rate_limited" not in result
+    assert (
+        store.get("telegram", {}).get(
+            "rate_limit_backpressure"
+        )
+        is None
+    )
+
+
+def test_voice_batch_rejects_unrelated_rate_limit_cause(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        source_sync.speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+    monkeypatch.setattr(
+        source_sync.speech,
+        "speech_request",
+        lambda _operation, payload: {
+            "ok": True,
+            "path": payload["dest"],
+        },
+    )
+
+    class UnrelatedLimit:
+        def send_voice(self, *_args, **_kwargs):
+            try:
+                raise RateLimited(
+                    8,
+                    "Too Many Requests: retry after 8",
+                    method="deleteMessage",
+                )
+            except RateLimited as cause:
+                raise TelegramError("wrapped transport error") from cause
+
+    store = _store()
+    result = source_sync._execute_exact_provider_operation(
+        UnrelatedLimit(),
+        store=store,
+        mutation=source_sync._provider_mutation(
+            "telegram.send_voice_batch",
+            reason=(
+                "telegram.send_voice_batch: unrelated capability "
+                "must not be attributed"
+            ),
+            args=(
+                ("first", "must not run"),
+                "turn-1",
+                "-100",
+                "77",
+                "42",
+            ),
+        ),
+    )
+
+    assert (
+        result["status"]
+        == "telegram_voice_batch_delivery_unknown"
+    )
+    assert "rate_limited" not in result
+    assert (
+        store.get("telegram", {}).get(
+            "rate_limit_backpressure"
+        )
+        is None
+    )
 
 
 def test_voice_batch_programming_error_surfaces_loudly(

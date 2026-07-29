@@ -265,16 +265,36 @@ def _telegram_rate_limit_from_result(
     )
 
 
-def _nested_rate_limit(error: BaseException) -> RateLimited | None:
-    """Find Telegram backpressure hidden by a transport wrapper."""
+def _nested_rate_limit(
+    error: BaseException,
+    *,
+    expected_method: str,
+) -> RateLimited | None:
+    """Find relevant Telegram backpressure hidden by a transport wrapper.
+
+    Explicit causes are authoritative.  Implicit context is only usable when
+    the wrapper did not suppress it with ``raise ... from None``.  A rate
+    limit from another Bot API method is unrelated to this operation and must
+    not be confidently misattributed.
+    """
 
     current: BaseException | None = error
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, RateLimited):
-            return current
-        current = current.__cause__ or current.__context__
+            method = str(current.method or "")
+            return (
+                current
+                if not method or method == expected_method
+                else None
+            )
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
     return None
 
 
@@ -287,7 +307,6 @@ def _telegram_rate_limit_failure(
     retries: int,
     events: list[dict[str, Any]],
     accepted_message_ids: tuple[str, ...] = (),
-    automatic_replay_authorized: bool | None = None,
 ) -> dict[str, Any]:
     result = {
         "ok": False,
@@ -303,10 +322,6 @@ def _telegram_rate_limit_failure(
     if accepted_message_ids:
         result["accepted_message_ids"] = list(
             accepted_message_ids
-        )
-    if automatic_replay_authorized is not None:
-        result["automatic_replay_authorized"] = bool(
-            automatic_replay_authorized
         )
     return result
 
@@ -975,7 +990,6 @@ def _build_offlock_executor() -> Any:
                             ),
                             "error": "voice synthesis failed",
                             "accepted_message_ids": ids,
-                            "automatic_replay_authorized": True,
                         }
                     sent = provider.send_voice(
                         chat_id,
@@ -998,7 +1012,6 @@ def _build_offlock_executor() -> Any:
                                 300,
                             ),
                             "accepted_message_ids": ids,
-                            "automatic_replay_authorized": True,
                         }
                     else:
                         return {
@@ -1011,7 +1024,6 @@ def _build_offlock_executor() -> Any:
                                 "an attributable message id"
                             ),
                             "accepted_message_ids": ids,
-                            "automatic_replay_authorized": False,
                         }
                 except RateLimited as exc:
                     return {
@@ -1022,10 +1034,11 @@ def _build_offlock_executor() -> Any:
                         "retry_after": exc.retry_after,
                         "method": str(exc.method or "sendVoice"),
                         "accepted_message_ids": ids,
-                        "automatic_replay_authorized": True,
                     }
                 except TelegramError as exc:
-                    nested = _nested_rate_limit(exc)
+                    nested = _nested_rate_limit(
+                        exc, expected_method="sendVoice"
+                    )
                     if nested is not None:
                         return {
                             "ok": False,
@@ -1039,7 +1052,6 @@ def _build_offlock_executor() -> Any:
                                 nested.method or "sendVoice"
                             ),
                             "accepted_message_ids": ids,
-                            "automatic_replay_authorized": True,
                         }
                     return {
                         "ok": False,
@@ -1048,18 +1060,16 @@ def _build_offlock_executor() -> Any:
                         ),
                         "error": compact_ws(str(exc), 300),
                         "accepted_message_ids": ids,
-                        "automatic_replay_authorized": False,
                     }
                 except OSError as exc:
-                    # Local filesystem failures occur before a provider send,
-                    # so they are known non-acceptance and safe to retry after
-                    # any earlier accepted prefix has been retired.
+                    # Local filesystem failures occur before this chunk's
+                    # provider send.  Stop the additive batch and retain any
+                    # already-accepted prefix without replaying it.
                     return {
                         "ok": False,
                         "status": "telegram_voice_batch_local_failure",
                         "error": compact_ws(str(exc), 300),
                         "accepted_message_ids": ids,
-                        "automatic_replay_authorized": True,
                     }
             return ids
         raise AssertionError(
@@ -1139,13 +1149,6 @@ def _build_offlock_executor() -> Any:
                 if isinstance(rate_limited_result, dict)
                 else ()
             )
-            automatic_replay_authorized = (
-                rate_limited_result.get(
-                    "automatic_replay_authorized"
-                )
-                if isinstance(rate_limited_result, dict)
-                else None
-            )
             if mutation.capability in _TELEGRAM_NO_RETRY_CAPABILITIES:
                 event["outcome"] = "not_retried_message_send"
                 return _telegram_rate_limit_failure(
@@ -1156,13 +1159,6 @@ def _build_offlock_executor() -> Any:
                     retries=retries,
                     events=events,
                     accepted_message_ids=accepted_message_ids,
-                    automatic_replay_authorized=(
-                        automatic_replay_authorized
-                        if isinstance(
-                            automatic_replay_authorized, bool
-                        )
-                        else None
-                    ),
                 )
             if retries >= _TELEGRAM_RATE_LIMIT_MAX_RETRIES:
                 event["outcome"] = "retry_exhausted"
@@ -6257,132 +6253,6 @@ def _refind_entry(store: dict[str, Any], entry_key: str | None) -> dict[str, Any
     return None
 
 
-def _record_partial_voice_retirements(
-    store: dict[str, Any],
-    operation: _OfflockEntryOperation,
-    voice_ids: list[str],
-    *,
-    turn_id: str,
-    bot_kind: str,
-) -> list[str]:
-    """Record exact accepted-prefix ids until every one is deleted."""
-
-    records = _accepted_notification_messages(store, create=True)
-    binding_entry = _operation_binding_entry(operation)
-    receipt_ids: list[str] = []
-    for voice_id in voice_ids:
-        record = {
-            "kind": "voice_partial",
-            "topic_id": operation.route_topic_id,
-            "message_id": voice_id,
-            "bot_kind": bot_kind,
-            "provenance": _operation_provenance(operation),
-            "turn_id": turn_id,
-        }
-        receipt_id = short_hash(record, 32)
-        records.setdefault(receipt_id, record)
-        receipt_ids.append(receipt_id)
-        state.bind_message_to_worker(
-            store,
-            voice_id,
-            binding_entry,
-            topic_id=operation.route_topic_id,
-            kind="voice_partial",
-            turn_id=turn_id,
-            bot_kind=bot_kind,
-        )
-        binding = state.find_message_binding(store, voice_id)
-        if binding is not None:
-            binding["provider_fact"] = "accepted_voice_partial"
-            binding["cleanup_status"] = "pending"
-    return receipt_ids
-
-
-def _retire_partial_voice_prefix(
-    store: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    receipt_ids: list[str],
-    api_token: str | None,
-) -> list[str]:
-    """Delete known accepted prefix ids; retain failed exact obligations."""
-
-    records = _accepted_notification_messages(store, create=False)
-    for receipt_id in receipt_ids:
-        record = records.get(receipt_id)
-        if not isinstance(record, dict):
-            continue
-        message_id = str(record.get("message_id") or "")
-        deleted = _execute_exact_provider_operation(
-            runtime.telegram,
-            store=store,
-            mutation=_provider_mutation(
-                "telegram.delete_message",
-                reason=(
-                    "telegram.delete_message: retire incomplete "
-                    "voice reply prefix"
-                ),
-                args=(chat_id, message_id),
-                api_token=api_token,
-            ),
-        )
-        if (
-            deleted.get("ok") is True
-            or classify_telegram_error(deleted.get("error"))
-            == "not_found"
-        ):
-            _retire_local_message(store, None, message_id)
-            _complete_accepted_notification(store, receipt_id)
-            continue
-        current = _accepted_notification_messages(
-            store, create=False
-        ).get(receipt_id)
-        if isinstance(current, dict):
-            current["cleanup_status"] = str(
-                deleted.get("status") or "delete_failed"
-            )
-            current["cleanup_error"] = compact_ws(
-                deleted.get("error"), 300
-            )
-    current_records = _accepted_notification_messages(
-        store, create=False
-    )
-    return [
-        receipt_id
-        for receipt_id in receipt_ids
-        if receipt_id in current_records
-    ]
-
-
-def _pending_voice_reply_ready(
-    store: dict[str, Any],
-    entry: dict[str, Any],
-    item: dict[str, Any],
-) -> bool:
-    pending = entry.get("pending_voice_reply")
-    if not isinstance(pending, dict):
-        return False
-    if str(pending.get("turn_id") or "") != _turn_id(item):
-        return False
-    if pending.get("automatic_replay_authorized") is not True:
-        return False
-    records = _accepted_notification_messages(store, create=False)
-    remaining = [
-        str(receipt_id)
-        for receipt_id in pending.get("cleanup_receipt_ids", ())
-        if str(receipt_id) in records
-    ]
-    pending["cleanup_receipt_ids"] = remaining
-    if remaining:
-        pending["status"] = "retiring_prefix"
-        pending["operator_attention_required"] = True
-        return False
-    pending["status"] = "retry_ready"
-    pending["operator_attention_required"] = False
-    return True
-
-
 def _speak_reply(
     store: dict[str, Any],
     item: dict[str, Any],
@@ -6393,7 +6263,6 @@ def _speak_reply(
     chat_id: str,
     thread_id: str,
     reply_to: str | None,
-    force_pending: bool = False,
 ) -> dict[str, Any]:
     """Strictly additive (issue #4): after a final text turn is delivered, optionally speak it back as
     one or more Telegram voice notes (long replies are chunked). Fires on the one-shot speak_next_reply
@@ -6406,12 +6275,7 @@ def _speak_reply(
     if runtime.dry_run:
         return entry  # preview pass: don't consume the flag or synth; the real send speaks
     want = bool(entry.pop("speak_next_reply", None))
-    if not (
-        want
-        or force_pending
-        or speech.speech_reply_triggered(item.get("user_text"))
-        or speech.speech_replies_enabled()
-    ):
+    if not (want or speech.speech_reply_triggered(item.get("user_text")) or speech.speech_replies_enabled()):
         return entry
     chunks = speech.speech_reply_chunks(item.get("assistant_final_text") or item.get("assistant_stream_text") or "")
     if not chunks:
@@ -6447,56 +6311,10 @@ def _speak_reply(
         else execution.result
     )
     voice_ids = [str(voice_id) for voice_id in voice_ids]
-    if isinstance(execution.result, dict):
-        receipt_ids = _record_partial_voice_retirements(
-            store,
-            operation,
-            voice_ids,
-            turn_id=_turn_id(item),
-            bot_kind=_bot_kind,
-        )
-        remaining = _retire_partial_voice_prefix(
-            store,
-            runtime,
-            chat_id=chat_id,
-            receipt_ids=receipt_ids,
-            api_token=api_token,
-        )
-        current = _resolve_operation_entry(store, operation)
-        if current is not None:
-            automatic_replay = (
-                execution.result.get(
-                    "automatic_replay_authorized"
-                )
-                is True
-            )
-            status = (
-                "delivery_unknown"
-                if not automatic_replay
-                else "retiring_prefix"
-                if remaining
-                else "retry_ready"
-            )
-            current["pending_voice_reply"] = {
-                "turn_id": _turn_id(item),
-                "status": status,
-                "error": compact_ws(
-                    execution.result.get("error"), 300
-                ),
-                "cleanup_receipt_ids": remaining,
-                "accepted_prefix_count": len(voice_ids),
-                "automatic_replay_authorized": automatic_replay,
-                "operator_attention_required": (
-                    not automatic_replay or bool(remaining)
-                ),
-            }
-            return current
-        return entry
     resolution = execution.resolution
     if resolution.disposition == _OFFLOCK_APPLY:
         target = resolution.entry
         assert target is not None
-        target.pop("pending_voice_reply", None)
         for voice_id in voice_ids:
             state.record_voice_reply_message_id(target, voice_id)
         return target
@@ -7304,7 +7122,6 @@ def _sync_turns(
             continue
         before = dict(entry)
         repaired_open_final = False
-        pending_voice_attempted = False
         worker_key = str(entry.get("tendwire_worker_id") or item.get("worker_id") or "")
         latest_turn_id = latest_content_turn_by_worker.get(worker_key)
         complete = _turn_has_complete_final(item)
@@ -7324,29 +7141,6 @@ def _sync_turns(
             if worker_key in seen_final_workers:
                 continue
             seen_final_workers.add(worker_key)
-            if _pending_voice_reply_ready(store, entry, item):
-                retry_topic_id = str(entry.get("topic_id") or "")
-                retry_bindings = _final_delivery_bindings(
-                    store,
-                    _turn_id(item),
-                    topic_id=retry_topic_id,
-                )
-                entry = _speak_reply(
-                    store,
-                    item,
-                    entry,
-                    entry_key,
-                    runtime,
-                    chat_id=chat_id,
-                    thread_id=retry_topic_id,
-                    reply_to=(
-                        retry_bindings[-1][0]
-                        if retry_bindings
-                        else None
-                    ),
-                    force_pending=True,
-                )
-                pending_voice_attempted = True
             if _content_revision(item):
                 try:
                     _staged, page_calls, entry = _stage_final_plan(
@@ -7397,17 +7191,16 @@ def _sync_turns(
                         if delivery_bindings
                         else None
                     )
-                    if not pending_voice_attempted:
-                        entry = _speak_reply(
-                            store, item, entry, entry_key, runtime,
-                            chat_id=chat_id,
-                            thread_id=delivery_thread_id,
-                            reply_to=(
-                                reply_binding[0]
-                                if reply_binding is not None
-                                else None
-                            ),
-                        )
+                    entry = _speak_reply(
+                        store, item, entry, entry_key, runtime,
+                        chat_id=chat_id,
+                        thread_id=delivery_thread_id,
+                        reply_to=(
+                            reply_binding[0]
+                            if reply_binding is not None
+                            else None
+                        ),
+                    )
         elif item.get("assistant_stream_text") or _turn_is_working_placeholder(item, entry):
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 continue
