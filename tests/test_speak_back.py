@@ -224,13 +224,12 @@ def test_speak_seam_chunks_long_reply_into_multiple_notes(monkeypatch):
     assert len(entry.get("voice_reply_message_ids") or []) == len(telegram.voice_notes)  # all recorded
 
 
-def test_speak_seam_keeps_ids_accepted_before_batch_rate_limit(
+def test_speak_seam_retires_partial_batch_before_full_retry(
     tmp_path, monkeypatch
 ):
     store, entry = _worker_store(
         monkeypatch, speak_next_reply=True
     )
-    entry_key = next(iter(store["panes"]))
     monkeypatch.setattr(
         speech,
         "speech_reply_chunks",
@@ -251,31 +250,79 @@ def test_speak_seam_keeps_ids_accepted_before_batch_rate_limit(
     )
 
     class PartialVoice(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+            self.next_id = 900
+            self.deleted_messages = []
+
         def send_voice(self, *args, **kwargs):
-            if self.voice_notes:
+            self.attempts += 1
+            if self.attempts == 2:
                 raise RateLimited(
                     5,
                     "Too Many Requests: retry after 5",
                     method="sendVoice",
                 )
-            return super().send_voice(*args, **kwargs)
+            message_id = str(self.next_id)
+            self.next_id += 1
+            self.voice_notes.append(
+                (
+                    str(args[0]),
+                    str(args[1]),
+                    dict(kwargs),
+                    message_id,
+                )
+            )
+            return {"ok": True, "message_id": message_id}
+
+        def delete_message(self, chat_id, message_id):
+            self.deleted_messages.append(
+                (str(chat_id), str(message_id))
+            )
+            self.voice_notes[:] = [
+                note
+                for note in self.voice_notes
+                if note[3] != str(message_id)
+            ]
+            return {"ok": True}
 
     telegram = PartialVoice()
-    current = source_sync._speak_reply(
-        store,
-        _final_item(),
-        entry,
-        entry_key,
-        SyncRuntime(
-            FakeTendwire(), telegram, with_outbox=False
-        ),
-        chat_id="-100",
-        thread_id="77",
-        reply_to="42",
+    runtime = SyncRuntime(
+        FakeTendwire(), telegram, with_outbox=False
     )
+    delivery_attempts = [0]
 
-    assert len(telegram.voice_notes) == 1
-    assert current["voice_reply_message_ids"] == ["900"]
+    def deliver_once(*_args, **_kwargs):
+        delivery_attempts[0] += 1
+        return delivery_attempts[0] == 1
+
+    monkeypatch.setattr(
+        source_sync, "_deliver_final", deliver_once
+    )
+    _run_turns(store, _final_item(), runtime)
+
+    assert telegram.voice_notes == []
+    assert telegram.deleted_messages == [("-100", "900")]
+    assert entry["pending_voice_reply"]["status"] == "retry_ready"
+
+    # A later sync pass retries from chunk one even though the final text is
+    # already delivered; the owner never sees a proper subset of the batch.
+    _run_turns(store, _final_item(), runtime)
+    assert [note[3] for note in telegram.voice_notes] == [
+        "901",
+        "902",
+        "903",
+    ]
+    assert entry["voice_reply_message_ids"] == [
+        "901",
+        "902",
+        "903",
+    ]
+    assert "pending_voice_reply" not in entry
+    attempts = telegram.attempts
+    _run_turns(store, _final_item(), runtime)
+    assert telegram.attempts == attempts
     events = store["telegram"]["rate_limit_backpressure"]["events"]
     assert len(events) == 1
     assert events[0]["method"] == "sendVoice"

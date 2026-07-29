@@ -8,7 +8,11 @@ import pytest
 
 from herdres_connector import source_sync
 from herdres_connector import telegram_delivery
-from herdres_connector.telegram_delivery import RateLimited, TelegramClient
+from herdres_connector.telegram_delivery import (
+    RateLimited,
+    TelegramClient,
+    TelegramError,
+)
 from test_source_only import FakeTelegram, FakeTendwire, _store
 
 
@@ -431,3 +435,167 @@ def test_voice_batch_rate_limit_stops_and_keeps_accepted_ids(
     assert events[0]["method"] == "sendVoice"
     assert events[0]["capability"] == "telegram.send_voice_batch"
     assert events[0]["outcome"] == "not_retried_message_send"
+
+
+def test_voice_batch_finds_nested_rate_limit_and_stops(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        source_sync.speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+    monkeypatch.setattr(
+        source_sync.speech,
+        "speech_request",
+        lambda _operation, payload: {
+            "ok": True,
+            "path": payload["dest"],
+        },
+    )
+
+    class NestedLimit:
+        def __init__(self):
+            self.calls = 0
+
+        def send_voice(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {"ok": True, "message_id": "801"}
+            try:
+                raise RateLimited(
+                    6,
+                    "Too Many Requests: retry after 6",
+                    method="sendVoice",
+                )
+            except RateLimited as cause:
+                raise TelegramError("wrapped transport error") from cause
+
+    telegram = NestedLimit()
+    store = _store()
+    result = source_sync._execute_exact_provider_operation(
+        telegram,
+        store=store,
+        mutation=source_sync._provider_mutation(
+            "telegram.send_voice_batch",
+            reason=(
+                "telegram.send_voice_batch: nested rate-limit "
+                "regression"
+            ),
+            args=(
+                ("first", "second", "must not run"),
+                "turn-1",
+                "-100",
+                "77",
+                "42",
+            ),
+        ),
+    )
+
+    assert telegram.calls == 2
+    assert result["status"] == "telegram_rate_limited"
+    assert result["retry_after"] == 6
+    assert result["method"] == "sendVoice"
+    assert result["accepted_message_ids"] == ["801"]
+    events = store["telegram"]["rate_limit_backpressure"]["events"]
+    assert len(events) == 1
+    assert events[0]["method"] == "sendVoice"
+    assert events[0]["outcome"] == "not_retried_message_send"
+
+
+def test_voice_batch_generic_telegram_error_stops_as_unknown(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        source_sync.speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+    monkeypatch.setattr(
+        source_sync.speech,
+        "speech_request",
+        lambda _operation, payload: {
+            "ok": True,
+            "path": payload["dest"],
+        },
+    )
+
+    class AmbiguousVoice:
+        def __init__(self):
+            self.calls = 0
+
+        def send_voice(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {"ok": True, "message_id": "801"}
+            raise TelegramError("connection closed after upload")
+
+    telegram = AmbiguousVoice()
+    result = source_sync._execute_exact_provider_operation(
+        telegram,
+        store=_store(),
+        mutation=source_sync._provider_mutation(
+            "telegram.send_voice_batch",
+            reason=(
+                "telegram.send_voice_batch: ambiguous transport "
+                "regression"
+            ),
+            args=(
+                ("first", "second", "must not run"),
+                "turn-1",
+                "-100",
+                "77",
+                "42",
+            ),
+        ),
+    )
+
+    assert telegram.calls == 2
+    assert (
+        result["status"]
+        == "telegram_voice_batch_delivery_unknown"
+    )
+    assert result["accepted_message_ids"] == ["801"]
+    assert result["automatic_replay_authorized"] is False
+
+
+def test_voice_batch_programming_error_surfaces_loudly(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        source_sync.speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+    monkeypatch.setattr(
+        source_sync.speech,
+        "speech_request",
+        lambda _operation, payload: {
+            "ok": True,
+            "path": payload["dest"],
+        },
+    )
+
+    class BrokenVoice:
+        def send_voice(self, *_args, **_kwargs):
+            raise AttributeError("voice adapter typo")
+
+    with pytest.raises(AttributeError, match="voice adapter typo"):
+        source_sync._execute_exact_provider_operation(
+            BrokenVoice(),
+            store=_store(),
+            mutation=source_sync._provider_mutation(
+                "telegram.send_voice_batch",
+                reason=(
+                    "telegram.send_voice_batch: programming error "
+                    "must remain loud"
+                ),
+                args=(
+                    ("first", "must not run"),
+                    "turn-1",
+                    "-100",
+                    "77",
+                    "42",
+                ),
+            ),
+        )
