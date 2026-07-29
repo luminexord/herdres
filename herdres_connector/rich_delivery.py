@@ -83,90 +83,143 @@ def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
 
 
 def _replace_inline_links(
-    text: str, link_spans: list[str]
+    text: str,
+    link_spans: list[str],
+    *,
+    _work_counter: list[int] | None = None,
 ) -> str:
-    """Hold complete Markdown links without truncating balanced destinations.
+    """Hold complete Markdown links in one forward, linear-time scan.
 
     Parentheses inside a destination must balance; an escaped parenthesis is
     literal URL content and does not affect that balance. Destinations with
     whitespace or angle brackets stay literal because converting only part of
-    an ambiguous destination would create a confidently wrong link.
+    an ambiguous destination would create a confidently wrong link. Rejected
+    candidates consume the characters already inspected, so no suffix is
+    searched again. ``_work_counter`` counts character inspections for the
+    deterministic complexity regression.
     """
 
     rendered: list[str] = []
     index = 0
+
+    def worked(amount: int = 1) -> None:
+        if _work_counter is not None:
+            _work_counter[0] += amount
+
     while index < len(text):
-        label_start = text.find("[", index)
-        if label_start < 0:
-            rendered.append(text[index:])
-            break
-        rendered.append(text[index:label_start])
+        worked()
+        if text[index] != "[":
+            rendered.append(text[index])
+            index += 1
+            continue
+        label_start = index
         if label_start > 0 and text[label_start - 1] == "!":
             rendered.append("[")
-            index = label_start + 1
-            continue
-        label_end = text.find("](", label_start + 1)
-        if label_end < 0:
-            rendered.append(text[label_start:])
-            break
-        label = text[label_start + 1 : label_end]
-        if (
-            not label
-            or len(label) > 300
-            or "[" in label
-            or "]" in label
-        ):
-            rendered.append("[")
-            index = label_start + 1
+            index += 1
             continue
 
-        destination_start = label_end + 2
-        cursor = destination_start
+        cursor = label_start + 1
+        label_end = -1
+        rejected_at = -1
+        nested_candidate = False
+        label_length = 0
+        while cursor < len(text):
+            worked()
+            char = text[cursor]
+            if char == "[":
+                rejected_at = cursor
+                nested_candidate = True
+                break
+            if char == "\n":
+                rejected_at = cursor
+                break
+            if char == "]":
+                worked()
+                if cursor + 1 < len(text) and text[cursor + 1] == "(":
+                    label_end = cursor
+                else:
+                    rejected_at = cursor
+                break
+            label_length += 1
+            if label_length > 300:
+                rejected_at = cursor
+                break
+            cursor += 1
+        if label_end < 0:
+            if rejected_at < 0:
+                rendered.append(text[label_start:])
+                break
+            if nested_candidate:
+                # The inner opener is a new candidate, not part of the
+                # rejected outer label. Process it next without searching any
+                # already-inspected suffix again; this preserves the existing
+                # unmatched-bracket behavior in linear time.
+                rendered.append(text[label_start:rejected_at])
+                index = rejected_at
+            else:
+                rendered.append(text[label_start : rejected_at + 1])
+                index = rejected_at + 1
+            continue
+        if label_length == 0:
+            rendered.append(text[label_start : label_end + 2])
+            index = label_end + 2
+            continue
+
+        cursor = label_end + 2
         depth = 0
         destination: list[str] = []
+        destination_length = 0
         delimiter = -1
         invalid = False
         while cursor < len(text):
+            worked()
             char = text[cursor]
             if char == "\\" and cursor + 1 < len(text):
+                worked()
                 escaped = text[cursor + 1]
                 if escaped in {"(", ")", "\\"}:
-                    destination.append(escaped)
+                    destination_length += 1
+                    if destination_length <= 2000:
+                        destination.append(escaped)
+                    else:
+                        invalid = True
                     cursor += 2
                     continue
             if char.isspace():
                 invalid = True
-                break
             if text.startswith("&lt;", cursor) or text.startswith(
                 "&gt;", cursor
             ):
                 invalid = True
-                break
             if char == "(":
                 depth += 1
-                destination.append(char)
             elif char == ")":
                 if depth == 0:
                     delimiter = cursor
                     break
                 depth -= 1
+            destination_length += 1
+            if destination_length <= 2000:
                 destination.append(char)
             else:
-                destination.append(char)
+                invalid = True
             cursor += 1
 
+        if delimiter < 0:
+            rendered.append(text[label_start:])
+            break
         href = html.unescape("".join(destination))
         if (
             invalid
-            or delimiter < 0
             or depth
             or not href.lower().startswith(_INLINE_LINK_SCHEMES)
-            or len(href) > 2000
+            or destination_length > 2000
         ):
-            rendered.append("[")
-            index = label_start + 1
+            rendered.append(text[label_start : delimiter + 1])
+            index = delimiter + 1
             continue
 
+        label = text[label_start + 1 : label_end]
         safe_href = html.escape(href, quote=True)
         link_spans.append(f'<a href="{safe_href}">{label}</a>')
         rendered.append(f"\u0001{len(link_spans) - 1}\u0001")

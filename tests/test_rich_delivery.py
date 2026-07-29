@@ -8,6 +8,7 @@ import pytest
 from herdres_connector import source_sync, state
 from herdres_connector.rendering import telegram_html
 from herdres_connector.rich_delivery import (
+    _replace_inline_links,
     edit_rich_message,
     send_feed_item,
     send_rich_message,
@@ -327,10 +328,28 @@ def test_recipient_fake_matches_measured_telegram_entity_behavior(
             id="escaped-unbalanced-closing-parenthesis",
         ),
         pytest.param(
+            r"[wiki](https://example.test/\(Foo\))",
+            "✅ Response\nwiki",
+            "https://example.test/(Foo)",
+            id="escaped-balanced-parentheses",
+        ),
+        pytest.param(
             "[wiki](https://example.test/Foo))",
             "✅ Response\nwiki)",
             "https://example.test/Foo",
             id="trailing-prose-parenthesis",
+        ),
+        pytest.param(
+            r"[wiki](https://example.test/end\\)",
+            "✅ Response\nwiki",
+            "https://example.test/end\\",
+            id="doubled-terminal-backslash",
+        ),
+        pytest.param(
+            "[wiki](https://example.test/[one])",
+            "✅ Response\nwiki",
+            "https://example.test/[one]",
+            id="destination-brackets",
         ),
     ],
 )
@@ -367,6 +386,22 @@ def test_markdown_link_destination_is_preserved_exactly(
             "[wiki](<https://example.test/Foo>)",
             id="angle-brackets",
         ),
+        pytest.param(
+            r"[wiki](https://example.test/end\)",
+            id="terminal-backslash",
+        ),
+        pytest.param(
+            "[wiki](https://example.test/(unterminated)",
+            id="unterminated-parenthesis",
+        ),
+        pytest.param(
+            "[[[[not a link",
+            id="unmatched-bracket-run",
+        ),
+        pytest.param(
+            "![image](https://example.test/image.png)",
+            id="image-syntax",
+        ),
     ],
 )
 def test_ambiguous_markdown_link_destination_stays_literal(markdown):
@@ -389,6 +424,54 @@ def test_ambiguous_markdown_link_destination_stays_literal(markdown):
         entity["type"] == "TextUrl"
         for entity in client.recipient_messages[0]["entities"]
     )
+
+
+def test_adjacent_markdown_links_preserve_both_destinations():
+    client = RecipientTelegram()
+
+    result = send_feed_item(
+        client,
+        "-100",
+        {
+            "kind": "turn",
+            "assistant_final_text": (
+                "[one](https://example.test/1)"
+                "[two](https://example.test/2)"
+            ),
+        },
+        telegram={},
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert client.recipient_messages[0]["text"] == "✅ Response\nonetwo"
+    assert [
+        entity["url"]
+        for entity in client.recipient_messages[0]["entities"]
+        if entity["type"] == "TextUrl"
+    ] == [
+        "https://example.test/1",
+        "https://example.test/2",
+    ]
+
+
+def test_pathological_64k_link_scan_has_bounded_linear_work():
+    tail = "x](https://example.test)"
+    source = "[" * (64000 - len(tail)) + tail
+    work = [0]
+    link_spans = []
+
+    rendered = _replace_inline_links(
+        source,
+        link_spans,
+        _work_counter=work,
+    )
+
+    assert rendered.endswith("\u00010\u0001")
+    assert link_spans == [
+        '<a href="https://example.test">x</a>'
+    ]
+    assert work[0] <= len(source) * 2
 
 
 def test_unsupported_nested_tag_is_flattened_without_plain_fallback():
