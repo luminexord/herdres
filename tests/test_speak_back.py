@@ -10,9 +10,13 @@ import json
 from unittest.mock import patch
 
 import herdres
+import pytest
 from herdres_connector import source_sync, speech, state
 from herdres_connector.source_sync import SyncRuntime
-from herdres_connector.telegram_delivery import TelegramClient
+from herdres_connector.telegram_delivery import (
+    RateLimited,
+    TelegramClient,
+)
 
 from test_source_only import (
     REQUEST_ID,
@@ -84,6 +88,39 @@ def test_send_voice_multipart_body_and_call(tmp_path):
     assert b'name="message_thread_id"' in body and b"77" in body
     assert b'name="reply_parameters"' in body and b'"message_id":42' in body
     assert b'name="voice"; filename="reply.ogg"' in body and b"OggS-fake-opus" in body
+
+
+@pytest.mark.parametrize(
+    "result",
+    [{}, {"message_id": 0}, {"message_id": "0"}],
+    ids=["missing", "numeric-zero", "string-zero"],
+)
+def test_send_voice_does_not_synthesize_zero_message_id(
+    tmp_path, result
+):
+    ogg = tmp_path / "reply.ogg"
+    ogg.write_bytes(b"OggS-fake-opus")
+
+    class _Resp:
+        def __enter__(self_):
+            return self_
+
+        def __exit__(self_, *args):
+            return False
+
+        def read(self_):
+            return json.dumps(
+                {"ok": True, "result": result}
+            ).encode()
+
+    with patch(
+        "urllib.request.urlopen", return_value=_Resp()
+    ):
+        sent = TelegramClient(token="TOK").send_voice(
+            "-100", ogg
+        )
+
+    assert sent == {"ok": True, "message_id": ""}
 
 
 # --- speech trim / triggers --------------------------------------------------
@@ -219,6 +256,122 @@ def test_speak_seam_chunks_long_reply_into_multiple_notes(monkeypatch):
     _run_turns(store, long_item, runtime)
     assert len(telegram.voice_notes) >= 2                       # spoken as several voice notes
     assert len(entry.get("voice_reply_message_ids") or []) == len(telegram.voice_notes)  # all recorded
+
+
+def test_speak_seam_keeps_partial_batch_without_replay(
+    tmp_path, monkeypatch
+):
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(statepath)
+    )
+    store, entry = _worker_store(
+        monkeypatch, speak_next_reply=True
+    )
+    entry_key = next(iter(store["panes"]))
+    state.save_state(store, statepath)
+    monkeypatch.setattr(
+        speech,
+        "speech_reply_chunks",
+        lambda _text: ["first", "second", "third"],
+    )
+    monkeypatch.setattr(
+        speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+    monkeypatch.setattr(
+        speech,
+        "speech_request",
+        lambda _operation, payload: {
+            "ok": True,
+            "path": payload["dest"],
+        },
+    )
+
+    class PartialVoice(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+            self.next_id = 900
+
+        def send_voice(self, *args, **kwargs):
+            self.attempts += 1
+            if self.attempts == 3:
+                raise RateLimited(
+                    5,
+                    "Too Many Requests: retry after 5",
+                    method="sendVoice",
+                )
+            message_id = str(self.next_id)
+            self.next_id += 1
+            self.voice_notes.append(
+                (
+                    str(args[0]),
+                    str(args[1]),
+                    dict(kwargs),
+                    message_id,
+                )
+            )
+            return {"ok": True, "message_id": message_id}
+
+    telegram = PartialVoice()
+    runtime = SyncRuntime(
+        FakeTendwire(), telegram, with_outbox=False
+    )
+    saves = 0
+    real_save_state = state.save_state
+
+    def counted_save_state(*args, **kwargs):
+        nonlocal saves
+        saves += 1
+        return real_save_state(*args, **kwargs)
+
+    monkeypatch.setattr(state, "save_state", counted_save_state)
+    with state.state_lock(path=statepath):
+        current = source_sync._speak_reply(
+            store,
+            _final_item(),
+            entry,
+            entry_key,
+            runtime,
+            chat_id="-100",
+            thread_id="77",
+            reply_to="42",
+        )
+
+    # Voice is strictly additive beneath the already-complete text reply.
+    # Keep the accepted prefix, stop on backpressure, and never create a
+    # distributed deletion/replay obligation for cosmetic incompleteness.
+    assert [note[3] for note in telegram.voice_notes] == [
+        "900",
+        "901",
+    ]
+    assert current["voice_reply_message_ids"] == [
+        "900",
+        "901",
+    ]
+    assert "pending_voice_reply" not in current
+    assert (
+        store.get("telegram", {}).get(
+            "accepted_notification_messages"
+        )
+        in (None, {})
+    )
+    assert saves == 1
+
+    # The one-shot speak flag was committed before the off-lock batch. Even
+    # if a later delivery branch reports success, it must not replay voice.
+    monkeypatch.setattr(
+        source_sync, "_deliver_final", lambda *_a, **_k: True
+    )
+    attempts = telegram.attempts
+    _run_turns(store, _final_item(), runtime)
+    assert telegram.attempts == attempts
+    events = store["telegram"]["rate_limit_backpressure"]["events"]
+    assert len(events) == 1
+    assert events[0]["method"] == "sendVoice"
+    assert events[0]["outcome"] == "not_retried_message_send"
 
 
 def test_speak_seam_offlock_synth_no_clobber(tmp_path, monkeypatch):
