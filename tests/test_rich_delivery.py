@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 from html.parser import HTMLParser
 
+import pytest
+
 from herdres_connector import source_sync, state
 from herdres_connector.rendering import telegram_html
 from herdres_connector.rich_delivery import (
@@ -49,9 +51,10 @@ class _RecipientHTMLParser(HTMLParser):
         self.text: list[str] = []
         self.entities: list[dict[str, str]] = []
         self.unsupported_tags: list[str] = []
+        self.open_tags: list[str] = []
 
     def handle_starttag(self, tag, attrs):
-        if tag not in {
+        supported = {
             "a",
             "b",
             "blockquote",
@@ -62,20 +65,47 @@ class _RecipientHTMLParser(HTMLParser):
             "s",
             "strong",
             "u",
-        }:
+        }
+        if tag not in supported:
             self.unsupported_tags.append(tag)
+            return
         attributes = dict(attrs)
         entity_type = {
             "b": "Bold",
             "strong": "Bold",
+            "i": "Italic",
+            "em": "Italic",
+            "u": "Underline",
+            "s": "Strikethrough",
             "code": "Code",
+            "pre": "Pre",
             "a": "TextUrl",
+            "blockquote": "Blockquote",
         }.get(tag)
-        if entity_type:
+        suppressed = any(
+            parent in {"code", "pre"} for parent in self.open_tags
+        )
+        if tag == "a" and "a" in self.open_tags:
+            suppressed = True
+        if tag == "blockquote" and "blockquote" in self.open_tags:
+            suppressed = True
+        href = str(attributes.get("href") or "")
+        if tag == "a" and not href.lower().startswith(
+            ("http://", "https://", "mailto:", "tg://")
+        ):
+            suppressed = True
+        if entity_type and not suppressed:
             entity = {"type": entity_type}
             if tag == "a":
-                entity["url"] = str(attributes.get("href") or "")
+                entity["url"] = href
             self.entities.append(entity)
+        self.open_tags.append(tag)
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.open_tags) - 1, -1, -1):
+            if self.open_tags[index] == tag:
+                del self.open_tags[index]
+                break
 
     def handle_data(self, data):
         self.text.append(data)
@@ -150,6 +180,217 @@ def test_canonical_send_preserves_recipient_formatting_entities():
     assert "Bold inline() link" in client.recipient_messages[0]["text"]
 
 
+@pytest.mark.parametrize(
+    ("markup", "entity"),
+    [
+        pytest.param("<b>bold</b>", {"type": "Bold"}, id="bold"),
+        pytest.param("<i>italic</i>", {"type": "Italic"}, id="italic"),
+        pytest.param(
+            "<u>underline</u>", {"type": "Underline"}, id="underline"
+        ),
+        pytest.param(
+            "<s>strike</s>",
+            {"type": "Strikethrough"},
+            id="strikethrough",
+        ),
+        pytest.param("<code>inline</code>", {"type": "Code"}, id="code"),
+        pytest.param("<pre>block</pre>", {"type": "Pre"}, id="pre"),
+        pytest.param(
+            '<a href="https://example.test/path">link</a>',
+            {
+                "type": "TextUrl",
+                "url": "https://example.test/path",
+            },
+            id="link",
+        ),
+        pytest.param(
+            "<blockquote>quote</blockquote>",
+            {"type": "Blockquote"},
+            id="blockquote",
+        ),
+    ],
+)
+def test_each_promised_format_reaches_the_recipient(markup, entity):
+    client = RecipientTelegram()
+
+    result = send_rich_message(
+        client,
+        "-100",
+        markup,
+        telegram={},
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    assert entity in client.recipient_messages[0]["entities"]
+
+
+@pytest.mark.parametrize(
+    ("markup", "expected_entities"),
+    [
+        pytest.param(
+            "<b>Run <code>cmd</code></b>",
+            [{"type": "Bold"}, {"type": "Code"}],
+            id="bold-with-code",
+        ),
+        pytest.param(
+            "<code>x <b>y</b> z</code>",
+            [{"type": "Code"}],
+            id="code-drops-inner",
+        ),
+        pytest.param(
+            "<pre>x <b>y</b> z</pre>",
+            [{"type": "Pre"}],
+            id="pre-drops-inner",
+        ),
+        pytest.param(
+            '<blockquote>q <a href="https://example.test/q">link</a>'
+            "</blockquote>",
+            [
+                {"type": "Blockquote"},
+                {
+                    "type": "TextUrl",
+                    "url": "https://example.test/q",
+                },
+            ],
+            id="blockquote-with-link",
+        ),
+        pytest.param(
+            '<a href="https://example.test/a"><b>linked</b></a>',
+            [
+                {
+                    "type": "TextUrl",
+                    "url": "https://example.test/a",
+                },
+                {"type": "Bold"},
+            ],
+            id="link-with-bold",
+        ),
+        pytest.param(
+            '<a href="https://example.test/outer">outer '
+            '<a href="https://example.test/inner">inner</a></a>',
+            [
+                {
+                    "type": "TextUrl",
+                    "url": "https://example.test/outer",
+                }
+            ],
+            id="nested-anchor-keeps-outer",
+        ),
+        pytest.param(
+            "<blockquote>outer <blockquote>inner</blockquote></blockquote>",
+            [{"type": "Blockquote"}],
+            id="nested-blockquote-flattens-inner",
+        ),
+        pytest.param(
+            '<a href="javascript:alert(1)">unsafe</a>',
+            [],
+            id="javascript-href-stripped",
+        ),
+        pytest.param(
+            '<a href="data:text/plain,unsafe">unsafe</a>',
+            [],
+            id="data-href-stripped",
+        ),
+        pytest.param(
+            "<b>a <i>b</i> c</b>",
+            [{"type": "Bold"}, {"type": "Italic"}],
+            id="bold-with-italic",
+        ),
+    ],
+)
+def test_recipient_fake_matches_measured_telegram_entity_behavior(
+    markup, expected_entities
+):
+    client = RecipientTelegram()
+
+    result = client.send_message("-100", markup)
+
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    assert client.recipient_messages[0]["entities"] == expected_entities
+
+
+@pytest.mark.parametrize(
+    ("markdown", "expected_text", "expected_url"),
+    [
+        pytest.param(
+            "[wiki](https://example.test/Foo_(bar))",
+            "✅ Response\nwiki",
+            "https://example.test/Foo_(bar)",
+            id="balanced-parentheses",
+        ),
+        pytest.param(
+            r"[wiki](https://example.test/Foo_\))",
+            "✅ Response\nwiki",
+            "https://example.test/Foo_)",
+            id="escaped-unbalanced-closing-parenthesis",
+        ),
+        pytest.param(
+            "[wiki](https://example.test/Foo))",
+            "✅ Response\nwiki)",
+            "https://example.test/Foo",
+            id="trailing-prose-parenthesis",
+        ),
+    ],
+)
+def test_markdown_link_destination_is_preserved_exactly(
+    markdown, expected_text, expected_url
+):
+    client = RecipientTelegram()
+
+    result = send_feed_item(
+        client,
+        "-100",
+        {"kind": "turn", "assistant_final_text": markdown},
+        telegram={},
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    assert client.recipient_messages[0]["text"] == expected_text
+    assert {
+        "type": "TextUrl",
+        "url": expected_url,
+    } in client.recipient_messages[0]["entities"]
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    [
+        pytest.param(
+            "[wiki](https://example.test/Foo bar)",
+            id="space",
+        ),
+        pytest.param(
+            "[wiki](<https://example.test/Foo>)",
+            id="angle-brackets",
+        ),
+    ],
+)
+def test_ambiguous_markdown_link_destination_stays_literal(markdown):
+    client = RecipientTelegram()
+
+    result = send_feed_item(
+        client,
+        "-100",
+        {"kind": "turn", "assistant_final_text": markdown},
+        telegram={},
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    assert client.recipient_messages[0]["text"] == (
+        f"✅ Response\n{markdown}"
+    )
+    assert not any(
+        entity["type"] == "TextUrl"
+        for entity in client.recipient_messages[0]["entities"]
+    )
+
+
 def test_unsupported_nested_tag_is_flattened_without_plain_fallback():
     client = RecipientTelegram()
 
@@ -188,6 +429,14 @@ def test_telegram_html_allowlist_balances_and_escapes_edge_cases():
         "<i>unclosed</i></b>"
     )
     assert telegram_html("2 < 3 & 5") == "2 &lt; 3 &amp; 5"
+    assert (
+        telegram_html('<a href="javascript:alert(1)">unsafe</a>')
+        == "unsafe"
+    )
+    assert (
+        telegram_html('<a href="data:text/plain,unsafe">unsafe</a>')
+        == "unsafe"
+    )
 
 
 def test_rejected_html_still_delivers_nonempty_readable_plain_text():

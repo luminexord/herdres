@@ -34,6 +34,7 @@ _TELEGRAM_HTML_INLINE_TAGS = frozenset(
 )
 _TELEGRAM_HTML_BLOCK_TAGS = frozenset({"blockquote", "pre"})
 _TELEGRAM_HTML_TAGS = _TELEGRAM_HTML_INLINE_TAGS | _TELEGRAM_HTML_BLOCK_TAGS
+_TELEGRAM_LINK_SCHEMES = ("http://", "https://", "mailto:", "tg://")
 _TELEGRAM_HTML_LINE_END_TAGS = frozenset(
     {
         "details",
@@ -99,7 +100,22 @@ class _TelegramHTMLSanitizer(HTMLParser):
                 )
                 if not href:
                     return
-                rendered_attrs = f' href="{html.escape(href, quote=True)}"'
+                decoded_href = html.unescape(href)
+                if (
+                    any(char.isspace() for char in decoded_href)
+                    or "<" in decoded_href
+                    or ">" in decoded_href
+                    or not decoded_href.lower().startswith(
+                        _TELEGRAM_LINK_SCHEMES
+                    )
+                ):
+                    # Defence in depth: Telegram currently strips unsafe
+                    # schemes itself, but canonical output should not depend
+                    # on that provider behaviour remaining unchanged.
+                    return
+                rendered_attrs = (
+                    f' href="{html.escape(decoded_href, quote=True)}"'
+                )
             elif name == "blockquote" and any(
                 key.lower() == "expandable" for key, _value in attrs
             ):

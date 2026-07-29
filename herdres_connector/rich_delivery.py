@@ -71,10 +71,7 @@ RICH_STATE_UPDATE_KEY = "_herdres_rich_state_update"
 FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
 HRULE_RE = re.compile(r"^\s*([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 INLINE_CODE_RE = re.compile(r"`([^`\n]{1,300})`")
-INLINE_LINK_RE = re.compile(
-    r"\[([^\]\n]{1,300})\]"
-    r"\(((?:https?://|tg://|mailto:)[^\s)\n]{1,2000})\)"
-)
+_INLINE_LINK_SCHEMES = ("http://", "https://", "mailto:", "tg://")
 
 
 class PresentationContentError(RuntimeError):
@@ -83,6 +80,98 @@ class PresentationContentError(RuntimeError):
 
 def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
     return html.escape(sanitize_text(str(value or ""), max_chars), quote=False)
+
+
+def _replace_inline_links(
+    text: str, link_spans: list[str]
+) -> str:
+    """Hold complete Markdown links without truncating balanced destinations.
+
+    Parentheses inside a destination must balance; an escaped parenthesis is
+    literal URL content and does not affect that balance. Destinations with
+    whitespace or angle brackets stay literal because converting only part of
+    an ambiguous destination would create a confidently wrong link.
+    """
+
+    rendered: list[str] = []
+    index = 0
+    while index < len(text):
+        label_start = text.find("[", index)
+        if label_start < 0:
+            rendered.append(text[index:])
+            break
+        rendered.append(text[index:label_start])
+        if label_start > 0 and text[label_start - 1] == "!":
+            rendered.append("[")
+            index = label_start + 1
+            continue
+        label_end = text.find("](", label_start + 1)
+        if label_end < 0:
+            rendered.append(text[label_start:])
+            break
+        label = text[label_start + 1 : label_end]
+        if (
+            not label
+            or len(label) > 300
+            or "[" in label
+            or "]" in label
+        ):
+            rendered.append("[")
+            index = label_start + 1
+            continue
+
+        destination_start = label_end + 2
+        cursor = destination_start
+        depth = 0
+        destination: list[str] = []
+        delimiter = -1
+        invalid = False
+        while cursor < len(text):
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < len(text):
+                escaped = text[cursor + 1]
+                if escaped in {"(", ")", "\\"}:
+                    destination.append(escaped)
+                    cursor += 2
+                    continue
+            if char.isspace():
+                invalid = True
+                break
+            if text.startswith("&lt;", cursor) or text.startswith(
+                "&gt;", cursor
+            ):
+                invalid = True
+                break
+            if char == "(":
+                depth += 1
+                destination.append(char)
+            elif char == ")":
+                if depth == 0:
+                    delimiter = cursor
+                    break
+                depth -= 1
+                destination.append(char)
+            else:
+                destination.append(char)
+            cursor += 1
+
+        href = html.unescape("".join(destination))
+        if (
+            invalid
+            or delimiter < 0
+            or depth
+            or not href.lower().startswith(_INLINE_LINK_SCHEMES)
+            or len(href) > 2000
+        ):
+            rendered.append("[")
+            index = label_start + 1
+            continue
+
+        safe_href = html.escape(href, quote=True)
+        link_spans.append(f'<a href="{safe_href}">{label}</a>')
+        rendered.append(f"\u0001{len(link_spans) - 1}\u0001")
+        index = delimiter + 1
+    return "".join(rendered)
 
 
 def _rich_inline(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
@@ -96,13 +185,7 @@ def _rich_inline(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
 
     text = INLINE_CODE_RE.sub(hold_code, text)
 
-    def hold_link(match: re.Match[str]) -> str:
-        label = match.group(1)
-        href = html.escape(html.unescape(match.group(2)), quote=True)
-        link_spans.append(f'<a href="{href}">{label}</a>')
-        return f"\u0001{len(link_spans) - 1}\u0001"
-
-    text = INLINE_LINK_RE.sub(hold_link, text)
+    text = _replace_inline_links(text, link_spans)
     text = re.sub(r"\*\*\*([^\n]+?)\*\*\*", r"<b><i>\1</i></b>", text)
     text = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", text)
