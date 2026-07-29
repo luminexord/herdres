@@ -133,6 +133,13 @@ with at most one leased head, while up to
 `HERDRES_INBOUND_DISPATCH_WORKERS` lanes run concurrently (default `8`). A
 retry delays only its lane using exponential backoff based on
 `HERDRES_INBOUND_LANE_BACKOFF_SECONDS` (default `2`, capped at five minutes).
+An accepted-but-unverified delivery holds that strict FIFO for at most
+`HERDRES_INBOUND_HOLD_SECONDS` (default `15`), then becomes terminal without
+redispatch; later messages are never leased before that transition. The
+dispatcher caps its sleep at the hold expiry, so this bound does not grow with
+the retry backoff. `herdres doctor` fails with the structured
+`inbound_lane_stalled` signal when a lane has pending work but no claimable head
+for `HERDRES_INBOUND_LANE_STALL_SECONDS` (default `5`).
 The dispatcher renews a claimed lease across the full pipeline, including
 unbounded voice pretranscription, command execution, and terminal receipt commit.
 Expired leases are reclaimed after a crash and replay the same request ID;

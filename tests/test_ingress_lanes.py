@@ -13,7 +13,7 @@ import pytest
 
 import herdres
 import herdres_gateway
-from herdres_connector import config, ingress_requests, speech, state
+from herdres_connector import config, doctor, ingress_requests, speech, state
 from herdres_connector.ingress_identity import derive_telegram_request_id
 from herdres_connector.ingress_lanes import IngressLaneSpool, lane_key
 
@@ -136,6 +136,185 @@ def test_pending_lane_is_spool_eligible_even_while_its_head_is_processing(
     assert snapshot.eligible_lane_count == 1
     assert snapshot.claimable_lane_count == 0
     assert snapshot.first_claimable_lane == ""
+
+
+def test_bounded_hold_terminalizes_before_follower_and_preserves_fifo(
+    tmp_path,
+) -> None:
+    """Ambiguous delivery holds ordering for 15 seconds, never for 24 hours."""
+
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    started = 1_000.0
+    deadline = started + 86_400.0
+    _enqueue(
+        spool,
+        _update(3, 77, "ambiguous head"),
+        "77",
+        first_seen_at=started,
+        deadline_at=deadline,
+    )
+    _enqueue(
+        spool,
+        _update(4, 77, "ordered follower"),
+        "77",
+        first_seen_at=started,
+        deadline_at=deadline,
+    )
+
+    head = spool.claim("worker", now=started, lease_seconds=30)
+    assert head is not None
+    assert head.update_id == 3
+    assert spool.mark_blocked(
+        head.seq,
+        "worker",
+        now=started,
+        hold_seconds=15,
+    )
+
+    # Strict FIFO remains intact until the predecessor becomes terminal.
+    assert spool.claim("early-worker", now=started + 14.999) is None
+    assert [row["state"] for row in spool.rows()] == ["blocked", "pending"]
+
+    follower = spool.claim("next-worker", now=started + 15.0)
+    assert follower is not None
+    assert follower.update_id == 4
+    assert [row["state"] for row in spool.rows()] == ["done", "processing"]
+    assert started + 15.0 < deadline
+
+
+def test_dispatcher_hold_bound_overrides_long_idle_backoff(
+    tmp_path, monkeypatch
+) -> None:
+    """A 300-second idle cadence cannot extend the bounded hold."""
+
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    _enqueue(spool, _update(5, 77, "ambiguous head"), "77")
+    _enqueue(spool, _update(6, 77, "ordered follower"), "77")
+    calls: list[tuple[int, float]] = []
+
+    def handle(update, *_args, **_kwargs):
+        calls.append((int(update["update_id"]), time.monotonic()))
+        return (
+            herdres_gateway.CHECKPOINT_HOLD
+            if update["update_id"] == 5
+            else herdres_gateway.CHECKPOINT_ADVANCE
+        )
+
+    monkeypatch.setattr(herdres_gateway, "handle_update", handle)
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        spool,
+        REQUEST_ID_KEY,
+        workers=1,
+        backoff_seconds=300,
+        lease_seconds=1,
+        hold_seconds=0.1,
+    )
+    dispatcher.update_specs([("manager", "token", 0)])
+    dispatcher.start()
+    try:
+        _wait_for(
+            lambda: [row["state"] for row in spool.rows()] == ["done", "done"],
+            timeout=1.0,
+        )
+    finally:
+        dispatcher.stop()
+
+    assert [update_id for update_id, _at in calls] == [5, 6]
+    assert 0.1 <= calls[1][1] - calls[0][1] < 1.0
+
+
+def test_hold_terminalizes_at_bound_while_dispatch_capacity_is_busy(
+    tmp_path, monkeypatch
+) -> None:
+    """Terminal hold expiry is independent of unrelated service capacity."""
+
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    _enqueue(spool, _update(7, 77, "ambiguous head"), "77")
+    _enqueue(spool, _update(8, 88, "slow other lane"), "88")
+    _enqueue(spool, _update(9, 77, "ordered follower"), "77")
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+
+    def handle(update, *_args, **_kwargs):
+        if update["update_id"] == 7:
+            return herdres_gateway.CHECKPOINT_HOLD
+        if update["update_id"] == 8:
+            slow_started.set()
+            assert release_slow.wait(2.0)
+        return herdres_gateway.CHECKPOINT_ADVANCE
+
+    monkeypatch.setattr(herdres_gateway, "handle_update", handle)
+    dispatcher = herdres_gateway._InboundLaneDispatcher(
+        spool,
+        REQUEST_ID_KEY,
+        workers=1,
+        backoff_seconds=300,
+        lease_seconds=1,
+        hold_seconds=0.1,
+    )
+    dispatcher.update_specs([("manager", "token", 0)])
+    dispatcher.start()
+    try:
+        assert slow_started.wait(1.0)
+        _wait_for(lambda: spool.rows()[0]["state"] == "done", timeout=0.75)
+        rows = spool.rows()
+        assert rows[1]["state"] == "processing"
+        assert rows[2]["state"] == "pending"
+    finally:
+        release_slow.set()
+        dispatcher.stop()
+
+
+def test_stalled_lane_is_a_structured_doctor_signal(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
+    started = 2_000.0
+    _enqueue(
+        spool,
+        _update(10, 77, "ambiguous head"),
+        "77",
+        first_seen_at=started,
+        deadline_at=started + 86_400,
+    )
+    _enqueue(
+        spool,
+        _update(11, 77, "silenced follower"),
+        "77",
+        first_seen_at=started,
+        deadline_at=started + 86_400,
+    )
+    head = spool.claim("worker", now=started, lease_seconds=30)
+    assert head is not None
+    assert spool.mark_blocked(
+        head.seq,
+        "worker",
+        now=started,
+        hold_seconds=15,
+    )
+
+    before_threshold = doctor.inbound_lanes(
+        spool_path,
+        now=started + 4.999,
+        stall_after_seconds=5,
+    )
+    assert before_threshold["ok"] is True
+    assert before_threshold["signal"] == ""
+
+    signal = doctor.inbound_lanes(
+        spool_path,
+        now=started + 5.0,
+        stall_after_seconds=5,
+    )
+    assert signal["ok"] is False
+    assert signal["status"] == "stalled"
+    assert signal["signal"] == "inbound_lane_stalled"
+    assert signal["pending"] == 1
+    assert signal["claimable"] == 0
+    assert signal["blocked"] == 1
+    assert signal["stalled_lanes"] == 1
+    assert signal["first_stalled_lane"] == lane_key("manager", "77")
+    assert signal["oldest_stalled_seconds"] == 5.0
 
 
 def test_busy_lane_does_not_delay_another_agent_under_two_seconds(
@@ -894,6 +1073,16 @@ def test_lane_configuration_defaults_and_bounds() -> None:
     assert config.inbound_lane_depth({}) == 32
     assert config.inbound_lane_depth({"HERDRES_INBOUND_LANE_DEPTH": "5000"}) == 4096
     assert config.inbound_lane_backoff_seconds({}) == 2.0
+    assert config.inbound_hold_seconds({}) == 15.0
+    assert config.inbound_hold_seconds({"HERDRES_INBOUND_HOLD_SECONDS": "0"}) == 1.0
+    assert config.inbound_hold_seconds({"HERDRES_INBOUND_HOLD_SECONDS": "120"}) == 60.0
+    assert config.inbound_lane_stall_seconds({}) == 5.0
+    assert (
+        config.inbound_lane_stall_seconds(
+            {"HERDRES_INBOUND_LANE_STALL_SECONDS": "120"}
+        )
+        == 60.0
+    )
     assert config.gateway_timing_logs_enabled({}) is True
     assert (
         config.gateway_timing_logs_enabled({"HERDRES_GATEWAY_TIMING_LOGS": "0"})

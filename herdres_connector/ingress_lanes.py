@@ -52,6 +52,8 @@ CREATE INDEX IF NOT EXISTS lane_items_pending_by_attempt
     ON lane_items(next_attempt_at, seq) WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS lane_items_processing_by_lease
     ON lane_items(lease_until) WHERE state = 'processing';
+CREATE INDEX IF NOT EXISTS lane_items_blocked_by_expiry
+    ON lane_items(next_attempt_at) WHERE state = 'blocked';
 """
 
 
@@ -90,6 +92,11 @@ class DispatchSnapshot:
     eligible_lane_count: int
     claimable_lane_count: int
     first_claimable_lane: str
+    blocked_count: int
+    next_blocked_expiry_at: float | None
+    stalled_lane_count: int
+    first_stalled_lane: str
+    oldest_stalled_seconds: float
 
 
 def lane_key(receiver_kind: str, topic_id: str) -> str:
@@ -141,6 +148,7 @@ class IngressLaneSpool:
             connection.execute("DROP INDEX IF EXISTS lane_items_open_by_lane")
             connection.execute("DROP INDEX IF EXISTS lane_items_pending_by_attempt")
             connection.execute("DROP INDEX IF EXISTS lane_items_processing_by_lease")
+            connection.execute("DROP INDEX IF EXISTS lane_items_blocked_by_expiry")
             connection.execute("ALTER TABLE lane_items RENAME TO lane_items_before_hold")
             connection.execute(
                 """
@@ -191,6 +199,12 @@ class IngressLaneSpool:
                     ON lane_items(lease_until) WHERE state = 'processing'
                 """
             )
+            connection.execute(
+                """
+                CREATE INDEX lane_items_blocked_by_expiry
+                    ON lane_items(next_attempt_at) WHERE state = 'blocked'
+                """
+            )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -210,6 +224,25 @@ class IngressLaneSpool:
     @staticmethod
     def _begin(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
+
+    @staticmethod
+    def _expire_holds_tx(
+        connection: sqlite3.Connection,
+        timestamp: float,
+    ) -> int:
+        """Terminalize expired ambiguous deliveries without redispatch."""
+
+        return int(
+            connection.execute(
+                """
+                UPDATE lane_items
+                SET state = 'done', lease_owner = NULL, lease_until = NULL,
+                    updated_at = ?
+                WHERE state = 'blocked' AND next_attempt_at <= ?
+                """,
+                (timestamp, timestamp),
+            ).rowcount
+        )
 
     @staticmethod
     def _advance_cursor_tx(
@@ -377,6 +410,12 @@ class IngressLaneSpool:
                     """,
                     (timestamp, timestamp),
                 )
+                # Ambiguous delivery is never retried: when its short hold
+                # expires, terminalize the spool row in the same claim
+                # transaction. The unchanged head-only query below therefore
+                # preserves strict FIFO; a follower cannot be leased before
+                # its predecessor is terminal.
+                self._expire_holds_tx(connection, timestamp)
                 row = connection.execute(
                     """
                     SELECT candidate.*
@@ -431,7 +470,12 @@ class IngressLaneSpool:
             notify_state=str(row["notify_state"]),
         )
 
-    def dispatch_snapshot(self, *, now: float | None = None) -> DispatchSnapshot:
+    def dispatch_snapshot(
+        self,
+        *,
+        now: float | None = None,
+        stall_after_seconds: float | None = None,
+    ) -> DispatchSnapshot:
         """Describe spool-visible work without applying receiver/spec filters.
 
         A lane is eligible whenever the spool contains a pending row for it.
@@ -440,13 +484,23 @@ class IngressLaneSpool:
         """
 
         timestamp = time.time() if now is None else float(now)
+        stall_after = (
+            config.inbound_lane_stall_seconds()
+            if stall_after_seconds is None
+            else max(0.0, float(stall_after_seconds))
+        )
         with self._connect() as connection:
             snapshot_row = connection.execute(
                 """
                 WITH pending AS (
-                    SELECT seq, lane_key
+                    SELECT seq, lane_key, first_seen_at
                     FROM lane_items
                     WHERE state = 'pending'
+                ),
+                pending_lanes AS (
+                    SELECT lane_key, MIN(first_seen_at) AS oldest_pending_at
+                    FROM pending
+                    GROUP BY lane_key
                 ),
                 claimable AS (
                     SELECT candidate.seq, candidate.lane_key
@@ -458,6 +512,15 @@ class IngressLaneSpool:
                           WHERE prior.lane_key = candidate.lane_key
                             AND prior.state != 'done'
                             AND prior.seq < candidate.seq
+                      )
+                ),
+                stalled AS (
+                    SELECT pending_lane.lane_key, pending_lane.oldest_pending_at
+                    FROM pending_lanes AS pending_lane
+                    WHERE pending_lane.oldest_pending_at <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM claimable
+                          WHERE claimable.lane_key = pending_lane.lane_key
                       )
                 )
                 SELECT
@@ -477,9 +540,30 @@ class IngressLaneSpool:
                         FROM claimable
                         ORDER BY seq
                         LIMIT 1
-                    ) AS first_claimable_lane
+                    ) AS first_claimable_lane,
+                    (
+                        SELECT COUNT(*)
+                        FROM lane_items
+                        WHERE state = 'blocked'
+                    ) AS blocked_count,
+                    (
+                        SELECT MIN(next_attempt_at)
+                        FROM lane_items
+                        WHERE state = 'blocked'
+                    ) AS next_blocked_expiry_at,
+                    (SELECT COUNT(*) FROM stalled) AS stalled_lane_count,
+                    (
+                        SELECT lane_key
+                        FROM stalled
+                        ORDER BY oldest_pending_at, lane_key
+                        LIMIT 1
+                    ) AS first_stalled_lane,
+                    (
+                        SELECT MIN(oldest_pending_at)
+                        FROM stalled
+                    ) AS oldest_stalled_at
                 """,
-                (timestamp,),
+                (timestamp, timestamp - stall_after),
             ).fetchone()
         return DispatchSnapshot(
             pending_count=(
@@ -510,7 +594,48 @@ class IngressLaneSpool:
                 )
                 else ""
             ),
+            blocked_count=(
+                int(snapshot_row["blocked_count"])
+                if snapshot_row is not None
+                else 0
+            ),
+            next_blocked_expiry_at=(
+                float(snapshot_row["next_blocked_expiry_at"])
+                if (
+                    snapshot_row is not None
+                    and snapshot_row["next_blocked_expiry_at"] is not None
+                )
+                else None
+            ),
+            stalled_lane_count=(
+                int(snapshot_row["stalled_lane_count"])
+                if snapshot_row is not None
+                else 0
+            ),
+            first_stalled_lane=(
+                str(snapshot_row["first_stalled_lane"])
+                if (
+                    snapshot_row is not None
+                    and snapshot_row["first_stalled_lane"] is not None
+                )
+                else ""
+            ),
+            oldest_stalled_seconds=(
+                max(0.0, timestamp - float(snapshot_row["oldest_stalled_at"]))
+                if (
+                    snapshot_row is not None
+                    and snapshot_row["oldest_stalled_at"] is not None
+                )
+                else 0.0
+            ),
         )
+
+    def expire_holds(self, *, now: float | None = None) -> int:
+        """Apply due hold transitions independently of dispatch capacity."""
+
+        timestamp = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            return self._expire_holds_tx(connection, timestamp)
 
     def reclaim_processing(self, *, now: float | None = None) -> int:
         """Make leases from a previous dispatcher process immediately runnable."""
@@ -620,19 +745,30 @@ class IngressLaneSpool:
         lease_owner: str,
         *,
         now: float | None = None,
+        hold_seconds: float | None = None,
     ) -> bool:
-        """Hold a lane head without timer-driven redispatch."""
+        """Hold a lane head briefly, then terminalize it without redispatch."""
 
         timestamp = time.time() if now is None else float(now)
+        hold_for = (
+            config.inbound_hold_seconds()
+            if hold_seconds is None
+            else max(0.1, float(hold_seconds))
+        )
         with self._connect() as connection:
             changed = connection.execute(
                 """
                 UPDATE lane_items
                 SET state = 'blocked', lease_owner = NULL, lease_until = NULL,
-                    updated_at = ?
+                    next_attempt_at = MIN(deadline_at, ?), updated_at = ?
                 WHERE seq = ? AND state = 'processing' AND lease_owner = ?
                 """,
-                (timestamp, int(seq), str(lease_owner)),
+                (
+                    timestamp + hold_for,
+                    timestamp,
+                    int(seq),
+                    str(lease_owner),
+                ),
             ).rowcount
         return changed == 1
 
