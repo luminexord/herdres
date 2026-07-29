@@ -21,15 +21,40 @@ def test_collapse_flag_default_off_env_on():
 
 # --- renderer -------------------------------------------------------------------
 
+_FORMATTED_RESPONSE = (
+    "First response line has **Bold result** and `inline()`.\n"
+    "Second response line has *italic detail* and "
+    "[reference](https://example.test/response).\n"
+    "Third response line makes the folded section meaningful."
+)
+_FORMATTED_PROMPT = (
+    "First prompt line has **Bold request** and `inline()`.\n"
+    "Second prompt line has *italic detail* and "
+    "[reference](https://example.test/prompt).\n"
+    "Third prompt line makes the folded section meaningful."
+)
+_FORMATTED_WORKLOG = (
+    "First worklog line has **Bold progress** and `inline()`.\n"
+    "Second worklog line has *italic detail* and "
+    "[reference](https://example.test/worklog).\n"
+    "Third worklog line makes the folded section meaningful."
+)
+
+
 def _turn_item(**extra):
-    item = {"kind": "turn", "user_text": "do the thing", "assistant_final_text": "All done. The result is ready."}
+    item = {
+        "kind": "turn",
+        "user_text": _FORMATTED_PROMPT,
+        "assistant_final_text": _FORMATTED_RESPONSE,
+        "worklog_text": _FORMATTED_WORKLOG,
+    }
     item.update(extra)
     return item
 
 
 def test_render_open_by_default():
     html = render_turn_item_html(_turn_item())
-    assert "All done." in html
+    assert "Bold result" in html
     # the Response is the open top-level body, not wrapped in a details card
     assert "<b>✅ Response</b><br><br>" in html
 
@@ -39,13 +64,23 @@ def test_render_collapsed_when_flagged():
     assert html.startswith(
         "<b>✅ Response</b>\n<blockquote expandable>"
     )
+    assert "<b>Bold result</b>" in html
+    assert "<code>inline()</code>" in html
+    assert "<i>italic detail</i>" in html
     assert (
-        "<blockquote expandable>All done. The result is ready.</blockquote>"
+        '<a href="https://example.test/response">reference</a>'
         in html
     )
-    assert html.count("All done. The result is ready.") == 1
+    assert (
+        '<a href="https://example.test/prompt">reference</a>'
+        in html
+    )
+    assert (
+        '<a href="https://example.test/worklog">reference</a>'
+        in html
+    )
+    assert html.count("First response line") == 1
     assert "<details" not in html
-    assert "<blockquote>do the thing</blockquote>" in html
 
 
 # --- the fold sweep in _sync_turns ---------------------------------------------
@@ -56,7 +91,7 @@ def _two_turn_payload():
         {"id": "turn-new", "worker_id": "w1", "worker_fingerprint": "fp1",
          "assistant_final_text": "New answer", "complete": True},
         {"id": "turn-old", "worker_id": "w1", "worker_fingerprint": "fp1",
-         "assistant_final_text": "Old answer text", "complete": True},
+         "assistant_final_text": _FORMATTED_RESPONSE, "complete": True},
     ]}
 
 
@@ -107,7 +142,13 @@ def test_superseded_final_gets_folded(monkeypatch):
     assert (
         "400",
         "<b>✅ Response</b>\n"
-        "<blockquote expandable>Old answer text</blockquote>",
+        "<blockquote expandable>"
+        "First response line has <b>Bold result</b> and "
+        "<code>inline()</code>.\n"
+        "Second response line has <i>italic detail</i> and "
+        '<a href="https://example.test/response">reference</a>.\n'
+        "Third response line makes the folded section meaningful."
+        "</blockquote>",
     ) in edited
     assert not any(mid == "501" for mid, _ in edited)                 # latest never folded
     assert state.message_bindings(store)["400"].get("folded") is True  # idempotency marker

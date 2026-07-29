@@ -21,11 +21,13 @@ from .rendering import (
     split_text_chunks,
     split_text_spans,
     table_continuation_header,
+    telegram_html,
     try_render_table,
     worker_label,
 )
 from .safe import canonical_text, sanitize_text
 from .telegram_delivery import (
+    DELIVERY_FORMAT_STATE_UPDATE_KEY,
     MESSAGE_TEXT_LIMIT,
     SPLIT_TEXT_LIMIT,
     TelegramClient,
@@ -69,6 +71,7 @@ RICH_STATE_UPDATE_KEY = "_herdres_rich_state_update"
 FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
 HRULE_RE = re.compile(r"^\s*([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 INLINE_CODE_RE = re.compile(r"`([^`\n]{1,300})`")
+_INLINE_LINK_SCHEMES = ("http://", "https://", "mailto:", "tg://")
 
 
 class PresentationContentError(RuntimeError):
@@ -79,15 +82,151 @@ def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
     return html.escape(sanitize_text(str(value or ""), max_chars), quote=False)
 
 
+def _replace_inline_links(
+    text: str,
+    link_spans: list[str],
+) -> str:
+    """Hold complete Markdown links in one forward, linear-time scan.
+
+    Parentheses inside a destination must balance; an escaped parenthesis is
+    literal URL content and does not affect that balance. Destinations with
+    whitespace or angle brackets stay literal because converting only part of
+    an ambiguous destination would create a confidently wrong link. Rejected
+    candidates consume the characters already inspected, so no suffix is
+    searched again.
+    """
+
+    rendered: list[str] = []
+    index = 0
+
+    while index < len(text):
+        if text[index] != "[":
+            rendered.append(text[index])
+            index += 1
+            continue
+        label_start = index
+        if label_start > 0 and text[label_start - 1] == "!":
+            rendered.append("[")
+            index += 1
+            continue
+
+        cursor = label_start + 1
+        label_end = -1
+        rejected_at = -1
+        nested_candidate = False
+        label_length = 0
+        while cursor < len(text):
+            char = text[cursor]
+            if char == "[":
+                rejected_at = cursor
+                nested_candidate = True
+                break
+            if char == "\n":
+                rejected_at = cursor
+                break
+            if char == "]":
+                if cursor + 1 < len(text) and text[cursor + 1] == "(":
+                    label_end = cursor
+                else:
+                    rejected_at = cursor
+                break
+            label_length += 1
+            if label_length > 300:
+                rejected_at = cursor
+                break
+            cursor += 1
+        if label_end < 0:
+            if rejected_at < 0:
+                rendered.append(text[label_start:])
+                break
+            if nested_candidate:
+                # The inner opener is a new candidate, not part of the
+                # rejected outer label. Process it next without searching any
+                # already-inspected suffix again; this preserves the existing
+                # unmatched-bracket behavior in linear time.
+                rendered.append(text[label_start:rejected_at])
+                index = rejected_at
+            else:
+                rendered.append(text[label_start : rejected_at + 1])
+                index = rejected_at + 1
+            continue
+        if label_length == 0:
+            rendered.append(text[label_start : label_end + 2])
+            index = label_end + 2
+            continue
+
+        cursor = label_end + 2
+        depth = 0
+        destination: list[str] = []
+        destination_length = 0
+        delimiter = -1
+        invalid = False
+        while cursor < len(text):
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < len(text):
+                escaped = text[cursor + 1]
+                if escaped in {"(", ")", "\\"}:
+                    destination_length += 1
+                    if destination_length <= 2000:
+                        destination.append(escaped)
+                    else:
+                        invalid = True
+                    cursor += 2
+                    continue
+            if char.isspace():
+                invalid = True
+            if text.startswith("&lt;", cursor) or text.startswith(
+                "&gt;", cursor
+            ):
+                invalid = True
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    delimiter = cursor
+                    break
+                depth -= 1
+            destination_length += 1
+            if destination_length <= 2000:
+                destination.append(char)
+            else:
+                invalid = True
+            cursor += 1
+
+        if delimiter < 0:
+            rendered.append(text[label_start:])
+            break
+        href = html.unescape("".join(destination))
+        if (
+            invalid
+            or depth
+            or not href.lower().startswith(_INLINE_LINK_SCHEMES)
+            or destination_length > 2000
+        ):
+            rendered.append(text[label_start : delimiter + 1])
+            index = delimiter + 1
+            continue
+
+        label = text[label_start + 1 : label_end]
+        safe_href = html.escape(href, quote=True)
+        link_spans.append(f'<a href="{safe_href}">{label}</a>')
+        rendered.append(f"\u0001{len(link_spans) - 1}\u0001")
+        index = delimiter + 1
+    return "".join(rendered)
+
+
 def _rich_inline(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
     text = _html_text(value, max_chars)
     code_spans: list[str] = []
+    link_spans: list[str] = []
 
     def hold_code(match: re.Match[str]) -> str:
         code_spans.append(f"<code>{html.escape(match.group(1), quote=False)}</code>")
         return f"\u0000{len(code_spans) - 1}\u0000"
 
     text = INLINE_CODE_RE.sub(hold_code, text)
+
+    text = _replace_inline_links(text, link_spans)
     text = re.sub(r"\*\*\*([^\n]+?)\*\*\*", r"<b><i>\1</i></b>", text)
     text = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", text)
@@ -95,6 +234,8 @@ def _rich_inline(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
     text = re.sub(r"~~([^\s~][^\n]*?)~~", r"<s>\1</s>", text)
     for index, code in enumerate(code_spans):
         text = text.replace(f"\u0000{index}\u0000", code)
+    for index, link in enumerate(link_spans):
+        text = text.replace(f"\u0001{index}\u0001", link)
     return text
 
 
@@ -431,7 +572,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
         # unsupported <details>/<footer> would make Telegram reject the whole
         # edit and fall back to an expanded plain rendering.
         body_html = "<br>".join(
-            _html_text(line, MAX_REPLY_CHARS)
+            _rich_inline(line, MAX_REPLY_CHARS)
             for line in sanitize_text(
                 assistant_final, MAX_REPLY_CHARS
             ).splitlines()
@@ -446,7 +587,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
         parts.append(response_html)
         if user_text:
             user_body = "<br>".join(
-                _html_text(line, MAX_REPLY_CHARS)
+                _rich_inline(line, MAX_REPLY_CHARS)
                 for line in sanitize_text(
                     user_text, MAX_REPLY_CHARS
                 ).splitlines()
@@ -457,7 +598,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
             )
         if worklog_text:
             worklog_body = "<br>".join(
-                _html_text(line, MAX_REPLY_CHARS)
+                _rich_inline(line, 900)
                 for line in sanitize_text(
                     worklog_text, WORKLOG_MAX_CHARS
                 ).splitlines()
@@ -805,27 +946,20 @@ def _client_for_token(client: TelegramClient, api_token: str | None) -> Telegram
     return client.with_token(token) if token else client
 
 
-def _readable_plain_text(html_text: str, fallback_text: str) -> str:
-    """Flatten rich HTML into the canonical readable Telegram body.
+def _readable_telegram_html(html_text: str, fallback_text: str) -> str:
+    """Preserve Telegram formatting while flattening unsupported structure.
 
-    ``html_to_plain`` renders table cells as `` | ``-separated columns and
-    table rows on separate lines. Prefer that rendering over a caller fallback
-    so the readable message and rich enhancement carry the same content.
+    ``telegram_html`` is an allowlist: supported sendMessage markup survives,
+    while tables, headings, lists and unknown tags become readable text before
+    Telegram sees them.  A caller fallback remains plain content and therefore
+    must be escaped before it enters the HTML-first transport ladder.
     """
 
-    source = str(html_text or "")
-    source = re.sub(r"<li\b[^>]*>", "- ", source, flags=re.IGNORECASE)
-    source = re.sub(
-        r"</(?:p|h[1-6]|pre|li|ul|ol|blockquote|details|footer|table)>",
-        "\n",
-        source,
-        flags=re.IGNORECASE,
+    rendered = telegram_html(html_text, limit=MAX_REPLY_CHARS).strip()
+    fallback = html.escape(
+        sanitize_text(str(fallback_text or ""), MAX_REPLY_CHARS).strip(),
+        quote=False,
     )
-    rendered = sanitize_text(
-        html_to_plain(source, limit=MAX_REPLY_CHARS),
-        MAX_REPLY_CHARS,
-    ).strip()
-    fallback = sanitize_text(str(fallback_text or ""), MAX_REPLY_CHARS).strip()
     return rendered or fallback
 
 
@@ -871,7 +1005,7 @@ def send_rich_message(
     require_single_operation: bool = False,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
-    fallback = _readable_plain_text(html_text, fallback_text)
+    fallback = _readable_telegram_html(html_text, fallback_text)
     if not fallback:
         return {
             "ok": False,
@@ -909,10 +1043,13 @@ def edit_rich_message(
     preserve_plain_html: bool = False,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
+    # Collapse edits use the same allowlist boundary as canonical sends:
+    # preserve expandable blockquotes, but turn unsupported builder markup
+    # such as <br> into the literal newlines accepted by Telegram.
     fallback = (
-        sanitize_text(str(html_text or ""), MAX_REPLY_CHARS).strip()
+        telegram_html(str(html_text or ""), limit=MAX_REPLY_CHARS).strip()
         if preserve_plain_html
-        else _readable_plain_text(html_text, fallback_text)
+        else _readable_telegram_html(html_text, fallback_text)
     )
     if not fallback:
         return {
@@ -1033,6 +1170,7 @@ def send_feed_item(
         )
     message_ids: list[str] = []
     formats: list[str] = []
+    format_state_updates: list[dict[str, Any]] = []
     last_result: dict[str, Any] = {}
     for index, html_part in enumerate(html_parts):
         result = send_rich_message(
@@ -1049,9 +1187,16 @@ def send_feed_item(
         last_result = result
         if not result.get("ok"):
             result["partial_message_ids"] = message_ids
+            if format_state_updates:
+                result[DELIVERY_FORMAT_STATE_UPDATE_KEY] = (
+                    format_state_updates
+                )
             return result
         message_ids.extend(split_legacy_message_ids(result))
         formats.append(str(result.get("format") or ""))
+        update = result.get(DELIVERY_FORMAT_STATE_UPDATE_KEY)
+        if isinstance(update, dict):
+            format_state_updates.append(update)
     combined = {
         "ok": True,
         "format": "rich-split",
@@ -1059,6 +1204,8 @@ def send_feed_item(
         "message_id": message_ids[0] if message_ids else str(last_result.get("message_id") or ""),
         "message_ids": message_ids,
     }
+    if format_state_updates:
+        combined[DELIVERY_FORMAT_STATE_UPDATE_KEY] = format_state_updates
     return combined
 
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import html
 import re
+from html.parser import HTMLParser
 from typing import Any, Callable
 
 from .safe import canonical_text, compact_ws, html_escape, sanitize_text
@@ -26,6 +28,175 @@ PINNED_STATUS_SEVERITY = {
     "idle": 3,
     "unknown": 1,
 }
+
+_TELEGRAM_HTML_INLINE_TAGS = frozenset(
+    {"a", "b", "code", "em", "i", "s", "strong", "u"}
+)
+_TELEGRAM_HTML_BLOCK_TAGS = frozenset({"blockquote", "pre"})
+_TELEGRAM_HTML_TAGS = _TELEGRAM_HTML_INLINE_TAGS | _TELEGRAM_HTML_BLOCK_TAGS
+_TELEGRAM_LINK_SCHEMES = ("http://", "https://", "mailto:", "tg://")
+_TELEGRAM_HTML_LINE_END_TAGS = frozenset(
+    {
+        "details",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "ol",
+        "p",
+        "summary",
+        "table",
+        "ul",
+    }
+)
+
+
+class _TelegramHTMLSanitizer(HTMLParser):
+    """Allow only Telegram's sendMessage HTML while preserving readable text.
+
+    Unsupported containers are unwrapped rather than passed to Telegram. Their
+    presentation-only block structure is retained as newlines, and native
+    tables retain the canonical `` | `` cell separator.  The renderer escapes
+    user content before it reaches this parser; the parser escapes all text
+    again so malformed/raw ``<`` and ``&`` cannot become markup accidentally.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.output: list[str] = []
+        self.open_tags: list[str] = []
+        self.table_cell_index = 0
+
+    def _append_newline(self) -> None:
+        if self.output and not self.output[-1].endswith("\n"):
+            self.output.append("\n")
+
+    def _inside_pre(self) -> bool:
+        return "pre" in self.open_tags
+
+    def _append_literal_tag(self) -> None:
+        self.output.append(html.escape(self.get_starttag_text() or "", quote=False))
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        name = tag.lower()
+        if self._inside_pre() and name != "code":
+            self._append_literal_tag()
+            return
+        if name in _TELEGRAM_HTML_TAGS:
+            rendered_attrs = ""
+            if name == "a":
+                href = next(
+                    (
+                        value
+                        for key, value in attrs
+                        if key.lower() == "href" and value is not None
+                    ),
+                    None,
+                )
+                if not href:
+                    return
+                decoded_href = html.unescape(href)
+                if (
+                    any(char.isspace() for char in decoded_href)
+                    or "<" in decoded_href
+                    or ">" in decoded_href
+                    or not decoded_href.lower().startswith(
+                        _TELEGRAM_LINK_SCHEMES
+                    )
+                ):
+                    # Defence in depth: Telegram currently strips unsafe
+                    # schemes itself, but canonical output should not depend
+                    # on that provider behaviour remaining unchanged.
+                    return
+                rendered_attrs = (
+                    f' href="{html.escape(decoded_href, quote=True)}"'
+                )
+            elif name == "blockquote" and any(
+                key.lower() == "expandable" for key, _value in attrs
+            ):
+                rendered_attrs = " expandable"
+            self.output.append(f"<{name}{rendered_attrs}>")
+            self.open_tags.append(name)
+            return
+        if name == "br":
+            self._append_newline()
+        elif name == "li":
+            self.output.append("- ")
+        elif name == "tr":
+            self.table_cell_index = 0
+        elif name in {"td", "th"}:
+            if self.table_cell_index:
+                self.output.append(" | ")
+            self.table_cell_index += 1
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if self._inside_pre():
+            self._append_literal_tag()
+            return
+        self.handle_starttag(tag, attrs)
+        name = tag.lower()
+        if name in _TELEGRAM_HTML_TAGS:
+            self.handle_endtag(name)
+
+    def handle_endtag(self, tag: str) -> None:
+        name = tag.lower()
+        if self._inside_pre() and name not in {"code", "pre"}:
+            self.output.append(html.escape(f"</{name}>", quote=False))
+            return
+        if name in self.open_tags:
+            # Balance malformed nesting deterministically. Telegram rejects the
+            # whole message for one unclosed/misnested supported tag.
+            while self.open_tags:
+                opened = self.open_tags.pop()
+                self.output.append(f"</{opened}>")
+                if opened == name:
+                    break
+            return
+        if name == "tr" or name in _TELEGRAM_HTML_LINE_END_TAGS:
+            self._append_newline()
+
+    def handle_data(self, data: str) -> None:
+        self.output.append(html.escape(data, quote=False))
+
+    def handle_entityref(self, name: str) -> None:
+        self.output.append(html.escape(html.unescape(f"&{name};"), quote=False))
+
+    def handle_charref(self, name: str) -> None:
+        self.output.append(html.escape(html.unescape(f"&#{name};"), quote=False))
+
+    def handle_comment(self, _data: str) -> None:
+        return
+
+    def finish(self) -> str:
+        while self.open_tags:
+            self.output.append(f"</{self.open_tags.pop()}>")
+        return "".join(self.output)
+
+
+def telegram_html(value: Any, *, limit: int = 64000) -> str:
+    """Return balanced allowlisted Telegram HTML with lossless plain fallback.
+
+    Only Telegram-supported tags survive. Unknown tags are unwrapped, tables
+    become pipe-separated rows, headings/lists retain their line treatment,
+    and markup inside ``pre`` is escaped as code (apart from its optional
+    supported ``code`` wrapper). Attributes are dropped except ``href`` on
+    links and the boolean ``expandable`` blockquote marker.
+    """
+
+    parser = _TelegramHTMLSanitizer()
+    parser.feed(sanitize_text(str(value or ""), limit))
+    parser.close()
+    # Do not truncate after balancing: escaping can expand the source and a
+    # second cut could split an entity or discard the generated closing tags.
+    return parser.finish()
 
 
 def normalized_status(value: Any) -> str:
