@@ -295,3 +295,139 @@ def test_bot_api_429_carries_exact_method_and_retry_hint(
 
     assert raised.value.retry_after == 6
     assert raised.value.method == "editForumTopic"
+
+
+def test_send_voice_http_429_carries_method_and_retry_hint(
+    tmp_path, monkeypatch
+):
+    voice = tmp_path / "reply.ogg"
+    voice.write_bytes(b"OggS")
+    payload = json.dumps(
+        {
+            "ok": False,
+            "error_code": 429,
+            "description": "Too Many Requests: retry after 8",
+            "parameters": {"retry_after": 8},
+        }
+    ).encode()
+
+    def limited(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "https://api.telegram.invalid",
+            429,
+            "Too Many Requests",
+            hdrs=None,
+            fp=io.BytesIO(payload),
+        )
+
+    monkeypatch.setattr(
+        telegram_delivery.urllib.request, "urlopen", limited
+    )
+
+    with pytest.raises(RateLimited) as raised:
+        TelegramClient(token="test").send_voice("-100", voice)
+
+    assert raised.value.retry_after == 8
+    assert raised.value.method == "sendVoice"
+
+
+def test_send_voice_json_429_carries_method_and_retry_hint(
+    tmp_path, monkeypatch
+):
+    voice = tmp_path / "reply.ogg"
+    voice.write_bytes(b"OggS")
+    payload = json.dumps(
+        {
+            "ok": False,
+            "error_code": 429,
+            "description": "Too Many Requests: retry after 9",
+            "parameters": {"retry_after": 9},
+        }
+    ).encode()
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return payload
+
+    monkeypatch.setattr(
+        telegram_delivery.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+
+    with pytest.raises(RateLimited) as raised:
+        TelegramClient(token="test").send_voice("-100", voice)
+
+    assert raised.value.retry_after == 9
+    assert raised.value.method == "sendVoice"
+
+
+def test_voice_batch_rate_limit_stops_and_keeps_accepted_ids(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        source_sync.speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+    monkeypatch.setattr(
+        source_sync.speech,
+        "speech_request",
+        lambda _operation, payload: {
+            "ok": True,
+            "path": payload["dest"],
+        },
+    )
+
+    class PartialVoice:
+        def __init__(self):
+            self.calls = 0
+
+        def send_voice(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {"ok": True, "message_id": "801"}
+            raise RateLimited(
+                5,
+                "Too Many Requests: retry after 5",
+                method="sendVoice",
+            )
+
+    telegram = PartialVoice()
+    store = _store()
+    result = source_sync._execute_exact_provider_operation(
+        telegram,
+        store=store,
+        mutation=source_sync._provider_mutation(
+            "telegram.send_voice_batch",
+            reason=(
+                "telegram.send_voice_batch: partial acceptance "
+                "backpressure regression"
+            ),
+            args=(
+                ("first", "second", "must not run"),
+                "turn-1",
+                "-100",
+                "77",
+                "42",
+            ),
+        ),
+    )
+
+    assert telegram.calls == 2
+    assert result["ok"] is False
+    assert result["status"] == "telegram_rate_limited"
+    assert result["method"] == "sendVoice"
+    assert result["retry_after"] == 5
+    assert result["accepted_message_ids"] == ["801"]
+    events = store["telegram"]["rate_limit_backpressure"]["events"]
+    assert len(events) == 1
+    assert events[0]["method"] == "sendVoice"
+    assert events[0]["capability"] == "telegram.send_voice_batch"
+    assert events[0]["outcome"] == "not_retried_message_send"

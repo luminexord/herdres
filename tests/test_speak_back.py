@@ -12,7 +12,10 @@ from unittest.mock import patch
 import herdres
 from herdres_connector import source_sync, speech, state
 from herdres_connector.source_sync import SyncRuntime
-from herdres_connector.telegram_delivery import TelegramClient
+from herdres_connector.telegram_delivery import (
+    RateLimited,
+    TelegramClient,
+)
 
 from test_source_only import (
     REQUEST_ID,
@@ -219,6 +222,64 @@ def test_speak_seam_chunks_long_reply_into_multiple_notes(monkeypatch):
     _run_turns(store, long_item, runtime)
     assert len(telegram.voice_notes) >= 2                       # spoken as several voice notes
     assert len(entry.get("voice_reply_message_ids") or []) == len(telegram.voice_notes)  # all recorded
+
+
+def test_speak_seam_keeps_ids_accepted_before_batch_rate_limit(
+    tmp_path, monkeypatch
+):
+    store, entry = _worker_store(
+        monkeypatch, speak_next_reply=True
+    )
+    entry_key = next(iter(store["panes"]))
+    monkeypatch.setattr(
+        speech,
+        "speech_reply_chunks",
+        lambda _text: ["first", "second", "must not run"],
+    )
+    monkeypatch.setattr(
+        speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+    monkeypatch.setattr(
+        speech,
+        "speech_request",
+        lambda _operation, payload: {
+            "ok": True,
+            "path": payload["dest"],
+        },
+    )
+
+    class PartialVoice(FakeTelegram):
+        def send_voice(self, *args, **kwargs):
+            if self.voice_notes:
+                raise RateLimited(
+                    5,
+                    "Too Many Requests: retry after 5",
+                    method="sendVoice",
+                )
+            return super().send_voice(*args, **kwargs)
+
+    telegram = PartialVoice()
+    current = source_sync._speak_reply(
+        store,
+        _final_item(),
+        entry,
+        entry_key,
+        SyncRuntime(
+            FakeTendwire(), telegram, with_outbox=False
+        ),
+        chat_id="-100",
+        thread_id="77",
+        reply_to="42",
+    )
+
+    assert len(telegram.voice_notes) == 1
+    assert current["voice_reply_message_ids"] == ["900"]
+    events = store["telegram"]["rate_limit_backpressure"]["events"]
+    assert len(events) == 1
+    assert events[0]["method"] == "sendVoice"
+    assert events[0]["outcome"] == "not_retried_message_send"
 
 
 def test_speak_seam_offlock_synth_no_clobber(tmp_path, monkeypatch):

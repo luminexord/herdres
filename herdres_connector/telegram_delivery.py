@@ -316,7 +316,29 @@ class TelegramClient:
         except Exception as exc:  # noqa: BLE001
             raise TelegramError(sanitize_text(str(exc), 300)) from exc
         if not isinstance(data, dict) or not data.get("ok"):
-            raise TelegramError(sanitize_text((data or {}).get("description") or "Telegram sendVoice error", 300))
+            error = data if isinstance(data, dict) else {}
+            params = (
+                error.get("parameters")
+                if isinstance(error.get("parameters"), dict)
+                else {}
+            )
+            if str(error.get("error_code") or "") == "429":
+                raise RateLimited(
+                    int(params.get("retry_after") or 1),
+                    sanitize_text(
+                        error.get("description")
+                        or "Telegram rate limited",
+                        300,
+                    ),
+                    method="sendVoice",
+                )
+            raise TelegramError(
+                sanitize_text(
+                    error.get("description")
+                    or "Telegram sendVoice error",
+                    300,
+                )
+            )
         result = data.get("result") or {}
         return {"ok": True, "message_id": str(result.get("message_id") or "0")}
 

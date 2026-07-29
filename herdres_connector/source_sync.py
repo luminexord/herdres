@@ -272,8 +272,9 @@ def _telegram_rate_limit_failure(
     retry_after: int,
     retries: int,
     events: list[dict[str, Any]],
+    accepted_message_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    return {
+    result = {
         "ok": False,
         "status": status,
         "error": compact_ws(error, 300),
@@ -284,6 +285,11 @@ def _telegram_rate_limit_failure(
         "retry_exhausted": status == "telegram_rate_limit_exhausted",
         _PROVIDER_BACKPRESSURE_KEY: events,
     }
+    if accepted_message_ids:
+        result["accepted_message_ids"] = list(
+            accepted_message_ids
+        )
+    return result
 
 
 def _record_telegram_backpressure(
@@ -955,6 +961,16 @@ def _build_offlock_executor() -> Any:
                     )
                     if sent.get("ok") and sent.get("message_id"):
                         ids.append(str(sent.get("message_id")))
+                except RateLimited as exc:
+                    return {
+                        "ok": False,
+                        "status": "telegram_voice_batch_rate_limited",
+                        "error": compact_ws(str(exc), 300),
+                        "rate_limited": True,
+                        "retry_after": exc.retry_after,
+                        "method": str(exc.method or "sendVoice"),
+                        "accepted_message_ids": ids,
+                    }
                 except Exception as exc:
                     print(
                         f"herdres speak-reply chunk failed: {exc}",
@@ -1000,6 +1016,7 @@ def _build_offlock_executor() -> Any:
             mutation.capability.removeprefix("telegram."),
         )
         while True:
+            rate_limited_result: Any = None
             try:
                 result = invoke_provider_mutation(provider, mutation)
                 rate_limit = _telegram_rate_limit_from_result(result)
@@ -1011,6 +1028,7 @@ def _build_offlock_executor() -> Any:
                     return result
                 retry_after, error, result_method = rate_limit
                 method = result_method or default_method
+                rate_limited_result = result
             except RateLimited as exc:
                 retry_after = exc.retry_after
                 error = compact_ws(str(exc), 300)
@@ -1025,6 +1043,17 @@ def _build_offlock_executor() -> Any:
                 "outcome": "",
             }
             events.append(event)
+            accepted_message_ids = (
+                tuple(
+                    str(message_id)
+                    for message_id in rate_limited_result.get(
+                        "accepted_message_ids", ()
+                    )
+                    if str(message_id)
+                )
+                if isinstance(rate_limited_result, dict)
+                else ()
+            )
             if mutation.capability in _TELEGRAM_NO_RETRY_CAPABILITIES:
                 event["outcome"] = "not_retried_message_send"
                 return _telegram_rate_limit_failure(
@@ -1034,6 +1063,7 @@ def _build_offlock_executor() -> Any:
                     retry_after=retry_after,
                     retries=retries,
                     events=events,
+                    accepted_message_ids=accepted_message_ids,
                 )
             if retries >= _TELEGRAM_RATE_LIMIT_MAX_RETRIES:
                 event["outcome"] = "retry_exhausted"
@@ -6180,7 +6210,11 @@ def _speak_reply(
             api_token=api_token,
         ),
     )
-    voice_ids = execution.result
+    voice_ids = (
+        execution.result.get("accepted_message_ids", ())
+        if isinstance(execution.result, dict)
+        else execution.result
+    )
     resolution = execution.resolution
     if resolution.disposition == _OFFLOCK_APPLY:
         target = resolution.entry
