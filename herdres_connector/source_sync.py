@@ -22,7 +22,6 @@ from .rich_delivery import (
     feed_item_requires_send_split,
     prepare_turn_delivery_parts,
     render_feed_item_html,
-    rich_message_send_enabled,
     send_feed_item,
     send_turn_delivery_part,
     split_legacy_message_ids,
@@ -6046,7 +6045,7 @@ def _stage_final_plan(
     feed_item = _turn_feed_item(item, entry)
     parts = prepare_turn_delivery_parts(
         feed_item,
-        rich_transport=rich_message_send_enabled(_telegram_state(store)),
+        rich_transport=False,
     )
     if not parts:
         raise _TurnContentError(
@@ -8310,9 +8309,7 @@ def _drain_post_ack_reconciliations(
             feed_item = _turn_feed_item(item, entry)
             plans = prepare_turn_delivery_parts(
                 feed_item,
-                rich_transport=rich_message_send_enabled(
-                    _telegram_state(store)
-                ),
+                rich_transport=False,
             )
             ordinal = int(obligation.get("part_ordinal") or 0)
             if not 0 <= ordinal < len(plans):
@@ -8968,7 +8965,7 @@ def _drain_turn_final(
             feed_item = _turn_feed_item(item, entry)
             plans = prepare_turn_delivery_parts(
                 feed_item,
-                rich_transport=rich_message_send_enabled(_telegram_state(store)),
+                rich_transport=False,
             )
             if (
                 ordinal >= len(plans)

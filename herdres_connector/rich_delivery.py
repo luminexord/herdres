@@ -626,9 +626,15 @@ def prepare_turn_delivery_parts(
     item: dict[str, Any],
     *,
     live: bool = False,
-    rich_transport: bool = True,
+    rich_transport: bool = False,
 ) -> list[dict[str, Any]]:
-    """Plan deterministic exact spans for bounded one-operation Telegram parts."""
+    """Plan deterministic exact spans for bounded one-operation Telegram parts.
+
+    Production is plain-only while the paired rich-message lifecycle is
+    deferred to #207. ``rich_transport=True`` deliberately remains an isolated
+    planning surface for that follow-up and its tests; production callers must
+    not select it from Telegram capability state.
+    """
     if live or str(item.get("kind") or "").lower() != "turn":
         return []
     fields = _canonical_turn_fields(item)
@@ -652,8 +658,8 @@ def prepare_turn_delivery_parts(
     ):
         return [full_part]
 
-    # Plain is the canonical delivery even when a bounded rich table twin will
-    # follow, so every deterministic part must fit one sendMessage.
+    # Plain is the canonical delivery, so every deterministic part must fit one
+    # sendMessage.
     source_limit = TURN_DELIVERY_PLAIN_SOURCE_CHARS
     user_limit = max(1, source_limit)
     final_limit = max(1, source_limit)
@@ -903,7 +909,7 @@ def send_turn_delivery_part(
     if not _turn_delivery_part_is_bounded(
         item,
         part,
-        rich_transport=rich_message_send_enabled(telegram),
+        rich_transport=False,
     ):
         raise ValueError("turn delivery part exceeds Telegram presentation limits")
     html_text = render_turn_delivery_part_html(item, part)
@@ -935,7 +941,7 @@ def edit_turn_delivery_part(
     if not _turn_delivery_part_is_bounded(
         item,
         part,
-        rich_transport=rich_message_send_enabled(telegram),
+        rich_transport=False,
     ):
         raise ValueError("turn delivery part exceeds Telegram presentation limits")
     html_text = render_turn_delivery_part_html(item, part)

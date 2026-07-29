@@ -2715,6 +2715,33 @@ def test_table_delivery_operation_budget_matches_single_plain_write(monkeypatch)
     )
 
 
+def test_dormant_rich_state_does_not_fragment_plain_delivery_budget(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    text = "\n\n".join("x" for _ in range(1800))
+    assert len(text) == 5_398
+    tendwire = TurnFinalTendwire(
+        _turn_row("turn-plain-planning", "twrev1.plainplanning", text)
+    )
+    telegram = DeletingTelegram()
+    store = _store()
+    store["telegram"]["rich_messages"] = {"supported": "yes"}
+
+    result = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=100)
+    )
+
+    assert result["tendwire_turn_final"]["operations"] == 2
+    assert result["tendwire_turn_final"]["acked"] == 2
+    assert len(telegram.sent) == 2
+    assert not any(
+        method == "sendRichMessage"
+        for method, _payload, _token in telegram.api_calls
+    )
+
+
 def test_incomplete_row_isolated_while_working_final_pins_and_attention_continue(monkeypatch):
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "1")
     monkeypatch.setenv("HERDRES_PINNED_ACCOUNT", "1")

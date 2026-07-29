@@ -243,7 +243,9 @@ def test_rich_capability_does_not_weaken_canonical_plain_part_bound():
         "assistant_final_text": "f" * 15_799,
     }
 
-    rich_parts = prepare_turn_delivery_parts(item)
+    # Rich planning is retained only as an explicit #207 surface. Production
+    # defaults to the identical plain profile used by the sole sender.
+    rich_parts = prepare_turn_delivery_parts(item, rich_transport=True)
     plain_parts = prepare_turn_delivery_parts(item, rich_transport=False)
 
     assert rich_parts == plain_parts
@@ -267,6 +269,26 @@ def test_rich_capability_does_not_weaken_canonical_plain_part_bound():
         <= RICH_FALLBACK_MAX_CHARS
         for part in plain_parts
     )
+
+
+def test_production_planner_ignores_dormant_rich_capability_profile():
+    text = "\n\n".join("x" for _ in range(1800))
+    assert len(text) == 5_398
+    item = {
+        "kind": "turn",
+        "user_text": "",
+        "assistant_final_text": text,
+    }
+
+    production = prepare_turn_delivery_parts(item)
+    plain = prepare_turn_delivery_parts(item, rich_transport=False)
+    isolated_rich = prepare_turn_delivery_parts(
+        item, rich_transport=True
+    )
+
+    assert production == plain
+    assert len(production) == 2
+    assert len(isolated_rich) == 7
 
 
 def test_plain_canonical_plan_keeps_content_lossless():
