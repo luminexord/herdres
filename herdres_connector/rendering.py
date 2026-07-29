@@ -93,7 +93,7 @@ def _inline_markdown_html(text: str) -> str:
 
 # A GitHub-style pipe-table delimiter row, e.g. ``| :--- | ---: |`` or ``---|---``.
 _TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*$")
-_TABLE_MAX_ROWS = 40
+RICH_TABLE_MAX_ROWS = 40
 
 
 def _looks_like_table_row(line: str) -> bool:
@@ -142,13 +142,18 @@ def _table_cells(line: str) -> list[str]:
     return cells
 
 
-def _render_table_html(rows: list[list[str]], *, cell_html: "Callable[[str], str]") -> str:
+def _render_table_html(
+    rows: list[list[str]],
+    *,
+    cell_html: "Callable[[str], str]",
+    max_rows: int | None,
+) -> str:
     """Render parsed rows (first = header) as a native ``<table bordered striped>`` — the Telegram
     rich-message path turns this into a real ``PageBlockTable`` (native table), far better than a
     monospace box. Cell content is rendered rich (bold/code/links) via ``cell_html``."""
-    trimmed = rows[:_TABLE_MAX_ROWS]
-    width = max(len(row) for row in trimmed)
-    grid = [row + [""] * (width - len(row)) for row in trimmed]
+    selected = rows if max_rows is None else rows[:max_rows]
+    width = max(len(row) for row in selected)
+    grid = [row + [""] * (width - len(row)) for row in selected]
     header, body = grid[0], grid[1:]
     html_rows = ["<tr>" + "".join(f"<th>{cell_html(cell)}</th>" for cell in header) + "</tr>"]
     html_rows.extend(
@@ -163,12 +168,15 @@ def try_render_table(
     *,
     limit: int = 12000,
     cell_html: "Callable[[str], str] | None" = None,
+    max_rows: int | None = None,
 ) -> tuple[str, int] | None:
     """If a GitHub-style pipe table starts at ``lines[i]`` (a row immediately followed by a
     ``---|---`` delimiter), render the whole block to a native ``<table>`` and return
     ``(html, next_index)``; otherwise ``None``. Shared by both markdown engines; each passes its own
     ``cell_html`` inline renderer so cell content matches the surrounding formatting. ``limit`` is
-    accepted for signature stability (the native table isn't length-padded)."""
+    accepted for signature stability (the native table isn't length-padded).
+    Canonical rendering is lossless by default. The deferred rich enhancement
+    may explicitly pass ``RICH_TABLE_MAX_ROWS`` as its presentation cap."""
     if not (
         _looks_like_table_row(lines[i])
         and i + 1 < len(lines)
@@ -187,7 +195,148 @@ def try_render_table(
         j += 1
     if not any(cell.strip() for row in (header, *data_rows) for cell in row):
         return None  # all-empty header/body → leave as plain text, not an empty table
-    return _render_table_html([header, *data_rows], cell_html=render_cell), j
+    return (
+        _render_table_html(
+            [header, *data_rows],
+            cell_html=render_cell,
+            max_rows=max_rows,
+        ),
+        j,
+    )
+
+
+def _markdown_table_blocks(
+    value: Any,
+) -> list[tuple[int, int, int, str]]:
+    """Return ``(start, data_start, end, header)`` source ranges.
+
+    The header includes the Markdown header and delimiter rows. These ranges
+    let canonical delivery keep table rows atomic and repeat the header when a
+    table continues in another Telegram message.
+    """
+
+    text = canonical_text(value)
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    blocks: list[tuple[int, int, int, str]] = []
+    index = 0
+    while index < len(lines):
+        rendered = try_render_table(lines, index)
+        if rendered is None:
+            index += 1
+            continue
+        _html, next_index = rendered
+        data_index = min(index + 2, next_index)
+        header = "".join(lines[index:data_index])
+        if header and not header.endswith(("\n", "\r")):
+            header += "\n"
+        blocks.append(
+            (
+                offsets[index],
+                offsets[data_index],
+                offsets[next_index],
+                header,
+            )
+        )
+        index = next_index
+    return blocks
+
+
+def split_table_aware_spans(
+    value: Any,
+    *,
+    limit: int = FINAL_CHUNK_SOURCE_CHARS,
+) -> list[tuple[int, int]]:
+    """Split losslessly, preferring complete Markdown table rows.
+
+    Complete rows stay atomic whenever they fit.  An individual row or header
+    may itself exceed the transport planning limit, though; in that case
+    losslessness outranks row atomicity and only that oversized source range is
+    split at the ordinary Markdown-friendly boundary.
+    """
+
+    text = canonical_text(value)
+    size = int(limit)
+    if size <= 0:
+        raise ValueError("split limit must be positive")
+    if not text:
+        return []
+    blocks = _markdown_table_blocks(text)
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < len(text):
+        hard_end = min(len(text), start + size)
+        end = _preferred_span_end(text, start, hard_end, size)
+        for block_start, data_start, block_end, _header in blocks:
+            if not block_start < end < block_end:
+                continue
+            row_boundaries = [
+                match.end()
+                for match in re.finditer(r"\r\n|\n|\r", text)
+                if data_start < match.end() <= block_end
+            ]
+            safe = [
+                boundary
+                for boundary in row_boundaries
+                if start < boundary <= end
+            ]
+            if safe:
+                end = max(safe)
+                break
+            if start < block_start:
+                end = block_start
+                break
+            following = [
+                boundary
+                for boundary in row_boundaries
+                if boundary > start
+            ]
+            if not following or following[0] - start > size:
+                # Tracking whole rows is a readability preference, not a
+                # license to reject valid content.  When one row cannot fit,
+                # keep the exact source span selected by the generic splitter;
+                # later spans continue from this exact code-point boundary.
+                end = _preferred_span_end(
+                    text, start, hard_end, size
+                )
+                if end <= start:
+                    end = hard_end
+                break
+            end = following[0]
+            break
+        if end <= start:
+            end = hard_end
+        spans.append((start, end))
+        start = end
+    return spans
+
+
+def table_continuation_header(
+    value: Any,
+    start: int,
+    *,
+    planning_limit: int,
+) -> str:
+    """Return the header to repeat when ``start`` continues a table."""
+
+    text = canonical_text(value)
+    limit = int(planning_limit)
+    if limit <= 0:
+        raise ValueError("planning limit must be positive")
+    for block_start, data_start, block_end, header in _markdown_table_blocks(
+        text
+    ):
+        if data_start <= start < block_end and start != block_start:
+            # An oversized header is itself being delivered losslessly across
+            # parts.  Repeating it would make every data-row continuation
+            # exceed the same bound, so that specific table degrades to plain
+            # source continuation instead.
+            if len(header) > limit:
+                return ""
+            return header
+    return ""
 
 
 def markdownish_to_html(value: Any, *, limit: int = 12000) -> str:

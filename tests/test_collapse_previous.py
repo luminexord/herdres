@@ -1,5 +1,5 @@
 """Collapse-previous-responses (monolith port, first time working in source mode): superseded finals
-get their Response folded into a closed <details> so only the newest answer stays expanded. Opt-in via
+get their Response folded into an expandable blockquote so only the newest answer stays expanded. Opt-in via
 HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS (the user's env sets =1)."""
 from __future__ import annotations
 
@@ -36,10 +36,16 @@ def test_render_open_by_default():
 
 def test_render_collapsed_when_flagged():
     html = render_turn_item_html(_turn_item(collapse_response=True))
-    assert html.startswith("<details><summary>✅")         # Response card is CLOSED (no ` open` attr)
-    assert "<details open><summary>✅" not in html          # (the prompt section may be open — that's fine)
-    assert "Response" in html
-    assert "All done." in html                             # preview and/or body retain the text
+    assert html.startswith(
+        "<b>✅ Response</b>\n<blockquote expandable>"
+    )
+    assert (
+        "<blockquote expandable>All done. The result is ready.</blockquote>"
+        in html
+    )
+    assert html.count("All done. The result is ready.") == 1
+    assert "<details" not in html
+    assert "<blockquote>do the thing</blockquote>" in html
 
 
 # --- the fold sweep in _sync_turns ---------------------------------------------
@@ -69,9 +75,15 @@ def _folded_store(monkeypatch):
         topic_id="77",
     )
     worker["last_clean_message_id"] = "501"  # the NEW final's message (never folded)
-    worker["last_clean_hash"] = "irrelevant"
+    worker["last_clean_message_ids"] = ["501"]
+    worker["last_turn_id"] = "turn-new"
+    new_hash = source_sync._turn_content_hash(
+        _two_turn_payload()["turns"][0], "final"
+    )
+    worker["last_clean_hash"] = new_hash
+    worker["last_clean_bot_kind"] = MANAGER_BOT_KIND
     # both turns already delivered + bound (the sweep edits the OLD one)
-    state.mark_delivered(store, "final:turn-new:whatever", {"worker_id": "w1", "turn_id": "turn-new"})
+    state.mark_delivered(store, f"final:turn-new:{new_hash}", {"worker_id": "w1", "turn_id": "turn-new"})
     state.mark_delivered(store, "final:turn-old:whatever", {"worker_id": "w1", "turn_id": "turn-old"})
     state.bind_message_to_worker(store, "400", worker, topic_id="77", kind="final", turn_id="turn-old", bot_kind=MANAGER_BOT_KIND)
     state.bind_message_to_worker(store, "501", worker, topic_id="77", kind="final", turn_id="turn-new", bot_kind=MANAGER_BOT_KIND)
@@ -89,9 +101,14 @@ def _run(store, monkeypatch, flag="1", telegram=None):
 def test_superseded_final_gets_folded(monkeypatch):
     store = _folded_store(monkeypatch)
     telegram = _run(store, monkeypatch)
-    # the OLD message (400) was edited into a collapsed rendering
+    # The OLD message is actually collapsed, contains its answer exactly once,
+    # and uses only markup supported by sendMessage/editMessageText.
     edited = [(mid, html) for _chat, mid, html in telegram.edited]
-    assert any(mid == "400" and "<details><summary>" in html and "Old answer text" in html for mid, html in edited)
+    assert (
+        "400",
+        "<b>✅ Response</b>\n"
+        "<blockquote expandable>Old answer text</blockquote>",
+    ) in edited
     assert not any(mid == "501" for mid, _ in edited)                 # latest never folded
     assert state.message_bindings(store)["400"].get("folded") is True  # idempotency marker
 
@@ -101,6 +118,30 @@ def test_fold_idempotent_second_sweep_skips(monkeypatch):
     _run(store, monkeypatch)
     telegram2 = _run(store, monkeypatch)                  # second sweep
     assert not any(mid == "400" for _c, mid, _h in telegram2.edited)  # already folded -> no re-edit
+
+
+def test_readable_noncollapsed_fallback_is_never_marked_folded(
+    monkeypatch,
+):
+    store = _folded_store(monkeypatch)
+
+    class PlainFallbackTelegram(FakeTelegram):
+        def with_token(self, _token):
+            return self
+
+        def edit_message(self, chat_id, message_id, html):
+            self.edited.append((chat_id, str(message_id), html))
+            return {
+                "ok": True,
+                "message_id": str(message_id),
+                "format": "plain",
+            }
+
+    _run(store, monkeypatch, telegram=PlainFallbackTelegram())
+
+    binding = state.message_bindings(store)["400"]
+    assert binding.get("folded") is None
+    assert binding["fold_attempts"] == 1
 
 
 def test_fold_topic_not_found_never_tombstones_rebound_live_topic(
@@ -113,6 +154,23 @@ def test_fold_topic_not_found_never_tombstones_rebound_live_topic(
     entry["topic_id"] = "16000"
 
     class TopicMissingEditTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.edit_attempts = 0
+
+        def with_token(self, _token):
+            return self
+
+        def edit_message(self, _chat_id, message_id, _html):
+            self.edit_attempts += 1
+            return {
+                "ok": False,
+                "message_id": str(message_id),
+                "kind": "topic_not_found",
+                "topic_missing": True,
+                "error": "Bad Request: message thread not found",
+            }
+
         def api(self, method, payload):
             if method == "editMessageText":
                 raise TelegramError(
@@ -120,13 +178,18 @@ def test_fold_topic_not_found_never_tombstones_rebound_live_topic(
                 )
             return super().api(method, payload)
 
+    telegram = TopicMissingEditTelegram()
     _run(
         store,
         monkeypatch,
-        telegram=TopicMissingEditTelegram(),
+        telegram=telegram,
     )
+    assert telegram.edit_attempts == 1
+    _run(store, monkeypatch, telegram=telegram)
 
-    assert binding["folded"] is True
+    assert binding.get("folded") is None
+    assert binding["fold_unavailable"] is True
+    assert telegram.edit_attempts == 1
     assert binding["topic_id"] == "15007"
     assert entry["topic_id"] == "16000"
     assert not state.topic_id_is_tombstoned(store, "15007")
@@ -140,6 +203,23 @@ def test_fold_message_not_found_never_tombstones_topic(monkeypatch):
     binding = state.message_bindings(store)["400"]
 
     class MessageMissingEditTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.edit_attempts = 0
+
+        def with_token(self, _token):
+            return self
+
+        def edit_message(self, _chat_id, message_id, _html):
+            self.edit_attempts += 1
+            return {
+                "ok": False,
+                "message_id": str(message_id),
+                "kind": "not_found",
+                "not_found": True,
+                "error": "Bad Request: message to edit not found",
+            }
+
         def api(self, method, payload):
             if method == "editMessageText":
                 raise TelegramError(
@@ -147,13 +227,18 @@ def test_fold_message_not_found_never_tombstones_topic(monkeypatch):
                 )
             return super().api(method, payload)
 
+    telegram = MessageMissingEditTelegram()
     _run(
         store,
         monkeypatch,
-        telegram=MessageMissingEditTelegram(),
+        telegram=telegram,
     )
+    assert telegram.edit_attempts == 1
+    _run(store, monkeypatch, telegram=telegram)
 
-    assert binding["folded"] is True
+    assert binding.get("folded") is None
+    assert binding["fold_unavailable"] is True
+    assert telegram.edit_attempts == 1
     assert entry["topic_id"] == "77"
     assert store.get("telegram_dead_topic_ids", []) == []
     assert "topic_recovery_pending" not in entry

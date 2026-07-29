@@ -1917,7 +1917,10 @@ def test_source_final_uses_configured_managed_bot_voice(monkeypatch):
     result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
 
     assert result["feed_sent"] == 1
-    assert any(call[0] == "sendRichMessage" and call[2] == "codex-token" for call in telegram.api_calls)
+    assert any(
+        "Codex final" in sent[1] and sent[2]["token"] == "codex-token"
+        for sent in telegram.sent
+    )
     entry = next(iter(state.source_worker_entries(store).values()))
     assert entry["last_clean_bot_kind"] == "codex"
     binding = state.find_message_binding(store, entry["last_clean_message_id"], topic_id="77")
@@ -2040,8 +2043,14 @@ def test_per_agent_bot_reply_targets_original_worker_once(tmp_path, monkeypatch)
     )
 
     assert result["feed_sent"] == 2
-    assert any(call[0] == "sendRichMessage" and call[2] == "claude-token" for call in telegram.api_calls)
-    assert any(call[0] == "sendRichMessage" and call[2] == "codex-token" for call in telegram.api_calls)
+    assert any(
+        "Claude final" in sent[1] and sent[2]["token"] == "claude-token"
+        for sent in telegram.sent
+    )
+    assert any(
+        "Codex final" in sent[1] and sent[2]["token"] == "codex-token"
+        for sent in telegram.sent
+    )
     assert claude_reply == _gateway_child(
         REQUEST_ID,
         disposition="terminal_accepted",
@@ -2512,7 +2521,7 @@ def test_sync_sends_all_long_final_response_parts(monkeypatch):
 
     result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
 
-    response_messages = [sent[1] for sent in telegram.sent if "<b>✅ Response" in sent[1]]
+    response_messages = [sent[1] for sent in telegram.sent if "✅ Response" in sent[1]]
     assert result["feed_sent"] == 1
     assert len(response_messages) >= 1
     assert any(tail in message for message in response_messages)
@@ -2592,7 +2601,7 @@ def test_promoted_working_final_edits_in_place_as_single_message(monkeypatch):
     assert result["feed_sent"] == 1
     # The final Response was edited into the existing working message.
     assert "4557d20 Prevent child bot target races" in edited_html
-    assert "branch: <code>tendwired</code>" in edited_html
+    assert "branch: tendwired" in edited_html
     # Single message -- no "Response i/N" split labels anywhere.
     assert "✅ Response 1/" not in edited_html
     assert "✅ Response 1/" not in "\n".join(sent[1] for sent in telegram.sent)
@@ -2616,8 +2625,8 @@ def test_oversize_response_splits_losslessly_into_labeled_parts():
     assert combined.count("<b>✅ Response ") == total  # one marker per part
 
 
-def test_promote_to_final_uses_one_rich_send_above_plain_edit_cap(monkeypatch):
-    # A final above the ordinary-message cap can still use one rich message.
+def test_promote_to_final_uses_bounded_plain_sends_above_edit_cap(monkeypatch):
+    # A final above the ordinary-message cap is split into readable plain parts.
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
     telegram = FakeTelegram()
@@ -2651,10 +2660,10 @@ def test_promote_to_final_uses_one_rich_send_above_plain_edit_cap(monkeypatch):
     assert full_html_len > 3900            # above legacy edit cap -> cannot edit
     assert full_html_len <= MAX_RICH_HTML_CHARS
 
-    response_messages = [sent[1] for sent in telegram.sent if "<b>✅ Response" in sent[1]]
+    response_messages = [sent[1] for sent in telegram.sent if "✅ Response" in sent[1]]
     assert result["feed_sent"] == 1
-    assert len(response_messages) == 1
-    assert response_messages[0].startswith("<b>✅ Response</b>")
+    assert len(response_messages) > 1
+    assert response_messages[0].startswith("✅ Response 1/")
     assert any(tail in message for message in response_messages)
 
 

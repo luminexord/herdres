@@ -4,7 +4,6 @@ import hashlib
 
 from herdres_connector import source_sync, state
 from herdres_connector.rich_delivery import (
-    RICH_STATE_UPDATE_KEY,
     edit_rich_message,
     send_rich_message,
 )
@@ -15,16 +14,25 @@ class FakeTelegram:
     def __init__(self, error: str):
         self.error = error
         self.calls: list[tuple[str, str]] = []
+        self.sent_texts: list[str] = []
+        self.plain_succeeded = False
+        self.fail_plain = False
 
     def with_token(self, _token):
         return self
 
     def api(self, method, _payload):
         self.calls.append(("api", method))
+        if method == "sendRichMessage" and not self.plain_succeeded:
+            raise AssertionError("rich enhancement ran before canonical plain send")
         raise TelegramError(self.error)
 
-    def send_message(self, _chat_id, _html, **_kwargs):
+    def send_message(self, _chat_id, html, **_kwargs):
         self.calls.append(("send_message", "legacy"))
+        self.sent_texts.append(str(html))
+        if self.fail_plain:
+            return {"ok": False, "error": "plain rejected"}
+        self.plain_succeeded = True
         return {"ok": True, "message_id": "123", "format": "html"}
 
     def edit_message(self, _chat_id, _message_id, _html):
@@ -32,43 +40,128 @@ class FakeTelegram:
         return {"ok": True, "message_id": "42", "format": "html"}
 
 
-def test_transient_rich_send_error_retries_without_plain_fallback():
+def test_table_delivery_is_exactly_one_canonical_plain_send():
     telegram = {"rich_messages": {"supported": "yes"}}
-    client = FakeTelegram("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+    client = FakeTelegram("sendRichMessage must not run")
 
-    result = send_rich_message(client, "-100", "<p>Hello</p>", telegram=telegram, thread_id="77")
+    result = send_rich_message(
+        client,
+        "-100",
+        "<h3>Results</h3><table><tr><th>Name</th><th>Status</th></tr>"
+        "<tr><td>Ada</td><td>Ready</td></tr></table>",
+        telegram=telegram,
+        thread_id="77",
+    )
 
-    assert result["ok"] is False
-    assert result["format"] == "rich"
-    assert result["kind"] == "transient"
-    assert client.calls == [("api", "sendRichMessage")]
+    assert result["ok"] is True
+    assert result["message_id"] == "123"
+    assert client.calls == [("send_message", "legacy")]
+    assert client.sent_texts == ["Results\nName | Status\nAda | Ready"]
     assert telegram["rich_messages"]["supported"] == "yes"
 
 
-def test_transient_rich_edit_error_retries_without_plain_fallback():
+def test_rich_edit_keeps_the_durable_message_readable():
     telegram = {"rich_messages": {"supported": "yes"}}
     client = FakeTelegram("timed out while calling Telegram")
 
     result = edit_rich_message(client, "-100", "42", "<p>Hello</p>", telegram=telegram)
 
-    assert result["ok"] is False
-    assert result["format"] == "rich"
-    assert result["kind"] == "transient"
-    assert client.calls == [("api", "editMessageText")]
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    assert client.calls == [("edit_message", "legacy")]
     assert telegram["rich_messages"]["supported"] == "yes"
 
 
-def test_capability_rich_send_error_still_falls_back_and_disables_rich():
+def test_rich_capability_state_does_not_add_a_second_write():
     telegram = {"rich_messages": {"supported": "unknown"}}
     client = FakeTelegram("Not Found: method not found")
 
-    result = send_rich_message(client, "-100", "<p>Hello</p>", telegram=telegram, thread_id="77")
+    result = send_rich_message(
+        client,
+        "-100",
+        "<h3>Results</h3><table><tr><th>Name</th><th>Status</th></tr>"
+        "<tr><td>Ada</td><td>Ready</td></tr></table>",
+        telegram=telegram,
+        thread_id="77",
+    )
 
     assert result["ok"] is True
-    assert result["fallback_reason"] == "capability"
-    assert client.calls == [("api", "sendRichMessage"), ("send_message", "legacy")]
+    assert client.calls == [("send_message", "legacy")]
     assert telegram["rich_messages"]["supported"] == "unknown"
-    assert result[RICH_STATE_UPDATE_KEY]["transition"] == "disabled"
+
+
+def test_rich_capable_paragraph_is_delivered_as_nonempty_plain_text():
+    telegram = {"rich_messages": {"supported": "yes"}}
+    client = FakeTelegram("rich should not run")
+
+    result = send_rich_message(
+        client,
+        "-100",
+        "<p>The exact response the owner must read.</p>",
+        telegram=telegram,
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert client.sent_texts == ["The exact response the owner must read."]
+    assert client.calls == [("send_message", "legacy")]
+
+
+def test_supported_table_still_uses_one_physical_write():
+    class SupportedRichTelegram(FakeTelegram):
+        def api(self, method, _payload):
+            raise AssertionError(f"unexpected second physical write: {method}")
+
+    telegram = {"rich_messages": {"supported": "yes"}}
+    client = SupportedRichTelegram("")
+
+    result = send_rich_message(
+        client,
+        "-100",
+        "<table><tr><th>Name</th><th>Status</th></tr>"
+        "<tr><td>Ada</td><td>Ready</td></tr></table>",
+        telegram=telegram,
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert result["message_id"] == "123"
+    assert client.calls == [("send_message", "legacy")]
+
+
+def test_plain_failure_is_the_only_failed_write():
+    telegram = {"rich_messages": {"supported": "yes"}}
+    client = FakeTelegram("rich must not run")
+    client.fail_plain = True
+
+    result = send_rich_message(
+        client,
+        "-100",
+        "<table><tr><th>Name</th><th>Status</th></tr>"
+        "<tr><td>Ada</td><td>Ready</td></tr></table>",
+        telegram=telegram,
+        thread_id="77",
+    )
+
+    assert result["ok"] is False
+    assert client.calls == [("send_message", "legacy")]
+
+
+def test_table_plain_text_uses_pipe_delimited_rows():
+    telegram = {"rich_messages": {"supported": "no"}}
+    client = FakeTelegram("rich must not run")
+
+    result = send_rich_message(
+        client,
+        "-100",
+        "<h3>Results</h3><table><tr><th>Name</th><th>Status</th></tr>"
+        "<tr><td>Ada</td><td>Ready</td></tr></table>",
+        telegram=telegram,
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert client.sent_texts == ["Results\nName | Status\nAda | Ready"]
 
 
 def _guarded_store() -> dict:
@@ -107,7 +200,11 @@ def _guarded_rich_send(current, telegram):
             ),
             args=(
                 "-100",
-                {"kind": "notice", "title": "Test", "summary": "Hello"},
+                {
+                    "kind": "notice",
+                    "title": "Test",
+                    "summary": "| Name | Status |\n| --- | --- |\n| Ada | Ready |",
+                },
             ),
             kwargs={
                 "telegram": current["telegram"],
@@ -117,58 +214,24 @@ def _guarded_rich_send(current, telegram):
     )
 
 
-def test_guarded_rich_capability_transitions_persist_after_reload(
+def test_guarded_table_delivery_is_plain_only_and_leaves_rich_state_unchanged(
     tmp_path, monkeypatch
 ):
     state_path = tmp_path / "state.json"
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
 
-    capability = _guarded_store()
-    state.save_state(capability, state_path)
+    store = _guarded_store()
+    state.save_state(store, state_path)
     with state.state_lock(state_path):
         current = state.load_state(state_path)
+        client = FakeTelegram("sendRichMessage must not run")
         result = _guarded_rich_send(
-            current, FakeTelegram("Not Found: method not found")
+            current, client
         )
         assert result.result["ok"] is True
-        assert current["telegram"]["rich_messages"]["supported"] == "no"
+        assert client.calls == [("send_message", "legacy")]
+        assert current["telegram"]["rich_messages"]["supported"] == "unknown"
         state.save_state(current, state_path)
     assert state.load_state(state_path)["telegram"]["rich_messages"][
         "supported"
-    ] == "no"
-
-    supported = _guarded_store()
-    state.save_state(supported, state_path)
-
-    class SupportedTelegram(FakeTelegram):
-        def api(self, method, _payload):
-            self.calls.append(("api", method))
-            return {"ok": True, "result": {"message_id": 501}}
-
-    with state.state_lock(state_path):
-        current = state.load_state(state_path)
-        result = _guarded_rich_send(current, SupportedTelegram(""))
-        assert result.result["format"] == "rich"
-        assert current["telegram"]["rich_messages"]["supported"] == "yes"
-        state.save_state(current, state_path)
-    assert state.load_state(state_path)["telegram"]["rich_messages"][
-        "supported"
-    ] == "yes"
-
-    bad_request = _guarded_store()
-    state.save_state(bad_request, state_path)
-    with state.state_lock(state_path):
-        current = state.load_state(state_path)
-        for _index in range(3):
-            result = _guarded_rich_send(
-                current, FakeTelegram("Bad Request: malformed rich payload")
-            )
-            assert result.result["ok"] is True
-        rich = current["telegram"]["rich_messages"]
-        assert rich["bad_request_streak"] == 3
-        assert rich["supported"] == "no"
-        assert "repeated bad_request" in rich["disabled_reason"]
-        state.save_state(current, state_path)
-    persisted = state.load_state(state_path)["telegram"]["rich_messages"]
-    assert persisted["bad_request_streak"] == 3
-    assert persisted["supported"] == "no"
+    ] == "unknown"

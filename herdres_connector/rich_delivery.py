@@ -15,15 +15,20 @@ import re
 from typing import Any
 
 from . import config
-from .rendering import html_to_plain, split_text_chunks, split_text_spans, try_render_table, worker_label
+from .rendering import (
+    html_to_plain,
+    split_table_aware_spans,
+    split_text_chunks,
+    split_text_spans,
+    table_continuation_header,
+    try_render_table,
+    worker_label,
+)
 from .safe import canonical_text, sanitize_text
 from .telegram_delivery import (
     MESSAGE_TEXT_LIMIT,
     SPLIT_TEXT_LIMIT,
-    RateLimited,
     TelegramClient,
-    TelegramError,
-    classify_telegram_error,
 )
 
 
@@ -49,7 +54,6 @@ USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHA
 WORKLOG_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_WORKLOG_MAX_CHARS", "1200"))
 RICH_FALLBACK_MAX_CHARS = MESSAGE_TEXT_LIMIT
 TURN_DELIVERY_PLAN_SCHEMA_VERSION = 1
-TURN_DELIVERY_RICH_SOURCE_CHARS = min(RICH_SPLIT_CHUNK_CHARS, MAX_RICH_HTML_CHARS)
 TURN_DELIVERY_PLAIN_SOURCE_CHARS = min(SPLIT_TEXT_LIMIT, MESSAGE_TEXT_LIMIT)
 PROMPT_PREVIEW_CHARS = 80
 USER_PROMPT_LABEL = "You"
@@ -65,6 +69,10 @@ RICH_STATE_UPDATE_KEY = "_herdres_rich_state_update"
 FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
 HRULE_RE = re.compile(r"^\s*([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 INLINE_CODE_RE = re.compile(r"`([^`\n]{1,300})`")
+
+
+class PresentationContentError(RuntimeError):
+    """Expected inability to fit specific valid content in one presentation."""
 
 
 def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
@@ -416,16 +424,50 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     assistant_final = str(item.get("assistant_final_text") or "").strip()
     parts: list[str] = []
     if assistant_final and item.get("collapse_response"):
-        # Superseded final: the Response folds into a closed <details> with a one-line preview, so
-        # older answers read as a compact history while staying expandable in place.
-        body_html = render_final_reply_html(assistant_final, seen_heading=True) or _rich_paragraph(assistant_final)
-        response_html = _rich_details_quote_html(
-            str(item.get("response_label") or RESPONSE_LABEL),
-            body_html,
-            icon=RESPONSE_ICON,
-            open_by_default=False,
-            preview=_prompt_preview(assistant_final),
+        # sendMessage does not support the rich-message <details> element.
+        # Use Bot API's expandable blockquote so the provider-applied payload
+        # is genuinely collapsed and contains the answer exactly once. Keep
+        # every sibling section on sendMessage-supported markup too; one
+        # unsupported <details>/<footer> would make Telegram reject the whole
+        # edit and fall back to an expanded plain rendering.
+        body_html = "<br>".join(
+            _html_text(line, MAX_REPLY_CHARS)
+            for line in sanitize_text(
+                assistant_final, MAX_REPLY_CHARS
+            ).splitlines()
         )
+        label = _html_text(
+            str(item.get("response_label") or RESPONSE_LABEL), 80
+        )
+        response_html = (
+            f"<b>{RESPONSE_ICON} {label}</b>\n"
+            f"<blockquote expandable>{body_html}</blockquote>"
+        )
+        parts.append(response_html)
+        if user_text:
+            user_body = "<br>".join(
+                _html_text(line, MAX_REPLY_CHARS)
+                for line in sanitize_text(
+                    user_text, MAX_REPLY_CHARS
+                ).splitlines()
+            )
+            parts.append(
+                f"<b>{YOU_ICON} {USER_PROMPT_LABEL}</b>\n"
+                f"<blockquote>{user_body}</blockquote>"
+            )
+        if worklog_text:
+            worklog_body = "<br>".join(
+                _html_text(line, MAX_REPLY_CHARS)
+                for line in sanitize_text(
+                    worklog_text, WORKLOG_MAX_CHARS
+                ).splitlines()
+            )
+            parts.append(
+                f"<b>{WORKING_ICON} "
+                f"{_html_text(worklog_label, 80)}</b>\n"
+                f"<blockquote>{worklog_body}</blockquote>"
+            )
+        return "\n\n".join(parts).strip()
     else:
         response_html = render_assistant_response_html(assistant_final, label=str(item.get("response_label") or RESPONSE_LABEL))
     if response_html:
@@ -490,7 +532,9 @@ def _planned_parts_for_limits(
 ) -> list[dict[str, Any]]:
     field_spans = {
         "user_text": split_text_spans(fields["user_text"], limit=user_limit),
-        "assistant_final_text": split_text_spans(fields["assistant_final_text"], limit=final_limit),
+        "assistant_final_text": split_table_aware_spans(
+            fields["assistant_final_text"], limit=final_limit
+        ),
     }
     part_count = max((len(spans) for spans in field_spans.values()), default=0)
     parts: list[dict[str, Any]] = []
@@ -507,6 +551,13 @@ def _planned_parts_for_limits(
                 "ordinal": ordinal,
                 "part_count": part_count,
                 "spans": spans,
+                # Local-only metadata: Tendwire persists the canonical spans,
+                # while delivery recomputes this deterministic limit before
+                # materializing them.
+                "_source_limits": {
+                    "user_text": user_limit,
+                    "assistant_final_text": final_limit,
+                },
             }
         )
     return parts
@@ -525,6 +576,11 @@ def _materialize_turn_delivery_part(item: dict[str, Any], part: dict[str, Any]) 
     spans = part.get("spans")
     if not isinstance(spans, list) or not spans:
         raise ValueError("turn delivery part spans must be a non-empty list")
+    source_limits = part.get("_source_limits")
+    if source_limits is None:
+        source_limits = {}
+    if not isinstance(source_limits, dict):
+        raise ValueError("turn delivery source limits must be an object")
     seen_fields: set[str] = set()
     for span in spans:
         if not isinstance(span, dict):
@@ -542,7 +598,28 @@ def _materialize_turn_delivery_part(item: dict[str, Any], part: dict[str, Any]) 
         source = fields[field]
         if start < 0 or end <= start or end > len(source):
             raise ValueError("turn delivery span is outside canonical content")
-        fragments[field].append(source[start:end])
+        fragment = source[start:end]
+        if field == "assistant_final_text":
+            planning_limit = source_limits.get(
+                field, TURN_DELIVERY_PLAIN_SOURCE_CHARS
+            )
+            if (
+                isinstance(planning_limit, bool)
+                or not isinstance(planning_limit, int)
+                or planning_limit <= 0
+            ):
+                raise ValueError(
+                    "turn delivery source limit must be a positive integer"
+                )
+            fragment = (
+                table_continuation_header(
+                    source,
+                    start,
+                    planning_limit=planning_limit,
+                )
+                + fragment
+            )
+        fragments[field].append(fragment)
     materialized = dict(item)
     materialized["user_text"] = "".join(fragments["user_text"])
     materialized["assistant_final_text"] = "".join(fragments["assistant_final_text"])
@@ -577,8 +654,10 @@ def _turn_delivery_part_is_bounded(
 ) -> bool:
     rendered = render_turn_delivery_part_html(item, part)
     plain = html_to_plain(rendered, limit=MAX_REPLY_CHARS)
+    if len(plain) > RICH_FALLBACK_MAX_CHARS:
+        return False
     if not rich_transport:
-        return len(plain) <= RICH_FALLBACK_MAX_CHARS
+        return True
     return (
         len(rendered) <= min(RICH_SINGLE_MESSAGE_CHARS, MAX_RICH_HTML_CHARS)
         and (
@@ -594,9 +673,15 @@ def prepare_turn_delivery_parts(
     item: dict[str, Any],
     *,
     live: bool = False,
-    rich_transport: bool = True,
+    rich_transport: bool = False,
 ) -> list[dict[str, Any]]:
-    """Plan deterministic exact spans for bounded one-operation Telegram parts."""
+    """Plan deterministic exact spans for bounded one-operation Telegram parts.
+
+    Production is plain-only while the paired rich-message lifecycle is
+    deferred to #207. ``rich_transport=True`` deliberately remains an isolated
+    planning surface for that follow-up and its tests; production callers must
+    not select it from Telegram capability state.
+    """
     if live or str(item.get("kind") or "").lower() != "turn":
         return []
     fields = _canonical_turn_fields(item)
@@ -620,11 +705,9 @@ def prepare_turn_delivery_parts(
     ):
         return [full_part]
 
-    source_limit = (
-        TURN_DELIVERY_RICH_SOURCE_CHARS
-        if rich_transport
-        else TURN_DELIVERY_PLAIN_SOURCE_CHARS
-    )
+    # Plain is the canonical delivery, so every deterministic part must fit one
+    # sendMessage.
+    source_limit = TURN_DELIVERY_PLAIN_SOURCE_CHARS
     user_limit = max(1, source_limit)
     final_limit = max(1, source_limit)
     while True:
@@ -644,7 +727,9 @@ def prepare_turn_delivery_parts(
         ):
             return parts
         if user_limit == 1 and final_limit == 1:
-            raise ValueError("one code point cannot fit Telegram presentation limits")
+            raise PresentationContentError(
+                "one code point cannot fit Telegram presentation limits"
+            )
         user_limit = max(1, user_limit // 2)
         final_limit = max(1, final_limit // 2)
 
@@ -715,37 +800,33 @@ def rich_message_send_enabled(telegram: dict[str, Any] | None) -> bool:
     return isinstance(telegram, dict) and rich_enabled(telegram)
 
 
-def _with_rich_state_update(
-    result: dict[str, Any],
-    transition: str,
-    *,
-    reason: str = "",
-) -> dict[str, Any]:
-    """Attach a pure provider fact for guarded post-reload application."""
-
-    result[RICH_STATE_UPDATE_KEY] = {
-        "transition": transition,
-        "reason": sanitize_text(reason, 300),
-    }
-    return result
-
-
 def _client_for_token(client: TelegramClient, api_token: str | None) -> TelegramClient:
     token = str(api_token or "").strip()
     return client.with_token(token) if token else client
 
 
-def _telegram_message_id(response: dict[str, Any]) -> str:
-    result = response.get("result") if isinstance(response.get("result"), dict) else {}
-    return str(result.get("message_id") or "0")
+def _readable_plain_text(html_text: str, fallback_text: str) -> str:
+    """Flatten rich HTML into the canonical readable Telegram body.
 
+    ``html_to_plain`` renders table cells as `` | ``-separated columns and
+    table rows on separate lines. Prefer that rendering over a caller fallback
+    so the readable message and rich enhancement carry the same content.
+    """
 
-def _classify_telegram_error(error: Exception) -> str:
-    return classify_telegram_error(error)
-
-
-def _retry_rich_delivery(kind: str, error: Exception) -> dict[str, Any]:
-    return {"ok": False, "format": "rich", "kind": kind, "error": sanitize_text(str(error), 300)}
+    source = str(html_text or "")
+    source = re.sub(r"<li\b[^>]*>", "- ", source, flags=re.IGNORECASE)
+    source = re.sub(
+        r"</(?:p|h[1-6]|pre|li|ul|ol|blockquote|details|footer|table)>",
+        "\n",
+        source,
+        flags=re.IGNORECASE,
+    )
+    rendered = sanitize_text(
+        html_to_plain(source, limit=MAX_REPLY_CHARS),
+        MAX_REPLY_CHARS,
+    ).strip()
+    fallback = sanitize_text(str(fallback_text or ""), MAX_REPLY_CHARS).strip()
+    return rendered or fallback
 
 
 def _fallback_send(
@@ -790,80 +871,28 @@ def send_rich_message(
     require_single_operation: bool = False,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
-    rendered_fallback = sanitize_text(html_to_plain(html_text, limit=MAX_REPLY_CHARS), MAX_REPLY_CHARS)
-    fallback = rendered_fallback or fallback_text or sanitize_text(str(html_text or ""), MAX_REPLY_CHARS)
-    if not rich_message_send_enabled(telegram):
-        return _fallback_send(
-            target,
-            chat_id,
-            fallback,
-            thread_id=thread_id,
-            notify=notify,
-            reply_to_message_id=reply_to_message_id,
-            require_single_operation=require_single_operation,
-        )
-    if len(html_text) > MAX_RICH_HTML_CHARS:
-        fallback_result = _fallback_send(
-            target,
-            chat_id,
-            fallback,
-            thread_id=thread_id,
-            notify=notify,
-            reply_to_message_id=reply_to_message_id,
-            require_single_operation=require_single_operation,
-        )
-        fallback_result["fallback_reason"] = "rich_too_large"
-        return fallback_result
+    fallback = _readable_plain_text(html_text, fallback_text)
+    if not fallback:
+        return {
+            "ok": False,
+            "format": "plain",
+            "kind": "empty_plain_text",
+            "error": "readable Telegram text is empty",
+        }
 
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "disable_notification": "false" if notify else "true",
-        "rich_message": json.dumps(
-            {"html": sanitize_text(html_text, MAX_RICH_HTML_CHARS), "skip_entity_detection": True},
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ),
-    }
-    if thread_id:
-        payload["message_thread_id"] = str(thread_id)
-    if reply_to_message_id:
-        payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
-    try:
-        response = target.api("sendRichMessage", payload)
-    except RateLimited:
-        raise
-    except TelegramError as exc:
-        kind = _classify_telegram_error(exc)
-        if kind == "transient":
-            return _retry_rich_delivery(kind, exc)
-        elif api_token and kind == "bot_access":
-            return {"ok": False, "format": "rich", "kind": kind, "error": str(exc)}
-        fallback_result = _fallback_send(
-            target,
-            chat_id,
-            fallback,
-            thread_id=thread_id,
-            notify=notify,
-            reply_to_message_id=reply_to_message_id,
-            require_single_operation=require_single_operation,
-        )
-        fallback_result["fallback_reason"] = kind
-        if kind == "capability":
-            _with_rich_state_update(
-                fallback_result, "disabled", reason=str(exc)
-            )
-        elif kind == "bad_request":
-            _with_rich_state_update(
-                fallback_result, "bad_request", reason=str(exc)
-            )
-        return fallback_result
-    return _with_rich_state_update(
-        {
-            "ok": True,
-            "format": "rich",
-            "message_id": _telegram_message_id(response),
-        },
-        "supported",
+    # sendMessage is the sole human-readable delivery. Telegram accepts
+    # text/caption fields on sendRichMessage but silently discards them. A
+    # separate rich twin needs a paired lifecycle and operation budget, so it
+    # is deliberately deferred to the follow-up design rather than emitted
+    # from this single-message delivery path.
+    return _fallback_send(
+        target,
+        chat_id,
+        fallback,
+        thread_id=thread_id,
+        notify=notify,
+        reply_to_message_id=reply_to_message_id,
+        require_single_operation=require_single_operation,
     )
 
 
@@ -877,100 +906,40 @@ def edit_rich_message(
     fallback_text: str = "",
     api_token: str | None = None,
     require_single_operation: bool = False,
+    preserve_plain_html: bool = False,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
-    rendered_fallback = sanitize_text(html_to_plain(html_text, limit=MAX_REPLY_CHARS), MAX_REPLY_CHARS)
-    fallback = rendered_fallback or fallback_text or sanitize_text(str(html_text or ""), MAX_REPLY_CHARS)
-    if require_single_operation and len(html_to_plain(fallback, limit=MAX_REPLY_CHARS)) > RICH_FALLBACK_MAX_CHARS:
-        fallback_allowed = False
-    else:
-        fallback_allowed = True
-    if not rich_message_send_enabled(telegram):
-        if not fallback_allowed:
-            return {
-                "ok": False,
-                "format": "plain",
-                "kind": "presentation_transport_changed",
-                "error": "presentation transport changed",
-            }
-        return target.edit_message(chat_id, message_id, fallback)
-    if len(html_text) > MAX_RICH_HTML_CHARS:
-        if not fallback_allowed:
-            return {
-                "ok": False,
-                "format": "plain",
-                "kind": "presentation_transport_changed",
-                "error": "presentation transport changed",
-            }
-        legacy = target.edit_message(chat_id, message_id, fallback)
-        legacy["fallback_reason"] = "rich_too_large"
-        return legacy
-    payload = {
-        "chat_id": chat_id,
-        "message_id": str(message_id),
-        "rich_message": json.dumps(
-            {"html": sanitize_text(html_text, MAX_RICH_HTML_CHARS), "skip_entity_detection": True},
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ),
-    }
-    try:
-        response = target.api("editMessageText", payload)
-    except RateLimited:
-        raise
-    except TelegramError as exc:
-        kind = _classify_telegram_error(exc)
-        if kind == "transient":
-            return _retry_rich_delivery(kind, exc)
-        if kind == "not_modified":
-            return _with_rich_state_update(
-                {
-                    "ok": True,
-                    "format": "rich",
-                    "kind": kind,
-                    "message_id": str(message_id),
-                },
-                "supported",
-            )
-        if kind in {"not_found", "topic_not_found"}:
-            return {"ok": False, "format": "rich", "kind": kind, "not_found": kind == "not_found", "topic_missing": kind == "topic_not_found", "error": str(exc)}
-        if not fallback_allowed:
-            result = {
-                "ok": False,
-                "format": "plain",
-                "kind": "presentation_transport_changed",
-                "error": "presentation transport changed",
-            }
-            if kind == "capability":
-                return _with_rich_state_update(
-                    result, "disabled", reason=str(exc)
-                )
-            if kind == "bad_request":
-                return _with_rich_state_update(
-                    result, "bad_request", reason=str(exc)
-                )
-            return result
-        legacy = target.edit_message(chat_id, message_id, fallback)
-        legacy["fallback_reason"] = kind
-        if kind == "capability":
-            _with_rich_state_update(
-                legacy, "disabled", reason=str(exc)
-            )
-        elif kind == "bad_request":
-            _with_rich_state_update(
-                legacy, "bad_request", reason=str(exc)
-            )
-        return legacy
-    return _with_rich_state_update(
-        {
-            "ok": True,
-            "format": "rich",
-            "kind": "edited",
-            "message_id": _telegram_message_id(response)
-            or str(message_id),
-        },
-        "supported",
+    fallback = (
+        sanitize_text(str(html_text or ""), MAX_REPLY_CHARS).strip()
+        if preserve_plain_html
+        else _readable_plain_text(html_text, fallback_text)
     )
+    if not fallback:
+        return {
+            "ok": False,
+            "format": "plain",
+            "kind": "empty_plain_text",
+            "error": "readable Telegram text is empty",
+        }
+    if require_single_operation and len(html_to_plain(fallback, limit=MAX_REPLY_CHARS)) > RICH_FALLBACK_MAX_CHARS:
+        return {
+            "ok": False,
+            "format": "plain",
+            "kind": "presentation_transport_changed",
+            "error": "presentation transport changed",
+        }
+    # An edit has only one durable message identity. Keep that identity
+    # readable instead of converting it back into a rich-only blank bubble.
+    result = target.edit_message(chat_id, message_id, fallback)
+    if preserve_plain_html:
+        # TelegramClient reports ``html-no-expandable`` or ``plain`` when it
+        # had to shed the expandable blockquote. Those are readable edits, but
+        # they are not folds and must never authorize binding["folded"].
+        result["collapse_applied"] = bool(
+            result.get("ok")
+            and str(result.get("format") or "html") == "html"
+        )
+    return result
 
 
 def send_turn_delivery_part(
@@ -989,7 +958,7 @@ def send_turn_delivery_part(
     if not _turn_delivery_part_is_bounded(
         item,
         part,
-        rich_transport=rich_message_send_enabled(telegram),
+        rich_transport=False,
     ):
         raise ValueError("turn delivery part exceeds Telegram presentation limits")
     html_text = render_turn_delivery_part_html(item, part)
@@ -1021,7 +990,7 @@ def edit_turn_delivery_part(
     if not _turn_delivery_part_is_bounded(
         item,
         part,
-        rich_transport=rich_message_send_enabled(telegram),
+        rich_transport=False,
     ):
         raise ValueError("turn delivery part exceeds Telegram presentation limits")
     html_text = render_turn_delivery_part_html(item, part)
@@ -1090,9 +1059,6 @@ def send_feed_item(
         "message_id": message_ids[0] if message_ids else str(last_result.get("message_id") or ""),
         "message_ids": message_ids,
     }
-    update = last_result.get(RICH_STATE_UPDATE_KEY)
-    if isinstance(update, dict):
-        combined[RICH_STATE_UPDATE_KEY] = dict(update)
     return combined
 
 
@@ -1114,6 +1080,7 @@ def edit_feed_item(
         telegram=telegram,
         fallback_text=item_plain_text(item),
         api_token=api_token,
+        preserve_plain_html=bool(item.get("collapse_response")),
     )
 
 

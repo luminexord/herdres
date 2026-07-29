@@ -14,6 +14,7 @@ from . import accounts, config, decisions, ingress_requests, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import (
+    PresentationContentError,
     RICH_BAD_REQUEST_LIMIT,
     RICH_RENDER_VERSION,
     RICH_STATE_UPDATE_KEY,
@@ -22,7 +23,6 @@ from .rich_delivery import (
     feed_item_requires_send_split,
     prepare_turn_delivery_parts,
     render_feed_item_html,
-    rich_message_send_enabled,
     send_feed_item,
     send_turn_delivery_part,
     split_legacy_message_ids,
@@ -40,7 +40,7 @@ from .telegram_delivery import (
     topic_icon_catalog,
     topic_icon_id,
 )
-from .tendwire_client import TendwireClient
+from .tendwire_client import TendwireClient, TendwireError
 
 RENDER_VERSION = "telegram-rich-v27-multipart-margin"
 PRESENTATION_VERSION = "turn-present-v29"
@@ -2902,7 +2902,12 @@ def _fold_superseded_final(
     if len(bindings) != 1:
         return False
     message_id, binding = bindings[0]
-    if not message_id or binding.get("folded") or int(binding.get("fold_attempts") or 0) >= _FOLD_ATTEMPT_CAP:
+    if (
+        not message_id
+        or binding.get("folded")
+        or binding.get("fold_unavailable")
+        or int(binding.get("fold_attempts") or 0) >= _FOLD_ATTEMPT_CAP
+    ):
         return False
     if str(message_id) == str(entry.get("last_clean_message_id") or ""):
         return False  # belt-and-braces: never fold the latest delivered message
@@ -2956,13 +2961,27 @@ def _fold_superseded_final(
     # to the exact binding even when the pane owner moved during the edit.
     binding = state.find_message_binding(store, message_id) or binding
     error = str(sent.get("error") or "").lower()
-    if sent.get("ok") or _message_missing(sent.get("error")):
-        binding["folded"] = True  # done (or the message/topic is gone — nothing left to fold)
-        return True
-    if _topic_missing(sent.get("error")) or "not found" in error:
-        # Edits carry only a message id. They cannot prove which historical
-        # topic is gone, so a cosmetic fold must never tombstone any topic.
+    if sent.get("ok") and sent.get("collapse_applied") is True:
+        # This is the only path allowed to claim the message was folded: the
+        # exact expandable-HTML edit was accepted (including Telegram's
+        # already-identical "not modified" success). Readable fallback formats
+        # are not collapsed and therefore cannot set this marker.
         binding["folded"] = True
+        return True
+    if sent.get("ok"):
+        binding["fold_attempts"] = int(
+            binding.get("fold_attempts") or 0
+        ) + 1
+        return True
+    if (
+        _message_missing(sent.get("error"))
+        or _topic_missing(sent.get("error"))
+        or "not found" in error
+    ):
+        # Edits carry only a message id. They cannot prove which historical
+        # topic is gone, so a cosmetic fold must never tombstone any topic or
+        # falsely claim that the unavailable message was folded.
+        binding["fold_unavailable"] = True
         return True
     binding["fold_attempts"] = int(binding.get("fold_attempts") or 0) + 1
     return True
@@ -6025,10 +6044,7 @@ def _stage_final_plan(
 
     page_calls = _materialize_turn_item(item, runtime)
     feed_item = _turn_feed_item(item, entry)
-    parts = prepare_turn_delivery_parts(
-        feed_item,
-        rich_transport=rich_message_send_enabled(_telegram_state(store)),
-    )
+    parts = _prepare_final_delivery_parts(feed_item)
     if not parts:
         raise _TurnContentError(
             "invalid_presentation_plan",
@@ -6248,6 +6264,28 @@ def _stage_final_plan(
     if isinstance(final_identity, str) and final_identity:
         entry["pending_final_identity"] = final_identity
     return True, page_calls, entry
+
+
+def _prepare_final_delivery_parts(
+    feed_item: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Turn expected content limits into a per-item outcome.
+
+    Programming defects deliberately propagate to the loop-level systemic
+    failure reporter. Quietly converting AttributeError, TypeError, ValueError,
+    or another unexpected exception would make a lost final look healthy.
+    """
+
+    try:
+        return prepare_turn_delivery_parts(
+            feed_item,
+            rich_transport=False,
+        )
+    except PresentationContentError as exc:
+        raise _TurnContentError(
+            "invalid_presentation_plan",
+            str(exc),
+        ) from exc
 
 
 def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
@@ -8289,12 +8327,22 @@ def _drain_post_ack_reconciliations(
                 continue
             _materialize_turn_item(item, runtime)
             feed_item = _turn_feed_item(item, entry)
-            plans = prepare_turn_delivery_parts(
-                feed_item,
-                rich_transport=rich_message_send_enabled(
-                    _telegram_state(store)
-                ),
-            )
+            try:
+                plans = _prepare_final_delivery_parts(feed_item)
+            except _TurnContentError as exc:
+                # This message has already been acknowledged upstream.  Keep
+                # the durable local reconciliation obligation in place and
+                # isolate the bad item from the rest of the sync pass.
+                state.record_tendwire_turn_job_post_ack_error(
+                    store,
+                    job_key,
+                    status=exc.status,
+                    error=str(exc),
+                )
+                result["status"] = exc.status
+                result["failed"] += 1
+                result["changed"] = True
+                continue
             ordinal = int(obligation.get("part_ordinal") or 0)
             if not 0 <= ordinal < len(plans):
                 continue
@@ -8654,9 +8702,10 @@ def _drain_turn_final(
                     runtime, ref, f"{exc.status}: {exc}", result
                 )
                 break
-            except Exception:
-                # Plan preparation is idempotent and still precedes Telegram.
-                # A transport/process failure is therefore safe to retry.
+            except TendwireError:
+                # The provider boundary names transport/process failures.
+                # Programming exceptions from local planning are deliberately
+                # not caught here and reach loop-level failure reporting.
                 _defer_turn_final(
                     runtime,
                     ref,
@@ -8947,10 +8996,16 @@ def _drain_turn_final(
                 break
             result["content_pages"] += page_calls
             feed_item = _turn_feed_item(item, entry)
-            plans = prepare_turn_delivery_parts(
-                feed_item,
-                rich_transport=rich_message_send_enabled(_telegram_state(store)),
-            )
+            try:
+                plans = _prepare_final_delivery_parts(feed_item)
+            except _TurnContentError as exc:
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    f"{exc.status}: {exc}",
+                    result,
+                )
+                break
             if (
                 ordinal >= len(plans)
                 or part_count != len(plans)
