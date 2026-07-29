@@ -226,6 +226,27 @@ def test_each_promised_format_reaches_the_recipient(markup, entity):
     assert entity in client.recipient_messages[0]["entities"]
 
 
+def test_quoted_reply_separates_author_label_from_recipient_text():
+    client = RecipientTelegram()
+
+    result = send_feed_item(
+        client,
+        "-100",
+        {
+            "kind": "turn",
+            "user_text": "Testing message from telegram",
+        },
+        telegram={},
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    assert client.recipient_messages[0]["text"] == (
+        "💬 You\nTesting message from telegram"
+    )
+
+
 @pytest.mark.parametrize(
     ("markup", "expected_entities"),
     [
@@ -455,23 +476,47 @@ def test_adjacent_markdown_links_preserve_both_destinations():
     ]
 
 
+class _CountedText(str):
+    """Test-only string that charges deterministic character inspections."""
+
+    def __new__(cls, value):
+        instance = super().__new__(cls, value)
+        instance.inspections = 0
+        return instance
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            start, stop, step = key.indices(len(self))
+            self.inspections += len(range(start, stop, step))
+        else:
+            self.inspections += 1
+        return super().__getitem__(key)
+
+    def startswith(self, prefix, start=0, end=None):
+        stop = len(self) if end is None else min(len(self), end)
+        self.inspections += min(len(prefix), max(0, stop - start))
+        return super().startswith(prefix, start, stop)
+
+    def find(self, sub, start=0, end=None):
+        stop = len(self) if end is None else min(len(self), end)
+        found = super().find(sub, start, stop)
+        scan_stop = stop if found < 0 else found + len(sub)
+        self.inspections += max(0, scan_stop - start)
+        return found
+
+
 def test_pathological_64k_link_scan_has_bounded_linear_work():
     tail = "x](https://example.test)"
-    source = "[" * (64000 - len(tail)) + tail
-    work = [0]
+    source = _CountedText("[" * (64000 - len(tail)) + tail)
     link_spans = []
 
-    rendered = _replace_inline_links(
-        source,
-        link_spans,
-        _work_counter=work,
-    )
+    rendered = _replace_inline_links(source, link_spans)
 
     assert rendered.endswith("\u00010\u0001")
     assert link_spans == [
         '<a href="https://example.test">x</a>'
     ]
-    assert work[0] <= len(source) * 2
+    assert source.inspections <= len(source) * 4 + 128
 
 
 def test_unsupported_nested_tag_is_flattened_without_plain_fallback():

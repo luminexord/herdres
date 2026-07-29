@@ -85,8 +85,6 @@ def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
 def _replace_inline_links(
     text: str,
     link_spans: list[str],
-    *,
-    _work_counter: list[int] | None = None,
 ) -> str:
     """Hold complete Markdown links in one forward, linear-time scan.
 
@@ -95,19 +93,13 @@ def _replace_inline_links(
     whitespace or angle brackets stay literal because converting only part of
     an ambiguous destination would create a confidently wrong link. Rejected
     candidates consume the characters already inspected, so no suffix is
-    searched again. ``_work_counter`` counts character inspections for the
-    deterministic complexity regression.
+    searched again.
     """
 
     rendered: list[str] = []
     index = 0
 
-    def worked(amount: int = 1) -> None:
-        if _work_counter is not None:
-            _work_counter[0] += amount
-
     while index < len(text):
-        worked()
         if text[index] != "[":
             rendered.append(text[index])
             index += 1
@@ -124,7 +116,6 @@ def _replace_inline_links(
         nested_candidate = False
         label_length = 0
         while cursor < len(text):
-            worked()
             char = text[cursor]
             if char == "[":
                 rejected_at = cursor
@@ -134,7 +125,6 @@ def _replace_inline_links(
                 rejected_at = cursor
                 break
             if char == "]":
-                worked()
                 if cursor + 1 < len(text) and text[cursor + 1] == "(":
                     label_end = cursor
                 else:
@@ -172,10 +162,8 @@ def _replace_inline_links(
         delimiter = -1
         invalid = False
         while cursor < len(text):
-            worked()
             char = text[cursor]
             if char == "\\" and cursor + 1 < len(text):
-                worked()
                 escaped = text[cursor + 1]
                 if escaped in {"(", ")", "\\"}:
                     destination_length += 1

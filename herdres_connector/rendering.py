@@ -48,6 +48,7 @@ _TELEGRAM_HTML_LINE_END_TAGS = frozenset(
         "li",
         "ol",
         "p",
+        "summary",
         "table",
         "ul",
     }
