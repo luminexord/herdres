@@ -49,7 +49,6 @@ USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHA
 WORKLOG_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_WORKLOG_MAX_CHARS", "1200"))
 RICH_FALLBACK_MAX_CHARS = MESSAGE_TEXT_LIMIT
 TURN_DELIVERY_PLAN_SCHEMA_VERSION = 1
-TURN_DELIVERY_RICH_SOURCE_CHARS = min(RICH_SPLIT_CHUNK_CHARS, MAX_RICH_HTML_CHARS)
 TURN_DELIVERY_PLAIN_SOURCE_CHARS = min(SPLIT_TEXT_LIMIT, MESSAGE_TEXT_LIMIT)
 PROMPT_PREVIEW_CHARS = 80
 USER_PROMPT_LABEL = "You"
@@ -577,8 +576,10 @@ def _turn_delivery_part_is_bounded(
 ) -> bool:
     rendered = render_turn_delivery_part_html(item, part)
     plain = html_to_plain(rendered, limit=MAX_REPLY_CHARS)
+    if len(plain) > RICH_FALLBACK_MAX_CHARS:
+        return False
     if not rich_transport:
-        return len(plain) <= RICH_FALLBACK_MAX_CHARS
+        return True
     return (
         len(rendered) <= min(RICH_SINGLE_MESSAGE_CHARS, MAX_RICH_HTML_CHARS)
         and (
@@ -620,11 +621,9 @@ def prepare_turn_delivery_parts(
     ):
         return [full_part]
 
-    source_limit = (
-        TURN_DELIVERY_RICH_SOURCE_CHARS
-        if rich_transport
-        else TURN_DELIVERY_PLAIN_SOURCE_CHARS
-    )
+    # Plain is the canonical delivery even when a bounded rich table twin will
+    # follow, so every deterministic part must fit one sendMessage.
+    source_limit = TURN_DELIVERY_PLAIN_SOURCE_CHARS
     user_limit = max(1, source_limit)
     final_limit = max(1, source_limit)
     while True:
@@ -744,8 +743,34 @@ def _classify_telegram_error(error: Exception) -> str:
     return classify_telegram_error(error)
 
 
-def _retry_rich_delivery(kind: str, error: Exception) -> dict[str, Any]:
-    return {"ok": False, "format": "rich", "kind": kind, "error": sanitize_text(str(error), 300)}
+def _rich_enhancement_warranted(html_text: str) -> bool:
+    """Keep duplicate bubbles for the one structure plain text genuinely loses."""
+
+    return bool(re.search(r"<table\b", str(html_text or ""), re.IGNORECASE))
+
+
+def _readable_plain_text(html_text: str, fallback_text: str) -> str:
+    """Flatten rich HTML into the canonical readable Telegram body.
+
+    ``html_to_plain`` renders table cells as `` | ``-separated columns and
+    table rows on separate lines. Prefer that rendering over a caller fallback
+    so the readable message and rich enhancement carry the same content.
+    """
+
+    source = str(html_text or "")
+    source = re.sub(r"<li\b[^>]*>", "- ", source, flags=re.IGNORECASE)
+    source = re.sub(
+        r"</(?:p|h[1-6]|pre|li|ul|ol|blockquote|details|footer|table)>",
+        "\n",
+        source,
+        flags=re.IGNORECASE,
+    )
+    rendered = sanitize_text(
+        html_to_plain(source, limit=MAX_REPLY_CHARS),
+        MAX_REPLY_CHARS,
+    ).strip()
+    fallback = sanitize_text(str(fallback_text or ""), MAX_REPLY_CHARS).strip()
+    return rendered or fallback
 
 
 def _fallback_send(
@@ -790,30 +815,35 @@ def send_rich_message(
     require_single_operation: bool = False,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
-    rendered_fallback = sanitize_text(html_to_plain(html_text, limit=MAX_REPLY_CHARS), MAX_REPLY_CHARS)
-    fallback = rendered_fallback or fallback_text or sanitize_text(str(html_text or ""), MAX_REPLY_CHARS)
-    if not rich_message_send_enabled(telegram):
-        return _fallback_send(
-            target,
-            chat_id,
-            fallback,
-            thread_id=thread_id,
-            notify=notify,
-            reply_to_message_id=reply_to_message_id,
-            require_single_operation=require_single_operation,
-        )
-    if len(html_text) > MAX_RICH_HTML_CHARS:
-        fallback_result = _fallback_send(
-            target,
-            chat_id,
-            fallback,
-            thread_id=thread_id,
-            notify=notify,
-            reply_to_message_id=reply_to_message_id,
-            require_single_operation=require_single_operation,
-        )
-        fallback_result["fallback_reason"] = "rich_too_large"
-        return fallback_result
+    fallback = _readable_plain_text(html_text, fallback_text)
+    if not fallback:
+        return {
+            "ok": False,
+            "format": "plain",
+            "kind": "empty_plain_text",
+            "error": "readable Telegram text is empty",
+        }
+
+    # sendMessage is the canonical human-readable delivery. Telegram accepts
+    # text/caption fields on sendRichMessage but silently discards them, so a
+    # rich message must never be the first or only accepted artifact.
+    plain_result = _fallback_send(
+        target,
+        chat_id,
+        fallback,
+        thread_id=thread_id,
+        notify=notify,
+        reply_to_message_id=reply_to_message_id,
+        require_single_operation=require_single_operation,
+    )
+    if not plain_result.get("ok"):
+        return plain_result
+    if (
+        not rich_message_send_enabled(telegram)
+        or not _rich_enhancement_warranted(html_text)
+        or len(html_text) > MAX_RICH_HTML_CHARS
+    ):
+        return plain_result
 
     payload: dict[str, Any] = {
         "chat_id": chat_id,
@@ -830,38 +860,41 @@ def send_rich_message(
         payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
     try:
         response = target.api("sendRichMessage", payload)
-    except RateLimited:
-        raise
+    except RateLimited as exc:
+        plain_result["rich_enhancement"] = {
+            "ok": False,
+            "kind": "rate_limited",
+            "error": sanitize_text(str(exc), 300),
+        }
+        return plain_result
     except TelegramError as exc:
         kind = _classify_telegram_error(exc)
-        if kind == "transient":
-            return _retry_rich_delivery(kind, exc)
-        elif api_token and kind == "bot_access":
-            return {"ok": False, "format": "rich", "kind": kind, "error": str(exc)}
-        fallback_result = _fallback_send(
-            target,
-            chat_id,
-            fallback,
-            thread_id=thread_id,
-            notify=notify,
-            reply_to_message_id=reply_to_message_id,
-            require_single_operation=require_single_operation,
-        )
-        fallback_result["fallback_reason"] = kind
+        plain_result["rich_enhancement"] = {
+            "ok": False,
+            "kind": kind,
+            "error": sanitize_text(str(exc), 300),
+        }
         if kind == "capability":
             _with_rich_state_update(
-                fallback_result, "disabled", reason=str(exc)
+                plain_result, "disabled", reason=str(exc)
             )
         elif kind == "bad_request":
             _with_rich_state_update(
-                fallback_result, "bad_request", reason=str(exc)
+                plain_result, "bad_request", reason=str(exc)
             )
-        return fallback_result
+        return plain_result
+    rich_message_id = _telegram_message_id(response)
+    message_ids = split_legacy_message_ids(plain_result)
+    if rich_message_id and rich_message_id != "0":
+        message_ids.append(rich_message_id)
     return _with_rich_state_update(
         {
+            **plain_result,
             "ok": True,
-            "format": "rich",
-            "message_id": _telegram_message_id(response),
+            "format": "plain+rich",
+            "message_ids": message_ids,
+            "rich_message_id": rich_message_id,
+            "rich_enhancement": {"ok": True},
         },
         "supported",
     )
@@ -879,98 +912,24 @@ def edit_rich_message(
     require_single_operation: bool = False,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
-    rendered_fallback = sanitize_text(html_to_plain(html_text, limit=MAX_REPLY_CHARS), MAX_REPLY_CHARS)
-    fallback = rendered_fallback or fallback_text or sanitize_text(str(html_text or ""), MAX_REPLY_CHARS)
+    fallback = _readable_plain_text(html_text, fallback_text)
+    if not fallback:
+        return {
+            "ok": False,
+            "format": "plain",
+            "kind": "empty_plain_text",
+            "error": "readable Telegram text is empty",
+        }
     if require_single_operation and len(html_to_plain(fallback, limit=MAX_REPLY_CHARS)) > RICH_FALLBACK_MAX_CHARS:
-        fallback_allowed = False
-    else:
-        fallback_allowed = True
-    if not rich_message_send_enabled(telegram):
-        if not fallback_allowed:
-            return {
-                "ok": False,
-                "format": "plain",
-                "kind": "presentation_transport_changed",
-                "error": "presentation transport changed",
-            }
-        return target.edit_message(chat_id, message_id, fallback)
-    if len(html_text) > MAX_RICH_HTML_CHARS:
-        if not fallback_allowed:
-            return {
-                "ok": False,
-                "format": "plain",
-                "kind": "presentation_transport_changed",
-                "error": "presentation transport changed",
-            }
-        legacy = target.edit_message(chat_id, message_id, fallback)
-        legacy["fallback_reason"] = "rich_too_large"
-        return legacy
-    payload = {
-        "chat_id": chat_id,
-        "message_id": str(message_id),
-        "rich_message": json.dumps(
-            {"html": sanitize_text(html_text, MAX_RICH_HTML_CHARS), "skip_entity_detection": True},
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ),
-    }
-    try:
-        response = target.api("editMessageText", payload)
-    except RateLimited:
-        raise
-    except TelegramError as exc:
-        kind = _classify_telegram_error(exc)
-        if kind == "transient":
-            return _retry_rich_delivery(kind, exc)
-        if kind == "not_modified":
-            return _with_rich_state_update(
-                {
-                    "ok": True,
-                    "format": "rich",
-                    "kind": kind,
-                    "message_id": str(message_id),
-                },
-                "supported",
-            )
-        if kind in {"not_found", "topic_not_found"}:
-            return {"ok": False, "format": "rich", "kind": kind, "not_found": kind == "not_found", "topic_missing": kind == "topic_not_found", "error": str(exc)}
-        if not fallback_allowed:
-            result = {
-                "ok": False,
-                "format": "plain",
-                "kind": "presentation_transport_changed",
-                "error": "presentation transport changed",
-            }
-            if kind == "capability":
-                return _with_rich_state_update(
-                    result, "disabled", reason=str(exc)
-                )
-            if kind == "bad_request":
-                return _with_rich_state_update(
-                    result, "bad_request", reason=str(exc)
-                )
-            return result
-        legacy = target.edit_message(chat_id, message_id, fallback)
-        legacy["fallback_reason"] = kind
-        if kind == "capability":
-            _with_rich_state_update(
-                legacy, "disabled", reason=str(exc)
-            )
-        elif kind == "bad_request":
-            _with_rich_state_update(
-                legacy, "bad_request", reason=str(exc)
-            )
-        return legacy
-    return _with_rich_state_update(
-        {
-            "ok": True,
-            "format": "rich",
-            "kind": "edited",
-            "message_id": _telegram_message_id(response)
-            or str(message_id),
-        },
-        "supported",
-    )
+        return {
+            "ok": False,
+            "format": "plain",
+            "kind": "presentation_transport_changed",
+            "error": "presentation transport changed",
+        }
+    # An edit has only one durable message identity. Keep that identity
+    # readable instead of converting it back into a rich-only blank bubble.
+    return target.edit_message(chat_id, message_id, fallback)
 
 
 def send_turn_delivery_part(

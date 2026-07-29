@@ -89,9 +89,9 @@ def _run(store, monkeypatch, flag="1", telegram=None):
 def test_superseded_final_gets_folded(monkeypatch):
     store = _folded_store(monkeypatch)
     telegram = _run(store, monkeypatch)
-    # the OLD message (400) was edited into a collapsed rendering
+    # The OLD message (400) remains readable after the cosmetic fold edit.
     edited = [(mid, html) for _chat, mid, html in telegram.edited]
-    assert any(mid == "400" and "<details><summary>" in html and "Old answer text" in html for mid, html in edited)
+    assert any(mid == "400" and "Old answer text" in html for mid, html in edited)
     assert not any(mid == "501" for mid, _ in edited)                 # latest never folded
     assert state.message_bindings(store)["400"].get("folded") is True  # idempotency marker
 

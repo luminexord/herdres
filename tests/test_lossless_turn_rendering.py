@@ -195,7 +195,7 @@ class RecordingTelegram(TelegramClient):
         return {"ok": True, "result": {"message_id": len(self.calls)}}
 
 
-def test_one_part_executor_never_activates_telegram_hidden_split():
+def test_one_part_executor_uses_one_canonical_plain_send():
     item = _long_canonical_turn()
     parts = prepare_turn_delivery_parts(item)
 
@@ -213,7 +213,7 @@ def test_one_part_executor_never_activates_telegram_hidden_split():
         )
         assert result["ok"] is True
         assert len(rich_client.calls) == before + 1
-        assert rich_client.calls[-1][0] == "sendRichMessage"
+        assert rich_client.calls[-1][0] == "sendMessage"
 
     fallback_parts = prepare_turn_delivery_parts(item, rich_transport=False)
     fallback_client = RecordingTelegram()
@@ -236,7 +236,7 @@ def test_one_part_executor_never_activates_telegram_hidden_split():
         assert result.get("message_ids") is None
 
 
-def test_rich_planner_uses_current_32768_character_transport_bound():
+def test_rich_capability_does_not_weaken_canonical_plain_part_bound():
     item = {
         "kind": "turn",
         "user_text": "u" * 18_000,
@@ -246,8 +246,8 @@ def test_rich_planner_uses_current_32768_character_transport_bound():
     rich_parts = prepare_turn_delivery_parts(item)
     plain_parts = prepare_turn_delivery_parts(item, rich_transport=False)
 
-    assert len(rich_parts) == 2
-    assert len(plain_parts) > len(rich_parts)
+    assert rich_parts == plain_parts
+    assert len(rich_parts) > 2
     assert _reconstruct(item, rich_parts, "user_text") == item["user_text"]
     assert (
         _reconstruct(item, rich_parts, "assistant_final_text")
@@ -269,7 +269,7 @@ def test_rich_planner_uses_current_32768_character_transport_bound():
     )
 
 
-def test_two_part_rich_plan_keeps_provider_display_margin_without_content_loss():
+def test_plain_canonical_plan_keeps_content_lossless():
     final = (("- delivery item " + ("x" * 110) + "\n") * 280)[:35_579]
     item = {
         "kind": "turn",
@@ -279,7 +279,7 @@ def test_two_part_rich_plan_keeps_provider_display_margin_without_content_loss()
 
     parts = prepare_turn_delivery_parts(item)
 
-    assert len(parts) == 2
+    assert len(parts) > 2
     assert _reconstruct(item, parts, "user_text") == item["user_text"]
     assert _reconstruct(item, parts, "assistant_final_text") == final
     assert all(
@@ -289,7 +289,7 @@ def test_two_part_rich_plan_keeps_provider_display_margin_without_content_loss()
     )
 
 
-def test_large_rich_part_never_falls_back_to_hidden_plain_siblings():
+def test_large_turn_part_uses_one_bounded_plain_send():
     class UnsupportedRichTelegram(RecordingTelegram):
         def api(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
             self.calls.append((method, payload))
@@ -315,6 +315,5 @@ def test_large_rich_part_never_falls_back_to_hidden_plain_siblings():
         thread_id="7",
     )
 
-    assert result["ok"] is False
-    assert result["kind"] == "presentation_transport_changed"
-    assert [method for method, _payload in client.calls] == ["sendRichMessage"]
+    assert result["ok"] is True
+    assert [method for method, _payload in client.calls] == ["sendMessage"]

@@ -2665,15 +2665,17 @@ def test_rate_limit_defers_without_failure_or_uncertainty(monkeypatch):
     assert resumed["tendwire_turn_final"]["acked"] == 1
 
 
-def test_physical_budget_stops_before_next_lease_and_acceptance_loss_is_explicit(monkeypatch):
+def test_physical_budget_uses_sync_floor_and_acceptance_loss_is_explicit(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
     long_text = "bounded part\n\n" * 500
     tendwire = TurnFinalTendwire(_turn_row("turn-budget", "twrev1.budget", long_text))
     telegram = DeletingTelegram()
     result = sync_once(_store(), _runtime(tendwire, telegram, max_sends=1))
-    assert result["tendwire_turn_final"]["operations"] == 1
-    assert result["tendwire_turn_final"]["polled"] == 1
+    # sync_once intentionally grants the turn-final path a three-operation
+    # floor. Canonical plain planning may need all three for one long turn.
+    assert result["tendwire_turn_final"]["operations"] == 3
+    assert result["tendwire_turn_final"]["polled"] == 3
 
     uncertain_wire = TurnFinalTendwire(_turn_row("turn-uncertain", "twrev1.uncertain", "one message"))
     uncertain_telegram = DeletingTelegram()
