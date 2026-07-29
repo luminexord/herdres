@@ -572,7 +572,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
         # unsupported <details>/<footer> would make Telegram reject the whole
         # edit and fall back to an expanded plain rendering.
         body_html = "<br>".join(
-            _html_text(line, MAX_REPLY_CHARS)
+            _rich_inline(line, MAX_REPLY_CHARS)
             for line in sanitize_text(
                 assistant_final, MAX_REPLY_CHARS
             ).splitlines()
@@ -587,7 +587,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
         parts.append(response_html)
         if user_text:
             user_body = "<br>".join(
-                _html_text(line, MAX_REPLY_CHARS)
+                _rich_inline(line, MAX_REPLY_CHARS)
                 for line in sanitize_text(
                     user_text, MAX_REPLY_CHARS
                 ).splitlines()
@@ -598,7 +598,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
             )
         if worklog_text:
             worklog_body = "<br>".join(
-                _html_text(line, MAX_REPLY_CHARS)
+                _rich_inline(line, 900)
                 for line in sanitize_text(
                     worklog_text, WORKLOG_MAX_CHARS
                 ).splitlines()

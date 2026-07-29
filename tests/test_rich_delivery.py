@@ -256,40 +256,58 @@ def test_quoted_reply_separates_author_label_from_recipient_text():
 
 
 @pytest.mark.parametrize(
-    ("item", "expected_text"),
+    ("item", "expected_url"),
     [
         pytest.param(
             {
                 "kind": "turn",
-                "assistant_final_text": "first response line\nsecond response line",
+                "assistant_final_text": (
+                    "First response line has **Bold result** and `inline()`.\n"
+                    "Second response line has *italic detail* and "
+                    "[reference](https://example.test/response).\n"
+                    "Third response line makes the folded section meaningful."
+                ),
                 "collapse_response": True,
             },
-            "first response line\nsecond response line",
+            "https://example.test/response",
             id="response",
         ),
         pytest.param(
             {
                 "kind": "turn",
                 "assistant_final_text": "answer",
-                "user_text": "first prompt line\nsecond prompt line",
+                "user_text": (
+                    "First prompt line has **Bold request** and `inline()`.\n"
+                    "Second prompt line has *italic detail* and "
+                    "[reference](https://example.test/prompt).\n"
+                    "Third prompt line makes the folded section meaningful."
+                ),
                 "collapse_response": True,
             },
-            "first prompt line\nsecond prompt line",
+            "https://example.test/prompt",
             id="prompt",
         ),
         pytest.param(
             {
                 "kind": "turn",
                 "assistant_final_text": "answer",
-                "worklog_text": "first worklog line\nsecond worklog line",
+                "worklog_text": (
+                    "First worklog line has **Bold progress** and `inline()`.\n"
+                    "Second worklog line has *italic detail* and "
+                    "[reference](https://example.test/worklog).\n"
+                    "Third worklog line makes the folded section meaningful."
+                ),
                 "collapse_response": True,
             },
-            "first worklog line\nsecond worklog line",
+            "https://example.test/worklog",
             id="worklog",
         ),
     ],
 )
-def test_multiline_collapse_edit_is_accepted_as_html(item, expected_text):
+def test_formatted_multiline_collapse_edit_preserves_recipient_entities(
+    item,
+    expected_url,
+):
     client = RecipientTelegram()
 
     result = edit_feed_item(
@@ -306,7 +324,19 @@ def test_multiline_collapse_edit_is_accepted_as_html(item, expected_text):
     assert len(client.attempts) == 1
     assert client.attempts[0]["method"] == "editMessageText"
     assert "<br>" not in client.attempts[0]["text"]
-    assert expected_text in client.recipient_edits[0]["text"]
+    received = client.recipient_edits[0]
+    entity_types = [entity["type"] for entity in received["entities"]]
+    assert entity_types.count("Bold") >= 2
+    assert "Code" in entity_types
+    assert "Italic" in entity_types
+    assert {
+        "type": "TextUrl",
+        "url": expected_url,
+    } in received["entities"]
+    assert "**" not in received["text"]
+    assert "`" not in received["text"]
+    assert "*italic detail*" not in received["text"]
+    assert "[reference](" not in received["text"]
 
 
 @pytest.mark.parametrize(
