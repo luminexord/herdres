@@ -22,7 +22,11 @@ def test_collapse_flag_default_off_env_on():
 # --- renderer -------------------------------------------------------------------
 
 def _turn_item(**extra):
-    item = {"kind": "turn", "user_text": "do the thing", "assistant_final_text": "All done. The result is ready."}
+    item = {
+        "kind": "turn",
+        "user_text": "do the thing\nthen verify it",
+        "assistant_final_text": "All done.\nThe result is ready.",
+    }
     item.update(extra)
     return item
 
@@ -40,12 +44,13 @@ def test_render_collapsed_when_flagged():
         "<b>✅ Response</b>\n<blockquote expandable>"
     )
     assert (
-        "<blockquote expandable>All done. The result is ready.</blockquote>"
+        "<blockquote expandable>All done.<br>The result is ready.</blockquote>"
         in html
     )
-    assert html.count("All done. The result is ready.") == 1
+    assert html.count("All done.") == 1
+    assert html.count("The result is ready.") == 1
     assert "<details" not in html
-    assert "<blockquote>do the thing</blockquote>" in html
+    assert "<blockquote>do the thing<br>then verify it</blockquote>" in html
 
 
 # --- the fold sweep in _sync_turns ---------------------------------------------
@@ -56,7 +61,7 @@ def _two_turn_payload():
         {"id": "turn-new", "worker_id": "w1", "worker_fingerprint": "fp1",
          "assistant_final_text": "New answer", "complete": True},
         {"id": "turn-old", "worker_id": "w1", "worker_fingerprint": "fp1",
-         "assistant_final_text": "Old answer text", "complete": True},
+         "assistant_final_text": "Old answer text\nSecond old line", "complete": True},
     ]}
 
 
@@ -107,7 +112,7 @@ def test_superseded_final_gets_folded(monkeypatch):
     assert (
         "400",
         "<b>✅ Response</b>\n"
-        "<blockquote expandable>Old answer text</blockquote>",
+        "<blockquote expandable>Old answer text\nSecond old line</blockquote>",
     ) in edited
     assert not any(mid == "501" for mid, _ in edited)                 # latest never folded
     assert state.message_bindings(store)["400"].get("folded") is True  # idempotency marker

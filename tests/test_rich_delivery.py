@@ -9,6 +9,7 @@ from herdres_connector import source_sync, state
 from herdres_connector.rendering import telegram_html
 from herdres_connector.rich_delivery import (
     _replace_inline_links,
+    edit_feed_item,
     edit_rich_message,
     send_feed_item,
     send_rich_message,
@@ -119,13 +120,16 @@ class RecipientTelegram(TelegramClient):
         super().__init__(token="test")
         object.__setattr__(self, "reject_html", reject_html)
         object.__setattr__(self, "recipient_messages", [])
+        object.__setattr__(self, "recipient_edits", [])
         object.__setattr__(self, "attempts", [])
 
     def api(self, method, payload):
-        assert method == "sendMessage"
+        assert method in {"sendMessage", "editMessageText"}
         text = str(payload.get("text") or "")
         parse_mode = str(payload.get("parse_mode") or "")
-        self.attempts.append({"text": text, "parse_mode": parse_mode})
+        self.attempts.append(
+            {"method": method, "text": text, "parse_mode": parse_mode}
+        )
         if parse_mode == "HTML" and self.reject_html:
             raise TelegramError("can't parse entities")
         parser = _RecipientHTMLParser()
@@ -141,13 +145,17 @@ class RecipientTelegram(TelegramClient):
         else:
             received_text = text
             entities = []
-        self.recipient_messages.append(
-            {"text": received_text, "entities": entities}
-        )
+        received = {"text": received_text, "entities": entities}
+        if method == "editMessageText":
+            self.recipient_edits.append(received)
+            message_id = payload.get("message_id")
+        else:
+            self.recipient_messages.append(received)
+            message_id = len(self.recipient_messages)
         return {
             "ok": True,
             "result": {
-                "message_id": len(self.recipient_messages),
+                "message_id": message_id,
             },
         }
 
@@ -245,6 +253,60 @@ def test_quoted_reply_separates_author_label_from_recipient_text():
     assert client.recipient_messages[0]["text"] == (
         "💬 You\nTesting message from telegram"
     )
+
+
+@pytest.mark.parametrize(
+    ("item", "expected_text"),
+    [
+        pytest.param(
+            {
+                "kind": "turn",
+                "assistant_final_text": "first response line\nsecond response line",
+                "collapse_response": True,
+            },
+            "first response line\nsecond response line",
+            id="response",
+        ),
+        pytest.param(
+            {
+                "kind": "turn",
+                "assistant_final_text": "answer",
+                "user_text": "first prompt line\nsecond prompt line",
+                "collapse_response": True,
+            },
+            "first prompt line\nsecond prompt line",
+            id="prompt",
+        ),
+        pytest.param(
+            {
+                "kind": "turn",
+                "assistant_final_text": "answer",
+                "worklog_text": "first worklog line\nsecond worklog line",
+                "collapse_response": True,
+            },
+            "first worklog line\nsecond worklog line",
+            id="worklog",
+        ),
+    ],
+)
+def test_multiline_collapse_edit_is_accepted_as_html(item, expected_text):
+    client = RecipientTelegram()
+
+    result = edit_feed_item(
+        client,
+        "-100",
+        "42",
+        item,
+        telegram={},
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    assert result["collapse_applied"] is True
+    assert len(client.attempts) == 1
+    assert client.attempts[0]["method"] == "editMessageText"
+    assert "<br>" not in client.attempts[0]["text"]
+    assert expected_text in client.recipient_edits[0]["text"]
 
 
 @pytest.mark.parametrize(

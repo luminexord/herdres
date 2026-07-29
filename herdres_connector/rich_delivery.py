@@ -1043,8 +1043,11 @@ def edit_rich_message(
     preserve_plain_html: bool = False,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
+    # Collapse edits use the same allowlist boundary as canonical sends:
+    # preserve expandable blockquotes, but turn unsupported builder markup
+    # such as <br> into the literal newlines accepted by Telegram.
     fallback = (
-        sanitize_text(str(html_text or ""), MAX_REPLY_CHARS).strip()
+        telegram_html(str(html_text or ""), limit=MAX_REPLY_CHARS).strip()
         if preserve_plain_html
         else _readable_telegram_html(html_text, fallback_text)
     )
