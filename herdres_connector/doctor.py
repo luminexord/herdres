@@ -148,6 +148,7 @@ def inbound_lanes(
         "pending": snapshot.pending_count,
         "claimable": snapshot.claimable_lane_count,
         "blocked": snapshot.blocked_count,
+        "unknown_obstructions": snapshot.unknown_obstruction_lane_count,
         "stalled_lanes": snapshot.stalled_lane_count,
         "oldest_stalled_seconds": snapshot.oldest_stalled_seconds,
         "first_stalled_lane": snapshot.first_stalled_lane,

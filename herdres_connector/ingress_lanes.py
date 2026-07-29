@@ -95,6 +95,7 @@ class DispatchSnapshot:
     first_claimable_lane: str
     blocked_count: int
     next_blocked_expiry_at: float | None
+    unknown_obstruction_lane_count: int
     stalled_lane_count: int
     first_stalled_lane: str
     oldest_stalled_seconds: float
@@ -214,7 +215,7 @@ class IngressLaneSpool:
 
     @staticmethod
     def _migrate_state_since(connection: sqlite3.Connection) -> None:
-        """Add and conservatively backfill the state-transition clock."""
+        """Add state-specific transition clocks without inventing lease age."""
 
         columns = {
             str(row["name"])
@@ -229,8 +230,10 @@ class IngressLaneSpool:
                 """
                 UPDATE lane_items
                 SET state_since = CASE
+                    WHEN state = 'blocked' THEN updated_at
+                    WHEN state = 'pending' THEN updated_at
+                    WHEN state = 'processing' THEN NULL
                     WHEN state = 'done' THEN updated_at
-                    ELSE first_seen_at
                 END
                 WHERE state_since IS NULL
                 """
@@ -562,13 +565,27 @@ class IngressLaneSpool:
                 obstructions AS (
                     SELECT
                         pending_lane.lane_key,
-                        COALESCE(head.state_since, head.updated_at)
-                            AS obstruction_started_at
+                        CASE
+                            WHEN head.state_since IS NOT NULL
+                                THEN head.state_since
+                            WHEN head.state = 'processing'
+                                THEN NULL
+                            ELSE head.updated_at
+                        END AS obstruction_started_at
                     FROM pending_lanes AS pending_lane
                     JOIN open_heads AS open_head
                       ON open_head.lane_key = pending_lane.lane_key
                     JOIN lane_items AS head
                       ON head.seq = open_head.head_seq
+                    WHERE NOT (
+                        head.state = 'pending'
+                        AND head.next_attempt_at > ?
+                    )
+                ),
+                unknown_obstructions AS (
+                    SELECT obstruction.lane_key
+                    FROM obstructions AS obstruction
+                    WHERE obstruction.obstruction_started_at IS NULL
                 ),
                 stalled AS (
                     SELECT obstruction.lane_key, obstruction.obstruction_started_at
@@ -607,6 +624,10 @@ class IngressLaneSpool:
                         FROM lane_items
                         WHERE state = 'blocked'
                     ) AS next_blocked_expiry_at,
+                    (
+                        SELECT COUNT(*)
+                        FROM unknown_obstructions
+                    ) AS unknown_obstruction_lane_count,
                     (SELECT COUNT(*) FROM stalled) AS stalled_lane_count,
                     (
                         SELECT lane_key
@@ -619,7 +640,7 @@ class IngressLaneSpool:
                         FROM stalled
                     ) AS oldest_stalled_at
                 """,
-                (timestamp, timestamp - stall_after),
+                (timestamp, timestamp, timestamp - stall_after),
             ).fetchone()
         return DispatchSnapshot(
             pending_count=(
@@ -662,6 +683,11 @@ class IngressLaneSpool:
                     and snapshot_row["next_blocked_expiry_at"] is not None
                 )
                 else None
+            ),
+            unknown_obstruction_lane_count=(
+                int(snapshot_row["unknown_obstruction_lane_count"])
+                if snapshot_row is not None
+                else 0
             ),
             stalled_lane_count=(
                 int(snapshot_row["stalled_lane_count"])

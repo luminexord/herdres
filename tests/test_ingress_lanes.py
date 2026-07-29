@@ -276,30 +276,33 @@ def test_enqueue_constraint_failure_is_loud_and_does_not_advance_cursor(
     assert spool.cursor("manager") == 21
 
 
-def test_existing_spool_conservatively_backfills_open_state_transition_clock(
-    tmp_path,
+def test_legacy_blocked_jam_uses_block_transition_clock(
+    tmp_path, monkeypatch
 ) -> None:
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
     _enqueue(
         spool,
-        _update(10, 77, "legacy processing head"),
+        _update(10, 77, "legacy blocked head"),
         "77",
-        first_seen_at=1_001.0,
+        first_seen_at=1_000.0,
+        deadline_at=5_000.0,
     )
     _enqueue(
         spool,
-        _update(11, 77, "legacy pending follower"),
+        _update(11, 77, "legacy blocked follower"),
         "77",
-        first_seen_at=1_001.0,
+        first_seen_at=1_000.0,
+        deadline_at=5_000.0,
     )
-    claimed = spool.claim("legacy-worker", now=1_002.0, lease_seconds=2_000.0)
+    claimed = spool.claim("legacy-worker", now=1_000.0, lease_seconds=30.0)
     assert claimed is not None
-    assert spool.renew_lease(
+    assert spool.mark_blocked(
         claimed.seq,
         "legacy-worker",
-        now=1_999.0,
-        lease_seconds=2_000.0,
+        now=1_001.0,
+        hold_seconds=1_000.0,
     )
     with sqlite3.connect(spool_path) as connection:
         connection.execute("ALTER TABLE lane_items DROP COLUMN state_since")
@@ -308,23 +311,148 @@ def test_existing_spool_conservatively_backfills_open_state_transition_clock(
     rows = migrated.rows()
 
     assert len(rows) == 2
-    assert rows[0]["first_seen_at"] == rows[0]["state_since"] == 1_001.0
+    assert rows[0]["first_seen_at"] == 1_000.0
+    assert rows[0]["state_since"] == rows[0]["updated_at"] == 1_001.0
+    signal = doctor.inbound_lanes(
+        spool_path,
+        now=1_011.0,
+        stall_after_seconds=5.0,
+    )
+    assert signal["signal"] == "inbound_lane_stalled"
+    assert signal["stalled_lanes"] == 1
+    assert signal["unknown_obstructions"] == 0
+    assert signal["oldest_stalled_seconds"] == 10.0
+
+
+def test_legacy_fresh_processing_clock_is_unknown_not_a_long_stall(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
+    _enqueue(
+        spool,
+        _update(20, 77, "legacy freshly claimed head"),
+        "77",
+        first_seen_at=1_000.0,
+        deadline_at=5_000.0,
+    )
+    _enqueue(
+        spool,
+        _update(21, 77, "legacy processing follower"),
+        "77",
+        first_seen_at=1_000.0,
+        deadline_at=5_000.0,
+    )
+    claimed = spool.claim("legacy-worker", now=1_999.0, lease_seconds=300.0)
+    assert claimed is not None
+    with sqlite3.connect(spool_path) as connection:
+        connection.execute("ALTER TABLE lane_items DROP COLUMN state_since")
+
+    migrated = IngressLaneSpool(spool_path)
+    rows = migrated.rows()
+
+    assert rows[0]["state"] == "processing"
     assert rows[0]["updated_at"] == 1_999.0
-    snapshot = migrated.dispatch_snapshot(now=2_000.0, stall_after_seconds=5.0)
-    assert snapshot.stalled_lane_count == 1
-    assert snapshot.oldest_stalled_seconds == 999.0
+    assert rows[0]["state_since"] is None
+    unknown = doctor.inbound_lanes(
+        spool_path,
+        now=2_000.0,
+        stall_after_seconds=5.0,
+    )
+    assert unknown["ok"] is True
+    assert unknown["signal"] == ""
+    assert unknown["pending"] == 1
+    assert unknown["claimable"] == 0
+    assert unknown["unknown_obstructions"] == 1
+    assert unknown["stalled_lanes"] == 0
+    assert unknown["oldest_stalled_seconds"] == 0.0
+
+
+def test_legacy_fresh_retry_is_not_stalled_during_backoff(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
+    _enqueue(
+        spool,
+        _update(30, 77, "legacy retry head"),
+        "77",
+        first_seen_at=1_000.0,
+        deadline_at=5_000.0,
+    )
+    _enqueue(
+        spool,
+        _update(31, 77, "legacy retry follower"),
+        "77",
+        first_seen_at=1_000.0,
+        deadline_at=5_000.0,
+    )
+    claimed = spool.claim("legacy-worker", now=1_001.0, lease_seconds=30.0)
+    assert claimed is not None
+    assert spool.retry(
+        claimed.seq,
+        "legacy-worker",
+        now=1_999.5,
+        backoff_seconds=300.0,
+    )
+    with sqlite3.connect(spool_path) as connection:
+        connection.execute("ALTER TABLE lane_items DROP COLUMN state_since")
+
+    migrated = IngressLaneSpool(spool_path)
+    rows = migrated.rows()
+
+    assert rows[0]["state"] == "pending"
+    assert rows[0]["state_since"] == rows[0]["updated_at"] == 1_999.5
+    assert rows[0]["next_attempt_at"] == 2_299.5
+    during_backoff = doctor.inbound_lanes(
+        spool_path,
+        now=2_299.499,
+        stall_after_seconds=5.0,
+    )
+    assert during_backoff["ok"] is True
+    assert during_backoff["signal"] == ""
+    assert during_backoff["pending"] == 2
+    assert during_backoff["claimable"] == 0
+    assert during_backoff["unknown_obstructions"] == 0
+    assert during_backoff["stalled_lanes"] == 0
+
+    due = doctor.inbound_lanes(
+        spool_path,
+        now=2_299.5,
+        stall_after_seconds=5.0,
+    )
+    assert due["ok"] is True
+    assert due["claimable"] == 1
+    assert due["stalled_lanes"] == 0
+
+
+def test_migrated_spool_remains_writable_by_prior_release(tmp_path) -> None:
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
+    _enqueue(
+        spool,
+        _update(40, 77, "legacy row"),
+        "77",
+        first_seen_at=2_000.0,
+    )
+    with sqlite3.connect(spool_path) as connection:
+        connection.execute("ALTER TABLE lane_items DROP COLUMN state_since")
+
+    migrated = IngressLaneSpool(spool_path)
 
     prior_seq, prior_cursor = _prior_enqueue_shape(
         spool_path,
-        _update(12, 88, "prior release after migration"),
+        _update(41, 88, "prior release after migration"),
         "88",
-        first_seen_at=2_000.0,
+        first_seen_at=2_001.0,
     )
-    assert prior_seq == 3
-    assert prior_cursor == 13
-    assert migrated.cursor("manager") == 13
-    assert [row["update_id"] for row in migrated.rows()] == [10, 11, 12]
-    assert migrated.rows()[2]["state_since"] is None
+    assert prior_seq == 2
+    assert prior_cursor == 42
+    assert migrated.cursor("manager") == 42
+    assert [row["update_id"] for row in migrated.rows()] == [40, 41]
+    assert migrated.rows()[1]["state_since"] is None
 
 
 def test_bounded_hold_terminalizes_before_follower_and_preserves_fifo(
