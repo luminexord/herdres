@@ -7,14 +7,19 @@ import urllib.error
 
 import pytest
 
-from herdres_connector import source_sync
+from herdres_connector import source_sync, state
 from herdres_connector import telegram_delivery
 from herdres_connector.telegram_delivery import (
     RateLimited,
     TelegramClient,
     TelegramError,
 )
-from test_source_only import FakeTelegram, FakeTendwire, _store
+from test_source_only import (
+    FakeTelegram,
+    FakeTendwire,
+    _source_worker,
+    _store,
+)
 
 
 def _worker(worker_id: str, space_id: str) -> dict[str, str]:
@@ -559,9 +564,23 @@ def test_voice_batch_production_adapter_reports_missing_id_unknown(
     assert result["accepted_message_ids"] == []
 
 
-def test_voice_batch_accepts_genuine_message_id(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("message_id", "expected_id"),
+    [
+        (812, "812"),
+        (9223372036854775807, "9223372036854775807"),
+        ("012345", "012345"),
+    ],
+    ids=["small-int", "large-int", "leading-zero-string"],
+)
+def test_voice_batch_accepts_and_persists_genuine_message_id(
+    tmp_path, monkeypatch, message_id, expected_id
 ):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(state_path)
+    )
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     monkeypatch.setattr(
         source_sync.speech,
         "outbound_speech_dir",
@@ -578,28 +597,50 @@ def test_voice_batch_accepts_genuine_message_id(
 
     class GenuineVoiceId:
         def send_voice(self, *_args, **_kwargs):
-            return {"ok": True, "message_id": 812}
+            return {"ok": True, "message_id": message_id}
 
-    result = source_sync._execute_exact_provider_operation(
-        GenuineVoiceId(),
-        store=_store(),
-        mutation=source_sync._provider_mutation(
-            "telegram.send_voice_batch",
-            reason=(
-                "telegram.send_voice_batch: genuine id "
-                "regression"
-            ),
-            args=(
-                ("first",),
-                "turn-1",
-                "-100",
-                "77",
-                "42",
-            ),
+    store = _store()
+    entry_key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-one",
+                "name": "worker-one",
+                "status": "working",
+                "space_id": "space-one",
+                "fingerprint": "fp-worker-one",
+            }
         ),
+        topic_id="77",
+    )
+    entry["speak_next_reply"] = True
+    current = source_sync._speak_reply(
+        store,
+        {
+            "id": "turn-1",
+            "worker_id": "worker-one",
+            "worker_fingerprint": "fp-worker-one",
+            "assistant_final_text": "Complete text answer.",
+            "complete": True,
+        },
+        entry,
+        entry_key,
+        source_sync.SyncRuntime(
+            FakeTendwire(),
+            GenuineVoiceId(),
+            with_outbox=False,
+        ),
+        chat_id="-100",
+        thread_id="77",
+        reply_to="42",
     )
 
-    assert result == ["812"]
+    assert current["voice_reply_message_ids"] == [expected_id]
+    state.save_state(store, state_path)
+    persisted = state.load_state(state_path)
+    assert persisted["panes"][entry_key][
+        "voice_reply_message_ids"
+    ] == [expected_id]
 
 
 def test_voice_batch_finds_nested_rate_limit_and_stops(
