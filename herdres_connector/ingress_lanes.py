@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS lane_items (
     lease_owner TEXT,
     lease_until REAL,
     notify_state TEXT NOT NULL DEFAULT 'pending',
-    state_since REAL NOT NULL,
+    state_since REAL,
     updated_at REAL NOT NULL,
     UNIQUE(receiver_kind, update_id)
 );
@@ -214,7 +214,7 @@ class IngressLaneSpool:
 
     @staticmethod
     def _migrate_state_since(connection: sqlite3.Connection) -> None:
-        """Add and backfill the state-transition clock on existing spools."""
+        """Add and conservatively backfill the state-transition clock."""
 
         columns = {
             str(row["name"])
@@ -228,7 +228,10 @@ class IngressLaneSpool:
             connection.execute(
                 """
                 UPDATE lane_items
-                SET state_since = updated_at
+                SET state_since = CASE
+                    WHEN state = 'done' THEN updated_at
+                    ELSE first_seen_at
+                END
                 WHERE state_since IS NULL
                 """
             )
@@ -384,7 +387,7 @@ class IngressLaneSpool:
 
                 cursor_row = connection.execute(
                     """
-                    INSERT OR IGNORE INTO lane_items(
+                    INSERT INTO lane_items(
                         request_id, receiver_kind, update_id, lane_key, kind,
                         update_json, route_json, state, attempts, first_seen_at,
                         next_attempt_at, deadline_at, lease_owner, lease_until,
@@ -408,7 +411,9 @@ class IngressLaneSpool:
                         now,
                     ),
                 )
-                seq = int(cursor_row.lastrowid)
+                seq = int(cursor_row.lastrowid or 0)
+                if cursor_row.rowcount != 1 or seq <= 0:
+                    raise RuntimeError("inbound spool insert did not persist")
                 cursor = self._advance_cursor_tx(
                     connection, receiver_kind, update_id + 1, now
                 )

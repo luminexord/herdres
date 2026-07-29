@@ -91,6 +91,86 @@ def _enqueue(
     )
 
 
+def _prior_enqueue_shape(
+    spool_path: Path,
+    update: dict[str, object],
+    topic: str,
+    *,
+    first_seen_at: float,
+) -> tuple[int, int]:
+    """Write with the pre-state_since SQL used by the prior release."""
+
+    update_id = int(update["update_id"])
+    update_json = json.dumps(
+        update,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    route_json = json.dumps(
+        {"chat_id": "-100", "topic_id": topic},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    with sqlite3.connect(spool_path, isolation_level=None) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            inserted = connection.execute(
+                """
+                INSERT OR IGNORE INTO lane_items(
+                    request_id, receiver_kind, update_id, lane_key, kind,
+                    update_json, route_json, state, attempts, first_seen_at,
+                    next_attempt_at, deadline_at, lease_owner, lease_until,
+                    notify_state, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, NULL, ?, ?)
+                """,
+                (
+                    _request_id(update),
+                    "manager",
+                    update_id,
+                    lane_key("manager", topic),
+                    "message",
+                    update_json,
+                    route_json,
+                    "pending",
+                    first_seen_at,
+                    first_seen_at,
+                    first_seen_at + 60,
+                    "pending",
+                    first_seen_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO receiver_cursors(receiver_kind, next_update_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(receiver_kind) DO UPDATE SET
+                    next_update_id = MAX(
+                        receiver_cursors.next_update_id,
+                        excluded.next_update_id
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                ("manager", update_id + 1, first_seen_at),
+            )
+            cursor = connection.execute(
+                """
+                SELECT next_update_id
+                FROM receiver_cursors
+                WHERE receiver_kind = 'manager'
+                """
+            ).fetchone()
+            assert cursor is not None
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    return int(inserted.lastrowid or 0), int(cursor[0])
+
+
 def _wait_for(predicate, timeout: float = 3.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -139,14 +219,87 @@ def test_pending_lane_is_spool_eligible_even_while_its_head_is_processing(
     assert snapshot.first_claimable_lane == ""
 
 
-def test_existing_spool_backfills_state_transition_clock(tmp_path) -> None:
+def test_fresh_spool_remains_writable_by_prior_and_current_enqueue_shapes(
+    tmp_path,
+) -> None:
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
+    _enqueue(spool, _update(1, 77, "current before rollback"), "77")
+
+    prior_seq, prior_cursor = _prior_enqueue_shape(
+        spool_path,
+        _update(2, 77, "prior release during rollback"),
+        "77",
+        first_seen_at=1_001.0,
+    )
+    assert prior_seq == 2
+    assert prior_cursor == 3
+    assert spool.cursor("manager") == 3
+    rollback_rows = spool.rows()
+    assert [row["update_id"] for row in rollback_rows] == [1, 2]
+    assert rollback_rows[0]["state_since"] == rollback_rows[0]["first_seen_at"]
+    assert rollback_rows[1]["state_since"] is None
+
+    with sqlite3.connect(spool_path) as connection:
+        state_since = next(
+            row
+            for row in connection.execute("PRAGMA table_info(lane_items)")
+            if row[1] == "state_since"
+        )
+    assert state_since[3] == 0
+
+    _enqueue(
+        spool,
+        _update(3, 77, "current after rollback"),
+        "77",
+        first_seen_at=1_002.0,
+    )
+    assert [row["update_id"] for row in spool.rows()] == [1, 2, 3]
+    assert spool.cursor("manager") == 4
+
+
+def test_enqueue_constraint_failure_is_loud_and_does_not_advance_cursor(
+    tmp_path,
+) -> None:
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
+    _enqueue(spool, _update(20, 77, "persisted"), "77")
+    with sqlite3.connect(spool_path) as connection:
+        connection.execute(
+            "CREATE UNIQUE INDEX test_one_item_per_lane ON lane_items(lane_key)"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _enqueue(spool, _update(21, 77, "must fail loudly"), "77")
+
+    assert [row["update_id"] for row in spool.rows()] == [20]
+    assert spool.cursor("manager") == 21
+
+
+def test_existing_spool_conservatively_backfills_open_state_transition_clock(
+    tmp_path,
+) -> None:
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
     _enqueue(
         spool,
-        _update(2, 77, "pre-migration"),
+        _update(10, 77, "legacy processing head"),
         "77",
-        first_seen_at=1_000.0,
+        first_seen_at=1_001.0,
+    )
+    _enqueue(
+        spool,
+        _update(11, 77, "legacy pending follower"),
+        "77",
+        first_seen_at=1_001.0,
+    )
+    claimed = spool.claim("legacy-worker", now=1_002.0, lease_seconds=2_000.0)
+    assert claimed is not None
+    assert spool.renew_lease(
+        claimed.seq,
+        "legacy-worker",
+        now=1_999.0,
+        lease_seconds=2_000.0,
     )
     with sqlite3.connect(spool_path) as connection:
         connection.execute("ALTER TABLE lane_items DROP COLUMN state_since")
@@ -154,8 +307,24 @@ def test_existing_spool_backfills_state_transition_clock(tmp_path) -> None:
     migrated = IngressLaneSpool(spool_path)
     rows = migrated.rows()
 
-    assert len(rows) == 1
-    assert rows[0]["state_since"] == rows[0]["updated_at"] == 1_000.0
+    assert len(rows) == 2
+    assert rows[0]["first_seen_at"] == rows[0]["state_since"] == 1_001.0
+    assert rows[0]["updated_at"] == 1_999.0
+    snapshot = migrated.dispatch_snapshot(now=2_000.0, stall_after_seconds=5.0)
+    assert snapshot.stalled_lane_count == 1
+    assert snapshot.oldest_stalled_seconds == 999.0
+
+    prior_seq, prior_cursor = _prior_enqueue_shape(
+        spool_path,
+        _update(12, 88, "prior release after migration"),
+        "88",
+        first_seen_at=2_000.0,
+    )
+    assert prior_seq == 3
+    assert prior_cursor == 13
+    assert migrated.cursor("manager") == 13
+    assert [row["update_id"] for row in migrated.rows()] == [10, 11, 12]
+    assert migrated.rows()[2]["state_since"] is None
 
 
 def test_bounded_hold_terminalizes_before_follower_and_preserves_fifo(

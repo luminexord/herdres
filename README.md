@@ -142,6 +142,11 @@ the retry backoff. `herdres doctor` fails with the structured
 continuously for `HERDRES_INBOUND_LANE_STALL_SECONDS` (default `5`). The clock
 starts at the current obstructing head's state transition, so old followers
 behind a freshly claimed head do not produce a false alarm.
+On the first boot after adding that clock, legacy open rows conservatively use
+their original `first_seen_at`: their latest heartbeat is not evidence of a
+state transition, and a possible early alert is safer than hiding an existing
+obstruction. The nullable column deliberately remains writable by the prior
+release during rollback; the next real state transition fills it.
 The dispatcher renews a claimed lease across the full pipeline, including
 unbounded voice pretranscription, command execution, and terminal receipt commit.
 Expired leases are reclaimed after a crash and replay the same request ID;
