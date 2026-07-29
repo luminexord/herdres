@@ -71,6 +71,10 @@ HRULE_RE = re.compile(r"^\s*([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 INLINE_CODE_RE = re.compile(r"`([^`\n]{1,300})`")
 
 
+class PresentationContentError(RuntimeError):
+    """Expected inability to fit specific valid content in one presentation."""
+
+
 def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
     return html.escape(sanitize_text(str(value or ""), max_chars), quote=False)
 
@@ -547,6 +551,13 @@ def _planned_parts_for_limits(
                 "ordinal": ordinal,
                 "part_count": part_count,
                 "spans": spans,
+                # Local-only metadata: Tendwire persists the canonical spans,
+                # while delivery recomputes this deterministic limit before
+                # materializing them.
+                "_source_limits": {
+                    "user_text": user_limit,
+                    "assistant_final_text": final_limit,
+                },
             }
         )
     return parts
@@ -565,6 +576,11 @@ def _materialize_turn_delivery_part(item: dict[str, Any], part: dict[str, Any]) 
     spans = part.get("spans")
     if not isinstance(spans, list) or not spans:
         raise ValueError("turn delivery part spans must be a non-empty list")
+    source_limits = part.get("_source_limits")
+    if source_limits is None:
+        source_limits = {}
+    if not isinstance(source_limits, dict):
+        raise ValueError("turn delivery source limits must be an object")
     seen_fields: set[str] = set()
     for span in spans:
         if not isinstance(span, dict):
@@ -584,8 +600,24 @@ def _materialize_turn_delivery_part(item: dict[str, Any], part: dict[str, Any]) 
             raise ValueError("turn delivery span is outside canonical content")
         fragment = source[start:end]
         if field == "assistant_final_text":
+            planning_limit = source_limits.get(
+                field, TURN_DELIVERY_PLAIN_SOURCE_CHARS
+            )
+            if (
+                isinstance(planning_limit, bool)
+                or not isinstance(planning_limit, int)
+                or planning_limit <= 0
+            ):
+                raise ValueError(
+                    "turn delivery source limit must be a positive integer"
+                )
             fragment = (
-                table_continuation_header(source, start) + fragment
+                table_continuation_header(
+                    source,
+                    start,
+                    planning_limit=planning_limit,
+                )
+                + fragment
             )
         fragments[field].append(fragment)
     materialized = dict(item)
@@ -695,7 +727,9 @@ def prepare_turn_delivery_parts(
         ):
             return parts
         if user_limit == 1 and final_limit == 1:
-            raise ValueError("one code point cannot fit Telegram presentation limits")
+            raise PresentationContentError(
+                "one code point cannot fit Telegram presentation limits"
+            )
         user_limit = max(1, user_limit // 2)
         final_limit = max(1, final_limit // 2)
 

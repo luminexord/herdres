@@ -14,6 +14,7 @@ from . import accounts, config, decisions, ingress_requests, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import (
+    PresentationContentError,
     RICH_BAD_REQUEST_LIMIT,
     RICH_RENDER_VERSION,
     RICH_STATE_UPDATE_KEY,
@@ -39,7 +40,7 @@ from .telegram_delivery import (
     topic_icon_catalog,
     topic_icon_id,
 )
-from .tendwire_client import TendwireClient
+from .tendwire_client import TendwireClient, TendwireError
 
 RENDER_VERSION = "telegram-rich-v27-multipart-margin"
 PRESENTATION_VERSION = "turn-present-v29"
@@ -6268,11 +6269,11 @@ def _stage_final_plan(
 def _prepare_final_delivery_parts(
     feed_item: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Turn any presentation-planning defect into a per-item outcome.
+    """Turn expected content limits into a per-item outcome.
 
-    Planning happens before a provider write.  Its failures therefore belong
-    to the exact turn being planned and must never escape far enough to abort
-    the enclosing sync pass or leave the lease to expire silently.
+    Programming defects deliberately propagate to the loop-level systemic
+    failure reporter. Quietly converting AttributeError, TypeError, ValueError,
+    or another unexpected exception would make a lost final look healthy.
     """
 
     try:
@@ -6280,12 +6281,10 @@ def _prepare_final_delivery_parts(
             feed_item,
             rich_transport=False,
         )
-    except _TurnContentError:
-        raise
-    except Exception as exc:
+    except PresentationContentError as exc:
         raise _TurnContentError(
             "invalid_presentation_plan",
-            f"turn presentation planning failed: {type(exc).__name__}",
+            str(exc),
         ) from exc
 
 
@@ -8330,11 +8329,17 @@ def _drain_post_ack_reconciliations(
             feed_item = _turn_feed_item(item, entry)
             try:
                 plans = _prepare_final_delivery_parts(feed_item)
-            except _TurnContentError:
+            except _TurnContentError as exc:
                 # This message has already been acknowledged upstream.  Keep
                 # the durable local reconciliation obligation in place and
                 # isolate the bad item from the rest of the sync pass.
-                result["status"] = "invalid_presentation_plan"
+                state.record_tendwire_turn_job_post_ack_error(
+                    store,
+                    job_key,
+                    status=exc.status,
+                    error=str(exc),
+                )
+                result["status"] = exc.status
                 result["failed"] += 1
                 result["changed"] = True
                 continue
@@ -8697,9 +8702,10 @@ def _drain_turn_final(
                     runtime, ref, f"{exc.status}: {exc}", result
                 )
                 break
-            except Exception:
-                # Plan preparation is idempotent and still precedes Telegram.
-                # A transport/process failure is therefore safe to retry.
+            except TendwireError:
+                # The provider boundary names transport/process failures.
+                # Programming exceptions from local planning are deliberately
+                # not caught here and reach loop-level failure reporting.
                 _defer_turn_final(
                     runtime,
                     ref,

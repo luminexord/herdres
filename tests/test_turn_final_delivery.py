@@ -2068,6 +2068,44 @@ def test_turn_final_rebind_during_ack_records_local_reconciliation(
     assert len(tendwire.ack_calls) == 1
     assert [sent[2]["thread_id"] for sent in telegram.sent] == ["77"]
 
+    real_planner = source_sync.prepare_turn_delivery_parts
+    monkeypatch.setattr(
+        source_sync,
+        "prepare_turn_delivery_parts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            source_sync.PresentationContentError(
+                "synthetic reconciliation presentation failure"
+            )
+        ),
+    )
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        blocked = sync_once(
+            current, _runtime(tendwire, telegram, max_sends=8)
+        )
+        state.save_state(current, state_path)
+
+    persisted = state.load_state(state_path)
+    receipt = next(
+        iter(state.tendwire_turn_jobs(persisted).values())
+    )
+    assert blocked["ok"] is True
+    assert (
+        blocked["tendwire_turn_final"]["status"]
+        == "invalid_presentation_plan"
+    )
+    assert receipt["post_ack_reconcile"]["planning_error"] == {
+        "status": "invalid_presentation_plan",
+        "error": "synthetic reconciliation presentation failure",
+        "attempts": 1,
+    }
+    assert len(tendwire.ack_calls) == 1
+    monkeypatch.setattr(
+        source_sync,
+        "prepare_turn_delivery_parts",
+        real_planner,
+    )
+
     with state.state_lock(path=state_path):
         current = state.load_state(state_path)
         healed = sync_once(
@@ -2839,6 +2877,79 @@ def test_oversized_table_row_or_header_delivers_losslessly(
     assert sum(payload.count(marker) for payload in payloads) == expected_count
 
 
+def test_fitting_large_header_repeats_on_every_continuation(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    header = "H" * 3_300
+    table = "\n".join(
+        [
+            f"| {header} |",
+            "| --- |",
+            "| short |",
+            f"| {'D' * 250} |",
+        ]
+    )
+    tendwire = TurnFinalTendwire(
+        _turn_row(
+            "turn-fitting-large-header",
+            "twrev1.fitting_large_header",
+            table,
+        )
+    )
+    telegram = DeletingTelegram()
+
+    result = sync_once(
+        _store(), _runtime(tendwire, telegram, max_sends=100)
+    )
+    payloads = [message[1] for message in telegram.sent]
+
+    assert result["tendwire_turn_final"]["failed"] == 0
+    assert result["tendwire_turn_final"]["acked"] == 2
+    assert len(payloads) == 2
+    assert [payload.count("H") for payload in payloads] == [
+        len(header),
+        len(header),
+    ]
+
+
+def test_oversized_continued_header_is_not_repeated_past_effective_limit(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    header = "H" * 3_850
+    table = "\n".join(
+        [
+            f"| {header} |",
+            "| --- |",
+            f"| {'D' * 4_000} |",
+        ]
+    )
+    tendwire = TurnFinalTendwire(
+        _turn_row(
+            "turn-oversized-continued-header",
+            "twrev1.oversized_continued_header",
+            table,
+        )
+    )
+    telegram = DeletingTelegram()
+
+    result = sync_once(
+        _store(), _runtime(tendwire, telegram, max_sends=100)
+    )
+    payloads = [message[1] for message in telegram.sent]
+
+    assert result["tendwire_turn_final"]["failed"] == 0
+    assert result["tendwire_turn_final"]["acked"] == len(payloads)
+    assert len(payloads) == 3
+    assert sum(payload.count("H") for payload in payloads) == len(
+        header
+    )
+    assert payloads[-1].count("H") == 0
+
+
 def test_split_table_repeats_header_and_preserves_each_complete_row(
     monkeypatch,
 ):
@@ -2904,7 +3015,7 @@ def test_table_aware_split_keeps_near_limit_row_out_of_prior_part(
     assert all("Name | Value" in payload for payload in payloads)
 
 
-def test_planning_failure_records_exact_failure_and_sync_continues(
+def test_content_presentation_failure_records_exact_failure_and_sync_continues(
     monkeypatch,
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
@@ -2921,7 +3032,9 @@ def test_planning_failure_records_exact_failure_and_sync_continues(
         source_sync,
         "prepare_turn_delivery_parts",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            ValueError("synthetic future planning defect")
+            source_sync.PresentationContentError(
+                "synthetic content presentation failure"
+            )
         ),
     )
 
@@ -2944,6 +3057,42 @@ def test_planning_failure_records_exact_failure_and_sync_continues(
         "must not be reported delivered" in message[1]
         for message in telegram.sent
     )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AttributeError("synthetic planner attribute defect"),
+        TypeError("synthetic planner type defect"),
+        ValueError("synthetic planner value defect"),
+    ],
+)
+def test_programming_planning_defect_surfaces_as_systemic_failure(
+    monkeypatch, error
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    row = _turn_row(
+        "turn-planning-defect",
+        "twrev1.planning_defect",
+        "must remain eligible after the loud failure",
+    )
+    tendwire = MultiTurnFinalTendwire([row])
+    telegram = DeletingTelegram()
+    monkeypatch.setattr(
+        source_sync,
+        "prepare_turn_delivery_parts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(type(error), match="synthetic planner"):
+        sync_once(
+            _store(), _runtime(tendwire, telegram, max_sends=100)
+        )
+
+    assert tendwire.fail_calls == []
+    assert tendwire.ack_calls == []
+    assert telegram.sent == []
 
 
 def test_dormant_rich_state_does_not_fragment_plain_delivery_budget(
@@ -4830,7 +4979,9 @@ def test_prepare_exception_defers_source_root_then_retries_once(
         def connector_prepare_begin(self, **kwargs):
             if self.prepare_failure_armed:
                 self.prepare_failure_armed = False
-                raise RuntimeError("transient prepare transport failure")
+                raise source_sync.TendwireError(
+                    "transient prepare transport failure"
+                )
             return super().connector_prepare_begin(**kwargs)
 
     tendwire = PrepareFailsOnce(

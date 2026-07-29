@@ -313,10 +313,18 @@ def split_table_aware_spans(
     return spans
 
 
-def table_continuation_header(value: Any, start: int) -> str:
+def table_continuation_header(
+    value: Any,
+    start: int,
+    *,
+    planning_limit: int,
+) -> str:
     """Return the header to repeat when ``start`` continues a table."""
 
     text = canonical_text(value)
+    limit = int(planning_limit)
+    if limit <= 0:
+        raise ValueError("planning limit must be positive")
     for block_start, data_start, block_end, header in _markdown_table_blocks(
         text
     ):
@@ -325,7 +333,7 @@ def table_continuation_header(value: Any, start: int) -> str:
             # parts.  Repeating it would make every data-row continuation
             # exceed the same bound, so that specific table degrades to plain
             # source continuation instead.
-            if len(header) > FINAL_CHUNK_SOURCE_CHARS:
+            if len(header) > limit:
                 return ""
             return header
     return ""

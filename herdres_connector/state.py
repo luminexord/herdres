@@ -4266,6 +4266,39 @@ def clear_tendwire_turn_job_post_ack_reconcile(
     return True
 
 
+def record_tendwire_turn_job_post_ack_error(
+    data: dict[str, Any],
+    job_key: str,
+    *,
+    status: str,
+    error: str,
+) -> dict[str, Any]:
+    """Keep reconciliation diagnostics with the obligation until it heals."""
+
+    receipt = find_tendwire_turn_job(data, job_key)
+    if receipt is None:
+        raise KeyError(job_key)
+    obligation = receipt.get("post_ack_reconcile")
+    if not isinstance(obligation, dict):
+        raise ValueError("turn job has no post-ACK reconciliation obligation")
+    previous = obligation.get("planning_error")
+    attempts = (
+        int(previous.get("attempts") or 0)
+        if isinstance(previous, dict)
+        and isinstance(previous.get("attempts"), int)
+        and not isinstance(previous.get("attempts"), bool)
+        else 0
+    )
+    diagnostic = {
+        "status": compact_ws(status, 80),
+        "error": compact_ws(error, 240),
+        "attempts": attempts + 1,
+    }
+    obligation["planning_error"] = diagnostic
+    receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
+    return diagnostic
+
+
 def orphaned_created_topics(data: dict[str, Any]) -> list[dict[str, Any]]:
     raw = data.get("telegram_orphaned_created_topics")
     if not isinstance(raw, list):
