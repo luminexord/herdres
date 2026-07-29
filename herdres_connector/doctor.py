@@ -140,15 +140,38 @@ def inbound_lanes(
             "error": sanitize_text(str(exc), 200),
         }
     stalled = snapshot.stalled_lane_count > 0
+    unknown = snapshot.unknown_obstruction_lane_count > 0
+    retry_obstructed = snapshot.retry_obstructed_lane_count > 0
+    if stalled:
+        status = "stalled"
+        signal = "inbound_lane_stalled"
+    elif unknown:
+        status = "obstruction_unknown"
+        signal = "inbound_lane_obstruction_unknown"
+    elif retry_obstructed:
+        status = "retry_obstructed"
+        signal = "inbound_lane_retry_obstructed"
+    else:
+        status = "healthy"
+        signal = ""
     return {
-        "ok": not stalled,
-        "status": "stalled" if stalled else "healthy",
-        "signal": "inbound_lane_stalled" if stalled else "",
+        "ok": not (stalled or unknown or retry_obstructed),
+        "status": status,
+        "signal": signal,
         "threshold_seconds": threshold,
         "pending": snapshot.pending_count,
         "claimable": snapshot.claimable_lane_count,
         "blocked": snapshot.blocked_count,
         "unknown_obstructions": snapshot.unknown_obstruction_lane_count,
+        "first_unknown_obstruction_lane": (
+            snapshot.first_unknown_obstruction_lane
+        ),
+        "unknown_obstruction_duration_seconds": None,
+        "retry_obstructed_lanes": snapshot.retry_obstructed_lane_count,
+        "first_retry_obstructed_lane": snapshot.first_retry_obstructed_lane,
+        "oldest_retry_obstructed_seconds": (
+            snapshot.oldest_retry_obstructed_seconds
+        ),
         "stalled_lanes": snapshot.stalled_lane_count,
         "oldest_stalled_seconds": snapshot.oldest_stalled_seconds,
         "first_stalled_lane": snapshot.first_stalled_lane,

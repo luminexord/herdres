@@ -180,6 +180,12 @@ def _wait_for(predicate, timeout: float = 3.0) -> None:
     assert predicate()
 
 
+def _healthy_or_stalled(check: dict[str, object]) -> str:
+    """Model a compatibility consumer that understands only ``ok``."""
+
+    return "healthy" if check["ok"] else "stalled"
+
+
 def _configured_state(path: Path) -> None:
     store = _store()
     for worker_id, topic in (("worker-a", "77"), ("worker-b", "88")):
@@ -239,6 +245,7 @@ def test_fresh_spool_remains_writable_by_prior_and_current_enqueue_shapes(
     assert [row["update_id"] for row in rollback_rows] == [1, 2]
     assert rollback_rows[0]["state_since"] == rollback_rows[0]["first_seen_at"]
     assert rollback_rows[1]["state_since"] is None
+    assert rollback_rows[1]["retry_obstructed_since"] is None
 
     with sqlite3.connect(spool_path) as connection:
         state_since = next(
@@ -306,6 +313,9 @@ def test_legacy_blocked_jam_uses_block_transition_clock(
     )
     with sqlite3.connect(spool_path) as connection:
         connection.execute("ALTER TABLE lane_items DROP COLUMN state_since")
+        connection.execute(
+            "ALTER TABLE lane_items DROP COLUMN retry_obstructed_since"
+        )
 
     migrated = IngressLaneSpool(spool_path)
     rows = migrated.rows()
@@ -348,25 +358,38 @@ def test_legacy_fresh_processing_clock_is_unknown_not_a_long_stall(
     assert claimed is not None
     with sqlite3.connect(spool_path) as connection:
         connection.execute("ALTER TABLE lane_items DROP COLUMN state_since")
+        connection.execute(
+            "ALTER TABLE lane_items DROP COLUMN retry_obstructed_since"
+        )
 
     migrated = IngressLaneSpool(spool_path)
+    assert migrated.renew_lease(
+        claimed.seq,
+        "legacy-worker",
+        now=9_999.0,
+        lease_seconds=300.0,
+    )
     rows = migrated.rows()
 
     assert rows[0]["state"] == "processing"
-    assert rows[0]["updated_at"] == 1_999.0
+    assert rows[0]["updated_at"] == 9_999.0
     assert rows[0]["state_since"] is None
     unknown = doctor.inbound_lanes(
         spool_path,
-        now=2_000.0,
+        now=10_000.0,
         stall_after_seconds=5.0,
     )
-    assert unknown["ok"] is True
-    assert unknown["signal"] == ""
+    assert unknown["ok"] is False
+    assert unknown["status"] == "obstruction_unknown"
+    assert unknown["signal"] == "inbound_lane_obstruction_unknown"
     assert unknown["pending"] == 1
     assert unknown["claimable"] == 0
     assert unknown["unknown_obstructions"] == 1
+    assert unknown["first_unknown_obstruction_lane"] == lane_key("manager", "77")
+    assert unknown["unknown_obstruction_duration_seconds"] is None
     assert unknown["stalled_lanes"] == 0
     assert unknown["oldest_stalled_seconds"] == 0.0
+    assert _healthy_or_stalled(unknown) == "stalled"
 
 
 def test_legacy_fresh_retry_is_not_stalled_during_backoff(
@@ -395,20 +418,24 @@ def test_legacy_fresh_retry_is_not_stalled_during_backoff(
         claimed.seq,
         "legacy-worker",
         now=1_999.5,
-        backoff_seconds=300.0,
+        backoff_seconds=2.0,
     )
     with sqlite3.connect(spool_path) as connection:
         connection.execute("ALTER TABLE lane_items DROP COLUMN state_since")
+        connection.execute(
+            "ALTER TABLE lane_items DROP COLUMN retry_obstructed_since"
+        )
 
     migrated = IngressLaneSpool(spool_path)
     rows = migrated.rows()
 
     assert rows[0]["state"] == "pending"
     assert rows[0]["state_since"] == rows[0]["updated_at"] == 1_999.5
-    assert rows[0]["next_attempt_at"] == 2_299.5
+    assert rows[0]["retry_obstructed_since"] == 1_999.5
+    assert rows[0]["next_attempt_at"] == 2_001.5
     during_backoff = doctor.inbound_lanes(
         spool_path,
-        now=2_299.499,
+        now=2_000.5,
         stall_after_seconds=5.0,
     )
     assert during_backoff["ok"] is True
@@ -416,16 +443,93 @@ def test_legacy_fresh_retry_is_not_stalled_during_backoff(
     assert during_backoff["pending"] == 2
     assert during_backoff["claimable"] == 0
     assert during_backoff["unknown_obstructions"] == 0
+    assert during_backoff["retry_obstructed_lanes"] == 0
     assert during_backoff["stalled_lanes"] == 0
 
     due = doctor.inbound_lanes(
         spool_path,
-        now=2_299.5,
+        now=2_001.5,
         stall_after_seconds=5.0,
     )
     assert due["ok"] is True
     assert due["claimable"] == 1
     assert due["stalled_lanes"] == 0
+
+
+def test_successive_retries_preserve_continuous_obstruction_clock(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    spool_path = tmp_path / "spool.db"
+    spool = IngressLaneSpool(spool_path)
+    _enqueue(
+        spool,
+        _update(50, 77, "repeated retry head"),
+        "77",
+        first_seen_at=1_000.0,
+        deadline_at=5_000.0,
+    )
+    _enqueue(
+        spool,
+        _update(51, 77, "starved follower"),
+        "77",
+        first_seen_at=1_000.0,
+        deadline_at=5_000.0,
+    )
+
+    head = spool.claim("worker-1", now=1_000.0, lease_seconds=30.0)
+    assert head is not None
+    assert spool.retry(
+        head.seq,
+        "worker-1",
+        now=1_000.0,
+        backoff_seconds=1.0,
+    )
+    head = spool.claim("worker-2", now=1_001.0, lease_seconds=30.0)
+    assert head is not None
+    assert spool.retry(
+        head.seq,
+        "worker-2",
+        now=1_001.0,
+        backoff_seconds=1.0,
+    )
+    head = spool.claim("worker-3", now=1_003.0, lease_seconds=30.0)
+    assert head is not None
+    assert spool.retry(
+        head.seq,
+        "worker-3",
+        now=1_003.0,
+        backoff_seconds=1.0,
+    )
+
+    rows = spool.rows()
+    assert rows[0]["attempts"] == 3
+    assert rows[0]["state_since"] == 1_003.0
+    assert rows[0]["retry_obstructed_since"] == 1_000.0
+    before_threshold = doctor.inbound_lanes(
+        spool_path,
+        now=1_004.999,
+        stall_after_seconds=5.0,
+    )
+    assert before_threshold["ok"] is True
+    assert before_threshold["signal"] == ""
+    assert before_threshold["retry_obstructed_lanes"] == 0
+
+    obstructed = doctor.inbound_lanes(
+        spool_path,
+        now=1_005.0,
+        stall_after_seconds=5.0,
+    )
+    assert obstructed["ok"] is False
+    assert obstructed["status"] == "retry_obstructed"
+    assert obstructed["signal"] == "inbound_lane_retry_obstructed"
+    assert obstructed["pending"] == 2
+    assert obstructed["claimable"] == 0
+    assert obstructed["retry_obstructed_lanes"] == 1
+    assert obstructed["first_retry_obstructed_lane"] == lane_key("manager", "77")
+    assert obstructed["oldest_retry_obstructed_seconds"] == 5.0
+    assert obstructed["stalled_lanes"] == 0
+    assert _healthy_or_stalled(obstructed) == "stalled"
 
 
 def test_migrated_spool_remains_writable_by_prior_release(tmp_path) -> None:
@@ -439,6 +543,9 @@ def test_migrated_spool_remains_writable_by_prior_release(tmp_path) -> None:
     )
     with sqlite3.connect(spool_path) as connection:
         connection.execute("ALTER TABLE lane_items DROP COLUMN state_since")
+        connection.execute(
+            "ALTER TABLE lane_items DROP COLUMN retry_obstructed_since"
+        )
 
     migrated = IngressLaneSpool(spool_path)
 
@@ -453,6 +560,7 @@ def test_migrated_spool_remains_writable_by_prior_release(tmp_path) -> None:
     assert migrated.cursor("manager") == 42
     assert [row["update_id"] for row in migrated.rows()] == [40, 41]
     assert migrated.rows()[1]["state_since"] is None
+    assert migrated.rows()[1]["retry_obstructed_since"] is None
 
 
 def test_bounded_hold_terminalizes_before_follower_and_preserves_fifo(

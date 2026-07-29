@@ -146,10 +146,15 @@ On the first boot after adding that clock, legacy blocked and retry-pending rows
 use their latest transition timestamp. A retry-pending head is excluded from
 stall evaluation until its backoff is due. A legacy processing timestamp is
 unknowable because its latest write may only be a lease heartbeat, so its clock
-remains null: doctor reports `unknown_obstructions` but does not emit
-`inbound_lane_stalled`. Gateway startup reclaims inherited processing leases
-and supplies the first real transition timestamp. The nullable column also
-remains writable by the prior release during rollback.
+remains null: doctor fails with `inbound_lane_obstruction_unknown`, names the
+lane, and reports no duration. Gateway startup reclaims inherited processing
+leases and supplies the first real transition timestamp. Retry obstruction has
+its own durable clock, set by the first retry and preserved across later
+backoffs. A retry shorter than the stall threshold remains healthy; at the
+threshold doctor fails with `inbound_lane_retry_obstructed`. Thus every
+non-claimable lane is visible within five seconds by default, without calling a
+legitimate short retry stalled. The nullable columns also remain writable by
+the prior release during rollback.
 The dispatcher renews a claimed lease across the full pipeline, including
 unbounded voice pretranscription, command execution, and terminal receipt commit.
 Expired leases are reclaimed after a crash and replay the same request ID;
