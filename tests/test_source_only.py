@@ -2601,7 +2601,7 @@ def test_promoted_working_final_edits_in_place_as_single_message(monkeypatch):
     assert result["feed_sent"] == 1
     # The final Response was edited into the existing working message.
     assert "4557d20 Prevent child bot target races" in edited_html
-    assert "branch: tendwired" in edited_html
+    assert "branch: <code>tendwired</code>" in edited_html
     # Single message -- no "Response i/N" split labels anywhere.
     assert "✅ Response 1/" not in edited_html
     assert "✅ Response 1/" not in "\n".join(sent[1] for sent in telegram.sent)
@@ -2625,8 +2625,8 @@ def test_oversize_response_splits_losslessly_into_labeled_parts():
     assert combined.count("<b>✅ Response ") == total  # one marker per part
 
 
-def test_promote_to_final_uses_bounded_plain_sends_above_edit_cap(monkeypatch):
-    # A final above the ordinary-message cap is split into readable plain parts.
+def test_promote_to_final_uses_bounded_formatted_sends_above_edit_cap(monkeypatch):
+    # A final above the ordinary-message cap is split into readable HTML parts.
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
     telegram = FakeTelegram()
@@ -2663,7 +2663,7 @@ def test_promote_to_final_uses_bounded_plain_sends_above_edit_cap(monkeypatch):
     response_messages = [sent[1] for sent in telegram.sent if "✅ Response" in sent[1]]
     assert result["feed_sent"] == 1
     assert len(response_messages) > 1
-    assert response_messages[0].startswith("✅ Response 1/")
+    assert response_messages[0].startswith("<b>✅ Response 1/")
     assert any(tail in message for message in response_messages)
 
 

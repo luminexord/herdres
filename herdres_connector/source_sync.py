@@ -30,6 +30,7 @@ from .rich_delivery import (
 )
 from .safe import compact_ws, html_escape, short_hash
 from .telegram_delivery import (
+    DELIVERY_FORMAT_STATE_UPDATE_KEY,
     MESSAGE_TEXT_LIMIT,
     TOPIC_ICON_COLORS,
     RateLimited,
@@ -61,6 +62,7 @@ _TOPIC_CLEANUP_PERMANENT_ERROR_KINDS = frozenset(
     {"bad_request", "bot_access", "capability"}
 )
 _ACCEPTED_NOTIFICATION_LIMIT = 64
+_DELIVERY_FORMAT_FALLBACK_LIMIT = 64
 
 
 class _TurnContentError(RuntimeError):
@@ -1304,6 +1306,58 @@ def _apply_provider_capability_state(
 
     if not isinstance(result, dict):
         return
+    format_updates = result.get(DELIVERY_FORMAT_STATE_UPDATE_KEY)
+    if isinstance(format_updates, dict):
+        format_updates = [format_updates]
+    if isinstance(format_updates, list):
+        telegram = _telegram_state(store)
+        fallback_state = telegram.setdefault(
+            "delivery_format_fallbacks", {}
+        )
+        if not isinstance(fallback_state, dict):
+            fallback_state = {}
+            telegram["delivery_format_fallbacks"] = fallback_state
+        events = fallback_state.setdefault("events", [])
+        if not isinstance(events, list):
+            events = []
+        try:
+            sequence = int(fallback_state.get("sequence") or 0)
+        except (TypeError, ValueError):
+            sequence = 0
+        for raw_update in format_updates:
+            if not isinstance(raw_update, dict):
+                continue
+            sequence += 1
+            raw_rejections = raw_update.get("rejections")
+            rejections = []
+            if isinstance(raw_rejections, list):
+                rejections = [
+                    {
+                        "format": compact_ws(rejection.get("format"), 40),
+                        "error": compact_ws(rejection.get("error"), 300),
+                    }
+                    for rejection in raw_rejections
+                    if isinstance(rejection, dict)
+                ]
+            event = {
+                "sequence": sequence,
+                "observed_at": time.time(),
+                "method": compact_ws(raw_update.get("method"), 80),
+                "requested_format": compact_ws(
+                    raw_update.get("requested_format"), 40
+                ),
+                "delivered_format": compact_ws(
+                    raw_update.get("delivered_format"), 40
+                ),
+                "rejections": rejections,
+            }
+            events.append(event)
+            fallback_state["last"] = event
+        fallback_state["sequence"] = sequence
+        fallback_state["events"] = events[
+            -_DELIVERY_FORMAT_FALLBACK_LIMIT:
+        ]
+
     update = result.get(RICH_STATE_UPDATE_KEY)
     if not isinstance(update, dict):
         return

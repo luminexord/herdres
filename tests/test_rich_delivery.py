@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+from html.parser import HTMLParser
 
 from herdres_connector import source_sync, state
+from herdres_connector.rendering import telegram_html
 from herdres_connector.rich_delivery import (
     edit_rich_message,
+    send_feed_item,
     send_rich_message,
 )
-from herdres_connector.telegram_delivery import TelegramError
+from herdres_connector.telegram_delivery import TelegramClient, TelegramError
 
 
 class FakeTelegram:
@@ -38,6 +41,198 @@ class FakeTelegram:
     def edit_message(self, _chat_id, _message_id, _html):
         self.calls.append(("edit_message", "legacy"))
         return {"ok": True, "message_id": "42", "format": "html"}
+
+
+class _RecipientHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text: list[str] = []
+        self.entities: list[dict[str, str]] = []
+        self.unsupported_tags: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in {
+            "a",
+            "b",
+            "blockquote",
+            "code",
+            "em",
+            "i",
+            "pre",
+            "s",
+            "strong",
+            "u",
+        }:
+            self.unsupported_tags.append(tag)
+        attributes = dict(attrs)
+        entity_type = {
+            "b": "Bold",
+            "strong": "Bold",
+            "code": "Code",
+            "a": "TextUrl",
+        }.get(tag)
+        if entity_type:
+            entity = {"type": entity_type}
+            if tag == "a":
+                entity["url"] = str(attributes.get("href") or "")
+            self.entities.append(entity)
+
+    def handle_data(self, data):
+        self.text.append(data)
+
+
+class RecipientTelegram(TelegramClient):
+    """Telegram test adapter that records what a recipient can read."""
+
+    def __init__(self, *, reject_html=False):
+        super().__init__(token="test")
+        object.__setattr__(self, "reject_html", reject_html)
+        object.__setattr__(self, "recipient_messages", [])
+        object.__setattr__(self, "attempts", [])
+
+    def api(self, method, payload):
+        assert method == "sendMessage"
+        text = str(payload.get("text") or "")
+        parse_mode = str(payload.get("parse_mode") or "")
+        self.attempts.append({"text": text, "parse_mode": parse_mode})
+        if parse_mode == "HTML" and self.reject_html:
+            raise TelegramError("can't parse entities")
+        parser = _RecipientHTMLParser()
+        if parse_mode == "HTML":
+            parser.feed(text)
+            parser.close()
+            if parser.unsupported_tags:
+                raise TelegramError(
+                    f"unsupported tag: {parser.unsupported_tags[0]}"
+                )
+            received_text = "".join(parser.text)
+            entities = parser.entities
+        else:
+            received_text = text
+            entities = []
+        self.recipient_messages.append(
+            {"text": received_text, "entities": entities}
+        )
+        return {
+            "ok": True,
+            "result": {
+                "message_id": len(self.recipient_messages),
+            },
+        }
+
+
+def test_canonical_send_preserves_recipient_formatting_entities():
+    client = RecipientTelegram()
+
+    result = send_feed_item(
+        client,
+        "-100",
+        {
+            "kind": "turn",
+            "assistant_final_text": (
+                "**Bold** `inline()` "
+                "[link](https://example.test/path)"
+            ),
+        },
+        telegram={},
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    entities = client.recipient_messages[0]["entities"]
+    assert {"type": "Bold"} in entities
+    assert {"type": "Code"} in entities
+    assert {
+        "type": "TextUrl",
+        "url": "https://example.test/path",
+    } in entities
+    assert "Bold inline() link" in client.recipient_messages[0]["text"]
+
+
+def test_unsupported_nested_tag_is_flattened_without_plain_fallback():
+    client = RecipientTelegram()
+
+    result = send_rich_message(
+        client,
+        "-100",
+        "<h3>Result</h3><b>before <widget><code>x</code></widget> "
+        "after</b><table><tr><th>Name</th><th>Status</th></tr>"
+        "<tr><td>Ada</td><td>Ready</td></tr></table>",
+        telegram={},
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    assert len(client.attempts) == 1
+    assert client.recipient_messages[0]["text"] == (
+        "Result\nbefore x afterName | Status\nAda | Ready"
+    )
+    assert client.recipient_messages[0]["entities"] == [
+        {"type": "Bold"},
+        {"type": "Code"},
+    ]
+
+
+def test_telegram_html_allowlist_balances_and_escapes_edge_cases():
+    sanitized = telegram_html(
+        '<b class="ignored">bold<unknown> nested</unknown>'
+        '<a href="https://example.test/?a=1&amp;b=2" title="drop">link</a>'
+        '<pre><b>literal & raw</b></pre>'
+        "<i>unclosed"
+    )
+
+    assert sanitized == (
+        '<b>bold nested<a href="https://example.test/?a=1&amp;b=2">'
+        "link</a><pre>&lt;b&gt;literal &amp; raw&lt;/b&gt;</pre>"
+        "<i>unclosed</i></b>"
+    )
+    assert telegram_html("2 < 3 & 5") == "2 &lt; 3 &amp; 5"
+
+
+def test_rejected_html_still_delivers_nonempty_readable_plain_text():
+    client = RecipientTelegram(reject_html=True)
+
+    result = client.send_message("-100", "<b>Readable fallback</b>")
+
+    assert result["ok"] is True
+    assert result["format"] == "plain"
+    assert len(client.attempts) == 2
+    assert client.recipient_messages == [
+        {"text": "Readable fallback", "entities": []}
+    ]
+
+
+def test_html_rejection_plain_fallback_is_readable_and_recorded():
+    client = RecipientTelegram(reject_html=True)
+    store = {"telegram": {}}
+
+    result = source_sync._execute_exact_provider_operation(
+        client,
+        mutation=source_sync._provider_mutation(
+            "telegram.send_message",
+            reason=(
+                "telegram.send_message: test formatted delivery fallback "
+                "observability"
+            ),
+            args=("-100", "<b>Readable fallback</b>"),
+        ),
+        store=store,
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "plain"
+    assert client.recipient_messages == [
+        {"text": "Readable fallback", "entities": []}
+    ]
+    fallback_state = store["telegram"]["delivery_format_fallbacks"]
+    assert fallback_state["sequence"] == 1
+    assert fallback_state["last"]["method"] == "sendMessage"
+    assert fallback_state["last"]["requested_format"] == "html"
+    assert fallback_state["last"]["delivered_format"] == "plain"
+    assert fallback_state["last"]["rejections"] == [
+        {"format": "html", "error": "can't parse entities"}
+    ]
 
 
 def test_table_delivery_is_exactly_one_canonical_plain_send():

@@ -53,6 +53,7 @@ def _rate_limited_result(
 MESSAGE_TEXT_LIMIT = 3900
 SPLIT_TEXT_LIMIT = 3400
 MESSAGE_SOURCE_LIMIT = 64000
+DELIVERY_FORMAT_STATE_UPDATE_KEY = "_herdres_delivery_format_state_update"
 
 
 def _utc_now() -> str:
@@ -245,6 +246,7 @@ class TelegramClient:
                 return result
             return {"ok": False, "error": sanitize_text(last_error, 300)}
         last_error = ""
+        rejected_formats: list[dict[str, str]] = []
         for fmt, text in self._html_variants(html_text):
             payload = dict(base_payload)
             payload["text"] = text
@@ -252,11 +254,29 @@ class TelegramClient:
                 payload["parse_mode"] = "HTML"
             try:
                 result = self.api("sendMessage", payload).get("result") or {}
-                return {"ok": True, "message_id": str(result.get("message_id") or "0"), "format": fmt}
+                outcome = {
+                    "ok": True,
+                    "message_id": str(result.get("message_id") or "0"),
+                    "format": fmt,
+                }
+                if rejected_formats:
+                    outcome[DELIVERY_FORMAT_STATE_UPDATE_KEY] = {
+                        "method": "sendMessage",
+                        "requested_format": "html",
+                        "delivered_format": fmt,
+                        "rejections": rejected_formats,
+                    }
+                return outcome
             except RateLimited:
                 raise
             except TelegramError as exc:
                 last_error = str(exc)
+                rejected_formats.append(
+                    {
+                        "format": fmt,
+                        "error": sanitize_text(str(exc), 300),
+                    }
+                )
         return {"ok": False, "error": sanitize_text(last_error, 300)}
 
     def send_voice(

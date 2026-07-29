@@ -21,11 +21,13 @@ from .rendering import (
     split_text_chunks,
     split_text_spans,
     table_continuation_header,
+    telegram_html,
     try_render_table,
     worker_label,
 )
 from .safe import canonical_text, sanitize_text
 from .telegram_delivery import (
+    DELIVERY_FORMAT_STATE_UPDATE_KEY,
     MESSAGE_TEXT_LIMIT,
     SPLIT_TEXT_LIMIT,
     TelegramClient,
@@ -69,6 +71,10 @@ RICH_STATE_UPDATE_KEY = "_herdres_rich_state_update"
 FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
 HRULE_RE = re.compile(r"^\s*([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 INLINE_CODE_RE = re.compile(r"`([^`\n]{1,300})`")
+INLINE_LINK_RE = re.compile(
+    r"\[([^\]\n]{1,300})\]"
+    r"\(((?:https?://|tg://|mailto:)[^\s)\n]{1,2000})\)"
+)
 
 
 class PresentationContentError(RuntimeError):
@@ -82,12 +88,21 @@ def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
 def _rich_inline(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
     text = _html_text(value, max_chars)
     code_spans: list[str] = []
+    link_spans: list[str] = []
 
     def hold_code(match: re.Match[str]) -> str:
         code_spans.append(f"<code>{html.escape(match.group(1), quote=False)}</code>")
         return f"\u0000{len(code_spans) - 1}\u0000"
 
     text = INLINE_CODE_RE.sub(hold_code, text)
+
+    def hold_link(match: re.Match[str]) -> str:
+        label = match.group(1)
+        href = html.escape(html.unescape(match.group(2)), quote=True)
+        link_spans.append(f'<a href="{href}">{label}</a>')
+        return f"\u0001{len(link_spans) - 1}\u0001"
+
+    text = INLINE_LINK_RE.sub(hold_link, text)
     text = re.sub(r"\*\*\*([^\n]+?)\*\*\*", r"<b><i>\1</i></b>", text)
     text = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", text)
@@ -95,6 +110,8 @@ def _rich_inline(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
     text = re.sub(r"~~([^\s~][^\n]*?)~~", r"<s>\1</s>", text)
     for index, code in enumerate(code_spans):
         text = text.replace(f"\u0000{index}\u0000", code)
+    for index, link in enumerate(link_spans):
+        text = text.replace(f"\u0001{index}\u0001", link)
     return text
 
 
@@ -805,27 +822,20 @@ def _client_for_token(client: TelegramClient, api_token: str | None) -> Telegram
     return client.with_token(token) if token else client
 
 
-def _readable_plain_text(html_text: str, fallback_text: str) -> str:
-    """Flatten rich HTML into the canonical readable Telegram body.
+def _readable_telegram_html(html_text: str, fallback_text: str) -> str:
+    """Preserve Telegram formatting while flattening unsupported structure.
 
-    ``html_to_plain`` renders table cells as `` | ``-separated columns and
-    table rows on separate lines. Prefer that rendering over a caller fallback
-    so the readable message and rich enhancement carry the same content.
+    ``telegram_html`` is an allowlist: supported sendMessage markup survives,
+    while tables, headings, lists and unknown tags become readable text before
+    Telegram sees them.  A caller fallback remains plain content and therefore
+    must be escaped before it enters the HTML-first transport ladder.
     """
 
-    source = str(html_text or "")
-    source = re.sub(r"<li\b[^>]*>", "- ", source, flags=re.IGNORECASE)
-    source = re.sub(
-        r"</(?:p|h[1-6]|pre|li|ul|ol|blockquote|details|footer|table)>",
-        "\n",
-        source,
-        flags=re.IGNORECASE,
+    rendered = telegram_html(html_text, limit=MAX_REPLY_CHARS).strip()
+    fallback = html.escape(
+        sanitize_text(str(fallback_text or ""), MAX_REPLY_CHARS).strip(),
+        quote=False,
     )
-    rendered = sanitize_text(
-        html_to_plain(source, limit=MAX_REPLY_CHARS),
-        MAX_REPLY_CHARS,
-    ).strip()
-    fallback = sanitize_text(str(fallback_text or ""), MAX_REPLY_CHARS).strip()
     return rendered or fallback
 
 
@@ -871,7 +881,7 @@ def send_rich_message(
     require_single_operation: bool = False,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
-    fallback = _readable_plain_text(html_text, fallback_text)
+    fallback = _readable_telegram_html(html_text, fallback_text)
     if not fallback:
         return {
             "ok": False,
@@ -912,7 +922,7 @@ def edit_rich_message(
     fallback = (
         sanitize_text(str(html_text or ""), MAX_REPLY_CHARS).strip()
         if preserve_plain_html
-        else _readable_plain_text(html_text, fallback_text)
+        else _readable_telegram_html(html_text, fallback_text)
     )
     if not fallback:
         return {
@@ -1033,6 +1043,7 @@ def send_feed_item(
         )
     message_ids: list[str] = []
     formats: list[str] = []
+    format_state_updates: list[dict[str, Any]] = []
     last_result: dict[str, Any] = {}
     for index, html_part in enumerate(html_parts):
         result = send_rich_message(
@@ -1049,9 +1060,16 @@ def send_feed_item(
         last_result = result
         if not result.get("ok"):
             result["partial_message_ids"] = message_ids
+            if format_state_updates:
+                result[DELIVERY_FORMAT_STATE_UPDATE_KEY] = (
+                    format_state_updates
+                )
             return result
         message_ids.extend(split_legacy_message_ids(result))
         formats.append(str(result.get("format") or ""))
+        update = result.get(DELIVERY_FORMAT_STATE_UPDATE_KEY)
+        if isinstance(update, dict):
+            format_state_updates.append(update)
     combined = {
         "ok": True,
         "format": "rich-split",
@@ -1059,6 +1077,8 @@ def send_feed_item(
         "message_id": message_ids[0] if message_ids else str(last_result.get("message_id") or ""),
         "message_ids": message_ids,
     }
+    if format_state_updates:
+        combined[DELIVERY_FORMAT_STATE_UPDATE_KEY] = format_state_updates
     return combined
 
 
