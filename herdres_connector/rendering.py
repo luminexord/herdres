@@ -249,7 +249,13 @@ def split_table_aware_spans(
     *,
     limit: int = FINAL_CHUNK_SOURCE_CHARS,
 ) -> list[tuple[int, int]]:
-    """Split losslessly without cutting a Markdown table row in half."""
+    """Split losslessly, preferring complete Markdown table rows.
+
+    Complete rows stay atomic whenever they fit.  An individual row or header
+    may itself exceed the transport planning limit, though; in that case
+    losslessness outranks row atomicity and only that oversized source range is
+    split at the ordinary Markdown-friendly boundary.
+    """
 
     text = canonical_text(value)
     size = int(limit)
@@ -288,9 +294,16 @@ def split_table_aware_spans(
                 if boundary > start
             ]
             if not following or following[0] - start > size:
-                raise ValueError(
-                    "one Markdown table row cannot fit Telegram presentation limits"
+                # Tracking whole rows is a readability preference, not a
+                # license to reject valid content.  When one row cannot fit,
+                # keep the exact source span selected by the generic splitter;
+                # later spans continue from this exact code-point boundary.
+                end = _preferred_span_end(
+                    text, start, hard_end, size
                 )
+                if end <= start:
+                    end = hard_end
+                break
             end = following[0]
             break
         if end <= start:
@@ -308,6 +321,12 @@ def table_continuation_header(value: Any, start: int) -> str:
         text
     ):
         if data_start <= start < block_end and start != block_start:
+            # An oversized header is itself being delivered losslessly across
+            # parts.  Repeating it would make every data-row continuation
+            # exceed the same bound, so that specific table degrades to plain
+            # source continuation instead.
+            if len(header) > FINAL_CHUNK_SOURCE_CHARS:
+                return ""
             return header
     return ""
 

@@ -6043,10 +6043,7 @@ def _stage_final_plan(
 
     page_calls = _materialize_turn_item(item, runtime)
     feed_item = _turn_feed_item(item, entry)
-    parts = prepare_turn_delivery_parts(
-        feed_item,
-        rich_transport=False,
-    )
+    parts = _prepare_final_delivery_parts(feed_item)
     if not parts:
         raise _TurnContentError(
             "invalid_presentation_plan",
@@ -6266,6 +6263,30 @@ def _stage_final_plan(
     if isinstance(final_identity, str) and final_identity:
         entry["pending_final_identity"] = final_identity
     return True, page_calls, entry
+
+
+def _prepare_final_delivery_parts(
+    feed_item: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Turn any presentation-planning defect into a per-item outcome.
+
+    Planning happens before a provider write.  Its failures therefore belong
+    to the exact turn being planned and must never escape far enough to abort
+    the enclosing sync pass or leave the lease to expire silently.
+    """
+
+    try:
+        return prepare_turn_delivery_parts(
+            feed_item,
+            rich_transport=False,
+        )
+    except _TurnContentError:
+        raise
+    except Exception as exc:
+        raise _TurnContentError(
+            "invalid_presentation_plan",
+            f"turn presentation planning failed: {type(exc).__name__}",
+        ) from exc
 
 
 def _deliver_final(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
@@ -8307,10 +8328,16 @@ def _drain_post_ack_reconciliations(
                 continue
             _materialize_turn_item(item, runtime)
             feed_item = _turn_feed_item(item, entry)
-            plans = prepare_turn_delivery_parts(
-                feed_item,
-                rich_transport=False,
-            )
+            try:
+                plans = _prepare_final_delivery_parts(feed_item)
+            except _TurnContentError:
+                # This message has already been acknowledged upstream.  Keep
+                # the durable local reconciliation obligation in place and
+                # isolate the bad item from the rest of the sync pass.
+                result["status"] = "invalid_presentation_plan"
+                result["failed"] += 1
+                result["changed"] = True
+                continue
             ordinal = int(obligation.get("part_ordinal") or 0)
             if not 0 <= ordinal < len(plans):
                 continue
@@ -8963,10 +8990,16 @@ def _drain_turn_final(
                 break
             result["content_pages"] += page_calls
             feed_item = _turn_feed_item(item, entry)
-            plans = prepare_turn_delivery_parts(
-                feed_item,
-                rich_transport=False,
-            )
+            try:
+                plans = _prepare_final_delivery_parts(feed_item)
+            except _TurnContentError as exc:
+                _fail_turn_final(
+                    runtime,
+                    ref,
+                    f"{exc.status}: {exc}",
+                    result,
+                )
+                break
             if (
                 ordinal >= len(plans)
                 or part_count != len(plans)
