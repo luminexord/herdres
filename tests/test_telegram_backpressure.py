@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 import urllib.error
 
 import pytest
@@ -435,6 +436,170 @@ def test_voice_batch_rate_limit_stops_and_keeps_accepted_ids(
     assert events[0]["method"] == "sendVoice"
     assert events[0]["capability"] == "telegram.send_voice_batch"
     assert events[0]["outcome"] == "not_retried_message_send"
+
+
+@pytest.mark.parametrize(
+    "message_id",
+    [None, 0, "0"],
+    ids=["missing", "numeric-zero", "string-zero"],
+)
+def test_voice_batch_treats_absent_or_zero_id_as_unknown(
+    tmp_path, monkeypatch, message_id
+):
+    monkeypatch.setattr(
+        source_sync.speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+    monkeypatch.setattr(
+        source_sync.speech,
+        "speech_request",
+        lambda _operation, payload: {
+            "ok": True,
+            "path": payload["dest"],
+        },
+    )
+
+    class MissingVoiceId:
+        def send_voice(self, *_args, **_kwargs):
+            result = {"ok": True}
+            if message_id is not None:
+                result["message_id"] = message_id
+            return result
+
+    result = source_sync._execute_exact_provider_operation(
+        MissingVoiceId(),
+        store=_store(),
+        mutation=source_sync._provider_mutation(
+            "telegram.send_voice_batch",
+            reason=(
+                "telegram.send_voice_batch: absent id is "
+                "delivery unknown"
+            ),
+            args=(
+                ("first", "must not run"),
+                "turn-1",
+                "-100",
+                "77",
+                "42",
+            ),
+        ),
+    )
+
+    assert (
+        result["status"]
+        == "telegram_voice_batch_delivery_unknown"
+    )
+    assert result["accepted_message_ids"] == []
+
+
+@pytest.mark.parametrize(
+    "adapter_result",
+    [{}, {"message_id": 0}, {"message_id": "0"}],
+    ids=["missing", "numeric-zero", "string-zero"],
+)
+def test_voice_batch_production_adapter_reports_missing_id_unknown(
+    tmp_path, monkeypatch, adapter_result
+):
+    monkeypatch.setattr(
+        source_sync.speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+
+    def synthesize(_operation, payload):
+        payload["dest"] = str(payload["dest"])
+        Path(payload["dest"]).write_bytes(b"OggS-fake-opus")
+        return {"ok": True, "path": payload["dest"]}
+
+    monkeypatch.setattr(
+        source_sync.speech, "speech_request", synthesize
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"ok": True, "result": adapter_result}
+            ).encode()
+
+    monkeypatch.setattr(
+        telegram_delivery.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+    result = source_sync._execute_exact_provider_operation(
+        TelegramClient(token="test"),
+        store=_store(),
+        mutation=source_sync._provider_mutation(
+            "telegram.send_voice_batch",
+            reason=(
+                "telegram.send_voice_batch: production adapter "
+                "missing id"
+            ),
+            args=(
+                ("first",),
+                "turn-1",
+                "-100",
+                "77",
+                "42",
+            ),
+        ),
+    )
+
+    assert (
+        result["status"]
+        == "telegram_voice_batch_delivery_unknown"
+    )
+    assert result["accepted_message_ids"] == []
+
+
+def test_voice_batch_accepts_genuine_message_id(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        source_sync.speech,
+        "outbound_speech_dir",
+        lambda *, prune=False: tmp_path,
+    )
+    monkeypatch.setattr(
+        source_sync.speech,
+        "speech_request",
+        lambda _operation, payload: {
+            "ok": True,
+            "path": payload["dest"],
+        },
+    )
+
+    class GenuineVoiceId:
+        def send_voice(self, *_args, **_kwargs):
+            return {"ok": True, "message_id": 812}
+
+    result = source_sync._execute_exact_provider_operation(
+        GenuineVoiceId(),
+        store=_store(),
+        mutation=source_sync._provider_mutation(
+            "telegram.send_voice_batch",
+            reason=(
+                "telegram.send_voice_batch: genuine id "
+                "regression"
+            ),
+            args=(
+                ("first",),
+                "turn-1",
+                "-100",
+                "77",
+                "42",
+            ),
+        ),
+    )
+
+    assert result == ["812"]
 
 
 def test_voice_batch_finds_nested_rate_limit_and_stops(

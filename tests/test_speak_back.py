@@ -10,6 +10,7 @@ import json
 from unittest.mock import patch
 
 import herdres
+import pytest
 from herdres_connector import source_sync, speech, state
 from herdres_connector.source_sync import SyncRuntime
 from herdres_connector.telegram_delivery import (
@@ -87,6 +88,39 @@ def test_send_voice_multipart_body_and_call(tmp_path):
     assert b'name="message_thread_id"' in body and b"77" in body
     assert b'name="reply_parameters"' in body and b'"message_id":42' in body
     assert b'name="voice"; filename="reply.ogg"' in body and b"OggS-fake-opus" in body
+
+
+@pytest.mark.parametrize(
+    "result",
+    [{}, {"message_id": 0}, {"message_id": "0"}],
+    ids=["missing", "numeric-zero", "string-zero"],
+)
+def test_send_voice_does_not_synthesize_zero_message_id(
+    tmp_path, result
+):
+    ogg = tmp_path / "reply.ogg"
+    ogg.write_bytes(b"OggS-fake-opus")
+
+    class _Resp:
+        def __enter__(self_):
+            return self_
+
+        def __exit__(self_, *args):
+            return False
+
+        def read(self_):
+            return json.dumps(
+                {"ok": True, "result": result}
+            ).encode()
+
+    with patch(
+        "urllib.request.urlopen", return_value=_Resp()
+    ):
+        sent = TelegramClient(token="TOK").send_voice(
+            "-100", ogg
+        )
+
+    assert sent == {"ok": True, "message_id": ""}
 
 
 # --- speech trim / triggers --------------------------------------------------

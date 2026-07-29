@@ -1000,8 +1000,15 @@ def _build_offlock_executor() -> Any:
                         ),
                         notify=False,
                     )
-                    if sent.get("ok") and sent.get("message_id"):
-                        ids.append(str(sent.get("message_id")))
+                    message_id = str(
+                        sent.get("message_id") or ""
+                    ).strip()
+                    if (
+                        sent.get("ok")
+                        and message_id
+                        and message_id != "0"
+                    ):
+                        ids.append(message_id)
                     elif sent.get("ok") is False:
                         return {
                             "ok": False,

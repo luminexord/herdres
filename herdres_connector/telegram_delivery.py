@@ -340,7 +340,10 @@ class TelegramClient:
                 )
             )
         result = data.get("result") or {}
-        return {"ok": True, "message_id": str(result.get("message_id") or "0")}
+        message_id = str(result.get("message_id") or "").strip()
+        if message_id == "0":
+            message_id = ""
+        return {"ok": True, "message_id": message_id}
 
     def edit_message(self, chat_id: str, message_id: str | int, html_text: str) -> dict[str, Any]:
         base_payload = {
