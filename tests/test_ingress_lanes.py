@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import multiprocessing
 import os
@@ -14,7 +15,14 @@ import pytest
 
 import herdres
 import herdres_gateway
-from herdres_connector import config, doctor, ingress_requests, speech, state
+from herdres_connector import (
+    config,
+    doctor,
+    ingress_lanes as ingress_lanes_module,
+    ingress_requests,
+    speech,
+    state,
+)
 from herdres_connector.ingress_identity import derive_telegram_request_id
 from herdres_connector.ingress_lanes import IngressLaneSpool, lane_key
 
@@ -222,6 +230,131 @@ def _prior_retry_shape(
             raise
 
 
+def _rollback_claim_shape(
+    spool_path: Path,
+    seq: int,
+    lease_owner: str,
+    *,
+    now: float,
+    lease_seconds: float,
+) -> None:
+    """Claim with the pre-state_since, pre-retry-clock UPDATE shape."""
+
+    with sqlite3.connect(spool_path) as connection:
+        changed = connection.execute(
+            """
+            UPDATE lane_items
+            SET state = 'processing', lease_owner = ?, lease_until = ?,
+                updated_at = ?
+            WHERE seq = ? AND state = 'pending' AND next_attempt_at <= ?
+            """,
+            (
+                lease_owner,
+                now + lease_seconds,
+                now,
+                seq,
+                now,
+            ),
+        ).rowcount
+    assert changed == 1
+
+
+def _rollback_retry_shape(
+    spool_path: Path,
+    seq: int,
+    lease_owner: str,
+    *,
+    now: float,
+    backoff_seconds: float,
+) -> None:
+    """Retry with the pre-state_since, pre-retry-clock UPDATE shape."""
+
+    with sqlite3.connect(spool_path, isolation_level=None) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                """
+                SELECT attempts, deadline_at FROM lane_items
+                WHERE seq = ? AND state = 'processing' AND lease_owner = ?
+                """,
+                (seq, lease_owner),
+            ).fetchone()
+            assert row is not None
+            attempts = int(row[0]) + 1
+            delay = min(
+                300.0,
+                backoff_seconds * (2 ** min(attempts - 1, 16)),
+            )
+            next_attempt = min(now + delay, float(row[1]))
+            changed = connection.execute(
+                """
+                UPDATE lane_items
+                SET state = 'pending', attempts = ?, next_attempt_at = ?,
+                    lease_owner = NULL, lease_until = NULL,
+                    updated_at = ?
+                WHERE seq = ? AND state = 'processing' AND lease_owner = ?
+                """,
+                (
+                    attempts,
+                    next_attempt,
+                    now,
+                    seq,
+                    lease_owner,
+                ),
+            ).rowcount
+            assert changed == 1
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+
+def _prior_crashed_retry_lane(
+    spool_path: Path,
+    *,
+    first_update_id: int,
+    final_lease_seconds: float,
+) -> tuple[IngressLaneSpool, int]:
+    """Create a processing retry head using only rollback-writer shapes."""
+
+    spool = IngressLaneSpool(spool_path)
+    head_seq, _cursor = _prior_enqueue_shape(
+        spool_path,
+        _update(first_update_id, 77, "rollback retry head"),
+        "77",
+        first_seen_at=0.0,
+    )
+    follower_seq, _cursor = _prior_enqueue_shape(
+        spool_path,
+        _update(first_update_id + 1, 77, "starved follower"),
+        "77",
+        first_seen_at=0.0,
+    )
+    assert (head_seq, follower_seq) == (1, 2)
+    _rollback_claim_shape(
+        spool_path,
+        head_seq,
+        "rollback-worker",
+        now=0.0,
+        lease_seconds=30.0,
+    )
+    _rollback_retry_shape(
+        spool_path,
+        head_seq,
+        "rollback-worker",
+        now=0.0,
+        backoff_seconds=10.0,
+    )
+    _rollback_claim_shape(
+        spool_path,
+        head_seq,
+        "rollback-worker",
+        now=10.0,
+        lease_seconds=final_lease_seconds,
+    )
+    return spool, head_seq
+
+
 def _wait_for(predicate, timeout: float = 3.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -254,6 +387,37 @@ def _configured_state(path: Path) -> None:
             topic_id=topic,
         )
     state.save_state(store, path=path)
+
+
+def test_every_lane_updated_at_update_preserves_retry_fallback() -> None:
+    source_path = Path(ingress_lanes_module.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    updates = [
+        node.value
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and "UPDATE lane_items" in node.value
+            and "updated_at =" in node.value
+        )
+    ]
+
+    # Exact enumeration makes adding any lane timestamp writer an explicit
+    # review event, even when the new statement already looks safe.
+    assert len(updates) == 10
+    fallback_promotions = 0
+    preselected_promotions = 0
+    for statement in updates:
+        before_timestamp_write = statement.split("updated_at =", 1)[0]
+        assert "retry_obstructed_since" in before_timestamp_write
+        normalized = " ".join(before_timestamp_write.split())
+        if "CASE WHEN attempts > 0 THEN updated_at END" in normalized:
+            fallback_promotions += 1
+        if "COALESCE(retry_obstructed_since, ?)" in normalized:
+            preselected_promotions += 1
+    assert fallback_promotions == 8
+    assert preselected_promotions == 2
 
 
 def test_pending_lane_is_spool_eligible_even_while_its_head_is_processing(
@@ -668,6 +832,162 @@ def test_mixed_version_retry_clock_survives_current_claim_and_retry(
     assert after_retry["signal"] == "inbound_lane_retry_obstructed"
     assert after_retry["oldest_retry_obstructed_seconds"] == 14.999
     assert _healthy_or_stalled(after_retry) == "stalled"
+
+
+def test_prior_crash_startup_reclaim_preserves_retry_obstruction(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    spool, head_seq = _prior_crashed_retry_lane(
+        tmp_path / "spool.db",
+        first_update_id=70,
+        final_lease_seconds=1_000.0,
+    )
+    before_reclaim = doctor.inbound_lanes(
+        spool.path,
+        now=20.0,
+        stall_after_seconds=5.0,
+    )
+    assert before_reclaim["ok"] is False
+    assert before_reclaim["signal"] == "inbound_lane_obstruction_unknown"
+
+    assert spool.reclaim_processing(now=50.0) == 1
+    reclaimed = spool.rows()[0]
+    assert reclaimed["state"] == "pending"
+    assert reclaimed["updated_at"] == 50.0
+    assert reclaimed["retry_obstructed_since"] == 10.0
+
+    current_head = spool.claim(
+        "current-worker",
+        now=50.0,
+        lease_seconds=30.0,
+    )
+    assert current_head is not None
+    assert current_head.seq == head_seq
+    during_claim = doctor.inbound_lanes(
+        spool.path,
+        now=50.0,
+        stall_after_seconds=5.0,
+    )
+    assert during_claim["ok"] is False
+    assert during_claim["signal"] == "inbound_lane_retry_obstructed"
+    assert during_claim["oldest_retry_obstructed_seconds"] == 40.0
+
+    assert spool.retry(
+        current_head.seq,
+        "current-worker",
+        now=50.0,
+        backoff_seconds=10.0,
+    )
+    after_retry = doctor.inbound_lanes(
+        spool.path,
+        now=54.999,
+        stall_after_seconds=5.0,
+    )
+    assert after_retry["ok"] is False
+    assert after_retry["signal"] == "inbound_lane_retry_obstructed"
+    assert after_retry["oldest_retry_obstructed_seconds"] == 44.999
+
+
+def test_prior_crash_expired_reclaim_preserves_retry_obstruction(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
+    spool, head_seq = _prior_crashed_retry_lane(
+        tmp_path / "spool.db",
+        first_update_id=80,
+        final_lease_seconds=20.0,
+    )
+    before_reclaim = doctor.inbound_lanes(
+        spool.path,
+        now=20.0,
+        stall_after_seconds=5.0,
+    )
+    assert before_reclaim["ok"] is False
+    assert before_reclaim["signal"] == "inbound_lane_obstruction_unknown"
+
+    current_head = spool.claim(
+        "current-worker",
+        now=50.0,
+        lease_seconds=30.0,
+    )
+    assert current_head is not None
+    assert current_head.seq == head_seq
+    claimed = spool.rows()[0]
+    assert claimed["state"] == "processing"
+    assert claimed["updated_at"] == 50.0
+    assert claimed["retry_obstructed_since"] == 10.0
+    during_claim = doctor.inbound_lanes(
+        spool.path,
+        now=50.0,
+        stall_after_seconds=5.0,
+    )
+    assert during_claim["ok"] is False
+    assert during_claim["signal"] == "inbound_lane_retry_obstructed"
+    assert during_claim["oldest_retry_obstructed_seconds"] == 40.0
+
+    assert spool.retry(
+        current_head.seq,
+        "current-worker",
+        now=50.0,
+        backoff_seconds=10.0,
+    )
+    after_retry = doctor.inbound_lanes(
+        spool.path,
+        now=54.999,
+        stall_after_seconds=5.0,
+    )
+    assert after_retry["ok"] is False
+    assert after_retry["signal"] == "inbound_lane_retry_obstructed"
+    assert after_retry["oldest_retry_obstructed_seconds"] == 44.999
+
+
+@pytest.mark.parametrize("reclaim_kind", ["startup", "expired"])
+def test_reclaim_paths_preserve_retry_clock_invariants(
+    tmp_path, reclaim_kind
+) -> None:
+    spool = IngressLaneSpool(tmp_path / f"{reclaim_kind}.db")
+    _enqueue(
+        spool,
+        _update(90, 77, "attempts-zero"),
+        "77",
+        first_seen_at=0.0,
+        deadline_at=1_000.0,
+    )
+    _enqueue(
+        spool,
+        _update(91, 88, "existing retry clock"),
+        "88",
+        first_seen_at=0.0,
+        deadline_at=1_000.0,
+    )
+    zero = spool.claim("zero-worker", now=0.0, lease_seconds=20.0)
+    existing = spool.claim("retry-worker", now=0.0, lease_seconds=20.0)
+    assert zero is not None
+    assert existing is not None
+    assert spool.retry(
+        existing.seq,
+        "retry-worker",
+        now=1.0,
+        backoff_seconds=1.0,
+    )
+    existing = spool.claim(
+        "retry-worker",
+        now=2.0,
+        lease_seconds=20.0,
+    )
+    assert existing is not None
+
+    if reclaim_kind == "startup":
+        assert spool.reclaim_processing(now=50.0) == 2
+    else:
+        assert spool.claim("expired-worker", now=50.0) is not None
+
+    rows = spool.rows()
+    assert rows[0]["attempts"] == 0
+    assert rows[0]["retry_obstructed_since"] is None
+    assert rows[1]["attempts"] == 1
+    assert rows[1]["retry_obstructed_since"] == 1.0
 
 
 def test_migrated_spool_remains_writable_by_prior_release(tmp_path) -> None:

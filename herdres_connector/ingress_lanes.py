@@ -303,6 +303,10 @@ class IngressLaneSpool:
                 """
                 UPDATE lane_items
                 SET state = 'done', lease_owner = NULL, lease_until = NULL,
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
                     state_since = ?, updated_at = ?
                 WHERE state = 'blocked' AND next_attempt_at <= ?
                 """,
@@ -474,6 +478,10 @@ class IngressLaneSpool:
                     """
                     UPDATE lane_items
                     SET state = 'pending', lease_owner = NULL, lease_until = NULL,
+                        retry_obstructed_since = COALESCE(
+                            retry_obstructed_since,
+                            CASE WHEN attempts > 0 THEN updated_at END
+                        ),
                         state_since = ?, updated_at = ?
                     WHERE state = 'processing' AND lease_until <= ?
                     """,
@@ -862,6 +870,10 @@ class IngressLaneSpool:
                 UPDATE lane_items
                 SET state = 'pending', next_attempt_at = MIN(next_attempt_at, ?),
                     lease_owner = NULL, lease_until = NULL,
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
                     state_since = ?, updated_at = ?
                 WHERE state = 'processing'
                 """,
@@ -885,7 +897,12 @@ class IngressLaneSpool:
             changed = connection.execute(
                 """
                 UPDATE lane_items
-                SET lease_until = ?, updated_at = ?
+                SET lease_until = ?,
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
+                    updated_at = ?
                 WHERE seq = ? AND state = 'processing' AND lease_owner = ?
                 """,
                 (lease_until, timestamp, int(seq), str(lease_owner)),
@@ -907,7 +924,12 @@ class IngressLaneSpool:
             changed = connection.execute(
                 """
                 UPDATE lane_items
-                SET notify_state = 'claimed', updated_at = ?
+                SET notify_state = 'claimed',
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
+                    updated_at = ?
                 WHERE seq = ? AND notify_state = 'pending'
                 """,
                 (timestamp, int(seq)),
@@ -922,7 +944,12 @@ class IngressLaneSpool:
             changed = connection.execute(
                 """
                 UPDATE lane_items
-                SET notify_state = 'sent', updated_at = ?
+                SET notify_state = 'sent',
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
+                    updated_at = ?
                 WHERE seq = ? AND notify_state = 'claimed'
                 """,
                 (timestamp, int(seq)),
@@ -944,6 +971,10 @@ class IngressLaneSpool:
                 UPDATE lane_items
                 SET state = 'done', lease_owner = NULL, lease_until = NULL,
                     notify_state = COALESCE(?, notify_state),
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
                     state_since = ?, updated_at = ?
                 WHERE seq = ? AND state = 'processing' AND lease_owner = ?
                 """,
@@ -979,6 +1010,10 @@ class IngressLaneSpool:
                 UPDATE lane_items
                 SET state = 'blocked', lease_owner = NULL, lease_until = NULL,
                     next_attempt_at = MIN(deadline_at, ?),
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
                     state_since = ?, updated_at = ?
                 WHERE seq = ? AND state = 'processing' AND lease_owner = ?
                 """,
