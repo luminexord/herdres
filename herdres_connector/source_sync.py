@@ -2902,7 +2902,12 @@ def _fold_superseded_final(
     if len(bindings) != 1:
         return False
     message_id, binding = bindings[0]
-    if not message_id or binding.get("folded") or int(binding.get("fold_attempts") or 0) >= _FOLD_ATTEMPT_CAP:
+    if (
+        not message_id
+        or binding.get("folded")
+        or binding.get("fold_unavailable")
+        or int(binding.get("fold_attempts") or 0) >= _FOLD_ATTEMPT_CAP
+    ):
         return False
     if str(message_id) == str(entry.get("last_clean_message_id") or ""):
         return False  # belt-and-braces: never fold the latest delivered message
@@ -2956,13 +2961,27 @@ def _fold_superseded_final(
     # to the exact binding even when the pane owner moved during the edit.
     binding = state.find_message_binding(store, message_id) or binding
     error = str(sent.get("error") or "").lower()
-    if sent.get("ok") or _message_missing(sent.get("error")):
-        binding["folded"] = True  # done (or the message/topic is gone — nothing left to fold)
-        return True
-    if _topic_missing(sent.get("error")) or "not found" in error:
-        # Edits carry only a message id. They cannot prove which historical
-        # topic is gone, so a cosmetic fold must never tombstone any topic.
+    if sent.get("ok") and sent.get("collapse_applied") is True:
+        # This is the only path allowed to claim the message was folded: the
+        # exact expandable-HTML edit was accepted (including Telegram's
+        # already-identical "not modified" success). Readable fallback formats
+        # are not collapsed and therefore cannot set this marker.
         binding["folded"] = True
+        return True
+    if sent.get("ok"):
+        binding["fold_attempts"] = int(
+            binding.get("fold_attempts") or 0
+        ) + 1
+        return True
+    if (
+        _message_missing(sent.get("error"))
+        or _topic_missing(sent.get("error"))
+        or "not found" in error
+    ):
+        # Edits carry only a message id. They cannot prove which historical
+        # topic is gone, so a cosmetic fold must never tombstone any topic or
+        # falsely claim that the unavailable message was folded.
+        binding["fold_unavailable"] = True
         return True
     binding["fold_attempts"] = int(binding.get("fold_attempts") or 0) + 1
     return True

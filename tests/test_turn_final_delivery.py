@@ -2687,6 +2687,34 @@ def test_physical_budget_uses_sync_floor_and_acceptance_loss_is_explicit(monkeyp
     assert "delivery_uncertain" in uncertain_wire.fail_calls[-1][1]
 
 
+def test_table_delivery_operation_budget_matches_single_plain_write(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    table = (
+        "| Name | Status |\n"
+        "| --- | --- |\n"
+        "| Ada | Ready |"
+    )
+    tendwire = TurnFinalTendwire(
+        _turn_row("turn-table-budget", "twrev1.tablebudget", table)
+    )
+    telegram = DeletingTelegram()
+
+    result = sync_once(
+        _store(), _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert result["tendwire_turn_final"]["operations"] == 1
+    assert result["tendwire_turn_final"]["acked"] == 1
+    assert len(telegram.sent) == 1
+    assert "Name | Status" in telegram.sent[0][1]
+    assert "Ada | Ready" in telegram.sent[0][1]
+    assert not any(
+        method == "sendRichMessage"
+        for method, _payload, _token in telegram.api_calls
+    )
+
+
 def test_incomplete_row_isolated_while_working_final_pins_and_attention_continue(monkeypatch):
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "1")
     monkeypatch.setenv("HERDRES_PINNED_ACCOUNT", "1")
