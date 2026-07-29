@@ -15,7 +15,15 @@ import re
 from typing import Any
 
 from . import config
-from .rendering import html_to_plain, split_text_chunks, split_text_spans, try_render_table, worker_label
+from .rendering import (
+    html_to_plain,
+    split_table_aware_spans,
+    split_text_chunks,
+    split_text_spans,
+    table_continuation_header,
+    try_render_table,
+    worker_label,
+)
 from .safe import canonical_text, sanitize_text
 from .telegram_delivery import (
     MESSAGE_TEXT_LIMIT,
@@ -520,7 +528,9 @@ def _planned_parts_for_limits(
 ) -> list[dict[str, Any]]:
     field_spans = {
         "user_text": split_text_spans(fields["user_text"], limit=user_limit),
-        "assistant_final_text": split_text_spans(fields["assistant_final_text"], limit=final_limit),
+        "assistant_final_text": split_table_aware_spans(
+            fields["assistant_final_text"], limit=final_limit
+        ),
     }
     part_count = max((len(spans) for spans in field_spans.values()), default=0)
     parts: list[dict[str, Any]] = []
@@ -572,7 +582,12 @@ def _materialize_turn_delivery_part(item: dict[str, Any], part: dict[str, Any]) 
         source = fields[field]
         if start < 0 or end <= start or end > len(source):
             raise ValueError("turn delivery span is outside canonical content")
-        fragments[field].append(source[start:end])
+        fragment = source[start:end]
+        if field == "assistant_final_text":
+            fragment = (
+                table_continuation_header(source, start) + fragment
+            )
+        fragments[field].append(fragment)
     materialized = dict(item)
     materialized["user_text"] = "".join(fragments["user_text"])
     materialized["assistant_final_text"] = "".join(fragments["assistant_final_text"])

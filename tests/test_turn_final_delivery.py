@@ -2715,6 +2715,76 @@ def test_table_delivery_operation_budget_matches_single_plain_write(monkeypatch)
     )
 
 
+def _large_markdown_table(
+    row_count: int, *, value_chars: int = 8
+) -> tuple[str, list[str]]:
+    rows = [
+        (
+            f"row-{index:03d} | "
+            f"value-{index:03d}-{'x' * value_chars}"
+        )
+        for index in range(1, row_count + 1)
+    ]
+    source = "\n".join(
+        [
+            "| Name | Value |",
+            "| --- | --- |",
+            *[f"| {row} |" for row in rows],
+        ]
+    )
+    return source, rows
+
+
+def test_canonical_table_delivers_final_row_before_ack(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    table, rows = _large_markdown_table(50)
+    telegram = DeletingTelegram()
+
+    class AckAfterFinalRowTendwire(TurnFinalTendwire):
+        def turn_final_ack(self, ref, response=None):
+            assert any(rows[-1] in message[1] for message in telegram.sent)
+            return super().turn_final_ack(ref, response=response)
+
+    tendwire = AckAfterFinalRowTendwire(
+        _turn_row("turn-table-50", "twrev1.table50", table)
+    )
+
+    result = sync_once(
+        _store(), _runtime(tendwire, telegram, max_sends=100)
+    )
+
+    assert result["tendwire_turn_final"]["operations"] == 1
+    assert result["tendwire_turn_final"]["acked"] == 1
+    assert len(telegram.sent) == 1
+    assert rows[-1] in telegram.sent[0][1]
+
+
+def test_split_table_repeats_header_and_preserves_each_complete_row(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    table, rows = _large_markdown_table(90, value_chars=80)
+    tendwire = TurnFinalTendwire(
+        _turn_row("turn-table-split", "twrev1.tablesplit", table)
+    )
+    telegram = DeletingTelegram()
+
+    result = sync_once(
+        _store(), _runtime(tendwire, telegram, max_sends=100)
+    )
+    payloads = [message[1] for message in telegram.sent]
+
+    assert len(payloads) > 1
+    assert result["tendwire_turn_final"]["operations"] == len(payloads)
+    assert result["tendwire_turn_final"]["acked"] == len(payloads)
+    assert all("Name | Value" in payload for payload in payloads)
+    for row in rows:
+        assert sum(row in payload for payload in payloads) == 1
+    assert rows[-1] in payloads[-1]
+
+
 def test_dormant_rich_state_does_not_fragment_plain_delivery_budget(
     monkeypatch,
 ):

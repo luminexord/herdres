@@ -3,7 +3,12 @@ the rich-message path), in both the turn-card engine (_render_final_reply_blocks
 markdownish_to_html path. Ported from the pre-tendwire renderer, which the RC rewrite had dropped."""
 from __future__ import annotations
 
-from herdres_connector.rendering import html_to_plain, markdownish_to_html, try_render_table
+from herdres_connector.rendering import (
+    RICH_TABLE_MAX_ROWS,
+    html_to_plain,
+    markdownish_to_html,
+    try_render_table,
+)
 from herdres_connector.rich_delivery import render_final_reply_html, render_turn_item_html
 
 _TABLE = """| Feature | Status | Notes |
@@ -112,3 +117,19 @@ def test_all_empty_table_left_as_text():
 def test_try_render_table_returns_none_off_table():
     assert try_render_table(["just a line"], 0) is None
     assert try_render_table(["| h |", "not a delimiter"], 0) is None
+
+
+def test_canonical_table_rendering_is_uncapped_but_rich_cap_remains_available():
+    lines = [
+        "| Name | Value |",
+        "| --- | --- |",
+        *[f"| row-{index:02d} | value-{index:02d} |" for index in range(1, 51)],
+    ]
+
+    canonical, _next = try_render_table(lines, 0)
+    rich_preview, _next = try_render_table(
+        lines, 0, max_rows=RICH_TABLE_MAX_ROWS
+    )
+
+    assert "row-50" in canonical
+    assert "row-50" not in rich_preview
