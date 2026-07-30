@@ -195,7 +195,20 @@ class TelegramClient:
         reply_to_message_id: str | int | None = None,
         notify: bool = False,
         reply_markup: dict[str, Any] | None = None,
+        max_physical_writes: int | None = None,
     ) -> dict[str, Any]:
+        write_limit = (
+            max(0, int(max_physical_writes))
+            if max_physical_writes is not None
+            else None
+        )
+        if write_limit == 0:
+            return {
+                "ok": False,
+                "kind": "operation_budget_exhausted",
+                "error": "Telegram physical-write budget exhausted",
+                "physical_writes": 0,
+            }
         base_payload: dict[str, Any] = {
             "chat_id": chat_id,
             "disable_web_page_preview": "true",
@@ -211,6 +224,16 @@ class TelegramClient:
         plain = html_to_plain(source, limit=MESSAGE_SOURCE_LIMIT)
         if len(source) > MESSAGE_TEXT_LIMIT and plain:
             chunks = split_text_chunks(plain, limit=SPLIT_TEXT_LIMIT)
+            if write_limit is not None and len(chunks) > write_limit:
+                return {
+                    "ok": False,
+                    "kind": "operation_budget_exhausted",
+                    "error": (
+                        "split message exceeds the remaining Telegram "
+                        "physical-write budget"
+                    ),
+                    "physical_writes": 0,
+                }
             message_ids: list[str] = []
             last_error = ""
             total = len(chunks)
@@ -238,16 +261,27 @@ class TelegramClient:
                     "message_id": message_ids[0] if message_ids else "0",
                     "message_ids": message_ids,
                     "format": "plain-split",
+                    "physical_writes": len(message_ids),
                 }
                 if reply_markup is not None:
                     result["reply_markup_message_id"] = (
                         message_ids[-1] if message_ids else "0"
                     )
                 return result
-            return {"ok": False, "error": sanitize_text(last_error, 300)}
+            return {
+                "ok": False,
+                "error": sanitize_text(last_error, 300),
+                "physical_writes": len(message_ids) + 1,
+            }
         last_error = ""
         rejected_formats: list[dict[str, str]] = []
-        for fmt, text in self._html_variants(html_text):
+        variants = self._html_variants(html_text)
+        attempted_variants = (
+            variants
+            if write_limit is None
+            else variants[:write_limit]
+        )
+        for fmt, text in attempted_variants:
             payload = dict(base_payload)
             payload["text"] = text
             if fmt != "plain":
@@ -258,6 +292,7 @@ class TelegramClient:
                     "ok": True,
                     "message_id": str(result.get("message_id") or "0"),
                     "format": fmt,
+                    "physical_writes": len(rejected_formats) + 1,
                 }
                 if rejected_formats:
                     outcome[DELIVERY_FORMAT_STATE_UPDATE_KEY] = {
@@ -277,7 +312,21 @@ class TelegramClient:
                         "error": sanitize_text(str(exc), 300),
                     }
                 )
-        return {"ok": False, "error": sanitize_text(last_error, 300)}
+        outcome = {
+            "ok": False,
+            "error": sanitize_text(last_error, 300),
+            "physical_writes": len(rejected_formats),
+        }
+        if (
+            write_limit is not None
+            and len(attempted_variants) < len(variants)
+        ):
+            outcome["kind"] = "operation_budget_exhausted"
+            outcome["error"] = (
+                "Telegram fallback variants exceed the remaining "
+                "physical-write budget"
+            )
+        return outcome
 
     def send_voice(
         self,
@@ -365,27 +414,71 @@ class TelegramClient:
             message_id = ""
         return {"ok": True, "message_id": message_id}
 
-    def edit_message(self, chat_id: str, message_id: str | int, html_text: str) -> dict[str, Any]:
+    def edit_message(
+        self,
+        chat_id: str,
+        message_id: str | int,
+        html_text: str,
+        *,
+        max_physical_writes: int | None = None,
+    ) -> dict[str, Any]:
+        write_limit = (
+            max(0, int(max_physical_writes))
+            if max_physical_writes is not None
+            else None
+        )
+        if write_limit == 0:
+            return {
+                "ok": False,
+                "kind": "operation_budget_exhausted",
+                "error": "Telegram physical-write budget exhausted",
+                "physical_writes": 0,
+            }
         base_payload = {
             "chat_id": chat_id,
             "message_id": str(message_id),
             "disable_web_page_preview": "true",
         }
         last_error = ""
-        for fmt, text in self._html_variants(html_text):
+        rejected_formats: list[dict[str, str]] = []
+        variants = self._html_variants(html_text)
+        attempted_variants = (
+            variants
+            if write_limit is None
+            else variants[:write_limit]
+        )
+        for fmt, text in attempted_variants:
             payload = dict(base_payload)
             payload["text"] = text
             if fmt != "plain":
                 payload["parse_mode"] = "HTML"
             try:
                 self.api("editMessageText", payload)
-                return {"ok": True, "message_id": str(message_id), "kind": "edited", "format": fmt}
+                return {
+                    "ok": True,
+                    "message_id": str(message_id),
+                    "kind": "edited",
+                    "format": fmt,
+                    "physical_writes": len(rejected_formats) + 1,
+                }
             except RateLimited:
                 raise
             except TelegramError as exc:
                 last_error = str(exc)
+                rejected_formats.append(
+                    {
+                        "format": fmt,
+                        "error": sanitize_text(str(exc), 300),
+                    }
+                )
                 if "message is not modified" in last_error.lower():
-                    return {"ok": True, "message_id": str(message_id), "kind": "unchanged", "format": fmt}
+                    return {
+                        "ok": True,
+                        "message_id": str(message_id),
+                        "kind": "unchanged",
+                        "format": fmt,
+                        "physical_writes": len(rejected_formats),
+                    }
                 if "message to edit not found" in last_error.lower() or "message not found" in last_error.lower():
                     return {
                         "ok": False,
@@ -393,6 +486,7 @@ class TelegramClient:
                         "kind": "not_found",
                         "not_found": True,
                         "error": sanitize_text(last_error, 300),
+                        "physical_writes": len(rejected_formats),
                     }
                 if _topic_missing(last_error):
                     return {
@@ -401,8 +495,23 @@ class TelegramClient:
                         "kind": "topic_not_found",
                         "topic_missing": True,
                         "error": sanitize_text(last_error, 300),
+                        "physical_writes": len(rejected_formats),
                     }
-        return {"ok": False, "error": sanitize_text(last_error, 300)}
+        outcome = {
+            "ok": False,
+            "error": sanitize_text(last_error, 300),
+            "physical_writes": len(rejected_formats),
+        }
+        if (
+            write_limit is not None
+            and len(attempted_variants) < len(variants)
+        ):
+            outcome["kind"] = "operation_budget_exhausted"
+            outcome["error"] = (
+                "Telegram fallback variants exceed the remaining "
+                "physical-write budget"
+            )
+        return outcome
 
     def edit_message_reply_markup(
         self,
@@ -709,7 +818,16 @@ def drain_outbox(
     yield_barrier: Callable[[], None] | None = None,
     ack_barrier_persists_state: bool = False,
 ) -> dict[str, Any]:
-    result = {"enabled": True, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
+    result = {
+        "enabled": True,
+        "polled": 0,
+        "delivered": 0,
+        "acked": 0,
+        "failed": 0,
+        "deferred": 0,
+        "physical_writes": 0,
+        "changed": False,
+    }
     if max_sends <= 0:
         return result
     if yield_barrier is not None:
@@ -749,6 +867,8 @@ def drain_outbox(
         str(item) for item in delivered_identities()
     }
     for item in items[:max_sends]:
+        if result["physical_writes"] >= max_sends:
+            break
         if yield_barrier is not None:
             yield_barrier()
         ref = str(item.get("ref") or "")
@@ -769,11 +889,15 @@ def drain_outbox(
         html = render_attention_notice(payload)
         thread_id = config.general_thread_id(store)
         sent = {"ok": True, "message_id": "0"} if dry_run else telegram.send_message(chat_id, html, thread_id=thread_id, notify=True)
+        if not dry_run:
+            result["physical_writes"] += 1
         if not dry_run and not sent.get("ok") and thread_id and _topic_missing(sent.get("error")):
             state.tombstone_dead_topic(store, str(thread_id))
-            sent = telegram.send_message(chat_id, html, notify=True)
-            if sent.get("ok"):
-                sent["fallback_reason"] = "general_thread_missing"
+            if result["physical_writes"] < max_sends:
+                sent = telegram.send_message(chat_id, html, notify=True)
+                result["physical_writes"] += 1
+                if sent.get("ok"):
+                    sent["fallback_reason"] = "general_thread_missing"
         if sent.get("ok"):
             result["delivered"] += 1
             result["changed"] = True

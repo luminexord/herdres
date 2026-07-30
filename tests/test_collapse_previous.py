@@ -12,6 +12,16 @@ from herdres_connector.telegram_delivery import TelegramError
 from test_source_only import FakeTelegram, FakeTendwire, _source_worker, _store
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _plain_fallback_by_default(monkeypatch):
+    """Legacy collapse assertions describe the force-plain fallback."""
+
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
+
+
 # --- flag ---------------------------------------------------------------------
 
 def test_collapse_flag_default_off_env_on():
@@ -159,6 +169,101 @@ def test_fold_idempotent_second_sweep_skips(monkeypatch):
     _run(store, monkeypatch)
     telegram2 = _run(store, monkeypatch)                  # second sweep
     assert not any(mid == "400" for _c, mid, _h in telegram2.edited)  # already folded -> no re-edit
+
+
+def test_multipart_rich_final_folds_every_recipient_message(monkeypatch):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "1"
+    )
+    old_text = "Old detailed answer.\n\n" * 300
+    turns = {
+        "turns": [
+            {
+                "id": "turn-new",
+                "worker_id": "w1",
+                "worker_fingerprint": "fp1",
+                "assistant_final_text": "New answer",
+                "complete": True,
+            },
+            {
+                "id": "turn-old",
+                "worker_id": "w1",
+                "worker_fingerprint": "fp1",
+                "assistant_final_text": old_text,
+                "complete": True,
+            },
+        ]
+    }
+    store = _store()
+    _worker_key, worker, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "w1",
+                "name": "w1",
+                "status": "idle",
+                "space_id": "s1",
+                "fingerprint": "fp1",
+            }
+        ),
+        topic_id="77",
+    )
+    worker["last_clean_message_id"] = "501"
+    worker["last_clean_message_ids"] = ["501"]
+    worker["last_turn_id"] = "turn-new"
+    for ordinal, message_id in enumerate(("400", "401")):
+        state.bind_message_to_worker(
+            store,
+            message_id,
+            worker,
+            topic_id="77",
+            kind="final",
+            turn_id="turn-old",
+            bot_kind=MANAGER_BOT_KIND,
+            content_revision="twrev1.old",
+            plan_token="twplan1.old",
+            part_ordinal=ordinal,
+            part_count=2,
+            tendwire_job_key=(
+                f"turn-final:twplan1.old:{ordinal:06d}"
+            ),
+        )
+    state.bind_message_to_worker(
+        store,
+        "501",
+        worker,
+        topic_id="77",
+        kind="final",
+        turn_id="turn-new",
+        bot_kind=MANAGER_BOT_KIND,
+    )
+    telegram = FakeTelegram()
+
+    _sync_turns(
+        store,
+        turns,
+        {"pending": []},
+        SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+        chat_id="-100",
+    )
+
+    edited_ids = {message_id for _chat, message_id, _html in telegram.edited}
+    assert {"400", "401"} <= edited_ids
+    assert all(
+        "<blockquote expandable>" in html
+        for _chat, message_id, html in telegram.edited
+        if message_id in {"400", "401"}
+    )
+    assert not any(
+        message_id == "501" and "<blockquote expandable>" in html
+        for _chat, message_id, html in telegram.edited
+    )
+    assert all(
+        state.message_bindings(store)[message_id]["folded"] is True
+        for message_id in ("400", "401")
+    )
 
 
 def test_readable_noncollapsed_fallback_is_never_marked_folded(

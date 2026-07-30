@@ -379,7 +379,11 @@ def _offlock_protocol_violations(
                         and node.args[3].func.id == "_provider_mutation"
                     )
                     or (
-                        owner == "_execute_decision_provider_operation"
+                        owner
+                        in {
+                            "_execute_accounted_delivery_write",
+                            "_execute_decision_provider_operation",
+                        }
                         and isinstance(node.args[3], ast.Name)
                         and node.args[3].id == "mutation"
                     )
@@ -884,6 +888,286 @@ def _offlock_protocol_violations(
     return violations
 
 
+def _delivery_write_accounting_violations(source_text):
+    """Find delivery mutations that bypass the pass-wide accounting wrapper."""
+
+    tree = ast.parse(source_text)
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    roots = {
+        "_drain_turn_final",
+        "_sync_submission_working_cards",
+        "_sync_turns",
+    }
+    traversal_stops = {
+        "_execute_accounted_delivery_write",
+        "_execute_entry_operation",
+        "_execute_exact_provider_operation",
+        "_provider_mutation",
+    }
+
+    def local_nodes(scope):
+        pending = list(scope.body)
+        while pending:
+            node = pending.pop()
+            yield node
+            if isinstance(
+                node,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.Lambda,
+                ),
+            ):
+                continue
+            pending.extend(ast.iter_child_nodes(node))
+
+    reachable = set(roots)
+    pending = list(roots)
+    while pending:
+        owner = pending.pop()
+        function = functions.get(owner)
+        if function is None:
+            continue
+        for node in local_nodes(function):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+            ):
+                continue
+            called = node.func.id
+            if (
+                called in functions
+                and called not in reachable
+                and called not in traversal_stops
+            ):
+                reachable.add(called)
+                pending.append(called)
+
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    # The modern staged-final drain predates the shared SyncRuntime budget and
+    # has its own exact ``result["operations"]`` ledger. Keep its finite
+    # physical-write inventory explicit: any new call, computed capability, or
+    # renamed reason fails closed until its accounting is audited. Rich/plain
+    # ladders must additionally receive the live remainder in their actual
+    # call arguments.
+    staged_inventory = {
+        (
+            "_drain_post_ack_reconciliations",
+            "telegram.delete_turn_delivery_message",
+            "telegram.delete_turn_delivery_message: post-ACK retire superseded copy",
+        ),
+        (
+            "_drain_post_ack_reconciliations",
+            "telegram.send_turn_delivery_part",
+            "telegram.send_turn_delivery_part: post-ACK reconcile route",
+        ),
+        (
+            "_drain_post_ack_reconciliations",
+            "telegram.delete_turn_delivery_message",
+            "telegram.delete_turn_delivery_message: post-ACK retire stale copy",
+        ),
+        (
+            "_drain_turn_final",
+            "telegram.delete_turn_delivery_message",
+            "telegram.delete_turn_delivery_message: retire tracked stale final copy",
+        ),
+        (
+            "_drain_turn_final",
+            "telegram.delete_turn_delivery_message",
+            "telegram.delete_turn_delivery_message: retire replaced final slot",
+        ),
+        (
+            "_drain_turn_final",
+            "telegram.send_turn_delivery_part",
+            "telegram.send_turn_delivery_part: replace missing final",
+        ),
+        (
+            "_drain_turn_final",
+            "telegram.send_turn_delivery_part",
+            "telegram.send_turn_delivery_part: apply new final",
+        ),
+        (
+            "_drain_turn_final",
+            "telegram.edit_turn_delivery_part",
+            "telegram.edit_turn_delivery_part: apply compatible final",
+        ),
+        (
+            "_drain_turn_final",
+            "telegram.delete_turn_delivery_message",
+            "telegram.delete_turn_delivery_message: retire planned final slot",
+        ),
+        (
+            "_drain_turn_final",
+            "telegram.delete_turn_delivery_message",
+            "telegram.delete_turn_delivery_message: stale-copy backpressure retirement",
+        ),
+    }
+    staged_seen = set()
+    violations = []
+    for owner in reachable:
+        function = functions.get(owner)
+        if function is None:
+            continue
+        for node in local_nodes(function):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_provider_mutation"
+            ):
+                continue
+            capability_node = node.args[0] if node.args else None
+            if not (
+                isinstance(capability_node, ast.Constant)
+                and isinstance(capability_node.value, str)
+            ):
+                # Fail closed: computed/concatenated capabilities are not
+                # exempt merely because a scanner cannot recover their text.
+                violations.append(
+                    ("dynamic_delivery_capability", node.lineno, owner)
+                )
+                continue
+            capability = capability_node.value
+            if not capability.startswith("telegram."):
+                continue
+            reason_node = next(
+                (
+                    keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg == "reason"
+                ),
+                None,
+            )
+            reason = (
+                reason_node.value
+                if isinstance(reason_node, ast.Constant)
+                and isinstance(reason_node.value, str)
+                else None
+            )
+            current = node
+            accounted = False
+            while current in parents:
+                current = parents[current]
+                if isinstance(
+                    current, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    break
+                if (
+                    isinstance(current, ast.Call)
+                    and isinstance(current.func, ast.Name)
+                    and current.func.id
+                    == "_execute_accounted_delivery_write"
+                ):
+                    accounted = True
+                    break
+            if not accounted:
+                staged_key = (owner, capability, reason)
+                if staged_key in staged_inventory:
+                    staged_seen.add(staged_key)
+                    executor = node
+                    while executor in parents:
+                        executor = parents[executor]
+                        if isinstance(
+                            executor,
+                            (ast.FunctionDef, ast.AsyncFunctionDef),
+                        ):
+                            break
+                        if (
+                            isinstance(executor, ast.Call)
+                            and isinstance(executor.func, ast.Name)
+                            and executor.func.id
+                            in {
+                                "_execute_entry_operation",
+                                "_execute_exact_provider_operation",
+                            }
+                        ):
+                            break
+                    if not (
+                        isinstance(executor, ast.Call)
+                        and isinstance(executor.func, ast.Name)
+                        and executor.func.id
+                        in {
+                            "_execute_entry_operation",
+                            "_execute_exact_provider_operation",
+                        }
+                    ):
+                        violations.append(
+                            (
+                                "staged_delivery_write_without_executor",
+                                node.lineno,
+                                owner,
+                                capability,
+                            )
+                        )
+                        continue
+                    if capability in {
+                        "telegram.edit_turn_delivery_part",
+                        "telegram.send_turn_delivery_part",
+                    }:
+                        kwargs_node = next(
+                            (
+                                keyword.value
+                                for keyword in node.keywords
+                                if keyword.arg == "kwargs"
+                            ),
+                            None,
+                        )
+                        allowance_node = None
+                        if isinstance(kwargs_node, ast.Dict):
+                            for key, value in zip(
+                                kwargs_node.keys, kwargs_node.values
+                            ):
+                                if (
+                                    isinstance(key, ast.Constant)
+                                    and key.value
+                                    == "max_physical_writes"
+                                ):
+                                    allowance_node = value
+                                    break
+                        names = {
+                            candidate.id
+                            for candidate in ast.walk(allowance_node)
+                            if isinstance(candidate, ast.Name)
+                        } if allowance_node is not None else set()
+                        operation_reads = any(
+                            isinstance(candidate, ast.Constant)
+                            and candidate.value == "operations"
+                            for candidate in ast.walk(allowance_node)
+                        ) if allowance_node is not None else False
+                        if (
+                            "max_operations" not in names
+                            or not operation_reads
+                        ):
+                            violations.append(
+                                (
+                                    "staged_delivery_write_without_exact_allowance",
+                                    node.lineno,
+                                    owner,
+                                    capability,
+                                )
+                            )
+                    continue
+                violations.append(
+                    (
+                        "unaccounted_delivery_write",
+                        node.lineno,
+                        owner,
+                        capability,
+                    )
+                )
+    for missing in sorted(staged_inventory - staged_seen):
+        violations.append(("missing_staged_delivery_write", *missing))
+    return violations
+
+
 def test_source_sync_mutations_require_offlock_executor():
     """The off-lock protocol is enforced structurally, not by convention."""
 
@@ -892,6 +1176,142 @@ def test_source_sync_mutations_require_offlock_executor():
     source_text = source_path.read_text(encoding="utf-8")
     delivery_text = delivery_path.read_text(encoding="utf-8")
     assert _offlock_protocol_violations(source_text, delivery_text) == []
+
+
+def test_delivery_write_accounting_is_structural_and_fails_closed():
+    source_path = Path(source_sync.__file__)
+    source_text = source_path.read_text(encoding="utf-8")
+    assert _delivery_write_accounting_violations(source_text) == []
+
+    direct = source_text.replace(
+        "execution = _execute_accounted_delivery_write(\n"
+        "            store,\n"
+        "            runtime,\n"
+        "            operation,\n"
+        "            _provider_mutation(\n"
+        "                \"telegram.send_feed_item\",\n"
+        "                reason=\"telegram.send_feed_item: create working card\",",
+        "execution = _execute_entry_operation(\n"
+        "            store,\n"
+        "            runtime.telegram,\n"
+        "            operation,\n"
+        "            _provider_mutation(\n"
+        "                \"telegram.send_feed_item\",\n"
+        "                reason=\"telegram.send_feed_item: create working card\",",
+        1,
+    )
+    assert any(
+        violation[0] == "unaccounted_delivery_write"
+        for violation in _delivery_write_accounting_violations(direct)
+    )
+
+    assembled = source_text.replace(
+        "\"telegram.send_feed_item\",\n"
+        "                reason=\"telegram.send_feed_item: create working card\",",
+        "\"telegram.\" + \"send_feed_item\",\n"
+        "                reason=\"telegram.send_feed_item: create working card\",",
+        1,
+    )
+    assert any(
+        violation[0] == "dynamic_delivery_capability"
+        for violation in _delivery_write_accounting_violations(assembled)
+    )
+
+    fixed_staged_allowance = source_text.replace(
+        '"telegram.edit_turn_delivery_part: apply compatible final"\n'
+        "                            ),\n"
+        "                            args=(\n"
+        "                                chat_id,\n"
+        "                                candidate_id,\n"
+        "                                feed_item,\n"
+        "                                plans[ordinal],\n"
+        "                            ),\n"
+        "                            kwargs={\n"
+        '                                "telegram": _telegram_state(store),\n'
+        '                                "api_token": desired_token,\n'
+        '                                "max_physical_writes": (\n'
+        "                                    max_operations\n"
+        '                                    - result["operations"]\n'
+        "                                    + 1\n"
+        "                                ),",
+        '"telegram.edit_turn_delivery_part: apply compatible final"\n'
+        "                            ),\n"
+        "                            args=(\n"
+        "                                chat_id,\n"
+        "                                candidate_id,\n"
+        "                                feed_item,\n"
+        "                                plans[ordinal],\n"
+        "                            ),\n"
+        "                            kwargs={\n"
+        '                                "telegram": _telegram_state(store),\n'
+        '                                "api_token": desired_token,\n'
+        '                                "max_physical_writes": 1,',
+        1,
+    )
+    assert any(
+        violation[0]
+        == "staged_delivery_write_without_exact_allowance"
+        for violation in _delivery_write_accounting_violations(
+            fixed_staged_allowance
+        )
+    )
+
+
+def _pending_delivery_work_components(source_text):
+    tree = ast.parse(source_text)
+    sync_function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "sync_once"
+    )
+    assignment = next(
+        node
+        for node in ast.walk(sync_function)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "pending_delivery_work"
+            for target in node.targets
+        )
+    )
+    components = set()
+    for call in ast.walk(assignment.value):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "get"
+            and isinstance(call.func.value, ast.Name)
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        ):
+            continue
+        components.add((call.func.value.id, call.args[0].value))
+    return components
+
+
+def test_pending_delivery_work_inventory_is_complete_and_fail_closed():
+    source_text = Path(source_sync.__file__).read_text(encoding="utf-8")
+    expected = {
+        ("turn_counts", "work_pending"),
+        ("submission_counts", "work_pending"),
+        ("turn_final_result", "failed"),
+        ("turn_final_result", "deferred"),
+        ("outbox_result", "failed"),
+        ("outbox_result", "deferred"),
+    }
+    assert _pending_delivery_work_components(source_text) == expected
+
+    missing_outbox_failure = source_text.replace(
+        '        + int(outbox_result.get("failed") or 0)\n',
+        "",
+        1,
+    )
+    assert (
+        _pending_delivery_work_components(missing_outbox_failure)
+        == expected - {("outbox_result", "failed")}
+    )
 
 
 def test_offlock_enforcement_rejects_all_three_demonstrated_bypasses():
@@ -1760,7 +2180,14 @@ def test_first_sync_bootstraps_current_turns_without_telegram_posts(monkeypatch)
         ]
     }
 
-    result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns=turns),
+            telegram,
+            with_outbox=False,
+        ),
+    )
 
     assert result["bootstrap_seen"] == 1
     assert result["feed_sent"] == 0
@@ -2492,7 +2919,15 @@ def test_oversize_rich_response_falls_back_without_raw_markdown_or_truncation(mo
         ]
     }
 
-    result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns=turns),
+            telegram,
+            with_outbox=False,
+            max_sends=100,
+        ),
+    )
 
     sent_text = "\n".join(sent[1] for sent in telegram.sent)
     assert result["feed_sent"] == 1
@@ -2711,7 +3146,12 @@ def test_outbox_attention_falls_back_when_general_thread_missing():
             return {"ok": True}
 
     class TopicMissingTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
         def send_message(self, chat_id, html, **kwargs):
+            self.attempts += 1
             if kwargs.get("thread_id"):
                 return {"ok": False, "error": "Bad Request: message thread not found"}
             return super().send_message(chat_id, html, **kwargs)
@@ -2728,17 +3168,74 @@ def test_outbox_attention_falls_back_when_general_thread_missing():
     tendwire = OutboxTendwire()
     telegram = TopicMissingTelegram()
 
-    result = drain_outbox(store, telegram, tendwire, chat_id="-100", max_sends=1)
+    result = drain_outbox(
+        store, telegram, tendwire, chat_id="-100", max_sends=2
+    )
 
     assert result["delivered"] == 1
     assert result["acked"] == 1
     assert result["failed"] == 0
+    assert result["physical_writes"] == 2
+    assert telegram.attempts == 2
     assert tendwire.failed == []
     assert tendwire.acked == [("ref-1", {"telegram": "delivered"})]
     assert telegram.sent[-1][2].get("thread_id") is None
     assert store["telegram_dead_topic_ids"] == ["1"]
     assert "topic_id" not in stale_alias
     assert stale_alias["deleted_topic_id"] == "1"
+
+
+def test_outbox_topic_fallback_obeys_exact_physical_write_allowance():
+    class OutboxTendwire:
+        def connector_poll(self, **_kwargs):
+            return {
+                "ok": True,
+                "items": [
+                    {
+                        "ref": "ref-1",
+                        "key": "attention:1",
+                        "attempt": 1,
+                        "payload": {
+                            "event_type": "attention_created",
+                            "attention": {
+                                "severity": "warning",
+                                "reason": "Needs input",
+                            },
+                        },
+                    }
+                ],
+            }
+
+        def connector_fail(self, _ref, _error, **_kwargs):
+            return {"ok": True}
+
+    class TopicMissingTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def send_message(self, chat_id, html, **kwargs):
+            self.attempts += 1
+            return {
+                "ok": False,
+                "error": "Bad Request: message thread not found",
+            }
+
+    store = _store()
+    telegram = TopicMissingTelegram()
+
+    result = drain_outbox(
+        store,
+        telegram,
+        OutboxTendwire(),
+        chat_id="-100",
+        max_sends=1,
+    )
+
+    assert result["delivered"] == 0
+    assert result["failed"] == 1
+    assert result["physical_writes"] == 1
+    assert telegram.attempts == 1
 
 
 def test_long_telegram_send_splits_instead_of_truncating():

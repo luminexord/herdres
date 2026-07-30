@@ -22,6 +22,8 @@ from .rendering import normalized_status
 from .safe import compact_ws, short_hash
 
 DELIVERED_TURN_LEDGER_LIMIT = 10000
+PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION = 3
+PARTIAL_FINAL_DELIVERY_LIMIT = 512
 TENDWIRE_TURN_JOB_LIMIT = 20001
 TENDWIRE_TURN_JOB_STALE_COPY_LIMIT = 8
 ORPHANED_CREATED_TOPIC_LIMIT = 200
@@ -3766,6 +3768,373 @@ def mark_delivered(data: dict[str, Any], identity: str, record: dict[str, Any]) 
     return True
 
 
+def partial_final_delivery_key(turn_id: str, content_hash: str) -> str:
+    """Return the durable replay-witness identity for one turn revision."""
+
+    turn = compact_ws(turn_id, 200)
+    content = compact_ws(content_hash, 200)
+    if not turn or not content:
+        raise ValueError("partial final requires turn and content identity")
+    return short_hash(
+        {"partial_final_turn_id": turn, "content_hash": content},
+        40,
+    )
+
+
+def partial_final_deliveries(
+    data: dict[str, Any],
+    *,
+    create: bool = False,
+) -> dict[str, Any]:
+    """Return content-keyed records whose active members hold their turn.
+
+    Schema v2 briefly stored one turn-keyed slot. Re-key every valid record by
+    content so resolved replay witnesses survive later revisions. Multiple
+    active content records for one turn remain independently visible and
+    resolvable; their presence collectively forms the turn-scoped hold.
+    """
+
+    records = data.get("telegram_partial_final_deliveries")
+    if not isinstance(records, dict):
+        records = {}
+        if create:
+            data["telegram_partial_final_deliveries"] = records
+        return records
+    normalized: dict[str, Any] = {}
+    for record in records.values():
+        if not isinstance(record, dict):
+            continue
+        turn_id = compact_ws(record.get("turn_id"), 200)
+        content_hash = compact_ws(record.get("content_hash"), 200)
+        if not turn_id or not content_hash:
+            continue
+        record["schema_version"] = PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION
+        key = partial_final_delivery_key(turn_id, content_hash)
+        incumbent = normalized.get(key)
+        if not isinstance(incumbent, dict):
+            normalized[key] = record
+            continue
+        incumbent_active = (
+            incumbent.get("status") in {"held", "retry_authorized"}
+            and incumbent.get("operator_attention_required") is True
+        )
+        record_active = (
+            record.get("status") in {"held", "retry_authorized"}
+            and record.get("operator_attention_required") is True
+        )
+        if record_active and not incumbent_active:
+            normalized[key] = record
+    if len(normalized) > PARTIAL_FINAL_DELIVERY_LIMIT:
+        # Active/unresolved records are operator obligations and are never
+        # silently evicted. Resolved witnesses are replay protection, but the
+        # oldest resolved entries are the only safe candidates when bounding
+        # state growth. If legacy input already contains more unresolved
+        # obligations than the bound, preserve them all and let health remain
+        # non-healthy; losing an obligation is worse than a temporary overflow.
+        def record_time(record: dict[str, Any]) -> float:
+            value = (
+                record.get("resolved_at")
+                or record.get("updated_at")
+                or record.get("created_at")
+                or 0
+            )
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        resolved = sorted(
+            (
+                (key, record)
+                for key, record in normalized.items()
+                if record.get("status") == "resolved"
+                and record.get("operator_attention_required") is not True
+            ),
+            key=lambda pair: (
+                record_time(pair[1]),
+                pair[0],
+            ),
+        )
+        evict_count = min(
+            len(resolved),
+            len(normalized) - PARTIAL_FINAL_DELIVERY_LIMIT,
+        )
+        for key, _record in resolved[:evict_count]:
+            normalized.pop(key, None)
+    if list(records.items()) != list(normalized.items()):
+        records.clear()
+        records.update(normalized)
+    return records
+
+
+def partial_final_delivery_has_unresolved_capacity(
+    data: dict[str, Any],
+) -> bool:
+    """Return whether another unresolved provider fact can be recorded."""
+
+    unresolved = sum(
+        1
+        for record in partial_final_deliveries(data).values()
+        if isinstance(record, dict)
+        and (
+            record.get("status") != "resolved"
+            or record.get("operator_attention_required") is True
+        )
+    )
+    return unresolved < PARTIAL_FINAL_DELIVERY_LIMIT
+
+
+def find_partial_final_delivery(
+    data: dict[str, Any],
+    turn_id: str,
+    content_hash: str,
+) -> dict[str, Any] | None:
+    record = partial_final_deliveries(data).get(
+        partial_final_delivery_key(turn_id, content_hash)
+    )
+    return record if isinstance(record, dict) else None
+
+
+def partial_final_delivery_records_for_turn(
+    data: dict[str, Any],
+    turn_id: str,
+) -> list[dict[str, Any]]:
+    """Return every content witness for a turn without collapsing revisions."""
+
+    return [
+        record
+        for record in partial_final_deliveries(data).values()
+        if isinstance(record, dict) and record.get("turn_id") == turn_id
+    ]
+
+
+def active_partial_final_deliveries_for_turn(
+    data: dict[str, Any],
+    turn_id: str,
+) -> list[dict[str, Any]]:
+    """Return every unresolved content record forming this turn's hold."""
+
+    return [
+        record
+        for record in partial_final_delivery_records_for_turn(data, turn_id)
+        if record.get("status") in {"held", "retry_authorized"}
+        and record.get("operator_attention_required") is True
+    ]
+
+
+def active_partial_final_deliveries(
+    data: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        record
+        for record in partial_final_deliveries(data).values()
+        if isinstance(record, dict)
+        and record.get("status") in {"held", "retry_authorized"}
+        and record.get("operator_attention_required") is True
+    ]
+
+
+def partial_final_delivery_health(
+    data: dict[str, Any],
+    *,
+    now: float,
+    escalation_seconds: int,
+) -> dict[str, Any]:
+    """Return the operator-facing health state for incomplete final delivery."""
+
+    records = active_partial_final_deliveries(data)
+    if not records:
+        return {
+            "ok": True,
+            "status": "healthy",
+            "signal": "",
+            "held_count": 0,
+            "escalation_seconds": int(escalation_seconds),
+        }
+
+    def created_at(record: dict[str, Any]) -> float:
+        value = record.get("created_at")
+        return (
+            float(value)
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            else float(now)
+        )
+
+    ordered = sorted(records, key=created_at)
+    first = ordered[0]
+    age = max(0.0, float(now) - created_at(first))
+    escalated = any(
+        max(0.0, float(now) - created_at(record))
+        >= float(escalation_seconds)
+        for record in records
+    )
+    unknown = any(
+        record.get("terminal_outcome") == "delivery_unknown"
+        for record in records
+    )
+    retry_pending = any(
+        record.get("status") == "retry_authorized"
+        for record in records
+    )
+    if escalated:
+        status = "partial_final_escalated"
+        signal = "outbound_partial_final_escalated"
+    elif unknown:
+        status = "partial_final_delivery_unknown"
+        signal = "outbound_partial_final_delivery_unknown"
+    elif retry_pending:
+        status = "partial_final_recovery_pending"
+        signal = "outbound_partial_final_recovery_pending"
+    else:
+        status = "partial_final_not_delivered"
+        signal = "outbound_partial_final_not_delivered"
+    return {
+        "ok": False,
+        "status": status,
+        "signal": signal,
+        "held_count": len(records),
+        "escalation_seconds": int(escalation_seconds),
+        "oldest_age_seconds": age,
+        "first_hold": {
+            key: deepcopy(first.get(key))
+            for key in (
+                "turn_id",
+                "content_hash",
+                "blocked_revision_content_hash",
+                "superseded_by_content_hash",
+                "superseded_at",
+                "supersession",
+                "supersession_message_ids",
+                "terminal_outcome",
+                "status",
+                "original_worker_id",
+                "original_topic_id",
+                "original_bot_kind",
+                "current_worker_id",
+                "current_topic_id",
+                "current_bot_kind",
+                "recovery_action",
+            )
+        },
+    }
+
+
+def _clear_embedded_partial_final_delivery(
+    data: dict[str, Any],
+    *,
+    turn_id: str,
+    content_hash: str,
+    error: str,
+) -> None:
+    for entry in source_worker_entries(data).values():
+        partial = entry.get("partial_final_delivery")
+        if (
+            isinstance(partial, dict)
+            and partial.get("turn_id") == turn_id
+            and partial.get("content_hash") == content_hash
+        ):
+            entry.pop("partial_final_delivery", None)
+            if entry.get("last_delivery_error") == error:
+                entry.pop("last_delivery_error", None)
+    for binding in message_bindings(data).values():
+        partial = (
+            binding.get("partial_final_delivery")
+            if isinstance(binding, dict)
+            else None
+        )
+        if (
+            isinstance(partial, dict)
+            and partial.get("turn_id") == turn_id
+            and partial.get("content_hash") == content_hash
+        ):
+            binding.pop("partial_final_delivery", None)
+
+
+def resolve_partial_final_delivery(
+    data: dict[str, Any],
+    *,
+    turn_id: str,
+    content_hash: str,
+    action: str,
+    request_id: str,
+    now: float,
+) -> dict[str, Any]:
+    """Apply the only operator-authorized exits from an incomplete-final hold.
+
+    An ambiguous suffix may only be accepted as an explicitly incomplete
+    delivery. A definitely rejected suffix may authorize a suffix-only retry.
+    Neither action authorizes replay of the already accepted prefix.
+    """
+
+    record = find_partial_final_delivery(data, turn_id, content_hash)
+    if record is None:
+        raise KeyError("partial final delivery not found")
+    prior_request = str(record.get("resolution_request_id") or "")
+    prior_action = str(record.get("resolution_action") or "")
+    if prior_request:
+        if prior_request == request_id and prior_action == action:
+            return deepcopy(record)
+        raise ValueError("partial final already has a different resolution")
+    outcome = str(record.get("terminal_outcome") or "")
+    allowed = {
+        "delivery_unknown": "accept-partial",
+        "not_delivered": "retry-missing",
+    }.get(outcome)
+    if action != allowed:
+        raise ValueError(
+            f"{outcome or 'unknown'} requires recovery action {allowed or 'none'}"
+        )
+    record["resolution_request_id"] = compact_ws(request_id, 128)
+    record["resolution_action"] = action
+    record["resolution_requested_at"] = float(now)
+    if action == "retry-missing":
+        record["status"] = "retry_authorized"
+        record["recovery_action"] = "await-suffix-retry"
+        return deepcopy(record)
+    record["status"] = "resolved"
+    record["resolved_at"] = float(now)
+    record["resolution"] = "accepted_incomplete"
+    record["operator_attention_required"] = False
+    record["recovery_action"] = "none"
+    _clear_embedded_partial_final_delivery(
+        data,
+        turn_id=str(record["turn_id"]),
+        content_hash=str(record["content_hash"]),
+        error=str(record.get("error") or ""),
+    )
+    return deepcopy(record)
+
+
+def complete_partial_final_retry(
+    data: dict[str, Any],
+    *,
+    turn_id: str,
+    content_hash: str,
+    message_ids: list[str],
+    now: float,
+) -> dict[str, Any]:
+    """Complete a previously operator-authorized missing-suffix retry."""
+
+    record = find_partial_final_delivery(data, turn_id, content_hash)
+    if record is None or record.get("status") != "retry_authorized":
+        raise ValueError("partial final suffix retry is not authorized")
+    record["status"] = "resolved"
+    record["resolved_at"] = float(now)
+    record["resolution"] = "missing_suffix_delivered"
+    record["operator_attention_required"] = False
+    record["recovery_action"] = "none"
+    record["message_ids"] = list(message_ids)
+    record["canonical_message_id"] = message_ids[0] if message_ids else ""
+    _clear_embedded_partial_final_delivery(
+        data,
+        turn_id=str(record["turn_id"]),
+        content_hash=str(record["content_hash"]),
+        error=str(record.get("error") or ""),
+    )
+    return deepcopy(record)
+
+
 def tendwire_turn_jobs(data: dict[str, Any]) -> dict[str, Any]:
     """Return the private, stable-job-keyed multipart checkpoint ledger."""
     jobs = data.get("tendwire_turn_jobs")
@@ -4372,6 +4741,7 @@ def bind_message_to_worker(
     part_count: int | None = None,
     tendwire_job_key: str = "",
     submission_id: str = "",
+    delivery_format: str = "",
 ) -> None:
     message = str(message_id or "").strip()
     if not message or message == "0":
@@ -4386,6 +4756,8 @@ def bind_message_to_worker(
         "turn_id": str(turn_id or ""),
         "bot_kind": str(bot_kind or ""),
     }
+    if delivery_format:
+        binding["delivery_format"] = str(delivery_format)
     if submission_id:
         binding["submission_id"] = str(submission_id)
     delivery_values_present = bool(

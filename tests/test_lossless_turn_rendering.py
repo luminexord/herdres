@@ -195,7 +195,7 @@ class RecordingTelegram(TelegramClient):
         return {"ok": True, "result": {"message_id": len(self.calls)}}
 
 
-def test_one_part_executor_uses_one_canonical_plain_send():
+def test_one_part_executor_uses_rich_primary_or_one_plain_override():
     item = _long_canonical_turn()
     parts = prepare_turn_delivery_parts(item)
 
@@ -213,7 +213,8 @@ def test_one_part_executor_uses_one_canonical_plain_send():
         )
         assert result["ok"] is True
         assert len(rich_client.calls) == before + 1
-        assert rich_client.calls[-1][0] == "sendMessage"
+        assert rich_client.calls[-1][0] == "sendRichMessage"
+        assert result["physical_writes"] == 1
 
     fallback_parts = prepare_turn_delivery_parts(item, rich_transport=False)
     fallback_client = RecordingTelegram()
@@ -233,7 +234,8 @@ def test_one_part_executor_uses_one_canonical_plain_send():
         method, payload = fallback_client.calls[-1]
         assert method == "sendMessage"
         assert len(payload["text"]) <= RICH_FALLBACK_MAX_CHARS
-        assert result.get("message_ids") is None
+        assert result["message_ids"] == [result["message_id"]]
+        assert result["canonical_message_id"] == result["message_id"]
 
 
 def test_rich_capability_does_not_weaken_canonical_plain_part_bound():
@@ -311,7 +313,7 @@ def test_plain_canonical_plan_keeps_content_lossless():
     )
 
 
-def test_large_turn_part_uses_one_bounded_plain_send():
+def test_rejected_rich_part_uses_one_bounded_plain_fallback():
     class UnsupportedRichTelegram(RecordingTelegram):
         def api(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
             self.calls.append((method, payload))
@@ -338,4 +340,8 @@ def test_large_turn_part_uses_one_bounded_plain_send():
     )
 
     assert result["ok"] is True
-    assert [method for method, _payload in client.calls] == ["sendMessage"]
+    assert [method for method, _payload in client.calls] == [
+        "sendRichMessage",
+        "sendMessage",
+    ]
+    assert result["physical_writes"] == 2
