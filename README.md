@@ -382,6 +382,15 @@ bound into the same lifecycle group; `last_clean_message_id` is the canonical
 reply id and `last_clean_message_ids` is the complete ordered set used by
 revision, deletion, and collapse.
 
+`max_sends` is an exact, pass-wide physical-write allowance. Rich attempts,
+HTML/plain fallbacks, multipart sends, working-card sends and edits,
+supersession edits, collapse edits, suffix recovery, pending cards, and
+additive voice notes all consume the same allowance whether they succeed or
+fail. A failed turn that leaves another turn waiting advances a durable
+round-robin cursor, so the waiting turn leads the next pass instead of being
+starved by the same failure. A pass that completes no delivery while work is
+pending reports `outbound_delivery_stalled`, never healthy success.
+
 `HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` bounds recovery after a connector
 poll response is lost. It defaults to 60 seconds; unset, empty, or invalid
 values use the same 60-second fallback, and configured values are clamped to 60
@@ -419,6 +428,14 @@ herdres resolve-partial-final --turn-id TURN --content-hash HASH \
 
 Neither action replays the accepted prefix. Resolution request ids are bound
 to one action for auditability and idempotent operator retries.
+
+The partial-final ledger retains at most 512 records during normal operation.
+When space is needed, it evicts the oldest resolved replay witnesses first.
+Held and retry-authorized records are operator obligations and are never
+evicted. If legacy state already contains more than 512 unresolved records,
+Herdres preserves the overflow and remains unhealthy rather than silently
+discarding evidence; new final sends are refused until unresolved capacity is
+available.
 
 An ordinary restart retains the private Herdres state and Tendwire database.
 Herdres resumes proven provider work under a fresh transient ref without

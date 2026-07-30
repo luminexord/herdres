@@ -23,6 +23,7 @@ from .safe import compact_ws, short_hash
 
 DELIVERED_TURN_LEDGER_LIMIT = 10000
 PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION = 3
+PARTIAL_FINAL_DELIVERY_LIMIT = 512
 TENDWIRE_TURN_JOB_LIMIT = 20001
 TENDWIRE_TURN_JOB_STALE_COPY_LIMIT = 8
 ORPHANED_CREATED_TOPIC_LIMIT = 200
@@ -3823,10 +3824,64 @@ def partial_final_deliveries(
         )
         if record_active and not incumbent_active:
             normalized[key] = record
+    if len(normalized) > PARTIAL_FINAL_DELIVERY_LIMIT:
+        # Active/unresolved records are operator obligations and are never
+        # silently evicted. Resolved witnesses are replay protection, but the
+        # oldest resolved entries are the only safe candidates when bounding
+        # state growth. If legacy input already contains more unresolved
+        # obligations than the bound, preserve them all and let health remain
+        # non-healthy; losing an obligation is worse than a temporary overflow.
+        def record_time(record: dict[str, Any]) -> float:
+            value = (
+                record.get("resolved_at")
+                or record.get("updated_at")
+                or record.get("created_at")
+                or 0
+            )
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        resolved = sorted(
+            (
+                (key, record)
+                for key, record in normalized.items()
+                if record.get("status") == "resolved"
+                and record.get("operator_attention_required") is not True
+            ),
+            key=lambda pair: (
+                record_time(pair[1]),
+                pair[0],
+            ),
+        )
+        evict_count = min(
+            len(resolved),
+            len(normalized) - PARTIAL_FINAL_DELIVERY_LIMIT,
+        )
+        for key, _record in resolved[:evict_count]:
+            normalized.pop(key, None)
     if list(records.items()) != list(normalized.items()):
         records.clear()
         records.update(normalized)
     return records
+
+
+def partial_final_delivery_has_unresolved_capacity(
+    data: dict[str, Any],
+) -> bool:
+    """Return whether another unresolved provider fact can be recorded."""
+
+    unresolved = sum(
+        1
+        for record in partial_final_deliveries(data).values()
+        if isinstance(record, dict)
+        and (
+            record.get("status") != "resolved"
+            or record.get("operator_attention_required") is True
+        )
+    )
+    return unresolved < PARTIAL_FINAL_DELIVERY_LIMIT
 
 
 def find_partial_final_delivery(

@@ -65,6 +65,23 @@ _ACCEPTED_NOTIFICATION_LIMIT = 64
 _DELIVERY_FORMAT_FALLBACK_LIMIT = 64
 
 
+@dataclass
+class _DeliveryWriteBudget:
+    """One pass-wide allowance charged by physical provider attempts."""
+
+    limit: int
+    spent: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.spent)
+
+    def charge(self, result: Any, *, default: int = 1) -> int:
+        writes = _telegram_physical_writes(result, default=default)
+        self.spent += writes
+        return writes
+
+
 class _TurnContentError(RuntimeError):
     def __init__(self, status: str, message: str, *, conflict: bool = False) -> None:
         super().__init__(message)
@@ -81,6 +98,7 @@ class SyncRuntime:
     max_sends: int = 8
     checkpoint: Callable[[], None] | None = None
     after_provider_accept: Callable[[], None] | None = None
+    delivery_write_budget: _DeliveryWriteBudget | None = None
 
 
 @dataclass(frozen=True)
@@ -969,7 +987,23 @@ def _build_offlock_executor() -> Any:
                 reply_to,
             ) = args
             ids: list[str] = []
+            max_writes = max(
+                0,
+                int(
+                    kwargs.get(
+                        "max_physical_writes", len(chunks)
+                    )
+                ),
+            )
             for index, chunk in enumerate(chunks):
+                if index >= max_writes:
+                    return {
+                        "ok": False,
+                        "status": "telegram_voice_batch_budget_exhausted",
+                        "error": "Telegram physical-write budget exhausted",
+                        "accepted_message_ids": ids,
+                        "physical_writes": len(ids),
+                    }
                 try:
                     dest = (
                         speech.outbound_speech_dir(prune=(index == 0))
@@ -992,6 +1026,7 @@ def _build_offlock_executor() -> Any:
                             ),
                             "error": "voice synthesis failed",
                             "accepted_message_ids": ids,
+                            "physical_writes": len(ids),
                         }
                     sent = provider.send_voice(
                         chat_id,
@@ -1021,6 +1056,7 @@ def _build_offlock_executor() -> Any:
                                 300,
                             ),
                             "accepted_message_ids": ids,
+                            "physical_writes": len(ids) + 1,
                         }
                     else:
                         return {
@@ -1033,6 +1069,7 @@ def _build_offlock_executor() -> Any:
                                 "an attributable message id"
                             ),
                             "accepted_message_ids": ids,
+                            "physical_writes": len(ids) + 1,
                         }
                 except RateLimited as exc:
                     return {
@@ -1043,6 +1080,7 @@ def _build_offlock_executor() -> Any:
                         "retry_after": exc.retry_after,
                         "method": str(exc.method or "sendVoice"),
                         "accepted_message_ids": ids,
+                        "physical_writes": len(ids) + 1,
                     }
                 except TelegramError as exc:
                     nested = _nested_rate_limit(
@@ -1061,6 +1099,7 @@ def _build_offlock_executor() -> Any:
                                 nested.method or "sendVoice"
                             ),
                             "accepted_message_ids": ids,
+                            "physical_writes": len(ids) + 1,
                         }
                     return {
                         "ok": False,
@@ -1069,6 +1108,7 @@ def _build_offlock_executor() -> Any:
                         ),
                         "error": compact_ws(str(exc), 300),
                         "accepted_message_ids": ids,
+                        "physical_writes": len(ids) + 1,
                     }
                 except OSError as exc:
                     # Local filesystem failures occur before this chunk's
@@ -1079,8 +1119,13 @@ def _build_offlock_executor() -> Any:
                         "status": "telegram_voice_batch_local_failure",
                         "error": compact_ws(str(exc), 300),
                         "accepted_message_ids": ids,
+                        "physical_writes": len(ids),
                     }
-            return ids
+            return {
+                "ok": True,
+                "accepted_message_ids": ids,
+                "physical_writes": len(ids),
+            }
         raise AssertionError(
             "unhandled provider mutation capability: "
             f"{mutation.capability}"
@@ -1446,6 +1491,61 @@ def _execute_entry_operation(
     )
 
 
+def _delivery_write_budget(runtime: SyncRuntime) -> _DeliveryWriteBudget:
+    budget = runtime.delivery_write_budget
+    if budget is None:
+        budget = _DeliveryWriteBudget(max(0, int(runtime.max_sends)))
+        runtime.delivery_write_budget = budget
+    return budget
+
+
+def _execute_accounted_delivery_write(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    operation: _OfflockEntryOperation,
+    mutation: _ProviderMutation,
+) -> _OfflockEntryExecution:
+    """Execute and charge one owner-visible Telegram delivery capability.
+
+    Adapter results report the whole rich/HTML/plain ladder as
+    ``physical_writes``.  The wrapper charges that fact whether the logical
+    delivery succeeded or failed.  Every delivery caller must also pass the
+    wrapper's exact ``remaining`` value as ``max_physical_writes``; this
+    runtime check makes a missing allowance loud even if a static guard is
+    accidentally weakened.
+    """
+
+    budget = _delivery_write_budget(runtime)
+    kwargs = dict(mutation.kwargs)
+    allowance = kwargs.get("max_physical_writes")
+    if (
+        isinstance(allowance, bool)
+        or not isinstance(allowance, int)
+        or allowance != budget.remaining
+    ):
+        raise RuntimeError(
+            "delivery mutation must carry the exact remaining physical-write "
+            "allowance"
+        )
+    if budget.remaining <= 0:
+        raise RuntimeError(
+            "delivery mutation attempted after physical-write budget exhaustion"
+        )
+    try:
+        execution = _execute_entry_operation(
+            store, runtime.telegram, operation, mutation
+        )
+    except Exception:
+        # The adapter contract converts expected provider outcomes into a
+        # structured result. An escaping exception is ambiguous about whether
+        # the provider saw the request, so conservatively charge one attempt
+        # before surfacing it loudly.
+        budget.spent += 1
+        raise
+    budget.charge(execution.result, default=1)
+    return execution
+
+
 def _execute_exact_provider_operation(
     client: Any,
     *,
@@ -1495,6 +1595,7 @@ def _offlock_runtime(
         max_sends=runtime.max_sends,
         checkpoint=runtime.checkpoint,
         after_provider_accept=runtime.after_provider_accept,
+        delivery_write_budget=runtime.delivery_write_budget,
     )
 
 
@@ -2365,6 +2466,9 @@ def _record_partial_final_delivery(
     state.partial_final_deliveries(store, create=True)[
         state.partial_final_delivery_key(turn_id, content_hash)
     ] = record
+    # Re-run normalization after insertion so the resolved-witness bound is
+    # enforced immediately. Unresolved records are never eviction candidates.
+    state.partial_final_deliveries(store)
     entry["partial_final_delivery"] = record
     _record_delivery_error(entry, {"error": error}, bot_kind)
     for message_id in message_ids:
@@ -3473,8 +3577,6 @@ def _promote_working_to_final(
     thread_id: str,
     content_hash: str,
     identity: str,
-    max_physical_writes: int | None = None,
-    physical_write_counter: dict[str, int] | None = None,
 ) -> bool:
     turn_id = _turn_id(item)
     stream_message_id = str(entry.get("last_stream_message_id") or "")
@@ -3502,9 +3604,9 @@ def _promote_working_to_final(
         message_id=stream_message_id,
         observe=("last_stream_message_id",),
     )
-    execution = _execute_entry_operation(
+    execution = _execute_accounted_delivery_write(
         store,
-        runtime.telegram,
+        runtime,
         operation,
         _provider_mutation(
             "telegram.edit_feed_item",
@@ -3515,16 +3617,13 @@ def _promote_working_to_final(
             kwargs={
                 "telegram": telegram,
                 "api_token": api_token,
-                "max_physical_writes": max_physical_writes,
+                "max_physical_writes": _delivery_write_budget(
+                    runtime
+                ).remaining,
             },
         ),
     )
     sent, resolution = execution.result, execution.resolution
-    if physical_write_counter is not None:
-        physical_write_counter["physical_writes"] = (
-            int(physical_write_counter.get("physical_writes") or 0)
-            + _telegram_physical_writes(sent, default=0)
-        )
     if not sent.get("ok") or resolution.disposition != _OFFLOCK_APPLY:
         return False
     entry = resolution.entry
@@ -3554,8 +3653,6 @@ def _replace_changed_final(
     thread_id: str,
     content_hash: str,
     identity: str,
-    max_physical_writes: int | None = None,
-    physical_write_counter: dict[str, int] | None = None,
 ) -> bool:
     bindings = _final_delivery_bindings(
         store, _turn_id(item), topic_id=thread_id
@@ -3587,13 +3684,8 @@ def _replace_changed_final(
         return False
     message_ids: list[str] = []
     current_entry = entry
-    remaining_writes = (
-        max(0, int(max_physical_writes))
-        if max_physical_writes is not None
-        else None
-    )
     for fallback_ordinal, (message_id, binding) in enumerate(ordered):
-        if remaining_writes == 0:
+        if _delivery_write_budget(runtime).remaining == 0:
             return False
         ordinal = binding.get("part_ordinal")
         if not isinstance(ordinal, int):
@@ -3606,9 +3698,9 @@ def _replace_changed_final(
             topic_id=thread_id,
             message_id=message_id,
         )
-        execution = _execute_entry_operation(
+        execution = _execute_accounted_delivery_write(
             store,
-            runtime.telegram,
+            runtime,
             operation,
             _provider_mutation(
                 "telegram.edit_turn_delivery_part",
@@ -3625,22 +3717,13 @@ def _replace_changed_final(
                 kwargs={
                     "telegram": _telegram_state(store),
                     "api_token": api_token,
-                    "max_physical_writes": remaining_writes,
+                    "max_physical_writes": _delivery_write_budget(
+                        runtime
+                    ).remaining,
                 },
             ),
         )
         sent, resolution = execution.result, execution.resolution
-        writes = _telegram_physical_writes(sent, default=0)
-        if physical_write_counter is not None:
-            physical_write_counter["physical_writes"] = (
-                int(
-                    physical_write_counter.get("physical_writes")
-                    or 0
-                )
-                + writes
-            )
-        if remaining_writes is not None:
-            remaining_writes = max(0, remaining_writes - writes)
         if (
             not sent.get("ok")
             or resolution.disposition != _OFFLOCK_APPLY
@@ -3749,6 +3832,8 @@ def _fold_superseded_final(
             and fold_state.get("issued", 0) >= _FOLD_PASS_CAP
         ):
             break
+        if _delivery_write_budget(runtime).remaining == 0:
+            break
         if str(message_id) == str(
             entry.get("last_clean_message_id") or ""
         ):
@@ -3763,11 +3848,6 @@ def _fold_superseded_final(
             ordinal = fallback_ordinal
         if not 0 <= ordinal < len(plans):
             continue
-        remaining = (
-            _FOLD_PASS_CAP - fold_state.get("issued", 0)
-            if fold_state is not None
-            else _FOLD_PASS_CAP
-        )
         operation = _capture_entry_operation(
             store,
             entry,
@@ -3775,9 +3855,9 @@ def _fold_superseded_final(
             message_id=message_id,
         )
         try:
-            execution = _execute_entry_operation(
+            execution = _execute_accounted_delivery_write(
                 store,
-                runtime.telegram,
+                runtime,
                 operation,
                 _provider_mutation(
                     "telegram.edit_turn_delivery_part",
@@ -3794,7 +3874,9 @@ def _fold_superseded_final(
                     kwargs={
                         "telegram": telegram,
                         "api_token": api_token,
-                        "max_physical_writes": remaining,
+                        "max_physical_writes": _delivery_write_budget(
+                            runtime
+                        ).remaining,
                     },
                 ),
             )
@@ -6251,6 +6333,8 @@ def _deliver_working(
         )
         _record_stream_update_time(entry, now)
         return True
+    if _delivery_write_budget(runtime).remaining == 0:
+        return False
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
     stored_bot_kind = str(entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND)
@@ -6277,9 +6361,9 @@ def _deliver_working(
         observe=("last_stream_message_id",) if edit_attempted else (),
     )
     if edit_attempted:
-        execution = _execute_entry_operation(
+        execution = _execute_accounted_delivery_write(
             store,
-            runtime.telegram,
+            runtime,
             operation,
             _provider_mutation(
                 "telegram.edit_feed_item",
@@ -6289,13 +6373,16 @@ def _deliver_working(
                     "telegram": telegram,
                     "live": True,
                     "api_token": api_token,
+                    "max_physical_writes": _delivery_write_budget(
+                        runtime
+                    ).remaining,
                 },
             ),
         )
     else:
-        execution = _execute_entry_operation(
+        execution = _execute_accounted_delivery_write(
             store,
-            runtime.telegram,
+            runtime,
             operation,
             _provider_mutation(
                 "telegram.send_feed_item",
@@ -6307,6 +6394,9 @@ def _deliver_working(
                     "notify": False,
                     "live": True,
                     "api_token": api_token,
+                    "max_physical_writes": _delivery_write_budget(
+                        runtime
+                    ).remaining,
                 },
             ),
         )
@@ -6329,12 +6419,14 @@ def _deliver_working(
         entry = resolution.entry
         assert entry is not None
         _clear_stream_delivery_keys(entry)
+        if _delivery_write_budget(runtime).remaining == 0:
+            return False
         operation = _capture_entry_operation(
             store, entry, topic_id=thread_id
         )
-        execution = _execute_entry_operation(
+        execution = _execute_accounted_delivery_write(
             store,
-            runtime.telegram,
+            runtime,
             operation,
             _provider_mutation(
                 "telegram.send_feed_item",
@@ -6348,6 +6440,9 @@ def _deliver_working(
                     "notify": False,
                     "live": True,
                     "api_token": api_token,
+                    "max_physical_writes": _delivery_write_budget(
+                        runtime
+                    ).remaining,
                 },
             ),
         )
@@ -6503,7 +6598,14 @@ def _sync_submission_working_cards(
 ) -> dict[str, int]:
     """Render v3 receipts while leaving the legacy predicted-turn path inert."""
 
-    counts = {"sent": 0, "updated": 0}
+    counts = {
+        "sent": 0,
+        "updated": 0,
+        "physical_writes": 0,
+        "work_pending": 0,
+    }
+    budget = _delivery_write_budget(runtime)
+    budget_start = budget.spent
     complete_turn_ids = {
         _turn_id(item) for item in turns if _turn_has_complete_final(item)
     }
@@ -6552,6 +6654,7 @@ def _sync_submission_working_cards(
             )
             if record is None:
                 continue
+        writes_before = budget.spent
         delivered = _deliver_submission_working_record(
             store,
             record,
@@ -6562,6 +6665,10 @@ def _sync_submission_working_cards(
         )
         counts["sent"] += delivered["sent"]
         counts["updated"] += delivered["updated"]
+        writes_used = budget.spent - writes_before
+        counts["physical_writes"] = budget.spent - budget_start
+        if writes_used and not delivered["sent"]:
+            counts["work_pending"] += 1
     return counts
 
 
@@ -6739,6 +6846,8 @@ def _speak_reply(
     chunks = speech.speech_reply_chunks(item.get("assistant_final_text") or item.get("assistant_stream_text") or "")
     if not chunks:
         return entry
+    if _delivery_write_budget(runtime).remaining == 0:
+        return entry
     api_token, _bot_kind = _delivery_bot(store, entry)
     operation = _capture_entry_operation(
         store,
@@ -6747,9 +6856,9 @@ def _speak_reply(
         message_id=str(reply_to or ""),
     )
 
-    execution = _execute_entry_operation(
+    execution = _execute_accounted_delivery_write(
         store,
-        runtime.telegram,
+        runtime,
         operation,
         _provider_mutation(
             "telegram.send_voice_batch",
@@ -6761,6 +6870,11 @@ def _speak_reply(
                 thread_id,
                 reply_to,
             ),
+            kwargs={
+                "max_physical_writes": _delivery_write_budget(
+                    runtime
+                ).remaining,
+            },
             api_token=api_token,
         ),
     )
@@ -7208,8 +7322,6 @@ def _deliver_final(
     runtime: SyncRuntime,
     *,
     chat_id: str,
-    remaining_write_allowance: int | None = None,
-    physical_write_counter: dict[str, int] | None = None,
 ) -> bool:
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
@@ -7306,9 +7418,6 @@ def _deliver_final(
         return True
     send_changed_as_new = _changed_final_should_send_new_message(item, entry)
     if _final_turn_delivered(store, turn_id) and visible_here:
-        writes_before = int(
-            (physical_write_counter or {}).get("physical_writes") or 0
-        )
         replaced = bool(
             not send_changed_as_new
             and entry.get("last_clean_hash") == content_hash
@@ -7321,26 +7430,8 @@ def _deliver_final(
                 thread_id=thread_id,
                 content_hash=content_hash,
                 identity=identity,
-                max_physical_writes=(
-                    remaining_write_allowance if retry_missing else None
-                ),
-                physical_write_counter=physical_write_counter,
             )
         )
-        if remaining_write_allowance is not None:
-            remaining_write_allowance = max(
-                0,
-                remaining_write_allowance
-                - (
-                    int(
-                        (physical_write_counter or {}).get(
-                            "physical_writes"
-                        )
-                        or 0
-                    )
-                    - writes_before
-                ),
-            )
         if replaced:
             if revision_blockers:
                 _record_partial_final_supersession(
@@ -7354,9 +7445,6 @@ def _deliver_final(
         if not send_changed_as_new:
             _repair_delivered_final_entry(store, item, entry, content_hash)
             return False
-    writes_before = int(
-        (physical_write_counter or {}).get("physical_writes") or 0
-    )
     replaced = bool(
         not send_changed_as_new
         and _replace_changed_final(
@@ -7368,26 +7456,8 @@ def _deliver_final(
             thread_id=thread_id,
             content_hash=content_hash,
             identity=identity,
-            max_physical_writes=(
-                remaining_write_allowance if retry_missing else None
-            ),
-            physical_write_counter=physical_write_counter,
         )
     )
-    if remaining_write_allowance is not None:
-        remaining_write_allowance = max(
-            0,
-            remaining_write_allowance
-            - (
-                int(
-                    (physical_write_counter or {}).get(
-                        "physical_writes"
-                    )
-                    or 0
-                )
-                - writes_before
-            ),
-        )
     if replaced:
         if revision_blockers:
             _record_partial_final_supersession(
@@ -7398,11 +7468,8 @@ def _deliver_final(
                 ),
             )
         return True
-    if remaining_write_allowance == 0:
+    if _delivery_write_budget(runtime).remaining == 0:
         return False
-    writes_before = int(
-        (physical_write_counter or {}).get("physical_writes") or 0
-    )
     promoted = _promote_working_to_final(
         store,
         presentation_item,
@@ -7412,25 +7479,7 @@ def _deliver_final(
         thread_id=thread_id,
         content_hash=content_hash,
         identity=identity,
-        max_physical_writes=(
-            remaining_write_allowance if retry_missing else None
-        ),
-        physical_write_counter=physical_write_counter,
     )
-    if remaining_write_allowance is not None:
-        remaining_write_allowance = max(
-            0,
-            remaining_write_allowance
-            - (
-                int(
-                    (physical_write_counter or {}).get(
-                        "physical_writes"
-                    )
-                    or 0
-                )
-                - writes_before
-            ),
-        )
     if promoted:
         if revision_blockers:
             _record_partial_final_supersession(
@@ -7441,7 +7490,11 @@ def _deliver_final(
                 ),
             )
         return True
-    if remaining_write_allowance == 0:
+    if _delivery_write_budget(runtime).remaining == 0:
+        return False
+    if not state.partial_final_delivery_has_unresolved_capacity(store):
+        # Do not start a provider write when an incomplete outcome could not
+        # be recorded without discarding another unresolved obligation.
         return False
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
@@ -7453,9 +7506,9 @@ def _deliver_final(
         if retry_missing and isinstance(exact_record, dict)
         else 0
     )
-    execution = _execute_entry_operation(
+    execution = _execute_accounted_delivery_write(
         store,
-        runtime.telegram,
+        runtime,
         operation,
         _provider_mutation(
             "telegram.send_feed_item",
@@ -7467,20 +7520,13 @@ def _deliver_final(
                 "notify": False,
                 "api_token": api_token,
                 "start_part_index": start_part_index,
-                "max_physical_writes": (
-                    remaining_write_allowance
-                    if retry_missing
-                    else None
-                ),
+                "max_physical_writes": _delivery_write_budget(
+                    runtime
+                ).remaining,
             },
         ),
     )
     sent, resolution = execution.result, execution.resolution
-    if physical_write_counter is not None:
-        physical_write_counter["physical_writes"] = (
-            int(physical_write_counter.get("physical_writes") or 0)
-            + _telegram_physical_writes(sent, default=0)
-        )
     message_ids = split_legacy_message_ids(sent)
     if not sent.get("ok"):
         if (
@@ -7584,7 +7630,13 @@ def _deliver_final(
     return True
 
 
-def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncRuntime, *, chat_id: str) -> bool:
+def _deliver_pending(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+) -> bool:
     key, entry = _entry_for_turn(store, item)
     if key is None or entry is None:
         return False
@@ -7599,19 +7651,27 @@ def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncR
     html = render_pending(item, entry)
     if runtime.dry_run:
         return state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id})
+    if _delivery_write_budget(runtime).remaining == 0:
+        return False
     api_token, bot_kind = _delivery_bot(store, entry)
     operation = _capture_entry_operation(
         store, entry, topic_id=thread_id
     )
-    execution = _execute_entry_operation(
+    execution = _execute_accounted_delivery_write(
         store,
-        runtime.telegram,
+        runtime,
         operation,
         _provider_mutation(
             "telegram.send_message",
             reason="telegram.send_message: deliver pending interaction",
             args=(chat_id, html),
-            kwargs={"thread_id": thread_id, "notify": True},
+            kwargs={
+                "thread_id": thread_id,
+                "notify": True,
+                "max_physical_writes": _delivery_write_budget(
+                    runtime
+                ).remaining,
+            },
             api_token=api_token,
         ),
     )
@@ -7750,7 +7810,11 @@ def _sync_turns(
         "updated": 0,
         "content_pages": 0,
         "physical_writes": 0,
+        "work_pending": 0,
+        "failed_writes": 0,
     }
+    budget = _delivery_write_budget(runtime)
+    budget_start = budget.spent
     turns = _turns(turns_payload)
     if live_worker_ids is not None:
         # Retired-worker turns must not be delivered (same rule already applied
@@ -7811,11 +7875,29 @@ def _sync_turns(
             continue
         if _turn_is_working_placeholder(item, entry):
             latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
+    # Fairness is pass-to-pass round-robin. A failing logical turn may consume
+    # the remaining allowance in this pass, but the durable cursor starts the
+    # next pass immediately after it so the same turn cannot starve every
+    # independent owner indefinitely.
+    cursor = compact_ws(store.get("telegram_delivery_turn_cursor"), 200)
+    delivery_turns = list(turns)
+    if cursor:
+        cursor_indexes = [
+            index
+            for index, candidate in enumerate(delivery_turns)
+            if _turn_id(candidate) == cursor
+        ]
+        if cursor_indexes:
+            split_at = cursor_indexes[-1] + 1
+            delivery_turns = (
+                delivery_turns[split_at:] + delivery_turns[:split_at]
+            )
     seen_final_workers: set[str] = set()
     seen_working_workers: set[str] = set()
     fold_state: dict[str, int] = {"issued": 0}
-    turn_count = len(turns)
-    for idx, item in enumerate(turns):
+    fairness_cursor_candidate = ""
+    turn_count = len(delivery_turns)
+    for idx, item in enumerate(delivery_turns):
         if _turn_has_content_outcome(item):
             continue
         entry_key, entry = _entry_for_turn(store, item)
@@ -7837,7 +7919,10 @@ def _sync_turns(
                 delivered = False
                 content_hash = _content_revision(item) or _turn_content_hash(item, "final")
                 counts["updated"] += int(_suppress_historical_final(store, item, content_hash))
+                writes_before = budget.spent
                 counts["updated"] += int(_fold_superseded_final(store, item, entry, runtime, chat_id=chat_id, fold_state=fold_state))
+                if budget.spent > writes_before:
+                    counts["physical_writes"] = budget.spent - budget_start
                 continue
             if worker_key in seen_final_workers:
                 continue
@@ -7870,10 +7955,7 @@ def _sync_turns(
                         )
                     )
                 }
-                remaining_writes = max(
-                    0,
-                    runtime.max_sends - counts["physical_writes"],
-                )
+                writes_before = budget.spent
                 delivered = (
                     _deliver_final(
                         store,
@@ -7881,12 +7963,18 @@ def _sync_turns(
                         entry,
                         runtime,
                         chat_id=chat_id,
-                        remaining_write_allowance=remaining_writes,
-                        physical_write_counter=counts,
                     )
-                    if remaining_writes
+                    if budget.remaining
                     else False
                 )
+                writes_used = budget.spent - writes_before
+                if writes_used:
+                    counts["physical_writes"] = budget.spent - budget_start
+                if not delivered and (writes_used or not budget.remaining):
+                    counts["work_pending"] += 1
+                    counts["failed_writes"] += int(bool(writes_used))
+                    if writes_used:
+                        fairness_cursor_candidate = _turn_id(item)
                 if delivered:
                     # Legacy inline direct-call compatibility; v2 finals are spoken only after the
                     # complete ordered plan is acknowledged.
@@ -7959,14 +8047,27 @@ def _sync_turns(
                     or previous_is_placeholder
                 )
             )
-            delivered = _deliver_working(
-                store,
-                item,
-                entry,
-                runtime,
-                chat_id=chat_id,
-                reuse_previous_working=reuse_previous_working,
+            writes_before = budget.spent
+            delivered = (
+                _deliver_working(
+                    store,
+                    item,
+                    entry,
+                    runtime,
+                    chat_id=chat_id,
+                    reuse_previous_working=reuse_previous_working,
+                )
+                if budget.remaining
+                else False
             )
+            writes_used = budget.spent - writes_before
+            if writes_used:
+                counts["physical_writes"] = budget.spent - budget_start
+            if not delivered and (writes_used or not budget.remaining):
+                counts["work_pending"] += 1
+                counts["failed_writes"] += int(bool(writes_used))
+                if writes_used:
+                    fairness_cursor_candidate = _turn_id(item)
         else:
             delivered = False
         counts["feed_sent"] += int(delivered)
@@ -7990,7 +8091,17 @@ def _sync_turns(
     pending_items = _pending(pending_payload)
     pending_count = len(pending_items)
     for p_idx, item in enumerate(pending_items):
-        delivered = _deliver_pending(store, item, runtime, chat_id=chat_id)
+        writes_before = budget.spent
+        delivered = (
+            _deliver_pending(store, item, runtime, chat_id=chat_id)
+            if budget.remaining
+            else False
+        )
+        writes_used = budget.spent - writes_before
+        counts["physical_writes"] = budget.spent - budget_start
+        if not delivered and (writes_used or not budget.remaining):
+            counts["work_pending"] += 1
+            counts["failed_writes"] += int(bool(writes_used))
         counts["feed_sent"] += int(delivered)
         counts["sent"] += int(delivered)
         if (
@@ -8002,6 +8113,8 @@ def _sync_turns(
         # Same yield between delivered pending prompts (each is a send under the lock).
         if yield_barrier is not None and delivered and p_idx + 1 < pending_count:
             yield_barrier()
+    if fairness_cursor_candidate and counts["work_pending"] > 1:
+        store["telegram_delivery_turn_cursor"] = fairness_cursor_candidate
     return counts
 
 
@@ -13003,6 +13116,11 @@ def drain_outbound_once(
 
 def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     config.require_source_mode()
+    # SyncRuntime instances are routinely reused by tests and service loops.
+    # The allowance is per pass, never per runtime object.
+    runtime.delivery_write_budget = _DeliveryWriteBudget(
+        max(0, int(runtime.max_sends))
+    )
     backpressure_sequence = _telegram_backpressure_sequence(store)
     observed_at = time.time()
     with state.lock_phase("sync.observe"):
@@ -13192,6 +13310,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "sent": 0,
                 "updated": 0,
                 "content_pages": 0,
+                "physical_writes": 0,
+                "work_pending": 0,
+                "failed_writes": 0,
             }
         else:
             with state.lock_phase("sync.turns"):
@@ -13371,7 +13492,8 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     outbox_result = {"enabled": runtime.with_outbox, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
     if runtime.with_outbox:
         with state.lock_phase("sync.outbox"):
-            remaining = max(3, runtime.max_sends - int(turn_counts["sent"]))
+            delivery_budget = _delivery_write_budget(runtime)
+            remaining = delivery_budget.remaining
             turn_final_result = _drain_turn_final(
                 store,
                 turns_payload,
@@ -13386,8 +13508,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                     else None
                 ),
             )
+            delivery_budget.spent += int(
+                turn_final_result.get("operations") or 0
+            )
             remaining = max(
-                0, remaining - int(turn_final_result["operations"])
+                0, delivery_budget.remaining
             )
             outbox_result = drain_outbox(
                 store,
@@ -13409,6 +13534,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 yield_barrier=yield_barrier,
                 ack_barrier_persists_state=True,
             )
+            delivery_budget.spent += int(
+                outbox_result.get("physical_writes") or 0
+            )
         changed = changed or bool(turn_final_result.get("changed")) or bool(outbox_result.get("changed"))
     telegram_backpressure = _telegram_backpressure_since(
         store, backpressure_sequence
@@ -13419,11 +13547,46 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         now=time.time(),
         escalation_seconds=config.partial_final_escalation_seconds(),
     )
+    completed_deliveries = (
+        int(turn_counts["sent"])
+        + int(submission_counts["sent"])
+        + int(turn_final_result.get("delivered") or 0)
+        + int(outbox_result.get("delivered") or 0)
+    )
+    pending_delivery_work = (
+        int(turn_counts.get("work_pending") or 0)
+        + int(submission_counts.get("work_pending") or 0)
+        + int(turn_final_result.get("failed") or 0)
+        + int(turn_final_result.get("deferred") or 0)
+    )
+    delivery_stalled = bool(
+        pending_delivery_work and completed_deliveries == 0
+    )
+    outbound_delivery_health = {
+        "ok": not delivery_stalled,
+        "status": (
+            "outbound_delivery_stalled"
+            if delivery_stalled
+            else "healthy"
+        ),
+        "pending_count": pending_delivery_work,
+        "completed_count": completed_deliveries,
+        "physical_writes": _delivery_write_budget(runtime).spent,
+    }
+    overall_ok = bool(
+        partial_final_health["ok"] and not delivery_stalled
+    )
     return {
-        "ok": partial_final_health["ok"],
+        "ok": overall_ok,
         **(
-            {"status": partial_final_health["status"]}
-            if partial_final_health["ok"] is not True
+            {
+                "status": (
+                    partial_final_health["status"]
+                    if partial_final_health["ok"] is not True
+                    else outbound_delivery_health["status"]
+                )
+            }
+            if not overall_ok
             else {}
         ),
         "changed": changed,
@@ -13454,5 +13617,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "tendwire_turn_final": turn_final_result,
         "tendwire_outbox": outbox_result,
         "telegram_backpressure": telegram_backpressure,
+        "outbound_delivery": outbound_delivery_health,
         "outbound_partial_finals": partial_final_health,
     }

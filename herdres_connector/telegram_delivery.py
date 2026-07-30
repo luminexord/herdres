@@ -818,7 +818,16 @@ def drain_outbox(
     yield_barrier: Callable[[], None] | None = None,
     ack_barrier_persists_state: bool = False,
 ) -> dict[str, Any]:
-    result = {"enabled": True, "polled": 0, "delivered": 0, "acked": 0, "failed": 0, "deferred": 0, "changed": False}
+    result = {
+        "enabled": True,
+        "polled": 0,
+        "delivered": 0,
+        "acked": 0,
+        "failed": 0,
+        "deferred": 0,
+        "physical_writes": 0,
+        "changed": False,
+    }
     if max_sends <= 0:
         return result
     if yield_barrier is not None:
@@ -858,6 +867,8 @@ def drain_outbox(
         str(item) for item in delivered_identities()
     }
     for item in items[:max_sends]:
+        if result["physical_writes"] >= max_sends:
+            break
         if yield_barrier is not None:
             yield_barrier()
         ref = str(item.get("ref") or "")
@@ -878,11 +889,15 @@ def drain_outbox(
         html = render_attention_notice(payload)
         thread_id = config.general_thread_id(store)
         sent = {"ok": True, "message_id": "0"} if dry_run else telegram.send_message(chat_id, html, thread_id=thread_id, notify=True)
+        if not dry_run:
+            result["physical_writes"] += 1
         if not dry_run and not sent.get("ok") and thread_id and _topic_missing(sent.get("error")):
             state.tombstone_dead_topic(store, str(thread_id))
-            sent = telegram.send_message(chat_id, html, notify=True)
-            if sent.get("ok"):
-                sent["fallback_reason"] = "general_thread_missing"
+            if result["physical_writes"] < max_sends:
+                sent = telegram.send_message(chat_id, html, notify=True)
+                result["physical_writes"] += 1
+                if sent.get("ok"):
+                    sent["fallback_reason"] = "general_thread_missing"
         if sent.get("ok"):
             result["delivered"] += 1
             result["changed"] = True

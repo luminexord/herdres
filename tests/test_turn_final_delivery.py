@@ -1066,7 +1066,7 @@ def _runtime(
     )
 
 
-def test_turn_final_drain_keeps_polling_when_feed_uses_send_budget(
+def test_turn_final_drain_does_not_exceed_feed_write_budget(
     monkeypatch,
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
@@ -1087,7 +1087,8 @@ def test_turn_final_drain_keeps_polling_when_feed_uses_send_budget(
 
     assert result["feed_sent"] == 1
     assert result["sent"] == 1
-    assert tendwire.poll_calls == 1
+    assert tendwire.poll_calls == 0
+    assert result["tendwire_turn_final"]["operations"] == 0
 
 
 def test_short_inline_stages_and_delivers_without_page_fetch_then_two_syncs_noop(monkeypatch):
@@ -1589,7 +1590,7 @@ class MissingEditTelegram(DeletingTelegram):
         )
 
 
-def test_not_found_edit_uses_drain_floor_to_retry_as_send_in_same_pass(monkeypatch):
+def test_not_found_edit_resumes_as_send_in_next_budgeted_pass(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
@@ -1609,15 +1610,15 @@ def test_not_found_edit_uses_drain_floor_to_retry_as_send_in_same_pass(monkeypat
     missing = sync_once(store, _runtime(tendwire, telegram, max_sends=1))
     resumed = sync_once(store, _runtime(tendwire, telegram, max_sends=1))
 
-    assert missing["tendwire_turn_final"]["operations"] == 2
-    assert missing["tendwire_turn_final"]["deferred"] == 0
-    assert missing["tendwire_turn_final"]["acked"] == 1
+    assert missing["tendwire_turn_final"]["operations"] == 1
+    assert missing["tendwire_turn_final"]["deferred"] == 1
+    assert missing["tendwire_turn_final"]["acked"] == 0
     assert missing["tendwire_turn_final"]["failed"] == 0
     assert missing["tendwire_turn_final"]["uncertain"] == 0
     assert len(telegram.sent) == sent_before + 1
     assert telegram.edit_attempts == 1
-    assert resumed["tendwire_turn_final"]["operations"] == 0
-    assert resumed["tendwire_turn_final"]["acked"] == 0
+    assert resumed["tendwire_turn_final"]["operations"] == 1
+    assert resumed["tendwire_turn_final"]["acked"] == 1
 
 
 def test_turn_final_resend_tombstones_requested_topic_after_concurrent_rebind(
@@ -2155,7 +2156,8 @@ def test_turn_final_rebind_during_ack_records_local_reconciliation(
     receipt = next(
         iter(state.tendwire_turn_jobs(persisted).values())
     )
-    assert blocked["ok"] is True
+    assert blocked["ok"] is False
+    assert blocked["status"] == "outbound_delivery_stalled"
     assert (
         blocked["tendwire_turn_final"]["status"]
         == "invalid_presentation_plan"
@@ -2769,17 +2771,15 @@ def test_rate_limit_defers_without_failure_or_uncertainty(monkeypatch):
     assert resumed["tendwire_turn_final"]["acked"] == 1
 
 
-def test_physical_budget_uses_sync_floor_and_acceptance_loss_is_explicit(monkeypatch):
+def test_physical_budget_is_exact_and_acceptance_loss_is_explicit(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
     long_text = "bounded part\n\n" * 500
     tendwire = TurnFinalTendwire(_turn_row("turn-budget", "twrev1.budget", long_text))
     telegram = DeletingTelegram()
     result = sync_once(_store(), _runtime(tendwire, telegram, max_sends=1))
-    # sync_once intentionally grants the turn-final path a three-operation
-    # floor. Canonical plain planning may need all three for one long turn.
-    assert result["tendwire_turn_final"]["operations"] == 3
-    assert result["tendwire_turn_final"]["polled"] == 3
+    assert result["tendwire_turn_final"]["operations"] == 1
+    assert result["tendwire_turn_final"]["polled"] == 1
 
     uncertain_wire = TurnFinalTendwire(_turn_row("turn-uncertain", "twrev1.uncertain", "one message"))
     uncertain_telegram = DeletingTelegram()
@@ -3667,6 +3667,7 @@ def test_partial_final_suffix_recovery_obeys_one_write_allowance_and_stays_held(
 
     assert limited["ok"] is False
     assert telegram.rich_attempts - attempts_before == 1
+    assert limited["outbound_delivery"]["physical_writes"] == 1
     assert len(set(telegram.recipient_messages) - recipient_ids_before) == 1
     content_hash = source_sync._turn_content_hash(row, "final")
     hold = state.find_partial_final_delivery(
@@ -3919,6 +3920,235 @@ def test_multiple_legacy_records_for_one_turn_remain_visible_and_resolvable():
             store, turn_id
         )
     } == {"resolved"}
+
+
+def test_every_legacy_delivery_shape_shares_one_physical_write_allowance(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+
+    class RejectRichTelegram(DeletingTelegram):
+        def api(self, method, payload):
+            if method == "sendRichMessage":
+                self.api_calls.append(
+                    (method, dict(payload), self.token)
+                )
+                raise TelegramError("Bad Request: reject rich")
+            return super().api(method, payload)
+
+    row = _turn_row(
+        "turn-one-shared-write",
+        "twrev1.one_shared_write",
+        "**formatted fallback**",
+    )
+    row.pop("content")
+    tendwire = TurnFinalTendwire(row, turn_schema_version=1)
+    telegram = RejectRichTelegram()
+    store = _store()
+
+    result = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "outbound_delivery_stalled"
+    assert result["outbound_delivery"]["physical_writes"] == 1
+    assert [
+        method
+        for method, _payload, _token in telegram.api_calls
+        if method == "sendRichMessage"
+    ] == ["sendRichMessage"]
+    assert telegram.sent == []
+    assert state.delivered_turns(store) == {}
+
+
+def test_escalated_supersession_and_working_then_final_each_obey_one_write(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+
+    store, row, tendwire, telegram, _first = _legacy_partial_case(
+        ambiguous=True
+    )
+    hold_hash = source_sync._turn_content_hash(row, "final")
+    hold = state.find_partial_final_delivery(
+        store, row["id"], hold_hash
+    )
+    assert hold is not None
+    hold["created_at"] -= (
+        config.partial_final_escalation_seconds() + 1
+    )
+    row["assistant_final_text"] = (
+        "long revised supersession\n\n" * 500
+    ) + "SUPERSESSION_TAIL"
+    attempts_before = telegram.rich_attempts
+
+    superseded = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert telegram.rich_attempts - attempts_before == 1
+    assert superseded["outbound_delivery"]["physical_writes"] == 1
+    assert superseded["ok"] is False
+
+    working = _turn_row(
+        "turn-working-budget",
+        "twrev1.working_budget",
+        None,
+    )
+    working["assistant_stream_text"] = "WORKING CARD"
+    final = _turn_row(
+        "turn-final-after-working",
+        "twrev1.final_after_working",
+        "FINAL MUST WAIT",
+    )
+    final["worker_id"] = "worker-2"
+    final["worker_fingerprint"] = "fp-2"
+    tendwire = MultiTurnFinalTendwire([working, final])
+    working.pop("content")
+    final.pop("content")
+    tendwire.turn_schema_version = 1
+    tendwire.turns = lambda: {
+        "ok": True,
+        "schema_version": 1,
+        "turns": deepcopy(tendwire.rows),
+    }
+    tendwire.turn_final_poll = lambda **_kwargs: {
+        "ok": True,
+        "schema_version": 1,
+        "items": [],
+    }
+    telegram = DeletingTelegram()
+
+    combined = sync_once(
+        _store(), _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert combined["outbound_delivery"]["physical_writes"] == 1
+    assert len(telegram.recipient_messages) == 1
+    recipient_text = next(iter(telegram.recipient_messages.values()))[
+        "content"
+    ]
+    assert "WORKING CARD" in recipient_text
+    assert "FINAL MUST WAIT" not in recipient_text
+
+
+def test_round_robin_moves_a_healthy_final_ahead_of_a_repeated_failure(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+
+    class FailOneTurnTelegram(DeletingTelegram):
+        def api(self, method, payload):
+            rich = json.loads(payload.get("rich_message") or "{}")
+            if (
+                method == "sendRichMessage"
+                and "ALWAYS FAIL" in str(rich.get("html") or "")
+            ):
+                self.api_calls.append(
+                    (method, dict(payload), self.token)
+                )
+                raise TelegramError("network timeout")
+            return super().api(method, payload)
+
+    failing = _turn_row(
+        "turn-always-fails",
+        "twrev1.always_fails",
+        "ALWAYS FAIL",
+    )
+    healthy = _turn_row(
+        "turn-healthy-behind-failure",
+        "twrev1.healthy_behind_failure",
+        "HEALTHY FINAL",
+    )
+    healthy["worker_id"] = "worker-2"
+    healthy["worker_fingerprint"] = "fp-2"
+    tendwire = MultiTurnFinalTendwire([failing, healthy])
+    failing.pop("content")
+    healthy.pop("content")
+    tendwire.turn_schema_version = 1
+    tendwire.turns = lambda: {
+        "ok": True,
+        "schema_version": 1,
+        "turns": deepcopy(tendwire.rows),
+    }
+    tendwire.turn_final_poll = lambda **_kwargs: {
+        "ok": True,
+        "schema_version": 1,
+        "items": [],
+    }
+    telegram = FailOneTurnTelegram()
+    store = _store()
+
+    first = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    second = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert first["ok"] is False
+    assert first["status"] == "outbound_delivery_stalled"
+    assert first["feed_sent"] == 0
+    assert second["feed_sent"] == 1
+    assert any(
+        "HEALTHY FINAL" in message["content"]
+        for message in telegram.recipient_messages.values()
+    )
+    failing_hash = source_sync._turn_content_hash(
+        failing, "final"
+    )
+    assert (
+        f"final:{failing['id']}:{failing_hash}"
+        not in state.delivered_turns(store)
+    )
+
+
+def test_partial_final_ledger_prunes_old_resolved_but_never_unresolved():
+    store = _store()
+    unresolved_hashes = {
+        f"held-{index}" for index in range(7)
+    }
+    records = {}
+    total = state.PARTIAL_FINAL_DELIVERY_LIMIT + 300
+    for index in range(total):
+        content_hash = (
+            f"held-{index}"
+            if index < len(unresolved_hashes)
+            else f"resolved-{index}"
+        )
+        unresolved = content_hash in unresolved_hashes
+        records[f"legacy-{index}"] = {
+            "turn_id": f"turn-{index}",
+            "content_hash": content_hash,
+            "status": "held" if unresolved else "resolved",
+            "operator_attention_required": unresolved,
+            "delivery_complete": not unresolved,
+            "created_at": float(index),
+            "resolved_at": None if unresolved else float(index),
+        }
+    store["telegram_partial_final_deliveries"] = records
+
+    normalized = state.partial_final_deliveries(store)
+
+    assert len(normalized) == state.PARTIAL_FINAL_DELIVERY_LIMIT
+    assert unresolved_hashes <= {
+        record["content_hash"] for record in normalized.values()
+    }
+    retained_resolved = [
+        record
+        for record in normalized.values()
+        if record["status"] == "resolved"
+    ]
+    assert min(record["resolved_at"] for record in retained_resolved) == (
+        total - (state.PARTIAL_FINAL_DELIVERY_LIMIT - 7)
+    )
 
 
 def test_partial_final_recovery_actions_are_distinct_and_clear_doctor_only_when_safe(
