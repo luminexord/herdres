@@ -44,7 +44,7 @@ from .telegram_delivery import (
 )
 from .tendwire_client import TendwireClient, TendwireError
 
-RENDER_VERSION = "telegram-rich-v27-multipart-margin"
+RENDER_VERSION = "telegram-rich-v28-primary-dual-bound"
 PRESENTATION_VERSION = "turn-present-v29"
 TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
@@ -3157,9 +3157,31 @@ def _record_final_delivery_success(
 ) -> None:
     turn_id = _turn_id(item)
     submission_id = str(entry.get("last_stream_submission_id") or "")
+    canonical_message_id = message_ids[0] if message_ids else ""
     for message_id in message_ids:
-        state.bind_message_to_worker(store, message_id, entry, topic_id=thread_id, kind="final", turn_id=turn_id, bot_kind=bot_kind)
-    state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
+        state.bind_message_to_worker(
+            store,
+            message_id,
+            entry,
+            topic_id=thread_id,
+            kind="final",
+            turn_id=turn_id,
+            bot_kind=bot_kind,
+        )
+        binding = state.find_message_binding(store, message_id)
+        if binding is not None:
+            binding["message_ids"] = list(message_ids)
+            binding["canonical_message_id"] = canonical_message_id
+    state.mark_delivered(
+        store,
+        identity,
+        {
+            "worker_id": entry.get("tendwire_worker_id"),
+            "turn_id": turn_id,
+            "message_ids": list(message_ids),
+            "canonical_message_id": canonical_message_id,
+        },
+    )
     _set_final_delivery(
         entry,
         turn_id=turn_id,
@@ -3263,49 +3285,89 @@ def _replace_changed_final(
     bindings = _final_delivery_bindings(
         store, _turn_id(item), topic_id=thread_id
     )
-    message_ids = [message_id for message_id, _binding in bindings if message_id]
-    if len(message_ids) != 1:
+    if not bindings:
         return False
-    telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
-    stored_bot_kind = str(bindings[-1][1].get("bot_kind") or entry.get("last_clean_bot_kind") or MANAGER_BOT_KIND)
-    if stored_bot_kind != bot_kind:
+    if any(
+        str(binding.get("bot_kind") or "")
+        not in {"", bot_kind}
+        for _message_id, binding in bindings
+    ):
         return False
     feed_item = _turn_feed_item(item, entry)
-    if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(feed_item):
+    try:
+        plans = _prepare_final_delivery_parts(feed_item)
+    except _TurnContentError:
         return False
-    operation = _capture_entry_operation(
-        store,
-        entry,
-        topic_id=thread_id,
-        message_id=message_ids[0],
-    )
-    execution = _execute_entry_operation(
-        store,
-        runtime.telegram,
-        operation,
-        _provider_mutation(
-            "telegram.edit_feed_item",
-            reason=(
-                "telegram.edit_feed_item: replace changed final card"
-            ),
-            args=(chat_id, message_ids[0], feed_item),
-            kwargs={"telegram": telegram, "api_token": api_token},
+    ordered = sorted(
+        bindings,
+        key=lambda pair: (
+            pair[1].get("part_ordinal")
+            if isinstance(pair[1].get("part_ordinal"), int)
+            else len(bindings),
+            pair[0],
         ),
     )
-    sent, resolution = execution.result, execution.resolution
-    if not sent.get("ok") or resolution.disposition != _OFFLOCK_APPLY:
+    if len(ordered) != len(plans):
         return False
-    entry = resolution.entry
-    assert entry is not None
-    edited_message_id = str(sent.get("message_id") or "").strip()
-    message_id = edited_message_id if edited_message_id and edited_message_id != "0" else message_ids[0]
+    message_ids: list[str] = []
+    current_entry = entry
+    for fallback_ordinal, (message_id, binding) in enumerate(ordered):
+        ordinal = binding.get("part_ordinal")
+        if not isinstance(ordinal, int):
+            ordinal = fallback_ordinal
+        if not 0 <= ordinal < len(plans):
+            return False
+        operation = _capture_entry_operation(
+            store,
+            current_entry,
+            topic_id=thread_id,
+            message_id=message_id,
+        )
+        execution = _execute_entry_operation(
+            store,
+            runtime.telegram,
+            operation,
+            _provider_mutation(
+                "telegram.edit_turn_delivery_part",
+                reason=(
+                    "telegram.edit_turn_delivery_part: replace "
+                    "changed final part"
+                ),
+                args=(
+                    chat_id,
+                    message_id,
+                    feed_item,
+                    plans[ordinal],
+                ),
+                kwargs={
+                    "telegram": _telegram_state(store),
+                    "api_token": api_token,
+                },
+            ),
+        )
+        sent, resolution = execution.result, execution.resolution
+        if (
+            not sent.get("ok")
+            or resolution.disposition != _OFFLOCK_APPLY
+        ):
+            return False
+        current_entry = resolution.entry
+        assert current_entry is not None
+        edited_message_id = str(
+            sent.get("message_id") or ""
+        ).strip()
+        message_ids.append(
+            edited_message_id
+            if edited_message_id and edited_message_id != "0"
+            else message_id
+        )
     _record_final_delivery_success(
         store,
         item,
-        entry,
+        current_entry,
         thread_id=thread_id,
-        message_ids=[message_id],
+        message_ids=message_ids,
         content_hash=content_hash,
         identity=identity,
         bot_kind=bot_kind,
@@ -3347,8 +3409,9 @@ def _fold_superseded_final(
     collapse_response=True so only the newest answer stays expanded. Runs in the historical-final
     branch of _sync_turns, which sees every non-latest completed final WITH its content each sync (the
     store retains a short per-worker turn history) — a self-healing sweep, no extra text persisted.
-    Idempotent via binding["folded"]; bounded by _FOLD_ATTEMPT_CAP; single-message finals only (a
-    split final has no single message to re-render). Never touches the latest delivery."""
+    Idempotent per physical binding via binding["folded"] and bounded by
+    _FOLD_ATTEMPT_CAP. Multipart finals are folded part-by-part so no stale
+    sibling remains expanded. Never touches the latest delivery."""
     if runtime.dry_run or not config.response_collapse_previous_default():
         return False
     if fold_state is not None and fold_state.get("issued", 0) >= _FOLD_PASS_CAP:
@@ -3356,92 +3419,133 @@ def _fold_superseded_final(
     if not str(item.get("assistant_final_text") or "").strip():
         return False
     bindings = _final_delivery_bindings(store, _turn_id(item))
-    if len(bindings) != 1:
+    if not bindings:
         return False
-    message_id, binding = bindings[0]
-    if (
-        not message_id
-        or binding.get("folded")
-        or binding.get("fold_unavailable")
-        or int(binding.get("fold_attempts") or 0) >= _FOLD_ATTEMPT_CAP
-    ):
-        return False
-    if str(message_id) == str(entry.get("last_clean_message_id") or ""):
-        return False  # belt-and-braces: never fold the latest delivered message
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
-    # Only fold when the binding ITSELF records which bot sent the message. Guessing from
-    # last_clean_bot_kind describes the LATEST delivery's bot, not this old message's — a wrong-bot
-    # edit 404s and would falsely mark the fold done.
-    stored_bot_kind = str(binding.get("bot_kind") or "")
-    if not stored_bot_kind or stored_bot_kind != bot_kind:
-        return False
     folded_item = dict(_turn_feed_item(item, entry))
     folded_item["collapse_response"] = True
-    # Same oversize/split guards as _replace_changed_final: never let a cosmetic fold degrade a rich
-    # message through the too-large -> legacy-plain fallback.
-    if len(render_feed_item_html(folded_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(folded_item):
-        return False
-    if fold_state is not None:
-        fold_state["issued"] = fold_state.get("issued", 0) + 1
-    operation = _capture_entry_operation(
-        store,
-        entry,
-        topic_id=str(entry.get("topic_id") or ""),
-        message_id=message_id,
-    )
     try:
-        execution = _execute_entry_operation(
-            store,
-            runtime.telegram,
-            operation,
-            _provider_mutation(
-                "telegram.edit_feed_item",
-                reason=(
-                    "telegram.edit_feed_item: fold superseded final card"
-                ),
-                args=(chat_id, message_id, folded_item),
-                kwargs={"telegram": telegram, "api_token": api_token},
-            ),
+        plans = _prepare_final_delivery_parts(folded_item)
+    except _TurnContentError:
+        return False
+    ordered = sorted(
+        bindings,
+        key=lambda pair: (
+            pair[1].get("part_ordinal")
+            if isinstance(pair[1].get("part_ordinal"), int)
+            else len(bindings),
+            pair[0],
+        ),
+    )
+    if len(ordered) != len(plans):
+        return False
+    attempted = False
+    for fallback_ordinal, (message_id, binding) in enumerate(ordered):
+        if (
+            not message_id
+            or binding.get("folded")
+            or binding.get("fold_unavailable")
+            or int(binding.get("fold_attempts") or 0)
+            >= _FOLD_ATTEMPT_CAP
+        ):
+            continue
+        if (
+            fold_state is not None
+            and fold_state.get("issued", 0) >= _FOLD_PASS_CAP
+        ):
+            break
+        if str(message_id) == str(
+            entry.get("last_clean_message_id") or ""
+        ):
+            continue
+        # The binding itself owns the bot identity. The latest entry's bot can
+        # describe another delivery and must not authorize this historical edit.
+        stored_bot_kind = str(binding.get("bot_kind") or "")
+        if not stored_bot_kind or stored_bot_kind != bot_kind:
+            continue
+        ordinal = binding.get("part_ordinal")
+        if not isinstance(ordinal, int):
+            ordinal = fallback_ordinal
+        if not 0 <= ordinal < len(plans):
+            continue
+        remaining = (
+            _FOLD_PASS_CAP - fold_state.get("issued", 0)
+            if fold_state is not None
+            else _FOLD_PASS_CAP
         )
-    except Exception as exc:  # a rate-limit/transport blip must not abort the sync pass
-        print(f"herdres fold edit failed: {exc}", file=sys.stderr)
-        _compare_and_apply_entry_operation(store, operation)
-        current_binding = state.find_message_binding(store, message_id)
-        if current_binding is not None:
-            current_binding["fold_attempts"] = (
-                int(current_binding.get("fold_attempts") or 0) + 1
+        operation = _capture_entry_operation(
+            store,
+            entry,
+            topic_id=str(binding.get("topic_id") or ""),
+            message_id=message_id,
+        )
+        try:
+            execution = _execute_entry_operation(
+                store,
+                runtime.telegram,
+                operation,
+                _provider_mutation(
+                    "telegram.edit_turn_delivery_part",
+                    reason=(
+                        "telegram.edit_turn_delivery_part: fold "
+                        "superseded final part"
+                    ),
+                    args=(
+                        chat_id,
+                        message_id,
+                        folded_item,
+                        plans[ordinal],
+                    ),
+                    kwargs={
+                        "telegram": telegram,
+                        "api_token": api_token,
+                        "allow_plain_fallback": remaining > 1,
+                    },
+                ),
             )
-        return True
-    sent = execution.result
-    # Folding is an exact-message cosmetic fact, not routing state. Apply it
-    # to the exact binding even when the pane owner moved during the edit.
-    binding = state.find_message_binding(store, message_id) or binding
-    error = str(sent.get("error") or "").lower()
-    if sent.get("ok") and sent.get("collapse_applied") is True:
-        # This is the only path allowed to claim the message was folded: the
-        # exact expandable-HTML edit was accepted (including Telegram's
-        # already-identical "not modified" success). Readable fallback formats
-        # are not collapsed and therefore cannot set this marker.
-        binding["folded"] = True
-        return True
-    if sent.get("ok"):
-        binding["fold_attempts"] = int(
-            binding.get("fold_attempts") or 0
-        ) + 1
-        return True
-    if (
-        _message_missing(sent.get("error"))
-        or _topic_missing(sent.get("error"))
-        or "not found" in error
-    ):
-        # Edits carry only a message id. They cannot prove which historical
-        # topic is gone, so a cosmetic fold must never tombstone any topic or
-        # falsely claim that the unavailable message was folded.
-        binding["fold_unavailable"] = True
-        return True
-    binding["fold_attempts"] = int(binding.get("fold_attempts") or 0) + 1
-    return True
+        except Exception as exc:  # a provider blip must not abort the pass
+            print(f"herdres fold edit failed: {exc}", file=sys.stderr)
+            _compare_and_apply_entry_operation(store, operation)
+            current = state.find_message_binding(store, message_id)
+            if current is not None:
+                current["fold_attempts"] = (
+                    int(current.get("fold_attempts") or 0) + 1
+                )
+            if fold_state is not None:
+                fold_state["issued"] = (
+                    fold_state.get("issued", 0) + 1
+                )
+            attempted = True
+            continue
+        sent = execution.result
+        writes = _telegram_physical_writes(sent)
+        if fold_state is not None:
+            fold_state["issued"] = (
+                fold_state.get("issued", 0) + writes
+            )
+        attempted = True
+        binding = state.find_message_binding(store, message_id) or binding
+        error = str(sent.get("error") or "").lower()
+        if sent.get("ok") and sent.get("collapse_applied") is True:
+            binding["folded"] = True
+            continue
+        if sent.get("ok"):
+            binding["fold_attempts"] = (
+                int(binding.get("fold_attempts") or 0) + 1
+            )
+            continue
+        if (
+            _message_missing(sent.get("error"))
+            or _topic_missing(sent.get("error"))
+            or "not found" in error
+        ):
+            binding["fold_unavailable"] = True
+            continue
+        binding["fold_attempts"] = (
+            int(binding.get("fold_attempts") or 0) + 1
+        )
+    return attempted
 
 def _ensure_topic(
     store: dict[str, Any],
@@ -8113,6 +8217,10 @@ def _maybe_complete_turn_plan(
     message_ids = [
         message_id for _ordinal, message_id, _binding in bindings
     ]
+    canonical_message_id = message_ids[0]
+    for _ordinal, _message_id, binding in bindings:
+        binding["message_ids"] = list(message_ids)
+        binding["canonical_message_id"] = canonical_message_id
     bot_kind = str(
         bindings[0][2].get("bot_kind") or MANAGER_BOT_KIND
     )
@@ -8124,6 +8232,8 @@ def _maybe_complete_turn_plan(
             "worker_id": entry.get("tendwire_worker_id"),
             "turn_id": _turn_id(item),
             "content_revision": revision,
+            "message_ids": list(message_ids),
+            "canonical_message_id": canonical_message_id,
         },
     )
     _set_final_delivery(
@@ -8485,6 +8595,21 @@ def _telegram_result_is_transient(result: dict[str, Any]) -> bool:
         return True
     error = str(result.get("error") or "").lower()
     return any(marker in error for marker in ("rate limit", "too many requests", "retry after"))
+
+
+def _telegram_physical_writes(
+    result: dict[str, Any],
+    *,
+    default: int = 1,
+) -> int:
+    raw = result.get("physical_writes")
+    if (
+        isinstance(raw, int)
+        and not isinstance(raw, bool)
+        and raw >= 0
+    ):
+        return raw
+    return default
 
 
 def _telegram_result_retry_after(
@@ -8897,11 +9022,15 @@ def _drain_post_ack_reconciliations(
                         "thread_id": current_topic,
                         "notify": False,
                         "api_token": token,
+                        "allow_plain_fallback": (
+                            result["operations"] + 1
+                            < max_operations
+                        ),
                     },
                 ),
             )
-            result["operations"] += 1
             sent = execution.result
+            result["operations"] += _telegram_physical_writes(sent)
             if not sent.get("ok"):
                 return
             new_message_id = str(sent.get("message_id") or "")
@@ -8920,6 +9049,7 @@ def _drain_post_ack_reconciliations(
                 part_ordinal=ordinal,
                 part_count=int(obligation.get("part_count") or len(plans)),
                 tendwire_job_key=job_key,
+                delivery_format=str(sent.get("format") or ""),
             )
             if current_message_id:
                 stale.append(
@@ -10083,6 +10213,10 @@ def _drain_turn_final(
                             kwargs={
                                 "telegram": _telegram_state(store),
                                 "api_token": desired_token,
+                                "allow_plain_fallback": (
+                                    result["operations"]
+                                    < max_operations
+                                ),
                             },
                         ),
                     )
@@ -10102,6 +10236,10 @@ def _drain_turn_final(
                                 "thread_id": attempted_topic_id,
                                 "notify": False,
                                 "api_token": desired_token,
+                                "allow_plain_fallback": (
+                                    result["operations"]
+                                    < max_operations
+                                ),
                             },
                         ),
                     )
@@ -10126,9 +10264,23 @@ def _drain_turn_final(
                 )
                 break
             applied = execution.result
+            result["operations"] += max(
+                0, _telegram_physical_writes(applied) - 1
+            )
             delivery_resolution = execution.resolution
             if not applied.get("ok"):
                 kind = str(applied.get("kind") or "")
+                if kind == "operation_budget_exhausted":
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "operation_budget_exhausted",
+                        result,
+                        store,
+                        job_key,
+                        delay_seconds=1,
+                    )
+                    break
                 if _telegram_result_is_transient(applied):
                     _defer_turn_final(
                         runtime,
@@ -10222,6 +10374,10 @@ def _drain_turn_final(
                                     "thread_id": attempted_topic_id,
                                     "notify": False,
                                     "api_token": desired_token,
+                                    "allow_plain_fallback": (
+                                        result["operations"]
+                                        < max_operations
+                                    ),
                                 },
                             ),
                         )
@@ -10247,6 +10403,9 @@ def _drain_turn_final(
                         )
                         break
                     applied = execution.result
+                    result["operations"] += max(
+                        0, _telegram_physical_writes(applied) - 1
+                    )
                     delivery_resolution = execution.resolution
                 if not applied.get("ok"):
                     if _repair_provider_gone_topic(
@@ -10328,6 +10487,7 @@ def _drain_turn_final(
                 part_ordinal=ordinal,
                 part_count=part_count,
                 tendwire_job_key=job_key,
+                delivery_format=str(applied.get("format") or ""),
             )
             if delivery_resolution.disposition != _OFFLOCK_APPLY:
                 state.reconcile_tendwire_turn_job_route(

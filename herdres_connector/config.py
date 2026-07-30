@@ -506,6 +506,11 @@ def managed_bot_token(kind: str, env: Any | None = None) -> str:
 
 def rich_messages_enabled(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
+    force_plain = str(
+        source.get("HERDRES_FORCE_PLAIN_DELIVERY", "0") or ""
+    ).strip().lower()
+    if force_plain in {"1", "true", "yes", "on"}:
+        return False
     value = str(source.get("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1") or "").strip().lower()
     return value not in {"0", "false", "no", "off"}
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from html.parser import HTMLParser
 
 import pytest
@@ -15,6 +16,13 @@ from herdres_connector.rich_delivery import (
     send_rich_message,
 )
 from herdres_connector.telegram_delivery import TelegramClient, TelegramError
+
+
+@pytest.fixture(autouse=True)
+def _plain_fallback_by_default(monkeypatch):
+    """#213's focused assertions exercise the emergency plain path."""
+
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
 
 
 class FakeTelegram:
@@ -158,6 +166,205 @@ class RecipientTelegram(TelegramClient):
                 "message_id": message_id,
             },
         }
+
+
+class _RichCardRecipientParser(HTMLParser):
+    """Small read-back model for the rich block types the owner consumes."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text: list[str] = []
+        self.tags: list[str] = []
+        self.table_rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag, _attrs):
+        self.tags.append(tag)
+        if tag == "tr":
+            self._row = []
+        elif tag in {"th", "td"} and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag):
+        if tag in {"th", "td"} and self._row is not None:
+            self._row.append("".join(self._cell or []))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self.table_rows.append(self._row)
+            self._row = None
+
+    def handle_data(self, data):
+        self.text.append(data)
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+class RichCardRecipientTelegram(RecipientTelegram):
+    """Recipient read-back model for sendRichMessage plus plain fallback."""
+
+    def __init__(
+        self,
+        *,
+        reject_rich_at: int | None = None,
+        rich_error: str = "network timeout",
+    ):
+        super().__init__()
+        object.__setattr__(self, "reject_rich_at", reject_rich_at)
+        object.__setattr__(self, "rich_error", rich_error)
+        object.__setattr__(self, "rich_attempts", 0)
+
+    def api(self, method, payload):
+        if method not in {"sendRichMessage", "editMessageText"} or (
+            method == "editMessageText"
+            and "rich_message" not in payload
+        ):
+            return super().api(method, payload)
+        self.rich_attempts += 1
+        self.attempts.append(
+            {"method": method, "rich_message": payload["rich_message"]}
+        )
+        if self.reject_rich_at == self.rich_attempts:
+            raise TelegramError(self.rich_error)
+        rich = json.loads(payload["rich_message"])
+        parser = _RichCardRecipientParser()
+        parser.feed(str(rich.get("html") or ""))
+        parser.close()
+        received = {
+            "format": "rich",
+            "text": "".join(parser.text),
+            "blocks": list(parser.tags),
+            "table_rows": parser.table_rows,
+        }
+        if method == "editMessageText":
+            message_id = str(payload.get("message_id") or "")
+            self.recipient_edits.append(received)
+        else:
+            message_id = str(len(self.recipient_messages) + 1)
+            self.recipient_messages.append(received)
+        return {
+            "ok": True,
+            "result": {"message_id": message_id},
+        }
+
+
+def test_rich_primary_arrives_as_titled_card_with_table(monkeypatch):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+    client = RichCardRecipientTelegram()
+
+    result = send_feed_item(
+        client,
+        "-100",
+        {
+            "kind": "turn",
+            "user_text": "Inspect this table",
+            "worklog_text": "Checked the source",
+            "assistant_final_text": (
+                "| Name | Status |\n"
+                "| --- | --- |\n"
+                "| Ada | Ready |"
+            ),
+        },
+        telegram={},
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "rich"
+    assert result["physical_writes"] == 1
+    assert [attempt["method"] for attempt in client.attempts] == [
+        "sendRichMessage"
+    ]
+    received = client.recipient_messages[0]
+    assert received["format"] == "rich"
+    assert {"details", "summary", "table", "tr", "th", "td"} <= set(
+        received["blocks"]
+    )
+    assert all(
+        title in received["text"]
+        for title in ("Response", "You", "Working")
+    )
+    assert received["table_rows"] == [
+        ["Name", "Status"],
+        ["Ada", "Ready"],
+    ]
+
+
+def test_rich_rejection_falls_back_to_readable_formatted_plain(monkeypatch):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+    client = RichCardRecipientTelegram(
+        reject_rich_at=1,
+        rich_error="Bad Request: rich message rejected",
+    )
+
+    result = send_feed_item(
+        client,
+        "-100",
+        {
+            "kind": "turn",
+            "assistant_final_text": (
+                "**Readable** `fallback()` "
+                "[reference](https://example.test/fallback)"
+            ),
+        },
+        telegram={},
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    assert result["fallback_reason"] == "bad_request"
+    assert result["physical_writes"] == 2
+    assert [attempt["method"] for attempt in client.attempts] == [
+        "sendRichMessage",
+        "sendMessage",
+    ]
+    received = client.recipient_messages[0]
+    assert received["text"].startswith("✅ Response")
+    assert {"Bold", "Code", "TextUrl"} <= {
+        entity["type"] for entity in received["entities"]
+    }
+
+
+def test_force_plain_switch_skips_rich_primary(monkeypatch):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
+    client = RichCardRecipientTelegram()
+
+    result = send_feed_item(
+        client,
+        "-100",
+        {"kind": "turn", "assistant_final_text": "**Plain override**"},
+        telegram={},
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert result["format"] == "html"
+    assert all(
+        attempt["method"] != "sendRichMessage"
+        for attempt in client.attempts
+    )
+
+
+def test_failed_later_rich_part_keeps_honest_accepted_prefix(monkeypatch):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+    client = RichCardRecipientTelegram(reject_rich_at=2)
+    text = "first paragraph\n\n" * 500
+
+    result = send_feed_item(
+        client,
+        "-100",
+        {"kind": "turn", "assistant_final_text": text},
+        telegram={},
+        thread_id="77",
+    )
+
+    assert result["ok"] is True
+    assert result["partial"] is True
+    assert result["message_ids"] == ["1"]
+    assert result["canonical_message_id"] == "1"
+    assert result["failed_part_index"] == 1
+    assert len(client.recipient_messages) == 1
 
 
 def test_canonical_send_preserves_recipient_formatting_entities():

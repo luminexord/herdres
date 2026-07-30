@@ -352,16 +352,13 @@ old-slot retirement, then ACKed to Tendwire and checkpointed as
 `acknowledged`. The stable job key, not a transient lease ref, is restart
 identity.
 
-Rich-message plans retain Telegram's current 32,768-character text ceiling and
-500-block ceiling for complete single-card messages. Once multipart delivery is
-required, source chunks default to 24,000 characters and each rendered card is
-also held below a 28 KiB UTF-8 operational ceiling. This margin avoids
-provider-accepted boundary messages that some Telegram clients fail to display,
-without returning to small 4K-era chunks. Ordinary `sendMessage` fallback plans
-retain their separate 4,096-safe bound; a rich plan is never silently truncated
-into that smaller transport. The presentation version binds the selected
-transport and ranges so an older boundary-sized plan cannot be replayed as the
-current layout.
+Rich cards are the primary transport, but the durable ranges use the stricter
+formatted-plain bound as well as Telegram's rich limits. That dual bound lets a
+definite `sendRichMessage` rejection fall back to `sendMessage` without
+changing part coordinates or truncating content. Each physical message id is
+bound into the same lifecycle group; `last_clean_message_id` is the canonical
+reply id and `last_clean_message_ids` is the complete ordered set used by
+revision, deletion, and collapse.
 
 `HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` bounds recovery after a connector
 poll response is lost. It defaults to 60 seconds; unset, empty, or invalid
@@ -586,8 +583,24 @@ permanently abandoned after three attempts; Telegram 429 responses persist
 their requested backoff. Changing from `close` to `delete` also deletes
 already-auto-closed dormant or retired topics once they are TTL-eligible.
 
-Rich Telegram messages are enabled by default. Final responses render as open
-rich content; working updates render as compact editable updates.
+Rich Telegram messages are enabled by default and are attempted first. Final
+responses render as open rich content; working updates render as compact
+editable updates. A definite rich rejection falls back to the existing
+formatted `sendMessage` ladder. Transient or ambiguous rich failures do not
+blindly resend because Telegram has no receiver-side idempotency key.
+
+Set `HERDRES_FORCE_PLAIN_DELIVERY=1` to bypass rich delivery immediately for a
+client that cannot render cards. `HERDR_TELEGRAM_TOPICS_RICH_MESSAGES=0` remains
+the capability-level disable switch.
+
+Bot API acceptance cannot prove recipient rendering. The operational read-back
+probe uses an owner-authorized Telethon session to fetch the delivered message
+and inspect both `message.rich_message.blocks` and `message.message` (or
+`raw_text`). Rich cards normally have blocks while the ordinary text field is
+empty; that empty field alone does not mean the card is blank. Confirm the card
+visually in the owner's client, and use the force-plain switch if the client
+does not render those blocks. Never put the owner's session credentials in
+Herdres state or repository configuration.
 
 Optional per-agent bot identities are configured with generic private tokens:
 

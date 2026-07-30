@@ -30,7 +30,10 @@ from .telegram_delivery import (
     DELIVERY_FORMAT_STATE_UPDATE_KEY,
     MESSAGE_TEXT_LIMIT,
     SPLIT_TEXT_LIMIT,
+    RateLimited,
     TelegramClient,
+    TelegramError,
+    classify_telegram_error,
 )
 
 
@@ -64,7 +67,7 @@ WORKING_LABEL = "Working"
 YOU_ICON = "💬"
 WORKING_ICON = "⚙️"
 RESPONSE_ICON = "✅"
-RICH_RENDER_VERSION = 27
+RICH_RENDER_VERSION = 28
 RICH_BAD_REQUEST_LIMIT = 3
 RICH_STATE_UPDATE_KEY = "_herdres_rich_state_update"
 
@@ -818,10 +821,9 @@ def prepare_turn_delivery_parts(
 ) -> list[dict[str, Any]]:
     """Plan deterministic exact spans for bounded one-operation Telegram parts.
 
-    Production is plain-only while the paired rich-message lifecycle is
-    deferred to #207. ``rich_transport=True`` deliberately remains an isolated
-    planning surface for that follow-up and its tests; production callers must
-    not select it from Telegram capability state.
+    Production plans to the stricter plain bound even though rich is attempted
+    first. That makes a provider rejection degradable without changing the
+    durable part coordinates or inventing a second lifecycle.
     """
     if live or str(item.get("kind") or "").lower() != "turn":
         return []
@@ -846,8 +848,8 @@ def prepare_turn_delivery_parts(
     ):
         return [full_part]
 
-    # Plain is the canonical delivery, so every deterministic part must fit one
-    # sendMessage.
+    # Every deterministic part must fit the plain fallback as well as the rich
+    # primary transport.
     source_limit = TURN_DELIVERY_PLAIN_SOURCE_CHARS
     user_limit = max(1, source_limit)
     final_limit = max(1, source_limit)
@@ -941,9 +943,64 @@ def rich_message_send_enabled(telegram: dict[str, Any] | None) -> bool:
     return isinstance(telegram, dict) and rich_enabled(telegram)
 
 
+def _with_rich_state_update(
+    result: dict[str, Any],
+    transition: str,
+    *,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Attach a pure provider fact for guarded post-reload application."""
+
+    result[RICH_STATE_UPDATE_KEY] = {
+        "transition": transition,
+        "reason": sanitize_text(reason, 300),
+    }
+    return result
+
+
 def _client_for_token(client: TelegramClient, api_token: str | None) -> TelegramClient:
     token = str(api_token or "").strip()
     return client.with_token(token) if token else client
+
+
+def _telegram_message_id(response: dict[str, Any]) -> str:
+    result = (
+        response.get("result")
+        if isinstance(response.get("result"), dict)
+        else {}
+    )
+    message_id = str(result.get("message_id") or "").strip()
+    return "" if message_id == "0" else message_id
+
+
+def _physical_writes(result: dict[str, Any], *, default: int = 1) -> int:
+    raw = result.get("physical_writes")
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    return default
+
+
+def _with_delivery_identity(result: dict[str, Any]) -> dict[str, Any]:
+    ids = split_legacy_message_ids(result)
+    if ids:
+        result.setdefault("message_ids", ids)
+        result.setdefault("canonical_message_id", ids[0])
+    return result
+
+
+def _rich_failure(
+    kind: str,
+    error: Exception,
+    *,
+    physical_writes: int = 1,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "format": "rich",
+        "kind": kind,
+        "error": sanitize_text(str(error), 300),
+        "physical_writes": physical_writes,
+    }
 
 
 def _readable_telegram_html(html_text: str, fallback_text: str) -> str:
@@ -982,13 +1039,13 @@ def _fallback_send(
                 "kind": "presentation_transport_changed",
                 "error": "presentation transport changed",
             }
-    return client.send_message(
+    return _with_delivery_identity(client.send_message(
         chat_id,
         fallback,
         thread_id=thread_id,
         notify=notify,
         reply_to_message_id=reply_to_message_id,
-    )
+    ))
 
 
 def send_rich_message(
@@ -1003,6 +1060,7 @@ def send_rich_message(
     reply_to_message_id: str | int | None = None,
     api_token: str | None = None,
     require_single_operation: bool = False,
+    allow_plain_fallback: bool = True,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
     fallback = _readable_telegram_html(html_text, fallback_text)
@@ -1014,20 +1072,109 @@ def send_rich_message(
             "error": "readable Telegram text is empty",
         }
 
-    # sendMessage is the sole human-readable delivery. Telegram accepts
-    # text/caption fields on sendRichMessage but silently discards them. A
-    # separate rich twin needs a paired lifecycle and operation budget, so it
-    # is deliberately deferred to the follow-up design rather than emitted
-    # from this single-message delivery path.
-    return _fallback_send(
-        target,
-        chat_id,
-        fallback,
-        thread_id=thread_id,
-        notify=notify,
-        reply_to_message_id=reply_to_message_id,
-        require_single_operation=require_single_operation,
+    if not rich_message_send_enabled(telegram):
+        return _fallback_send(
+            target,
+            chat_id,
+            fallback,
+            thread_id=thread_id,
+            notify=notify,
+            reply_to_message_id=reply_to_message_id,
+            require_single_operation=require_single_operation,
+        )
+    if len(html_text) > MAX_RICH_HTML_CHARS:
+        result = _fallback_send(
+            target,
+            chat_id,
+            fallback,
+            thread_id=thread_id,
+            notify=notify,
+            reply_to_message_id=reply_to_message_id,
+            require_single_operation=require_single_operation,
+        )
+        result["fallback_reason"] = "rich_too_large"
+        return result
+
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "disable_notification": "false" if notify else "true",
+        "rich_message": json.dumps(
+            {
+                "html": sanitize_text(html_text, MAX_RICH_HTML_CHARS),
+                "skip_entity_detection": True,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ),
+    }
+    if thread_id:
+        payload["message_thread_id"] = str(thread_id)
+    if reply_to_message_id:
+        payload["reply_parameters"] = json.dumps(
+            {"message_id": int(reply_to_message_id)},
+            separators=(",", ":"),
+        )
+    try:
+        response = target.api("sendRichMessage", payload)
+    except RateLimited:
+        raise
+    except TelegramError as exc:
+        kind = classify_telegram_error(exc)
+        if kind == "transient" or (api_token and kind == "bot_access"):
+            return _rich_failure(kind, exc)
+        state_transition = (
+            "disabled" if kind == "capability" else "bad_request"
+            if kind == "bad_request" else ""
+        )
+        if not allow_plain_fallback:
+            result = _rich_failure(
+                "operation_budget_exhausted",
+                RuntimeError(
+                    "rich delivery was rejected but the plain fallback "
+                    "would exceed the physical-write budget"
+                ),
+            )
+            if state_transition:
+                _with_rich_state_update(
+                    result, state_transition, reason=str(exc)
+                )
+            return result
+        fallback_result = _fallback_send(
+            target,
+            chat_id,
+            fallback,
+            thread_id=thread_id,
+            notify=notify,
+            reply_to_message_id=reply_to_message_id,
+            require_single_operation=require_single_operation,
+        )
+        fallback_result["physical_writes"] = (
+            1 + _physical_writes(fallback_result)
+        )
+        fallback_result["fallback_reason"] = kind
+        if state_transition:
+            _with_rich_state_update(
+                fallback_result, state_transition, reason=str(exc)
+            )
+        return fallback_result
+    message_id = _telegram_message_id(response)
+    result = _with_delivery_identity(
+        {
+            "ok": bool(message_id),
+            "format": "rich",
+            "message_id": message_id,
+            "physical_writes": 1,
+        }
     )
+    if not message_id:
+        result.update(
+            {
+                "kind": "delivery_unknown",
+                "error": "sendRichMessage returned no message id",
+            }
+        )
+        return result
+    return _with_rich_state_update(result, "supported")
 
 
 def edit_rich_message(
@@ -1041,6 +1188,7 @@ def edit_rich_message(
     api_token: str | None = None,
     require_single_operation: bool = False,
     preserve_plain_html: bool = False,
+    allow_plain_fallback: bool = True,
 ) -> dict[str, Any]:
     target = _client_for_token(client, api_token)
     # Collapse edits use the same allowlist boundary as canonical sends:
@@ -1065,16 +1213,103 @@ def edit_rich_message(
             "kind": "presentation_transport_changed",
             "error": "presentation transport changed",
         }
-    # An edit has only one durable message identity. Keep that identity
-    # readable instead of converting it back into a rich-only blank bubble.
-    result = target.edit_message(chat_id, message_id, fallback)
+    if not rich_message_send_enabled(telegram) or len(html_text) > MAX_RICH_HTML_CHARS:
+        result = target.edit_message(chat_id, message_id, fallback)
+        if len(html_text) > MAX_RICH_HTML_CHARS:
+            result["fallback_reason"] = "rich_too_large"
+    else:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": str(message_id),
+            "rich_message": json.dumps(
+                {
+                    "html": sanitize_text(
+                        html_text, MAX_RICH_HTML_CHARS
+                    ),
+                    "skip_entity_detection": True,
+                },
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+        }
+        try:
+            response = target.api("editMessageText", payload)
+        except RateLimited:
+            raise
+        except TelegramError as exc:
+            kind = classify_telegram_error(exc)
+            if kind == "transient":
+                return _rich_failure(kind, exc)
+            if kind == "not_modified":
+                result = _with_rich_state_update(
+                    {
+                        "ok": True,
+                        "format": "rich",
+                        "kind": kind,
+                        "message_id": str(message_id),
+                        "physical_writes": 1,
+                    },
+                    "supported",
+                )
+            elif kind in {"not_found", "topic_not_found"}:
+                return {
+                    "ok": False,
+                    "format": "rich",
+                    "kind": kind,
+                    "not_found": kind == "not_found",
+                    "topic_missing": kind == "topic_not_found",
+                    "error": str(exc),
+                    "physical_writes": 1,
+                }
+            else:
+                transition = (
+                    "disabled" if kind == "capability" else "bad_request"
+                    if kind == "bad_request" else ""
+                )
+                if not allow_plain_fallback:
+                    result = _rich_failure(
+                        "operation_budget_exhausted",
+                        RuntimeError(
+                            "rich edit was rejected but the plain fallback "
+                            "would exceed the physical-write budget"
+                        ),
+                    )
+                    if transition:
+                        _with_rich_state_update(
+                            result, transition, reason=str(exc)
+                        )
+                    return result
+                result = target.edit_message(
+                    chat_id, message_id, fallback
+                )
+                result["physical_writes"] = (
+                    1 + _physical_writes(result)
+                )
+                result["fallback_reason"] = kind
+                if transition:
+                    _with_rich_state_update(
+                        result, transition, reason=str(exc)
+                    )
+        else:
+            result = _with_rich_state_update(
+                {
+                    "ok": True,
+                    "format": "rich",
+                    "kind": "edited",
+                    "message_id": _telegram_message_id(response)
+                    or str(message_id),
+                    "physical_writes": 1,
+                },
+                "supported",
+            )
     if preserve_plain_html:
         # TelegramClient reports ``html-no-expandable`` or ``plain`` when it
         # had to shed the expandable blockquote. Those are readable edits, but
         # they are not folds and must never authorize binding["folded"].
         result["collapse_applied"] = bool(
             result.get("ok")
-            and str(result.get("format") or "html") == "html"
+            and str(result.get("format") or "html")
+            in {"html", "rich"}
         )
     return result
 
@@ -1090,6 +1325,7 @@ def send_turn_delivery_part(
     notify: bool = False,
     reply_to_message_id: str | int | None = None,
     api_token: str | None = None,
+    allow_plain_fallback: bool = True,
 ) -> dict[str, Any]:
     """Execute one planned upsert as at most one Telegram message."""
     if not _turn_delivery_part_is_bounded(
@@ -1110,6 +1346,7 @@ def send_turn_delivery_part(
         reply_to_message_id=reply_to_message_id,
         api_token=api_token,
         require_single_operation=True,
+        allow_plain_fallback=allow_plain_fallback,
     )
 
 
@@ -1122,6 +1359,7 @@ def edit_turn_delivery_part(
     *,
     telegram: dict[str, Any] | None,
     api_token: str | None = None,
+    allow_plain_fallback: bool = True,
 ) -> dict[str, Any]:
     """Execute one planned edit without consulting or rendering sibling parts."""
     if not _turn_delivery_part_is_bounded(
@@ -1140,6 +1378,8 @@ def edit_turn_delivery_part(
         fallback_text=html_to_plain(html_text, limit=RICH_FALLBACK_MAX_CHARS),
         api_token=api_token,
         require_single_operation=True,
+        allow_plain_fallback=allow_plain_fallback,
+        preserve_plain_html=bool(item.get("collapse_response")),
     )
 
 
@@ -1170,7 +1410,9 @@ def send_feed_item(
         )
     message_ids: list[str] = []
     formats: list[str] = []
+    physical_writes = 0
     format_state_updates: list[dict[str, Any]] = []
+    rich_state_update: dict[str, Any] | None = None
     last_result: dict[str, Any] = {}
     for index, html_part in enumerate(html_parts):
         result = send_rich_message(
@@ -1185,8 +1427,28 @@ def send_feed_item(
             api_token=api_token,
         )
         last_result = result
+        physical_writes += _physical_writes(result)
         if not result.get("ok"):
-            result["partial_message_ids"] = message_ids
+            if message_ids:
+                # A multipart logical delivery is honest about the accepted
+                # prefix. The owner has those messages, so this remains a
+                # successful partial delivery and claims no failed id.
+                result.update(
+                    {
+                        "ok": True,
+                        "partial": True,
+                        "format": "rich-partial",
+                        "formats": formats,
+                        "message_id": message_ids[0],
+                        "message_ids": message_ids,
+                        "canonical_message_id": message_ids[0],
+                        "failed_part_index": index,
+                        "physical_writes": physical_writes,
+                    }
+                )
+            else:
+                result["partial_message_ids"] = []
+                result["physical_writes"] = physical_writes
             if format_state_updates:
                 result[DELIVERY_FORMAT_STATE_UPDATE_KEY] = (
                     format_state_updates
@@ -1197,15 +1459,22 @@ def send_feed_item(
         update = result.get(DELIVERY_FORMAT_STATE_UPDATE_KEY)
         if isinstance(update, dict):
             format_state_updates.append(update)
+        update = result.get(RICH_STATE_UPDATE_KEY)
+        if isinstance(update, dict):
+            rich_state_update = dict(update)
     combined = {
         "ok": True,
         "format": "rich-split",
         "formats": formats,
         "message_id": message_ids[0] if message_ids else str(last_result.get("message_id") or ""),
         "message_ids": message_ids,
+        "canonical_message_id": message_ids[0] if message_ids else "",
+        "physical_writes": physical_writes,
     }
     if format_state_updates:
         combined[DELIVERY_FORMAT_STATE_UPDATE_KEY] = format_state_updates
+    if rich_state_update is not None:
+        combined[RICH_STATE_UPDATE_KEY] = rich_state_update
     return combined
 
 

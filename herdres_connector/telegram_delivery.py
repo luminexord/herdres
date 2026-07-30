@@ -238,13 +238,18 @@ class TelegramClient:
                     "message_id": message_ids[0] if message_ids else "0",
                     "message_ids": message_ids,
                     "format": "plain-split",
+                    "physical_writes": len(message_ids),
                 }
                 if reply_markup is not None:
                     result["reply_markup_message_id"] = (
                         message_ids[-1] if message_ids else "0"
                     )
                 return result
-            return {"ok": False, "error": sanitize_text(last_error, 300)}
+            return {
+                "ok": False,
+                "error": sanitize_text(last_error, 300),
+                "physical_writes": len(message_ids) + 1,
+            }
         last_error = ""
         rejected_formats: list[dict[str, str]] = []
         for fmt, text in self._html_variants(html_text):
@@ -258,6 +263,7 @@ class TelegramClient:
                     "ok": True,
                     "message_id": str(result.get("message_id") or "0"),
                     "format": fmt,
+                    "physical_writes": len(rejected_formats) + 1,
                 }
                 if rejected_formats:
                     outcome[DELIVERY_FORMAT_STATE_UPDATE_KEY] = {
@@ -277,7 +283,11 @@ class TelegramClient:
                         "error": sanitize_text(str(exc), 300),
                     }
                 )
-        return {"ok": False, "error": sanitize_text(last_error, 300)}
+        return {
+            "ok": False,
+            "error": sanitize_text(last_error, 300),
+            "physical_writes": len(rejected_formats),
+        }
 
     def send_voice(
         self,
@@ -372,6 +382,7 @@ class TelegramClient:
             "disable_web_page_preview": "true",
         }
         last_error = ""
+        rejected_formats: list[dict[str, str]] = []
         for fmt, text in self._html_variants(html_text):
             payload = dict(base_payload)
             payload["text"] = text
@@ -379,13 +390,31 @@ class TelegramClient:
                 payload["parse_mode"] = "HTML"
             try:
                 self.api("editMessageText", payload)
-                return {"ok": True, "message_id": str(message_id), "kind": "edited", "format": fmt}
+                return {
+                    "ok": True,
+                    "message_id": str(message_id),
+                    "kind": "edited",
+                    "format": fmt,
+                    "physical_writes": len(rejected_formats) + 1,
+                }
             except RateLimited:
                 raise
             except TelegramError as exc:
                 last_error = str(exc)
+                rejected_formats.append(
+                    {
+                        "format": fmt,
+                        "error": sanitize_text(str(exc), 300),
+                    }
+                )
                 if "message is not modified" in last_error.lower():
-                    return {"ok": True, "message_id": str(message_id), "kind": "unchanged", "format": fmt}
+                    return {
+                        "ok": True,
+                        "message_id": str(message_id),
+                        "kind": "unchanged",
+                        "format": fmt,
+                        "physical_writes": len(rejected_formats),
+                    }
                 if "message to edit not found" in last_error.lower() or "message not found" in last_error.lower():
                     return {
                         "ok": False,
@@ -393,6 +422,7 @@ class TelegramClient:
                         "kind": "not_found",
                         "not_found": True,
                         "error": sanitize_text(last_error, 300),
+                        "physical_writes": len(rejected_formats),
                     }
                 if _topic_missing(last_error):
                     return {
@@ -401,8 +431,13 @@ class TelegramClient:
                         "kind": "topic_not_found",
                         "topic_missing": True,
                         "error": sanitize_text(last_error, 300),
+                        "physical_writes": len(rejected_formats),
                     }
-        return {"ok": False, "error": sanitize_text(last_error, 300)}
+        return {
+            "ok": False,
+            "error": sanitize_text(last_error, 300),
+            "physical_writes": len(rejected_formats),
+        }
 
     def edit_message_reply_markup(
         self,

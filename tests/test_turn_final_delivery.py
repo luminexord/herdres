@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import herdres
 import pytest
 from herdres_connector import config, source_sync, state
+from herdres_connector.rich_delivery import split_legacy_message_ids
 from herdres_connector.source_sync import PRESENTATION_VERSION, SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import RateLimited, TelegramClient, TelegramError
 from test_source_only import FakeTelegram, _source_worker, _store
@@ -988,7 +989,9 @@ class DeletingTelegram(FakeTelegram):
     def __init__(self, token="fake", shared=None):
         super().__init__(token=token, shared=shared)
         self._shared.setdefault("deleted_messages", [])
+        self._shared.setdefault("recipient_messages", {})
         self.deleted_messages = self._shared["deleted_messages"]
+        self.recipient_messages = self._shared["recipient_messages"]
         self.raise_after_accept = False
 
     def with_token(self, token):
@@ -996,6 +999,24 @@ class DeletingTelegram(FakeTelegram):
 
     def api(self, method, payload):
         result = super().api(method, payload)
+        if method == "sendRichMessage":
+            message_id = str(
+                (result.get("result") or {}).get("message_id") or ""
+            )
+            rich = json.loads(payload.get("rich_message") or "{}")
+            self.recipient_messages[message_id] = {
+                "format": "rich",
+                "content": str(rich.get("html") or ""),
+            }
+        elif method == "editMessageText":
+            message_id = str(payload.get("message_id") or "")
+            rich = json.loads(payload.get("rich_message") or "{}")
+            self.recipient_messages[message_id] = {
+                "format": "rich" if rich else "html",
+                "content": str(
+                    rich.get("html") or payload.get("text") or ""
+                ),
+            }
         if method == "sendRichMessage" and self.raise_after_accept:
             self.raise_after_accept = False
             raise RuntimeError("response lost after acceptance")
@@ -1003,13 +1024,27 @@ class DeletingTelegram(FakeTelegram):
 
     def send_message(self, chat_id, html, **kwargs):
         result = super().send_message(chat_id, html, **kwargs)
+        for message_id in split_legacy_message_ids(result):
+            self.recipient_messages[message_id] = {
+                "format": str(result.get("format") or "html"),
+                "content": str(html),
+            }
         if self.raise_after_accept:
             self.raise_after_accept = False
             raise RuntimeError("response lost after acceptance")
         return result
 
+    def edit_message(self, chat_id, message_id, html):
+        result = super().edit_message(chat_id, message_id, html)
+        self.recipient_messages[str(message_id)] = {
+            "format": str(result.get("format") or "html"),
+            "content": str(html),
+        }
+        return result
+
     def delete_message(self, chat_id, message_id):
         self.deleted_messages.append((str(chat_id), str(message_id), self.token))
+        self.recipient_messages.pop(str(message_id), None)
         return {"ok": True}
 
 
@@ -1346,6 +1381,7 @@ def test_revision_growth_shrink_and_wrong_owner_converge_without_surplus(monkeyp
     tendwire = TurnFinalTendwire(_turn_row("turn-revise", "twrev1.r1", first_text))
     sync_once(store, _runtime(tendwire, telegram, max_sends=100))
     entry = next(iter(state.source_worker_entries(store).values()))
+    first_ids = list(entry["last_clean_message_ids"])
     first_count = len(entry["last_clean_message_ids"])
     assert first_count > 1
 
@@ -1355,6 +1391,29 @@ def test_revision_growth_shrink_and_wrong_owner_converge_without_surplus(monkeyp
     grown_ids = list(entry["last_clean_message_ids"])
     assert len(grown_ids) > first_count
     assert grow_result["tendwire_turn_final"]["acked"] == len(grown_ids)
+    assert all(
+        message_id in telegram.recipient_messages
+        for message_id in grown_ids
+    )
+    assert all(
+        message_id not in telegram.recipient_messages
+        for message_id in first_ids
+        if message_id not in grown_ids
+    )
+    assert all(
+        "B changed." in telegram.recipient_messages[message_id]["content"]
+        and "A paragraph." not in telegram.recipient_messages[message_id]["content"]
+        for message_id in grown_ids
+    )
+    assert all(
+        state.find_message_binding(store, message_id)["message_ids"]
+        == grown_ids
+        and state.find_message_binding(store, message_id)[
+            "canonical_message_id"
+        ]
+        == grown_ids[0]
+        for message_id in grown_ids
+    )
 
     old_zero = grown_ids[0]
     state.message_bindings(store)[old_zero]["bot_kind"] = "claude"
@@ -1370,6 +1429,13 @@ def test_revision_growth_shrink_and_wrong_owner_converge_without_surplus(monkeyp
     assert shrink_result["tendwire_turn_final"]["acked"] == 1 + len(grown_ids) - 1
     assert all(state.find_message_binding(store, message_id) is None for message_id in grown_ids)
     assert state.find_message_binding(store, current_ids[0])["content_revision"] == "twrev1.r3"
+    assert all(
+        message_id not in telegram.recipient_messages
+        for message_id in grown_ids
+    )
+    assert "C final compact" in telegram.recipient_messages[
+        current_ids[0]
+    ]["content"]
 
 
 @pytest.mark.parametrize(
@@ -2728,6 +2794,7 @@ def test_physical_budget_uses_sync_floor_and_acceptance_loss_is_explicit(monkeyp
 def test_table_delivery_operation_budget_matches_single_plain_write(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
     table = (
         "| Name | Status |\n"
         "| --- | --- |\n"
@@ -2783,6 +2850,7 @@ def _header_only_table(source_chars: int) -> tuple[str, str]:
 def test_canonical_table_delivers_final_row_before_ack(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
     table, rows = _large_markdown_table(50)
     telegram = DeletingTelegram()
 
@@ -2955,6 +3023,7 @@ def test_split_table_repeats_header_and_preserves_each_complete_row(
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
     table, rows = _large_markdown_table(90, value_chars=80)
     tendwire = TurnFinalTendwire(
         _turn_row("turn-table-split", "twrev1.tablesplit", table)
@@ -2980,6 +3049,7 @@ def test_table_aware_split_keeps_near_limit_row_out_of_prior_part(
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
     short_row = "short | first"
     crossing_row = "crossing | " + ("X" * 3_350)
     final_row = "final | last"
@@ -3095,7 +3165,7 @@ def test_programming_planning_defect_surfaces_as_systemic_failure(
     assert telegram.sent == []
 
 
-def test_dormant_rich_state_does_not_fragment_plain_delivery_budget(
+def test_rich_state_uses_rich_primary_without_extra_physical_writes(
     monkeypatch,
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
@@ -3116,10 +3186,54 @@ def test_dormant_rich_state_does_not_fragment_plain_delivery_budget(
     assert result["tendwire_turn_final"]["operations"] == 2
     assert result["tendwire_turn_final"]["acked"] == 2
     assert len(telegram.sent) == 2
-    assert not any(
+    assert all(
         method == "sendRichMessage"
         for method, _payload, _token in telegram.api_calls
+        if method in {"sendRichMessage", "sendMessage"}
     )
+
+
+def test_rich_rejection_plain_fallback_counts_both_physical_writes(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+
+    class RejectRichTelegram(DeletingTelegram):
+        def api(self, method, payload):
+            if method == "sendRichMessage":
+                self.api_calls.append((method, dict(payload), self.token))
+                raise TelegramError(
+                    "Bad Request: rich message rejected"
+                )
+            return super().api(method, payload)
+
+    tendwire = TurnFinalTendwire(
+        _turn_row(
+            "turn-rich-fallback",
+            "twrev1.richfallback",
+            "**Readable fallback**",
+        )
+    )
+    telegram = RejectRichTelegram()
+
+    result = sync_once(
+        _store(), _runtime(tendwire, telegram, max_sends=3)
+    )
+
+    assert result["tendwire_turn_final"]["operations"] == 2
+    assert result["tendwire_turn_final"]["acked"] == 1
+    assert [
+        method
+        for method, _payload, _token in telegram.api_calls
+        if method == "sendRichMessage"
+    ] == ["sendRichMessage"]
+    assert len(telegram.sent) == 1
+    message_id = telegram.sent[0][3]
+    assert telegram.recipient_messages[message_id]["format"] == "html"
+    assert "Readable fallback" in telegram.recipient_messages[
+        message_id
+    ]["content"]
 
 
 def test_incomplete_row_isolated_while_working_final_pins_and_attention_continue(monkeypatch):
