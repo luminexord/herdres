@@ -1257,6 +1257,63 @@ def test_delivery_write_accounting_is_structural_and_fails_closed():
     )
 
 
+def _pending_delivery_work_components(source_text):
+    tree = ast.parse(source_text)
+    sync_function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "sync_once"
+    )
+    assignment = next(
+        node
+        for node in ast.walk(sync_function)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "pending_delivery_work"
+            for target in node.targets
+        )
+    )
+    components = set()
+    for call in ast.walk(assignment.value):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "get"
+            and isinstance(call.func.value, ast.Name)
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        ):
+            continue
+        components.add((call.func.value.id, call.args[0].value))
+    return components
+
+
+def test_pending_delivery_work_inventory_is_complete_and_fail_closed():
+    source_text = Path(source_sync.__file__).read_text(encoding="utf-8")
+    expected = {
+        ("turn_counts", "work_pending"),
+        ("submission_counts", "work_pending"),
+        ("turn_final_result", "failed"),
+        ("turn_final_result", "deferred"),
+        ("outbox_result", "failed"),
+        ("outbox_result", "deferred"),
+    }
+    assert _pending_delivery_work_components(source_text) == expected
+
+    missing_outbox_failure = source_text.replace(
+        '        + int(outbox_result.get("failed") or 0)\n',
+        "",
+        1,
+    )
+    assert (
+        _pending_delivery_work_components(missing_outbox_failure)
+        == expected - {("outbox_result", "failed")}
+    )
+
+
 def test_offlock_enforcement_rejects_all_three_demonstrated_bypasses():
     source_path = Path(source_sync.__file__)
     delivery_path = source_path.with_name("telegram_delivery.py")

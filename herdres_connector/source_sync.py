@@ -13558,6 +13558,8 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         + int(submission_counts.get("work_pending") or 0)
         + int(turn_final_result.get("failed") or 0)
         + int(turn_final_result.get("deferred") or 0)
+        + int(outbox_result.get("failed") or 0)
+        + int(outbox_result.get("deferred") or 0)
     )
     delivery_stalled = bool(
         pending_delivery_work and completed_deliveries == 0

@@ -4110,6 +4110,158 @@ def test_round_robin_moves_a_healthy_final_ahead_of_a_repeated_failure(
     )
 
 
+class AttentionOnlyTendwire(TurnFinalTendwire):
+    def __init__(self, *, ack_ok=True, item_available=True):
+        super().__init__(
+            _turn_row(
+                "turn-attention-health",
+                "twrev1.attention_health",
+                None,
+            ),
+            emit_ready=False,
+            turn_schema_version=2,
+        )
+        self.ack_ok = ack_ok
+        self.item_available = item_available
+        self.ack_calls = []
+        self.fail_calls = []
+
+    def snapshot(self):
+        return {"ok": True, "workers": [], "spaces": []}
+
+    def turns(self):
+        return {"ok": True, "schema_version": 2, "turns": []}
+
+    def turn_final_poll(self, **_kwargs):
+        return {"ok": True, "schema_version": 1, "items": []}
+
+    def connector_poll(self, **_kwargs):
+        if not self.item_available:
+            return {"ok": True, "items": []}
+        return {
+            "ok": True,
+            "items": [
+                {
+                    "ref": "twref1.attention-health",
+                    "key": "attention:health",
+                    "attempt": 1,
+                    "payload": {
+                        "event_type": "attention_created",
+                        "attention": {
+                            "severity": "warning",
+                            "reason": "Needs input",
+                        },
+                    },
+                }
+            ],
+        }
+
+    def connector_ack(self, ref, response, **_kwargs):
+        self.ack_calls.append((ref, deepcopy(response)))
+        return {"ok": self.ack_ok}
+
+    def connector_fail(self, ref, error, **_kwargs):
+        self.fail_calls.append((ref, str(error)))
+        return {"ok": True}
+
+
+def test_failed_attention_outbox_is_pending_and_stalls_zero_delivery(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+
+    class FailingAttentionTelegram(DeletingTelegram):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def send_message(self, _chat_id, _html, **_kwargs):
+            self.attempts += 1
+            return {"ok": False, "error": "synthetic attention failure"}
+
+    tendwire = AttentionOnlyTendwire()
+    telegram = FailingAttentionTelegram()
+
+    result = sync_once(
+        _store(), _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert telegram.attempts == 1
+    assert result["tendwire_outbox"]["failed"] == 1
+    assert result["tendwire_outbox"]["delivered"] == 0
+    assert result["outbound_delivery"] == {
+        "ok": False,
+        "status": "outbound_delivery_stalled",
+        "pending_count": 1,
+        "completed_count": 0,
+        "physical_writes": 1,
+    }
+    assert result["ok"] is False
+    assert result["status"] == "outbound_delivery_stalled"
+    assert tendwire.fail_calls == [
+        (
+            "twref1.attention-health",
+            "synthetic attention failure",
+        )
+    ]
+
+
+def test_deferred_attention_outbox_stalls_when_no_delivery_completes(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    tendwire = AttentionOnlyTendwire(ack_ok=False)
+    telegram = DeletingTelegram()
+    store = _store()
+
+    accepted_but_unacked = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    deferred_duplicate = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+
+    assert accepted_but_unacked["tendwire_outbox"]["delivered"] == 1
+    assert accepted_but_unacked["tendwire_outbox"]["deferred"] == 1
+    assert accepted_but_unacked["outbound_delivery"]["pending_count"] == 1
+    assert accepted_but_unacked["outbound_delivery"]["completed_count"] == 1
+    assert accepted_but_unacked["ok"] is True
+    assert deferred_duplicate["tendwire_outbox"]["delivered"] == 0
+    assert deferred_duplicate["tendwire_outbox"]["deferred"] == 1
+    assert deferred_duplicate["outbound_delivery"]["pending_count"] == 1
+    assert deferred_duplicate["outbound_delivery"]["completed_count"] == 0
+    assert deferred_duplicate["outbound_delivery"]["status"] == (
+        "outbound_delivery_stalled"
+    )
+    assert deferred_duplicate["ok"] is False
+    assert len(telegram.sent) == 1
+
+
+def test_quiet_outbound_pass_remains_healthy(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+
+    result = sync_once(
+        _store(),
+        _runtime(
+            AttentionOnlyTendwire(item_available=False),
+            DeletingTelegram(),
+            max_sends=1,
+        ),
+    )
+
+    assert result["outbound_delivery"] == {
+        "ok": True,
+        "status": "healthy",
+        "pending_count": 0,
+        "completed_count": 0,
+        "physical_writes": 0,
+    }
+    assert result["ok"] is True
+
+
 def test_partial_final_ledger_prunes_old_resolved_but_never_unresolved():
     store = _store()
     unresolved_hashes = {
