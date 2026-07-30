@@ -346,8 +346,8 @@ def try_render_table(
     ``(html, next_index)``; otherwise ``None``. Shared by both markdown engines; each passes its own
     ``cell_html`` inline renderer so cell content matches the surrounding formatting. ``limit`` is
     accepted for signature stability (the native table isn't length-padded).
-    Canonical rendering is lossless by default. The deferred rich enhancement
-    may explicitly pass ``RICH_TABLE_MAX_ROWS`` as its presentation cap."""
+    Canonical rendering is lossless by default. A noncanonical preview may
+    explicitly pass ``RICH_TABLE_MAX_ROWS`` as its presentation cap."""
     if not (
         _looks_like_table_row(lines[i])
         and i + 1 < len(lines)

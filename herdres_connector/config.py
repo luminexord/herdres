@@ -141,6 +141,22 @@ def tendwire_turn_final_lease_seconds(env: Any | None = None) -> int:
     return min(3600, max(60, value))
 
 
+def partial_final_escalation_seconds(env: Any | None = None) -> int:
+    """Maximum age before an unresolved partial final becomes escalated."""
+
+    source = os.environ if env is None else env
+    raw = source.get(
+        "HERDRES_PARTIAL_FINAL_ESCALATION_SECONDS", "300"
+    )
+    if raw is None or not str(raw).strip():
+        raw = "300"
+    try:
+        value = int(str(raw))
+    except (TypeError, ValueError):
+        return 300
+    return min(3600, max(30, value))
+
+
 def command_retry_horizon_seconds(env: Any | None = None) -> int:
     source = os.environ if env is None else env
     try:
@@ -530,6 +546,11 @@ def managed_bot_token(kind: str, env: Any | None = None) -> str:
 
 def rich_messages_enabled(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
+    force_plain = str(
+        source.get("HERDRES_FORCE_PLAIN_DELIVERY", "0") or ""
+    ).strip().lower()
+    if force_plain in {"1", "true", "yes", "on"}:
+        return False
     value = str(source.get("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1") or "").strip().lower()
     return value not in {"0", "false", "no", "off"}
 

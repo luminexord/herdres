@@ -1966,6 +1966,66 @@ def cmd_recover_turn_final(args: argparse.Namespace) -> int:
     return _json(response)
 
 
+def cmd_resolve_partial_final(args: argparse.Namespace) -> int:
+    """Apply an explicit, identity-bound exit from a partial-final hold."""
+
+    config.load_env_file()
+    config.require_source_mode()
+    turn_id = compact_ws(args.turn_id, 200)
+    content_hash = compact_ws(args.content_hash, 200)
+    request_id = str(args.request_id or "")
+    action = str(args.action or "")
+    if (
+        not turn_id
+        or not content_hash
+        or not _valid_recovery_request_id(request_id)
+    ):
+        return _json(
+            _recovery_error(
+                "invalid_partial_final_resolution",
+                "turn id, content hash, or request id is invalid",
+            )
+        )
+    with state.state_lock():
+        store = state.load_state()
+        candidate = copy.deepcopy(store)
+        try:
+            record = state.resolve_partial_final_delivery(
+                candidate,
+                turn_id=turn_id,
+                content_hash=content_hash,
+                action=action,
+                request_id=request_id,
+                now=time.time(),
+            )
+        except (KeyError, ValueError) as exc:
+            return _json(
+                _recovery_error(
+                    "partial_final_resolution_rejected", str(exc)
+                )
+            )
+        state.save_state(candidate)
+    pending = record.get("status") == "retry_authorized"
+    return _json(
+        {
+            "ok": True,
+            "status": (
+                "partial_final_recovery_authorized"
+                if pending
+                else "partial_final_resolved"
+            ),
+            "turn_id": record["turn_id"],
+            "content_hash": record["content_hash"],
+            "terminal_outcome": record["terminal_outcome"],
+            "action": action,
+            "operator_attention_required": record[
+                "operator_attention_required"
+            ],
+            "automatic_replay_authorized": False,
+        }
+    )
+
+
 def cmd_outbox(args: argparse.Namespace) -> int:
     config.load_env_file()
     with state.state_lock():
@@ -2022,6 +2082,16 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--plan-token", required=True)
     recover.add_argument("--request-id", required=True)
     recover.set_defaults(func=cmd_recover_turn_final)
+    partial = sub.add_parser("resolve-partial-final")
+    partial.add_argument("--turn-id", required=True)
+    partial.add_argument("--content-hash", required=True)
+    partial.add_argument("--request-id", required=True)
+    partial.add_argument(
+        "--action",
+        required=True,
+        choices=["accept-partial", "retry-missing"],
+    )
+    partial.set_defaults(func=cmd_resolve_partial_final)
     outbox = tendwire_sub.add_parser("outbox")
     outbox.add_argument("--limit", type=int, default=3)
     outbox.add_argument("--dry-run", action="store_true")
