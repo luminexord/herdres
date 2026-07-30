@@ -4,6 +4,7 @@ import ast
 import json
 import multiprocessing
 import os
+import re
 import signal
 import sqlite3
 import threading
@@ -389,35 +390,162 @@ def _configured_state(path: Path) -> None:
     state.save_state(store, path=path)
 
 
-def test_every_lane_updated_at_update_preserves_retry_fallback() -> None:
-    source_path = Path(ingress_lanes_module.__file__)
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    updates = [
-        node.value
-        for node in ast.walk(tree)
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and "UPDATE lane_items" in node.value
-            and "updated_at =" in node.value
-        )
-    ]
+def _lane_updated_at_writer_shapes(source: str) -> list[str]:
+    """Audit literal SQL passed to execute, rejecting dynamic SQL fail-closed."""
+
+    tree = ast.parse(source)
+    shapes: list[str] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "execute"
+        ):
+            continue
+        if not node.args:
+            raise AssertionError(f"execute without SQL at line {node.lineno}")
+        sql_node = node.args[0]
+        if not (
+            isinstance(sql_node, ast.Constant)
+            and isinstance(sql_node.value, str)
+        ):
+            raise AssertionError(
+                f"dynamic SQL passed to execute at line {node.lineno}"
+            )
+        normalized = re.sub(r"\s+", " ", sql_node.value).strip().upper()
+        if not (
+            re.search(r"\bUPDATE\s+LANE_ITEMS\b", normalized)
+            and re.search(r"\bUPDATED_AT\s*=", normalized)
+        ):
+            continue
+        updated_at = re.search(r"\bUPDATED_AT\s*=", normalized)
+        assert updated_at is not None
+        before_timestamp_write = normalized[: updated_at.start()]
+        if not re.search(
+            r"\bRETRY_OBSTRUCTED_SINCE\s*=",
+            before_timestamp_write,
+        ):
+            raise AssertionError(
+                f"lane updated_at writer lacks retry promotion at line {node.lineno}"
+            )
+        if re.search(
+            r"CASE\s+WHEN\s+ATTEMPTS\s*>\s*0\s+THEN\s+UPDATED_AT\s+END",
+            before_timestamp_write,
+        ):
+            shapes.append("fallback")
+        elif re.search(
+            r"COALESCE\s*\(\s*RETRY_OBSTRUCTED_SINCE\s*,\s*\?\s*\)",
+            before_timestamp_write,
+        ):
+            shapes.append("preselected")
+        else:
+            raise AssertionError(
+                f"lane updated_at writer has unknown promotion at line {node.lineno}"
+            )
+    return shapes
+
+
+def _assert_lane_updated_at_writer_inventory(source: str) -> None:
+    shapes = _lane_updated_at_writer_shapes(source)
 
     # Exact enumeration makes adding any lane timestamp writer an explicit
     # review event, even when the new statement already looks safe.
-    assert len(updates) == 10
-    fallback_promotions = 0
-    preselected_promotions = 0
-    for statement in updates:
-        before_timestamp_write = statement.split("updated_at =", 1)[0]
-        assert "retry_obstructed_since" in before_timestamp_write
-        normalized = " ".join(before_timestamp_write.split())
-        if "CASE WHEN attempts > 0 THEN updated_at END" in normalized:
-            fallback_promotions += 1
-        if "COALESCE(retry_obstructed_since, ?)" in normalized:
-            preselected_promotions += 1
-    assert fallback_promotions == 8
-    assert preselected_promotions == 2
+    assert len(shapes) == 10
+    assert shapes.count("fallback") == 8
+    assert shapes.count("preselected") == 2
+
+
+def test_every_lane_updated_at_update_preserves_retry_fallback() -> None:
+    source_path = Path(ingress_lanes_module.__file__)
+    _assert_lane_updated_at_writer_inventory(
+        source_path.read_text(encoding="utf-8")
+    )
+
+
+def test_concatenated_executable_lane_writer_fails_closed(tmp_path) -> None:
+    source = """
+def mutate(connection, updated_at, seq):
+    connection.execute(
+        "UPDATE " + "lane_items SET updated_at = ? WHERE seq = ?",
+        (updated_at, seq),
+    )
+"""
+    namespace: dict[str, object] = {}
+    exec(source, namespace)
+    spool = IngressLaneSpool(tmp_path / "spool.db")
+    _enqueue(
+        spool,
+        _update(1, 77, "will be mutated"),
+        "77",
+        first_seen_at=1.0,
+    )
+    with sqlite3.connect(spool.path) as connection:
+        namespace["mutate"](connection, 99.0, 1)
+    assert spool.rows()[0]["updated_at"] == 99.0
+
+    with pytest.raises(AssertionError, match="dynamic SQL passed to execute"):
+        _lane_updated_at_writer_shapes(source)
+
+
+@pytest.mark.parametrize(
+    "assembled_sql",
+    [
+        'f"UPDATE {table} SET updated_at = 1"',
+        '"UPDATE %s SET updated_at = 1" % table',
+        '"UPDATE {} SET updated_at = 1".format(table)',
+        "statement",
+    ],
+    ids=["f-string", "percent", "format", "bound-name"],
+)
+def test_dynamic_execute_sql_fails_closed(assembled_sql) -> None:
+    source = f"""
+def mutate(connection):
+    table = "lane_items"
+    statement = "UPDATE lane_items SET updated_at = 1"
+    connection.execute({assembled_sql})
+"""
+    with pytest.raises(AssertionError, match="dynamic SQL passed to execute"):
+        _lane_updated_at_writer_shapes(source)
+
+
+def test_lane_writer_detection_normalizes_case_and_whitespace() -> None:
+    source = """
+def mutate(connection):
+    connection.execute(
+        \"""
+        UpDaTe
+             LaNe_ItEmS
+        SeT retry_obstructed_since =
+                CoAlEsCe(
+                    retry_obstructed_since,
+                    CaSe WhEn attempts > 0 ThEn updated_at EnD
+                ),
+            updated_at=?
+        \"""
+    )
+"""
+    assert _lane_updated_at_writer_shapes(source) == ["fallback"]
+
+
+def test_eleventh_literal_lane_writer_fails_inventory() -> None:
+    source_path = Path(ingress_lanes_module.__file__)
+    extra_writer = """
+def reviewed_extra_writer(connection):
+    connection.execute(
+        \"""
+        UPDATE lane_items
+        SET retry_obstructed_since = COALESCE(
+                retry_obstructed_since,
+                CASE WHEN attempts > 0 THEN updated_at END
+            ),
+            updated_at = ?
+        \"""
+    )
+"""
+    with pytest.raises(AssertionError):
+        _assert_lane_updated_at_writer_inventory(
+            source_path.read_text(encoding="utf-8") + extra_writer
+        )
 
 
 def test_pending_lane_is_spool_eligible_even_while_its_head_is_processing(
