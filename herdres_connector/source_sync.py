@@ -4244,24 +4244,31 @@ def _entry_open_for_pin(entry: dict[str, Any]) -> bool:
     return not (entry.get("closed") or entry.get("exited") or entry.get("process_exited"))
 
 
+def _worker_visible_on_status_board(entry: dict[str, Any]) -> bool:
+    """Select display membership without consulting delivery routability.
+
+    Binding state, unique-route checks, topic ids, and a space's worker_ids are
+    delivery concerns.  A live pane must remain owner-visible when any of those
+    gates refuses it.  Explicitly historical entries stay hidden; entries from
+    older state files without the additive visibility field retain the
+    compatibility behavior established in issue #198.
+    """
+
+    return (
+        _entry_open_for_pin(entry)
+        and entry.get("live_in_snapshot") is not False
+    )
+
+
 def _status_entries_for_topic_pin(store: dict[str, Any], entry: dict[str, Any]) -> list[dict[str, Any]]:
     if str(entry.get("entry_type") or "") != "space":
-        return [
-            entry
-        ] if _entry_open_for_pin(entry) and state.entry_is_routable(entry) else []
+        return [entry] if _worker_visible_on_status_board(entry) else []
     space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
-    worker_ids = entry.get("worker_ids")
-    current_worker_ids = {str(worker_id) for worker_id in worker_ids if worker_id} if isinstance(worker_ids, list) else set()
     workers = [
         worker_entry
-        for worker_key, worker_entry in state.source_worker_entries(store).items()
-        if _entry_open_for_pin(worker_entry)
-        and state.worker_entry_is_uniquely_routable(store, worker_key, worker_entry)
+        for worker_entry in state.source_worker_entries(store).values()
+        if _worker_visible_on_status_board(worker_entry)
         and str(worker_entry.get("tendwire_space_id") or worker_entry.get("space_id") or "") == space_id
-        and (
-            not current_worker_ids
-            or str(worker_entry.get("tendwire_worker_id") or worker_entry.get("worker_id") or "") in current_worker_ids
-        )
     ]
     return workers or ([entry] if _entry_open_for_pin(entry) else [])
 
@@ -12217,30 +12224,11 @@ def _sync_pinned(
     yield_barrier: Callable[[], None] | None = None,
     account_usage: dict[str, Any] | None = None,
 ) -> bool:
-    current_worker_ids: set[str] = set()
-    current_space_ids = {
-        str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
-        for entry in state.source_space_entries(store).values()
-        if _entry_open_for_pin(entry) and not entry.get("stale_space_topic")
-    }
-    for entry in state.source_space_entries(store).values():
-        worker_ids = entry.get("worker_ids")
-        if isinstance(worker_ids, list):
-            current_worker_ids.update(str(worker_id) for worker_id in worker_ids if worker_id)
-    entries = []
-    for entry in state.source_worker_entries(store).values():
-        if (
-            not _entry_open_for_pin(entry)
-            or entry.get("live_in_snapshot") is False
-        ):
-            continue
-        worker_id = str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "")
-        space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
-        if current_worker_ids and worker_id not in current_worker_ids:
-            continue
-        if not current_worker_ids and current_space_ids and space_id not in current_space_ids:
-            continue
-        entries.append(entry)
+    entries = [
+        entry
+        for entry in state.source_worker_entries(store).values()
+        if _worker_visible_on_status_board(entry)
+    ]
     if not entries and config.source_topic_mode() != "worker":
         entries = [
             entry
