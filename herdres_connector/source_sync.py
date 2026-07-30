@@ -2285,11 +2285,10 @@ def _record_partial_final_delivery(
 ) -> None:
     """Persist a real accepted prefix without claiming logical completion."""
 
-    prior = state.find_partial_final_delivery(store, turn_id)
-    same_content_prior = bool(
-        isinstance(prior, dict)
-        and prior.get("content_hash") == content_hash
+    prior = state.find_partial_final_delivery(
+        store, turn_id, content_hash
     )
+    same_content_prior = isinstance(prior, dict)
     message_ids = (
         list(prior.get("message_ids") or [])
         if same_content_prior
@@ -2363,8 +2362,8 @@ def _record_partial_final_delivery(
         "current_bot_kind": bot_kind,
         "error": error,
     }
-    state.partial_final_deliveries(store)[
-        state.partial_final_delivery_key(turn_id)
+    state.partial_final_deliveries(store, create=True)[
+        state.partial_final_delivery_key(turn_id, content_hash)
     ] = record
     entry["partial_final_delivery"] = record
     _record_delivery_error(entry, {"error": error}, bot_kind)
@@ -2391,11 +2390,9 @@ def _partial_final_delivery_record(
     turn_id: str,
     content_hash: str,
 ) -> dict[str, Any] | None:
-    """Find or adopt a legacy route-local hold by durable turn identity."""
+    """Adopt every route-local record, then return this content's witness."""
 
-    record = state.find_partial_final_delivery(store, turn_id)
-    if record is not None:
-        return record
+    records = state.partial_final_deliveries(store)
     candidates = [
         partial
         for container in (
@@ -2409,34 +2406,47 @@ def _partial_final_delivery_record(
         and partial.get("turn_id") == turn_id
         and partial.get("delivery_complete") is False
     ]
-    if not candidates:
-        return None
-    adopted = dict(candidates[0])
-    now = time.time()
-    adopted["schema_version"] = (
-        state.PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION
+    if candidates and not isinstance(
+        store.get("telegram_partial_final_deliveries"), dict
+    ):
+        records = state.partial_final_deliveries(store, create=True)
+    for candidate in candidates:
+        candidate_content_hash = compact_ws(
+            candidate.get("content_hash"), 200
+        )
+        if not candidate_content_hash:
+            continue
+        key = state.partial_final_delivery_key(
+            turn_id, candidate_content_hash
+        )
+        if isinstance(records.get(key), dict):
+            continue
+        adopted = dict(candidate)
+        now = time.time()
+        adopted["schema_version"] = (
+            state.PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION
+        )
+        adopted["status"] = str(adopted.get("status") or "held")
+        adopted["created_at"] = float(
+            adopted.get("created_at")
+            if isinstance(adopted.get("created_at"), (int, float))
+            and not isinstance(adopted.get("created_at"), bool)
+            else now
+        )
+        adopted["updated_at"] = now
+        adopted["escalates_at"] = (
+            adopted["created_at"]
+            + config.partial_final_escalation_seconds()
+        )
+        adopted["recovery_action"] = (
+            "accept-partial"
+            if adopted.get("terminal_outcome") == "delivery_unknown"
+            else "retry-missing"
+        )
+        records[key] = adopted
+    return state.find_partial_final_delivery(
+        store, turn_id, content_hash
     )
-    adopted["status"] = "held"
-    adopted["created_at"] = float(
-        adopted.get("created_at")
-        if isinstance(adopted.get("created_at"), (int, float))
-        and not isinstance(adopted.get("created_at"), bool)
-        else now
-    )
-    adopted["updated_at"] = now
-    adopted["escalates_at"] = (
-        adopted["created_at"]
-        + config.partial_final_escalation_seconds()
-    )
-    adopted["recovery_action"] = (
-        "accept-partial"
-        if adopted.get("terminal_outcome") == "delivery_unknown"
-        else "retry-missing"
-    )
-    state.partial_final_deliveries(store)[
-        state.partial_final_delivery_key(turn_id)
-    ] = adopted
-    return adopted
 
 
 def _reconcile_partial_final_hold(
@@ -2469,6 +2479,60 @@ def _reconcile_partial_final_hold(
         or "multipart final requires operator reconciliation",
         240,
     )
+
+
+def _partial_final_hold_escalated(
+    record: dict[str, Any],
+    *,
+    now: float,
+) -> bool:
+    created_at = record.get("created_at")
+    if not isinstance(created_at, (int, float)) or isinstance(
+        created_at, bool
+    ):
+        return False
+    return (
+        float(now) - float(created_at)
+        >= config.partial_final_escalation_seconds()
+    )
+
+
+def _superseding_final_feed_item(
+    feed_item: dict[str, Any],
+) -> dict[str, Any]:
+    """Make the automatic post-bound supersession visible to the recipient."""
+
+    revised = dict(feed_item)
+    notice = (
+        "⚠️ Supersedes an incomplete earlier version whose delivery "
+        "still requires operator resolution."
+    )
+    response = str(revised.get("assistant_final_text") or "").strip()
+    revised["assistant_final_text"] = (
+        f"{notice}\n\n{response}" if response else notice
+    )
+    return revised
+
+
+def _record_partial_final_supersession(
+    records: list[dict[str, Any]],
+    *,
+    content_hash: str,
+    message_ids: list[str],
+) -> None:
+    """Record a delivered revision without resolving its predecessor holds."""
+
+    now = time.time()
+    for record in records:
+        record["superseded_by_content_hash"] = content_hash
+        record["superseded_at"] = now
+        record["supersession"] = "newer_revision_delivered"
+        record["supersession_message_ids"] = list(message_ids)
+        record["recovery_action"] = (
+            "accept-partial"
+            if record.get("terminal_outcome") == "delivery_unknown"
+            else "retry-missing"
+        )
 
 
 def _repair_provider_gone_topic(
@@ -3409,6 +3473,8 @@ def _promote_working_to_final(
     thread_id: str,
     content_hash: str,
     identity: str,
+    max_physical_writes: int | None = None,
+    physical_write_counter: dict[str, int] | None = None,
 ) -> bool:
     turn_id = _turn_id(item)
     stream_message_id = str(entry.get("last_stream_message_id") or "")
@@ -3446,10 +3512,19 @@ def _promote_working_to_final(
                 "telegram.edit_feed_item: promote working card to final"
             ),
             args=(chat_id, stream_message_id, feed_item),
-            kwargs={"telegram": telegram, "api_token": api_token},
+            kwargs={
+                "telegram": telegram,
+                "api_token": api_token,
+                "max_physical_writes": max_physical_writes,
+            },
         ),
     )
     sent, resolution = execution.result, execution.resolution
+    if physical_write_counter is not None:
+        physical_write_counter["physical_writes"] = (
+            int(physical_write_counter.get("physical_writes") or 0)
+            + _telegram_physical_writes(sent, default=0)
+        )
     if not sent.get("ok") or resolution.disposition != _OFFLOCK_APPLY:
         return False
     entry = resolution.entry
@@ -3479,6 +3554,8 @@ def _replace_changed_final(
     thread_id: str,
     content_hash: str,
     identity: str,
+    max_physical_writes: int | None = None,
+    physical_write_counter: dict[str, int] | None = None,
 ) -> bool:
     bindings = _final_delivery_bindings(
         store, _turn_id(item), topic_id=thread_id
@@ -3510,7 +3587,14 @@ def _replace_changed_final(
         return False
     message_ids: list[str] = []
     current_entry = entry
+    remaining_writes = (
+        max(0, int(max_physical_writes))
+        if max_physical_writes is not None
+        else None
+    )
     for fallback_ordinal, (message_id, binding) in enumerate(ordered):
+        if remaining_writes == 0:
+            return False
         ordinal = binding.get("part_ordinal")
         if not isinstance(ordinal, int):
             ordinal = fallback_ordinal
@@ -3541,10 +3625,22 @@ def _replace_changed_final(
                 kwargs={
                     "telegram": _telegram_state(store),
                     "api_token": api_token,
+                    "max_physical_writes": remaining_writes,
                 },
             ),
         )
         sent, resolution = execution.result, execution.resolution
+        writes = _telegram_physical_writes(sent, default=0)
+        if physical_write_counter is not None:
+            physical_write_counter["physical_writes"] = (
+                int(
+                    physical_write_counter.get("physical_writes")
+                    or 0
+                )
+                + writes
+            )
+        if remaining_writes is not None:
+            remaining_writes = max(0, remaining_writes - writes)
         if (
             not sent.get("ok")
             or resolution.disposition != _OFFLOCK_APPLY
@@ -7113,6 +7209,7 @@ def _deliver_final(
     *,
     chat_id: str,
     remaining_write_allowance: int | None = None,
+    physical_write_counter: dict[str, int] | None = None,
 ) -> bool:
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
@@ -7120,39 +7217,61 @@ def _deliver_final(
     turn_id = _turn_id(item)
     content_hash = _turn_content_hash(item, "final")
     identity = f"final:{turn_id}:{content_hash}"
-    partial = _partial_final_delivery_record(
+    exact_record = _partial_final_delivery_record(
         store, turn_id=turn_id, content_hash=content_hash
     )
     if (
-        isinstance(partial, dict)
-        and partial.get("status") == "resolved"
-        and partial.get("content_hash") == content_hash
+        isinstance(exact_record, dict)
+        and exact_record.get("status") == "resolved"
     ):
         # A resolved record is a permanent replay witness. It is retained even
         # after the route-local alert is cleared so the same content identity
         # can never be re-fired by a later owner generation.
         return False
     retry_missing = bool(
-        isinstance(partial, dict)
-        and partial.get("status") == "retry_authorized"
-        and partial.get("terminal_outcome") == "not_delivered"
-        and partial.get("resolution_action") == "retry-missing"
-        and partial.get("content_hash") == content_hash
+        isinstance(exact_record, dict)
+        and exact_record.get("status") == "retry_authorized"
+        and exact_record.get("terminal_outcome") == "not_delivered"
+        and exact_record.get("resolution_action") == "retry-missing"
     )
-    if (
-        isinstance(partial, dict)
-        and partial.get("status") == "resolved"
-        and partial.get("content_hash") != content_hash
-    ):
-        partial = None
-    if isinstance(partial, dict) and not retry_missing:
+    active_records = state.active_partial_final_deliveries_for_turn(
+        store, turn_id
+    )
+    if isinstance(exact_record, dict) and not retry_missing:
         _reconcile_partial_final_hold(
             store,
             entry,
-            partial,
+            exact_record,
             requested_content_hash=content_hash,
         )
         return False
+    revision_blockers = [
+        record
+        for record in active_records
+        if record.get("content_hash") != content_hash
+        and record.get("superseded_by_content_hash") != content_hash
+    ]
+    if retry_missing:
+        revision_blockers = []
+    if revision_blockers and not all(
+        _partial_final_hold_escalated(record, now=time.time())
+        for record in revision_blockers
+    ):
+        _reconcile_partial_final_hold(
+            store,
+            entry,
+            min(
+                revision_blockers,
+                key=lambda record: float(record.get("created_at") or 0),
+            ),
+            requested_content_hash=content_hash,
+        )
+        return False
+    presentation_item = (
+        _superseding_final_feed_item(item)
+        if revision_blockers
+        else item
+    )
     visible_here = bool(
         _final_delivery_bindings(store, turn_id, topic_id=thread_id)
     )
@@ -7172,7 +7291,7 @@ def _deliver_final(
         _repair_delivered_final_entry(store, item, entry, content_hash)
         entry.pop("tendwire_rebind_catchup_pending", None)
         return False
-    feed_item = _turn_feed_item(item, entry)
+    feed_item = _turn_feed_item(presentation_item, entry)
     if runtime.dry_run:
         state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
         _set_final_delivery(
@@ -7187,50 +7306,151 @@ def _deliver_final(
         return True
     send_changed_as_new = _changed_final_should_send_new_message(item, entry)
     if _final_turn_delivered(store, turn_id) and visible_here:
-        if not send_changed_as_new and entry.get("last_clean_hash") == content_hash and _replace_changed_final(
+        writes_before = int(
+            (physical_write_counter or {}).get("physical_writes") or 0
+        )
+        replaced = bool(
+            not send_changed_as_new
+            and entry.get("last_clean_hash") == content_hash
+            and _replace_changed_final(
+                store,
+                presentation_item,
+                entry,
+                runtime,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                content_hash=content_hash,
+                identity=identity,
+                max_physical_writes=(
+                    remaining_write_allowance if retry_missing else None
+                ),
+                physical_write_counter=physical_write_counter,
+            )
+        )
+        if remaining_write_allowance is not None:
+            remaining_write_allowance = max(
+                0,
+                remaining_write_allowance
+                - (
+                    int(
+                        (physical_write_counter or {}).get(
+                            "physical_writes"
+                        )
+                        or 0
+                    )
+                    - writes_before
+                ),
+            )
+        if replaced:
+            if revision_blockers:
+                _record_partial_final_supersession(
+                    revision_blockers,
+                    content_hash=content_hash,
+                    message_ids=list(
+                        entry.get("last_clean_message_ids") or []
+                    ),
+                )
+            return True
+        if not send_changed_as_new:
+            _repair_delivered_final_entry(store, item, entry, content_hash)
+            return False
+    writes_before = int(
+        (physical_write_counter or {}).get("physical_writes") or 0
+    )
+    replaced = bool(
+        not send_changed_as_new
+        and _replace_changed_final(
             store,
-            item,
+            presentation_item,
             entry,
             runtime,
             chat_id=chat_id,
             thread_id=thread_id,
             content_hash=content_hash,
             identity=identity,
-        ):
-            return True
-        if not send_changed_as_new:
-            _repair_delivered_final_entry(store, item, entry, content_hash)
-            return False
-    if not send_changed_as_new and _replace_changed_final(
+            max_physical_writes=(
+                remaining_write_allowance if retry_missing else None
+            ),
+            physical_write_counter=physical_write_counter,
+        )
+    )
+    if remaining_write_allowance is not None:
+        remaining_write_allowance = max(
+            0,
+            remaining_write_allowance
+            - (
+                int(
+                    (physical_write_counter or {}).get(
+                        "physical_writes"
+                    )
+                    or 0
+                )
+                - writes_before
+            ),
+        )
+    if replaced:
+        if revision_blockers:
+            _record_partial_final_supersession(
+                revision_blockers,
+                content_hash=content_hash,
+                message_ids=list(
+                    entry.get("last_clean_message_ids") or []
+                ),
+            )
+        return True
+    if remaining_write_allowance == 0:
+        return False
+    writes_before = int(
+        (physical_write_counter or {}).get("physical_writes") or 0
+    )
+    promoted = _promote_working_to_final(
         store,
-        item,
+        presentation_item,
         entry,
         runtime,
         chat_id=chat_id,
         thread_id=thread_id,
         content_hash=content_hash,
         identity=identity,
-    ):
+        max_physical_writes=(
+            remaining_write_allowance if retry_missing else None
+        ),
+        physical_write_counter=physical_write_counter,
+    )
+    if remaining_write_allowance is not None:
+        remaining_write_allowance = max(
+            0,
+            remaining_write_allowance
+            - (
+                int(
+                    (physical_write_counter or {}).get(
+                        "physical_writes"
+                    )
+                    or 0
+                )
+                - writes_before
+            ),
+        )
+    if promoted:
+        if revision_blockers:
+            _record_partial_final_supersession(
+                revision_blockers,
+                content_hash=content_hash,
+                message_ids=list(
+                    entry.get("last_clean_message_ids") or []
+                ),
+            )
         return True
-    if _promote_working_to_final(
-        store,
-        item,
-        entry,
-        runtime,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        content_hash=content_hash,
-        identity=identity,
-    ):
-        return True
+    if remaining_write_allowance == 0:
+        return False
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
     operation = _capture_entry_operation(
         store, entry, topic_id=thread_id
     )
     start_part_index = (
-        int(partial.get("failed_part_index") or 0)
-        if retry_missing and isinstance(partial, dict)
+        int(exact_record.get("failed_part_index") or 0)
+        if retry_missing and isinstance(exact_record, dict)
         else 0
     )
     execution = _execute_entry_operation(
@@ -7256,6 +7476,11 @@ def _deliver_final(
         ),
     )
     sent, resolution = execution.result, execution.resolution
+    if physical_write_counter is not None:
+        physical_write_counter["physical_writes"] = (
+            int(physical_write_counter.get("physical_writes") or 0)
+            + _telegram_physical_writes(sent, default=0)
+        )
     message_ids = split_legacy_message_ids(sent)
     if not sent.get("ok"):
         if (
@@ -7302,8 +7527,8 @@ def _deliver_final(
                 turn_id=turn_id,
                 bot_kind=bot_kind,
             )
-        if retry_missing and isinstance(partial, dict):
-            combined_ids = list(partial.get("message_ids") or [])
+        if retry_missing and isinstance(exact_record, dict):
+            combined_ids = list(exact_record.get("message_ids") or [])
             for message_id in message_ids:
                 if message_id not in combined_ids:
                     combined_ids.append(message_id)
@@ -7314,14 +7539,20 @@ def _deliver_final(
                 message_ids=combined_ids,
                 now=time.time(),
             )
+        if revision_blockers:
+            _record_partial_final_supersession(
+                revision_blockers,
+                content_hash=content_hash,
+                message_ids=message_ids,
+            )
         # The accepted text remains an exact, tracked provider fact. Let the
         # optional voice follow-up use its captured thread; routing/delivery
         # completion itself remains deferred to the current route.
         return True
     entry = resolution.entry
     assert entry is not None
-    if retry_missing and isinstance(partial, dict):
-        combined_ids = list(partial.get("message_ids") or [])
+    if retry_missing and isinstance(exact_record, dict):
+        combined_ids = list(exact_record.get("message_ids") or [])
         for message_id in message_ids:
             if message_id not in combined_ids:
                 combined_ids.append(message_id)
@@ -7343,6 +7574,12 @@ def _deliver_final(
             content_hash=content_hash,
             message_ids=message_ids,
             now=time.time(),
+        )
+    if revision_blockers:
+        _record_partial_final_supersession(
+            revision_blockers,
+            content_hash=content_hash,
+            message_ids=message_ids,
         )
     return True
 
@@ -7507,7 +7744,13 @@ def _sync_turns(
         candidate_entry_key, _candidate_entry = _entry_for_turn(store, candidate)
         return candidate if candidate_entry_key == entry_key else None
 
-    counts = {"feed_sent": 0, "sent": 0, "updated": 0, "content_pages": 0}
+    counts = {
+        "feed_sent": 0,
+        "sent": 0,
+        "updated": 0,
+        "content_pages": 0,
+        "physical_writes": 0,
+    }
     turns = _turns(turns_payload)
     if live_worker_ids is not None:
         # Retired-worker turns must not be delivered (same rule already applied
@@ -7627,15 +7870,22 @@ def _sync_turns(
                         )
                     )
                 }
-                delivered = _deliver_final(
-                    store,
-                    item,
-                    entry,
-                    runtime,
-                    chat_id=chat_id,
-                    remaining_write_allowance=max(
-                        0, runtime.max_sends - counts["sent"]
-                    ),
+                remaining_writes = max(
+                    0,
+                    runtime.max_sends - counts["physical_writes"],
+                )
+                delivered = (
+                    _deliver_final(
+                        store,
+                        item,
+                        entry,
+                        runtime,
+                        chat_id=chat_id,
+                        remaining_write_allowance=remaining_writes,
+                        physical_write_counter=counts,
+                    )
+                    if remaining_writes
+                    else False
                 )
                 if delivered:
                     # Legacy inline direct-call compatibility; v2 finals are spoken only after the

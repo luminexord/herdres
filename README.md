@@ -388,13 +388,21 @@ values use the same 60-second fallback, and configured values are clamped to 60
 through 3600 seconds. Durable plan and job checkpoints make expiry and restart
 recovery idempotent without repeating a proven Telegram operation.
 
-A multipart legacy final that accepts a prefix and then fails is held by
-turn/content identity, not by its current worker route. `herdres doctor`
-reports the hold as unhealthy with the original and current route identifiers.
-At 300 seconds (configurable with
-`HERDRES_PARTIAL_FINAL_ESCALATION_SECONDS`, clamped to 30–3600) it becomes an
-escalated failure; time alone never clears it. Resolve `delivery_unknown` only
-after inspecting the recipient by accepting the incomplete result:
+A multipart legacy final that accepts a prefix and then fails creates a
+turn-scoped hold, independent of its current worker route, plus a content-keyed
+replay witness. One turn can retain several witnesses without overwriting an
+earlier revision. `herdres doctor` reports every unresolved record as unhealthy
+with the original and current route identifiers.
+
+For 300 seconds (configurable with
+`HERDRES_PARTIAL_FINAL_ESCALATION_SECONDS`, clamped to 30–3600), a newer
+revision is refused and the recipient keeps only the accepted prefix. After
+that bound, a revision may proceed: the known prefix is replaced when possible,
+or the new message carries an explicit supersession notice, and the old record
+stores the superseding content and message ids. The old hold remains unhealthy
+and still requires human resolution; time never decides whether its ambiguous
+delivery succeeded. Resolve `delivery_unknown` only after inspecting the
+recipient by accepting the incomplete result:
 
 ```
 herdres resolve-partial-final --turn-id TURN --content-hash HASH \

@@ -1644,6 +1644,7 @@ def edit_feed_item(
     telegram: dict[str, Any] | None,
     live: bool = False,
     api_token: str | None = None,
+    max_physical_writes: int | None = None,
 ) -> dict[str, Any]:
     return edit_rich_message(
         client,
@@ -1654,6 +1655,7 @@ def edit_feed_item(
         fallback_text=item_plain_text(item),
         api_token=api_token,
         preserve_plain_html=bool(item.get("collapse_response")),
+        max_physical_writes=max_physical_writes,
     )
 
 

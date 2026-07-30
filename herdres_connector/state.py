@@ -22,7 +22,7 @@ from .rendering import normalized_status
 from .safe import compact_ws, short_hash
 
 DELIVERED_TURN_LEDGER_LIMIT = 10000
-PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION = 2
+PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION = 3
 TENDWIRE_TURN_JOB_LIMIT = 20001
 TENDWIRE_TURN_JOB_STALE_COPY_LIMIT = 8
 ORPHANED_CREATED_TOPIC_LIMIT = 200
@@ -3767,59 +3767,112 @@ def mark_delivered(data: dict[str, Any], identity: str, record: dict[str, Any]) 
     return True
 
 
-def partial_final_delivery_key(turn_id: str) -> str:
-    """Return the route- and content-independent identity for one held turn."""
+def partial_final_delivery_key(turn_id: str, content_hash: str) -> str:
+    """Return the durable replay-witness identity for one turn revision."""
 
     turn = compact_ws(turn_id, 200)
-    if not turn:
-        raise ValueError("partial final requires turn identity")
-    return short_hash({"partial_final_turn_id": turn}, 40)
+    content = compact_ws(content_hash, 200)
+    if not turn or not content:
+        raise ValueError("partial final requires turn and content identity")
+    return short_hash(
+        {"partial_final_turn_id": turn, "content_hash": content},
+        40,
+    )
 
 
-def partial_final_deliveries(data: dict[str, Any]) -> dict[str, Any]:
-    """Return the durable turn-keyed incomplete-final ledger."""
+def partial_final_deliveries(
+    data: dict[str, Any],
+    *,
+    create: bool = False,
+) -> dict[str, Any]:
+    """Return content-keyed records whose active members hold their turn.
+
+    Schema v2 briefly stored one turn-keyed slot. Re-key every valid record by
+    content so resolved replay witnesses survive later revisions. Multiple
+    active content records for one turn remain independently visible and
+    resolvable; their presence collectively forms the turn-scoped hold.
+    """
 
     records = data.get("telegram_partial_final_deliveries")
     if not isinstance(records, dict):
         records = {}
-        data["telegram_partial_final_deliveries"] = records
+        if create:
+            data["telegram_partial_final_deliveries"] = records
+        return records
+    normalized: dict[str, Any] = {}
+    for record in records.values():
+        if not isinstance(record, dict):
+            continue
+        turn_id = compact_ws(record.get("turn_id"), 200)
+        content_hash = compact_ws(record.get("content_hash"), 200)
+        if not turn_id or not content_hash:
+            continue
+        record["schema_version"] = PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION
+        key = partial_final_delivery_key(turn_id, content_hash)
+        incumbent = normalized.get(key)
+        if not isinstance(incumbent, dict):
+            normalized[key] = record
+            continue
+        incumbent_active = (
+            incumbent.get("status") in {"held", "retry_authorized"}
+            and incumbent.get("operator_attention_required") is True
+        )
+        record_active = (
+            record.get("status") in {"held", "retry_authorized"}
+            and record.get("operator_attention_required") is True
+        )
+        if record_active and not incumbent_active:
+            normalized[key] = record
+    if list(records.items()) != list(normalized.items()):
+        records.clear()
+        records.update(normalized)
     return records
 
 
 def find_partial_final_delivery(
     data: dict[str, Any],
     turn_id: str,
+    content_hash: str,
 ) -> dict[str, Any] | None:
-    records = data.get("telegram_partial_final_deliveries")
-    if not isinstance(records, dict):
-        return None
-    canonical_key = partial_final_delivery_key(turn_id)
-    record = records.get(canonical_key)
-    if isinstance(record, dict):
-        return record
-    # Adopt the pre-v2 turn/content-keyed record in place. The accepted prefix
-    # belongs to the turn even when the source content is later revised.
-    for legacy_key, candidate in list(records.items()):
-        if (
-            isinstance(candidate, dict)
-            and candidate.get("turn_id") == turn_id
-        ):
-            records[canonical_key] = candidate
-            if legacy_key != canonical_key:
-                records.pop(legacy_key, None)
-            return candidate
-    return None
+    record = partial_final_deliveries(data).get(
+        partial_final_delivery_key(turn_id, content_hash)
+    )
+    return record if isinstance(record, dict) else None
+
+
+def partial_final_delivery_records_for_turn(
+    data: dict[str, Any],
+    turn_id: str,
+) -> list[dict[str, Any]]:
+    """Return every content witness for a turn without collapsing revisions."""
+
+    return [
+        record
+        for record in partial_final_deliveries(data).values()
+        if isinstance(record, dict) and record.get("turn_id") == turn_id
+    ]
+
+
+def active_partial_final_deliveries_for_turn(
+    data: dict[str, Any],
+    turn_id: str,
+) -> list[dict[str, Any]]:
+    """Return every unresolved content record forming this turn's hold."""
+
+    return [
+        record
+        for record in partial_final_delivery_records_for_turn(data, turn_id)
+        if record.get("status") in {"held", "retry_authorized"}
+        and record.get("operator_attention_required") is True
+    ]
 
 
 def active_partial_final_deliveries(
     data: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    records = data.get("telegram_partial_final_deliveries")
-    if not isinstance(records, dict):
-        return []
     return [
         record
-        for record in records.values()
+        for record in partial_final_deliveries(data).values()
         if isinstance(record, dict)
         and record.get("status") in {"held", "retry_authorized"}
         and record.get("operator_attention_required") is True
@@ -3894,6 +3947,10 @@ def partial_final_delivery_health(
                 "turn_id",
                 "content_hash",
                 "blocked_revision_content_hash",
+                "superseded_by_content_hash",
+                "superseded_at",
+                "supersession",
+                "supersession_message_ids",
                 "terminal_outcome",
                 "status",
                 "original_worker_id",
@@ -3955,11 +4012,9 @@ def resolve_partial_final_delivery(
     Neither action authorizes replay of the already accepted prefix.
     """
 
-    record = find_partial_final_delivery(data, turn_id)
+    record = find_partial_final_delivery(data, turn_id, content_hash)
     if record is None:
         raise KeyError("partial final delivery not found")
-    if record.get("content_hash") != content_hash:
-        raise KeyError("partial final content identity does not match")
     prior_request = str(record.get("resolution_request_id") or "")
     prior_action = str(record.get("resolution_action") or "")
     if prior_request:
@@ -4006,11 +4061,9 @@ def complete_partial_final_retry(
 ) -> dict[str, Any]:
     """Complete a previously operator-authorized missing-suffix retry."""
 
-    record = find_partial_final_delivery(data, turn_id)
+    record = find_partial_final_delivery(data, turn_id, content_hash)
     if record is None or record.get("status") != "retry_authorized":
         raise ValueError("partial final suffix retry is not authorized")
-    if record.get("content_hash") != content_hash:
-        raise ValueError("partial final content identity does not match")
     record["status"] = "resolved"
     record["resolved_at"] = float(now)
     record["resolution"] = "missing_suffix_delivered"

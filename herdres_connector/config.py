@@ -142,7 +142,7 @@ def tendwire_turn_final_lease_seconds(env: Any | None = None) -> int:
 
 
 def partial_final_escalation_seconds(env: Any | None = None) -> int:
-    """Maximum age before an unresolved partial final becomes escalated."""
+    """Bound before escalation and explicit newer-revision supersession."""
 
     source = os.environ if env is None else env
     raw = source.get(
