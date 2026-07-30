@@ -223,6 +223,30 @@ def inbound_lane_backoff_seconds(env: Any | None = None) -> float:
     return min(300.0, max(0.01, value))
 
 
+def inbound_hold_seconds(env: Any | None = None) -> float:
+    """Maximum time an ambiguous delivery may hold strict lane FIFO."""
+
+    source = os.environ if env is None else env
+    try:
+        value = float(str(source.get("HERDRES_INBOUND_HOLD_SECONDS", "15") or "15"))
+    except (TypeError, ValueError):
+        return 15.0
+    return min(60.0, max(1.0, value))
+
+
+def inbound_lane_stall_seconds(env: Any | None = None) -> float:
+    """Age at which a non-draining pending lane fails the health probe."""
+
+    source = os.environ if env is None else env
+    try:
+        value = float(
+            str(source.get("HERDRES_INBOUND_LANE_STALL_SECONDS", "5") or "5")
+        )
+    except (TypeError, ValueError):
+        return 5.0
+    return min(60.0, max(1.0, value))
+
+
 def gateway_timing_logs_enabled(env: Any | None = None) -> bool:
     """Emit one structured timing breadcrumb at each durable ingress hop."""
 

@@ -133,6 +133,28 @@ with at most one leased head, while up to
 `HERDRES_INBOUND_DISPATCH_WORKERS` lanes run concurrently (default `8`). A
 retry delays only its lane using exponential backoff based on
 `HERDRES_INBOUND_LANE_BACKOFF_SECONDS` (default `2`, capped at five minutes).
+An accepted-but-unverified delivery holds that strict FIFO for at most
+`HERDRES_INBOUND_HOLD_SECONDS` (default `15`), then becomes terminal without
+redispatch; later messages are never leased before that transition. The
+dispatcher caps its sleep at the hold expiry, so this bound does not grow with
+the retry backoff. `herdres doctor` fails with the structured
+`inbound_lane_stalled` signal when a lane has pending work but no claimable head
+continuously for `HERDRES_INBOUND_LANE_STALL_SECONDS` (default `5`). The clock
+starts at the current obstructing head's state transition, so old followers
+behind a freshly claimed head do not produce a false alarm.
+On the first boot after adding that clock, legacy blocked and retry-pending rows
+use their latest transition timestamp. A retry-pending head is excluded from
+stall evaluation until its backoff is due. A legacy processing timestamp is
+unknowable because its latest write may only be a lease heartbeat, so its clock
+remains null: doctor fails with `inbound_lane_obstruction_unknown`, names the
+lane, and reports no duration. Gateway startup reclaims inherited processing
+leases and supplies the first real transition timestamp. Retry obstruction has
+its own durable clock, set by the first retry and preserved across later
+backoffs. A retry shorter than the stall threshold remains healthy; at the
+threshold doctor fails with `inbound_lane_retry_obstructed`. Thus every
+non-claimable lane is visible within five seconds by default, without calling a
+legitimate short retry stalled. The nullable columns also remain writable by
+the prior release during rollback.
 The dispatcher renews a claimed lease across the full pipeline, including
 unbounded voice pretranscription, command execution, and terminal receipt commit.
 Expired leases are reclaimed after a crash and replay the same request ID;

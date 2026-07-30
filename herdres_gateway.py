@@ -1103,6 +1103,8 @@ class _InboundLaneDispatcher:
         workers: int | None = None,
         backoff_seconds: float | None = None,
         lease_seconds: float | None = None,
+        hold_seconds: float | None = None,
+        stall_after_seconds: float | None = None,
     ) -> None:
         self.spool = spool
         self.request_id_key = request_id_key
@@ -1121,6 +1123,16 @@ class _InboundLaneDispatcher:
             max(120.0, float(COMMAND_TIMEOUT) + 30.0)
             if lease_seconds is None
             else float(lease_seconds),
+        )
+        self.hold_seconds = (
+            config.inbound_hold_seconds()
+            if hold_seconds is None
+            else max(0.1, float(hold_seconds))
+        )
+        self.stall_after_seconds = (
+            config.inbound_lane_stall_seconds()
+            if stall_after_seconds is None
+            else max(0.0, float(stall_after_seconds))
         )
         self._stop = threading.Event()
         # One durable enqueue needs one claimant. A threading.Event wakes every
@@ -1306,7 +1318,19 @@ class _InboundLaneDispatcher:
                 dispatch_slot_acquired = False
                 try:
                     stage_started = time.monotonic()
-                    snapshot = self.spool.dispatch_snapshot()
+                    snapshot = self.spool.dispatch_snapshot(
+                        stall_after_seconds=self.stall_after_seconds
+                    )
+                    expired_holds = 0
+                    if (
+                        snapshot.next_blocked_expiry_at is not None
+                        and snapshot.next_blocked_expiry_at <= time.time()
+                    ):
+                        expired_holds = self.spool.expire_holds()
+                        if expired_holds:
+                            snapshot = self.spool.dispatch_snapshot(
+                                stall_after_seconds=self.stall_after_seconds
+                            )
                     snapshot_ms = (time.monotonic() - stage_started) * 1000.0
                     _timing_log(
                         "dispatcher_iteration",
@@ -1316,6 +1340,7 @@ class _InboundLaneDispatcher:
                             f"pending={snapshot.pending_count},"
                             f"claimable={snapshot.claimable_lane_count},"
                             f"processing={snapshot.processing_count},"
+                            f"expired_holds={expired_holds},"
                             f"worker={worker_name},iteration={iteration}"
                         ),
                     )
@@ -1369,6 +1394,14 @@ class _InboundLaneDispatcher:
                             + self.backoff_seconds
                             - time.monotonic(),
                         )
+                        if snapshot.next_blocked_expiry_at is not None:
+                            wait_timeout = min(
+                                wait_timeout,
+                                max(
+                                    0.0,
+                                    snapshot.next_blocked_expiry_at - time.time(),
+                                ),
+                            )
                     else:
                         result = "claimed"
                         _timing_log(
@@ -1557,7 +1590,11 @@ class _InboundLaneDispatcher:
                 elapsed_from_receive=time.time() - item.first_seen_at,
             )
         elif checkpoint == CHECKPOINT_HOLD:
-            self.spool.mark_blocked(item.seq, lease_owner)
+            self.spool.mark_blocked(
+                item.seq,
+                lease_owner,
+                hold_seconds=self.hold_seconds,
+            )
             _timing_log(
                 "lane_blocked",
                 request_id=item.request_id,

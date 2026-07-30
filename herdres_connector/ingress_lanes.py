@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS lane_items (
     lease_owner TEXT,
     lease_until REAL,
     notify_state TEXT NOT NULL DEFAULT 'pending',
+    state_since REAL,
+    retry_obstructed_since REAL,
     updated_at REAL NOT NULL,
     UNIQUE(receiver_kind, update_id)
 );
@@ -52,6 +54,8 @@ CREATE INDEX IF NOT EXISTS lane_items_pending_by_attempt
     ON lane_items(next_attempt_at, seq) WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS lane_items_processing_by_lease
     ON lane_items(lease_until) WHERE state = 'processing';
+CREATE INDEX IF NOT EXISTS lane_items_blocked_by_expiry
+    ON lane_items(next_attempt_at) WHERE state = 'blocked';
 """
 
 
@@ -90,6 +94,16 @@ class DispatchSnapshot:
     eligible_lane_count: int
     claimable_lane_count: int
     first_claimable_lane: str
+    blocked_count: int
+    next_blocked_expiry_at: float | None
+    unknown_obstruction_lane_count: int
+    first_unknown_obstruction_lane: str
+    retry_obstructed_lane_count: int
+    first_retry_obstructed_lane: str
+    oldest_retry_obstructed_seconds: float
+    stalled_lane_count: int
+    first_stalled_lane: str
+    oldest_stalled_seconds: float
 
 
 def lane_key(receiver_kind: str, topic_id: str) -> str:
@@ -125,6 +139,8 @@ class IngressLaneSpool:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
             self._migrate_blocked_state(connection)
+            self._migrate_state_since(connection)
+            self._migrate_retry_obstructed_since(connection)
 
     @staticmethod
     def _migrate_blocked_state(connection: sqlite3.Connection) -> None:
@@ -141,6 +157,7 @@ class IngressLaneSpool:
             connection.execute("DROP INDEX IF EXISTS lane_items_open_by_lane")
             connection.execute("DROP INDEX IF EXISTS lane_items_pending_by_attempt")
             connection.execute("DROP INDEX IF EXISTS lane_items_processing_by_lease")
+            connection.execute("DROP INDEX IF EXISTS lane_items_blocked_by_expiry")
             connection.execute("ALTER TABLE lane_items RENAME TO lane_items_before_hold")
             connection.execute(
                 """
@@ -191,6 +208,69 @@ class IngressLaneSpool:
                     ON lane_items(lease_until) WHERE state = 'processing'
                 """
             )
+            connection.execute(
+                """
+                CREATE INDEX lane_items_blocked_by_expiry
+                    ON lane_items(next_attempt_at) WHERE state = 'blocked'
+                """
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_state_since(connection: sqlite3.Connection) -> None:
+        """Add state-specific transition clocks without inventing lease age."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(lane_items)").fetchall()
+        }
+        if "state_since" in columns:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("ALTER TABLE lane_items ADD COLUMN state_since REAL")
+            connection.execute(
+                """
+                UPDATE lane_items
+                SET state_since = CASE
+                    WHEN state = 'blocked' THEN updated_at
+                    WHEN state = 'pending' THEN updated_at
+                    WHEN state = 'processing' THEN NULL
+                    WHEN state = 'done' THEN updated_at
+                END
+                WHERE state_since IS NULL
+                """
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_retry_obstructed_since(connection: sqlite3.Connection) -> None:
+        """Add a clock that survives successive retry state transitions."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(lane_items)").fetchall()
+        }
+        if "retry_obstructed_since" in columns:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "ALTER TABLE lane_items ADD COLUMN retry_obstructed_since REAL"
+            )
+            connection.execute(
+                """
+                UPDATE lane_items
+                SET retry_obstructed_since = updated_at
+                WHERE state = 'pending' AND attempts > 0
+                """
+            )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -210,6 +290,29 @@ class IngressLaneSpool:
     @staticmethod
     def _begin(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
+
+    @staticmethod
+    def _expire_holds_tx(
+        connection: sqlite3.Connection,
+        timestamp: float,
+    ) -> int:
+        """Terminalize expired ambiguous deliveries without redispatch."""
+
+        return int(
+            connection.execute(
+                """
+                UPDATE lane_items
+                SET state = 'done', lease_owner = NULL, lease_until = NULL,
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
+                    state_since = ?, updated_at = ?
+                WHERE state = 'blocked' AND next_attempt_at <= ?
+                """,
+                (timestamp, timestamp, timestamp),
+            ).rowcount
+        )
 
     @staticmethod
     def _advance_cursor_tx(
@@ -324,12 +427,12 @@ class IngressLaneSpool:
 
                 cursor_row = connection.execute(
                     """
-                    INSERT OR IGNORE INTO lane_items(
+                    INSERT INTO lane_items(
                         request_id, receiver_kind, update_id, lane_key, kind,
                         update_json, route_json, state, attempts, first_seen_at,
                         next_attempt_at, deadline_at, lease_owner, lease_until,
-                        notify_state, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, NULL, ?, ?)
+                        notify_state, state_since, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, NULL, ?, ?, ?)
                     """,
                     (
                         request_id,
@@ -345,9 +448,12 @@ class IngressLaneSpool:
                         float(deadline_at),
                         "cached" if already_done else "pending",
                         now,
+                        now,
                     ),
                 )
-                seq = int(cursor_row.lastrowid)
+                seq = int(cursor_row.lastrowid or 0)
+                if cursor_row.rowcount != 1 or seq <= 0:
+                    raise RuntimeError("inbound spool insert did not persist")
                 cursor = self._advance_cursor_tx(
                     connection, receiver_kind, update_id + 1, now
                 )
@@ -372,11 +478,21 @@ class IngressLaneSpool:
                     """
                     UPDATE lane_items
                     SET state = 'pending', lease_owner = NULL, lease_until = NULL,
-                        updated_at = ?
+                        retry_obstructed_since = COALESCE(
+                            retry_obstructed_since,
+                            CASE WHEN attempts > 0 THEN updated_at END
+                        ),
+                        state_since = ?, updated_at = ?
                     WHERE state = 'processing' AND lease_until <= ?
                     """,
-                    (timestamp, timestamp),
+                    (timestamp, timestamp, timestamp),
                 )
+                # Ambiguous delivery is never retried: when its short hold
+                # expires, terminalize the spool row in the same claim
+                # transaction. The unchanged head-only query below therefore
+                # preserves strict FIFO; a follower cannot be leased before
+                # its predecessor is terminal.
+                self._expire_holds_tx(connection, timestamp)
                 row = connection.execute(
                     """
                     SELECT candidate.*
@@ -398,13 +514,36 @@ class IngressLaneSpool:
                     connection.commit()
                     return None
                 lease_until = timestamp + max(0.1, float(lease_seconds))
+                # A rollback writer cannot populate the durable retry clock.
+                # Promote its pre-claim updated_at before this UPDATE replaces
+                # that read-only fallback with the claim timestamp.
+                retry_obstructed_since = (
+                    float(row["retry_obstructed_since"])
+                    if row["retry_obstructed_since"] is not None
+                    else (
+                        float(row["updated_at"])
+                        if int(row["attempts"]) > 0
+                        else None
+                    )
+                )
                 changed = connection.execute(
                     """
                     UPDATE lane_items
-                    SET state = 'processing', lease_owner = ?, lease_until = ?, updated_at = ?
+                    SET state = 'processing', lease_owner = ?, lease_until = ?,
+                        state_since = ?,
+                        retry_obstructed_since =
+                            COALESCE(retry_obstructed_since, ?),
+                        updated_at = ?
                     WHERE seq = ? AND state = 'pending'
                     """,
-                    (str(lease_owner), lease_until, timestamp, int(row["seq"])),
+                    (
+                        str(lease_owner),
+                        lease_until,
+                        timestamp,
+                        retry_obstructed_since,
+                        timestamp,
+                        int(row["seq"]),
+                    ),
                 ).rowcount
                 if changed != 1:
                     connection.rollback()
@@ -431,7 +570,12 @@ class IngressLaneSpool:
             notify_state=str(row["notify_state"]),
         )
 
-    def dispatch_snapshot(self, *, now: float | None = None) -> DispatchSnapshot:
+    def dispatch_snapshot(
+        self,
+        *,
+        now: float | None = None,
+        stall_after_seconds: float | None = None,
+    ) -> DispatchSnapshot:
         """Describe spool-visible work without applying receiver/spec filters.
 
         A lane is eligible whenever the spool contains a pending row for it.
@@ -440,6 +584,11 @@ class IngressLaneSpool:
         """
 
         timestamp = time.time() if now is None else float(now)
+        stall_after = (
+            config.inbound_lane_stall_seconds()
+            if stall_after_seconds is None
+            else max(0.0, float(stall_after_seconds))
+        )
         with self._connect() as connection:
             snapshot_row = connection.execute(
                 """
@@ -447,6 +596,16 @@ class IngressLaneSpool:
                     SELECT seq, lane_key
                     FROM lane_items
                     WHERE state = 'pending'
+                ),
+                pending_lanes AS (
+                    SELECT DISTINCT lane_key
+                    FROM pending
+                ),
+                open_heads AS (
+                    SELECT lane_key, MIN(seq) AS head_seq
+                    FROM lane_items
+                    WHERE state != 'done'
+                    GROUP BY lane_key
                 ),
                 claimable AS (
                     SELECT candidate.seq, candidate.lane_key
@@ -458,6 +617,67 @@ class IngressLaneSpool:
                           WHERE prior.lane_key = candidate.lane_key
                             AND prior.state != 'done'
                             AND prior.seq < candidate.seq
+                      )
+                ),
+                obstructions AS (
+                    SELECT
+                        pending_lane.lane_key,
+                        CASE
+                            WHEN head.state_since IS NOT NULL
+                                THEN head.state_since
+                            WHEN head.state = 'processing'
+                                THEN NULL
+                            ELSE head.updated_at
+                        END AS obstruction_started_at
+                    FROM pending_lanes AS pending_lane
+                    JOIN open_heads AS open_head
+                      ON open_head.lane_key = pending_lane.lane_key
+                    JOIN lane_items AS head
+                      ON head.seq = open_head.head_seq
+                    WHERE NOT (
+                        head.state = 'pending'
+                        AND head.next_attempt_at > ?
+                    )
+                ),
+                unknown_obstructions AS (
+                    SELECT obstruction.lane_key
+                    FROM obstructions AS obstruction
+                    WHERE obstruction.obstruction_started_at IS NULL
+                ),
+                retry_candidates AS (
+                    SELECT
+                        pending_lane.lane_key,
+                        COALESCE(
+                            head.retry_obstructed_since,
+                            CASE
+                                WHEN head.state = 'pending' AND head.attempts > 0
+                                    THEN head.updated_at
+                            END
+                        ) AS obstruction_started_at
+                    FROM pending_lanes AS pending_lane
+                    JOIN open_heads AS open_head
+                      ON open_head.lane_key = pending_lane.lane_key
+                    JOIN lane_items AS head
+                      ON head.seq = open_head.head_seq
+                ),
+                retry_obstructions AS (
+                    SELECT
+                        candidate.lane_key,
+                        candidate.obstruction_started_at
+                    FROM retry_candidates AS candidate
+                    WHERE candidate.obstruction_started_at <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM claimable
+                          WHERE claimable.lane_key = candidate.lane_key
+                      )
+                ),
+                stalled AS (
+                    SELECT obstruction.lane_key, obstruction.obstruction_started_at
+                    FROM obstructions AS obstruction
+                    WHERE obstruction.obstruction_started_at <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM claimable
+                          WHERE claimable.lane_key = obstruction.lane_key
                       )
                 )
                 SELECT
@@ -477,9 +697,59 @@ class IngressLaneSpool:
                         FROM claimable
                         ORDER BY seq
                         LIMIT 1
-                    ) AS first_claimable_lane
+                    ) AS first_claimable_lane,
+                    (
+                        SELECT COUNT(*)
+                        FROM lane_items
+                        WHERE state = 'blocked'
+                    ) AS blocked_count,
+                    (
+                        SELECT MIN(next_attempt_at)
+                        FROM lane_items
+                        WHERE state = 'blocked'
+                    ) AS next_blocked_expiry_at,
+                    (
+                        SELECT COUNT(*)
+                        FROM unknown_obstructions
+                    ) AS unknown_obstruction_lane_count,
+                    (
+                        SELECT lane_key
+                        FROM unknown_obstructions
+                        ORDER BY lane_key
+                        LIMIT 1
+                    ) AS first_unknown_obstruction_lane,
+                    (
+                        SELECT COUNT(*)
+                        FROM retry_obstructions
+                    ) AS retry_obstructed_lane_count,
+                    (
+                        SELECT lane_key
+                        FROM retry_obstructions
+                        ORDER BY obstruction_started_at, lane_key
+                        LIMIT 1
+                    ) AS first_retry_obstructed_lane,
+                    (
+                        SELECT MIN(obstruction_started_at)
+                        FROM retry_obstructions
+                    ) AS oldest_retry_obstructed_at,
+                    (SELECT COUNT(*) FROM stalled) AS stalled_lane_count,
+                    (
+                        SELECT lane_key
+                        FROM stalled
+                        ORDER BY obstruction_started_at, lane_key
+                        LIMIT 1
+                    ) AS first_stalled_lane,
+                    (
+                        SELECT MIN(obstruction_started_at)
+                        FROM stalled
+                    ) AS oldest_stalled_at
                 """,
-                (timestamp,),
+                (
+                    timestamp,
+                    timestamp,
+                    timestamp - stall_after,
+                    timestamp - stall_after,
+                ),
             ).fetchone()
         return DispatchSnapshot(
             pending_count=(
@@ -510,7 +780,85 @@ class IngressLaneSpool:
                 )
                 else ""
             ),
+            blocked_count=(
+                int(snapshot_row["blocked_count"])
+                if snapshot_row is not None
+                else 0
+            ),
+            next_blocked_expiry_at=(
+                float(snapshot_row["next_blocked_expiry_at"])
+                if (
+                    snapshot_row is not None
+                    and snapshot_row["next_blocked_expiry_at"] is not None
+                )
+                else None
+            ),
+            unknown_obstruction_lane_count=(
+                int(snapshot_row["unknown_obstruction_lane_count"])
+                if snapshot_row is not None
+                else 0
+            ),
+            first_unknown_obstruction_lane=(
+                str(snapshot_row["first_unknown_obstruction_lane"])
+                if (
+                    snapshot_row is not None
+                    and snapshot_row["first_unknown_obstruction_lane"] is not None
+                )
+                else ""
+            ),
+            retry_obstructed_lane_count=(
+                int(snapshot_row["retry_obstructed_lane_count"])
+                if snapshot_row is not None
+                else 0
+            ),
+            first_retry_obstructed_lane=(
+                str(snapshot_row["first_retry_obstructed_lane"])
+                if (
+                    snapshot_row is not None
+                    and snapshot_row["first_retry_obstructed_lane"] is not None
+                )
+                else ""
+            ),
+            oldest_retry_obstructed_seconds=(
+                max(
+                    0.0,
+                    timestamp - float(snapshot_row["oldest_retry_obstructed_at"]),
+                )
+                if (
+                    snapshot_row is not None
+                    and snapshot_row["oldest_retry_obstructed_at"] is not None
+                )
+                else 0.0
+            ),
+            stalled_lane_count=(
+                int(snapshot_row["stalled_lane_count"])
+                if snapshot_row is not None
+                else 0
+            ),
+            first_stalled_lane=(
+                str(snapshot_row["first_stalled_lane"])
+                if (
+                    snapshot_row is not None
+                    and snapshot_row["first_stalled_lane"] is not None
+                )
+                else ""
+            ),
+            oldest_stalled_seconds=(
+                max(0.0, timestamp - float(snapshot_row["oldest_stalled_at"]))
+                if (
+                    snapshot_row is not None
+                    and snapshot_row["oldest_stalled_at"] is not None
+                )
+                else 0.0
+            ),
         )
+
+    def expire_holds(self, *, now: float | None = None) -> int:
+        """Apply due hold transitions independently of dispatch capacity."""
+
+        timestamp = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            return self._expire_holds_tx(connection, timestamp)
 
     def reclaim_processing(self, *, now: float | None = None) -> int:
         """Make leases from a previous dispatcher process immediately runnable."""
@@ -521,10 +869,15 @@ class IngressLaneSpool:
                 """
                 UPDATE lane_items
                 SET state = 'pending', next_attempt_at = MIN(next_attempt_at, ?),
-                    lease_owner = NULL, lease_until = NULL, updated_at = ?
+                    lease_owner = NULL, lease_until = NULL,
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
+                    state_since = ?, updated_at = ?
                 WHERE state = 'processing'
                 """,
-                (timestamp, timestamp),
+                (timestamp, timestamp, timestamp),
             ).rowcount
         return int(changed)
 
@@ -544,7 +897,12 @@ class IngressLaneSpool:
             changed = connection.execute(
                 """
                 UPDATE lane_items
-                SET lease_until = ?, updated_at = ?
+                SET lease_until = ?,
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
+                    updated_at = ?
                 WHERE seq = ? AND state = 'processing' AND lease_owner = ?
                 """,
                 (lease_until, timestamp, int(seq), str(lease_owner)),
@@ -566,7 +924,12 @@ class IngressLaneSpool:
             changed = connection.execute(
                 """
                 UPDATE lane_items
-                SET notify_state = 'claimed', updated_at = ?
+                SET notify_state = 'claimed',
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
+                    updated_at = ?
                 WHERE seq = ? AND notify_state = 'pending'
                 """,
                 (timestamp, int(seq)),
@@ -581,7 +944,12 @@ class IngressLaneSpool:
             changed = connection.execute(
                 """
                 UPDATE lane_items
-                SET notify_state = 'sent', updated_at = ?
+                SET notify_state = 'sent',
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
+                    updated_at = ?
                 WHERE seq = ? AND notify_state = 'claimed'
                 """,
                 (timestamp, int(seq)),
@@ -602,11 +970,17 @@ class IngressLaneSpool:
                 """
                 UPDATE lane_items
                 SET state = 'done', lease_owner = NULL, lease_until = NULL,
-                    notify_state = COALESCE(?, notify_state), updated_at = ?
+                    notify_state = COALESCE(?, notify_state),
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
+                    state_since = ?, updated_at = ?
                 WHERE seq = ? AND state = 'processing' AND lease_owner = ?
                 """,
                 (
                     None if notify_state is None else str(notify_state),
+                    timestamp,
                     timestamp,
                     int(seq),
                     str(lease_owner),
@@ -620,19 +994,36 @@ class IngressLaneSpool:
         lease_owner: str,
         *,
         now: float | None = None,
+        hold_seconds: float | None = None,
     ) -> bool:
-        """Hold a lane head without timer-driven redispatch."""
+        """Hold a lane head briefly, then terminalize it without redispatch."""
 
         timestamp = time.time() if now is None else float(now)
+        hold_for = (
+            config.inbound_hold_seconds()
+            if hold_seconds is None
+            else max(0.1, float(hold_seconds))
+        )
         with self._connect() as connection:
             changed = connection.execute(
                 """
                 UPDATE lane_items
                 SET state = 'blocked', lease_owner = NULL, lease_until = NULL,
-                    updated_at = ?
+                    next_attempt_at = MIN(deadline_at, ?),
+                    retry_obstructed_since = COALESCE(
+                        retry_obstructed_since,
+                        CASE WHEN attempts > 0 THEN updated_at END
+                    ),
+                    state_since = ?, updated_at = ?
                 WHERE seq = ? AND state = 'processing' AND lease_owner = ?
                 """,
-                (timestamp, int(seq), str(lease_owner)),
+                (
+                    timestamp + hold_for,
+                    timestamp,
+                    timestamp,
+                    int(seq),
+                    str(lease_owner),
+                ),
             ).rowcount
         return changed == 1
 
@@ -665,10 +1056,22 @@ class IngressLaneSpool:
                     """
                     UPDATE lane_items
                     SET state = 'pending', attempts = ?, next_attempt_at = ?,
-                        lease_owner = NULL, lease_until = NULL, updated_at = ?
+                        lease_owner = NULL, lease_until = NULL,
+                        state_since = ?,
+                        retry_obstructed_since =
+                            COALESCE(retry_obstructed_since, ?),
+                        updated_at = ?
                     WHERE seq = ? AND state = 'processing' AND lease_owner = ?
                     """,
-                    (attempts, next_attempt, timestamp, int(seq), str(lease_owner)),
+                    (
+                        attempts,
+                        next_attempt,
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                        int(seq),
+                        str(lease_owner),
+                    ),
                 )
                 connection.commit()
                 return True

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config, state
+from .ingress_lanes import IngressLaneSpool
 from .safe import sanitize_text
 from .tendwire_client import TendwireClient
 
@@ -108,6 +109,75 @@ def tendwire_delta_feed() -> dict[str, Any]:
     return result
 
 
+def inbound_lanes(
+    path: Path | None = None,
+    *,
+    now: float | None = None,
+    stall_after_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Expose a structured failure signal for a non-draining ingress lane."""
+
+    if not config.inbound_lanes_enabled():
+        return {"ok": True, "status": "disabled"}
+    db_path = path or config.inbound_spool_path()
+    if not db_path.exists():
+        return {"ok": True, "status": "bootstrapping"}
+    threshold = (
+        config.inbound_lane_stall_seconds()
+        if stall_after_seconds is None
+        else max(0.0, float(stall_after_seconds))
+    )
+    try:
+        snapshot = IngressLaneSpool(db_path).dispatch_snapshot(
+            now=now,
+            stall_after_seconds=threshold,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        return {
+            "ok": False,
+            "status": "error",
+            "signal": "inbound_lane_probe_failed",
+            "error": sanitize_text(str(exc), 200),
+        }
+    stalled = snapshot.stalled_lane_count > 0
+    unknown = snapshot.unknown_obstruction_lane_count > 0
+    retry_obstructed = snapshot.retry_obstructed_lane_count > 0
+    if stalled:
+        status = "stalled"
+        signal = "inbound_lane_stalled"
+    elif unknown:
+        status = "obstruction_unknown"
+        signal = "inbound_lane_obstruction_unknown"
+    elif retry_obstructed:
+        status = "retry_obstructed"
+        signal = "inbound_lane_retry_obstructed"
+    else:
+        status = "healthy"
+        signal = ""
+    return {
+        "ok": not (stalled or unknown or retry_obstructed),
+        "status": status,
+        "signal": signal,
+        "threshold_seconds": threshold,
+        "pending": snapshot.pending_count,
+        "claimable": snapshot.claimable_lane_count,
+        "blocked": snapshot.blocked_count,
+        "unknown_obstructions": snapshot.unknown_obstruction_lane_count,
+        "first_unknown_obstruction_lane": (
+            snapshot.first_unknown_obstruction_lane
+        ),
+        "unknown_obstruction_duration_seconds": None,
+        "retry_obstructed_lanes": snapshot.retry_obstructed_lane_count,
+        "first_retry_obstructed_lane": snapshot.first_retry_obstructed_lane,
+        "oldest_retry_obstructed_seconds": (
+            snapshot.oldest_retry_obstructed_seconds
+        ),
+        "stalled_lanes": snapshot.stalled_lane_count,
+        "oldest_stalled_seconds": snapshot.oldest_stalled_seconds,
+        "first_stalled_lane": snapshot.first_stalled_lane,
+    }
+
+
 def run_doctor(client: TendwireClient | None = None) -> dict[str, Any]:
     checks = {
         "source_services": source_services(),
@@ -115,5 +185,6 @@ def run_doctor(client: TendwireClient | None = None) -> dict[str, Any]:
         "sqlite_integrity": sqlite_integrity(),
         "tendwire_backend": tendwire_backend(client),
         "tendwire_delta_feed": tendwire_delta_feed(),
+        "inbound_lanes": inbound_lanes(),
     }
     return {"ok": all(item.get("ok") for item in checks.values()), "checks": checks}
