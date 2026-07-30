@@ -12231,7 +12231,7 @@ def _sync_pinned(
     for entry in state.source_worker_entries(store).values():
         if (
             not _entry_open_for_pin(entry)
-            or entry.get("live_in_snapshot") is not True
+            or entry.get("live_in_snapshot") is False
         ):
             continue
         worker_id = str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "")

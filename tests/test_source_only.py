@@ -2150,6 +2150,41 @@ def test_live_unbound_status_counts_and_marks_only_snapshot_panes():
     assert "Claude 🟢 ⚠️" not in html
 
 
+def test_global_pinned_status_delivers_with_live_unbound_header():
+    store = _notification_race_store()
+    store["panes"]["worker:unbound"] = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "tendwire_worker_id": "worker-unbound",
+        "worker_id": "worker-unbound",
+        "tendwire_space_id": "space-1",
+        "space_id": "space-1",
+        "status": "working",
+        "live_in_snapshot": True,
+        "binding_state": "pending_create",
+    }
+    telegram = FakeTelegram()
+
+    updated = source_sync._sync_pinned(
+        store,
+        SyncRuntime(
+            FakeTendwire(),
+            telegram,
+            with_outbox=False,
+        ),
+        chat_id="-100",
+    )
+
+    assert updated is True
+    assert len(telegram.sent) == 1
+    assert telegram.sent[0][2]["thread_id"] == "1"
+    assert (
+        "<b>Live panes without topics: 1</b>"
+        in telegram.sent[0][1]
+    )
+    assert "⚠️ unbound: pending_create" in telegram.sent[0][1]
+
+
 def test_doctor_is_unhealthy_only_for_live_unbound_panes(monkeypatch):
     store = _store()
     historical = {
