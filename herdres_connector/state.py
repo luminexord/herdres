@@ -1026,6 +1026,26 @@ def worker_entry_is_uniquely_routable(
     return _worker_entry_keys_by_stable_key(data, identity[0]) == [key]
 
 
+def live_unbound_worker_entries(
+    data: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return only snapshot-observed live panes that currently lack a route."""
+
+    return [
+        (key, entry)
+        for key, entry in source_worker_entries(data).items()
+        if entry.get("live_in_snapshot") is True
+        and (
+            not str(
+                entry.get("binding_topic_id")
+                or entry.get("topic_id")
+                or ""
+            )
+            or entry.get("binding_state") != "bound"
+        )
+    ]
+
+
 def find_worker_entry_by_pane_uuid(
     data: dict[str, Any], pane_uuid: str
 ) -> tuple[str, dict[str, Any]] | tuple[None, None]:
