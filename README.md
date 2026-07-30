@@ -725,6 +725,50 @@ This branch runs two user services (plus the Tendwire daemon):
 - `tendwired.service` — the Tendwire daemon (installed from the Tendwire repo);
   Herdres depends on it but does not manage it.
 
+## What renders in Telegram
+
+Turn content is rendered as a Telegram rich card. Agents do not need to know
+that, with one exception that bites in practice: **a markdown table only becomes
+a real table if it carries the separator row.**
+
+```
+| column | column |
+|---|---|
+| value  | value  |
+```
+
+The `|---|---|` line is what converts it. Without that line the block is not a
+markdown table, so it degrades to paragraph text and the pipe characters show
+through. It looks like a table when you write it, which is why this is worth
+stating rather than leaving to be discovered.
+
+Measured against the deployed renderer, so this list is behaviour rather than
+intent:
+
+| written as | becomes a table |
+|---|---|
+| header + `\|---\|---\|` + rows | yes |
+| header + rows, **no separator row** | no |
+| no outer pipes (`a \| b`) | yes |
+| alignment colons (`\|:--\|--:\|`) | yes |
+| spaces in the separator (`\| --- \|`) | yes |
+| indented four spaces | yes |
+| no blank line above the table | yes |
+| ASCII box drawing (`+---+---+`) | no |
+
+Everything except the separator row is forgiving. ASCII box drawing never
+converts — write markdown instead.
+
+Also carried through to the card: bold, italic, inline code, code blocks, links,
+headings, ordered and unordered lists, and collapsible sections. A client that
+cannot render the rich extension is not left with an empty bubble; delivery
+falls back to formatted plain text, and `HERDRES_FORCE_PLAIN_DELIVERY=1` forces
+that path for every message.
+
+Note that a rich card carries no plain-text body by design — reading one back
+through a user session shows `message == ''` with the content in
+`rich_message.blocks`. That is correct, not a blank message.
+
 ## Send transport
 
 Herdres submits every outbound instruction through Tendwire's public command
