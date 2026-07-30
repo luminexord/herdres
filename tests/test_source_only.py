@@ -2420,6 +2420,87 @@ def test_unbound_final_notice_is_one_per_entry_cooldown(monkeypatch):
     assert entry["unbound_final_notice_turn_id"] == "turn-unbound"
 
 
+@pytest.mark.parametrize(
+    "binding_state",
+    [
+        "no_stable_identity",
+        "quarantined:snapshot_stable_key_conflict",
+        "quarantined:ambiguous_route",
+    ],
+)
+def test_identity_resolution_states_do_not_emit_general_final_notices(
+    binding_state,
+):
+    store = _store()
+    worker = _source_worker(
+        {
+            "id": "worker-resolving",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "worker-resolving-fp",
+        }
+    )
+    _key, entry, _created = state.upsert_worker_entry(store, worker)
+    entry["live_in_snapshot"] = True
+    entry["binding_state"] = binding_state
+    telegram = FakeTelegram()
+
+    writes = source_sync._notify_unbound_final(
+        store,
+        {
+            "id": "turn-resolving",
+            "worker_id": "worker-resolving",
+            "complete": True,
+            "assistant_final_text": "waiting for identity resolution",
+        },
+        entry,
+        SyncRuntime(
+            FakeTendwire(),
+            telegram,
+            with_outbox=False,
+            max_sends=8,
+        ),
+        chat_id="-100",
+    )
+
+    assert writes == 0
+    assert telegram.sent == []
+
+
+def test_identity_resolution_that_never_heals_stays_board_and_doctor_visible():
+    store = _store()
+    entry = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "agent": "claude",
+        "worker_name": "claude",
+        "tendwire_worker_id": "worker-stranded",
+        "live_in_snapshot": True,
+        "binding_state": "quarantined:snapshot_stable_key_conflict",
+        "status": "working",
+    }
+    store["panes"]["worker:stranded"] = entry
+
+    # Identity-resolution states deliberately never emit a General message.
+    # If consolidation does not heal, the existing owner surfaces remain
+    # continuously non-healthy instead of flooding once per claimant/pass.
+    for _pass in range(4):
+        overview = render_status_overview(
+            list(state.source_worker_entries(store).values())
+        )
+        check = doctor.outbound_unbound_live_panes(store)
+        assert overview.splitlines()[0] == (
+            "<b>Live panes without topics: 1</b>"
+        )
+        assert (
+            "Claude 🟡 ⚠️ unbound: "
+            "quarantined:snapshot_stable_key_conflict"
+        ) in overview
+        assert check["ok"] is False
+        assert check["status"] == "live_panes_unbound"
+        assert check["first_unbound"]["worker_id"] == "worker-stranded"
+
+
 def test_unbound_final_notice_runs_on_sync_drop_path(monkeypatch):
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
@@ -2465,10 +2546,16 @@ def test_unbound_final_notice_runs_on_sync_drop_path(monkeypatch):
     assert first["outbound_delivery"]["status"] == (
         "outbound_delivery_stalled"
     )
-    assert len(telegram.sent) == 1
-    assert telegram.sent[0][2]["thread_id"] == "1"
+    assert telegram.sent == []
     assert second["feed_sent"] == 0
-    assert len(telegram.sent) == 1
+    assert telegram.sent == []
+    entry = next(iter(state.source_worker_entries(store).values()))
+    overview = render_status_overview([entry])
+    assert overview.splitlines()[0] == (
+        "<b>Live panes without topics: 1</b>"
+    )
+    assert "⚠️ unbound: no_stable_identity" in overview
+    assert doctor.outbound_unbound_live_panes(store)["ok"] is False
 
 
 def test_jammed_completed_plan_enters_hold_then_exits_and_topic_resumes(

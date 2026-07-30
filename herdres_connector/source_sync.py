@@ -7439,11 +7439,25 @@ def _notify_unbound_final(
 ) -> int:
     """Send one bounded General notice instead of dropping a live final."""
 
+    binding_state = compact_ws(
+        entry.get("binding_state"), 160
+    ) or _BINDING_STATE_PENDING_CREATE
+    # Identity consolidation and quarantine are routing work in progress, not
+    # failed topic provisioning.  Their owner-visible surface is the pinned
+    # board plus doctor; sending here would violate the consolidation lane's
+    # no-delivery contract and could emit once per duplicate claimant.  A
+    # General notice is reserved for a pane whose identity is already usable
+    # but whose topic still cannot be created.
+    notice_eligible = (
+        binding_state == _BINDING_STATE_PENDING_CREATE
+        or binding_state.startswith("create_error:")
+    )
     if (
         runtime.dry_run
         or entry.get("live_in_snapshot") is not True
         or str(entry.get("topic_id") or "")
         or entry.get("binding_state") == _BINDING_STATE_BOUND
+        or not notice_eligible
         or _delivery_write_budget(runtime).remaining <= 0
         or not _notification_acceptance_capacity_available(store)
     ):
@@ -7458,9 +7472,6 @@ def _notify_unbound_final(
     ):
         return 0
     worker_id = _entry_worker_id(entry) or "unknown pane"
-    binding_state = compact_ws(
-        entry.get("binding_state"), 160
-    ) or _BINDING_STATE_PENDING_CREATE
     turn_id = _turn_id(item)
     notice_kind = "unbound_final:" + short_hash(
         {
