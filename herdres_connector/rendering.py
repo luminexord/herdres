@@ -846,7 +846,23 @@ def _render_status_entry_display(entry: dict[str, Any], display: str) -> str:
         or entry.get("tendwire_status_line")
         or entry.get("status")
     )
-    return f"{html_escape(display, 120)} {_pinned_status_dot(status)}"
+    rendered = f"{html_escape(display, 120)} {_pinned_status_dot(status)}"
+    if (
+        entry.get("live_in_snapshot") is True
+        and (
+            not str(
+                entry.get("binding_topic_id")
+                or entry.get("topic_id")
+                or ""
+            )
+            or entry.get("binding_state") != "bound"
+        )
+    ):
+        reason = html_escape(
+            entry.get("binding_state") or "pending_create", 160
+        )
+        rendered = f"{rendered} ⚠️ unbound: {reason}"
+    return rendered
 
 
 def render_status_entry(entry: dict[str, Any]) -> str:
@@ -884,7 +900,25 @@ def render_status_overview(entries: list[dict[str, Any]]) -> str:
             )
         )
     rows.sort(key=lambda row: (-row[0], row[1]))
-    return "\n".join(row[2] for row in rows)
+    unbound_count = sum(
+        1
+        for entry in entries
+        if entry.get("live_in_snapshot") is True
+        and (
+            not str(
+                entry.get("binding_topic_id")
+                or entry.get("topic_id")
+                or ""
+            )
+            or entry.get("binding_state") != "bound"
+        )
+    )
+    header = (
+        [f"<b>Live panes without topics: {unbound_count}</b>"]
+        if unbound_count
+        else []
+    )
+    return "\n".join(header + [row[2] for row in rows])
 
 
 def render_attention_notice(payload: dict[str, Any]) -> str:

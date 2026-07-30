@@ -4469,6 +4469,11 @@ def test_doctor_composes_inbound_and_outbound_health_without_masking(
             ),
         },
     )
+    monkeypatch.setattr(
+        doctor,
+        "outbound_unbound_live_panes",
+        lambda: {"ok": True, "status": "healthy"},
+    )
 
     result = doctor.run_doctor()
 

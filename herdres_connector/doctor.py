@@ -201,6 +201,49 @@ def outbound_partial_finals(
     )
 
 
+def outbound_unbound_live_panes(
+    store: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Expose live panes that have no usable owner-visible topic."""
+
+    try:
+        current = state.load_state() if store is None else store
+    except RuntimeError as exc:
+        return {
+            "ok": False,
+            "status": "error",
+            "signal": "outbound_unbound_live_pane_probe_failed",
+            "error": sanitize_text(str(exc), 200),
+        }
+    rows = state.live_unbound_worker_entries(current)
+    if not rows:
+        return {
+            "ok": True,
+            "status": "healthy",
+            "signal": "",
+            "unbound_count": 0,
+        }
+    key, entry = rows[0]
+    return {
+        "ok": False,
+        "status": "live_panes_unbound",
+        "signal": "outbound_live_panes_unbound",
+        "unbound_count": len(rows),
+        "first_unbound": {
+            "entry_key": key,
+            "worker_id": str(
+                entry.get("tendwire_worker_id")
+                or entry.get("worker_id")
+                or ""
+            ),
+            "pane_uuid": str(entry.get("pane_uuid") or ""),
+            "binding_state": str(
+                entry.get("binding_state") or "pending_create"
+            ),
+        },
+    }
+
+
 def run_doctor(client: TendwireClient | None = None) -> dict[str, Any]:
     checks = {
         "source_services": source_services(),
@@ -209,6 +252,7 @@ def run_doctor(client: TendwireClient | None = None) -> dict[str, Any]:
         "tendwire_backend": tendwire_backend(client),
         "tendwire_delta_feed": tendwire_delta_feed(),
         "inbound_lanes": inbound_lanes(),
+        "outbound_unbound_live_panes": outbound_unbound_live_panes(),
         "outbound_partial_finals": outbound_partial_finals(),
     }
     return {"ok": all(item.get("ok") for item in checks.values()), "checks": checks}

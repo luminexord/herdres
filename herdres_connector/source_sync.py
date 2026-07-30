@@ -63,6 +63,10 @@ _TOPIC_CLEANUP_PERMANENT_ERROR_KINDS = frozenset(
 )
 _ACCEPTED_NOTIFICATION_LIMIT = 64
 _DELIVERY_FORMAT_FALLBACK_LIMIT = 64
+_BINDING_STATE_BOUND = "bound"
+_BINDING_STATE_PENDING_CREATE = "pending_create"
+_BINDING_STATE_NO_IDENTITY = "no_stable_identity"
+_BINDING_STATE_ABSENT = "absent_from_snapshot"
 
 
 @dataclass
@@ -3923,6 +3927,25 @@ def _fold_superseded_final(
         )
     return attempted
 
+def _stamp_worker_binding_refusal(entry: dict[str, Any]) -> str:
+    """Persist the exact gate that keeps a snapshot-observed pane unbound."""
+
+    if state.entry_stable_identity(entry) is None:
+        binding_state = _BINDING_STATE_NO_IDENTITY
+    elif state.entry_is_quarantined(entry):
+        reason = compact_ws(
+            entry.get("stable_key_quarantine_reason"), 120
+        ) or "quarantined"
+        binding_state = f"quarantined:{reason}"
+    elif state.entry_is_retired(entry):
+        binding_state = "quarantined:retired_route"
+    else:
+        binding_state = "quarantined:ambiguous_route"
+    entry["binding_state"] = binding_state
+    entry.pop("binding_topic_id", None)
+    return binding_state
+
+
 def _ensure_topic(
     store: dict[str, Any],
     source: dict[str, Any],
@@ -3936,9 +3959,12 @@ def _ensure_topic(
         str(entry.get("entry_type") or "") == "worker"
         and not state.entry_is_routable(entry)
     ):
+        _stamp_worker_binding_refusal(entry)
         return False, False
     state.discard_tombstoned_topic_binding(store, entry)
     if entry.get("topic_id"):
+        entry["binding_state"] = _BINDING_STATE_BOUND
+        entry["binding_topic_id"] = str(entry["topic_id"])
         return False, False
     if str(entry.get("entry_type") or "") == "worker":
         identity = state.entry_stable_identity(entry)
@@ -3955,19 +3981,26 @@ def _ensure_topic(
             # Telegram has no idempotency key for createForumTopic. Stable-key
             # ownership is therefore the final guard against a positional-id
             # duplicate minting a second topic.
+            entry["binding_state"] = "quarantined:stable_identity_collision"
             return False, False
     reused = state.find_legacy_topic_id_by_name(store, entry.get("topic_name") or "")
     if reused:
         entry["topic_id"] = reused
+        entry["binding_state"] = _BINDING_STATE_BOUND
+        entry["binding_topic_id"] = str(reused)
         _complete_topic_recovery(entry, reused)
         return False, False
     if runtime.dry_run:
+        entry["binding_state"] = _BINDING_STATE_PENDING_CREATE
+        entry.pop("binding_topic_id", None)
         return True, False
     if (
         not can_create
         or len(state.orphaned_created_topics(store))
         >= state.ORPHANED_CREATED_TOPIC_LIMIT
     ):
+        entry["binding_state"] = _BINDING_STATE_PENDING_CREATE
+        entry.pop("binding_topic_id", None)
         return True, False   # real create deferred by the per-pass create cap; retry next tick
     topic_name = entry.get("topic_name") or state.topic_name_for_space(source)
     operation = _capture_entry_operation(store, entry)
@@ -4023,6 +4056,8 @@ def _ensure_topic(
     assert entry is not None
     if created.get("ok") and created.get("topic_id"):
         entry["topic_id"] = str(created["topic_id"])
+        entry["binding_state"] = _BINDING_STATE_BOUND
+        entry["binding_topic_id"] = str(created["topic_id"])
         _complete_topic_recovery(entry, str(created["topic_id"]))
         _complete_accepted_created_topic(
             store, accepted_receipt_id
@@ -4039,6 +4074,11 @@ def _ensure_topic(
             runtime.checkpoint()
         return True, True
     entry["last_topic_error"] = compact_ws(created.get("error"), 240)
+    entry["binding_state"] = (
+        "create_error:"
+        + (entry["last_topic_error"] or "unknown_create_error")
+    )
+    entry.pop("binding_topic_id", None)
     return False, False
 
 
@@ -4204,24 +4244,31 @@ def _entry_open_for_pin(entry: dict[str, Any]) -> bool:
     return not (entry.get("closed") or entry.get("exited") or entry.get("process_exited"))
 
 
+def _worker_visible_on_status_board(entry: dict[str, Any]) -> bool:
+    """Select display membership without consulting delivery routability.
+
+    Binding state, unique-route checks, topic ids, and a space's worker_ids are
+    delivery concerns.  A live pane must remain owner-visible when any of those
+    gates refuses it.  Explicitly historical entries stay hidden; entries from
+    older state files without the additive visibility field retain the
+    compatibility behavior established in issue #198.
+    """
+
+    return (
+        _entry_open_for_pin(entry)
+        and entry.get("live_in_snapshot") is not False
+    )
+
+
 def _status_entries_for_topic_pin(store: dict[str, Any], entry: dict[str, Any]) -> list[dict[str, Any]]:
     if str(entry.get("entry_type") or "") != "space":
-        return [
-            entry
-        ] if _entry_open_for_pin(entry) and state.entry_is_routable(entry) else []
+        return [entry] if _worker_visible_on_status_board(entry) else []
     space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
-    worker_ids = entry.get("worker_ids")
-    current_worker_ids = {str(worker_id) for worker_id in worker_ids if worker_id} if isinstance(worker_ids, list) else set()
     workers = [
         worker_entry
-        for worker_key, worker_entry in state.source_worker_entries(store).items()
-        if _entry_open_for_pin(worker_entry)
-        and state.worker_entry_is_uniquely_routable(store, worker_key, worker_entry)
+        for worker_entry in state.source_worker_entries(store).values()
+        if _worker_visible_on_status_board(worker_entry)
         and str(worker_entry.get("tendwire_space_id") or worker_entry.get("space_id") or "") == space_id
-        and (
-            not current_worker_ids
-            or str(worker_entry.get("tendwire_worker_id") or worker_entry.get("worker_id") or "") in current_worker_ids
-        )
     ]
     return workers or ([entry] if _entry_open_for_pin(entry) else [])
 
@@ -4876,6 +4923,7 @@ def _sync_sources(
     turn_status_by_worker, turn_status_by_space = _turn_activity_statuses(turns_payload, live_worker_ids)
     spaces = {compact_ws(item.get("id"), 160): item for item in _spaces(snapshot) if compact_ws(item.get("id"), 160)}
     workers_by_space: dict[str, list[dict[str, Any]]] = {}
+    observed_worker_entry_keys: set[str] = set()
     for worker in _ordered_workers(workers):
         space_id = compact_ws(worker.get("space_id"), 160)
         existing_key = worker_entry_reservations.get(id(worker))
@@ -4889,6 +4937,7 @@ def _sync_sources(
             use_preplanned_key=True,
             reserved_entry_keys=reserved_entry_keys,
         )
+        observed_worker_entry_keys.add(_key)
         stale_entry_key = continuity_handoffs.get(id(worker))
         if stale_entry_key is not None:
             counts["updated"] += int(
@@ -4897,11 +4946,19 @@ def _sync_sources(
                 )
             )
         entry["status"] = _effective_worker_status(worker, turn_status_by_worker)
+        entry["live_in_snapshot"] = _worker_is_open(worker)
         _stamp_managed_voice(entry, _space_voice_mode(store, space_id))
         if not state.worker_entry_is_uniquely_routable(store, _key, entry):
+            _stamp_worker_binding_refusal(entry)
             counts["created"] += int(created)
             counts["updated"] += int(not created and before != entry)
             continue
+        if entry.get("topic_id"):
+            entry["binding_state"] = _BINDING_STATE_BOUND
+            entry["binding_topic_id"] = str(entry["topic_id"])
+        else:
+            entry["binding_state"] = _BINDING_STATE_PENDING_CREATE
+            entry.pop("binding_topic_id", None)
         # Apply the cwd-based, disambiguated name before the topic is created (once it has a topic_id
         # the name is locked, so a later renumber can't rename an existing topic).
         wid = compact_ws(worker.get("id"), 160)
@@ -4968,6 +5025,9 @@ def _sync_sources(
         counts["created"] += int(created)
         counts["updated"] += int(not created and before != entry)
         if not _worker_is_open(worker):
+            entry["live_in_snapshot"] = False
+            entry["binding_state"] = _BINDING_STATE_ABSENT
+            entry.pop("binding_topic_id", None)
             continue
         if space_id:
             workers_by_space.setdefault(space_id, []).append(worker)
@@ -4982,6 +5042,29 @@ def _sync_sources(
                 continue
             counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["panes"] += 1
+
+    # Visibility is a current-snapshot fact. Historical state survives for
+    # lifecycle/reply ownership, but it must never inflate the live-unbound
+    # board or doctor alarm.
+    for key, historical in state.source_worker_entries(store).items():
+        if key in observed_worker_entry_keys:
+            continue
+        before_visibility = (
+            historical.get("live_in_snapshot"),
+            historical.get("binding_state"),
+            historical.get("binding_topic_id"),
+        )
+        historical["live_in_snapshot"] = False
+        historical["binding_state"] = _BINDING_STATE_ABSENT
+        historical.pop("binding_topic_id", None)
+        after_visibility = (
+            historical.get("live_in_snapshot"),
+            historical.get("binding_state"),
+            historical.get("binding_topic_id"),
+        )
+        counts["updated"] += int(
+            before_visibility != after_visibility
+        )
 
     for space_id, workers in workers_by_space.items():
         if space_id not in spaces:
@@ -5034,6 +5117,22 @@ def _sync_sources(
         entry = state.source_space_entries(store).get(_key)
         if entry is None:
             continue
+        route_topic_id = str(entry.get("topic_id") or "")
+        for worker in selectable:
+            worker_id = compact_ws(worker.get("id"), 160)
+            _worker_key, worker_entry = state.find_worker_entry_by_id(
+                store, worker_id
+            )
+            if worker_entry is None:
+                continue
+            if route_topic_id:
+                worker_entry["binding_state"] = _BINDING_STATE_BOUND
+                worker_entry["binding_topic_id"] = route_topic_id
+            else:
+                worker_entry["binding_state"] = (
+                    _BINDING_STATE_PENDING_CREATE
+                )
+                worker_entry.pop("binding_topic_id", None)
         counts["created"] += int(created or topic_created or topic_needed)
         counts["updated"] += int(not created and before != entry)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
@@ -6932,6 +7031,19 @@ def _stage_final_plan(
     revision = _content_revision(item)
     if not revision:
         return False, 0, entry
+    exact_hold = state.find_partial_final_delivery(
+        store, _turn_id(item), revision
+    )
+    if (
+        isinstance(exact_hold, dict)
+        and exact_hold.get("request_phase")
+        == "pending_plan_binding_gap"
+        and exact_hold.get("operator_attention_required") is True
+    ):
+        raise _TurnContentError(
+            "invalid_pending_plan",
+            "completed final is held after a multipart binding gap",
+        )
 
     def _prepare_begin_kwargs(part_count: int) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -7065,6 +7177,15 @@ def _stage_final_plan(
                 entry,
                 plan_token=pending_token,
                 revision=revision,
+            ):
+                _checkpoint_turn_job(runtime)
+            elif _observe_jammed_pending_plan(
+                store,
+                entry,
+                turn_id=_turn_id(item),
+                plan_token=pending_token,
+                revision=revision,
+                part_count=pending_count,
             ):
                 _checkpoint_turn_job(runtime)
         return False, 0, entry
@@ -7315,6 +7436,134 @@ def _prepare_final_delivery_parts(
         ) from exc
 
 
+def _notify_unbound_final(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+) -> int:
+    """Send one bounded General notice instead of dropping a live final."""
+
+    binding_state = compact_ws(
+        entry.get("binding_state"), 160
+    ) or _BINDING_STATE_PENDING_CREATE
+    # Identity consolidation and quarantine are routing work in progress, not
+    # failed topic provisioning.  Their owner-visible surface is the pinned
+    # board plus doctor; sending here would violate the consolidation lane's
+    # no-delivery contract and could emit once per duplicate claimant.  A
+    # General notice is reserved for a pane whose identity is already usable
+    # but whose topic still cannot be created.
+    notice_eligible = (
+        binding_state == _BINDING_STATE_PENDING_CREATE
+        or binding_state.startswith("create_error:")
+    )
+    if (
+        runtime.dry_run
+        or entry.get("live_in_snapshot") is not True
+        or str(entry.get("topic_id") or "")
+        or entry.get("binding_state") == _BINDING_STATE_BOUND
+        or not notice_eligible
+        or _delivery_write_budget(runtime).remaining <= 0
+        or not _notification_acceptance_capacity_available(store)
+    ):
+        return 0
+    now = time.time()
+    prior = entry.get("unbound_final_notice_at")
+    if (
+        isinstance(prior, (int, float))
+        and not isinstance(prior, bool)
+        and now - float(prior)
+        < config.unbound_final_notice_cooldown_seconds()
+    ):
+        return 0
+    worker_id = _entry_worker_id(entry) or "unknown pane"
+    turn_id = _turn_id(item)
+    notice_kind = "unbound_final:" + short_hash(
+        {
+            "worker_id": worker_id,
+            "pane_uuid": state.entry_pane_uuid(entry),
+        },
+        20,
+    )
+    if _notification_kind_pending(store, notice_kind):
+        return 0
+    html = (
+        "<b>Live pane has no Telegram topic</b>\n"
+        f"{html_escape(worker_id, 160)} has a completed turn waiting "
+        f"({html_escape(binding_state, 160)})."
+    )
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id="",
+        observe=("unbound_final_notice_at",),
+    )
+    execution = _execute_accounted_delivery_write(
+        store,
+        runtime,
+        operation,
+        _provider_mutation(
+            "telegram.send_message",
+            reason=(
+                "telegram.send_message: expose unbound live pane final"
+            ),
+            args=(chat_id, html),
+            kwargs={
+                "thread_id": str(config.general_thread_id(store)),
+                "notify": False,
+                "max_physical_writes": _delivery_write_budget(
+                    runtime
+                ).remaining,
+            },
+        ),
+    )
+    sent, resolution = execution.result, execution.resolution
+    writes = _telegram_physical_writes(sent)
+    if resolution.disposition != _OFFLOCK_APPLY:
+        return writes
+    current = resolution.entry
+    assert current is not None
+    if sent.get("ok"):
+        current["unbound_final_notice_at"] = now
+        current["unbound_final_notice_turn_id"] = turn_id
+        current["unbound_final_notice_message_id"] = str(
+            sent.get("message_id") or ""
+        )
+        current.pop("unbound_final_notice_error", None)
+    else:
+        current["unbound_final_notice_error"] = compact_ws(
+            sent.get("error") or sent.get("kind"), 240
+        )
+    return writes
+
+
+def _unbound_live_entry_for_item(
+    store: dict[str, Any], item: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Resolve a notice owner without weakening delivery routability."""
+
+    identity = _turn_stable_identity(item)
+    if identity is not None:
+        identity_matches = [
+            entry
+            for entry in state.source_worker_entries(store).values()
+            if entry.get("live_in_snapshot") is True
+            and state.entry_stable_identity(entry) == identity
+        ]
+        if len(identity_matches) == 1:
+            return identity_matches[0]
+    worker_id = compact_ws(item.get("worker_id"), 160)
+    matches = [
+        entry
+        for entry in state.source_worker_entries(store).values()
+        if entry.get("live_in_snapshot") is True
+        and _entry_worker_id(entry) == worker_id
+    ]
+    return matches[0] if worker_id and len(matches) == 1 else None
+
+
 def _deliver_final(
     store: dict[str, Any],
     item: dict[str, Any],
@@ -7325,6 +7574,9 @@ def _deliver_final(
 ) -> bool:
     thread_id = str(entry.get("topic_id") or "")
     if not thread_id:
+        _notify_unbound_final(
+            store, item, entry, runtime, chat_id=chat_id
+        )
         return False
     turn_id = _turn_id(item)
     content_hash = _turn_content_hash(item, "final")
@@ -7902,6 +8154,27 @@ def _sync_turns(
             continue
         entry_key, entry = _entry_for_turn(store, item)
         if entry is None:
+            if _turn_has_complete_final(item):
+                notice_entry = _unbound_live_entry_for_item(
+                    store, item
+                )
+                if notice_entry is not None:
+                    writes_before = budget.spent
+                    if budget.remaining:
+                        _notify_unbound_final(
+                            store,
+                            item,
+                            notice_entry,
+                            runtime,
+                            chat_id=chat_id,
+                        )
+                    writes_used = budget.spent - writes_before
+                    if writes_used:
+                        counts["physical_writes"] = (
+                            budget.spent - budget_start
+                        )
+                        counts["failed_writes"] += 1
+                    counts["work_pending"] += 1
             continue
         before = dict(entry)
         repaired_open_final = False
@@ -8948,6 +9221,173 @@ def _maybe_complete_turn_plan(
     return True
 
 
+def _observe_jammed_pending_plan(
+    store: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    plan_token: str,
+    revision: str,
+    part_count: int,
+) -> bool:
+    """Hold a completed plan whose acknowledged parts lost route bindings.
+
+    The hold is immediate and doctor-visible.  After the existing partial-final
+    escalation bound, only the broken plan handle is abandoned so later
+    revisions can use the topic; the delivery-unknown witness remains until an
+    operator resolves it.
+    """
+
+    receipts = [
+        receipt
+        for receipt in state.tendwire_turn_jobs(store).values()
+        if isinstance(receipt, dict)
+        and receipt.get("plan_token") == plan_token
+    ]
+    expected_jobs = entry.get("pending_turn_job_count")
+    if (
+        isinstance(expected_jobs, bool)
+        or not isinstance(expected_jobs, int)
+        or expected_jobs <= 0
+        or len(receipts) < expected_jobs
+        or any(
+            receipt.get("substate") != "acknowledged"
+            or isinstance(receipt.get("post_ack_reconcile"), dict)
+            for receipt in receipts
+        )
+    ):
+        return False
+    bound_ordinals = {
+        binding.get("part_ordinal")
+        for _message_id, binding in _final_delivery_bindings(
+            store, turn_id
+        )
+        if (
+            binding.get("plan_token") == plan_token
+            or binding.get("content_revision") == revision
+        )
+        and isinstance(binding.get("part_ordinal"), int)
+    }
+    missing = [
+        ordinal
+        for ordinal in range(part_count)
+        if ordinal not in bound_ordinals
+    ]
+    if not missing:
+        return False
+    record = state.find_partial_final_delivery(
+        store, turn_id, revision
+    )
+    changed = False
+    if not isinstance(record, dict):
+        existing_bindings = sorted(
+            (
+                (
+                    int(binding.get("part_ordinal")),
+                    message_id,
+                    binding,
+                )
+                for message_id, binding in _final_delivery_bindings(
+                    store, turn_id
+                )
+                if (
+                    binding.get("plan_token") == plan_token
+                    or binding.get("content_revision") == revision
+                )
+                and isinstance(binding.get("part_ordinal"), int)
+            ),
+            key=lambda row: row[0],
+        )
+        existing_ids = [row[1] for row in existing_bindings]
+        missing_binding_ids: list[str] = []
+        for receipt in receipts:
+            message_id = str(
+                receipt.get("telegram_message_id") or ""
+            )
+            if (
+                message_id
+                and message_id != "0"
+                and message_id not in existing_ids
+                and message_id not in missing_binding_ids
+            ):
+                missing_binding_ids.append(message_id)
+        _record_partial_final_delivery(
+            store,
+            entry,
+            {
+                "ok": False,
+                "partial": bool(
+                    existing_ids or missing_binding_ids
+                ),
+                "message_ids": missing_binding_ids,
+                "terminal_outcome": "delivery_unknown",
+                "failed_part_index": missing[0],
+                "error": (
+                    "completed multipart plan lost one or more "
+                    "acknowledged message bindings"
+                ),
+            },
+            turn_id=turn_id,
+            content_hash=revision,
+            topic_id=str(entry.get("topic_id") or ""),
+            bot_kind=str(
+                next(
+                    (
+                        receipt.get("bot_kind")
+                        for receipt in receipts
+                        if receipt.get("bot_kind")
+                    ),
+                    MANAGER_BOT_KIND,
+                )
+            ),
+        )
+        record = state.find_partial_final_delivery(
+            store, turn_id, revision
+        )
+        assert record is not None
+        all_message_ids = existing_ids + missing_binding_ids
+        record["message_ids"] = all_message_ids
+        record["canonical_message_id"] = (
+            all_message_ids[0] if all_message_ids else ""
+        )
+        record["request_phase"] = "pending_plan_binding_gap"
+        record["plan_token"] = plan_token
+        record["missing_part_ordinals"] = list(missing)
+        record["bounded_exit_seconds"] = (
+            config.partial_final_escalation_seconds()
+        )
+        for _ordinal, _message_id, binding in existing_bindings:
+            binding["message_ids"] = list(all_message_ids)
+            binding["canonical_message_id"] = record[
+                "canonical_message_id"
+            ]
+            binding["partial_final_delivery"] = dict(record)
+        entry["partial_final_delivery"] = record
+        changed = True
+    created_at = record.get("created_at")
+    age = (
+        time.time() - float(created_at)
+        if isinstance(created_at, (int, float))
+        and not isinstance(created_at, bool)
+        else 0.0
+    )
+    if (
+        age >= config.partial_final_escalation_seconds()
+        and entry.get("pending_plan_token") == plan_token
+        and _abandon_pending_turn_plan(
+            store,
+            entry,
+            plan_token=plan_token,
+            revision=revision,
+        )
+    ):
+        record["bounded_exit_at"] = time.time()
+        record["bounded_exit"] = "broken_plan_abandoned"
+        entry["partial_final_delivery"] = record
+        changed = True
+    return changed
+
+
 def _abandon_pending_turn_plan(
     store: dict[str, Any],
     entry: dict[str, Any],
@@ -9147,6 +9587,16 @@ def _reconcile_completed_turn_plans(
             )
         )
         if completed:
+            reconciled += 1
+            advanced = True
+        elif _observe_jammed_pending_plan(
+            store,
+            entry,
+            turn_id=turn_id,
+            plan_token=plan_token,
+            revision=revision,
+            part_count=part_count,
+        ):
             reconciled += 1
             advanced = True
         if advanced:
@@ -9910,6 +10360,17 @@ def _drain_turn_final(
                 store, payload
             )
             if entry is None or not str(entry.get("topic_id") or ""):
+                notice_entry = entry or _unbound_live_entry_for_item(
+                    store, item
+                )
+                if notice_entry is not None:
+                    result["operations"] += _notify_unbound_final(
+                        store,
+                        item,
+                        notice_entry,
+                        runtime,
+                        chat_id=chat_id,
+                    )
                 owner_matches = False
                 owner_bound = False
                 suppress_historical = False
@@ -10210,6 +10671,17 @@ def _drain_turn_final(
                 runtime,
                 ref,
                 "stale_or_unroutable_turn_plan",
+                result,
+            )
+            break
+        if (
+            entry.get("abandoned_plan_token") == plan_token
+            and entry.get("abandoned_content_revision") == revision
+        ):
+            _fail_turn_final(
+                runtime,
+                ref,
+                "invalid_pending_plan",
                 result,
             )
             break
@@ -11752,29 +12224,18 @@ def _sync_pinned(
     yield_barrier: Callable[[], None] | None = None,
     account_usage: dict[str, Any] | None = None,
 ) -> bool:
-    current_worker_ids: set[str] = set()
-    current_space_ids = {
-        str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
-        for entry in state.source_space_entries(store).values()
-        if _entry_open_for_pin(entry) and not entry.get("stale_space_topic")
-    }
-    for entry in state.source_space_entries(store).values():
-        worker_ids = entry.get("worker_ids")
-        if isinstance(worker_ids, list):
-            current_worker_ids.update(str(worker_id) for worker_id in worker_ids if worker_id)
-    entries = []
-    for entry in state.source_worker_entries(store).values():
-        if not _entry_open_for_pin(entry):
-            continue
-        worker_id = str(entry.get("tendwire_worker_id") or entry.get("worker_id") or "")
-        space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
-        if current_worker_ids and worker_id not in current_worker_ids:
-            continue
-        if not current_worker_ids and current_space_ids and space_id not in current_space_ids:
-            continue
-        entries.append(entry)
-    if not entries:
-        entries = [entry for entry in state.source_entries(store).values() if _entry_open_for_pin(entry)]
+    entries = [
+        entry
+        for entry in state.source_worker_entries(store).values()
+        if _worker_visible_on_status_board(entry)
+    ]
+    if not entries and config.source_topic_mode() != "worker":
+        entries = [
+            entry
+            for entry in state.source_space_entries(store).values()
+            if _entry_open_for_pin(entry)
+            and not entry.get("stale_space_topic")
+        ]
     if not entries:
         return False
     html = render_status_overview(entries)

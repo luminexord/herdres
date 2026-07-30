@@ -157,6 +157,24 @@ def partial_final_escalation_seconds(env: Any | None = None) -> int:
     return min(3600, max(30, value))
 
 
+def unbound_final_notice_cooldown_seconds(
+    env: Any | None = None,
+) -> int:
+    """Bound duplicate General notices for one live pane without a topic."""
+
+    source = os.environ if env is None else env
+    raw = source.get(
+        "HERDRES_UNBOUND_FINAL_NOTICE_COOLDOWN_SECONDS", "300"
+    )
+    if raw is None or not str(raw).strip():
+        raw = "300"
+    try:
+        value = int(str(raw))
+    except (TypeError, ValueError):
+        return 300
+    return min(3600, max(30, value))
+
+
 def command_retry_horizon_seconds(env: Any | None = None) -> int:
     source = os.environ if env is None else env
     try:

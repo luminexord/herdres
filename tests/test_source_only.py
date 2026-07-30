@@ -16,7 +16,7 @@ import pytest
 
 import herdres
 import herdres_gateway
-from herdres_connector import ingress_requests, source_sync, state
+from herdres_connector import doctor, ingress_requests, source_sync, state
 from herdres_connector.managed_bots import managed_bot_kind_for_key, managed_bot_tokens
 from herdres_connector.rendering import render_status_overview
 from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_feed_item_delivery_html_parts, render_turn_item_html, turn_item_from_source
@@ -2125,6 +2125,813 @@ def test_status_overview_disambiguates_duplicate_agent_labels():
     assert html.splitlines() == ["Codex 🟢", "Codex 1-2 🟢"]
 
 
+def test_live_unbound_status_counts_and_marks_only_snapshot_panes():
+    html = render_status_overview(
+        [
+            {
+                "agent": "codex",
+                "worker_name": "codex",
+                "status": "working",
+                "live_in_snapshot": True,
+                "binding_state": "pending_create",
+            },
+            {
+                "agent": "claude",
+                "worker_name": "claude",
+                "status": "idle",
+                "live_in_snapshot": False,
+                "binding_state": "absent_from_snapshot",
+            },
+        ]
+    )
+
+    assert html.splitlines()[0] == "<b>Live panes without topics: 1</b>"
+    assert "Codex 🟡 ⚠️ unbound: pending_create" in html
+    assert "Claude 🟢 ⚠️" not in html
+
+
+def test_global_pinned_status_delivers_with_live_unbound_header():
+    store = _notification_race_store()
+    store["panes"]["worker:unbound"] = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "tendwire_worker_id": "worker-unbound",
+        "worker_id": "worker-unbound",
+        "tendwire_space_id": "space-1",
+        "space_id": "space-1",
+        "status": "working",
+        "live_in_snapshot": True,
+        "binding_state": "pending_create",
+    }
+    telegram = FakeTelegram()
+
+    updated = source_sync._sync_pinned(
+        store,
+        SyncRuntime(
+            FakeTendwire(),
+            telegram,
+            with_outbox=False,
+        ),
+        chat_id="-100",
+    )
+
+    assert updated is True
+    assert len(telegram.sent) == 1
+    assert telegram.sent[0][2]["thread_id"] == "1"
+    assert (
+        "<b>Live panes without topics: 1</b>"
+        in telegram.sent[0][1]
+    )
+    assert "⚠️ unbound: pending_create" in telegram.sent[0][1]
+
+
+def _mixed_status_board_store():
+    store = _store()
+    _key, routable, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-routable",
+                "name": "Worker-routable",
+                "space_id": "space-1",
+                "fingerprint": "worker-routable-fp",
+                "status": "working",
+            }
+        ),
+        topic_id="77",
+    )
+    routable.update(
+        {
+            "binding_topic_id": "77",
+            "binding_state": "bound",
+            "live_in_snapshot": True,
+        }
+    )
+    _key, refused, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-refused",
+                "name": "Worker-refused",
+                "space_id": "space-1",
+                "fingerprint": "worker-refused-fp",
+                "status": "working",
+            },
+            stable_identity=False,
+        ),
+    )
+    refused.update(
+        {
+            "binding_state": "no_stable_identity",
+            "live_in_snapshot": True,
+        }
+    )
+    store["spaces"]["workspace:space-1"] = {
+        "source": "tendwire",
+        "entry_type": "space",
+        "tendwire_space_id": "space-1",
+        "space_id": "space-1",
+        "topic_id": "77",
+        "worker_ids": ["worker-routable"],
+        "status": "working",
+    }
+    return store
+
+
+def _assert_refused_worker_on_global_board(store):
+    telegram = FakeTelegram()
+    assert source_sync._sync_pinned(
+        store,
+        SyncRuntime(
+            FakeTendwire(),
+            telegram,
+            with_outbox=False,
+        ),
+        chat_id="-100",
+    )
+    assert len(telegram.sent) == 1
+    html = telegram.sent[0][1]
+    assert "<b>Live panes without topics: 1</b>" in html
+    assert "worker-refused 🟡 ⚠️ unbound: no_stable_identity" in html
+
+
+def test_space_mode_board_keeps_identity_refused_live_worker(monkeypatch):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "space")
+    store = _mixed_status_board_store()
+
+    _assert_refused_worker_on_global_board(store)
+
+    space = store["spaces"]["workspace:space-1"]
+    topic_entries = source_sync._status_entries_for_topic_pin(
+        store, space
+    )
+    assert {
+        entry["tendwire_worker_id"] for entry in topic_entries
+    } == {"worker-routable", "worker-refused"}
+
+
+def test_worker_mode_board_ignores_stale_space_worker_allowlist(monkeypatch):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _mixed_status_board_store()
+
+    _assert_refused_worker_on_global_board(store)
+
+
+@pytest.mark.parametrize(
+    "binding_state",
+    [
+        "no_stable_identity",
+        "quarantined:snapshot_stable_key_conflict",
+        "quarantined:retired_route",
+        "quarantined:ambiguous_route",
+        "quarantined:stable_identity_collision",
+    ],
+)
+def test_each_binding_refusal_reason_remains_on_global_board(
+    binding_state,
+):
+    store = _mixed_status_board_store()
+    refused = next(
+        entry
+        for entry in state.source_worker_entries(store).values()
+        if entry.get("tendwire_worker_id") == "worker-refused"
+    )
+    refused["binding_state"] = binding_state
+    telegram = FakeTelegram()
+
+    assert source_sync._sync_pinned(
+        store,
+        SyncRuntime(
+            FakeTendwire(),
+            telegram,
+            with_outbox=False,
+        ),
+        chat_id="-100",
+    )
+
+    html = telegram.sent[0][1]
+    assert "<b>Live panes without topics: 1</b>" in html
+    assert f"⚠️ unbound: {binding_state}" in html
+
+
+def test_doctor_is_unhealthy_only_for_live_unbound_panes(monkeypatch):
+    store = _store()
+    historical = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "live_in_snapshot": False,
+        "binding_state": "absent_from_snapshot",
+        "tendwire_worker_id": "historical",
+    }
+    store["panes"]["worker:historical"] = historical
+    assert doctor.outbound_unbound_live_panes(store)["ok"] is True
+
+    historical["live_in_snapshot"] = True
+    historical["binding_state"] = "no_stable_identity"
+    check = doctor.outbound_unbound_live_panes(store)
+
+    assert check["ok"] is False
+    assert check["status"] == "live_panes_unbound"
+    assert check["unbound_count"] == 1
+    assert check["first_unbound"]["worker_id"] == "historical"
+    assert check["first_unbound"]["binding_state"] == "no_stable_identity"
+    monkeypatch.setattr(
+        doctor, "source_services", lambda: {"ok": True}
+    )
+    monkeypatch.setattr(doctor, "legacy_timer", lambda: {"ok": True})
+    monkeypatch.setattr(
+        doctor, "sqlite_integrity", lambda: {"ok": True}
+    )
+    monkeypatch.setattr(
+        doctor, "tendwire_backend", lambda _client=None: {"ok": True}
+    )
+    monkeypatch.setattr(
+        doctor, "tendwire_delta_feed", lambda: {"ok": True}
+    )
+    monkeypatch.setattr(
+        doctor, "inbound_lanes", lambda: {"ok": True}
+    )
+    monkeypatch.setattr(doctor.state, "load_state", lambda: store)
+
+    composed = doctor.run_doctor()
+
+    assert composed["ok"] is False
+    assert (
+        composed["checks"]["outbound_unbound_live_panes"]["status"]
+        == "live_panes_unbound"
+    )
+
+
+def test_binding_refusals_stamp_each_specific_reason(monkeypatch):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
+
+    no_identity_worker = _source_worker(
+        {
+            "id": "missing-id",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "missing-id-fp",
+        },
+        stable_identity=False,
+    )
+    _key, no_identity, _created = state.upsert_worker_entry(
+        store, no_identity_worker
+    )
+    source_sync._ensure_topic(
+        store,
+        no_identity_worker,
+        no_identity,
+        runtime,
+        chat_id="-100",
+    )
+    assert no_identity["binding_state"] == "no_stable_identity"
+
+    quarantined_worker = _source_worker(
+        {
+            "id": "quarantined",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "quarantined-fp",
+        }
+    )
+    quarantined_key, quarantined, _created = state.upsert_worker_entry(
+        store, quarantined_worker
+    )
+    state.quarantine_worker_entry(
+        store,
+        quarantined_key,
+        reason="snapshot_stable_key_conflict",
+    )
+    source_sync._ensure_topic(
+        store,
+        quarantined_worker,
+        quarantined,
+        runtime,
+        chat_id="-100",
+    )
+    assert quarantined["binding_state"] == (
+        "quarantined:snapshot_stable_key_conflict"
+    )
+
+    pending_worker = _source_worker(
+        {
+            "id": "pending",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "pending-fp",
+        }
+    )
+    _key, pending, _created = state.upsert_worker_entry(
+        store, pending_worker
+    )
+    source_sync._ensure_topic(
+        store,
+        pending_worker,
+        pending,
+        runtime,
+        chat_id="-100",
+        can_create=False,
+    )
+    assert pending["binding_state"] == "pending_create"
+
+    class FailingCreateTelegram(FakeTelegram):
+        def create_topic(self, _chat_id, _name, icon_color=None):
+            return {"ok": False, "error": "topic quota reached"}
+
+    failed_worker = _source_worker(
+        {
+            "id": "create-error",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "create-error-fp",
+        }
+    )
+    _key, failed, _created = state.upsert_worker_entry(
+        store, failed_worker
+    )
+    source_sync._ensure_topic(
+        store,
+        failed_worker,
+        failed,
+        SyncRuntime(
+            FakeTendwire(),
+            FailingCreateTelegram(),
+            with_outbox=False,
+        ),
+        chat_id="-100",
+    )
+    assert failed["binding_state"] == "create_error:topic quota reached"
+
+
+def test_snapshot_stamps_bound_and_absent_binding_states(monkeypatch):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    store = _store()
+    historical_worker = _source_worker(
+        {
+            "id": "historical",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "historical-fp",
+        }
+    )
+    _key, historical, _created = state.upsert_worker_entry(
+        store, historical_worker
+    )
+    historical["topic_id"] = "51"
+
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                workers=[
+                    {
+                        "id": "live",
+                        "name": "Live",
+                        "status": "working",
+                        "space_id": "space-1",
+                        "fingerprint": "live-fp",
+                    }
+                ]
+            ),
+            FakeTelegram(),
+            with_outbox=False,
+        ),
+    )
+    entries = state.source_worker_entries(store)
+    live = next(
+        entry
+        for entry in entries.values()
+        if entry.get("tendwire_worker_id") == "live"
+    )
+
+    assert live["live_in_snapshot"] is True
+    assert live["binding_state"] == "bound"
+    assert live["binding_topic_id"] == live["topic_id"]
+    assert historical["live_in_snapshot"] is False
+    assert historical["binding_state"] == "absent_from_snapshot"
+
+
+def test_unique_routing_gate_stamps_ambiguous_route(monkeypatch):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    monkeypatch.setattr(
+        state,
+        "worker_entry_is_uniquely_routable",
+        lambda *_args, **_kwargs: False,
+    )
+    store = _store()
+
+    sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(),
+            FakeTelegram(),
+            with_outbox=False,
+        ),
+    )
+    entry = next(iter(state.source_worker_entries(store).values()))
+
+    assert entry["live_in_snapshot"] is True
+    assert entry["binding_state"] == "quarantined:ambiguous_route"
+    assert entry.get("topic_id") is None
+
+
+def test_unbound_final_notice_is_one_per_entry_cooldown(monkeypatch):
+    monkeypatch.setenv(
+        "HERDRES_UNBOUND_FINAL_NOTICE_COOLDOWN_SECONDS", "300"
+    )
+    store = _store()
+    worker = _source_worker(
+        {
+            "id": "worker-unbound",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "worker-unbound-fp",
+        }
+    )
+    _key, entry, _created = state.upsert_worker_entry(store, worker)
+    entry["live_in_snapshot"] = True
+    entry["binding_state"] = "pending_create"
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(
+        FakeTendwire(), telegram, with_outbox=False, max_sends=8
+    )
+    item = {
+        "id": "turn-unbound",
+        "worker_id": "worker-unbound",
+        "complete": True,
+        "assistant_final_text": "owner-visible final",
+    }
+
+    first = source_sync._notify_unbound_final(
+        store, item, entry, runtime, chat_id="-100"
+    )
+    second = source_sync._notify_unbound_final(
+        store, item, entry, runtime, chat_id="-100"
+    )
+
+    assert first == 1
+    assert second == 0
+    assert len(telegram.sent) == 1
+    assert telegram.sent[0][2]["thread_id"] == "1"
+    assert "Live pane has no Telegram topic" in telegram.sent[0][1]
+    assert entry["unbound_final_notice_turn_id"] == "turn-unbound"
+
+
+@pytest.mark.parametrize(
+    "binding_state",
+    [
+        "no_stable_identity",
+        "quarantined:snapshot_stable_key_conflict",
+        "quarantined:ambiguous_route",
+    ],
+)
+def test_identity_resolution_states_do_not_emit_general_final_notices(
+    binding_state,
+):
+    store = _store()
+    worker = _source_worker(
+        {
+            "id": "worker-resolving",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "worker-resolving-fp",
+        }
+    )
+    _key, entry, _created = state.upsert_worker_entry(store, worker)
+    entry["live_in_snapshot"] = True
+    entry["binding_state"] = binding_state
+    telegram = FakeTelegram()
+
+    writes = source_sync._notify_unbound_final(
+        store,
+        {
+            "id": "turn-resolving",
+            "worker_id": "worker-resolving",
+            "complete": True,
+            "assistant_final_text": "waiting for identity resolution",
+        },
+        entry,
+        SyncRuntime(
+            FakeTendwire(),
+            telegram,
+            with_outbox=False,
+            max_sends=8,
+        ),
+        chat_id="-100",
+    )
+
+    assert writes == 0
+    assert telegram.sent == []
+
+
+def test_identity_resolution_that_never_heals_stays_board_and_doctor_visible():
+    store = _store()
+    entry = {
+        "source": "tendwire",
+        "entry_type": "worker",
+        "agent": "claude",
+        "worker_name": "claude",
+        "tendwire_worker_id": "worker-stranded",
+        "live_in_snapshot": True,
+        "binding_state": "quarantined:snapshot_stable_key_conflict",
+        "status": "working",
+    }
+    store["panes"]["worker:stranded"] = entry
+
+    # Identity-resolution states deliberately never emit a General message.
+    # If consolidation does not heal, the existing owner surfaces remain
+    # continuously non-healthy instead of flooding once per claimant/pass.
+    for _pass in range(4):
+        overview = render_status_overview(
+            list(state.source_worker_entries(store).values())
+        )
+        check = doctor.outbound_unbound_live_panes(store)
+        assert overview.splitlines()[0] == (
+            "<b>Live panes without topics: 1</b>"
+        )
+        assert (
+            "Claude 🟡 ⚠️ unbound: "
+            "quarantined:snapshot_stable_key_conflict"
+        ) in overview
+        assert check["ok"] is False
+        assert check["status"] == "live_panes_unbound"
+        assert check["first_unbound"]["worker_id"] == "worker-stranded"
+
+
+def test_unbound_final_notice_runs_on_sync_drop_path():
+    turns = {
+        "schema_version": 1,
+        "turns": [
+            {
+                "id": "turn-pending-topic-final",
+                "worker_id": "worker-1",
+                "space_id": "space-1",
+                "complete": True,
+                "assistant_final_text": "final cannot reach a pane topic",
+            }
+        ]
+    }
+    store = _store()
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "working",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+    )
+    entry.update(
+        {
+            "live_in_snapshot": True,
+            "binding_state": "pending_create",
+            "status": "working",
+        }
+    )
+    telegram = FakeTelegram()
+    runtime = SyncRuntime(
+        FakeTendwire(),
+        telegram,
+        with_outbox=False,
+        max_sends=8,
+    )
+
+    first = source_sync._sync_turns(
+        store,
+        turns,
+        {"pending_interactions": []},
+        runtime,
+        chat_id="-100",
+        live_worker_ids={"worker-1"},
+    )
+    second = source_sync._sync_turns(
+        store,
+        turns,
+        {"pending_interactions": []},
+        runtime,
+        chat_id="-100",
+        live_worker_ids={"worker-1"},
+    )
+
+    assert first["feed_sent"] == 0
+    assert first["work_pending"] == 1
+    assert first["physical_writes"] == 1
+    assert len(telegram.sent) == 1
+    assert "Live pane has no Telegram topic" in telegram.sent[0][1]
+    assert second["feed_sent"] == 0
+    assert second["work_pending"] == 1
+    assert second["physical_writes"] == 0
+    assert len(telegram.sent) == 1
+    assert entry["binding_state"] == "pending_create"
+
+
+def test_identity_unresolved_sync_drop_stays_visible_without_notice(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    turns = {
+        "turns": [
+            {
+                "id": "turn-unroutable-final",
+                "worker_id": "worker-1",
+                "space_id": "space-1",
+                "complete": True,
+                "assistant_final_text": "final cannot reach a pane topic",
+            }
+        ]
+    }
+    store = _store()
+    telegram = FakeTelegram()
+
+    first = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                turns=turns,
+                stable_identities=False,
+            ),
+            telegram,
+            with_outbox=False,
+            max_sends=8,
+        ),
+    )
+    second = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                turns=turns,
+                stable_identities=False,
+            ),
+            telegram,
+            with_outbox=False,
+            max_sends=8,
+        ),
+    )
+
+    assert first["feed_sent"] == 0
+    assert first["outbound_delivery"]["status"] == (
+        "outbound_delivery_stalled"
+    )
+    assert second["feed_sent"] == 0
+    assert telegram.sent == []
+    entry = next(iter(state.source_worker_entries(store).values()))
+    overview = render_status_overview([entry])
+    assert overview.splitlines()[0] == (
+        "<b>Live panes without topics: 1</b>"
+    )
+    assert "⚠️ unbound: no_stable_identity" in overview
+    assert doctor.outbound_unbound_live_panes(store)["ok"] is False
+
+
+def test_jammed_completed_plan_enters_hold_then_exits_and_topic_resumes(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_PARTIAL_FINAL_ESCALATION_SECONDS", "30")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+    store = _store()
+    worker = _source_worker(
+        {
+            "id": "worker-jammed",
+            "status": "working",
+            "space_id": "space-1",
+            "fingerprint": "worker-jammed-fp",
+        }
+    )
+    _key, entry, _created = state.upsert_worker_entry(
+        store, worker, topic_id="77"
+    )
+    entry["live_in_snapshot"] = True
+    entry["binding_state"] = "bound"
+    entry["binding_topic_id"] = "77"
+    turn_id = "turn-jammed"
+    revision = "twrev1.jammed"
+    plan_token = "twplan1.jammed"
+    entry.update(
+        {
+            "pending_turn_id": turn_id,
+            "pending_content_revision": revision,
+            "pending_plan_token": plan_token,
+            "pending_turn_part_count": 5,
+            "pending_turn_job_count": 5,
+        }
+    )
+    for ordinal in range(5):
+        job_key = f"turn-final:{plan_token}:{ordinal:06d}"
+        state.reserve_tendwire_turn_job(
+            store,
+            job_key,
+            plan_token=plan_token,
+            content_revision=revision,
+            operation="upsert",
+            sequence_index=ordinal,
+            part_ordinal=ordinal,
+            part_count=5,
+            telegram_message_id=str(200 + ordinal),
+            bot_kind="manager",
+        )
+        state.update_tendwire_turn_job(
+            store,
+            job_key,
+            substate="telegram_applied",
+            telegram_message_id=str(200 + ordinal),
+        )
+        state.update_tendwire_turn_job(
+            store, job_key, substate="acknowledged"
+        )
+        if ordinal != 2:
+            state.bind_message_to_worker(
+                store,
+                str(200 + ordinal),
+                entry,
+                topic_id="77",
+                kind="final",
+                turn_id=turn_id,
+                bot_kind="manager",
+                content_revision=revision,
+                plan_token=plan_token,
+                part_ordinal=ordinal,
+                part_count=5,
+                tendwire_job_key=job_key,
+            )
+
+    held = source_sync._observe_jammed_pending_plan(
+        store,
+        entry,
+        turn_id=turn_id,
+        plan_token=plan_token,
+        revision=revision,
+        part_count=5,
+    )
+    record = state.find_partial_final_delivery(
+        store, turn_id, revision
+    )
+
+    assert held is True
+    assert record is not None
+    assert record["status"] == "held"
+    assert record["request_phase"] == "pending_plan_binding_gap"
+    assert record["missing_part_ordinals"] == [2]
+    assert entry["pending_plan_token"] == plan_token
+    assert doctor.outbound_partial_finals(store)["ok"] is False
+    # Existing bindings keep their plan ordinals; creating the hold must not
+    # repeat the earlier mutation that discarded sibling lifecycle metadata.
+    assert state.find_message_binding(store, "201")["part_ordinal"] == 1
+
+    record["created_at"] -= 31
+    exited = source_sync._observe_jammed_pending_plan(
+        store,
+        entry,
+        turn_id=turn_id,
+        plan_token=plan_token,
+        revision=revision,
+        part_count=5,
+    )
+
+    assert exited is True
+    assert "pending_plan_token" not in entry
+    assert record["bounded_exit"] == "broken_plan_abandoned"
+    assert doctor.outbound_partial_finals(store)["ok"] is False
+
+    telegram = FakeTelegram()
+    newer = {
+        "id": turn_id,
+        "worker_id": "worker-jammed",
+        "space_id": "space-1",
+        "complete": True,
+        "assistant_final_text": "new final after the bounded exit",
+        "user_text": "question",
+    }
+    delivered = source_sync._deliver_final(
+        store,
+        newer,
+        entry,
+        SyncRuntime(
+            FakeTendwire(),
+            telegram,
+            with_outbox=False,
+            max_sends=8,
+        ),
+        chat_id="-100",
+    )
+
+    assert delivered is True
+    assert len(telegram.sent) == 1
+    assert "new final after the bounded exit" in telegram.sent[0][1]
+    assert record["status"] == "held"
+
+
 def test_source_working_turn_renders_working_not_response():
     item = turn_item_from_source(
         {
@@ -2662,6 +3469,9 @@ def test_worker_topic_creation_refuses_second_topic_for_same_stable_owner(monkey
 
     assert needed is False and created is False
     assert second.get("topic_id") is None
+    assert second["binding_state"] == (
+        "quarantined:stable_identity_collision"
+    )
     assert telegram.topics == []
 
 
