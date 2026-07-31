@@ -10,6 +10,7 @@ from typing import Any
 
 
 FORBIDDEN_PUBLIC_KEYS = {
+    "_meta",
     "argv",
     "backend_target",
     "bot_token",
@@ -26,6 +27,24 @@ FORBIDDEN_PUBLIC_KEYS = {
     "token",
     "topic_id",
 }
+
+# ACP reserves ``_meta`` for implementation-specific data and carries raw
+# reasoning/tool material outside its message stream. Tendwire is the primary
+# sanitizer, but the connector boundary drops the unmistakably private fields
+# again so an upstream regression cannot copy them into Herdres state or audit
+# output. Keep this list narrow: ``meta`` (without the leading underscore) is
+# Tendwire's public stable-worker metadata and ``plan_token`` is an opaque
+# connector protocol value.
+PRIVATE_AGENT_FIELD_NAMES = frozenset(
+    {
+        "chainofthought",
+        "rawinput",
+        "rawoutput",
+        "reasoning",
+        "thought",
+        "thoughts",
+    }
+)
 
 SECRET_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
 
@@ -75,7 +94,14 @@ def public_prune(value: Any) -> Any:
         result: dict[str, Any] = {}
         for key, item in value.items():
             clean_key = str(key)
-            if clean_key in FORBIDDEN_PUBLIC_KEYS or "token" in clean_key.lower() or "secret" in clean_key.lower():
+            normalized_key = re.sub(r"[^a-z0-9]+", "", clean_key.lower())
+            if (
+                clean_key.lower() == "_meta"
+                or clean_key in FORBIDDEN_PUBLIC_KEYS
+                or normalized_key in PRIVATE_AGENT_FIELD_NAMES
+                or "token" in clean_key.lower()
+                or "secret" in clean_key.lower()
+            ):
                 continue
             result[clean_key] = public_prune(item)
         return result

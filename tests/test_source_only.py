@@ -18,7 +18,7 @@ import herdres
 import herdres_gateway
 from herdres_connector import doctor, ingress_requests, source_sync, state
 from herdres_connector.managed_bots import managed_bot_kind_for_key, managed_bot_tokens
-from herdres_connector.rendering import render_status_overview
+from herdres_connector.rendering import render_pending, render_status_overview
 from herdres_connector.rich_delivery import MAX_RICH_HTML_CHARS, render_feed_item_delivery_html_parts, render_turn_item_html, turn_item_from_source
 from herdres_connector.safe import public_prune
 from herdres_connector.source_sync import SyncRuntime, sync_once
@@ -522,6 +522,9 @@ def _offlock_protocol_violations(
             "tendwire.connector_ack: acknowledge delivered leased attention"
         ),
         ("connector_fail", 0): (
+            "tendwire.connector_fail: reject unsupported exact leased event"
+        ),
+        ("connector_fail", 1): (
             "tendwire.connector_fail: fail exact leased attention"
         ),
     }
@@ -7892,12 +7895,99 @@ def test_public_prune_removes_private_fields():
         "message_id": "10",
         "token": "secret",
         "target": {"worker_id": "w", "backend_target": "raw"},
+        "meta": {"stable_key": "public-stable-key"},
+        "_meta": {"adapter/internal": "private-extension"},
+        "agent_event": {
+            "thought": "private thought",
+            "reasoning": "private reasoning",
+            "rawInput": {"command": "private input"},
+            "raw_output": "private output",
+        },
     }
     clean = public_prune(payload)
     encoded = json.dumps(clean)
     assert "-100" not in encoded
     assert "secret" not in encoded
     assert "backend_target" not in encoded
+    assert "private-extension" not in encoded
+    assert "private thought" not in encoded
+    assert "private reasoning" not in encoded
+    assert "private input" not in encoded
+    assert "private output" not in encoded
+    assert clean["meta"] == {"stable_key": "public-stable-key"}
+
+
+def test_outbox_rejects_unversioned_structured_agent_event_without_telegram_send():
+    class StructuredEventTendwire:
+        def __init__(self):
+            self.failed = []
+
+        def connector_poll(self, **_kwargs):
+            return {
+                "ok": True,
+                "items": [
+                    {
+                        "ref": "ref-private-event",
+                        "key": "agent-event:tool-1",
+                        "attempt": 1,
+                        "payload": {
+                            "event_type": "tool_call_update",
+                            "tool_call": {
+                                "title": "Shell",
+                                "rawInput": "private command",
+                                "rawOutput": "private output",
+                            },
+                            "_meta": {"adapter/private": "private metadata"},
+                        },
+                    }
+                ],
+            }
+
+        def connector_fail(self, ref, error, **_kwargs):
+            self.failed.append((ref, error))
+            return {"ok": True}
+
+    store = _store()
+    tendwire = StructuredEventTendwire()
+    telegram = FakeTelegram()
+
+    result = drain_outbox(
+        store, telegram, tendwire, chat_id="-100", max_sends=1
+    )
+
+    assert result["delivered"] == 0
+    assert result["failed"] == 1
+    assert result["physical_writes"] == 0
+    assert telegram.sent == []
+    assert tendwire.failed == [
+        ("ref-private-event", "unsupported connector event type")
+    ]
+
+
+def test_status_and_pending_render_only_neutral_public_fields():
+    private = "must-not-reach-telegram"
+    entry = {
+        "worker_name": "Codex",
+        "tendwire_worker_id": "worker-1",
+        "status": "working",
+        "_meta": {"adapter/private": private},
+        "control": {"currentMode": private},
+    }
+    pending = {
+        "question": "Allow this operation?",
+        "choices": [{"label": "Allow once"}, {"label": "Reject"}],
+        "permission": {"toolCall": {"rawInput": private}},
+        "_meta": {"adapter/private": private},
+    }
+
+    status_html = render_status_overview([entry])
+    pending_html = render_pending(pending, entry)
+
+    assert "Codex" in status_html
+    assert "Allow this operation?" in pending_html
+    assert "Allow once" in pending_html
+    assert private not in status_html
+    assert private not in pending_html
 
 
 def test_placeholder_turn_never_outranks_real_turn_for_same_worker(monkeypatch):

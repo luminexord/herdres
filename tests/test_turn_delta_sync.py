@@ -647,6 +647,74 @@ def test_delta_page_isolates_revisionless_legacy_row_without_dropping_valid_rows
 
 
 @pytest.mark.parametrize(
+    "private_field,private_value",
+    [
+        ("_meta", {"adapter/private": "session-private"}),
+        ("thought", "raw chain of thought"),
+        ("toolCall", {"rawInput": "secret command"}),
+        ("tool_call_update", {"rawOutput": "secret output"}),
+        ("plan", [{"content": "private plan", "status": "pending"}]),
+        ("permission_request", {"options": ["allow_always"]}),
+        ("control", {"currentMode": "private-mode"}),
+    ],
+)
+def test_delta_quarantines_private_structured_agent_fields(
+    private_field, private_value
+):
+    row = _turn_row(
+        "turn-private", "twrev1.private", None, user="public prompt"
+    )
+    row[private_field] = private_value
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(row)],
+            mode="changes",
+            checkpoint="twdelta1.private-quarantined",
+        )
+    )
+
+    assert removals == []
+    assert upserts == [
+        {
+            "id": "turn-private",
+            "worker_id": row["worker_id"],
+            _TURN_CONTENT_OUTCOME_KEY: {
+                "turn_id": "turn-private",
+                "status": "private_agent_content",
+                "content_revision": "twrev1.private",
+            },
+        }
+    ]
+    encoded = repr(upserts)
+    assert repr(private_value) not in encoded
+
+
+def test_delta_accepts_agent_message_text_that_discusses_tools_and_plans():
+    row = _turn_row(
+        "turn-message",
+        "twrev1.message",
+        None,
+        user="Explain the plan and tool call.",
+    )
+    row["assistant_stream_text"] = (
+        "The plan is safe to discuss as ordinary assistant message text."
+    )
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(row)],
+            mode="changes",
+            checkpoint="twdelta1.message",
+        )
+    )
+
+    assert removals == []
+    assert upserts == [row]
+    assert _TURN_CONTENT_OUTCOME_KEY not in upserts[0]
+
+
+@pytest.mark.parametrize(
     "change",
     [
         pytest.param(

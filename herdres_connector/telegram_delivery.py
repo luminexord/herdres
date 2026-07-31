@@ -886,6 +886,16 @@ def drain_outbox(
             result["acked"] += 1
             result["changed"] = True
             continue
+        event_type = str(payload.get("event_type") or "")
+        if event_type not in {"attention_created", "attention_escalated"}:
+            # The generic connector queue is not permission to render a new
+            # payload family. In particular, never turn a future ACP
+            # tool/plan/control event into a misleading generic notification.
+            result["failed"] += 1
+            result["changed"] = True
+            if ref and not dry_run:
+                tendwire.connector_fail(ref, "unsupported connector event type")
+            continue
         html = render_attention_notice(payload)
         thread_id = config.general_thread_id(store)
         sent = {"ok": True, "message_id": "0"} if dry_run else telegram.send_message(chat_id, html, thread_id=thread_id, notify=True)

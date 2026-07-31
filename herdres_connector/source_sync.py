@@ -68,6 +68,37 @@ _BINDING_STATE_PENDING_CREATE = "pending_create"
 _BINDING_STATE_NO_IDENTITY = "no_stable_identity"
 _BINDING_STATE_ABSENT = "absent_from_snapshot"
 
+# These fields belong to ACP's private structured-event side. Herdres consumes
+# only Tendwire's neutral turn projection; tool/plan/permission/control details
+# require a separately versioned public contract before they can be presented.
+# Checking keys (not text values) keeps ordinary assistant messages free to
+# discuss tools or plans without being mistaken for protocol payloads.
+_PRIVATE_AGENT_TURN_FIELD_NAMES = frozenset(
+    {
+        "availablecommands",
+        "chainofthought",
+        "configoption",
+        "configoptions",
+        "control",
+        "controlevent",
+        "currentmode",
+        "extension",
+        "extensions",
+        "permission",
+        "permissionrequest",
+        "plan",
+        "rawinput",
+        "rawoutput",
+        "reasoning",
+        "thought",
+        "thoughts",
+        "toolcall",
+        "toolcalls",
+        "toolcallupdate",
+        "toolcallupdates",
+    }
+)
+
 
 @dataclass
 class _DeliveryWriteBudget:
@@ -91,6 +122,23 @@ class _TurnContentError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.conflict = conflict
+
+
+def _contains_private_agent_turn_fields(value: Any) -> bool:
+    """Return whether a neutral turn illegally embeds private ACP structure."""
+
+    if isinstance(value, Mapping):
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            normalized = "".join(char for char in key.lower() if char.isalnum())
+            if key.lower() == "_meta" or normalized in _PRIVATE_AGENT_TURN_FIELD_NAMES:
+                return True
+            if _contains_private_agent_turn_fields(item):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_contains_private_agent_turn_fields(item) for item in value)
+    return False
 
 
 @dataclass
@@ -2828,7 +2876,26 @@ def _turn_local_outcome(
     return outcome
 
 
+def _quarantined_turn_row(
+    item: dict[str, Any], status: str
+) -> dict[str, Any]:
+    """Retain public routing identity, never the rejected private structure."""
+
+    quarantined = {
+        key: item[key]
+        for key in ("id", "turn_id", "worker_id", "space_id")
+        if isinstance(item.get(key), str) and item[key]
+    }
+    quarantined[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(item, status)
+    return quarantined
+
+
 def _validate_turn_row(raw: dict[str, Any]) -> dict[str, Any]:
+    if _contains_private_agent_turn_fields(raw):
+        raise _TurnContentError(
+            "private_agent_content",
+            "neutral Tendwire turn contains private structured agent data",
+        )
     item = dict(raw)
     content = item.get("content")
     content_schema = (
@@ -2884,7 +2951,18 @@ def _validate_turns_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if type(schema) is int and schema == 1:
         # Direct-call Goal 01B compatibility. The production TendwireClient
         # negotiates schema v2 and refuses daemon/CLI v1 responses.
-        return payload
+        rows = payload.get("turns")
+        if not isinstance(rows, list):
+            return payload
+        validated = dict(payload)
+        validated["turns"] = [
+            _quarantined_turn_row(row, "private_agent_content")
+            if isinstance(row, dict)
+            and _contains_private_agent_turn_fields(row)
+            else row
+            for row in rows
+        ]
+        return validated
     if type(schema) is not int or schema != TURN_SCHEMA_VERSION:
         raise _TurnContentError(
             "upgrade_required", "Tendwire turn schema v2 is required"
@@ -2911,10 +2989,15 @@ def _validate_turns_payload(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             validated_rows.append(_validate_turn_row(raw))
         except _TurnContentError as exc:
-            item = dict(raw)
-            item[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
-                item, exc.status
+            item = (
+                _quarantined_turn_row(raw, exc.status)
+                if exc.status == "private_agent_content"
+                else dict(raw)
             )
+            if _TURN_CONTENT_OUTCOME_KEY not in item:
+                item[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
+                    item, exc.status
+                )
             validated_rows.append(item)
     validated = dict(payload)
     validated["turns"] = validated_rows
@@ -12847,10 +12930,15 @@ def _validate_delta_page(
             try:
                 turn = _validate_turn_row(raw_turn)
             except _TurnContentError as exc:
-                turn = dict(raw_turn)
-                turn[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
-                    turn, exc.status
+                turn = (
+                    _quarantined_turn_row(raw_turn, exc.status)
+                    if exc.status == "private_agent_content"
+                    else dict(raw_turn)
                 )
+                if _TURN_CONTENT_OUTCOME_KEY not in turn:
+                    turn[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
+                        turn, exc.status
+                    )
             else:
                 if _turn_id(turn) != change_turn_id:
                     raise _TurnContentError(
