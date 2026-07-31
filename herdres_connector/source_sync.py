@@ -28,7 +28,17 @@ from .rich_delivery import (
     split_legacy_message_ids,
     turn_item_from_source,
 )
-from .safe import compact_ws, html_escape, short_hash
+from .safe import (
+    PRIVATE_AGENT_CONTAINER_FIELD_NAMES,
+    PRIVATE_AGENT_FIELD_NAMES,
+    PRIVATE_STRUCTURE_MAX_DEPTH,
+    PRIVATE_STRUCTURE_MAX_ITEMS,
+    compact_ws,
+    html_escape,
+    mapping_has_private_agent_discriminator,
+    normalized_public_key,
+    short_hash,
+)
 from .telegram_delivery import (
     DELIVERY_FORMAT_STATE_UPDATE_KEY,
     MESSAGE_TEXT_LIMIT,
@@ -71,12 +81,12 @@ _BINDING_STATE_ABSENT = "absent_from_snapshot"
 # These fields belong to ACP's private structured-event side. Herdres consumes
 # only Tendwire's neutral turn projection; tool/plan/permission/control details
 # require a separately versioned public contract before they can be presented.
-# Checking keys (not text values) keeps ordinary assistant messages free to
-# discuss tools or plans without being mistaken for protocol payloads.
-_PRIVATE_AGENT_TURN_FIELD_NAMES = frozenset(
+# Checking structural keys and exact ACP discriminator values keeps ordinary
+# assistant messages free to discuss tools or plans without being mistaken for
+# protocol payloads.
+_PRIVATE_AGENT_ROOT_FIELD_NAMES = frozenset(
     {
         "availablecommands",
-        "chainofthought",
         "configoption",
         "configoptions",
         "control",
@@ -87,8 +97,6 @@ _PRIVATE_AGENT_TURN_FIELD_NAMES = frozenset(
         "permission",
         "permissionrequest",
         "plan",
-        "rawinput",
-        "rawoutput",
         "reasoning",
         "thought",
         "thoughts",
@@ -125,19 +133,48 @@ class _TurnContentError(RuntimeError):
 
 
 def _contains_private_agent_turn_fields(value: Any) -> bool:
-    """Return whether a neutral turn illegally embeds private ACP structure."""
+    """Return whether a neutral turn illegally embeds private ACP structure.
 
-    if isinstance(value, Mapping):
-        for raw_key, item in value.items():
-            key = str(raw_key)
-            normalized = "".join(char for char in key.lower() if char.isalnum())
-            if key.lower() == "_meta" or normalized in _PRIVATE_AGENT_TURN_FIELD_NAMES:
+    Public ``meta`` is intentionally extensible, so generic words such as
+    ``plan`` or ``control`` are rejected only as illegal root turn fields.
+    Nested detection is limited to unmistakably private keys and exact ACP
+    envelope shapes. Bounds and cycle detection make malformed input fail
+    closed without risking recursion failure.
+    """
+
+    stack: list[tuple[Any, int, bool]] = [(value, 0, True)]
+    seen: set[int] = set()
+    items = 0
+    while stack:
+        current, depth, is_root = stack.pop()
+        items += 1
+        if items > PRIVATE_STRUCTURE_MAX_ITEMS or depth > PRIVATE_STRUCTURE_MAX_DEPTH:
+            return True
+        if isinstance(current, Mapping):
+            identity = id(current)
+            if identity in seen:
                 return True
-            if _contains_private_agent_turn_fields(item):
+            seen.add(identity)
+            plain = dict(current)
+            if mapping_has_private_agent_discriminator(plain):
                 return True
-        return False
-    if isinstance(value, (list, tuple)):
-        return any(_contains_private_agent_turn_fields(item) for item in value)
+            for raw_key, item in current.items():
+                key = str(raw_key)
+                normalized = normalized_public_key(key)
+                if (
+                    key.lower() == "_meta"
+                    or normalized in PRIVATE_AGENT_CONTAINER_FIELD_NAMES
+                    or normalized in PRIVATE_AGENT_FIELD_NAMES
+                    or is_root and normalized in _PRIVATE_AGENT_ROOT_FIELD_NAMES
+                ):
+                    return True
+                stack.append((item, depth + 1, False))
+        elif isinstance(current, (list, tuple)):
+            identity = id(current)
+            if identity in seen:
+                return True
+            seen.add(identity)
+            stack.extend((item, depth + 1, False) for item in current)
     return False
 
 

@@ -14,7 +14,14 @@ from typing import Any
 
 from . import config
 from .ingress_identity import validate_request_id
-from .safe import FORBIDDEN_PUBLIC_KEYS, PRUNE_TEXT_LIMIT, public_prune, sanitize_text
+from .safe import (
+    FORBIDDEN_PUBLIC_KEYS,
+    PRIVATE_STRUCTURE_MAX_DEPTH,
+    PRIVATE_STRUCTURE_MAX_ITEMS,
+    PRUNE_TEXT_LIMIT,
+    public_prune,
+    sanitize_text,
+)
 
 
 class TendwireError(RuntimeError):
@@ -498,9 +505,26 @@ def _is_private_ingress_env_key(key: str) -> bool:
     )
 
 
-def _protocol_prune(value: Any) -> Any:
+def _protocol_prune(
+    value: Any,
+    *,
+    _depth: int = 0,
+    _budget: list[int] | None = None,
+    _seen: set[int] | None = None,
+) -> Any:
     """Prune public protocol metadata while retaining its opaque public tokens."""
+    if _budget is None:
+        _budget = [PRIVATE_STRUCTURE_MAX_ITEMS]
+    if _seen is None:
+        _seen = set()
+    _budget[0] -= 1
+    if _budget[0] < 0 or _depth > PRIVATE_STRUCTURE_MAX_DEPTH:
+        return None
     if isinstance(value, dict):
+        identity = id(value)
+        if identity in _seen:
+            return None
+        _seen.add(identity)
         result: dict[str, Any] = {}
         for key, item in value.items():
             clean_key = str(key)
@@ -508,10 +532,27 @@ def _protocol_prune(value: Any) -> Any:
             token_key = "token" in clean_key.lower()
             if forbidden or (token_key and clean_key not in _PUBLIC_PROTOCOL_TOKEN_KEYS):
                 continue
-            result[clean_key] = _protocol_prune(item)
+            result[clean_key] = _protocol_prune(
+                item,
+                _depth=_depth + 1,
+                _budget=_budget,
+                _seen=_seen,
+            )
         return result
     if isinstance(value, list):
-        return [_protocol_prune(item) for item in value]
+        identity = id(value)
+        if identity in _seen:
+            return None
+        _seen.add(identity)
+        return [
+            _protocol_prune(
+                item,
+                _depth=_depth + 1,
+                _budget=_budget,
+                _seen=_seen,
+            )
+            for item in value
+        ]
     if isinstance(value, str):
         return sanitize_text(value, PRUNE_TEXT_LIMIT)
     return value
@@ -640,7 +681,7 @@ class TendwireClient:
         stderr = proc.stderr.decode("utf-8", "replace")
         try:
             data = json.loads(stdout or "{}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             if post_start_uncertain:
                 return _request_state_uncertain(input_json)
             detail = sanitize_text(stderr or stdout or "non-json Tendwire response", 300)

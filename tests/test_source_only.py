@@ -7895,7 +7895,11 @@ def test_public_prune_removes_private_fields():
         "message_id": "10",
         "token": "secret",
         "target": {"worker_id": "w", "backend_target": "raw"},
-        "meta": {"stable_key": "public-stable-key"},
+        "meta": {
+            "stable_key": "public-stable-key",
+            "plan": "Migration roadmap",
+            "thought": "Product-design note",
+        },
         "_meta": {"adapter/internal": "private-extension"},
         "agent_event": {
             "thought": "private thought",
@@ -7914,7 +7918,32 @@ def test_public_prune_removes_private_fields():
     assert "private reasoning" not in encoded
     assert "private input" not in encoded
     assert "private output" not in encoded
-    assert clean["meta"] == {"stable_key": "public-stable-key"}
+    assert clean["meta"] == {
+        "stable_key": "public-stable-key",
+        "plan": "Migration roadmap",
+        "thought": "Product-design note",
+    }
+
+
+def test_public_prune_drops_acp_discriminated_event_with_sibling_content():
+    private = "internal chain of thought that must stay private"
+    payload = {
+        "ok": True,
+        "update": {
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": private},
+        },
+        "public": "still visible",
+    }
+
+    clean = public_prune(payload)
+
+    assert clean == {
+        "ok": True,
+        "update": {},
+        "public": "still visible",
+    }
+    assert private not in json.dumps(clean)
 
 
 def test_outbox_rejects_unversioned_structured_agent_event_without_telegram_send():

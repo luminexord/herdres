@@ -15,6 +15,24 @@ from herdres_connector.tendwire_client import TendwireClient
 REQUEST_ID = "hri1_SIodGeqCeIvApzpEvIaEM-L07UzUMgUFyeltRQxPpqU"
 
 
+def test_protocol_prune_bounds_deep_malformed_payload_without_recursion():
+    nested = {}
+    for _index in range(200):
+        nested = {"child": nested}
+
+    clean = tendwire_client._protocol_prune(
+        {"schema_version": 1, "nested": nested}
+    )
+
+    assert clean["schema_version"] == 1
+    current = clean["nested"]
+    for _index in range(129):
+        if current is None:
+            break
+        current = current["child"]
+    assert current is None
+
+
 def test_command_response_schema_negotiation_is_explicit_and_fail_closed(
     monkeypatch,
 ):

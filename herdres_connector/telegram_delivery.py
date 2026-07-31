@@ -891,6 +891,9 @@ def drain_outbox(
             # The generic connector queue is not permission to render a new
             # payload family. In particular, never turn a future ACP
             # tool/plan/control event into a misleading generic notification.
+            # ``connector.fail`` deliberately consumes the queue's bounded
+            # attempt budget and eventually dead-letters a poison/future item;
+            # ACK would falsely record an unsupported item as delivered.
             result["failed"] += 1
             result["changed"] = True
             if ref and not dry_run:

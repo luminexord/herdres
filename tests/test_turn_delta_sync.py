@@ -715,6 +715,125 @@ def test_delta_accepts_agent_message_text_that_discusses_tools_and_plans():
 
 
 @pytest.mark.parametrize(
+    "agent_event",
+    [
+        {
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {
+                "type": "text",
+                "text": "private reasoning in a sibling field",
+            },
+        },
+        {
+            "sessionUpdate": "agent_thought",
+            "content": {
+                "type": "text",
+                "text": "private ACP v2 reasoning update",
+            },
+        },
+        {
+            "sessionUpdate": "agent_thought_chunk",
+            "session_update": "benign-looking-collision",
+            "content": {
+                "type": "text",
+                "text": "private reasoning behind an alias collision",
+            },
+        },
+        {
+            "kind": "plan",
+            "visibility": "private",
+            "payload": {"steps": ["private step"]},
+        },
+        {
+            "kind": "agent_message",
+            "visibility": "private",
+            "payload": {"text": "private copy of an otherwise public kind"},
+        },
+    ],
+)
+def test_delta_quarantines_structurally_discriminated_acp_event(agent_event):
+    row = _turn_row(
+        "turn-private-structure",
+        "twrev1.private-structure",
+        None,
+        user="public prompt",
+    )
+    row.setdefault("meta", {})["upstream_projection"] = agent_event
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(row)],
+            mode="changes",
+            checkpoint="twdelta1.private-structure",
+        )
+    )
+
+    assert removals == []
+    assert len(upserts) == 1
+    assert upserts[0][_TURN_CONTENT_OUTCOME_KEY]["status"] == (
+        "private_agent_content"
+    )
+    assert repr(agent_event) not in repr(upserts)
+
+
+def test_delta_preserves_ordinary_public_meta_with_protocol_like_words():
+    row = _turn_row(
+        "turn-public-meta", "twrev1.public-meta", None, user="public prompt"
+    )
+    row.setdefault("meta", {}).update(
+        {
+            "plan": "Migration roadmap",
+            "control": "Control group",
+            "permission": "Document ACL label",
+            "extensions": [".py"],
+            "current_mode": "dark",
+            "reasoning": "Deductive",
+            "thought": "Product-design note",
+            "planning": {
+                "kind": "plan",
+                "payload": {"description": "Public roadmap metadata"},
+            },
+        }
+    )
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(row)],
+            mode="changes",
+            checkpoint="twdelta1.public-meta",
+        )
+    )
+
+    assert removals == []
+    assert upserts == [row]
+    assert _TURN_CONTENT_OUTCOME_KEY not in upserts[0]
+
+
+def test_delta_private_scan_fails_closed_on_excessive_depth_without_recursion():
+    nested = {}
+    for _index in range(200):
+        nested = {"child": nested}
+    row = _turn_row(
+        "turn-overdeep", "twrev1.overdeep", None, user="public prompt"
+    )
+    row.setdefault("meta", {})["nested"] = nested
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(row)],
+            mode="changes",
+            checkpoint="twdelta1.overdeep",
+        )
+    )
+
+    assert removals == []
+    assert len(upserts) == 1
+    assert upserts[0][_TURN_CONTENT_OUTCOME_KEY]["status"] == (
+        "private_agent_content"
+    )
+
+
+@pytest.mark.parametrize(
     "change",
     [
         pytest.param(
