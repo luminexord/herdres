@@ -19,6 +19,7 @@ from .rich_delivery import (
     RICH_BAD_REQUEST_LIMIT,
     RICH_RENDER_VERSION,
     RICH_STATE_UPDATE_KEY,
+    TURN_DELIVERY_MAX_PARTS,
     edit_feed_item,
     edit_turn_delivery_part,
     feed_item_requires_send_split,
@@ -7674,10 +7675,16 @@ def _prepare_final_delivery_parts(
     """
 
     try:
-        return prepare_turn_delivery_parts(
+        parts = prepare_turn_delivery_parts(
             feed_item,
             rich_transport=False,
         )
+        # Keep canonical planning reconstructable at every size.  The cap is a
+        # delivery policy: reject the whole logical send into an observable
+        # terminal hold before any physical card is attempted.
+        if len(parts) > TURN_DELIVERY_MAX_PARTS:
+            raise PresentationOversizeError(len(parts))
+        return parts
     except PresentationOversizeError as exc:
         raise _TurnContentError(
             "oversize_presentation",

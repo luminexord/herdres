@@ -841,7 +841,9 @@ def prepare_turn_delivery_parts(
 
     Production plans to the stricter plain bound even though rich is attempted
     first. That makes a provider rejection degradable without changing the
-    durable part coordinates or inventing a second lifecycle.
+    durable part coordinates or inventing a second lifecycle. This canonical
+    planner is deliberately lossless and uncapped; the logical-delivery caller
+    applies the owner-visible physical-card ceiling and records its outcome.
     """
     if live or str(item.get("kind") or "").lower() != "turn":
         return []
@@ -877,8 +879,6 @@ def prepare_turn_delivery_parts(
             user_limit=user_limit,
             final_limit=final_limit,
         )
-        if len(parts) > TURN_DELIVERY_MAX_PARTS:
-            raise PresentationOversizeError(len(parts))
         if all(
             _turn_delivery_part_is_bounded(
                 item,
