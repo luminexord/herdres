@@ -4087,6 +4087,11 @@ def partial_final_delivery_health(
                 "current_topic_id",
                 "current_bot_kind",
                 "recovery_action",
+                "oversize_notice_status",
+                "oversize_notice_error",
+                "oversize_notice_attempt_count",
+                "oversize_notice_attempt_cap",
+                "oversize_notice_terminal",
             )
         },
     }

@@ -1329,6 +1329,135 @@ def test_oversize_final_is_explicit_terminal_and_delivers_topic_notice(
     assert doctor.outbound_partial_finals(store)["ok"] is False
 
 
+class AmbiguousAcceptedOversizeNoticeTelegram(TelegramClient):
+    def __init__(self):
+        super().__init__(token="test")
+        object.__setattr__(self, "recipient_messages", [])
+        object.__setattr__(self, "attempts", 0)
+
+    def api(self, method, payload):
+        assert method == "sendMessage"
+        self.attempts += 1
+        self.recipient_messages.append(str(payload.get("text") or ""))
+        raise TelegramError(
+            "network response lost after Telegram accepted the message"
+        )
+
+
+class RejectedOversizeNoticeTelegram(TelegramClient):
+    def __init__(self):
+        super().__init__(token="test")
+        object.__setattr__(self, "attempts", [])
+
+    def api(self, method, payload):
+        assert method == "sendMessage"
+        self.attempts.append(str(payload.get("parse_mode") or "plain"))
+        raise TelegramError("Bad Request: oversize notice rejected")
+
+
+def _legacy_oversize_notice_case(telegram):
+    store = _store()
+    row = _turn_row(
+        "turn-oversize-notice-failure",
+        "twrev1.oversize_notice_failure",
+        "x" * (TURN_DELIVERY_PLAIN_SOURCE_CHARS * 8 + 1),
+        user="legitimate large request",
+    )
+    row.pop("content")
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+        topic_id="77",
+    )
+    runtime = SyncRuntime(
+        TurnFinalTendwire(
+            _turn_row(
+                "unused",
+                "twrev1.unused",
+                "unused",
+            )
+        ),
+        telegram,
+        with_outbox=False,
+        max_sends=8,
+    )
+    return store, row, entry, runtime
+
+
+def test_ambiguous_oversize_notice_accepts_once_without_plain_replay():
+    telegram = AmbiguousAcceptedOversizeNoticeTelegram()
+    store, row, entry, runtime = _legacy_oversize_notice_case(telegram)
+
+    assert not source_sync._deliver_final(
+        store, row, entry, runtime, chat_id="-100"
+    )
+    # A later pass must not retry a possibly accepted owner-visible send.
+    runtime.delivery_write_budget = None
+    assert not source_sync._deliver_final(
+        store, row, entry, runtime, chat_id="-100"
+    )
+
+    hold = next(iter(state.active_partial_final_deliveries(store)))
+    health = doctor.outbound_partial_finals(store)
+    assert telegram.attempts == 1
+    assert len(telegram.recipient_messages) == 1
+    assert "Answer held: exceeds Telegram card limit" in (
+        telegram.recipient_messages[0]
+    )
+    assert hold["oversize_notice_status"] == "delivery_unknown"
+    assert hold["oversize_notice_terminal"] is True
+    assert health["first_hold"]["oversize_notice_status"] == (
+        "delivery_unknown"
+    )
+
+
+def test_rejected_oversize_notice_retries_three_times_then_is_terminal():
+    telegram = RejectedOversizeNoticeTelegram()
+    store, row, entry, runtime = _legacy_oversize_notice_case(telegram)
+
+    assert not source_sync._deliver_final(
+        store, row, entry, runtime, chat_id="-100"
+    )
+    first_health = doctor.outbound_partial_finals(store)
+    assert first_health["first_hold"]["oversize_notice_status"] == (
+        "failed"
+    )
+    assert "oversize notice rejected" in first_health["first_hold"][
+        "oversize_notice_error"
+    ]
+
+    # Two more definite attempts reach the cap; the fourth pass is a no-op.
+    for _attempt in range(source_sync._OVERSIZE_NOTICE_ATTEMPT_CAP):
+        runtime.delivery_write_budget = None
+        assert not source_sync._deliver_final(
+            store, row, entry, runtime, chat_id="-100"
+        )
+
+    hold = next(iter(state.active_partial_final_deliveries(store)))
+    health = doctor.outbound_partial_finals(store)
+    assert telegram.attempts == ["HTML", "HTML", "HTML"]
+    assert hold["oversize_notice_attempt_count"] == 3
+    assert hold["oversize_notice_attempt_cap"] == 3
+    assert hold["oversize_notice_status"] == "terminal_failed"
+    assert hold["oversize_notice_terminal"] is True
+    assert "oversize notice rejected" in hold["oversize_notice_error"]
+    assert health["first_hold"]["oversize_notice_status"] == (
+        "terminal_failed"
+    )
+    assert health["first_hold"]["oversize_notice_attempt_count"] == 3
+    assert "oversize notice rejected" in health["first_hold"][
+        "oversize_notice_error"
+    ]
+    assert "pending_turn_started_at" not in entry
+
+
 def test_short_inline_stages_and_delivers_without_page_fetch_then_two_syncs_noop(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     row = _turn_row("turn-short", "twrev1.short", "short exact final", user="exact prompt")

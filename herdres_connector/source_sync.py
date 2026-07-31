@@ -65,6 +65,7 @@ _TOPIC_CLEANUP_PERMANENT_ERROR_KINDS = frozenset(
     {"bad_request", "bot_access", "capability"}
 )
 _ACCEPTED_NOTIFICATION_LIMIT = 64
+_OVERSIZE_NOTICE_ATTEMPT_CAP = 3
 _DELIVERY_FORMAT_FALLBACK_LIMIT = 64
 _BINDING_STATE_BOUND = "bound"
 _BINDING_STATE_PENDING_CREATE = "pending_create"
@@ -1519,6 +1520,10 @@ def _execute_accounted_delivery_write(
     runtime: SyncRuntime,
     operation: _OfflockEntryOperation,
     mutation: _ProviderMutation,
+    *,
+    acceptance_checkpoint: (
+        Callable[[Any, _OfflockEntryOperation], None] | None
+    ) = None,
 ) -> _OfflockEntryExecution:
     """Execute and charge one owner-visible Telegram delivery capability.
 
@@ -1550,7 +1555,11 @@ def _execute_accounted_delivery_write(
         )
     try:
         execution = _execute_entry_operation(
-            store, runtime.telegram, operation, mutation
+            store,
+            runtime.telegram,
+            operation,
+            mutation,
+            acceptance_checkpoint=acceptance_checkpoint,
         )
     except Exception:
         # The adapter contract converts expected provider outcomes into a
@@ -2559,33 +2568,72 @@ def _notify_oversize_final(
     content_hash: str,
     part_count: int | None,
 ) -> int:
-    """Make an exact oversize hold visible in its owner topic once.
+    """Make an exact oversize hold visible without duplicate retries.
 
     The notice is deliberately not the answer and does not authorize replay.
     The exact answer remains in Tendwire under the named turn/revision while
-    the partial-final record keeps the logical delivery incomplete.
+    the partial-final record keeps the logical delivery incomplete. Definite
+    rejections retry for three passes; ambiguous delivery is terminal because
+    retrying a possibly accepted owner-visible send would duplicate it.
     """
 
     record = state.find_partial_final_delivery(store, turn_id, content_hash)
     topic_id = str(entry.get("topic_id") or "")
+    raw_attempt_count = (
+        record.get("oversize_notice_attempt_count")
+        if isinstance(record, dict)
+        else None
+    )
+    attempt_count = (
+        int(raw_attempt_count)
+        if isinstance(raw_attempt_count, int)
+        and not isinstance(raw_attempt_count, bool)
+        and raw_attempt_count >= 0
+        else 0
+    )
+    notice_kind = "oversize_notice:" + short_hash(
+        {"turn_id": turn_id, "content_hash": content_hash}, 20
+    )
     if (
         runtime.dry_run
         or not isinstance(record, dict)
         or not chat_id
         or not topic_id
         or record.get("oversize_notice_status") == "accepted"
+        or record.get("oversize_notice_terminal") is True
+        or attempt_count >= _OVERSIZE_NOTICE_ATTEMPT_CAP
         or _delivery_write_budget(runtime).remaining <= 0
+        or not _notification_acceptance_capacity_available(store)
+        or _notification_kind_pending(store, notice_kind)
     ):
         return 0
-    answer = str(item.get("assistant_final_text") or "")
-    answer_bytes = answer.encode("utf-8")
-    digest = hashlib.sha256(answer_bytes).hexdigest()
-    required = part_count if isinstance(part_count, int) else 0
+    if not record.get("answer_sha256"):
+        answer = str(item.get("assistant_final_text") or "")
+        answer_bytes = answer.encode("utf-8")
+        record["answer_char_length"] = len(answer)
+        record["answer_byte_length"] = len(answer_bytes)
+        record["answer_sha256"] = hashlib.sha256(answer_bytes).hexdigest()
+    required = (
+        part_count
+        if isinstance(part_count, int) and not isinstance(part_count, bool)
+        else int(record.get("required_part_count") or 0)
+    )
+    record["required_part_count"] = required
+    record["oversize_notice_attempt_cap"] = _OVERSIZE_NOTICE_ATTEMPT_CAP
+    record["content_locator"] = {
+        "source": "tendwire_turn",
+        "turn_id": turn_id,
+        "content_revision": content_hash,
+        "field": "assistant_final_text",
+    }
+    answer_chars = int(record.get("answer_char_length") or 0)
+    answer_bytes = int(record.get("answer_byte_length") or 0)
+    digest = str(record.get("answer_sha256") or "")
     revision_label = content_hash or "unknown revision"
     html = (
         "<b>Answer held: exceeds Telegram card limit</b>\n"
         f"Turn <code>{html_escape(turn_id, 200)}</code> contains "
-        f"{len(answer):,} characters / {len(answer_bytes):,} UTF-8 bytes "
+        f"{answer_chars:,} characters / {answer_bytes:,} UTF-8 bytes "
         f"and needs {required or 'more than'} cards "
         f"(limit {TURN_DELIVERY_MAX_PARTS}).\n"
         f"Digest: <code>sha256:{digest}</code>\n"
@@ -2602,6 +2650,23 @@ def _notify_oversize_final(
         entry,
         topic_id=topic_id,
     )
+    accepted_receipt_id = ""
+
+    def checkpoint_oversize_notice(
+        result: Any, captured: _OfflockEntryOperation
+    ) -> None:
+        nonlocal accepted_receipt_id
+        accepted_receipt_id = _checkpoint_accepted_notification(
+            store,
+            runtime,
+            captured,
+            result,
+            kind=notice_kind,
+            bot_kind=desired_message_bot_kind(
+                _telegram_state(store), entry
+            ),
+        )
+
     execution = _execute_accounted_delivery_write(
         store,
         runtime,
@@ -2613,11 +2678,13 @@ def _notify_oversize_final(
             kwargs={
                 "thread_id": topic_id,
                 "notify": True,
-                "max_physical_writes": _delivery_write_budget(
-                    runtime
-                ).remaining,
+                # One provider attempt is essential: a lost response after
+                # acceptance must never fall through to the plain variant.
+                "max_physical_writes": 1,
+                "ambiguous_errors_are_unknown": True,
             },
         ),
+        acceptance_checkpoint=checkpoint_oversize_notice,
     )
     sent = execution.result
     writes = _telegram_physical_writes(sent)
@@ -2627,19 +2694,16 @@ def _notify_oversize_final(
     )
     if not isinstance(current_record, dict):
         return writes
-    current_record["answer_char_length"] = len(answer)
-    current_record["answer_byte_length"] = len(answer_bytes)
-    current_record["answer_sha256"] = digest
-    current_record["required_part_count"] = required
-    current_record["content_locator"] = {
-        "source": "tendwire_turn",
-        "turn_id": turn_id,
-        "content_revision": content_hash,
-        "field": "assistant_final_text",
-    }
+    current_record["oversize_notice_attempt_count"] = (
+        attempt_count + (1 if writes else 0)
+    )
+    current_record["oversize_notice_attempt_cap"] = (
+        _OVERSIZE_NOTICE_ATTEMPT_CAP
+    )
     current_record["oversize_notice_physical_writes"] = writes
     if message_ids:
         current_record["oversize_notice_status"] = "accepted"
+        current_record["oversize_notice_terminal"] = True
         current_record["oversize_notice_message_id"] = message_ids[0]
         binding_entry = (
             execution.resolution.entry
@@ -2658,11 +2722,22 @@ def _notify_oversize_final(
                 _telegram_state(store), entry
             ),
         )
+        _complete_accepted_notification(store, accepted_receipt_id)
     else:
+        delivery_unknown = sent.get("delivery_unknown") is True
+        exhausted = (
+            current_record["oversize_notice_attempt_count"]
+            >= _OVERSIZE_NOTICE_ATTEMPT_CAP
+        )
         current_record["oversize_notice_status"] = (
             "delivery_unknown"
-            if sent.get("delivery_unknown") is True
+            if delivery_unknown
+            else "terminal_failed"
+            if exhausted
             else "failed"
+        )
+        current_record["oversize_notice_terminal"] = bool(
+            delivery_unknown or exhausted
         )
         current_record["oversize_notice_error"] = str(
             sent.get("error") or "oversize notice was not accepted"
@@ -7470,6 +7545,20 @@ def _stage_final_plan(
     )
     if (
         isinstance(exact_hold, dict)
+        and exact_hold.get("request_phase") == "oversize_presentation"
+    ):
+        _notify_oversize_final(
+            store,
+            _turn_feed_item(item, entry),
+            entry,
+            runtime,
+            chat_id=config.telegram_chat_id(store),
+            turn_id=_turn_id(item),
+            content_hash=revision,
+            part_count=exact_hold.get("required_part_count"),
+        )
+    if (
+        isinstance(exact_hold, dict)
         and exact_hold.get("operator_attention_required") is True
         and not (
             exact_hold.get("status") == "retry_authorized"
@@ -8101,6 +8190,17 @@ def _deliver_final(
         store, turn_id
     )
     if isinstance(exact_record, dict) and not retry_missing:
+        if exact_record.get("request_phase") == "oversize_presentation":
+            _notify_oversize_final(
+                store,
+                _turn_feed_item(item, entry),
+                entry,
+                runtime,
+                chat_id=chat_id,
+                turn_id=turn_id,
+                content_hash=content_hash,
+                part_count=exact_record.get("required_part_count"),
+            )
         _reconcile_partial_final_hold(
             store,
             entry,

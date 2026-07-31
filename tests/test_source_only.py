@@ -5075,7 +5075,12 @@ def test_ten_global_status_deliveries_use_two_durability_barriers_each(
 
 @pytest.mark.parametrize(
     "kind",
-    ["topic_pinned", "retired_topic_notice", "global_pinned"],
+    [
+        "topic_pinned",
+        "retired_topic_notice",
+        "global_pinned",
+        "oversize_notice",
+    ],
 )
 def test_notification_acceptance_journal_closes_crash_seam(
     tmp_path, monkeypatch, kind
@@ -5087,6 +5092,13 @@ def test_notification_acceptance_journal_closes_crash_seam(
     initial = _notification_race_store(
         retired=kind == "retired_topic_notice"
     )
+    if kind == "oversize_notice":
+        source_sync._record_oversize_final_delivery(
+            initial,
+            initial["panes"]["worker:notification-race"],
+            turn_id="turn-oversize-receipt",
+            content_hash="twrev1.oversize_receipt",
+        )
     state.save_state(initial, state_path)
     telegram = CrashNotificationTelegram()
 
@@ -5094,6 +5106,21 @@ def test_notification_acceptance_journal_closes_crash_seam(
         raise RuntimeError("crash after notification acceptance")
 
     def deliver(current, runtime):
+        if kind == "oversize_notice":
+            return bool(
+                source_sync._notify_oversize_final(
+                    current,
+                    {
+                        "assistant_final_text": "exact oversized answer",
+                    },
+                    current["panes"]["worker:notification-race"],
+                    runtime,
+                    chat_id="-100",
+                    turn_id="turn-oversize-receipt",
+                    content_hash="twrev1.oversize_receipt",
+                    part_count=9,
+                )
+            )
         if kind == "topic_pinned":
             entry = current["panes"]["worker:notification-race"]
             return source_sync._sync_topic_pinned(
