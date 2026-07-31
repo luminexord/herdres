@@ -1513,10 +1513,11 @@ def _execute_accounted_delivery_write(
 
     Adapter results report the whole rich/HTML/plain ladder as
     ``physical_writes``.  The wrapper charges that fact whether the logical
-    delivery succeeded or failed.  Every delivery caller must also pass the
-    wrapper's exact ``remaining`` value as ``max_physical_writes``; this
-    runtime check makes a missing allowance loud even if a static guard is
-    accidentally weakened.
+    delivery succeeded or failed. Every delivery caller must pass a positive
+    allowance no larger than the wrapper's ``remaining`` value as
+    ``max_physical_writes``. A caller may impose a stricter local cap (the fold
+    sweep does); this runtime check still makes a missing or excessive
+    allowance loud even if a static guard is accidentally weakened.
     """
 
     budget = _delivery_write_budget(runtime)
@@ -1525,11 +1526,12 @@ def _execute_accounted_delivery_write(
     if (
         isinstance(allowance, bool)
         or not isinstance(allowance, int)
-        or allowance != budget.remaining
+        or allowance <= 0
+        or allowance > budget.remaining
     ):
         raise RuntimeError(
-            "delivery mutation must carry the exact remaining physical-write "
-            "allowance"
+            "delivery mutation must carry a positive physical-write allowance "
+            "within the remaining pass budget"
         )
     if budget.remaining <= 0:
         raise RuntimeError(
@@ -3772,7 +3774,7 @@ def _suppress_historical_final(store: dict[str, Any], item: dict[str, Any], cont
 
 
 
-_FOLD_ATTEMPT_CAP = 3
+_FOLD_ATTEMPT_CAP = state.RESPONSE_FOLD_ATTEMPT_CAP
 _FOLD_PASS_CAP = 3
 
 
@@ -3785,13 +3787,18 @@ def _record_fold_failure(
 ) -> None:
     """Persist a structured fold failure without an extra state save."""
 
+    previous_error = binding.get("fold_error")
+    previous_attempts = int(binding.get("fold_attempts") or 0)
     binding["fold_error"] = compact_ws(reason or "response fold failed", 240)
     if attempted:
-        binding["fold_attempts"] = (
-            int(binding.get("fold_attempts") or 0) + 1
-        )
+        binding["fold_attempts"] = previous_attempts + 1
     if fold_state is not None:
         fold_state["failed"] = fold_state.get("failed", 0) + 1
+        if (
+            binding.get("fold_error") != previous_error
+            or int(binding.get("fold_attempts") or 0) != previous_attempts
+        ):
+            fold_state["changed"] = fold_state.get("changed", 0) + 1
 
 
 def _fold_superseded_final(
@@ -3814,12 +3821,13 @@ def _fold_superseded_final(
     if runtime.dry_run or not config.response_collapse_previous_default():
         return False
     if fold_state is not None and fold_state.get("issued", 0) >= _FOLD_PASS_CAP:
-        return False  # per-pass edit budget spent; the sweep is self-healing, rest folds next ticks
+        return False  # per-pass physical-write budget spent; remaining folds wait for later ticks
     if not str(item.get("assistant_final_text") or "").strip():
         return False
     bindings = _final_delivery_bindings(store, _turn_id(item))
     if not bindings:
         return False
+    changed_before = fold_state.get("changed", 0) if fold_state else 0
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
     folded_item = dict(_turn_feed_item(item, entry))
@@ -3831,7 +3839,10 @@ def _fold_superseded_final(
             _record_fold_failure(
                 binding, exc.status, fold_state, attempted=False
             )
-        return False
+        return bool(
+            fold_state
+            and fold_state.get("changed", 0) != changed_before
+        )
     ordered = sorted(
         bindings,
         key=lambda pair: (
@@ -3849,7 +3860,10 @@ def _fold_superseded_final(
                 fold_state,
                 attempted=False,
             )
-        return False
+        return bool(
+            fold_state
+            and fold_state.get("changed", 0) != changed_before
+        )
     attempted = False
     for fallback_ordinal, (message_id, binding) in enumerate(ordered):
         if (
@@ -3917,6 +3931,12 @@ def _fold_superseded_final(
                 fold_state["attempted"] = (
                     fold_state.get("attempted", 0) + 1
                 )
+            global_remaining = _delivery_write_budget(runtime).remaining
+            fold_remaining = (
+                max(0, _FOLD_PASS_CAP - fold_state.get("issued", 0))
+                if fold_state is not None
+                else global_remaining
+            )
             execution = _execute_accounted_delivery_write(
                 store,
                 runtime,
@@ -3936,9 +3956,9 @@ def _fold_superseded_final(
                     kwargs={
                         "telegram": telegram,
                         "api_token": api_token,
-                        "max_physical_writes": _delivery_write_budget(
-                            runtime
-                        ).remaining,
+                        "max_physical_writes": min(
+                            global_remaining, fold_remaining
+                        ),
                     },
                 ),
             )
@@ -3996,7 +4016,9 @@ def _fold_superseded_final(
             sent.get("error") or sent.get("kind") or "response fold failed",
             fold_state,
         )
-    return attempted
+    return attempted or bool(
+        fold_state and fold_state.get("changed", 0) != changed_before
+    )
 
 def _stamp_worker_binding_refusal(entry: dict[str, Any]) -> str:
     """Persist the exact gate that keeps a snapshot-observed pane unbound."""
@@ -8225,6 +8247,7 @@ def _sync_turns(
         "attempted": 0,
         "folded": 0,
         "failed": 0,
+        "changed": 0,
     }
     fairness_cursor_candidate = ""
     turn_count = len(delivery_turns)
@@ -14093,6 +14116,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         now=time.time(),
         escalation_seconds=config.partial_final_escalation_seconds(),
     )
+    response_fold_health = state.response_fold_health(store)
     completed_deliveries = (
         int(turn_counts["sent"])
         + int(submission_counts["sent"])
@@ -14122,7 +14146,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "physical_writes": _delivery_write_budget(runtime).spent,
     }
     overall_ok = bool(
-        partial_final_health["ok"] and not delivery_stalled
+        partial_final_health["ok"]
+        and not delivery_stalled
+        and response_fold_health["ok"]
     )
     return {
         "ok": overall_ok,
@@ -14131,7 +14157,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "status": (
                     partial_final_health["status"]
                     if partial_final_health["ok"] is not True
-                    else outbound_delivery_health["status"]
+                    else (
+                        outbound_delivery_health["status"]
+                        if delivery_stalled
+                        else response_fold_health["status"]
+                    )
                 )
             }
             if not overall_ok
@@ -14176,4 +14206,5 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "telegram_backpressure": telegram_backpressure,
         "outbound_delivery": outbound_delivery_health,
         "outbound_partial_finals": partial_final_health,
+        "outbound_response_folds": response_fold_health,
     }

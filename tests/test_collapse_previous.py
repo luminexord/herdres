@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from herdres_connector import config, source_sync, state
+from herdres_connector import config, doctor, source_sync, state
 from herdres_connector.managed_bots import MANAGER_BOT_KIND
 from herdres_connector.rich_delivery import (
     render_turn_item_html,
@@ -552,18 +552,109 @@ def test_fold_failure_bounded_by_attempt_cap(monkeypatch):
 
     telegram = _FailingTelegram()
     runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
+    results = []
     for _ in range(5):
-        _sync_turns(
-            store,
-            _two_turn_payload(),
-            {"pending": []},
-            runtime,
-            chat_id="-100",
-            list_finals_are_authoritative=False,
+        results.append(
+            _sync_turns(
+                store,
+                _two_turn_payload(),
+                {"pending": []},
+                runtime,
+                chat_id="-100",
+                list_finals_are_authoritative=False,
+            )
         )
     binding = state.message_bindings(store)["400"]
     assert binding.get("folded") is None
-    assert int(binding.get("fold_attempts") or 0) == source_sync._FOLD_ATTEMPT_CAP   # gave up at the cap
+    assert (
+        int(binding.get("fold_attempts") or 0)
+        == source_sync._FOLD_ATTEMPT_CAP
+    )
+    assert results[-1]["response_fold_attempted"] == 0
+    assert results[-1]["response_fold_failed"] == 0
+
+    # The absence of fresh work on the capped pass cannot round the durable
+    # failure down to healthy. Consumers receive an explicit terminal signal.
+    health = doctor.outbound_response_folds(store)
+    assert health["ok"] is False
+    assert health["status"] == "response_fold_terminal"
+    assert health["signal"] == "outbound_response_fold_terminal"
+    assert health["terminal_count"] == 1
+    assert health["first_failure"]["message_id"] == "400"
+    assert health["first_failure"]["attempts"] == source_sync._FOLD_ATTEMPT_CAP
+
+
+def test_sync_consumer_propagates_terminal_fold_health(monkeypatch):
+    store = _folded_store(monkeypatch)
+    binding = state.message_bindings(store)["400"]
+    binding["fold_attempts"] = source_sync._FOLD_ATTEMPT_CAP
+    binding["fold_error"] = "recipient rejected fold"
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "1"
+    )
+    turns = _two_turn_payload()
+    turns["schema_version"] = source_sync.TURN_SCHEMA_VERSION
+    tendwire = FakeTendwire(
+        turns=turns,
+        workers=[
+            {
+                "id": "w1",
+                "name": "w1",
+                "status": "idle",
+                "space_id": "s1",
+                "fingerprint": "fp1",
+            }
+        ],
+        spaces=[
+            {
+                "id": "s1",
+                "name": "Project",
+                "status": "active",
+                "fingerprint": "space-fp1",
+            }
+        ],
+    )
+
+    result = source_sync.sync_once(
+        store,
+        SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "response_fold_terminal"
+    assert result["outbound_response_folds"]["signal"] == (
+        "outbound_response_fold_terminal"
+    )
+
+
+def test_doctor_consumer_propagates_terminal_fold_health(monkeypatch):
+    store = _folded_store(monkeypatch)
+    binding = state.message_bindings(store)["400"]
+    binding["fold_attempts"] = source_sync._FOLD_ATTEMPT_CAP
+    binding["fold_error"] = "recipient rejected fold"
+    monkeypatch.setattr(doctor, "source_services", lambda: {"ok": True})
+    monkeypatch.setattr(doctor, "legacy_timer", lambda: {"ok": True})
+    monkeypatch.setattr(doctor, "sqlite_integrity", lambda: {"ok": True})
+    monkeypatch.setattr(
+        doctor, "tendwire_backend", lambda _client=None: {"ok": True}
+    )
+    monkeypatch.setattr(doctor, "tendwire_delta_feed", lambda: {"ok": True})
+    monkeypatch.setattr(doctor, "inbound_lanes", lambda: {"ok": True})
+    monkeypatch.setattr(
+        doctor, "outbound_unbound_live_panes", lambda: {"ok": True}
+    )
+    monkeypatch.setattr(
+        doctor, "outbound_partial_finals", lambda: {"ok": True}
+    )
+    monkeypatch.setattr(doctor.state, "load_state", lambda: store)
+
+    result = doctor.run_doctor()
+
+    assert result["ok"] is False
+    assert result["checks"]["outbound_response_folds"]["signal"] == (
+        "outbound_response_fold_terminal"
+    )
 
 
 def test_fold_skipped_when_binding_lacks_bot_kind(monkeypatch):
@@ -578,6 +669,101 @@ def test_fold_skipped_when_binding_lacks_bot_kind(monkeypatch):
     assert binding.get("folded") is None
     assert "bot identity" in binding["fold_error"]
     assert telegram.sync_counts["response_fold_failed"] == 1
+
+
+def test_presend_fold_error_survives_pass_level_save(monkeypatch, tmp_path):
+    store = _folded_store(monkeypatch)
+    state.message_bindings(store)["400"].pop("bot_kind", None)
+    state_file = tmp_path / "state.json"
+    state.save_state(store, state_file)
+
+    loaded = state.load_state(state_file)
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "1"
+    )
+    counts = _sync_turns(
+        loaded,
+        _two_turn_payload(),
+        {"pending": []},
+        SyncRuntime(FakeTendwire(), FakeTelegram(), with_outbox=False),
+        chat_id="-100",
+        list_finals_are_authoritative=False,
+    )
+    # This is the same aggregate decision used by sync_once/_sync_pass: one
+    # pass-level save, never a per-binding save.
+    if counts["updated"]:
+        state.save_state(loaded, state_file)
+
+    persisted = state.load_state(state_file)
+    binding = state.message_bindings(persisted)["400"]
+    assert counts["updated"] == 1
+    assert binding.get("folded") is None
+    assert "bot identity" in binding["fold_error"]
+    assert doctor.outbound_response_folds(persisted)["ok"] is False
+
+
+def test_fold_pass_cap_limits_physical_rejection_ladder(monkeypatch):
+    store = _folded_store(monkeypatch)
+    worker = next(iter(state.source_worker_entries(store).values()))
+    state.mark_delivered(
+        store,
+        "final:turn-older:whatever",
+        {"worker_id": "w1", "turn_id": "turn-older"},
+    )
+    state.bind_message_to_worker(
+        store,
+        "399",
+        worker,
+        topic_id="77",
+        kind="final",
+        turn_id="turn-older",
+        bot_kind=MANAGER_BOT_KIND,
+    )
+    turns = _two_turn_payload()
+    turns["turns"].append(
+        {
+            "id": "turn-older",
+            "worker_id": "w1",
+            "worker_fingerprint": "fp1",
+            "assistant_final_text": "Older answer",
+            "complete": True,
+        }
+    )
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "1"
+    )
+
+    class RejectRichTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.rich_attempts = 0
+
+        def api(self, method, payload):
+            if method == "editMessageText":
+                self.rich_attempts += 1
+                raise TelegramError("Bad Request: rich fold rejected")
+            return super().api(method, payload)
+
+    telegram = RejectRichTelegram()
+    runtime = SyncRuntime(
+        FakeTendwire(), telegram, with_outbox=False, max_sends=8
+    )
+    counts = _sync_turns(
+        store,
+        turns,
+        {"pending": []},
+        runtime,
+        chat_id="-100",
+        list_finals_are_authoritative=False,
+    )
+
+    # Fold one uses rich + readable fallback. Only one write remains for the
+    # next fold, so its rich rejection cannot start another fallback write.
+    assert telegram.rich_attempts == 2
+    assert len(telegram.edited) == 1
+    assert counts["physical_writes"] == source_sync._FOLD_PASS_CAP
+    assert runtime.delivery_write_budget is not None
+    assert runtime.delivery_write_budget.spent == source_sync._FOLD_PASS_CAP
 
 
 def test_fold_per_pass_cap(monkeypatch):
