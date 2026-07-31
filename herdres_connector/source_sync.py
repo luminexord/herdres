@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import time
@@ -89,10 +90,18 @@ class _DeliveryWriteBudget:
 
 
 class _TurnContentError(RuntimeError):
-    def __init__(self, status: str, message: str, *, conflict: bool = False) -> None:
+    def __init__(
+        self,
+        status: str,
+        message: str,
+        *,
+        conflict: bool = False,
+        part_count: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.conflict = conflict
+        self.part_count = part_count
 
 
 @dataclass
@@ -2531,8 +2540,133 @@ def _record_oversize_final_delivery(
     assert record is not None
     record["request_phase"] = "oversize_presentation"
     record["transport_disposition"] = "not_delivered"
-    record["recovery_action"] = "supersede-with-shorter-answer"
+    record["recovery_action"] = (
+        "retrieve-canonical-source-or-supersede-with-shorter-answer"
+    )
     entry["partial_final_delivery"] = record
+
+
+def _notify_oversize_final(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    turn_id: str,
+    content_hash: str,
+    part_count: int | None,
+) -> int:
+    """Make an exact oversize hold visible in its owner topic once.
+
+    The notice is deliberately not the answer and does not authorize replay.
+    The exact answer remains in Tendwire under the named turn/revision while
+    the partial-final record keeps the logical delivery incomplete.
+    """
+
+    record = state.find_partial_final_delivery(store, turn_id, content_hash)
+    topic_id = str(entry.get("topic_id") or "")
+    if (
+        runtime.dry_run
+        or not isinstance(record, dict)
+        or not chat_id
+        or not topic_id
+        or record.get("oversize_notice_status") == "accepted"
+        or _delivery_write_budget(runtime).remaining <= 0
+    ):
+        return 0
+    answer = str(item.get("assistant_final_text") or "")
+    answer_bytes = answer.encode("utf-8")
+    digest = hashlib.sha256(answer_bytes).hexdigest()
+    required = part_count if isinstance(part_count, int) else 0
+    revision_label = content_hash or "unknown revision"
+    html = (
+        "<b>Answer held: exceeds Telegram card limit</b>\n"
+        f"Turn <code>{html_escape(turn_id, 200)}</code> contains "
+        f"{len(answer):,} characters / {len(answer_bytes):,} UTF-8 bytes "
+        f"and needs {required or 'more than'} cards "
+        f"(limit {TURN_DELIVERY_MAX_PARTS}).\n"
+        f"Digest: <code>sha256:{digest}</code>\n"
+        "No answer content was truncated or marked delivered. The exact "
+        "canonical answer remains in authenticated Tendwire source at "
+        f"turn <code>{html_escape(turn_id, 200)}</code>, revision "
+        f"<code>{html_escape(revision_label, 200)}</code>. Reply in this "
+        "topic asking the pane to resend it in at most "
+        f"{TURN_DELIVERY_MAX_PARTS} cards; an operator can retrieve the "
+        "exact source by that turn/revision identity."
+    )
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=topic_id,
+    )
+    execution = _execute_accounted_delivery_write(
+        store,
+        runtime,
+        operation,
+        _provider_mutation(
+            "telegram.send_message",
+            reason="telegram.send_message: expose oversize final hold",
+            args=(chat_id, html),
+            kwargs={
+                "thread_id": topic_id,
+                "notify": True,
+                "max_physical_writes": _delivery_write_budget(
+                    runtime
+                ).remaining,
+            },
+        ),
+    )
+    sent = execution.result
+    writes = _telegram_physical_writes(sent)
+    message_ids = split_legacy_message_ids(sent) if sent.get("ok") else []
+    current_record = state.find_partial_final_delivery(
+        store, turn_id, content_hash
+    )
+    if not isinstance(current_record, dict):
+        return writes
+    current_record["answer_char_length"] = len(answer)
+    current_record["answer_byte_length"] = len(answer_bytes)
+    current_record["answer_sha256"] = digest
+    current_record["required_part_count"] = required
+    current_record["content_locator"] = {
+        "source": "tendwire_turn",
+        "turn_id": turn_id,
+        "content_revision": content_hash,
+        "field": "assistant_final_text",
+    }
+    current_record["oversize_notice_physical_writes"] = writes
+    if message_ids:
+        current_record["oversize_notice_status"] = "accepted"
+        current_record["oversize_notice_message_id"] = message_ids[0]
+        binding_entry = (
+            execution.resolution.entry
+            if execution.resolution.disposition == _OFFLOCK_APPLY
+            else _operation_binding_entry(operation)
+        )
+        assert binding_entry is not None
+        state.bind_message_to_worker(
+            store,
+            message_ids[0],
+            binding_entry,
+            topic_id=topic_id,
+            kind="oversize_notice",
+            turn_id=turn_id,
+            bot_kind=desired_message_bot_kind(
+                _telegram_state(store), entry
+            ),
+        )
+    else:
+        current_record["oversize_notice_status"] = (
+            "delivery_unknown"
+            if sent.get("delivery_unknown") is True
+            else "failed"
+        )
+        current_record["oversize_notice_error"] = str(
+            sent.get("error") or "oversize notice was not accepted"
+        )
+    entry["partial_final_delivery"] = current_record
+    return writes
 
 
 def _set_pending_turn_plan(
@@ -7414,6 +7548,16 @@ def _stage_final_plan(
                 turn_id=_turn_id(item),
                 content_hash=revision,
             )
+            _notify_oversize_final(
+                store,
+                feed_item,
+                entry,
+                runtime,
+                chat_id=config.telegram_chat_id(store),
+                turn_id=_turn_id(item),
+                content_hash=revision,
+                part_count=exc.part_count,
+            )
         raise
     if not parts:
         raise _TurnContentError(
@@ -7689,6 +7833,7 @@ def _prepare_final_delivery_parts(
         raise _TurnContentError(
             "oversize_presentation",
             str(exc),
+            part_count=exc.part_count,
         ) from exc
     except PresentationContentError as exc:
         raise _TurnContentError(
@@ -7926,6 +8071,16 @@ def _deliver_final(
                 entry,
                 turn_id=turn_id,
                 content_hash=content_hash,
+            )
+            _notify_oversize_final(
+                store,
+                feed_item,
+                entry,
+                runtime,
+                chat_id=chat_id,
+                turn_id=turn_id,
+                content_hash=content_hash,
+                part_count=exc.part_count,
             )
             return False
         raise

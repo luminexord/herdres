@@ -1258,15 +1258,16 @@ def test_dead_lettered_child_immediately_holds_parent_plan(monkeypatch):
     assert doctor.outbound_partial_finals(store)["ok"] is False
 
 
-def test_oversize_final_is_explicit_terminal_and_delivers_no_prefix(
+def test_oversize_final_is_explicit_terminal_and_delivers_topic_notice(
     monkeypatch,
 ):
     monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
     store = _store()
+    exact_answer = "x" * (TURN_DELIVERY_PLAIN_SOURCE_CHARS * 8 + 1)
     row = _turn_row(
         "turn-oversize",
         "twrev1.oversize",
-        "x" * (TURN_DELIVERY_PLAIN_SOURCE_CHARS * 8 + 1),
+        exact_answer,
         user="legitimate large request",
     )
     _key, entry, _created = state.upsert_worker_entry(
@@ -1291,7 +1292,7 @@ def test_oversize_final_is_explicit_terminal_and_delivers_no_prefix(
             SyncRuntime(
                 TurnFinalTendwire(row),
                 telegram,
-                dry_run=True,
+                dry_run=False,
                 with_outbox=False,
             ),
         )
@@ -1303,8 +1304,27 @@ def test_oversize_final_is_explicit_terminal_and_delivers_no_prefix(
     assert hold is not None
     assert hold["request_phase"] == "oversize_presentation"
     assert hold["terminal_outcome"] == "not_delivered"
-    assert hold["recovery_action"] == "supersede-with-shorter-answer"
-    assert telegram.recipient_messages == {}
+    assert hold["recovery_action"] == (
+        "retrieve-canonical-source-or-supersede-with-shorter-answer"
+    )
+    assert len(telegram.recipient_messages) == 1
+    notice = next(iter(telegram.recipient_messages.values()))["content"]
+    assert "Answer held: exceeds Telegram card limit" in notice
+    assert "turn-oversize" in notice
+    assert f"{len(exact_answer):,} characters" in notice
+    assert hashlib.sha256(exact_answer.encode()).hexdigest() in notice
+    assert "authenticated Tendwire source" in notice
+    assert exact_answer not in notice
+    assert hold["message_ids"] == []
+    assert hold["oversize_notice_status"] == "accepted"
+    assert hold["oversize_notice_message_id"] in (
+        telegram.recipient_messages
+    )
+    assert hold["answer_char_length"] == len(exact_answer)
+    assert hold["answer_sha256"] == hashlib.sha256(
+        exact_answer.encode()
+    ).hexdigest()
+    assert "pending_turn_started_at" not in entry
     assert state.delivered_turns(store) == {}
     assert doctor.outbound_partial_finals(store)["ok"] is False
 

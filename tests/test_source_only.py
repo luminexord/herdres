@@ -3754,14 +3754,13 @@ def test_over_part_cap_source_final_is_visible_terminal_without_prefix(
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
     telegram = FakeTelegram()
+    exact_answer = "- exact legitimate answer line\n" * 1_100
     turns = {
         "turns": [
             {
                 "id": "turn-over-part-cap",
                 "worker_id": "worker-1",
-                "assistant_final_text": (
-                    "- exact legitimate answer line\n" * 1_100
-                ),
+                "assistant_final_text": exact_answer,
                 "complete": True,
             }
         ]
@@ -3785,6 +3784,17 @@ def test_over_part_cap_source_final_is_visible_terminal_without_prefix(
     assert result["ok"] is False
     assert result["status"] == "partial_final_not_delivered"
     assert result["feed_sent"] == 0
+    notices = [
+        sent
+        for sent in telegram.sent
+        if "Answer held: exceeds Telegram card limit" in sent[1]
+    ]
+    assert len(notices) == 1
+    assert notices[0][2]["thread_id"] == "77"
+    assert "turn-over-part-cap" in notices[0][1]
+    assert f"{len(exact_answer):,} characters" in notices[0][1]
+    assert hashlib.sha256(exact_answer.encode()).hexdigest() in notices[0][1]
+    assert "authenticated Tendwire source" in notices[0][1]
     assert not any(
         "exact legitimate answer line" in sent[1]
         for sent in telegram.sent
@@ -3792,6 +3802,10 @@ def test_over_part_cap_source_final_is_visible_terminal_without_prefix(
     assert hold["request_phase"] == "oversize_presentation"
     assert hold["terminal_outcome"] == "not_delivered"
     assert hold["message_ids"] == []
+    assert hold["oversize_notice_status"] == "accepted"
+    assert "pending_turn_started_at" not in next(
+        iter(state.source_worker_entries(store).values())
+    )
 
 
 def test_sync_sends_all_long_final_response_parts(monkeypatch):
