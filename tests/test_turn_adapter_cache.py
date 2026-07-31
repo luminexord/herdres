@@ -8,6 +8,9 @@ import importlib.util
 import json
 from pathlib import Path
 
+from herdres_connector.rich_delivery import send_feed_item
+from test_rich_delivery import RichCardRecipientTelegram
+
 _SPEC = importlib.util.spec_from_file_location(
     "herdr_turn_adapter", Path(__file__).resolve().parent.parent / "herdr_turn_adapter.py"
 )
@@ -284,8 +287,9 @@ def test_claude_internal_automation_final_does_not_replace_real_turn(tmp_path):
 
 
 def test_claude_compaction_summary_provenance_omits_prompt_but_keeps_answer(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
     transcript = tmp_path / "claude-compacted.jsonl"
     compact = _claude_user(
         "compact-1",
@@ -306,6 +310,15 @@ def test_claude_compaction_summary_provenance_omits_prompt_but_keeps_answer(
         transcript, "pane-1", "session-1"
     )
     encoded = json.dumps(turn)
+    recipient = RichCardRecipientTelegram()
+    delivered = send_feed_item(
+        recipient,
+        "-100",
+        {**turn, "kind": "turn", "title": "Claude"},
+        telegram={},
+        thread_id="77",
+    )
+    received = recipient.recipient_messages[0]
 
     assert turn["complete"] is True
     assert turn["turn_id"] == "compact-1"
@@ -317,3 +330,9 @@ def test_claude_compaction_summary_provenance_omits_prompt_but_keeps_answer(
     assert "Conversation summary" not in encoded
     assert "All user messages" not in encoded
     assert "/root/private/path" not in encoded
+    assert delivered["ok"] is True
+    assert delivered["format"] == "rich"
+    assert "The owner-visible answer survives compaction." in received["text"]
+    assert "Conversation summary" not in received["text"]
+    assert "All user messages" not in received["text"]
+    assert "/root/private/path" not in received["text"]

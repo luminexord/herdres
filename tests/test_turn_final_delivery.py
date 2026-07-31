@@ -1123,6 +1123,18 @@ def test_stopped_mid_creation_plan_ages_to_visible_terminal_hold(
         job_count=7,
         now=time.time() - 31,
     )
+    for ordinal in range(7):
+        state.reserve_tendwire_turn_job(
+            store,
+            f"turn-final:twplan1.mid_create:{ordinal:06d}",
+            plan_token="twplan1.mid_create",
+            content_revision="twrev1.mid_create",
+            operation="upsert",
+            sequence_index=ordinal,
+            part_ordinal=ordinal,
+            part_count=11,
+            bot_kind="manager",
+        )
 
     class StoppedPlan:
         def connector_prepare_commit(self, *, plan_token):
@@ -1166,6 +1178,8 @@ def test_stopped_mid_creation_plan_ages_to_visible_terminal_hold(
     assert hold["status"] == "held"
     assert hold["request_phase"] == "pending_plan_incomplete"
     assert hold["created_part_ordinals"] == list(range(7))
+    assert hold["reported_created_job_count"] == 7
+    assert hold["unwitnessed_created_job_count"] == 0
     assert hold["missing_part_ordinals"] == [7, 8, 9, 10]
     assert hold["operator_attention_required"] is True
     assert "pending_turn_id" not in entry
@@ -1236,7 +1250,10 @@ def test_dead_lettered_child_immediately_holds_parent_plan(monkeypatch):
     assert changed == 1
     assert hold is not None
     assert hold["request_phase"] == "pending_plan_incomplete"
-    assert hold["missing_part_ordinals"] == [2]
+    assert hold["created_part_ordinals"] == [1]
+    assert hold["reported_created_job_count"] == 2
+    assert hold["unwitnessed_created_job_count"] == 1
+    assert hold["missing_part_ordinals"] == [0, 2]
     assert hold["failed_part_index"] == 1
     assert doctor.outbound_partial_finals(store)["ok"] is False
 

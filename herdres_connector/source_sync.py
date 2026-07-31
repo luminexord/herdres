@@ -2621,18 +2621,26 @@ def _hold_incomplete_pending_plan(
         message_id = str(receipt.get("telegram_message_id") or "")
         if message_id and message_id != "0" and message_id not in accepted_ids:
             accepted_ids.append(message_id)
+    # Created ordinals are durable facts carried by immutable job receipts or
+    # accepted-message bindings.  Never synthesize them from a scalar count:
+    # a sparse 0,2 creation must not be rewritten as the fictional 0,1.
     known_ordinals = {
         int(receipt["part_ordinal"])
         for receipt in receipts
         if isinstance(receipt.get("part_ordinal"), int)
         and 0 <= int(receipt["part_ordinal"]) < part_count
     }
-    if isinstance(created_job_count, int) and not isinstance(
-        created_job_count, bool
-    ):
-        known_ordinals.update(
-            range(min(max(0, created_job_count), part_count))
-        )
+    known_ordinals.update(
+        ordinal
+        for ordinal, _message_id in bound
+        if 0 <= ordinal < part_count
+    )
+    reported_created_count = (
+        min(max(0, created_job_count), part_count)
+        if isinstance(created_job_count, int)
+        and not isinstance(created_job_count, bool)
+        else None
+    )
     missing = [
         ordinal for ordinal in range(part_count) if ordinal not in known_ordinals
     ]
@@ -2674,6 +2682,12 @@ def _hold_incomplete_pending_plan(
     record["plan_token"] = plan_token
     record["declared_part_count"] = int(part_count)
     record["created_part_ordinals"] = sorted(known_ordinals)
+    record["reported_created_job_count"] = reported_created_count
+    record["unwitnessed_created_job_count"] = (
+        max(0, reported_created_count - len(known_ordinals))
+        if reported_created_count is not None
+        else None
+    )
     record["missing_part_ordinals"] = missing
     record["bounded_exit_seconds"] = (
         config.partial_final_escalation_seconds()
