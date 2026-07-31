@@ -3776,6 +3776,24 @@ _FOLD_ATTEMPT_CAP = 3
 _FOLD_PASS_CAP = 3
 
 
+def _record_fold_failure(
+    binding: dict[str, Any],
+    reason: Any,
+    fold_state: dict[str, int] | None,
+    *,
+    attempted: bool = True,
+) -> None:
+    """Persist a structured fold failure without an extra state save."""
+
+    binding["fold_error"] = compact_ws(reason or "response fold failed", 240)
+    if attempted:
+        binding["fold_attempts"] = (
+            int(binding.get("fold_attempts") or 0) + 1
+        )
+    if fold_state is not None:
+        fold_state["failed"] = fold_state.get("failed", 0) + 1
+
+
 def _fold_superseded_final(
     store: dict[str, Any],
     item: dict[str, Any],
@@ -3808,7 +3826,11 @@ def _fold_superseded_final(
     folded_item["collapse_response"] = True
     try:
         plans = _prepare_final_delivery_parts(folded_item)
-    except _TurnContentError:
+    except _TurnContentError as exc:
+        for _message_id, binding in bindings:
+            _record_fold_failure(
+                binding, exc.status, fold_state, attempted=False
+            )
         return False
     ordered = sorted(
         bindings,
@@ -3820,16 +3842,30 @@ def _fold_superseded_final(
         ),
     )
     if len(ordered) != len(plans):
+        for _message_id, binding in ordered:
+            _record_fold_failure(
+                binding,
+                "fold delivery-part count does not match bindings",
+                fold_state,
+                attempted=False,
+            )
         return False
     attempted = False
     for fallback_ordinal, (message_id, binding) in enumerate(ordered):
         if (
-            not message_id
-            or binding.get("folded")
+            binding.get("folded")
             or binding.get("fold_unavailable")
             or int(binding.get("fold_attempts") or 0)
             >= _FOLD_ATTEMPT_CAP
         ):
+            continue
+        if not message_id:
+            _record_fold_failure(
+                binding,
+                "fold binding has no message id",
+                fold_state,
+                attempted=False,
+            )
             continue
         if (
             fold_state is not None
@@ -3841,16 +3877,34 @@ def _fold_superseded_final(
         if str(message_id) == str(
             entry.get("last_clean_message_id") or ""
         ):
+            _record_fold_failure(
+                binding,
+                "historical fold binding aliases the latest message",
+                fold_state,
+                attempted=False,
+            )
             continue
         # The binding itself owns the bot identity. The latest entry's bot can
         # describe another delivery and must not authorize this historical edit.
         stored_bot_kind = str(binding.get("bot_kind") or "")
         if not stored_bot_kind or stored_bot_kind != bot_kind:
+            _record_fold_failure(
+                binding,
+                "fold binding bot identity is unavailable or mismatched",
+                fold_state,
+                attempted=False,
+            )
             continue
         ordinal = binding.get("part_ordinal")
         if not isinstance(ordinal, int):
             ordinal = fallback_ordinal
         if not 0 <= ordinal < len(plans):
+            _record_fold_failure(
+                binding,
+                "fold binding part ordinal is outside the delivery plan",
+                fold_state,
+                attempted=False,
+            )
             continue
         operation = _capture_entry_operation(
             store,
@@ -3859,6 +3913,10 @@ def _fold_superseded_final(
             message_id=message_id,
         )
         try:
+            if fold_state is not None:
+                fold_state["attempted"] = (
+                    fold_state.get("attempted", 0) + 1
+                )
             execution = _execute_accounted_delivery_write(
                 store,
                 runtime,
@@ -3889,9 +3947,9 @@ def _fold_superseded_final(
             _compare_and_apply_entry_operation(store, operation)
             current = state.find_message_binding(store, message_id)
             if current is not None:
-                current["fold_attempts"] = (
-                    int(current.get("fold_attempts") or 0) + 1
-                )
+                _record_fold_failure(current, exc, fold_state)
+            elif fold_state is not None:
+                fold_state["failed"] = fold_state.get("failed", 0) + 1
             if fold_state is not None:
                 fold_state["issued"] = (
                     fold_state.get("issued", 0) + 1
@@ -3909,10 +3967,16 @@ def _fold_superseded_final(
         error = str(sent.get("error") or "").lower()
         if sent.get("ok") and sent.get("collapse_applied") is True:
             binding["folded"] = True
+            binding.pop("fold_error", None)
+            if fold_state is not None:
+                fold_state["folded"] = fold_state.get("folded", 0) + 1
             continue
         if sent.get("ok"):
-            binding["fold_attempts"] = (
-                int(binding.get("fold_attempts") or 0) + 1
+            _record_fold_failure(
+                binding,
+                "rich Response details presentation was not applied "
+                f"(format={sent.get('format') or 'unknown'})",
+                fold_state,
             )
             continue
         if (
@@ -3921,9 +3985,16 @@ def _fold_superseded_final(
             or "not found" in error
         ):
             binding["fold_unavailable"] = True
+            _record_fold_failure(
+                binding,
+                sent.get("error") or sent.get("kind") or "fold unavailable",
+                fold_state,
+            )
             continue
-        binding["fold_attempts"] = (
-            int(binding.get("fold_attempts") or 0) + 1
+        _record_fold_failure(
+            binding,
+            sent.get("error") or sent.get("kind") or "response fold failed",
+            fold_state,
         )
     return attempted
 
@@ -8064,6 +8135,9 @@ def _sync_turns(
         "physical_writes": 0,
         "work_pending": 0,
         "failed_writes": 0,
+        "response_fold_attempted": 0,
+        "response_folded": 0,
+        "response_fold_failed": 0,
     }
     budget = _delivery_write_budget(runtime)
     budget_start = budget.spent
@@ -8146,7 +8220,12 @@ def _sync_turns(
             )
     seen_final_workers: set[str] = set()
     seen_working_workers: set[str] = set()
-    fold_state: dict[str, int] = {"issued": 0}
+    fold_state: dict[str, int] = {
+        "issued": 0,
+        "attempted": 0,
+        "folded": 0,
+        "failed": 0,
+    }
     fairness_cursor_candidate = ""
     turn_count = len(delivery_turns)
     for idx, item in enumerate(delivery_turns):
@@ -8186,8 +8265,6 @@ def _sync_turns(
                 latest_turn_id = latest_completed_turn_by_worker.get(
                     worker_key
                 )
-            if not list_finals_are_authoritative and _content_revision(item):
-                continue
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 delivered = False
                 content_hash = _content_revision(item) or _turn_content_hash(item, "final")
@@ -8196,6 +8273,8 @@ def _sync_turns(
                 counts["updated"] += int(_fold_superseded_final(store, item, entry, runtime, chat_id=chat_id, fold_state=fold_state))
                 if budget.spent > writes_before:
                     counts["physical_writes"] = budget.spent - budget_start
+                continue
+            if not list_finals_are_authoritative and _content_revision(item):
                 continue
             if worker_key in seen_final_workers:
                 continue
@@ -8388,6 +8467,9 @@ def _sync_turns(
             yield_barrier()
     if fairness_cursor_candidate and counts["work_pending"] > 1:
         store["telegram_delivery_turn_cursor"] = fairness_cursor_candidate
+    counts["response_fold_attempted"] = fold_state["attempted"]
+    counts["response_folded"] = fold_state["folded"]
+    counts["response_fold_failed"] = fold_state["failed"]
     return counts
 
 
@@ -13774,6 +13856,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "physical_writes": 0,
                 "work_pending": 0,
                 "failed_writes": 0,
+                "response_fold_attempted": 0,
+                "response_folded": 0,
+                "response_fold_failed": 0,
             }
         else:
             with state.lock_phase("sync.turns"):
@@ -14064,6 +14149,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "sent": turn_counts["sent"] + submission_counts["sent"],
         "routing_repaired": routing_repaired,
         "turn_updates": turn_counts["updated"] + submission_counts["updated"],
+        "response_folds": {
+            "attempted": int(
+                turn_counts.get("response_fold_attempted") or 0
+            ),
+            "folded": int(turn_counts.get("response_folded") or 0),
+            "failed": int(
+                turn_counts.get("response_fold_failed") or 0
+            ),
+        },
         "submission_working": submission_counts,
         **(
             {"tendwire_delta_sync": _delta_health(delta, now=observed_at)}

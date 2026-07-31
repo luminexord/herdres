@@ -2946,7 +2946,7 @@ def test_source_working_turn_renders_working_not_response():
 
     assert item["assistant_final_text"] == ""
     assert item["worklog_text"] == "I am checking the current path."
-    assert "✅ Response" not in html
+    assert "✅ <b>Response" not in html
     assert "Working" in html
     assert "I am checking the current path." in html
 
@@ -2965,7 +2965,7 @@ def test_source_completed_stream_only_turn_can_render_response():
 
     assert item["assistant_final_text"] == "Final text from a completed stream-only turn."
     assert item["worklog_text"] == ""
-    assert "✅ Response" in html
+    assert "✅ <b>Response" in html
     assert "Final text from a completed stream-only turn." in html
 
 
@@ -3677,9 +3677,11 @@ def test_final_response_renders_common_markdown_as_telegram_html():
 
     assert "##" not in html
     assert "**" not in html
-    # No redundant top worker title; the Response is the open top-level section.
+    # No redundant top worker title; the newest Response details block is open.
     assert "<h3>Alpha</h3>" not in html
-    assert html.startswith("<b>✅ Response</b><br><br>")
+    assert html.startswith(
+        "<details open><summary>✅ <b>Response</b></summary>"
+    )
     assert "<h4>Fix it</h4>" in html
     assert "<ul>" in html
     assert "<li>keep <b>bold</b></li>" in html
@@ -3702,7 +3704,9 @@ def test_long_final_response_uses_full_visible_response_section():
         }
     )
 
-    assert html.startswith("<b>✅ Response</b><br><br>")
+    assert html.startswith(
+        "<details open><summary>✅ <b>Response</b></summary>"
+    )
     assert "<blockquote>" not in html
     assert "<blockquote expandable>" not in html
     assert "##" not in html
@@ -3766,7 +3770,9 @@ def test_sync_sends_all_long_final_response_parts(monkeypatch):
 
     result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
 
-    response_messages = [sent[1] for sent in telegram.sent if "✅ Response" in sent[1]]
+    response_messages = [
+        sent[1] for sent in telegram.sent if "✅ <b>Response" in sent[1]
+    ]
     assert result["feed_sent"] == 1
     assert len(response_messages) >= 1
     assert any(tail in message for message in response_messages)
@@ -3801,13 +3807,15 @@ Pushed:
 
 def test_medium_final_response_renders_as_single_message():
     # A medium response (~1350 chars rendered) fits one rich message, so it is
-    # delivered as a SINGLE part with a plain "Response" marker -- no "1/N" split.
+    # delivered as a SINGLE open Response details block -- no "1/N" split.
     parts = render_feed_item_delivery_html_parts(
         {"kind": "turn", "assistant_final_text": _recent_cutoff_response_text()}
     )
 
     assert len(parts) == 1
-    assert parts[0].startswith("<b>✅ Response</b><br><br>")
+    assert parts[0].startswith(
+        "<details open><summary>✅ <b>Response</b></summary>"
+    )
     assert "4557d20 Prevent child bot target races" in parts[0]
     assert "branch: <code>tendwired</code>" in parts[0]
 
@@ -3848,8 +3856,10 @@ def test_promoted_working_final_edits_in_place_as_single_message(monkeypatch):
     assert "4557d20 Prevent child bot target races" in edited_html
     assert "branch: <code>tendwired</code>" in edited_html
     # Single message -- no "Response i/N" split labels anywhere.
-    assert "✅ Response 1/" not in edited_html
-    assert "✅ Response 1/" not in "\n".join(sent[1] for sent in telegram.sent)
+    assert "✅ <b>Response 1/" not in edited_html
+    assert "✅ <b>Response 1/" not in "\n".join(
+        sent[1] for sent in telegram.sent
+    )
 
 
 def test_oversize_response_splits_losslessly_into_labeled_parts():
@@ -3863,11 +3873,14 @@ def test_oversize_response_splits_losslessly_into_labeled_parts():
     assert len(parts) > 1
     total = len(parts)
     for index, part in enumerate(parts, start=1):
-        assert part.startswith(f"<b>✅ Response {index}/{total}</b><br><br>")
+        assert part.startswith(
+            "<details open><summary>✅ "
+            f"<b>Response {index}/{total}</b></summary>"
+        )
         assert len(part) <= MAX_RICH_HTML_CHARS
     combined = "\n".join(parts)
     assert tail in combined                       # nothing cut
-    assert combined.count("<b>✅ Response ") == total  # one marker per part
+    assert combined.count("<summary>✅ <b>Response ") == total
 
 
 def test_promote_to_final_uses_bounded_formatted_sends_above_edit_cap(monkeypatch):
@@ -3905,10 +3918,14 @@ def test_promote_to_final_uses_bounded_formatted_sends_above_edit_cap(monkeypatc
     assert full_html_len > 3900            # above legacy edit cap -> cannot edit
     assert full_html_len <= MAX_RICH_HTML_CHARS
 
-    response_messages = [sent[1] for sent in telegram.sent if "✅ Response" in sent[1]]
+    response_messages = [
+        sent[1] for sent in telegram.sent if "✅ <b>Response" in sent[1]
+    ]
     assert result["feed_sent"] == 1
     assert len(response_messages) > 1
-    assert response_messages[0].startswith("<b>✅ Response 1/")
+    assert response_messages[0].startswith(
+        "<details open><summary>✅ <b>Response 1/"
+    )
     assert any(tail in message for message in response_messages)
 
 
