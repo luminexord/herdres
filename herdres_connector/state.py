@@ -24,6 +24,7 @@ from .safe import compact_ws, short_hash
 DELIVERED_TURN_LEDGER_LIMIT = 10000
 PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION = 3
 PARTIAL_FINAL_DELIVERY_LIMIT = 512
+RESPONSE_FOLD_ATTEMPT_CAP = 3
 TENDWIRE_TURN_JOB_LIMIT = 20001
 TENDWIRE_TURN_JOB_STALE_COPY_LIMIT = 8
 ORPHANED_CREATED_TOPIC_LIMIT = 200
@@ -4798,6 +4799,72 @@ def message_bindings(data: dict[str, Any]) -> dict[str, Any]:
         bindings = {}
         data["telegram_message_bindings"] = bindings
     return bindings
+
+
+def response_fold_health(data: dict[str, Any]) -> dict[str, Any]:
+    """Expose durable failures to collapse superseded Responses.
+
+    A binding keeps ``fold_error`` until a later successful edit clears it.
+    Reaching the attempt cap is terminal for the automatic sweep, so it must
+    remain distinguishable from a retryable failure even on passes that make
+    no new provider attempt.
+    """
+
+    failures: list[dict[str, Any]] = []
+    for message_id, raw_binding in message_bindings(data).items():
+        if not isinstance(raw_binding, dict) or raw_binding.get("folded"):
+            continue
+        error = compact_ws(raw_binding.get("fold_error"), 240)
+        if not error:
+            continue
+        try:
+            attempts = max(0, int(raw_binding.get("fold_attempts") or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        terminal = bool(
+            raw_binding.get("fold_unavailable")
+            or attempts >= RESPONSE_FOLD_ATTEMPT_CAP
+        )
+        failures.append(
+            {
+                "message_id": compact_ws(message_id, 80),
+                "worker_id": compact_ws(
+                    raw_binding.get("worker_id"), 160
+                ),
+                "turn_id": compact_ws(raw_binding.get("turn_id"), 160),
+                "attempts": attempts,
+                "terminal": terminal,
+                "error": error,
+            }
+        )
+    terminal_count = sum(bool(item["terminal"]) for item in failures)
+    if not failures:
+        return {
+            "ok": True,
+            "status": "healthy",
+            "signal": "",
+            "failed_count": 0,
+            "terminal_count": 0,
+            "attempt_cap": RESPONSE_FOLD_ATTEMPT_CAP,
+        }
+    terminal = terminal_count > 0
+    return {
+        "ok": False,
+        "status": (
+            "response_fold_terminal"
+            if terminal
+            else "response_fold_failed"
+        ),
+        "signal": (
+            "outbound_response_fold_terminal"
+            if terminal
+            else "outbound_response_fold_failed"
+        ),
+        "failed_count": len(failures),
+        "terminal_count": terminal_count,
+        "attempt_cap": RESPONSE_FOLD_ATTEMPT_CAP,
+        "first_failure": failures[0],
+    }
 
 
 def bind_message_to_worker(

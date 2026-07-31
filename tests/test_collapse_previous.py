@@ -1,25 +1,84 @@
-"""Collapse-previous-responses (monolith port, first time working in source mode): superseded finals
-get their Response folded into an expandable blockquote so only the newest answer stays expanded. Opt-in via
-HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS (the user's env sets =1)."""
+"""Recipient-visible collapse of superseded rich Response details blocks."""
 from __future__ import annotations
 
-from herdres_connector import config, source_sync, state
+import json
+
+from herdres_connector import config, doctor, source_sync, state
 from herdres_connector.managed_bots import MANAGER_BOT_KIND
-from herdres_connector.rich_delivery import render_turn_item_html
+from herdres_connector.rich_delivery import (
+    render_turn_item_html,
+    send_feed_item,
+)
 from herdres_connector.source_sync import SyncRuntime, _sync_turns
 from herdres_connector.telegram_delivery import TelegramError
 
 from test_source_only import FakeTelegram, FakeTendwire, _source_worker, _store
+from test_rich_delivery import _RichCardRecipientParser
 
 
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def _plain_fallback_by_default(monkeypatch):
-    """Legacy collapse assertions describe the force-plain fallback."""
+def _rich_delivery_by_default(monkeypatch):
+    """Collapse is a sendRichMessage presentation and is tested as such."""
 
-    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+
+
+def _recipient_tree(html: str) -> dict[str, object]:
+    parser = _RichCardRecipientParser()
+    parser.feed(html)
+    parser.close()
+    return {
+        "text": "".join(parser.text),
+        "details": [
+            {
+                **detail,
+                "summary": "".join(detail["summary"]),
+                "body": "".join(detail["body"]),
+            }
+            for detail in parser.details
+        ],
+    }
+
+
+class _ReadbackTelegram(FakeTelegram):
+    """Parse accepted rich payloads into the recipient's block-tree state."""
+
+    def __init__(self, token="fake", shared=None):
+        super().__init__(token=token, shared=shared)
+        self._shared.setdefault("recipient", {})
+        self.recipient = self._shared["recipient"]
+
+    def with_token(self, token):
+        return _ReadbackTelegram(token=token, shared=self._shared)
+
+    def seed(self, message_id: str, html: str) -> None:
+        self.recipient[str(message_id)] = _recipient_tree(html)
+
+    def api(self, method, payload):
+        response = super().api(method, payload)
+        rich_payload = payload.get("rich_message")
+        if method in {"sendRichMessage", "editMessageText"} and rich_payload:
+            rich = json.loads(rich_payload)
+            message_id = (
+                str(payload.get("message_id") or "")
+                if method == "editMessageText"
+                else str(response["result"]["message_id"])
+            )
+            self.seed(message_id, str(rich.get("html") or ""))
+        return response
+
+
+def _response_detail(tree: dict[str, object]) -> dict[str, object]:
+    matches = [
+        detail
+        for detail in tree["details"]
+        if "Response" in str(detail["summary"])
+    ]
+    assert len(matches) == 1
+    return matches[0]
 
 
 # --- flag ---------------------------------------------------------------------
@@ -62,35 +121,34 @@ def _turn_item(**extra):
     return item
 
 
-def test_render_open_by_default():
-    html = render_turn_item_html(_turn_item())
-    assert "Bold result" in html
-    # the Response is the open top-level body, not wrapped in a details card
-    assert "<b>✅ Response</b><br><br>" in html
+def test_delivered_newest_response_reads_back_as_open_details_once():
+    telegram = _ReadbackTelegram()
+    result = send_feed_item(
+        telegram,
+        "-100",
+        _turn_item(),
+        telegram={},
+        thread_id="77",
+    )
+
+    tree = telegram.recipient[result["message_id"]]
+    response = _response_detail(tree)
+    assert response["type"] == "PageBlockDetails"
+    assert response["open"] is True
+    assert str(response["body"]).count("First response line") == 1
+    assert str(tree["text"]).count("First response line") == 1
 
 
 def test_render_collapsed_when_flagged():
-    html = render_turn_item_html(_turn_item(collapse_response=True))
-    assert html.startswith(
-        "<b>✅ Response</b>\n<blockquote expandable>"
+    tree = _recipient_tree(
+        render_turn_item_html(_turn_item(collapse_response=True))
     )
-    assert "<b>Bold result</b>" in html
-    assert "<code>inline()</code>" in html
-    assert "<i>italic detail</i>" in html
-    assert (
-        '<a href="https://example.test/response">reference</a>'
-        in html
-    )
-    assert (
-        '<a href="https://example.test/prompt">reference</a>'
-        in html
-    )
-    assert (
-        '<a href="https://example.test/worklog">reference</a>'
-        in html
-    )
+    response = _response_detail(tree)
+    assert response["type"] == "PageBlockDetails"
+    assert response["open"] is False
+    html = str(response["body"])
+    assert "Bold result" in html
     assert html.count("First response line") == 1
-    assert "<details" not in html
 
 
 # --- the fold sweep in _sync_turns ---------------------------------------------
@@ -99,9 +157,23 @@ def _two_turn_payload():
     # rows are per-worker recency ordered: newest FIRST (pass 1 setdefault picks the latest)
     return {"turns": [
         {"id": "turn-new", "worker_id": "w1", "worker_fingerprint": "fp1",
-         "assistant_final_text": "New answer", "complete": True},
+         "assistant_final_text": "New answer", "complete": True,
+         "content": {
+             "schema_version": 1,
+             "content_revision": "twrev1.new",
+             "fields": {
+                 "assistant_final_text": {"availability": "complete"}
+             },
+         }},
         {"id": "turn-old", "worker_id": "w1", "worker_fingerprint": "fp1",
-         "assistant_final_text": _FORMATTED_RESPONSE, "complete": True},
+         "assistant_final_text": _FORMATTED_RESPONSE, "complete": True,
+         "content": {
+             "schema_version": 1,
+             "content_revision": "twrev1.old",
+             "fields": {
+                 "assistant_final_text": {"availability": "complete"}
+             },
+         }},
     ]}
 
 
@@ -139,29 +211,69 @@ def _run(store, monkeypatch, flag="1", telegram=None):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", flag)
     telegram = telegram or FakeTelegram()
     runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
-    _sync_turns(store, _two_turn_payload(), {"pending": []}, runtime, chat_id="-100")
+    telegram.sync_counts = _sync_turns(
+        store,
+        _two_turn_payload(),
+        {"pending": []},
+        runtime,
+        chat_id="-100",
+        list_finals_are_authoritative=False,
+    )
     return telegram
 
 
 def test_superseded_final_gets_folded(monkeypatch):
     store = _folded_store(monkeypatch)
-    telegram = _run(store, monkeypatch)
-    # The OLD message is actually collapsed, contains its answer exactly once,
-    # and uses only markup supported by sendMessage/editMessageText.
-    edited = [(mid, html) for _chat, mid, html in telegram.edited]
-    assert (
-        "400",
-        "<b>✅ Response</b>\n"
-        "<blockquote expandable>"
-        "First response line has <b>Bold result</b> and "
-        "<code>inline()</code>.\n"
-        "Second response line has <i>italic detail</i> and "
-        '<a href="https://example.test/response">reference</a>.\n'
-        "Third response line makes the folded section meaningful."
-        "</blockquote>",
-    ) in edited
-    assert not any(mid == "501" for mid, _ in edited)                 # latest never folded
+    telegram = _ReadbackTelegram()
+    telegram.seed("400", render_turn_item_html(_turn_item()))
+    before = _response_detail(telegram.recipient["400"])
+    assert before["open"] is True
+
+    _run(store, monkeypatch, telegram=telegram)
+
+    after = _response_detail(telegram.recipient["400"])
+    assert after["open"] is False
+    assert str(after["body"]).count("First response line") == 1
+    assert str(telegram.recipient["400"]["text"]).count(
+        "First response line"
+    ) == 1
+    assert not any(
+        mid == "501" for _chat, mid, _html in telegram.edited
+    )  # latest never folded
     assert state.message_bindings(store)["400"].get("folded") is True  # idempotency marker
+    assert sum(
+        binding.get("folded") is True
+        for binding in state.message_bindings(store).values()
+    ) > 0
+    assert telegram.sync_counts["response_folded"] == 1
+
+
+def test_schema_v2_source_final_reaches_fold_sweep(monkeypatch):
+    store = _folded_store(monkeypatch)
+    reached: list[str] = []
+    original = source_sync._fold_superseded_final
+
+    def recording_fold(store, item, entry, runtime, **kwargs):
+        reached.append(str(item.get("id") or ""))
+        return original(store, item, entry, runtime, **kwargs)
+
+    monkeypatch.setattr(
+        source_sync, "_fold_superseded_final", recording_fold
+    )
+    _run(store, monkeypatch, telegram=_ReadbackTelegram())
+
+    assert reached == ["turn-old"]
+
+
+def test_schema_v2_sweep_marks_a_binding_folded(monkeypatch):
+    store = _folded_store(monkeypatch)
+
+    _run(store, monkeypatch, telegram=_ReadbackTelegram())
+
+    assert sum(
+        binding.get("folded") is True
+        for binding in state.message_bindings(store).values()
+    ) > 0
 
 
 def test_fold_idempotent_second_sweep_skips(monkeypatch):
@@ -239,7 +351,7 @@ def test_multipart_rich_final_folds_every_recipient_message(monkeypatch):
         turn_id="turn-new",
         bot_kind=MANAGER_BOT_KIND,
     )
-    telegram = FakeTelegram()
+    telegram = _ReadbackTelegram()
 
     _sync_turns(
         store,
@@ -252,14 +364,11 @@ def test_multipart_rich_final_folds_every_recipient_message(monkeypatch):
     edited_ids = {message_id for _chat, message_id, _html in telegram.edited}
     assert {"400", "401"} <= edited_ids
     assert all(
-        "<blockquote expandable>" in html
-        for _chat, message_id, html in telegram.edited
-        if message_id in {"400", "401"}
+        _response_detail(telegram.recipient[message_id])["open"]
+        is False
+        for message_id in ("400", "401")
     )
-    assert not any(
-        message_id == "501" and "<blockquote expandable>" in html
-        for _chat, message_id, html in telegram.edited
-    )
+    assert _response_detail(telegram.recipient["501"])["open"] is True
     assert all(
         state.message_bindings(store)[message_id]["folded"] is True
         for message_id in ("400", "401")
@@ -269,6 +378,7 @@ def test_multipart_rich_final_folds_every_recipient_message(monkeypatch):
 def test_readable_noncollapsed_fallback_is_never_marked_folded(
     monkeypatch,
 ):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
     store = _folded_store(monkeypatch)
 
     class PlainFallbackTelegram(FakeTelegram):
@@ -283,16 +393,45 @@ def test_readable_noncollapsed_fallback_is_never_marked_folded(
                 "format": "plain",
             }
 
-    _run(store, monkeypatch, telegram=PlainFallbackTelegram())
+    telegram = _run(
+        store, monkeypatch, telegram=PlainFallbackTelegram()
+    )
 
     binding = state.message_bindings(store)["400"]
     assert binding.get("folded") is None
     assert binding["fold_attempts"] == 1
+    assert "not applied" in binding["fold_error"]
+    assert telegram.sync_counts["response_fold_failed"] == 1
+
+
+def test_failed_superseded_fold_is_observable_in_state_and_sync_result(
+    monkeypatch,
+):
+    store = _folded_store(monkeypatch)
+
+    class FailingTelegram(FakeTelegram):
+        def api(self, method, payload):
+            if method == "editMessageText":
+                raise TelegramError("recipient rejected fold")
+            return super().api(method, payload)
+
+        def edit_message(self, _chat_id, _message_id, _html):
+            return {"ok": False, "error": "recipient rejected fold"}
+
+    telegram = _run(store, monkeypatch, telegram=FailingTelegram())
+
+    binding = state.message_bindings(store)["400"]
+    assert binding.get("folded") is None
+    assert binding["fold_attempts"] == 1
+    assert binding["fold_error"] == "recipient rejected fold"
+    assert telegram.sync_counts["response_fold_attempted"] == 1
+    assert telegram.sync_counts["response_fold_failed"] == 1
 
 
 def test_fold_topic_not_found_never_tombstones_rebound_live_topic(
     monkeypatch,
 ):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
     store = _folded_store(monkeypatch)
     entry = next(iter(state.source_worker_entries(store).values()))
     binding = state.message_bindings(store)["400"]
@@ -344,6 +483,7 @@ def test_fold_topic_not_found_never_tombstones_rebound_live_topic(
 
 
 def test_fold_message_not_found_never_tombstones_topic(monkeypatch):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
     store = _folded_store(monkeypatch)
     entry = next(iter(state.source_worker_entries(store).values()))
     binding = state.message_bindings(store)["400"]
@@ -412,21 +552,218 @@ def test_fold_failure_bounded_by_attempt_cap(monkeypatch):
 
     telegram = _FailingTelegram()
     runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
+    results = []
     for _ in range(5):
-        _sync_turns(store, _two_turn_payload(), {"pending": []}, runtime, chat_id="-100")
+        results.append(
+            _sync_turns(
+                store,
+                _two_turn_payload(),
+                {"pending": []},
+                runtime,
+                chat_id="-100",
+                list_finals_are_authoritative=False,
+            )
+        )
     binding = state.message_bindings(store)["400"]
     assert binding.get("folded") is None
-    assert int(binding.get("fold_attempts") or 0) == source_sync._FOLD_ATTEMPT_CAP   # gave up at the cap
+    assert (
+        int(binding.get("fold_attempts") or 0)
+        == source_sync._FOLD_ATTEMPT_CAP
+    )
+    assert results[-1]["response_fold_attempted"] == 0
+    assert results[-1]["response_fold_failed"] == 0
+
+    # The absence of fresh work on the capped pass cannot round the durable
+    # failure down to healthy. Consumers receive an explicit terminal signal.
+    health = doctor.outbound_response_folds(store)
+    assert health["ok"] is False
+    assert health["status"] == "response_fold_terminal"
+    assert health["signal"] == "outbound_response_fold_terminal"
+    assert health["terminal_count"] == 1
+    assert health["first_failure"]["message_id"] == "400"
+    assert health["first_failure"]["attempts"] == source_sync._FOLD_ATTEMPT_CAP
+
+
+def test_sync_consumer_propagates_terminal_fold_health(monkeypatch):
+    store = _folded_store(monkeypatch)
+    binding = state.message_bindings(store)["400"]
+    binding["fold_attempts"] = source_sync._FOLD_ATTEMPT_CAP
+    binding["fold_error"] = "recipient rejected fold"
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "1"
+    )
+    turns = _two_turn_payload()
+    turns["schema_version"] = source_sync.TURN_SCHEMA_VERSION
+    tendwire = FakeTendwire(
+        turns=turns,
+        workers=[
+            {
+                "id": "w1",
+                "name": "w1",
+                "status": "idle",
+                "space_id": "s1",
+                "fingerprint": "fp1",
+            }
+        ],
+        spaces=[
+            {
+                "id": "s1",
+                "name": "Project",
+                "status": "active",
+                "fingerprint": "space-fp1",
+            }
+        ],
+    )
+
+    result = source_sync.sync_once(
+        store,
+        SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "response_fold_terminal"
+    assert result["outbound_response_folds"]["signal"] == (
+        "outbound_response_fold_terminal"
+    )
+
+
+def test_doctor_consumer_propagates_terminal_fold_health(monkeypatch):
+    store = _folded_store(monkeypatch)
+    binding = state.message_bindings(store)["400"]
+    binding["fold_attempts"] = source_sync._FOLD_ATTEMPT_CAP
+    binding["fold_error"] = "recipient rejected fold"
+    monkeypatch.setattr(doctor, "source_services", lambda: {"ok": True})
+    monkeypatch.setattr(doctor, "legacy_timer", lambda: {"ok": True})
+    monkeypatch.setattr(doctor, "sqlite_integrity", lambda: {"ok": True})
+    monkeypatch.setattr(
+        doctor, "tendwire_backend", lambda _client=None: {"ok": True}
+    )
+    monkeypatch.setattr(doctor, "tendwire_delta_feed", lambda: {"ok": True})
+    monkeypatch.setattr(doctor, "inbound_lanes", lambda: {"ok": True})
+    monkeypatch.setattr(
+        doctor, "outbound_unbound_live_panes", lambda: {"ok": True}
+    )
+    monkeypatch.setattr(
+        doctor, "outbound_partial_finals", lambda: {"ok": True}
+    )
+    monkeypatch.setattr(doctor.state, "load_state", lambda: store)
+
+    result = doctor.run_doctor()
+
+    assert result["ok"] is False
+    assert result["checks"]["outbound_response_folds"]["signal"] == (
+        "outbound_response_fold_terminal"
+    )
 
 
 def test_fold_skipped_when_binding_lacks_bot_kind(monkeypatch):
     # A binding that doesn't record which bot sent the message must NOT be folded (a wrong-bot edit
-    # 404s and would falsely mark the fold done). It just stays unfolded, honestly.
+    # 404s and would falsely mark the fold done). It stays unfolded and exposes
+    # the reason in both binding state and the structured sweep result.
     store = _folded_store(monkeypatch)
     state.message_bindings(store)["400"].pop("bot_kind", None)
     telegram = _run(store, monkeypatch)
     assert not any(mid == "400" for _c, mid, _h in telegram.edited)
-    assert state.message_bindings(store)["400"].get("folded") is None
+    binding = state.message_bindings(store)["400"]
+    assert binding.get("folded") is None
+    assert "bot identity" in binding["fold_error"]
+    assert telegram.sync_counts["response_fold_failed"] == 1
+
+
+def test_presend_fold_error_survives_pass_level_save(monkeypatch, tmp_path):
+    store = _folded_store(monkeypatch)
+    state.message_bindings(store)["400"].pop("bot_kind", None)
+    state_file = tmp_path / "state.json"
+    state.save_state(store, state_file)
+
+    loaded = state.load_state(state_file)
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "1"
+    )
+    counts = _sync_turns(
+        loaded,
+        _two_turn_payload(),
+        {"pending": []},
+        SyncRuntime(FakeTendwire(), FakeTelegram(), with_outbox=False),
+        chat_id="-100",
+        list_finals_are_authoritative=False,
+    )
+    # This is the same aggregate decision used by sync_once/_sync_pass: one
+    # pass-level save, never a per-binding save.
+    if counts["updated"]:
+        state.save_state(loaded, state_file)
+
+    persisted = state.load_state(state_file)
+    binding = state.message_bindings(persisted)["400"]
+    assert counts["updated"] == 1
+    assert binding.get("folded") is None
+    assert "bot identity" in binding["fold_error"]
+    assert doctor.outbound_response_folds(persisted)["ok"] is False
+
+
+def test_fold_pass_cap_limits_physical_rejection_ladder(monkeypatch):
+    store = _folded_store(monkeypatch)
+    worker = next(iter(state.source_worker_entries(store).values()))
+    state.mark_delivered(
+        store,
+        "final:turn-older:whatever",
+        {"worker_id": "w1", "turn_id": "turn-older"},
+    )
+    state.bind_message_to_worker(
+        store,
+        "399",
+        worker,
+        topic_id="77",
+        kind="final",
+        turn_id="turn-older",
+        bot_kind=MANAGER_BOT_KIND,
+    )
+    turns = _two_turn_payload()
+    turns["turns"].append(
+        {
+            "id": "turn-older",
+            "worker_id": "w1",
+            "worker_fingerprint": "fp1",
+            "assistant_final_text": "Older answer",
+            "complete": True,
+        }
+    )
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RESPONSE_COLLAPSE_PREVIOUS", "1"
+    )
+
+    class RejectRichTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.rich_attempts = 0
+
+        def api(self, method, payload):
+            if method == "editMessageText":
+                self.rich_attempts += 1
+                raise TelegramError("Bad Request: rich fold rejected")
+            return super().api(method, payload)
+
+    telegram = RejectRichTelegram()
+    runtime = SyncRuntime(
+        FakeTendwire(), telegram, with_outbox=False, max_sends=8
+    )
+    counts = _sync_turns(
+        store,
+        turns,
+        {"pending": []},
+        runtime,
+        chat_id="-100",
+        list_finals_are_authoritative=False,
+    )
+
+    # Fold one uses rich + readable fallback. Only one write remains for the
+    # next fold, so its rich rejection cannot start another fallback write.
+    assert telegram.rich_attempts == 2
+    assert len(telegram.edited) == 1
+    assert counts["physical_writes"] == source_sync._FOLD_PASS_CAP
+    assert runtime.delivery_write_budget is not None
+    assert runtime.delivery_write_budget.spent == source_sync._FOLD_PASS_CAP
 
 
 def test_fold_per_pass_cap(monkeypatch):

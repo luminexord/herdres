@@ -1077,7 +1077,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
         while True:
             started = _time.monotonic()
             try:
-                _sync_pass()
+                result = _sync_pass()
+                if result.get("ok") is not True:
+                    # The long-running service is the active probe: emit its
+                    # structured health result to the journal every pass so a
+                    # terminal fold failure does not depend on a human running
+                    # `herdres doctor` first.
+                    print(json.dumps(result), flush=True)
             except Exception as exc:  # noqa: BLE001 - keep the loop alive across transient failures
                 print(json.dumps({"ok": False, "status": "sync_pass_failed", "error": sanitize_text(str(exc), 300)}), flush=True)
             _time.sleep(max(0.5, interval - (_time.monotonic() - started)))

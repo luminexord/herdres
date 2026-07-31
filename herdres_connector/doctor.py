@@ -201,6 +201,23 @@ def outbound_partial_finals(
     )
 
 
+def outbound_response_folds(
+    store: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Expose durable failures to collapse superseded Responses."""
+
+    try:
+        current = state.load_state() if store is None else store
+    except RuntimeError as exc:
+        return {
+            "ok": False,
+            "status": "error",
+            "signal": "outbound_response_fold_probe_failed",
+            "error": sanitize_text(str(exc), 200),
+        }
+    return state.response_fold_health(current)
+
+
 def outbound_unbound_live_panes(
     store: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -254,5 +271,6 @@ def run_doctor(client: TendwireClient | None = None) -> dict[str, Any]:
         "inbound_lanes": inbound_lanes(),
         "outbound_unbound_live_panes": outbound_unbound_live_panes(),
         "outbound_partial_finals": outbound_partial_finals(),
+        "outbound_response_folds": outbound_response_folds(),
     }
     return {"ok": all(item.get("ok") for item in checks.values()), "checks": checks}
