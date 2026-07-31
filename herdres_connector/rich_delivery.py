@@ -60,6 +60,12 @@ WORKLOG_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_WORKLOG_MAX_CHARS", "12
 RICH_FALLBACK_MAX_CHARS = MESSAGE_TEXT_LIMIT
 TURN_DELIVERY_PLAN_SCHEMA_VERSION = 1
 TURN_DELIVERY_PLAIN_SOURCE_CHARS = min(SPLIT_TEXT_LIMIT, MESSAGE_TEXT_LIMIT)
+# Eight owner-visible cards is the hard presentation ceiling for one logical
+# turn.  It preserves the existing exact 20K-answer path while preventing the
+# unbounded 11+ card plans that caused issue #228. Beyond this, emitting an
+# incomplete prefix would be silent data loss; callers surface an explicit
+# oversize outcome instead.
+TURN_DELIVERY_MAX_PARTS = 8
 PROMPT_PREVIEW_CHARS = 80
 USER_PROMPT_LABEL = "You"
 RESPONSE_LABEL = "Response"
@@ -79,6 +85,18 @@ _INLINE_LINK_SCHEMES = ("http://", "https://", "mailto:", "tg://")
 
 class PresentationContentError(RuntimeError):
     """Expected inability to fit specific valid content in one presentation."""
+
+
+class PresentationOversizeError(PresentationContentError):
+    """Exact content would require more owner-visible cards than permitted."""
+
+    def __init__(self, part_count: int):
+        self.part_count = int(part_count)
+        super().__init__(
+            "turn requires "
+            f"{self.part_count} cards; hard maximum is "
+            f"{TURN_DELIVERY_MAX_PARTS}"
+        )
 
 
 def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
@@ -859,6 +877,8 @@ def prepare_turn_delivery_parts(
             user_limit=user_limit,
             final_limit=final_limit,
         )
+        if len(parts) > TURN_DELIVERY_MAX_PARTS:
+            raise PresentationOversizeError(len(parts))
         if all(
             _turn_delivery_part_is_bounded(
                 item,

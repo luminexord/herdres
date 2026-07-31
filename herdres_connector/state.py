@@ -3963,13 +3963,63 @@ def partial_final_delivery_health(
     """Return the operator-facing health state for incomplete final delivery."""
 
     records = active_partial_final_deliveries(data)
-    if not records:
+    stalled_plans: list[tuple[float, str, dict[str, Any]]] = []
+    for entry_key, entry in source_worker_entries(data).items():
+        plan_token = compact_ws(entry.get("pending_plan_token"), 280)
+        turn_id = compact_ws(entry.get("pending_turn_id"), 200)
+        started_at = entry.get("pending_turn_started_at")
+        if (
+            not plan_token.startswith("twplan1.")
+            or not turn_id
+            or not isinstance(started_at, (int, float))
+            or isinstance(started_at, bool)
+        ):
+            continue
+        age = max(0.0, float(now) - float(started_at))
+        if age >= float(escalation_seconds):
+            stalled_plans.append((age, entry_key, entry))
+    stalled_plans.sort(key=lambda row: (-row[0], row[1]))
+    if not records and not stalled_plans:
         return {
             "ok": True,
             "status": "healthy",
             "signal": "",
             "held_count": 0,
+            "stalled_plan_count": 0,
             "escalation_seconds": int(escalation_seconds),
+        }
+
+    first_stalled: dict[str, Any] | None = None
+    if stalled_plans:
+        stalled_age, entry_key, entry = stalled_plans[0]
+        first_stalled = {
+            "entry_key": entry_key,
+            "turn_id": str(entry.get("pending_turn_id") or ""),
+            "content_hash": str(
+                entry.get("pending_content_revision") or ""
+            ),
+            "plan_token": str(entry.get("pending_plan_token") or ""),
+            "worker_id": str(
+                entry.get("tendwire_worker_id")
+                or entry.get("active_worker_id")
+                or ""
+            ),
+            "topic_id": str(entry.get("topic_id") or ""),
+            "started_at": float(entry["pending_turn_started_at"]),
+            "age_seconds": stalled_age,
+            "declared_part_count": entry.get("pending_turn_part_count"),
+            "created_job_count": entry.get("pending_turn_job_count"),
+        }
+    if not records:
+        return {
+            "ok": False,
+            "status": "pending_turn_plan_stalled",
+            "signal": "outbound_pending_turn_plan_stalled",
+            "held_count": 0,
+            "stalled_plan_count": len(stalled_plans),
+            "escalation_seconds": int(escalation_seconds),
+            "oldest_age_seconds": stalled_plans[0][0],
+            "first_stalled_plan": first_stalled,
         }
 
     def created_at(record: dict[str, Any]) -> float:
@@ -4009,11 +4059,12 @@ def partial_final_delivery_health(
     else:
         status = "partial_final_not_delivered"
         signal = "outbound_partial_final_not_delivered"
-    return {
+    result = {
         "ok": False,
         "status": status,
         "signal": signal,
         "held_count": len(records),
+        "stalled_plan_count": len(stalled_plans),
         "escalation_seconds": int(escalation_seconds),
         "oldest_age_seconds": age,
         "first_hold": {
@@ -4038,6 +4089,9 @@ def partial_final_delivery_health(
             )
         },
     }
+    if first_stalled is not None:
+        result["first_stalled_plan"] = first_stalled
+    return result
 
 
 def _clear_embedded_partial_final_delivery(

@@ -3723,7 +3723,7 @@ def test_oversize_rich_response_falls_back_without_raw_markdown_or_truncation(mo
             {
                 "id": "turn-huge",
                 "worker_id": "worker-1",
-                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 1_100 + tail,
+                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 950 + tail,
                 "complete": True,
             }
         ]
@@ -3746,6 +3746,52 @@ def test_oversize_rich_response_falls_back_without_raw_markdown_or_truncation(mo
     assert tail in sent_text
     assert "##" not in sent_text
     assert "**" not in sent_text
+
+
+def test_over_part_cap_source_final_is_visible_terminal_without_prefix(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    turns = {
+        "turns": [
+            {
+                "id": "turn-over-part-cap",
+                "worker_id": "worker-1",
+                "assistant_final_text": (
+                    "- exact legitimate answer line\n" * 1_100
+                ),
+                "complete": True,
+            }
+        ]
+    }
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns=turns),
+            telegram,
+            with_outbox=False,
+            max_sends=100,
+        ),
+    )
+    hold = next(
+        record
+        for record in state.active_partial_final_deliveries(store)
+        if record["turn_id"] == "turn-over-part-cap"
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "partial_final_not_delivered"
+    assert result["feed_sent"] == 0
+    assert not any(
+        "exact legitimate answer line" in sent[1]
+        for sent in telegram.sent
+    )
+    assert hold["request_phase"] == "oversize_presentation"
+    assert hold["terminal_outcome"] == "not_delivered"
+    assert hold["message_ids"] == []
 
 
 def test_sync_sends_all_long_final_response_parts(monkeypatch):
@@ -3856,7 +3902,7 @@ def test_oversize_response_splits_losslessly_into_labeled_parts():
     # A response too large for one rich message still splits, losslessly, into
     # labeled "Response i/N" parts -- each under the per-message cap.
     tail = "TAIL_MARKER_LOSSLESS"
-    text = "## **Long**\n\n" + ("- keep **rich** sections\n" * 1_100) + tail
+    text = "## **Long**\n\n" + ("- keep **rich** sections\n" * 950) + tail
     parts = render_feed_item_delivery_html_parts({"kind": "turn", "assistant_final_text": text})
 
     assert len(render_turn_item_html({"kind": "turn", "assistant_final_text": text})) > MAX_RICH_HTML_CHARS

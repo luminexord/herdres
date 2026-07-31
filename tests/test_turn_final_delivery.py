@@ -3,13 +3,17 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import time
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import herdres
 import pytest
 from herdres_connector import config, doctor, source_sync, state
-from herdres_connector.rich_delivery import split_legacy_message_ids
+from herdres_connector.rich_delivery import (
+    TURN_DELIVERY_PLAIN_SOURCE_CHARS,
+    split_legacy_message_ids,
+)
 from herdres_connector.source_sync import PRESENTATION_VERSION, SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import RateLimited, TelegramClient, TelegramError
 from test_source_only import FakeTelegram, _source_worker, _store
@@ -1091,6 +1095,203 @@ def test_turn_final_drain_does_not_exceed_feed_write_budget(
     assert result["tendwire_turn_final"]["operations"] == 0
 
 
+def test_stopped_mid_creation_plan_ages_to_visible_terminal_hold(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "HERDRES_PARTIAL_FINAL_ESCALATION_SECONDS", "30"
+    )
+    store = _store()
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-mid-create",
+                "status": "working",
+                "space_id": "space-1",
+                "fingerprint": "mid-create-fp",
+            }
+        ),
+        topic_id="77",
+    )
+    source_sync._set_pending_turn_plan(
+        entry,
+        turn_id="turn-mid-create",
+        revision="twrev1.mid_create",
+        plan_token="twplan1.mid_create",
+        part_count=11,
+        job_count=7,
+        now=time.time() - 31,
+    )
+
+    class StoppedPlan:
+        def connector_prepare_commit(self, *, plan_token):
+            return {
+                "ok": True,
+                "plan_token": plan_token,
+                "state": "active",
+                "job_count": 7,
+            }
+
+    visible_before_reconcile = doctor.outbound_partial_finals(store)
+    checkpoints = []
+    changed = source_sync._reconcile_completed_turn_plans(
+        store,
+        SyncRuntime(
+            StoppedPlan(),
+            DeletingTelegram(),
+            with_outbox=True,
+            checkpoint=lambda: checkpoints.append("checkpoint"),
+        ),
+        pending_entry=entry,
+    )
+    hold = state.find_partial_final_delivery(
+        store, "turn-mid-create", "twrev1.mid_create"
+    )
+
+    assert visible_before_reconcile["ok"] is False
+    assert (
+        visible_before_reconcile["status"]
+        == "pending_turn_plan_stalled"
+    )
+    stalled = visible_before_reconcile["first_stalled_plan"]
+    assert stalled["turn_id"] == "turn-mid-create"
+    assert stalled["plan_token"] == "twplan1.mid_create"
+    assert stalled["worker_id"] == "worker-mid-create"
+    assert stalled["topic_id"] == "77"
+    assert stalled["age_seconds"] >= 30
+    assert changed == 1
+    assert checkpoints == ["checkpoint"]
+    assert hold is not None
+    assert hold["status"] == "held"
+    assert hold["request_phase"] == "pending_plan_incomplete"
+    assert hold["created_part_ordinals"] == list(range(7))
+    assert hold["missing_part_ordinals"] == [7, 8, 9, 10]
+    assert hold["operator_attention_required"] is True
+    assert "pending_turn_id" not in entry
+    assert doctor.outbound_partial_finals(store)["ok"] is False
+
+
+def test_dead_lettered_child_immediately_holds_parent_plan(monkeypatch):
+    monkeypatch.setenv(
+        "HERDRES_PARTIAL_FINAL_ESCALATION_SECONDS", "300"
+    )
+    store = _store()
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-dead-child",
+                "status": "working",
+                "space_id": "space-1",
+                "fingerprint": "dead-child-fp",
+            }
+        ),
+        topic_id="78",
+    )
+    source_sync._set_pending_turn_plan(
+        entry,
+        turn_id="turn-dead-child",
+        revision="twrev1.dead_child",
+        plan_token="twplan1.dead_child",
+        part_count=3,
+        job_count=2,
+    )
+    job_key = "turn-final:twplan1.dead_child:000001"
+    state.reserve_tendwire_turn_job(
+        store,
+        job_key,
+        plan_token="twplan1.dead_child",
+        content_revision="twrev1.dead_child",
+        operation="upsert",
+        sequence_index=1,
+        part_ordinal=1,
+        part_count=3,
+        bot_kind="manager",
+    )
+    state.update_tendwire_turn_job(
+        store, job_key, substate="failed"
+    )
+
+    class FailedPlan:
+        def connector_prepare_commit(self, *, plan_token):
+            return {
+                "ok": True,
+                "plan_token": plan_token,
+                "state": "failed",
+                "job_count": 2,
+            }
+
+    changed = source_sync._reconcile_completed_turn_plans(
+        store,
+        SyncRuntime(
+            FailedPlan(), DeletingTelegram(), with_outbox=True
+        ),
+        pending_entry=entry,
+    )
+    hold = state.find_partial_final_delivery(
+        store, "turn-dead-child", "twrev1.dead_child"
+    )
+
+    assert changed == 1
+    assert hold is not None
+    assert hold["request_phase"] == "pending_plan_incomplete"
+    assert hold["missing_part_ordinals"] == [2]
+    assert hold["failed_part_index"] == 1
+    assert doctor.outbound_partial_finals(store)["ok"] is False
+
+
+def test_oversize_final_is_explicit_terminal_and_delivers_no_prefix(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+    store = _store()
+    row = _turn_row(
+        "turn-oversize",
+        "twrev1.oversize",
+        "x" * (TURN_DELIVERY_PLAIN_SOURCE_CHARS * 8 + 1),
+        user="legitimate large request",
+    )
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+        topic_id="77",
+    )
+    telegram = DeletingTelegram()
+
+    with pytest.raises(source_sync._TurnContentError) as raised:
+        source_sync._stage_final_plan(
+            store,
+            row,
+            entry,
+            SyncRuntime(
+                TurnFinalTendwire(row),
+                telegram,
+                dry_run=True,
+                with_outbox=False,
+            ),
+        )
+
+    hold = state.find_partial_final_delivery(
+        store, "turn-oversize", "twrev1.oversize"
+    )
+    assert raised.value.status == "oversize_presentation"
+    assert hold is not None
+    assert hold["request_phase"] == "oversize_presentation"
+    assert hold["terminal_outcome"] == "not_delivered"
+    assert hold["recovery_action"] == "supersede-with-shorter-answer"
+    assert telegram.recipient_messages == {}
+    assert state.delivered_turns(store) == {}
+    assert doctor.outbound_partial_finals(store)["ok"] is False
+
+
 def test_short_inline_stages_and_delivers_without_page_fetch_then_two_syncs_noop(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     row = _turn_row("turn-short", "twrev1.short", "short exact final", user="exact prompt")
@@ -1378,7 +1579,9 @@ def test_revision_growth_shrink_and_wrong_owner_converge_without_surplus(monkeyp
     store = _store()
     store["telegram"]["managed_bots"] = {"claude": {"enabled": True, "token": "claude-token"}}
     telegram = DeletingTelegram()
-    first_text = "A paragraph.\n\n" * 2_500
+    # Keep this lifecycle regression below the explicit eight-card oversize
+    # terminal; oversize behavior has its own recipient-state regression.
+    first_text = "A paragraph.\n\n" * 800
     tendwire = TurnFinalTendwire(_turn_row("turn-revise", "twrev1.r1", first_text))
     sync_once(store, _runtime(tendwire, telegram, max_sends=100))
     entry = next(iter(state.source_worker_entries(store).values()))
@@ -1386,7 +1589,7 @@ def test_revision_growth_shrink_and_wrong_owner_converge_without_surplus(monkeyp
     first_count = len(entry["last_clean_message_ids"])
     assert first_count > 1
 
-    growth = "B changed.\n\n" * 7_000
+    growth = "B changed.\n\n" * 1_500
     tendwire.row = _turn_row("turn-revise", "twrev1.r2", growth)
     grow_result = sync_once(store, _runtime(tendwire, telegram, max_sends=100))
     grown_ids = list(entry["last_clean_message_ids"])

@@ -1492,9 +1492,19 @@ def _turn_final_recovery_preflight(
     if revision is None:
         revision = entry.get("abandoned_content_revision")
     part_count = entry.get("pending_turn_part_count")
+    if part_count is None:
+        part_count = entry.get("abandoned_turn_part_count")
     job_count = entry.get("pending_turn_job_count")
+    if job_count is None:
+        job_count = entry.get("abandoned_turn_job_count")
     prior_generation = entry.get("pending_plan_generation", 1)
+    if "pending_plan_generation" not in entry:
+        prior_generation = entry.get("abandoned_plan_generation", 1)
     predecessor_plan_token = entry.get("replaces_failed_plan_token")
+    if predecessor_plan_token is None:
+        predecessor_plan_token = entry.get(
+            "abandoned_replaces_failed_plan_token"
+        )
     if (
         not isinstance(revision, str)
         or not revision.startswith("twrev1.")
@@ -1817,13 +1827,50 @@ def _clone_recovery_prefix(
         entry["pending_content_revision"] = entry.get(
             "abandoned_content_revision"
         )
-    entry.pop("abandoned_plan_token", None)
-    entry.pop("abandoned_content_revision", None)
+    if entry.get("pending_turn_id") is None:
+        entry["pending_turn_id"] = entry.get("abandoned_turn_id")
+    if entry.get("pending_turn_part_count") is None:
+        entry["pending_turn_part_count"] = entry.get(
+            "abandoned_turn_part_count"
+        )
+    for field in (
+        "abandoned_plan_token",
+        "abandoned_content_revision",
+        "abandoned_turn_id",
+        "abandoned_turn_part_count",
+        "abandoned_turn_job_count",
+        "abandoned_plan_generation",
+        "abandoned_replaces_failed_plan_token",
+    ):
+        entry.pop(field, None)
     entry["pending_plan_token"] = plan_token
+    entry["pending_turn_started_at"] = time.time()
     entry["pending_turn_job_count"] = len(prefix) + executable_job_count
     entry["pending_plan_generation"] = int(response["generation"])
     entry["pending_acknowledged_prefix_count"] = len(prefix)
     entry["replaces_failed_plan_token"] = failed_plan_token
+
+    partial_turn_id = str(entry.get("pending_turn_id") or "")
+    partial_revision = str(
+        entry.get("pending_content_revision") or ""
+    )
+    partial = (
+        state.find_partial_final_delivery(
+            store, partial_turn_id, partial_revision
+        )
+        if partial_turn_id and partial_revision
+        else None
+    )
+    if (
+        isinstance(partial, dict)
+        and partial.get("request_phase") == "pending_plan_incomplete"
+        and partial.get("terminal_outcome") == "not_delivered"
+    ):
+        partial["status"] = "retry_authorized"
+        partial["resolution_request_id"] = request_id
+        partial["resolution_action"] = "recover-turn-final"
+        partial["resolution_requested_at"] = time.time()
+        partial["recovery_action"] = "await-suffix-retry"
 
     request_key = _recovery_request_key(request_id)
     request_bindings = _recovery_request_bindings(store)
