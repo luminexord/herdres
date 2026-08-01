@@ -1502,6 +1502,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
 def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, Any]:
     pending_user_text = ""
     pending_user_uuid = ""
+    pending_prompt_omitted = False
     consumed_user_uuid = ""  # uuid of the last real prompt already paired to an end_turn
     completed: list[dict[str, Any]] = []
     incomplete_user = False
@@ -1522,6 +1523,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             if event_type == "user":
                 text = content_text(msg.get("content")).strip()
                 uuid = str(event.get("uuid") or "")
+                compact_summary = event.get("isCompactSummary") is True
                 if re.match(r"^\[Request interrupted by user[^\]]*\]$", text):
                     # Issue #3: an interrupt ends the open turn WITHOUT an end_turn. The marker is a
                     # control message, never a human prompt — the exact bracketed whole-message form
@@ -1565,18 +1567,24 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     # Boundary reset: drop the marker and any content-less open turn.
                     pending_user_text = ""
                     pending_user_uuid = ""
+                    pending_prompt_omitted = False
                     incomplete_user = False
                     pending_api_error = None
                     latest_stream_text = ""
                     latest_stream_updated_at = ""
                     worklog_parts = []
                     continue
-                if text and not is_internal_claude_user_text(text):
+                if (
+                    text
+                    and not is_internal_claude_user_text(text)
+                    and not compact_summary
+                ):
                     # A real human prompt: it opens a new turn boundary. It also
                     # supersedes any prior API error (the owner has responded /
                     # is driving it forward), so don't keep warning about it.
                     pending_user_text = sanitize_canonical_text(text)
                     pending_user_uuid = uuid
+                    pending_prompt_omitted = False
                     incomplete_user = True
                     pending_api_error = None
                     latest_stream_text = ""
@@ -1591,6 +1599,12 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     if not real_prompt_armed:
                         pending_user_text = ""
                         pending_user_uuid = uuid
+                        # Claude explicitly identifies compaction summaries by
+                        # provenance.  They establish the continuation turn
+                        # boundary, but their internal prose is never a public
+                        # prompt quote.  Keep enough identity to deliver the
+                        # subsequent answer with an omitted You section.
+                        pending_prompt_omitted = compact_summary
                         incomplete_user = True
                         latest_stream_text = ""
                         latest_stream_updated_at = ""
@@ -1619,7 +1633,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     # projection through completion. Internal automation user
                     # records still delimit parsing, but must not materialize a
                     # public final with an empty user prompt.
-                    if pending_user_text:
+                    if pending_user_text or pending_prompt_omitted:
                         turn = {
                             "available": True,
                             "pane_id": pane_id,
@@ -1646,6 +1660,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                             completed.append(turn)
                     consumed_user_uuid = pending_user_uuid
                     incomplete_user = False
+                    pending_prompt_omitted = False
                     pending_api_error = None  # a real completion supersedes any prior API error
                     latest_stream_text = ""
                     latest_stream_updated_at = ""

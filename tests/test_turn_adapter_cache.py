@@ -8,6 +8,9 @@ import importlib.util
 import json
 from pathlib import Path
 
+from herdres_connector.rich_delivery import send_feed_item
+from test_rich_delivery import RichCardRecipientTelegram
+
 _SPEC = importlib.util.spec_from_file_location(
     "herdr_turn_adapter", Path(__file__).resolve().parent.parent / "herdr_turn_adapter.py"
 )
@@ -281,3 +284,55 @@ def test_claude_internal_automation_final_does_not_replace_real_turn(tmp_path):
     assert len(turn["recent_turns"]) == 1
     assert "private automation" not in encoded
     assert "Internal automation result" not in encoded
+
+
+def test_claude_compaction_summary_provenance_omits_prompt_but_keeps_answer(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+    transcript = tmp_path / "claude-compacted.jsonl"
+    compact = _claude_user(
+        "compact-1",
+        "Conversation summary\nAll user messages\n/root/private/path",
+    )
+    compact["isCompactSummary"] = True
+    _append_claude_event(transcript, compact)
+    _append_claude_event(
+        transcript,
+        _claude_assistant(
+            "assistant-final",
+            "The owner-visible answer survives compaction.",
+            final=True,
+        ),
+    )
+
+    turn = adapter.extract_claude_turn(
+        transcript, "pane-1", "session-1"
+    )
+    encoded = json.dumps(turn)
+    recipient = RichCardRecipientTelegram()
+    delivered = send_feed_item(
+        recipient,
+        "-100",
+        {**turn, "kind": "turn", "title": "Claude"},
+        telegram={},
+        thread_id="77",
+    )
+    received = recipient.recipient_messages[0]
+
+    assert turn["complete"] is True
+    assert turn["turn_id"] == "compact-1"
+    assert turn["user_text"] == ""
+    assert (
+        turn["assistant_final_text"]
+        == "The owner-visible answer survives compaction."
+    )
+    assert "Conversation summary" not in encoded
+    assert "All user messages" not in encoded
+    assert "/root/private/path" not in encoded
+    assert delivered["ok"] is True
+    assert delivered["format"] == "rich"
+    assert "The owner-visible answer survives compaction." in received["text"]
+    assert "Conversation summary" not in received["text"]
+    assert "All user messages" not in received["text"]
+    assert "/root/private/path" not in received["text"]
