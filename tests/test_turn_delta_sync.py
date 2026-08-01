@@ -650,6 +650,8 @@ def test_delta_page_isolates_revisionless_legacy_row_without_dropping_valid_rows
     "private_field,private_value",
     [
         ("_meta", {"adapter/private": "session-private"}),
+        ("sessionId", "private-session-id"),
+        ("toolCallId", "private-tool-id"),
         ("thought", "raw chain of thought"),
         ("toolCall", {"rawInput": "secret command"}),
         ("tool_call_update", {"rawOutput": "secret output"}),
@@ -831,6 +833,26 @@ def test_delta_private_scan_fails_closed_on_excessive_depth_without_recursion():
     assert upserts[0][_TURN_CONTENT_OUTCOME_KEY]["status"] == (
         "private_agent_content"
     )
+
+
+def test_delta_private_quarantine_cannot_advance_mismatched_turn_identity():
+    row = _turn_row(
+        "turn-row", "twrev1.private-mismatch", None, user="public prompt"
+    )
+    row["toolCall"] = {"rawInput": "private command"}
+    change = _upsert(row)
+    change["turn_id"] = "turn-wrapper"
+
+    with pytest.raises(_TurnContentError) as excinfo:
+        _validate_delta_page(
+            _page(
+                [change],
+                mode="changes",
+                checkpoint="twdelta1.private-mismatch",
+            )
+        )
+
+    assert excinfo.value.status == "delta_protocol_ambiguous"
 
 
 @pytest.mark.parametrize(

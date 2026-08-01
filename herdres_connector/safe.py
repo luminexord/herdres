@@ -37,15 +37,25 @@ FORBIDDEN_PUBLIC_KEYS = {
 # connector protocol value.
 PRIVATE_AGENT_FIELD_NAMES = frozenset(
     {
+        "agentsessionid",
+        "agentsessionids",
         "chainofthought",
         "controlevent",
         "permissionrequest",
         "rawinput",
         "rawoutput",
+        "sessionid",
+        "sessionids",
+        "sourcesessionid",
+        "sourcesessionids",
         "toolcall",
+        "toolcallid",
+        "toolcallids",
         "toolcalls",
         "toolcallupdate",
         "toolcallupdates",
+        "tooluseid",
+        "tooluseids",
     }
 )
 PRIVATE_AGENT_CONTAINER_FIELD_NAMES = frozenset({"acpevent", "agentevent"})
@@ -64,6 +74,7 @@ ACP_SESSION_UPDATE_KINDS = frozenset(
         "configoptionupdate",
         "currentmodeupdate",
         "plan",
+        "planremoved",
         "planupdate",
         "sessioninfoupdate",
         "stateupdate",
@@ -154,7 +165,21 @@ def mapping_has_private_agent_discriminator(value: dict[Any, Any]) -> bool:
     ):
         return True
 
+    # A raw ACP JSON-RPC notification/request is private even when a malformed
+    # or future peer omits the tool-call field that the recursive key checks
+    # below would otherwise recognize.  Requiring both method and params avoids
+    # treating ordinary prose metadata that merely names a protocol method as
+    # an ACP envelope.
     keys = {key for key, _item in normalized_items}
+    if "params" in keys and any(
+        key == "method"
+        and isinstance(item, str)
+        and item.strip().lower()
+        in {"session/update", "session/request_permission"}
+        for key, item in normalized_items
+    ):
+        return True
+
     kind_names = {
         normalized_public_key(item)
         for key, item in normalized_items

@@ -12976,6 +12976,18 @@ def _validate_delta_page(
                     turn[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
                         turn, exc.status
                     )
+                if (
+                    exc.status == "private_agent_content"
+                    and _turn_id(turn) != change_turn_id
+                ):
+                    # Privacy quarantine changes presentation, not journal
+                    # identity. It must not advance the checkpoint under a
+                    # different turn key. Legacy content-schema isolation keeps
+                    # its established row-local behavior below this boundary.
+                    raise _TurnContentError(
+                        "delta_protocol_ambiguous",
+                        "Tendwire turn.delta projection identity mismatched",
+                    )
             else:
                 if _turn_id(turn) != change_turn_id:
                     raise _TurnContentError(

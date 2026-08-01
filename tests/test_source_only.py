@@ -7946,6 +7946,42 @@ def test_public_prune_drops_acp_discriminated_event_with_sibling_content():
     assert private not in json.dumps(clean)
 
 
+@pytest.mark.parametrize(
+    "private_payload",
+    [
+        {
+            "sessionUpdate": "plan_removed",
+            "planId": "private-plan-id",
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "private-session-id",
+                "options": [{"optionId": "private-option-id"}],
+            },
+        },
+    ],
+)
+def test_public_prune_drops_current_acp_envelopes(private_payload):
+    clean = public_prune({"public": "safe", "private": private_payload})
+
+    assert clean == {"public": "safe", "private": {}}
+    assert "private-" not in json.dumps(clean)
+
+
+def test_public_prune_removes_normalized_raw_agent_identities():
+    payload = {
+        "public": "safe",
+        "Session-ID": "private-session-id",
+        "sourceSessionId": "private-source-session-id",
+        "tool_call_id": "private-tool-id",
+        "toolUseId": "private-tool-use-id",
+    }
+
+    assert public_prune(payload) == {"public": "safe"}
+
+
 def test_outbox_rejects_unversioned_structured_agent_event_without_telegram_send():
     class StructuredEventTendwire:
         def __init__(self):
