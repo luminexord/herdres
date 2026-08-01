@@ -5080,6 +5080,7 @@ def test_ten_global_status_deliveries_use_two_durability_barriers_each(
         "retired_topic_notice",
         "global_pinned",
         "oversize_notice",
+        "oversize_notice_ambiguous",
     ],
 )
 def test_notification_acceptance_journal_closes_crash_seam(
@@ -5092,7 +5093,7 @@ def test_notification_acceptance_journal_closes_crash_seam(
     initial = _notification_race_store(
         retired=kind == "retired_topic_notice"
     )
-    if kind == "oversize_notice":
+    if kind.startswith("oversize_notice"):
         source_sync._record_oversize_final_delivery(
             initial,
             initial["panes"]["worker:notification-race"],
@@ -5106,7 +5107,7 @@ def test_notification_acceptance_journal_closes_crash_seam(
         raise RuntimeError("crash after notification acceptance")
 
     def deliver(current, runtime):
-        if kind == "oversize_notice":
+        if kind.startswith("oversize_notice"):
             return bool(
                 source_sync._notify_oversize_final(
                     current,
@@ -5172,6 +5173,17 @@ def test_notification_acceptance_journal_closes_crash_seam(
         assert len(
             current["telegram"]["accepted_notification_messages"]
         ) == 1
+        if kind == "oversize_notice_ambiguous":
+            receipt = next(
+                iter(
+                    current["telegram"][
+                        "accepted_notification_messages"
+                    ].values()
+                )
+            )
+            # The provider acceptance remains durable, but current ownership
+            # can no longer be proven from the receipt after restart.
+            receipt["provenance"] = {}
         runtime = source_sync._offlock_runtime(
             current,
             SyncRuntime(
@@ -5186,7 +5198,9 @@ def test_notification_acceptance_journal_closes_crash_seam(
         retired, pending = source_sync._drain_accepted_notifications(
             current, runtime, chat_id="-100"
         )
-        assert deliver(current, runtime)
+        delivered_again = deliver(current, runtime)
+        if not kind.startswith("oversize_notice"):
+            assert delivered_again
         state.save_state(current, state_path)
 
     deleted_ids = {message_id for _chat, message_id in telegram.deleted_messages}
@@ -5194,7 +5208,40 @@ def test_notification_acceptance_journal_closes_crash_seam(
         str(row[3]) for row in telegram.sent
     } - deleted_ids
     assert (retired, pending) == (1, 0)
-    assert visible_ids == {"101"}
+    if kind.startswith("oversize_notice"):
+        # Count accepted provider sends and recipient deliveries across the
+        # crash. A surviving-set assertion alone cannot detect delete/resend.
+        assert len(telegram.sent) == 1
+        assert [str(row[3]) for row in telegram.sent] == ["100"]
+        assert delivered_again is False
+        assert "Answer held: exceeds Telegram card limit" in telegram.sent[0][1]
+        assert telegram.deleted_messages == []
+        assert visible_ids == {"100"}
+        hold = state.find_partial_final_delivery(
+            current,
+            "turn-oversize-receipt",
+            "twrev1.oversize_receipt",
+        )
+        assert hold["oversize_notice_status"] == (
+            "delivery_unknown"
+            if kind == "oversize_notice_ambiguous"
+            else "accepted"
+        )
+        assert hold["oversize_notice_message_id"] == "100"
+        if kind == "oversize_notice":
+            assert state.find_message_binding(current, "100") is not None
+        else:
+            health = state.partial_final_delivery_health(
+                current, now=0.0, escalation_seconds=300
+            )
+            assert health["oversize_notice_attention"][0][
+                "turn_id"
+            ] == "turn-oversize-receipt"
+            assert health["oversize_notice_attention"][0][
+                "oversize_notice_status"
+            ] == "delivery_unknown"
+    else:
+        assert visible_ids == {"101"}
     assert not state.accepted_notification_journal_path(
         state_path
     ).exists()

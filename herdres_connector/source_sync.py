@@ -2271,6 +2271,7 @@ def _checkpoint_accepted_notification(
     operation: _OfflockEntryOperation,
     result: Any,
     *,
+    chat_id: str,
     kind: str,
     bot_kind: str = MANAGER_BOT_KIND,
 ) -> str:
@@ -2290,6 +2291,7 @@ def _checkpoint_accepted_notification(
     receipt_id = short_hash(
         {
             "kind": kind,
+            "chat_id": chat_id,
             "topic_id": operation.route_topic_id,
             "message_id": message_id,
             "provenance": _operation_provenance(operation),
@@ -2301,6 +2303,7 @@ def _checkpoint_accepted_notification(
     # always admitted, even if a concurrent writer filled the nominal bound.
     record = {
         "kind": kind,
+        "chat_id": chat_id,
         "topic_id": operation.route_topic_id,
         "message_id": message_id,
         "bot_kind": bot_kind,
@@ -2326,13 +2329,150 @@ def _complete_accepted_notification(
         ).pop(receipt_id, None)
 
 
+def _oversize_notice_kind(turn_id: str, content_hash: str) -> str:
+    return "oversize_notice:" + short_hash(
+        {"turn_id": turn_id, "content_hash": content_hash}, 20
+    )
+
+
+def _oversize_hold_for_notice_kind(
+    store: dict[str, Any], kind: str
+) -> dict[str, Any] | None:
+    if not kind.startswith("oversize_notice:"):
+        return None
+    matches = [
+        record
+        for record in state.active_partial_final_deliveries(store)
+        if record.get("request_phase") == "oversize_presentation"
+        and _oversize_notice_kind(
+            str(record.get("turn_id") or ""),
+            str(record.get("content_hash") or ""),
+        )
+        == kind
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _adopt_checkpointed_oversize_notice(
+    store: dict[str, Any],
+    receipt_id: str,
+    raw: dict[str, Any],
+    *,
+    chat_id: str,
+) -> bool:
+    """Adopt one accepted oversize notice without another provider send.
+
+    A matching receipt is an acceptance witness even when its current route
+    cannot be proven. Exact route/provenance matches become ``accepted``;
+    uncertain matches become terminal ``delivery_unknown``. Neither outcome
+    deletes or re-sends the owner-visible notification.
+    """
+
+    kind = str(raw.get("kind") or "")
+    record = _oversize_hold_for_notice_kind(store, kind)
+    if record is None:
+        return False
+    message_id = str(raw.get("message_id") or "")
+    topic_id = str(raw.get("topic_id") or "")
+    bot_kind = str(raw.get("bot_kind") or MANAGER_BOT_KIND)
+    provenance = raw.get("provenance")
+    operation: _OfflockEntryOperation | None = None
+    resolution = _OfflockEntryResolution(_OFFLOCK_ABANDON)
+    if isinstance(provenance, dict):
+        try:
+            operation = _operation_from_provenance(provenance)
+            if (
+                operation.entry_type not in {"worker", "space", "global"}
+                or len(operation.owner_generation) < 6
+            ):
+                operation = None
+            else:
+                resolution = _compare_and_apply_entry_operation(
+                    store, operation
+                )
+        except (TypeError, ValueError):
+            operation = None
+    current_topic_id = str(record.get("current_topic_id") or "")
+    current_bot_kind = str(record.get("current_bot_kind") or "")
+    exact = bool(
+        message_id
+        and message_id != "0"
+        and str(raw.get("chat_id") or "") == str(chat_id)
+        and topic_id
+        and topic_id == current_topic_id
+        and (not current_bot_kind or bot_kind == current_bot_kind)
+        and operation is not None
+        and operation.route_topic_id == topic_id
+        and resolution.disposition == _OFFLOCK_APPLY
+        and resolution.entry is not None
+    )
+    raw_attempt_count = record.get("oversize_notice_attempt_count")
+    attempt_count = (
+        raw_attempt_count
+        if isinstance(raw_attempt_count, int)
+        and not isinstance(raw_attempt_count, bool)
+        and raw_attempt_count >= 0
+        else 0
+    )
+    record["oversize_notice_attempt_count"] = max(1, attempt_count)
+    record["oversize_notice_attempt_cap"] = _OVERSIZE_NOTICE_ATTEMPT_CAP
+    raw_physical_writes = record.get("oversize_notice_physical_writes")
+    physical_writes = (
+        raw_physical_writes
+        if isinstance(raw_physical_writes, int)
+        and not isinstance(raw_physical_writes, bool)
+        and raw_physical_writes >= 0
+        else 0
+    )
+    record["oversize_notice_physical_writes"] = max(1, physical_writes)
+    record["oversize_notice_terminal"] = True
+    if message_id and message_id != "0":
+        record["oversize_notice_message_id"] = message_id
+    if exact:
+        record["oversize_notice_status"] = "accepted"
+        record.pop("oversize_notice_error", None)
+    else:
+        record["oversize_notice_status"] = "delivery_unknown"
+        record["oversize_notice_error"] = (
+            "checkpointed provider acceptance could not be matched to the "
+            "current notice route; no automatic resend was attempted"
+        )
+
+    binding_entry = (
+        resolution.entry
+        if exact
+        else _operation_binding_entry(operation)
+        if operation is not None
+        else None
+    )
+    if (
+        binding_entry is not None
+        and message_id
+        and message_id != "0"
+        and topic_id
+    ):
+        state.bind_message_to_worker(
+            store,
+            message_id,
+            binding_entry,
+            topic_id=topic_id,
+            kind="oversize_notice",
+            turn_id=str(record.get("turn_id") or ""),
+            bot_kind=bot_kind,
+        )
+    if exact and resolution.entry is not None:
+        resolution.entry["partial_final_delivery"] = record
+    _complete_accepted_notification(store, receipt_id)
+    return True
+
+
 def _drain_accepted_notifications(
     store: dict[str, Any],
     runtime: SyncRuntime,
     *,
     chat_id: str,
 ) -> tuple[int, int]:
-    """Delete stale accepted cards before permitting replacement sends."""
+    """Adopt valid oversize notices; retire other stale accepted cards."""
 
     completed = 0
     pending = 0
@@ -2344,6 +2484,13 @@ def _drain_accepted_notifications(
         if not isinstance(raw, dict):
             _complete_accepted_notification(store, receipt_id)
             completed += 1
+            continue
+        if _adopt_checkpointed_oversize_notice(
+            store, receipt_id, raw, chat_id=chat_id
+        ):
+            completed += 1
+            if runtime.checkpoint is not None:
+                runtime.checkpoint()
             continue
         message_id = str(raw.get("message_id") or "")
         if not message_id:
@@ -2591,9 +2738,7 @@ def _notify_oversize_final(
         and raw_attempt_count >= 0
         else 0
     )
-    notice_kind = "oversize_notice:" + short_hash(
-        {"turn_id": turn_id, "content_hash": content_hash}, 20
-    )
+    notice_kind = _oversize_notice_kind(turn_id, content_hash)
     if (
         runtime.dry_run
         or not isinstance(record, dict)
@@ -2661,6 +2806,7 @@ def _notify_oversize_final(
             runtime,
             captured,
             result,
+            chat_id=chat_id,
             kind=notice_kind,
             bot_kind=desired_message_bot_kind(
                 _telegram_state(store), entry
@@ -4911,6 +5057,7 @@ def _sync_topic_pinned(
                 runtime,
                 operation,
                 result,
+                chat_id=chat_id,
                 kind="topic_pinned",
             )
 
@@ -5211,6 +5358,7 @@ def _sync_retired_worker_topics(
                         runtime,
                         operation,
                         result,
+                        chat_id=chat_id,
                         kind="retired_topic_notice",
                     )
                 )
@@ -13102,6 +13250,7 @@ def _sync_pinned(
                 runtime,
                 captured,
                 result,
+                chat_id=chat_id,
                 kind="global_pinned",
             )
 
