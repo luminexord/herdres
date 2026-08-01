@@ -484,6 +484,26 @@ def _valid_target_owner(value: Any) -> bool:
     )
 
 
+def _target_owner_matches_request(request_json: Any, target_owner: Any) -> bool:
+    """Correlate an exact stable request target with any persisted owner."""
+
+    if not isinstance(request_json, str) or target_owner is None:
+        return True
+    try:
+        request = json.loads(request_json)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    target = request.get("target") if isinstance(request, dict) else None
+    if not isinstance(target, dict) or not valid_stable_worker_key_pair(
+        target.get("stable_key"), target.get("stable_key_version")
+    ):
+        return True
+    return target_owner == {
+        "stable_key": target["stable_key"],
+        "stable_key_version": target["stable_key_version"],
+    }
+
+
 def _valid_submission_fields(record: dict[str, Any]) -> bool:
     submission_id = record.get("submission_id")
     submission_state = record.get("submission_state")
@@ -646,6 +666,10 @@ def _valid_legacy_record_version(
         return False
     if request_json is not None and _request_id_from_json(request_json) != request_id:
         return False
+    if not _target_owner_matches_request(
+        request_json, record.get("target_owner")
+    ):
+        return False
     if schema_version == PREVIOUS_RECORD_SCHEMA_VERSION and not _valid_submission_fields(record):
         return False
     if record["stale_target_refreshed"] and not isinstance(request_json, str):
@@ -756,6 +780,10 @@ def _valid_record(record: Any, request_id: str) -> bool:
     ):
         return False
     if request_json is not None and _request_id_from_json(request_json) != request_id:
+        return False
+    if not _target_owner_matches_request(
+        request_json, record.get("target_owner")
+    ):
         return False
     if record["stale_target_refreshed"] and not isinstance(request_json, str):
         return False

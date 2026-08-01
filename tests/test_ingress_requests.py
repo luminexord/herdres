@@ -1459,6 +1459,56 @@ def test_corrupt_current_record_is_a_non_destructive_global_barrier() -> None:
     assert store[ingress_requests.RECORDS_KEY][REQUEST_ID] is corrupt_record
 
 
+def test_mismatched_stable_target_owner_blocks_dispatch_without_rewrite(
+    tmp_path, monkeypatch
+) -> None:
+    _setup_command_state(tmp_path, monkeypatch)
+    now = herdres.time.time()
+    store = state.load_state()
+    entry = next(iter(state.source_worker_entries(store).values()))
+    identity = state.entry_stable_identity(entry)
+    assert identity is not None
+    record, _changed = ingress_requests.ensure_request_shell(
+        store,
+        REQUEST_ID,
+        now=now,
+        retry_horizon=60,
+        retention=120,
+    )
+    request = _request()
+    request["response_schema_version"] = 3
+    request["target"] = {
+        "stable_key": identity[0],
+        "stable_key_version": identity[1],
+    }
+    ingress_requests.attach_request_json(
+        record,
+        ingress_requests.canonical_request_json(request),
+        now=now,
+    )
+    ingress_requests.attach_target_owner(
+        record,
+        "wsk1_" + "f" * 64,
+        1,
+        now=now,
+    )
+    state.save_state(store)
+    before = copy.deepcopy(store)
+
+    class ForbiddenClient:
+        def __init__(self):
+            raise AssertionError("corrupt owner must block before dispatch")
+
+    monkeypatch.setattr(herdres, "TendwireClient", ForbiddenClient)
+
+    with pytest.raises(
+        RuntimeError, match="^ingress request record store is corrupt$"
+    ):
+        herdres.command_reply(_payload())
+
+    assert state.load_state() == before
+
+
 @pytest.mark.parametrize(
     "corrupt_record",
     [
