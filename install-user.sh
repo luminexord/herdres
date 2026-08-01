@@ -1,6 +1,88 @@
 #!/usr/bin/env sh
 set -eu
 
+# Validate every state that can refuse tendwired installation before the first
+# mutation anywhere in this script. A refusal must not leave Herdres binaries,
+# units, and source metadata at different deployment generations.
+TENDWIRED_UNIT="$HOME/.config/systemd/user/tendwired.service"
+TENDWIRED_TEMPLATE="systemd/user/tendwired.service.example"
+TENDWIRED_MANAGED_BASE="$HOME/.local/share/herdres/tendwired.service.managed"
+TENDWIRED_NEEDS_REFRESH=1
+TENDWIRED_MANAGED_NEEDS_REFRESH=1
+
+if [ -L "$TENDWIRED_UNIT" ]; then
+    TENDWIRED_LINK_TARGET=$(readlink "$TENDWIRED_UNIT" 2>/dev/null || printf '%s' '<unreadable>')
+    printf '%s\n' \
+        "Refusing to refresh $TENDWIRED_UNIT: it is a symlink to $TENDWIRED_LINK_TARGET." \
+        "Replace it with a regular unit file, keeping host overrides in tendwired.service.d, then rerun install-user.sh." >&2
+    exit 1
+fi
+if [ -e "$TENDWIRED_UNIT" ]; then
+    if [ ! -f "$TENDWIRED_UNIT" ]; then
+        printf '%s\n' \
+            "Refusing to refresh $TENDWIRED_UNIT: the existing path is not a regular file." \
+            "Move it aside, keep host overrides in tendwired.service.d, then rerun install-user.sh." >&2
+        exit 1
+    fi
+    if cmp -s "$TENDWIRED_TEMPLATE" "$TENDWIRED_UNIT"; then
+        TENDWIRED_NEEDS_REFRESH=0
+    elif [ ! -f "$TENDWIRED_MANAGED_BASE" ] \
+        || ! cmp -s "$TENDWIRED_MANAGED_BASE" "$TENDWIRED_UNIT"; then
+        printf '%s\n' \
+            "Refusing to refresh $TENDWIRED_UNIT: it differs from both the current and last installer-managed base unit." \
+            "The active unit was left unchanged. Move host-specific Environment= values into an operator drop-in; an ExecStart= override must first clear ExecStart= in that drop-in. Restore the base from $TENDWIRED_TEMPLATE, then rerun install-user.sh." >&2
+        exit 1
+    fi
+fi
+if [ -L "$TENDWIRED_MANAGED_BASE" ] \
+    || { [ -e "$TENDWIRED_MANAGED_BASE" ] && [ ! -f "$TENDWIRED_MANAGED_BASE" ]; }; then
+    printf '%s\n' \
+        "Refusing to refresh $TENDWIRED_MANAGED_BASE: the installer-managed baseline is not a regular file." \
+        "Move that path aside, then rerun install-user.sh." >&2
+    exit 1
+fi
+if [ -f "$TENDWIRED_MANAGED_BASE" ] \
+    && cmp -s "$TENDWIRED_TEMPLATE" "$TENDWIRED_MANAGED_BASE"; then
+    TENDWIRED_MANAGED_NEEDS_REFRESH=0
+fi
+
+# Copy, validate, and fsync in the destination directory before rename. The
+# fsync uses Python already required by this installer; the shell remains POSIX
+# and does not depend on the non-standard `sync -f` command.
+install_tendwired_file_atomically() (
+    source_path=$1
+    destination_path=$2
+    destination_directory=${destination_path%/*}
+    destination_name=${destination_path##*/}
+    temporary_path=$(mktemp "$destination_directory/.$destination_name.XXXXXX")
+    cleanup_temporary() {
+        if [ -n "${temporary_path:-}" ]; then
+            rm -f "$temporary_path"
+        fi
+    }
+    trap cleanup_temporary 0
+    trap 'cleanup_temporary; exit 1' 1 2 15
+    cp "$source_path" "$temporary_path"
+    chmod 644 "$temporary_path"
+    if ! cmp -s "$source_path" "$temporary_path"; then
+        printf '%s\n' "Refusing to install $destination_path: temporary-file validation failed." >&2
+        exit 1
+    fi
+    python3 - "$temporary_path" <<'SYNCPY'
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+SYNCPY
+    mv -f "$temporary_path" "$destination_path"
+    temporary_path=
+    trap - 0 1 2 15
+)
+
 install -Dm755 herdres.py "$HOME/.local/bin/herdres"
 install -Dm755 herdres_gateway.py "$HOME/.local/bin/herdres-gateway"
 # Turn adapter: the tendwire daemon captures turn content by running `herdr pane turn`, which some
@@ -277,78 +359,30 @@ KEYPY
 mkdir -p "$HOME/.config/systemd/user" "$HOME/.local/share/herdres"
 cp systemd/user/herdres.service systemd/user/herdres-gateway.service "$HOME/.config/systemd/user/"
 
-# The repository owns the tendwired base unit so deploys pick up lifecycle
-# hardening changes. A symlink is refused rather than followed. A diverged
-# regular base unit is also refused: older releases explicitly invited edits,
-# and guessing how to migrate Environment= or ExecStart= safely could change
-# effective daemon configuration. Host-specific settings belong in operator
-# tendwired.service.d drop-ins, which this installer never removes, rewrites,
-# reorders, or populates. A copy of the last installer-managed base lives
-# outside systemd's unit tree so a later repository version can be distinguished
-# from an operator edit. An existing canonical base is backed up before an
-# atomic refresh.
-TENDWIRED_UNIT="$HOME/.config/systemd/user/tendwired.service"
-TENDWIRED_TEMPLATE="systemd/user/tendwired.service.example"
-TENDWIRED_MANAGED_BASE="$HOME/.local/share/herdres/tendwired.service.managed"
-if [ -L "$TENDWIRED_UNIT" ]; then
-    TENDWIRED_LINK_TARGET=$(readlink "$TENDWIRED_UNIT" 2>/dev/null || printf '%s' '<unreadable>')
-    printf '%s\n' \
-        "Refusing to refresh $TENDWIRED_UNIT: it is a symlink to $TENDWIRED_LINK_TARGET." \
-        "Replace it with a regular unit file, keeping host overrides in tendwired.service.d, then rerun install-user.sh." >&2
-    exit 1
+# The repository owns the tendwired base unit. Preflight above established
+# whether this is a real refresh or a byte-identical no-op; only real refreshes
+# create a backup and replace the active unit.
+if [ "$TENDWIRED_NEEDS_REFRESH" -eq 1 ]; then
+    if [ -e "$TENDWIRED_UNIT" ]; then
+        TENDWIRED_BACKUP_BASE="$TENDWIRED_UNIT.bak-$(date -u +%Y%m%d%H%M%S)"
+        TENDWIRED_BACKUP="$TENDWIRED_BACKUP_BASE"
+        TENDWIRED_BACKUP_INDEX=0
+        while [ -e "$TENDWIRED_BACKUP" ] || [ -L "$TENDWIRED_BACKUP" ]; do
+            TENDWIRED_BACKUP_INDEX=$((TENDWIRED_BACKUP_INDEX + 1))
+            TENDWIRED_BACKUP="$TENDWIRED_BACKUP_BASE-$TENDWIRED_BACKUP_INDEX"
+        done
+        cp -p "$TENDWIRED_UNIT" "$TENDWIRED_BACKUP"
+        printf '%s\n' "Backed up existing tendwired.service to $TENDWIRED_BACKUP."
+    fi
+    install_tendwired_file_atomically "$TENDWIRED_TEMPLATE" "$TENDWIRED_UNIT"
+else
+    printf '%s\n' "tendwired.service already matches the repository-managed base; left unchanged."
 fi
-if [ -e "$TENDWIRED_UNIT" ]; then
-    if [ ! -f "$TENDWIRED_UNIT" ]; then
-        printf '%s\n' \
-            "Refusing to refresh $TENDWIRED_UNIT: the existing path is not a regular file." \
-            "Move it aside, keep host overrides in tendwired.service.d, then rerun install-user.sh." >&2
-        exit 1
-    fi
-    if ! cmp -s "$TENDWIRED_TEMPLATE" "$TENDWIRED_UNIT" \
-        && { [ ! -f "$TENDWIRED_MANAGED_BASE" ] \
-            || ! cmp -s "$TENDWIRED_MANAGED_BASE" "$TENDWIRED_UNIT"; }; then
-        printf '%s\n' \
-            "Refusing to refresh $TENDWIRED_UNIT: it differs from both the current and last installer-managed base unit." \
-            "The active unit was left unchanged. Move host-specific Environment= values into an operator drop-in; an ExecStart= override must first clear ExecStart= in that drop-in. Restore the base from $TENDWIRED_TEMPLATE, then rerun install-user.sh." >&2
-        exit 1
-    fi
-    TENDWIRED_BACKUP_BASE="$TENDWIRED_UNIT.bak-$(date -u +%Y%m%d%H%M%S)"
-    TENDWIRED_BACKUP="$TENDWIRED_BACKUP_BASE"
-    TENDWIRED_BACKUP_INDEX=0
-    while [ -e "$TENDWIRED_BACKUP" ] || [ -L "$TENDWIRED_BACKUP" ]; do
-        TENDWIRED_BACKUP_INDEX=$((TENDWIRED_BACKUP_INDEX + 1))
-        TENDWIRED_BACKUP="$TENDWIRED_BACKUP_BASE-$TENDWIRED_BACKUP_INDEX"
-    done
-    cp -p "$TENDWIRED_UNIT" "$TENDWIRED_BACKUP"
-    printf '%s\n' "Backed up existing tendwired.service to $TENDWIRED_BACKUP."
-fi
-TENDWIRED_TEMP=$(mktemp "$HOME/.config/systemd/user/.tendwired.service.XXXXXX")
-cleanup_tendwired_temp() {
-    if [ -n "${TENDWIRED_TEMP:-}" ]; then
-        rm -f "$TENDWIRED_TEMP"
-    fi
-}
-trap cleanup_tendwired_temp 0
-trap 'cleanup_tendwired_temp; exit 1' 1 2 15
-cp "$TENDWIRED_TEMPLATE" "$TENDWIRED_TEMP"
-chmod 644 "$TENDWIRED_TEMP"
-mv -f "$TENDWIRED_TEMP" "$TENDWIRED_UNIT"
-TENDWIRED_TEMP=
-trap - 0 1 2 15
 
-TENDWIRED_MANAGED_TEMP=$(mktemp "$HOME/.local/share/herdres/.tendwired.service.managed.XXXXXX")
-cleanup_tendwired_managed_temp() {
-    if [ -n "${TENDWIRED_MANAGED_TEMP:-}" ]; then
-        rm -f "$TENDWIRED_MANAGED_TEMP"
-    fi
-}
-trap cleanup_tendwired_managed_temp 0
-trap 'cleanup_tendwired_managed_temp; exit 1' 1 2 15
-cp "$TENDWIRED_TEMPLATE" "$TENDWIRED_MANAGED_TEMP"
-chmod 644 "$TENDWIRED_MANAGED_TEMP"
-mv -f "$TENDWIRED_MANAGED_TEMP" "$TENDWIRED_MANAGED_BASE"
-TENDWIRED_MANAGED_TEMP=
-trap - 0 1 2 15
+# Keep the comparison baseline current without rewriting it on a no-op run.
+if [ "$TENDWIRED_MANAGED_NEEDS_REFRESH" -eq 1 ]; then
+    install_tendwired_file_atomically "$TENDWIRED_TEMPLATE" "$TENDWIRED_MANAGED_BASE"
+fi
 
 rm -f "$HOME/.config/systemd/user/herdres.timer"
 rm -f "$HOME/.config/systemd/user/herdres-speech.service"
