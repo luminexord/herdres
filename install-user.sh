@@ -276,6 +276,25 @@ KEYPY
 
 mkdir -p "$HOME/.config/systemd/user" "$HOME/.local/share/herdres"
 cp systemd/user/herdres.service systemd/user/herdres-gateway.service "$HOME/.config/systemd/user/"
+
+# The repository owns the tendwired base unit so deploys pick up lifecycle
+# hardening changes. Preserve the previous base unit before every refresh;
+# host-specific settings belong in tendwired.service.d drop-ins, which this
+# installer deliberately never removes or rewrites.
+TENDWIRED_UNIT="$HOME/.config/systemd/user/tendwired.service"
+if [ -e "$TENDWIRED_UNIT" ] || [ -L "$TENDWIRED_UNIT" ]; then
+    TENDWIRED_BACKUP_BASE="$TENDWIRED_UNIT.bak-$(date -u +%Y%m%d%H%M%S)"
+    TENDWIRED_BACKUP="$TENDWIRED_BACKUP_BASE"
+    TENDWIRED_BACKUP_INDEX=0
+    while [ -e "$TENDWIRED_BACKUP" ] || [ -L "$TENDWIRED_BACKUP" ]; do
+        TENDWIRED_BACKUP_INDEX=$((TENDWIRED_BACKUP_INDEX + 1))
+        TENDWIRED_BACKUP="$TENDWIRED_BACKUP_BASE-$TENDWIRED_BACKUP_INDEX"
+    done
+    cp -p "$TENDWIRED_UNIT" "$TENDWIRED_BACKUP"
+    printf '%s\n' "Backed up existing tendwired.service to $TENDWIRED_BACKUP."
+fi
+cp systemd/user/tendwired.service.example "$TENDWIRED_UNIT"
+
 rm -f "$HOME/.config/systemd/user/herdres.timer"
 rm -f "$HOME/.config/systemd/user/herdres-speech.service"
 rm -rf "$HOME/.config/systemd/user/herdres-gateway.service.d"
@@ -285,3 +304,6 @@ printf '%s\n' "Installed source-only Herdres."
 printf '%s\n' "Edit $HOME/.config/herdres/herdres.env, then run:"
 printf '%s\n' "  systemctl --user daemon-reload"
 printf '%s\n' "  systemctl --user enable --now herdres.service herdres-gateway.service"
+printf '%s\n' "tendwired.service was installed/refreshed but was not enabled or started."
+printf '%s\n' "Keep host-specific tendwired settings in tendwired.service.d drop-ins."
+printf '%s\n' "  systemctl --user cat tendwired.service"
