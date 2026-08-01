@@ -1,6 +1,8 @@
-# Tendwire daemon base unit, installed and refreshed by install-user.sh. The installer backs up an
-# existing base unit before replacement and never touches tendwired.service.d. Keep host-specific
-# overrides (including a non-default Tendwire checkout) in drop-ins rather than editing this file.
+# Tendwire daemon base unit, installed and refreshed by install-user.sh. The installer refuses
+# symlinks and locally diverged base units, tracks its last managed base outside systemd's unit tree,
+# backs up a canonical unit before replacement, and never touches tendwired.service.d. Keep
+# host-specific overrides (including a non-default Tendwire checkout) in operator drop-ins rather
+# than editing this repository-managed file.
 #
 # LOAD-BEARING settings (each one broke prod when wrong):
 #  * TENDWIRE_HERDR_BIN must point at herdr_turn_adapter.py (installed by install-user.sh), NOT the

@@ -278,11 +278,40 @@ mkdir -p "$HOME/.config/systemd/user" "$HOME/.local/share/herdres"
 cp systemd/user/herdres.service systemd/user/herdres-gateway.service "$HOME/.config/systemd/user/"
 
 # The repository owns the tendwired base unit so deploys pick up lifecycle
-# hardening changes. Preserve the previous base unit before every refresh;
-# host-specific settings belong in tendwired.service.d drop-ins, which this
-# installer deliberately never removes or rewrites.
+# hardening changes. A symlink is refused rather than followed. A diverged
+# regular base unit is also refused: older releases explicitly invited edits,
+# and guessing how to migrate Environment= or ExecStart= safely could change
+# effective daemon configuration. Host-specific settings belong in operator
+# tendwired.service.d drop-ins, which this installer never removes, rewrites,
+# reorders, or populates. A copy of the last installer-managed base lives
+# outside systemd's unit tree so a later repository version can be distinguished
+# from an operator edit. An existing canonical base is backed up before an
+# atomic refresh.
 TENDWIRED_UNIT="$HOME/.config/systemd/user/tendwired.service"
-if [ -e "$TENDWIRED_UNIT" ] || [ -L "$TENDWIRED_UNIT" ]; then
+TENDWIRED_TEMPLATE="systemd/user/tendwired.service.example"
+TENDWIRED_MANAGED_BASE="$HOME/.local/share/herdres/tendwired.service.managed"
+if [ -L "$TENDWIRED_UNIT" ]; then
+    TENDWIRED_LINK_TARGET=$(readlink "$TENDWIRED_UNIT" 2>/dev/null || printf '%s' '<unreadable>')
+    printf '%s\n' \
+        "Refusing to refresh $TENDWIRED_UNIT: it is a symlink to $TENDWIRED_LINK_TARGET." \
+        "Replace it with a regular unit file, keeping host overrides in tendwired.service.d, then rerun install-user.sh." >&2
+    exit 1
+fi
+if [ -e "$TENDWIRED_UNIT" ]; then
+    if [ ! -f "$TENDWIRED_UNIT" ]; then
+        printf '%s\n' \
+            "Refusing to refresh $TENDWIRED_UNIT: the existing path is not a regular file." \
+            "Move it aside, keep host overrides in tendwired.service.d, then rerun install-user.sh." >&2
+        exit 1
+    fi
+    if ! cmp -s "$TENDWIRED_TEMPLATE" "$TENDWIRED_UNIT" \
+        && { [ ! -f "$TENDWIRED_MANAGED_BASE" ] \
+            || ! cmp -s "$TENDWIRED_MANAGED_BASE" "$TENDWIRED_UNIT"; }; then
+        printf '%s\n' \
+            "Refusing to refresh $TENDWIRED_UNIT: it differs from both the current and last installer-managed base unit." \
+            "The active unit was left unchanged. Move host-specific Environment= values into an operator drop-in; an ExecStart= override must first clear ExecStart= in that drop-in. Restore the base from $TENDWIRED_TEMPLATE, then rerun install-user.sh." >&2
+        exit 1
+    fi
     TENDWIRED_BACKUP_BASE="$TENDWIRED_UNIT.bak-$(date -u +%Y%m%d%H%M%S)"
     TENDWIRED_BACKUP="$TENDWIRED_BACKUP_BASE"
     TENDWIRED_BACKUP_INDEX=0
@@ -293,7 +322,33 @@ if [ -e "$TENDWIRED_UNIT" ] || [ -L "$TENDWIRED_UNIT" ]; then
     cp -p "$TENDWIRED_UNIT" "$TENDWIRED_BACKUP"
     printf '%s\n' "Backed up existing tendwired.service to $TENDWIRED_BACKUP."
 fi
-cp systemd/user/tendwired.service.example "$TENDWIRED_UNIT"
+TENDWIRED_TEMP=$(mktemp "$HOME/.config/systemd/user/.tendwired.service.XXXXXX")
+cleanup_tendwired_temp() {
+    if [ -n "${TENDWIRED_TEMP:-}" ]; then
+        rm -f "$TENDWIRED_TEMP"
+    fi
+}
+trap cleanup_tendwired_temp 0
+trap 'cleanup_tendwired_temp; exit 1' 1 2 15
+cp "$TENDWIRED_TEMPLATE" "$TENDWIRED_TEMP"
+chmod 644 "$TENDWIRED_TEMP"
+mv -f "$TENDWIRED_TEMP" "$TENDWIRED_UNIT"
+TENDWIRED_TEMP=
+trap - 0 1 2 15
+
+TENDWIRED_MANAGED_TEMP=$(mktemp "$HOME/.local/share/herdres/.tendwired.service.managed.XXXXXX")
+cleanup_tendwired_managed_temp() {
+    if [ -n "${TENDWIRED_MANAGED_TEMP:-}" ]; then
+        rm -f "$TENDWIRED_MANAGED_TEMP"
+    fi
+}
+trap cleanup_tendwired_managed_temp 0
+trap 'cleanup_tendwired_managed_temp; exit 1' 1 2 15
+cp "$TENDWIRED_TEMPLATE" "$TENDWIRED_MANAGED_TEMP"
+chmod 644 "$TENDWIRED_MANAGED_TEMP"
+mv -f "$TENDWIRED_MANAGED_TEMP" "$TENDWIRED_MANAGED_BASE"
+TENDWIRED_MANAGED_TEMP=
+trap - 0 1 2 15
 
 rm -f "$HOME/.config/systemd/user/herdres.timer"
 rm -f "$HOME/.config/systemd/user/herdres-speech.service"
