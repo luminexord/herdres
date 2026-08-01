@@ -428,19 +428,32 @@ def _submit_ingress_command_record(
             except (json.JSONDecodeError, TypeError, ValueError):
                 request = None
             target = request.get("target") if isinstance(request, dict) else None
-            worker_id = (
-                str(target.get("worker_id") or "")
-                if isinstance(target, dict)
-                else ""
-            )
-            _entry_key, owner_entry = state.find_worker_entry_by_id(
-                store, worker_id
-            )
-            identity = (
-                state.entry_stable_identity(owner_entry)
-                if isinstance(owner_entry, dict)
-                else None
-            )
+            identity = None
+            if isinstance(target, dict) and state.valid_stable_worker_key_pair(
+                target.get("stable_key"), target.get("stable_key_version")
+            ):
+                # The canonical target is the immutable routing authority. In
+                # particular, a space entry may carry only its active worker's
+                # stable identity, and the mutable worker row may disappear
+                # while Tendwire is processing the command.
+                identity = (
+                    target["stable_key"],
+                    target["stable_key_version"],
+                )
+            else:
+                worker_id = (
+                    str(target.get("worker_id") or "")
+                    if isinstance(target, dict)
+                    else ""
+                )
+                _entry_key, owner_entry = state.find_worker_entry_by_id(
+                    store, worker_id
+                )
+                identity = (
+                    state.entry_stable_identity(owner_entry)
+                    if isinstance(owner_entry, dict)
+                    else None
+                )
             if identity is not None:
                 ingress_requests.attach_target_owner(
                     record,

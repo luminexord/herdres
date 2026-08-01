@@ -1861,6 +1861,113 @@ def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
     assert replayed["updated_at"] == linked_updated_at
 
 
+def test_v3_stable_target_owner_is_fsynced_before_child_can_crash(
+    tmp_path, monkeypatch
+) -> None:
+    _setup_command_state(tmp_path, monkeypatch)
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "3"
+    )
+    entry = next(iter(state.source_worker_entries(state.load_state()).values()))
+    expected_owner = state.entry_stable_identity(entry)
+    assert expected_owner is not None
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    class CrashingClient:
+        def command_json(self, request_json):
+            request = json.loads(request_json)
+            assert request["target"] == {
+                "stable_key": expected_owner[0],
+                "stable_key_version": expected_owner[1],
+            }
+            persisted = state.load_state()[ingress_requests.RECORDS_KEY][REQUEST_ID]
+            assert persisted["target_owner"] == request["target"]
+            raise SimulatedCrash
+
+    monkeypatch.setattr(herdres, "TendwireClient", CrashingClient)
+
+    with pytest.raises(SimulatedCrash):
+        herdres.command_reply(_payload())
+
+    persisted = state.load_state()[ingress_requests.RECORDS_KEY][REQUEST_ID]
+    assert persisted["target_owner"] == {
+        "stable_key": expected_owner[0],
+        "stable_key_version": expected_owner[1],
+    }
+
+
+def test_v3_space_stable_owner_survives_worker_route_churn_before_acceptance(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "space")
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "3"
+    )
+    store = _store()
+    _worker_key, worker, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-original",
+            }
+        ),
+    )
+    _space_key, space, _created = state.upsert_space_entry(
+        store,
+        {
+            "id": "space-1",
+            "name": "Project",
+            "status": "active",
+            "fingerprint": "space-fp",
+        },
+        topic_id="77",
+    )
+    assert state.cache_space_active_worker(space, worker) is True
+    expected_owner = {
+        "stable_key": space["active_worker_stable_key"],
+        "stable_key_version": space["active_worker_stable_key_version"],
+    }
+    state.save_state(store)
+    submission_id = "twsub1." + "c" * 64
+
+    class ChurningClient:
+        def command_json(self, request_json):
+            request = json.loads(request_json)
+            assert request["target"] == expected_owner
+            concurrent = state.load_state()
+            record = concurrent[ingress_requests.RECORDS_KEY][REQUEST_ID]
+            assert record["target_owner"] == expected_owner
+            concurrent["panes"] = {}
+            state.save_state(concurrent)
+            response = _accepted_command_response(request)
+            response["schema_version"] = 3
+            response["result"].update(
+                {
+                    "submission_id": submission_id,
+                    "submission_verdict": "submitted",
+                    "turn_id": None,
+                }
+            )
+            return response
+
+    monkeypatch.setattr(herdres, "TendwireClient", ChurningClient)
+
+    result = herdres.command_reply(_payload())
+
+    assert result["transport_disposition"] == "written_to_pty"
+    persisted = state.load_state()[ingress_requests.RECORDS_KEY][REQUEST_ID]
+    assert persisted["target_owner"] == expected_owner
+    assert persisted["submission_id"] == submission_id
+    assert persisted["quarantined_at"] is None
+
+
 def test_unrelated_working_delivery_blocks_stale_submission_rebind() -> None:
     store = _store()
     _entry_key, entry, _created = state.upsert_worker_entry(
