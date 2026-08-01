@@ -24,6 +24,7 @@ from .safe import compact_ws, short_hash
 DELIVERED_TURN_LEDGER_LIMIT = 10000
 PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION = 3
 PARTIAL_FINAL_DELIVERY_LIMIT = 512
+PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT = 64
 RESPONSE_FOLD_ATTEMPT_CAP = 3
 TENDWIRE_TURN_JOB_LIMIT = 20001
 TENDWIRE_TURN_JOB_STALE_COPY_LIMIT = 8
@@ -4032,7 +4033,83 @@ def partial_final_delivery_health(
             else float(now)
         )
 
-    ordered = sorted(records, key=created_at)
+    ordered = sorted(
+        records,
+        key=lambda record: (
+            created_at(record),
+            str(record.get("turn_id") or ""),
+            str(record.get("content_hash") or ""),
+        ),
+    )
+
+    def project_hold(record: dict[str, Any]) -> dict[str, Any]:
+        projected = {
+            key: deepcopy(record.get(key))
+            for key in (
+                "turn_id",
+                "content_hash",
+                "blocked_revision_content_hash",
+                "superseded_by_content_hash",
+                "superseded_at",
+                "supersession",
+                "supersession_message_ids",
+                "terminal_outcome",
+                "status",
+                "request_phase",
+                "transport_disposition",
+                "original_worker_id",
+                "original_topic_id",
+                "original_bot_kind",
+                "current_worker_id",
+                "current_topic_id",
+                "current_bot_kind",
+                "recovery_action",
+                "error",
+                "created_at",
+                "updated_at",
+                "required_part_count",
+                "content_locator",
+                "oversize_notice_status",
+                "oversize_notice_error",
+                "oversize_notice_attempt_count",
+                "oversize_notice_attempt_cap",
+                "oversize_notice_terminal",
+            )
+        }
+        projected["age_seconds"] = max(
+            0.0, float(now) - created_at(record)
+        )
+        return projected
+
+    def bounded_projection(
+        selected: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        total = len(selected)
+        returned = min(total, PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT)
+        omitted = total - returned
+        return (
+            [project_hold(record) for record in selected[:returned]],
+            {
+                "total": total,
+                "returned": returned,
+                "omitted": omitted,
+                "truncated": omitted > 0,
+                "limit": PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT,
+            },
+        )
+
+    active_holds, active_holds_projection = bounded_projection(ordered)
+    oversize_notice_records = [
+        record
+        for record in ordered
+        if record.get("request_phase") == "oversize_presentation"
+        and str(record.get("oversize_notice_status") or "not_attempted")
+        != "accepted"
+    ]
+    (
+        oversize_notice_attention,
+        oversize_notice_attention_projection,
+    ) = bounded_projection(oversize_notice_records)
     first = ordered[0]
     age = max(0.0, float(now) - created_at(first))
     escalated = any(
@@ -4068,32 +4145,19 @@ def partial_final_delivery_health(
         "stalled_plan_count": len(stalled_plans),
         "escalation_seconds": int(escalation_seconds),
         "oldest_age_seconds": age,
-        "first_hold": {
-            key: deepcopy(first.get(key))
-            for key in (
-                "turn_id",
-                "content_hash",
-                "blocked_revision_content_hash",
-                "superseded_by_content_hash",
-                "superseded_at",
-                "supersession",
-                "supersession_message_ids",
-                "terminal_outcome",
-                "status",
-                "original_worker_id",
-                "original_topic_id",
-                "original_bot_kind",
-                "current_worker_id",
-                "current_topic_id",
-                "current_bot_kind",
-                "recovery_action",
-                "oversize_notice_status",
-                "oversize_notice_error",
-                "oversize_notice_attempt_count",
-                "oversize_notice_attempt_cap",
-                "oversize_notice_terminal",
-            )
-        },
+        # Keep the historical single-record projection for compatibility, but
+        # never make operator discovery depend on which hold sorts first.
+        "first_hold": project_hold(first),
+        "active_holds": active_holds,
+        "active_holds_projection": active_holds_projection,
+        # This independently scans every active record before bounding. A
+        # failed notice can therefore neither hide behind an older hold nor
+        # fall outside the general projection without an explicit omitted
+        # count appearing in the same health result.
+        "oversize_notice_attention": oversize_notice_attention,
+        "oversize_notice_attention_projection": (
+            oversize_notice_attention_projection
+        ),
     }
     if first_stalled is not None:
         result["first_stalled_plan"] = first_stalled
