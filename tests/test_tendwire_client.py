@@ -298,6 +298,43 @@ def test_command_accepts_exact_stable_owner_target(client_runner):
     assert json.loads(calls[0][1]["input"].decode("utf-8")) == request
 
 
+def test_command_accepts_current_tendwire_v3_acp_submission_envelope(client_runner):
+    client, calls, responses = client_runner
+    request = _command_request()
+    request["target"] = {
+        "stable_key": "wsk1_" + "a" * 64,
+        "stable_key_version": 1,
+    }
+    request["response_schema_version"] = 3
+    accepted = _accepted_result()
+    accepted.update(
+        {
+            "submission_id": "twsub1." + "b" * 64,
+            "submission_verdict": "submitted",
+            "turn_id": None,
+        }
+    )
+    response = _command_response(result=accepted)
+    response["schema_version"] = 3
+    responses.append({"body": response})
+
+    result = client.command(request)
+
+    assert result == response
+    assert json.loads(calls[0][1]["input"].decode("utf-8")) == request
+
+
+def test_command_rejects_unknown_accepted_submission_verdict(client_runner):
+    client, _calls, responses = client_runner
+    accepted = _accepted_result()
+    accepted["submission_verdict"] = "unknown"
+    responses.append({"body": _command_response(result=accepted)})
+
+    result = client.command(_command_request())
+
+    assert result["status"] == "request_state_uncertain"
+
+
 @pytest.mark.parametrize(
     "target",
     [

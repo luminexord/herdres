@@ -97,7 +97,10 @@ _COMMAND_ACCEPTED_RESULT_FIELDS = frozenset(
     }
 )
 _COMMAND_ACCEPTED_OPTIONAL_RESULT_FIELDS = frozenset(
-    {"submission_id", "turn_id"}
+    {"submission_id", "submission_verdict", "turn_id"}
+)
+_COMMAND_ACCEPTED_SUBMISSION_VERDICTS = frozenset(
+    {"submitted", "written_to_pty"}
 )
 _COMMAND_ACCEPTED_OBSERVED_TURN_STATES = frozenset(
     {"pending_observation", "observed", "complete", "linked"}
@@ -337,6 +340,12 @@ def _valid_accepted_command_result(
     submission_id = value.get("submission_id")
     if "submission_id" in value and (
         not isinstance(submission_id, str) or not submission_id.strip()
+    ):
+        return False
+    if (
+        "submission_verdict" in value
+        and value.get("submission_verdict")
+        not in _COMMAND_ACCEPTED_SUBMISSION_VERDICTS
     ):
         return False
     if response_schema_version == 2 and "submission_id" in value:
