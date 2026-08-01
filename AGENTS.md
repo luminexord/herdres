@@ -19,12 +19,19 @@ the operator and to every other session.
 What you write in a turn is delivered to Telegram as a rich card by default, but
 not always: rich delivery is *attempted* first and falls back to a formatted
 `sendMessage` when it is disabled (`HERDRES_FORCE_PLAIN_DELIVERY=1`), when the
-content is oversized, or when the provider definitely rejects it. Tables (`<table>`),
-headings (`<h1>`-`<h6>`) and `<details>` blocks exist only on the rich path, so a
-turn that leans on them loses that structure in the fallback — write so the plain
-form still reads. Collapsing itself survives: the fallback emits
-`<blockquote expandable>`, which is a `sendMessage` feature and is *not* available
-on the rich path.
+content is oversized, or when the provider definitely rejects it.
+
+Tables (`<table>`), headings (`<h1>`-`<h6>`) and `<details>` blocks exist only on
+the rich path. **The fallback does not translate them — it unwraps them.** A
+`<details>` block arrives as its summary line followed by its body, with no
+collapsing at all: `<blockquote expandable>` is honoured on the `sendMessage`
+path only when it is already present, and the rich fallback never emits it. So a
+turn that leans on rich structure loses that structure entirely; write so the
+plain form still reads.
+
+The oversized case is harsher still. Beyond roughly 3900 characters the content
+is split into plain chunks sent **without `parse_mode`**, so it is not merely
+unstructured but unformatted — no bold, no code, no links.
 
 One thing is easy to get wrong on the rich path: **a markdown table only renders
 as a table if it has the separator row.**
@@ -46,5 +53,8 @@ and the table's header row. Without it the paragraph collector swallows the
 header and the table is never recognised — measured 2026-08-01, four tables in
 the owner's own topic arrived as raw pipes for exactly this reason.
 
-Everything else is forgiving: outer pipes are optional, alignment colons are
-fine, and extra spaces in the separator are fine.
+Within an eligible table block three things are forgiving: outer pipes are
+optional, alignment colons are fine, and extra spaces in the separator are fine.
+That list is exhaustive, not an example — a table inside a code fence stays
+literal because the fence is handled before table parsing, and an all-empty
+table is rejected outright.
