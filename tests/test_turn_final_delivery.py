@@ -1559,7 +1559,7 @@ def test_later_terminal_oversize_notice_is_visible_behind_older_hold():
         "returned": 1,
         "omitted": 0,
         "truncated": False,
-        "limit": state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT,
+        "limit": None,
     }
 
 
@@ -1616,7 +1616,7 @@ def test_operator_can_enumerate_every_active_hold_and_notice_failure():
 
 def test_partial_final_health_projection_reports_visible_overflow():
     store = _store()
-    total = state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT + 3
+    total = state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT + 1
     records = [
         _operator_hold_record(
             f"turn-overflow-{index:03d}",
@@ -1639,15 +1639,106 @@ def test_partial_final_health_projection_reports_visible_overflow():
     assert health["active_holds_projection"] == {
         "total": total,
         "returned": state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT,
-        "omitted": 3,
+        "omitted": 1,
         "truncated": True,
         "limit": state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT,
     }
-    assert len(health["oversize_notice_attention"]) == (
-        state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT
+    assert len(health["oversize_notice_attention"]) == total
+    assert health["oversize_notice_attention"][-1]["turn_id"] == (
+        "turn-overflow-064"
     )
-    assert health["oversize_notice_attention_projection"]["omitted"] == 3
-    assert health["oversize_notice_attention_projection"]["truncated"] is True
+    assert health["oversize_notice_attention"][-1][
+        "oversize_notice_error"
+    ] == "rejection 64"
+    assert health["oversize_notice_attention_projection"] == {
+        "total": total,
+        "returned": total,
+        "omitted": 0,
+        "truncated": False,
+        "limit": None,
+    }
+    assert health["operator_listing_command"] == [
+        "herdres",
+        "list-partial-finals",
+    ]
+
+
+def test_list_partial_finals_reaches_omitted_identity_and_drives_resolution(
+    monkeypatch, capsys
+):
+    store = _store()
+    total = state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT + 1
+    records = [
+        _operator_hold_record(
+            f"turn-{index:03d}",
+            f"twrev1.hold_{index:03d}",
+            created_at=float(index),
+            notice_status="terminal_failed",
+            notice_error=f"rejection-{index:03d}",
+        )
+        for index in range(total)
+    ]
+    _store_operator_holds(store, records)
+    monkeypatch.setattr(herdres.config, "load_env_file", lambda: None)
+    monkeypatch.setattr(
+        herdres.config, "require_source_mode", lambda: None
+    )
+    monkeypatch.setattr(herdres.state, "load_state", lambda: store)
+    list_args = herdres.build_parser().parse_args(
+        ["list-partial-finals"]
+    )
+
+    assert list_args.func(list_args) == 0
+    listing = json.loads(capsys.readouterr().out)
+
+    assert listing["complete"] is True
+    assert listing["active_count"] == total
+    assert len(listing["holds"]) == total
+    omitted = next(
+        row for row in listing["holds"] if row["turn_id"] == "turn-064"
+    )
+    assert omitted["content_hash"] == "twrev1.hold_064"
+    assert omitted["oversize_notice_status"] == "terminal_failed"
+    assert omitted["oversize_notice_error"] == "rejection-064"
+    assert omitted["resolution_action"] == "retry-missing"
+    assert omitted["resolution_command"] == [
+        "herdres",
+        "resolve-partial-final",
+        "--turn-id",
+        "turn-064",
+        "--content-hash",
+        "twrev1.hold_064",
+        "--action",
+        "retry-missing",
+        "--request-id",
+        "<unique-request-id>",
+    ]
+
+    monkeypatch.setattr(
+        herdres.state, "state_lock", lambda: nullcontext()
+    )
+
+    def save_candidate(candidate):
+        saved = deepcopy(candidate)
+        store.clear()
+        store.update(saved)
+
+    monkeypatch.setattr(herdres.state, "save_state", save_candidate)
+    assert herdres.cmd_resolve_partial_final(
+        SimpleNamespace(
+            turn_id=omitted["turn_id"],
+            content_hash=omitted["content_hash"],
+            action=omitted["resolution_action"],
+            request_id="operator-list-resolution-064",
+        )
+    ) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    assert resolved["status"] == "partial_final_recovery_authorized"
+    assert resolved["turn_id"] == "turn-064"
+    assert resolved["content_hash"] == "twrev1.hold_064"
+    assert state.find_partial_final_delivery(
+        store, "turn-064", "twrev1.hold_064"
+    )["status"] == "retry_authorized"
 
 
 def test_sync_loop_journals_later_oversize_notice_failure(

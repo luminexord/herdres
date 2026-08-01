@@ -2079,6 +2079,26 @@ def cmd_resolve_partial_final(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_list_partial_finals(_args: argparse.Namespace) -> int:
+    """List every active partial-final obligation and its recovery command."""
+
+    config.load_env_file()
+    config.require_source_mode()
+    store = state.load_state()
+    rows = state.partial_final_delivery_operator_rows(
+        store, now=time.time()
+    )
+    return _json(
+        {
+            "ok": True,
+            "status": "partial_final_holds_listed",
+            "active_count": len(rows),
+            "complete": True,
+            "holds": rows,
+        }
+    )
+
+
 def cmd_outbox(args: argparse.Namespace) -> int:
     config.load_env_file()
     with state.state_lock():
@@ -2145,6 +2165,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["accept-partial", "retry-missing"],
     )
     partial.set_defaults(func=cmd_resolve_partial_final)
+    sub.add_parser("list-partial-finals").set_defaults(
+        func=cmd_list_partial_finals
+    )
     outbox = tendwire_sub.add_parser("outbox")
     outbox.add_argument("--limit", type=int, default=3)
     outbox.add_argument("--dry-run", action="store_true")

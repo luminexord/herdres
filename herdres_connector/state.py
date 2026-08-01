@@ -3956,6 +3956,103 @@ def active_partial_final_deliveries(
     ]
 
 
+def _partial_final_created_at(
+    record: dict[str, Any], *, now: float
+) -> float:
+    value = record.get("created_at")
+    return (
+        float(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        else float(now)
+    )
+
+
+def _partial_final_operator_row(
+    record: dict[str, Any], *, now: float
+) -> dict[str, Any]:
+    row = {
+        key: deepcopy(record.get(key))
+        for key in (
+            "turn_id",
+            "content_hash",
+            "blocked_revision_content_hash",
+            "superseded_by_content_hash",
+            "superseded_at",
+            "supersession",
+            "supersession_message_ids",
+            "terminal_outcome",
+            "status",
+            "request_phase",
+            "transport_disposition",
+            "original_worker_id",
+            "original_topic_id",
+            "original_bot_kind",
+            "current_worker_id",
+            "current_topic_id",
+            "current_bot_kind",
+            "recovery_action",
+            "error",
+            "created_at",
+            "updated_at",
+            "required_part_count",
+            "content_locator",
+            "oversize_notice_status",
+            "oversize_notice_error",
+            "oversize_notice_attempt_count",
+            "oversize_notice_attempt_cap",
+            "oversize_notice_terminal",
+        )
+    }
+    row["age_seconds"] = max(
+        0.0, float(now) - _partial_final_created_at(record, now=now)
+    )
+    resolution_action = {
+        "delivery_unknown": "accept-partial",
+        "not_delivered": "retry-missing",
+    }.get(str(record.get("terminal_outcome") or ""))
+    row["resolution_action"] = resolution_action
+    if resolution_action:
+        row["resolution_command"] = [
+            "herdres",
+            "resolve-partial-final",
+            "--turn-id",
+            str(record.get("turn_id") or ""),
+            "--content-hash",
+            str(record.get("content_hash") or ""),
+            "--action",
+            resolution_action,
+            "--request-id",
+            "<unique-request-id>",
+        ]
+    return row
+
+
+def partial_final_delivery_operator_rows(
+    data: dict[str, Any], *, now: float
+) -> list[dict[str, Any]]:
+    """Return every active hold with identity and supported recovery action.
+
+    This intentionally has no presentation cap: it backs an operator-invoked
+    listing rather than the continuously journaled health result. Normal state
+    bounds unresolved records at ``PARTIAL_FINAL_DELIVERY_LIMIT``; if legacy
+    state exceeds that bound, dropping identities here would make the excess
+    obligations impossible to resolve without reading private state.
+    """
+
+    records = sorted(
+        active_partial_final_deliveries(data),
+        key=lambda record: (
+            _partial_final_created_at(record, now=now),
+            str(record.get("turn_id") or ""),
+            str(record.get("content_hash") or ""),
+        ),
+    )
+    return [
+        _partial_final_operator_row(record, now=now)
+        for record in records
+    ]
+
+
 def partial_final_delivery_health(
     data: dict[str, Any],
     *,
@@ -4024,62 +4121,15 @@ def partial_final_delivery_health(
             "first_stalled_plan": first_stalled,
         }
 
-    def created_at(record: dict[str, Any]) -> float:
-        value = record.get("created_at")
-        return (
-            float(value)
-            if isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            else float(now)
-        )
-
     ordered = sorted(
         records,
         key=lambda record: (
-            created_at(record),
+            _partial_final_created_at(record, now=now),
             str(record.get("turn_id") or ""),
             str(record.get("content_hash") or ""),
         ),
     )
-
-    def project_hold(record: dict[str, Any]) -> dict[str, Any]:
-        projected = {
-            key: deepcopy(record.get(key))
-            for key in (
-                "turn_id",
-                "content_hash",
-                "blocked_revision_content_hash",
-                "superseded_by_content_hash",
-                "superseded_at",
-                "supersession",
-                "supersession_message_ids",
-                "terminal_outcome",
-                "status",
-                "request_phase",
-                "transport_disposition",
-                "original_worker_id",
-                "original_topic_id",
-                "original_bot_kind",
-                "current_worker_id",
-                "current_topic_id",
-                "current_bot_kind",
-                "recovery_action",
-                "error",
-                "created_at",
-                "updated_at",
-                "required_part_count",
-                "content_locator",
-                "oversize_notice_status",
-                "oversize_notice_error",
-                "oversize_notice_attempt_count",
-                "oversize_notice_attempt_cap",
-                "oversize_notice_terminal",
-            )
-        }
-        projected["age_seconds"] = max(
-            0.0, float(now) - created_at(record)
-        )
-        return projected
+    operator_rows = partial_final_delivery_operator_rows(data, now=now)
 
     def bounded_projection(
         selected: list[dict[str, Any]],
@@ -4088,7 +4138,7 @@ def partial_final_delivery_health(
         returned = min(total, PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT)
         omitted = total - returned
         return (
-            [project_hold(record) for record in selected[:returned]],
+            deepcopy(selected[:returned]),
             {
                 "total": total,
                 "returned": returned,
@@ -4098,22 +4148,37 @@ def partial_final_delivery_health(
             },
         )
 
-    active_holds, active_holds_projection = bounded_projection(ordered)
-    oversize_notice_records = [
-        record
-        for record in ordered
-        if record.get("request_phase") == "oversize_presentation"
-        and str(record.get("oversize_notice_status") or "not_attempted")
+    active_holds, active_holds_projection = bounded_projection(operator_rows)
+    oversize_notice_rows = [
+        row
+        for row in operator_rows
+        if row.get("request_phase") == "oversize_presentation"
+        and str(row.get("oversize_notice_status") or "not_attempted")
         != "accepted"
     ]
     (
         oversize_notice_attention,
         oversize_notice_attention_projection,
-    ) = bounded_projection(oversize_notice_records)
+    ) = (
+        deepcopy(oversize_notice_rows),
+        {
+            "total": len(oversize_notice_rows),
+            "returned": len(oversize_notice_rows),
+            "omitted": 0,
+            "truncated": False,
+            "limit": None,
+        },
+    )
     first = ordered[0]
-    age = max(0.0, float(now) - created_at(first))
+    age = max(
+        0.0,
+        float(now) - _partial_final_created_at(first, now=now),
+    )
     escalated = any(
-        max(0.0, float(now) - created_at(record))
+        max(
+            0.0,
+            float(now) - _partial_final_created_at(record, now=now),
+        )
         >= float(escalation_seconds)
         for record in records
     )
@@ -4147,13 +4212,14 @@ def partial_final_delivery_health(
         "oldest_age_seconds": age,
         # Keep the historical single-record projection for compatibility, but
         # never make operator discovery depend on which hold sorts first.
-        "first_hold": project_hold(first),
+        "first_hold": operator_rows[0],
         "active_holds": active_holds,
         "active_holds_projection": active_holds_projection,
-        # This independently scans every active record before bounding. A
-        # failed notice can therefore neither hide behind an older hold nor
-        # fall outside the general projection without an explicit omitted
-        # count appearing in the same health result.
+        "operator_listing_command": ["herdres", "list-partial-finals"],
+        # This independently scans and returns every attention record. Unlike
+        # the general health list it is intentionally uncapped: a large set of
+        # failed notices is itself an incident, and identities must remain
+        # actionable even if the manual listing command is unavailable.
         "oversize_notice_attention": oversize_notice_attention,
         "oversize_notice_attention_projection": (
             oversize_notice_attention_projection
