@@ -19,9 +19,12 @@ the operator and to every other session.
 What you write in a turn is delivered to Telegram as a rich card by default, but
 not always: rich delivery is *attempted* first and falls back to a formatted
 `sendMessage` when it is disabled (`HERDRES_FORCE_PLAIN_DELIVERY=1`), when the
-content is oversized, or when the provider definitely rejects it. Tables,
-headings and collapsible sections exist only on the rich path — the fallback has
-none of them, so write so the plain form still reads.
+content is oversized, or when the provider definitely rejects it. Tables (`<table>`),
+headings (`<h1>`-`<h6>`) and `<details>` blocks exist only on the rich path, so a
+turn that leans on them loses that structure in the fallback — write so the plain
+form still reads. Collapsing itself survives: the fallback emits
+`<blockquote expandable>`, which is a `sendMessage` feature and is *not* available
+on the rich path.
 
 One thing is easy to get wrong on the rich path: **a markdown table only renders
 as a table if it has the separator row.**
