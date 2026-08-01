@@ -725,6 +725,74 @@ This branch runs two user services (plus the Tendwire daemon):
 - `tendwired.service` — the Tendwire daemon (installed from the Tendwire repo);
   Herdres depends on it but does not manage it.
 
+## What renders in Telegram
+
+Turn content is attempted as a Telegram rich card by default. Agents do not
+need to know that, with one exception that bites in practice: **on the rich
+path, a markdown table only becomes a real table if it starts its own block and
+carries the separator row.**
+
+```
+| column | column |
+|---|---|
+| value  | value  |
+```
+
+The `|---|---|` line is what converts it. Without that line the block is not a
+markdown table, so it degrades to paragraph text and the pipe characters show
+through. The header must also begin a new block: after ordinary prose, put a
+blank line before the header. Otherwise the paragraph collector consumes the
+would-be table as paragraph text, including its separator. It looks like a
+table when you write it, which is why this is worth stating rather than leaving
+it to be discovered.
+
+Measured against the deployed renderer, so this list is behaviour rather than
+intent:
+
+| written as | becomes a table |
+|---|---|
+| header + `\|---\|---\|` + rows | yes |
+| header + rows, **no separator row** | no |
+| no outer pipes (`a \| b`) | yes |
+| alignment colons (`\|:--\|--:\|`) | yes |
+| spaces in the separator (`\| --- \|`) | yes |
+| indented four spaces | yes |
+| blank line between ordinary prose and the header | required |
+| ASCII box drawing (`+---+---+`) | no |
+
+Within a table block, outer pipes are optional; alignment colons, separator
+spacing, and four-space indentation are accepted. The separator row and the
+block boundary after prose are not optional. The current renderer treats ASCII
+box drawing as paragraph text, so write a markdown table instead.
+
+The rich `sendRichMessage` path carries bold, italic, inline code, code blocks,
+links, and rich-only structures: native `<table>` blocks, `<h*>` headings,
+ordered and unordered lists, and collapsible `<details>` sections.
+
+The formatted `sendMessage` path supports a different set. Inline formatting,
+links, code blocks, ordinary blockquotes, and `<blockquote expandable>` survive.
+Rich-only tables, headings, list containers, and details do not: tables flatten
+to pipe-separated rows, headings become text, list items become bullet lines,
+and details are expanded. The content stays readable, but those rich structures
+do not survive.
+
+Herdres selects plain delivery when rich delivery is disabled, and falls back to
+it after a definite provider rejection — though not if the physical-write budget
+is already spent, in which case no fallback is attempted and the turn ends
+`operation_budget_exhausted`. Length alone does not downgrade a turn: oversized
+rich content is split into several cards (`format=rich-split`). Once on the plain
+path, content beyond roughly 3900 characters is split into chunks sent **without
+`parse_mode`**, so it arrives unformatted as well as unstructured. A successful
+`sendRichMessage` response does not reveal whether the recipient's client
+rendered the blocks, so client-side incompatibility cannot trigger that fallback
+automatically. Set `HERDRES_FORCE_PLAIN_DELIVERY=1` when a client cannot render
+rich cards; that forces the plain path for every message.
+
+A successfully accepted rich card normally carries no plain-text body. Reading
+one back through a user session therefore shows `message == ''` with the content
+in `rich_message.blocks`. That is correct when the client renders those blocks;
+otherwise use the force-plain switch above.
+
 ## Send transport
 
 Herdres submits every outbound instruction through Tendwire's public command
