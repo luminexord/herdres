@@ -1792,6 +1792,9 @@ def _gateway_child(
     }
 
 
+_STABLE_TARGET_WORKERS: dict[str, str] = {}
+
+
 def _source_worker(worker, *, stable_identity=True):
     """Return a test worker with a deterministic valid identity by default."""
     result = dict(worker)
@@ -1805,11 +1808,28 @@ def _source_worker(worker, *, stable_identity=True):
         meta["stable_key"] = "wsk1_" + hashlib.sha256(material.encode()).hexdigest()
         meta["stable_key_version"] = 1
     result["meta"] = meta
+    stable_key = meta.get("stable_key")
+    worker_id = result.get("id")
+    if isinstance(stable_key, str) and isinstance(worker_id, str) and worker_id:
+        _STABLE_TARGET_WORKERS[stable_key] = worker_id
     return result
 
 
+def _stable_target(worker_id: str, fingerprint: str) -> dict[str, object]:
+    material = f"{worker_id}\0{fingerprint}"
+    return {
+        "stable_key": "wsk1_" + hashlib.sha256(material.encode()).hexdigest(),
+        "stable_key_version": 1,
+    }
+
+
 def _accepted_command_response(request):
-    worker_id = str(request.get("target", {}).get("worker_id") or "worker-1")
+    target = request.get("target", {})
+    worker_id = str(
+        target.get("worker_id")
+        or _STABLE_TARGET_WORKERS.get(str(target.get("stable_key") or ""))
+        or "worker-1"
+    )
     return {
         "schema_version": 2,
         "action": "send_instruction",
@@ -3299,8 +3319,8 @@ def test_per_agent_bot_reply_targets_original_worker_once(tmp_path, monkeypatch)
         reply="Sent to Tendwire worker.",
     )
     assert [command["target"] for command in fake.commands] == [
-        {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"},
-        {"worker_id": "worker-codex", "worker_fingerprint": "fp-codex"},
+        _stable_target("worker-claude", "fp-claude"),
+        _stable_target("worker-codex", "fp-codex"),
     ]
     assert [command["instruction"] for command in fake.commands] == [
         {"text": "reply to claude"},
@@ -5686,7 +5706,7 @@ def test_command_reply_preserves_prederived_request_id_and_strips_private_ingres
         reply="Sent to Tendwire worker.",
     )
     request = fake.commands[0]
-    assert request["target"] == {"worker_id": "worker-1", "worker_fingerprint": "fp-1"}
+    assert request["target"] == _stable_target("worker-1", "fp-1")
     assert request["request_id"] == REQUEST_ID
     assert set(request) == {
         "schema_version",
@@ -5713,7 +5733,7 @@ def test_command_reply_preserves_prederived_request_id_and_strips_private_ingres
 
 
 
-def test_stale_target_no_receipt_refresh_reuses_same_request_id(tmp_path, monkeypatch):
+def test_stable_target_no_receipt_never_relaxes_owner_identity(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
     state.upsert_worker_entry(
@@ -5763,19 +5783,14 @@ def test_stale_target_no_receipt_refresh_reuses_same_request_id(tmp_path, monkey
 
     assert result == _gateway_child(
         REQUEST_ID,
-        disposition="terminal_accepted",
-        reply="Sent to Tendwire worker.",
+        checkpoint=herdres_gateway.CHECKPOINT_RETRY,
+        disposition="no_receipt",
     )
-    assert len(calls) == 2
-    assert calls[0]["request_id"] == calls[1]["request_id"] == REQUEST_ID
-    assert calls[0]["target"] == {
-        "worker_id": "worker-1",
-        "worker_fingerprint": "fp-stale",
-    }
-    assert calls[1]["target"] == {"worker_id": "worker-1"}
-    assert {key: value for key, value in calls[0].items() if key != "target"} == {
-        key: value for key, value in calls[1].items() if key != "target"
-    }
+    assert len(calls) == 1
+    assert calls[0]["request_id"] == REQUEST_ID
+    assert calls[0]["target"] == _stable_target("worker-1", "fp-stale")
+    persisted = state.load_state()["tendwire_ingress_command_requests"][REQUEST_ID]
+    assert persisted.get("stale_target_refreshed") is not True
 
 
 def test_no_receipt_redelivery_reuses_durable_exact_request_across_state_churn(
@@ -5848,10 +5863,7 @@ def test_no_receipt_redelivery_reuses_durable_exact_request_across_state_churn(
     assert request_bytes[0] == request_bytes[1]
     request = json.loads(request_bytes[0])
     assert request["instruction"] == {"text": "original instruction"}
-    assert request["target"] == {
-        "worker_id": "worker-1",
-        "worker_fingerprint": "fp-original",
-    }
+    assert request["target"] == _stable_target("worker-1", "fp-original")
 
 
 
@@ -6313,7 +6325,7 @@ def test_command_reply_to_agent_message_targets_original_worker(tmp_path, monkey
         reply="Sent to Tendwire worker.",
     )
     request = fake.commands[0]
-    assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
+    assert request["target"] == _stable_target("worker-claude", "fp-claude")
     assert request["instruction"] == {"text": "reply to claude"}
 
 
@@ -6354,7 +6366,7 @@ def test_command_reply_at_alias_targets_worker_in_space(tmp_path, monkeypatch):
         reply="Sent to Tendwire worker.",
     )
     request = fake.commands[0]
-    assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
+    assert request["target"] == _stable_target("worker-claude", "fp-claude")
     assert request["instruction"] == {"text": "hello there"}
 
 
@@ -6396,7 +6408,7 @@ def test_command_reply_target_bot_kind_targets_worker_in_space(tmp_path, monkeyp
         reply="Sent to Tendwire worker.",
     )
     request = fake.commands[0]
-    assert request["target"] == {"worker_id": "worker-claude", "worker_fingerprint": "fp-claude"}
+    assert request["target"] == _stable_target("worker-claude", "fp-claude")
     assert request["instruction"] == {"text": "hello from child bot"}
 
 
@@ -6442,7 +6454,7 @@ def test_command_reply_voice_transcript_targets_worker_in_space(tmp_path, monkey
         reply="Sent to Tendwire worker.",
     )
     request = fake.commands[0]
-    assert request["target"] == {"worker_id": "worker-kimi", "worker_fingerprint": "fp-kimi"}
+    assert request["target"] == _stable_target("worker-kimi", "fp-kimi")
     assert request["instruction"] == {"text": "check the worker status"}
     assert "voice-file" not in json.dumps(request, sort_keys=True)
 

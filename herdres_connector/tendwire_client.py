@@ -22,6 +22,7 @@ from .safe import (
     public_prune,
     sanitize_text,
 )
+from .state import valid_stable_worker_key_pair
 
 
 class TendwireError(RuntimeError):
@@ -67,6 +68,7 @@ _DECISION_COMMAND_REQUEST_FIELDS = {
     "params",
 }
 _COMMAND_TARGET_SHAPES = {
+    frozenset({"stable_key", "stable_key_version"}),
     frozenset({"worker_id"}),
     frozenset({"worker_id", "worker_fingerprint"}),
     frozenset({"space_id"}),
@@ -242,7 +244,12 @@ def _exact_send_command_request(request: Any) -> dict[str, Any] | None:
     target = request.get("target")
     if not isinstance(target, dict) or frozenset(target) not in _COMMAND_TARGET_SHAPES:
         return None
-    if any(not isinstance(value, str) or not value.strip() for value in target.values()):
+    if set(target) == {"stable_key", "stable_key_version"}:
+        if not valid_stable_worker_key_pair(
+            target.get("stable_key"), target.get("stable_key_version")
+        ):
+            return None
+    elif any(not isinstance(value, str) or not value.strip() for value in target.values()):
         return None
     instruction = request.get("instruction")
     if (

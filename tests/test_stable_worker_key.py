@@ -133,6 +133,71 @@ def _persisted_missing_version_worker(
     return key, entry
 
 
+def test_acp_frontend_fingerprint_churn_keeps_topic_and_stable_ingress_target():
+    """A visible pane frontend may rotate without changing the ACP owner."""
+    store = _store()
+    original_key, original, created = state.upsert_worker_entry(
+        store,
+        _worker(
+            "codex",
+            KEY_A,
+            agent="codex",
+            fingerprint="fp-headless",
+        ),
+        topic_id="14303",
+    )
+    assert created is True
+    state.bind_message_to_worker(
+        store,
+        "14310",
+        original,
+        topic_id="14303",
+        kind="final",
+        turn_id="turn-before-frontend",
+    )
+
+    frontend_key, frontend, created = state.upsert_worker_entry(
+        store,
+        _worker(
+            "codex",
+            KEY_A,
+            agent="codex",
+            fingerprint="fp-visible-frontend",
+        ),
+    )
+
+    assert created is False
+    assert frontend_key == original_key
+    assert frontend is original
+    assert frontend["topic_id"] == "14303"
+    assert herdres._target_for_entry(frontend) == {
+        "stable_key": KEY_A,
+        "stable_key_version": 1,
+    }
+    binding = state.find_message_binding(store, "14310", topic_id="14303")
+    assert binding is not None
+    assert binding["worker_fingerprint"] == "fp-visible-frontend"
+    assert state.find_entry_by_thread(store, "14303") == (
+        original_key,
+        frontend,
+    )
+
+
+def test_ingress_target_uses_fingerprint_only_without_exact_stable_owner():
+    entry = {
+        "tendwire_worker_id": "codex",
+        "tendwire_fingerprint": "fp-legacy",
+        "tendwire_stable_key": KEY_A,
+        "tendwire_stable_key_version": "1",
+    }
+
+    assert state.entry_stable_identity(entry) is None
+    assert herdres._target_for_entry(entry) == {
+        "worker_id": "codex",
+        "worker_fingerprint": "fp-legacy",
+    }
+
+
 def _final_turn(worker_id, *, turn_id="turn-1", text="Full final answer"):
     return {
         "id": turn_id,

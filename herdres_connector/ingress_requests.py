@@ -14,6 +14,7 @@ from typing import Any
 
 from .ingress_identity import validate_request_id
 from .safe import sanitize_text
+from .state import valid_stable_worker_key_pair
 
 RECORDS_KEY = "tendwire_ingress_command_requests"
 RECORD_SCHEMA_VERSION = 4
@@ -165,6 +166,7 @@ _COMMAND_REQUEST_FIELDS = frozenset(
 _COMMAND_REQUEST_V3_FIELDS = _COMMAND_REQUEST_FIELDS | {"response_schema_version"}
 _COMMAND_TARGET_SHAPES = frozenset(
     {
+        frozenset({"stable_key", "stable_key_version"}),
         frozenset({"worker_id"}),
         frozenset({"worker_id", "worker_fingerprint"}),
         frozenset({"space_id"}),
@@ -412,13 +414,19 @@ def _valid_command_request(request: Any) -> bool:
         return False
     target = request.get("target")
     instruction = request.get("instruction")
+    target_valid = False
+    if isinstance(target, dict) and frozenset(target) in _COMMAND_TARGET_SHAPES:
+        if frozenset(target) == frozenset({"stable_key", "stable_key_version"}):
+            target_valid = valid_stable_worker_key_pair(
+                target.get("stable_key"), target.get("stable_key_version")
+            )
+        else:
+            target_valid = all(
+                isinstance(value, str) and bool(value.strip())
+                for value in target.values()
+            )
     return (
-        isinstance(target, dict)
-        and frozenset(target) in _COMMAND_TARGET_SHAPES
-        and all(
-            isinstance(value, str) and bool(value.strip())
-            for value in target.values()
-        )
+        target_valid
         and isinstance(instruction, dict)
         and frozenset(instruction) == {"text"}
         and isinstance(instruction.get("text"), str)

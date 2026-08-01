@@ -253,7 +253,22 @@ def _managed_bot_kind_for_alias(store: dict[str, Any], alias: str) -> str:
 
 
 
-def _target_for_entry(entry: dict[str, Any]) -> dict[str, str]:
+def _target_for_entry(entry: dict[str, Any]) -> dict[str, str | int]:
+    # Stable ownership survives frontend replacement and fingerprint churn.
+    # Prefer the authenticated v1 source identity whenever it is exact.
+    identity = state.entry_stable_identity(entry)
+    if identity is None and str(entry.get("entry_type") or "") == "space":
+        active_identity = (
+            entry.get("active_worker_stable_key"),
+            entry.get("active_worker_stable_key_version"),
+        )
+        if state.valid_stable_worker_key_pair(*active_identity):
+            identity = active_identity
+    if identity is not None:
+        return {
+            "stable_key": identity[0],
+            "stable_key_version": identity[1],
+        }
     worker_id = str(entry.get("active_worker_id") or entry.get("tendwire_worker_id") or "").strip()
     fingerprint = str(entry.get("active_worker_fingerprint") or entry.get("tendwire_fingerprint") or "").strip()
     if worker_id:

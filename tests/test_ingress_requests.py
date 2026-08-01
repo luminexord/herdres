@@ -40,6 +40,26 @@ def _request(request_id: str = REQUEST_ID) -> dict[str, object]:
     }
 
 
+def test_canonical_request_accepts_only_exact_v1_stable_owner_target():
+    request = _request()
+    request["target"] = {
+        "stable_key": "wsk1_" + "a" * 64,
+        "stable_key_version": 1,
+    }
+
+    encoded = ingress_requests.canonical_request_json(request)
+
+    assert json.loads(encoded)["target"] == request["target"]
+    for invalid in (
+        {"stable_key": "wsk1_short", "stable_key_version": 1},
+        {"stable_key": "wsk1_" + "a" * 64, "stable_key_version": True},
+        {"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 2},
+    ):
+        request["target"] = invalid
+        with pytest.raises(ValueError, match="exact public command"):
+            ingress_requests.canonical_request_json(request)
+
+
 def _setup_command_state(tmp_path, monkeypatch, *, request_id: str = REQUEST_ID) -> None:
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
@@ -2027,6 +2047,16 @@ def test_stale_refresh_uses_real_client_validation_and_persists_second_bytes(
     tmp_path, monkeypatch
 ) -> None:
     _setup_command_state(tmp_path, monkeypatch)
+    # Exercise the compatibility request shape explicitly. Current source
+    # entries prefer immutable stable-owner targets and never relax them.
+    monkeypatch.setattr(
+        herdres,
+        "_target_for_entry",
+        lambda _entry: {
+            "worker_id": "worker-1",
+            "worker_fingerprint": "fp-original",
+        },
+    )
     child_starts: list[bytes] = []
     backend_mutations = 0
 
