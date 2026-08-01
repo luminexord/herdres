@@ -776,11 +776,13 @@ to pipe-separated rows, headings become text, list items become bullet lines,
 and details are expanded. The content stays readable, but those rich structures
 do not survive.
 
-Herdres selects plain delivery when rich delivery is disabled or too large, and
-falls back to it after a definite provider rejection. That delivery is formatted
-only while the content stays under the message limit: beyond roughly 3900
-characters it is split into chunks sent **without `parse_mode`**, so an oversized
-turn arrives unformatted as well as unstructured. A successful
+Herdres selects plain delivery when rich delivery is disabled, and falls back to
+it after a definite provider rejection — though not if the physical-write budget
+is already spent, in which case no fallback is attempted and the turn ends
+`operation_budget_exhausted`. Length alone does not downgrade a turn: oversized
+rich content is split into several cards (`format=rich-split`). Once on the plain
+path, content beyond roughly 3900 characters is split into chunks sent **without
+`parse_mode`**, so it arrives unformatted as well as unstructured. A successful
 `sendRichMessage` response does not reveal whether the recipient's client
 rendered the blocks, so client-side incompatibility cannot trigger that fallback
 automatically. Set `HERDRES_FORCE_PLAIN_DELIVERY=1` when a client cannot render

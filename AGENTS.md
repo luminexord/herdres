@@ -16,10 +16,17 @@ the operator and to every other session.
 
 ## Tables in messages the owner reads
 
-What you write in a turn is delivered to Telegram as a rich card by default, but
-not always: rich delivery is *attempted* first and falls back to a formatted
-`sendMessage` when it is disabled (`HERDRES_FORCE_PLAIN_DELIVERY=1`), when the
-content is oversized, or when the provider definitely rejects it.
+What you write in a turn is delivered to Telegram as a rich card by default. Two
+things can change that, and a third can leave you with nothing:
+
+- **rich delivery disabled** (`HERDRES_FORCE_PLAIN_DELIVERY=1`) — falls back to
+  `sendMessage`;
+- **a definite provider rejection** — falls back to `sendMessage`, *unless* the
+  physical-write budget is already spent, in which case there is no fallback at
+  all and the turn ends `operation_budget_exhausted`.
+
+Length does **not** push you onto the plain path: an oversized turn is split into
+several rich cards (`format=rich-split`), not downgraded.
 
 Tables (`<table>`), headings (`<h1>`-`<h6>`) and `<details>` blocks exist only on
 the rich path. **The fallback does not translate them — it unwraps them.** A
@@ -29,9 +36,9 @@ path only when it is already present, and the rich fallback never emits it. So a
 turn that leans on rich structure loses that structure entirely; write so the
 plain form still reads.
 
-The oversized case is harsher still. Beyond roughly 3900 characters the content
-is split into plain chunks sent **without `parse_mode`**, so it is not merely
-unstructured but unformatted — no bold, no code, no links.
+Once you are already on the plain path, length hurts again: beyond roughly 3900
+characters the content is split into chunks sent **without `parse_mode`**, so it
+arrives unformatted as well as unstructured — no bold, no code, no links.
 
 One thing is easy to get wrong on the rich path: **a markdown table only renders
 as a table if it has the separator row.**
@@ -53,8 +60,12 @@ and the table's header row. Without it the paragraph collector swallows the
 header and the table is never recognised — measured 2026-08-01, four tables in
 the owner's own topic arrived as raw pipes for exactly this reason.
 
-Within an eligible table block three things are forgiving: outer pipes are
-optional, alignment colons are fine, and extra spaces in the separator are fine.
-That list is exhaustive, not an example — a table inside a code fence stays
-literal because the fence is handled before table parsing, and an all-empty
-table is rejected outright.
+Inside an eligible block the parser is permissive and I will not try to bound it
+again — a single hyphen per cell (`|-|-|`), deep indentation, alignment colons,
+outer pipes, and stray whitespace all still parse. Two things reliably defeat a
+table regardless: a code fence around it (the fence is handled before table
+parsing, so it stays literal), and a table with no content at all, which is
+rejected outright.
+
+Treat the two rules above — separator row, own block — as the requirements, and
+everything else as unspecified rather than guaranteed.
