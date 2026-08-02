@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
-import shutil
+import hashlib
 import subprocess
 from pathlib import Path
+
+import pytest
+
+from scripts import install_user_units
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -46,6 +50,22 @@ def _systemd_user_dir(home: Path) -> Path:
     return home / ".config/systemd/user"
 
 
+def _tree_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    if not root.exists() and not root.is_symlink():
+        return digest.hexdigest()
+    for path in sorted((root, *root.rglob("*")), key=lambda item: str(item)):
+        relative = "." if path == root else str(path.relative_to(root))
+        metadata = path.lstat()
+        digest.update(relative.encode())
+        digest.update(str(metadata.st_mode).encode())
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode())
+        elif path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def test_installer_rerun_preserves_existing_tendwired_dropins(
     tmp_path: Path,
 ) -> None:
@@ -77,9 +97,9 @@ def test_installed_tendwired_unit_contains_stale_process_hardening(
 
     _run_installer(home)
 
-    installed = (
-        _systemd_user_dir(home) / "tendwired.service"
-    ).read_text(encoding="utf-8")
+    installed = (_systemd_user_dir(home) / "tendwired.service").read_text(
+        encoding="utf-8"
+    )
     assert all(directive in installed for directive in HARDENING_DIRECTIVES)
 
 
@@ -156,15 +176,10 @@ def test_installer_refuses_diverged_tendwired_unit_without_losing_pythonpath(
 
     assert result.returncode != 0
     assert unit.read_text(encoding="utf-8") == operator_unit
-    assert "PYTHONPATH=/srv/operator/tendwire/src" in unit.read_text(
-        encoding="utf-8"
-    )
+    assert "PYTHONPATH=/srv/operator/tendwire/src" in unit.read_text(encoding="utf-8")
     assert "PYTHONPATH=%h/tendwire/src" not in unit.read_text(encoding="utf-8")
     assert list(unit_dir.glob("tendwired.service.bak-*")) == []
-    assert (
-        "differs from both the current and last installer-managed"
-        in result.stderr
-    )
+    assert "differs from both the current and last installer-managed" in result.stderr
     assert "active unit was left unchanged" in result.stderr
     assert "operator drop-in" in result.stderr
 
@@ -278,6 +293,7 @@ def test_installer_refuses_masked_tendwired_unit_before_any_write(
 
 def test_failed_tendwired_replacement_keeps_previous_active_unit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
     unit_dir = _systemd_user_dir(home)
@@ -288,35 +304,139 @@ def test_failed_tendwired_replacement_keeps_previous_active_unit(
     previous_canonical = "[Service]\nKillMode=control-group\nVersion=previous\n"
     unit.write_text(previous_canonical, encoding="utf-8")
     managed_base.write_text(previous_canonical, encoding="utf-8")
-    shim_dir = tmp_path / "shim-bin"
-    shim_dir.mkdir()
-    real_mv = shutil.which("mv")
-    assert real_mv is not None
-    mv_shim = shim_dir / "mv"
-    mv_shim.write_text(
-        "#!/bin/sh\n"
-        "last=\n"
-        "for argument\n"
-        "do\n"
-        "    last=$argument\n"
-        "done\n"
-        "case $last in\n"
-        "    */.config/systemd/user/tendwired.service) exit 73 ;;\n"
-        "esac\n"
-        f'exec "{real_mv}" "$@"\n',
-        encoding="utf-8",
-    )
-    mv_shim.chmod(0o755)
+    real_rename = install_user_units.os.rename
 
-    result = _invoke_installer(
-        home,
-        environment_overrides={
-            "PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}"
-        },
-    )
+    def fail_active_replace(source, destination, **kwargs):
+        if destination == "tendwired.service":
+            raise OSError("injected replacement failure")
+        return real_rename(source, destination, **kwargs)
 
-    assert result.returncode != 0
+    monkeypatch.setattr(install_user_units.os, "rename", fail_active_replace)
+
+    with pytest.raises(OSError, match="injected replacement failure"):
+        install_user_units.install_units(home, REPOSITORY)
+
     assert unit.is_file()
     assert unit.read_text(encoding="utf-8") == previous_canonical
     assert unit.stat().st_size > 0
     assert list(unit_dir.glob(".tendwired.service.*")) == []
+
+
+def test_installer_refuses_symlinked_managed_baseline_without_trusting_it(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    unit_dir = _systemd_user_dir(home)
+    unit_dir.mkdir(parents=True)
+    unit = unit_dir / "tendwired.service"
+    custom_unit = b"[Service]\nEnvironment=PYTHONPATH=/srv/custom/src\n"
+    unit.write_bytes(custom_unit)
+    managed = home / ".local/share/herdres/tendwired.service.managed"
+    managed.parent.mkdir(parents=True)
+    managed.symlink_to(os.path.relpath(unit, managed.parent))
+    external = tmp_path / "outside"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"outside-must-not-change")
+    unit_hash = hashlib.sha256(unit.read_bytes()).hexdigest()
+    outside_hash = _tree_hash(external)
+
+    result = _invoke_installer(home)
+
+    assert result.returncode != 0
+    assert hashlib.sha256(unit.read_bytes()).hexdigest() == unit_hash
+    assert unit.read_bytes() == custom_unit
+    assert managed.is_symlink()
+    assert _tree_hash(external) == outside_hash
+    assert not (unit_dir / "herdres.service").exists()
+    assert not (unit_dir / "herdres-gateway.service").exists()
+
+
+def test_installer_refuses_symlinked_unit_directory_without_external_writes(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    external = tmp_path / "operator-units"
+    external.mkdir()
+    (external / "sentinel.conf").write_bytes(b"operator-owned")
+    systemd_dir = home / ".config/systemd"
+    systemd_dir.mkdir(parents=True)
+    (systemd_dir / "user").symlink_to(external, target_is_directory=True)
+    outside_hash = _tree_hash(external)
+
+    result = _invoke_installer(home)
+
+    assert result.returncode != 0
+    assert _tree_hash(external) == outside_hash
+    assert sorted(path.name for path in external.iterdir()) == ["sentinel.conf"]
+    assert not (home / ".local").exists()
+
+
+def test_dirfd_revalidation_blocks_tendwired_toctou_symlink(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    unit_dir = _systemd_user_dir(home)
+    unit_dir.mkdir(parents=True)
+    external = tmp_path / "operator-directory"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"outside-must-not-change")
+    outside_hash = _tree_hash(external)
+    unit = unit_dir / "tendwired.service"
+
+    def introduce_symlink_after_staging() -> None:
+        unit.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(
+        install_user_units.InstallRefused,
+        match="symlink",
+    ):
+        install_user_units.install_units(
+            home,
+            REPOSITORY,
+            before_commit=introduce_symlink_after_staging,
+        )
+
+    assert unit.is_symlink()
+    assert unit.resolve() == external
+    assert _tree_hash(external) == outside_hash
+    assert sorted(path.name for path in external.iterdir()) == ["sentinel"]
+    assert list(unit_dir.glob(".*.tmp-*")) == []
+
+
+def test_real_host_divergence_refuses_before_any_installer_mutation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    unit_dir = _systemd_user_dir(home)
+    unit_dir.mkdir(parents=True)
+    (unit_dir / "tendwired.service").write_bytes(
+        b"[Service]\nEnvironment=PYTHONPATH=/root/tendwire/src\n"
+    )
+    dropins = unit_dir / "tendwired.service.d"
+    dropins.mkdir()
+    for name in (
+        "kill-hardening.conf",
+        "maintenance.conf",
+        "socket-path.conf",
+        "turn-model.conf",
+    ):
+        (dropins / name).write_bytes(f"# {name}\n".encode())
+    (unit_dir / "herdres.service").write_bytes(b"old-herdres-unit")
+    (unit_dir / "herdres-gateway.service").write_bytes(b"old-gateway-unit")
+    bin_dir = home / ".local/bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "herdres").write_bytes(b"old-herdres-binary")
+    (bin_dir / "herdres-gateway").write_bytes(b"old-gateway-binary")
+    external = tmp_path / "outside"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"outside-must-not-change")
+    home_hash = _tree_hash(home)
+    outside_hash = _tree_hash(external)
+
+    result = _invoke_installer(home)
+
+    assert result.returncode != 0
+    assert _tree_hash(home) == home_hash
+    assert _tree_hash(external) == outside_hash
+    assert not (home / ".local/share/herdres/source").exists()
+    assert "active unit was left unchanged" in result.stderr
