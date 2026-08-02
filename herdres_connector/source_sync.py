@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import time
@@ -15,9 +16,11 @@ from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bo
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import (
     PresentationContentError,
+    PresentationOversizeError,
     RICH_BAD_REQUEST_LIMIT,
     RICH_RENDER_VERSION,
     RICH_STATE_UPDATE_KEY,
+    TURN_DELIVERY_MAX_PARTS,
     edit_feed_item,
     edit_turn_delivery_part,
     feed_item_requires_send_split,
@@ -72,6 +75,7 @@ _TOPIC_CLEANUP_PERMANENT_ERROR_KINDS = frozenset(
     {"bad_request", "bot_access", "capability"}
 )
 _ACCEPTED_NOTIFICATION_LIMIT = 64
+_OVERSIZE_NOTICE_ATTEMPT_CAP = 3
 _DELIVERY_FORMAT_FALLBACK_LIMIT = 64
 _BINDING_STATE_BOUND = "bound"
 _BINDING_STATE_PENDING_CREATE = "pending_create"
@@ -126,10 +130,18 @@ class _DeliveryWriteBudget:
 
 
 class _TurnContentError(RuntimeError):
-    def __init__(self, status: str, message: str, *, conflict: bool = False) -> None:
+    def __init__(
+        self,
+        status: str,
+        message: str,
+        *,
+        conflict: bool = False,
+        part_count: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.conflict = conflict
+        self.part_count = part_count
 
 
 def _contains_private_agent_turn_fields(value: Any) -> bool:
@@ -1593,15 +1605,20 @@ def _execute_accounted_delivery_write(
     runtime: SyncRuntime,
     operation: _OfflockEntryOperation,
     mutation: _ProviderMutation,
+    *,
+    acceptance_checkpoint: (
+        Callable[[Any, _OfflockEntryOperation], None] | None
+    ) = None,
 ) -> _OfflockEntryExecution:
     """Execute and charge one owner-visible Telegram delivery capability.
 
     Adapter results report the whole rich/HTML/plain ladder as
     ``physical_writes``.  The wrapper charges that fact whether the logical
-    delivery succeeded or failed.  Every delivery caller must also pass the
-    wrapper's exact ``remaining`` value as ``max_physical_writes``; this
-    runtime check makes a missing allowance loud even if a static guard is
-    accidentally weakened.
+    delivery succeeded or failed. Every delivery caller must pass a positive
+    allowance no larger than the wrapper's ``remaining`` value as
+    ``max_physical_writes``. A caller may impose a stricter local cap (the fold
+    sweep does); this runtime check still makes a missing or excessive
+    allowance loud even if a static guard is accidentally weakened.
     """
 
     budget = _delivery_write_budget(runtime)
@@ -1610,11 +1627,12 @@ def _execute_accounted_delivery_write(
     if (
         isinstance(allowance, bool)
         or not isinstance(allowance, int)
-        or allowance != budget.remaining
+        or allowance <= 0
+        or allowance > budget.remaining
     ):
         raise RuntimeError(
-            "delivery mutation must carry the exact remaining physical-write "
-            "allowance"
+            "delivery mutation must carry a positive physical-write allowance "
+            "within the remaining pass budget"
         )
     if budget.remaining <= 0:
         raise RuntimeError(
@@ -1622,7 +1640,11 @@ def _execute_accounted_delivery_write(
         )
     try:
         execution = _execute_entry_operation(
-            store, runtime.telegram, operation, mutation
+            store,
+            runtime.telegram,
+            operation,
+            mutation,
+            acceptance_checkpoint=acceptance_checkpoint,
         )
     except Exception:
         # The adapter contract converts expected provider outcomes into a
@@ -2334,6 +2356,7 @@ def _checkpoint_accepted_notification(
     operation: _OfflockEntryOperation,
     result: Any,
     *,
+    chat_id: str,
     kind: str,
     bot_kind: str = MANAGER_BOT_KIND,
 ) -> str:
@@ -2353,6 +2376,7 @@ def _checkpoint_accepted_notification(
     receipt_id = short_hash(
         {
             "kind": kind,
+            "chat_id": chat_id,
             "topic_id": operation.route_topic_id,
             "message_id": message_id,
             "provenance": _operation_provenance(operation),
@@ -2364,6 +2388,7 @@ def _checkpoint_accepted_notification(
     # always admitted, even if a concurrent writer filled the nominal bound.
     record = {
         "kind": kind,
+        "chat_id": chat_id,
         "topic_id": operation.route_topic_id,
         "message_id": message_id,
         "bot_kind": bot_kind,
@@ -2389,13 +2414,150 @@ def _complete_accepted_notification(
         ).pop(receipt_id, None)
 
 
+def _oversize_notice_kind(turn_id: str, content_hash: str) -> str:
+    return "oversize_notice:" + short_hash(
+        {"turn_id": turn_id, "content_hash": content_hash}, 20
+    )
+
+
+def _oversize_hold_for_notice_kind(
+    store: dict[str, Any], kind: str
+) -> dict[str, Any] | None:
+    if not kind.startswith("oversize_notice:"):
+        return None
+    matches = [
+        record
+        for record in state.active_partial_final_deliveries(store)
+        if record.get("request_phase") == "oversize_presentation"
+        and _oversize_notice_kind(
+            str(record.get("turn_id") or ""),
+            str(record.get("content_hash") or ""),
+        )
+        == kind
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _adopt_checkpointed_oversize_notice(
+    store: dict[str, Any],
+    receipt_id: str,
+    raw: dict[str, Any],
+    *,
+    chat_id: str,
+) -> bool:
+    """Adopt one accepted oversize notice without another provider send.
+
+    A matching receipt is an acceptance witness even when its current route
+    cannot be proven. Exact route/provenance matches become ``accepted``;
+    uncertain matches become terminal ``delivery_unknown``. Neither outcome
+    deletes or re-sends the owner-visible notification.
+    """
+
+    kind = str(raw.get("kind") or "")
+    record = _oversize_hold_for_notice_kind(store, kind)
+    if record is None:
+        return False
+    message_id = str(raw.get("message_id") or "")
+    topic_id = str(raw.get("topic_id") or "")
+    bot_kind = str(raw.get("bot_kind") or MANAGER_BOT_KIND)
+    provenance = raw.get("provenance")
+    operation: _OfflockEntryOperation | None = None
+    resolution = _OfflockEntryResolution(_OFFLOCK_ABANDON)
+    if isinstance(provenance, dict):
+        try:
+            operation = _operation_from_provenance(provenance)
+            if (
+                operation.entry_type not in {"worker", "space", "global"}
+                or len(operation.owner_generation) < 6
+            ):
+                operation = None
+            else:
+                resolution = _compare_and_apply_entry_operation(
+                    store, operation
+                )
+        except (TypeError, ValueError):
+            operation = None
+    current_topic_id = str(record.get("current_topic_id") or "")
+    current_bot_kind = str(record.get("current_bot_kind") or "")
+    exact = bool(
+        message_id
+        and message_id != "0"
+        and str(raw.get("chat_id") or "") == str(chat_id)
+        and topic_id
+        and topic_id == current_topic_id
+        and (not current_bot_kind or bot_kind == current_bot_kind)
+        and operation is not None
+        and operation.route_topic_id == topic_id
+        and resolution.disposition == _OFFLOCK_APPLY
+        and resolution.entry is not None
+    )
+    raw_attempt_count = record.get("oversize_notice_attempt_count")
+    attempt_count = (
+        raw_attempt_count
+        if isinstance(raw_attempt_count, int)
+        and not isinstance(raw_attempt_count, bool)
+        and raw_attempt_count >= 0
+        else 0
+    )
+    record["oversize_notice_attempt_count"] = max(1, attempt_count)
+    record["oversize_notice_attempt_cap"] = _OVERSIZE_NOTICE_ATTEMPT_CAP
+    raw_physical_writes = record.get("oversize_notice_physical_writes")
+    physical_writes = (
+        raw_physical_writes
+        if isinstance(raw_physical_writes, int)
+        and not isinstance(raw_physical_writes, bool)
+        and raw_physical_writes >= 0
+        else 0
+    )
+    record["oversize_notice_physical_writes"] = max(1, physical_writes)
+    record["oversize_notice_terminal"] = True
+    if message_id and message_id != "0":
+        record["oversize_notice_message_id"] = message_id
+    if exact:
+        record["oversize_notice_status"] = "accepted"
+        record.pop("oversize_notice_error", None)
+    else:
+        record["oversize_notice_status"] = "delivery_unknown"
+        record["oversize_notice_error"] = (
+            "checkpointed provider acceptance could not be matched to the "
+            "current notice route; no automatic resend was attempted"
+        )
+
+    binding_entry = (
+        resolution.entry
+        if exact
+        else _operation_binding_entry(operation)
+        if operation is not None
+        else None
+    )
+    if (
+        binding_entry is not None
+        and message_id
+        and message_id != "0"
+        and topic_id
+    ):
+        state.bind_message_to_worker(
+            store,
+            message_id,
+            binding_entry,
+            topic_id=topic_id,
+            kind="oversize_notice",
+            turn_id=str(record.get("turn_id") or ""),
+            bot_kind=bot_kind,
+        )
+    if exact and resolution.entry is not None:
+        resolution.entry["partial_final_delivery"] = record
+    _complete_accepted_notification(store, receipt_id)
+    return True
+
+
 def _drain_accepted_notifications(
     store: dict[str, Any],
     runtime: SyncRuntime,
     *,
     chat_id: str,
 ) -> tuple[int, int]:
-    """Delete stale accepted cards before permitting replacement sends."""
+    """Adopt valid oversize notices; retire other stale accepted cards."""
 
     completed = 0
     pending = 0
@@ -2407,6 +2569,13 @@ def _drain_accepted_notifications(
         if not isinstance(raw, dict):
             _complete_accepted_notification(store, receipt_id)
             completed += 1
+            continue
+        if _adopt_checkpointed_oversize_notice(
+            store, receipt_id, raw, chat_id=chat_id
+        ):
+            completed += 1
+            if runtime.checkpoint is not None:
+                runtime.checkpoint()
             continue
         message_id = str(raw.get("message_id") or "")
         if not message_id:
@@ -2561,20 +2730,415 @@ def _record_partial_final_delivery(
     entry["partial_final_delivery"] = record
     _record_delivery_error(entry, {"error": error}, bot_kind)
     for message_id in message_ids:
-        state.bind_message_to_worker(
-            store,
-            message_id,
-            entry,
-            topic_id=topic_id,
-            kind="final",
-            turn_id=turn_id,
-            bot_kind=bot_kind,
-        )
         binding = state.find_message_binding(store, message_id)
+        if binding is None:
+            state.bind_message_to_worker(
+                store,
+                message_id,
+                entry,
+                topic_id=topic_id,
+                kind="final",
+                turn_id=turn_id,
+                bot_kind=bot_kind,
+            )
+            binding = state.find_message_binding(store, message_id)
         if binding is not None:
             binding["message_ids"] = list(message_ids)
             binding["canonical_message_id"] = canonical_message_id
             binding["partial_final_delivery"] = dict(record)
+
+
+def _record_oversize_final_delivery(
+    store: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    content_hash: str,
+) -> None:
+    """Make an exact-but-unpresentable final explicit without sending a prefix."""
+
+    topic_id = str(entry.get("topic_id") or "")
+    bot_kind = desired_message_bot_kind(_telegram_state(store), entry)
+    _record_partial_final_delivery(
+        store,
+        entry,
+        {
+            "ok": False,
+            "partial": False,
+            "message_ids": [],
+            "terminal_outcome": "not_delivered",
+            "failed_part_index": 0,
+            "error": (
+                "turn exceeds the hard Telegram presentation-part limit"
+            ),
+        },
+        turn_id=turn_id,
+        content_hash=content_hash,
+        topic_id=topic_id,
+        bot_kind=bot_kind,
+    )
+    record = state.find_partial_final_delivery(
+        store, turn_id, content_hash
+    )
+    assert record is not None
+    record["request_phase"] = "oversize_presentation"
+    record["transport_disposition"] = "not_delivered"
+    record["recovery_action"] = (
+        "retrieve-canonical-source-or-supersede-with-shorter-answer"
+    )
+    entry["partial_final_delivery"] = record
+
+
+def _notify_oversize_final(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    runtime: SyncRuntime,
+    *,
+    chat_id: str,
+    turn_id: str,
+    content_hash: str,
+    part_count: int | None,
+) -> int:
+    """Make an exact oversize hold visible without duplicate retries.
+
+    The notice is deliberately not the answer and does not authorize replay.
+    The exact answer remains in Tendwire under the named turn/revision while
+    the partial-final record keeps the logical delivery incomplete. Definite
+    rejections retry for three passes; ambiguous delivery is terminal because
+    retrying a possibly accepted owner-visible send would duplicate it.
+    """
+
+    record = state.find_partial_final_delivery(store, turn_id, content_hash)
+    topic_id = str(entry.get("topic_id") or "")
+    raw_attempt_count = (
+        record.get("oversize_notice_attempt_count")
+        if isinstance(record, dict)
+        else None
+    )
+    attempt_count = (
+        int(raw_attempt_count)
+        if isinstance(raw_attempt_count, int)
+        and not isinstance(raw_attempt_count, bool)
+        and raw_attempt_count >= 0
+        else 0
+    )
+    notice_kind = _oversize_notice_kind(turn_id, content_hash)
+    if (
+        runtime.dry_run
+        or not isinstance(record, dict)
+        or not chat_id
+        or not topic_id
+        or record.get("oversize_notice_status") == "accepted"
+        or record.get("oversize_notice_terminal") is True
+        or attempt_count >= _OVERSIZE_NOTICE_ATTEMPT_CAP
+        or _delivery_write_budget(runtime).remaining <= 0
+        or not _notification_acceptance_capacity_available(store)
+        or _notification_kind_pending(store, notice_kind)
+    ):
+        return 0
+    if not record.get("answer_sha256"):
+        answer = str(item.get("assistant_final_text") or "")
+        answer_bytes = answer.encode("utf-8")
+        record["answer_char_length"] = len(answer)
+        record["answer_byte_length"] = len(answer_bytes)
+        record["answer_sha256"] = hashlib.sha256(answer_bytes).hexdigest()
+    required = (
+        part_count
+        if isinstance(part_count, int) and not isinstance(part_count, bool)
+        else int(record.get("required_part_count") or 0)
+    )
+    record["required_part_count"] = required
+    record["oversize_notice_attempt_cap"] = _OVERSIZE_NOTICE_ATTEMPT_CAP
+    record["content_locator"] = {
+        "source": "tendwire_turn",
+        "turn_id": turn_id,
+        "content_revision": content_hash,
+        "field": "assistant_final_text",
+    }
+    answer_chars = int(record.get("answer_char_length") or 0)
+    answer_bytes = int(record.get("answer_byte_length") or 0)
+    digest = str(record.get("answer_sha256") or "")
+    revision_label = content_hash or "unknown revision"
+    html = (
+        "<b>Answer held: exceeds Telegram card limit</b>\n"
+        f"Turn <code>{html_escape(turn_id, 200)}</code> contains "
+        f"{answer_chars:,} characters / {answer_bytes:,} UTF-8 bytes "
+        f"and needs {required or 'more than'} cards "
+        f"(limit {TURN_DELIVERY_MAX_PARTS}).\n"
+        f"Digest: <code>sha256:{digest}</code>\n"
+        "No answer content was truncated or marked delivered. The exact "
+        "canonical answer remains in authenticated Tendwire source at "
+        f"turn <code>{html_escape(turn_id, 200)}</code>, revision "
+        f"<code>{html_escape(revision_label, 200)}</code>. Reply in this "
+        "topic asking the pane to resend it in at most "
+        f"{TURN_DELIVERY_MAX_PARTS} cards; an operator can retrieve the "
+        "exact source by that turn/revision identity."
+    )
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=topic_id,
+    )
+    accepted_receipt_id = ""
+
+    def checkpoint_oversize_notice(
+        result: Any, captured: _OfflockEntryOperation
+    ) -> None:
+        nonlocal accepted_receipt_id
+        accepted_receipt_id = _checkpoint_accepted_notification(
+            store,
+            runtime,
+            captured,
+            result,
+            chat_id=chat_id,
+            kind=notice_kind,
+            bot_kind=desired_message_bot_kind(
+                _telegram_state(store), entry
+            ),
+        )
+
+    execution = _execute_accounted_delivery_write(
+        store,
+        runtime,
+        operation,
+        _provider_mutation(
+            "telegram.send_message",
+            reason="telegram.send_message: expose oversize final hold",
+            args=(chat_id, html),
+            kwargs={
+                "thread_id": topic_id,
+                "notify": True,
+                # One provider attempt is essential: a lost response after
+                # acceptance must never fall through to the plain variant.
+                "max_physical_writes": 1,
+                "ambiguous_errors_are_unknown": True,
+            },
+        ),
+        acceptance_checkpoint=checkpoint_oversize_notice,
+    )
+    sent = execution.result
+    writes = _telegram_physical_writes(sent)
+    message_ids = split_legacy_message_ids(sent) if sent.get("ok") else []
+    current_record = state.find_partial_final_delivery(
+        store, turn_id, content_hash
+    )
+    if not isinstance(current_record, dict):
+        return writes
+    current_record["oversize_notice_attempt_count"] = (
+        attempt_count + (1 if writes else 0)
+    )
+    current_record["oversize_notice_attempt_cap"] = (
+        _OVERSIZE_NOTICE_ATTEMPT_CAP
+    )
+    current_record["oversize_notice_physical_writes"] = writes
+    if message_ids:
+        current_record["oversize_notice_status"] = "accepted"
+        current_record["oversize_notice_terminal"] = True
+        current_record["oversize_notice_message_id"] = message_ids[0]
+        binding_entry = (
+            execution.resolution.entry
+            if execution.resolution.disposition == _OFFLOCK_APPLY
+            else _operation_binding_entry(operation)
+        )
+        assert binding_entry is not None
+        state.bind_message_to_worker(
+            store,
+            message_ids[0],
+            binding_entry,
+            topic_id=topic_id,
+            kind="oversize_notice",
+            turn_id=turn_id,
+            bot_kind=desired_message_bot_kind(
+                _telegram_state(store), entry
+            ),
+        )
+        _complete_accepted_notification(store, accepted_receipt_id)
+    else:
+        delivery_unknown = sent.get("delivery_unknown") is True
+        exhausted = (
+            current_record["oversize_notice_attempt_count"]
+            >= _OVERSIZE_NOTICE_ATTEMPT_CAP
+        )
+        current_record["oversize_notice_status"] = (
+            "delivery_unknown"
+            if delivery_unknown
+            else "terminal_failed"
+            if exhausted
+            else "failed"
+        )
+        current_record["oversize_notice_terminal"] = bool(
+            delivery_unknown or exhausted
+        )
+        current_record["oversize_notice_error"] = str(
+            sent.get("error") or "oversize notice was not accepted"
+        )
+    entry["partial_final_delivery"] = current_record
+    return writes
+
+
+def _set_pending_turn_plan(
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    revision: str,
+    plan_token: str,
+    part_count: int,
+    job_count: int,
+    now: float | None = None,
+) -> None:
+    """Stamp one route-local plan and its non-resetting starvation clock."""
+
+    prior_token = str(entry.get("pending_plan_token") or "")
+    entry["pending_turn_id"] = turn_id
+    entry["pending_content_revision"] = revision
+    entry["pending_plan_token"] = plan_token
+    entry["pending_turn_part_count"] = int(part_count)
+    entry["pending_turn_job_count"] = int(job_count)
+    if (
+        prior_token != plan_token
+        or not isinstance(
+            entry.get("pending_turn_started_at"), (int, float)
+        )
+        or isinstance(entry.get("pending_turn_started_at"), bool)
+    ):
+        entry["pending_turn_started_at"] = (
+            time.time() if now is None else float(now)
+        )
+
+
+def _pending_turn_plan_age(
+    entry: dict[str, Any], *, now: float | None = None
+) -> float:
+    started_at = entry.get("pending_turn_started_at")
+    if not isinstance(started_at, (int, float)) or isinstance(
+        started_at, bool
+    ):
+        return 0.0
+    return max(
+        0.0,
+        (time.time() if now is None else float(now))
+        - float(started_at),
+    )
+
+
+def _hold_incomplete_pending_plan(
+    store: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    turn_id: str,
+    plan_token: str,
+    revision: str,
+    part_count: int,
+    created_job_count: int | None = None,
+    error: str,
+) -> bool:
+    """Move a non-completable parent plan to a visible, replay-blocking hold."""
+
+    existing = state.find_partial_final_delivery(store, turn_id, revision)
+    if isinstance(existing, dict):
+        return False
+    receipts = [
+        receipt
+        for receipt in state.tendwire_turn_jobs(store).values()
+        if isinstance(receipt, dict)
+        and receipt.get("plan_token") == plan_token
+        and receipt.get("content_revision") == revision
+    ]
+    bound = sorted(
+        (
+            (int(binding.get("part_ordinal")), message_id)
+            for message_id, binding in _final_delivery_bindings(
+                store, turn_id
+            )
+            if (
+                binding.get("plan_token") == plan_token
+                or binding.get("content_revision") == revision
+            )
+            and isinstance(binding.get("part_ordinal"), int)
+        ),
+        key=lambda row: row[0],
+    )
+    accepted_ids = [message_id for _ordinal, message_id in bound]
+    for receipt in receipts:
+        message_id = str(receipt.get("telegram_message_id") or "")
+        if message_id and message_id != "0" and message_id not in accepted_ids:
+            accepted_ids.append(message_id)
+    # Created ordinals are durable facts carried by immutable job receipts or
+    # accepted-message bindings.  Never synthesize them from a scalar count:
+    # a sparse 0,2 creation must not be rewritten as the fictional 0,1.
+    known_ordinals = {
+        int(receipt["part_ordinal"])
+        for receipt in receipts
+        if isinstance(receipt.get("part_ordinal"), int)
+        and 0 <= int(receipt["part_ordinal"]) < part_count
+    }
+    known_ordinals.update(
+        ordinal
+        for ordinal, _message_id in bound
+        if 0 <= ordinal < part_count
+    )
+    reported_created_count = (
+        min(max(0, created_job_count), part_count)
+        if isinstance(created_job_count, int)
+        and not isinstance(created_job_count, bool)
+        else None
+    )
+    missing = [
+        ordinal for ordinal in range(part_count) if ordinal not in known_ordinals
+    ]
+    failed_receipts = [
+        receipt
+        for receipt in receipts
+        if receipt.get("substate") == "failed"
+        and isinstance(receipt.get("part_ordinal"), int)
+    ]
+    failed_index = (
+        min(int(receipt["part_ordinal"]) for receipt in failed_receipts)
+        if failed_receipts
+        else (missing[0] if missing else len(known_ordinals))
+    )
+    _record_partial_final_delivery(
+        store,
+        entry,
+        {
+            "ok": False,
+            "partial": bool(accepted_ids),
+            "message_ids": accepted_ids,
+            # A stopped creator/dead-lettered child is a definite missing
+            # suffix. Accepted prefix ids remain exact provider facts, while
+            # only the missing suffix is eligible for explicit recovery.
+            "terminal_outcome": "not_delivered",
+            "failed_part_index": failed_index,
+            "error": error,
+        },
+        turn_id=turn_id,
+        content_hash=revision,
+        topic_id=str(entry.get("topic_id") or ""),
+        bot_kind=desired_message_bot_kind(
+            _telegram_state(store), entry
+        ),
+    )
+    record = state.find_partial_final_delivery(store, turn_id, revision)
+    assert record is not None
+    record["request_phase"] = "pending_plan_incomplete"
+    record["plan_token"] = plan_token
+    record["declared_part_count"] = int(part_count)
+    record["created_part_ordinals"] = sorted(known_ordinals)
+    record["reported_created_job_count"] = reported_created_count
+    record["unwitnessed_created_job_count"] = (
+        max(0, reported_created_count - len(known_ordinals))
+        if reported_created_count is not None
+        else None
+    )
+    record["missing_part_ordinals"] = missing
+    record["bounded_exit_seconds"] = (
+        config.partial_final_escalation_seconds()
+    )
+    if not accepted_ids:
+        record["transport_disposition"] = "not_delivered"
+    entry["partial_final_delivery"] = record
+    return True
 
 
 def _partial_final_delivery_record(
@@ -3892,8 +4456,31 @@ def _suppress_historical_final(store: dict[str, Any], item: dict[str, Any], cont
 
 
 
-_FOLD_ATTEMPT_CAP = 3
+_FOLD_ATTEMPT_CAP = state.RESPONSE_FOLD_ATTEMPT_CAP
 _FOLD_PASS_CAP = 3
+
+
+def _record_fold_failure(
+    binding: dict[str, Any],
+    reason: Any,
+    fold_state: dict[str, int] | None,
+    *,
+    attempted: bool = True,
+) -> None:
+    """Persist a structured fold failure without an extra state save."""
+
+    previous_error = binding.get("fold_error")
+    previous_attempts = int(binding.get("fold_attempts") or 0)
+    binding["fold_error"] = compact_ws(reason or "response fold failed", 240)
+    if attempted:
+        binding["fold_attempts"] = previous_attempts + 1
+    if fold_state is not None:
+        fold_state["failed"] = fold_state.get("failed", 0) + 1
+        if (
+            binding.get("fold_error") != previous_error
+            or int(binding.get("fold_attempts") or 0) != previous_attempts
+        ):
+            fold_state["changed"] = fold_state.get("changed", 0) + 1
 
 
 def _fold_superseded_final(
@@ -3916,20 +4503,28 @@ def _fold_superseded_final(
     if runtime.dry_run or not config.response_collapse_previous_default():
         return False
     if fold_state is not None and fold_state.get("issued", 0) >= _FOLD_PASS_CAP:
-        return False  # per-pass edit budget spent; the sweep is self-healing, rest folds next ticks
+        return False  # per-pass physical-write budget spent; remaining folds wait for later ticks
     if not str(item.get("assistant_final_text") or "").strip():
         return False
     bindings = _final_delivery_bindings(store, _turn_id(item))
     if not bindings:
         return False
+    changed_before = fold_state.get("changed", 0) if fold_state else 0
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
     folded_item = dict(_turn_feed_item(item, entry))
     folded_item["collapse_response"] = True
     try:
         plans = _prepare_final_delivery_parts(folded_item)
-    except _TurnContentError:
-        return False
+    except _TurnContentError as exc:
+        for _message_id, binding in bindings:
+            _record_fold_failure(
+                binding, exc.status, fold_state, attempted=False
+            )
+        return bool(
+            fold_state
+            and fold_state.get("changed", 0) != changed_before
+        )
     ordered = sorted(
         bindings,
         key=lambda pair: (
@@ -3940,16 +4535,33 @@ def _fold_superseded_final(
         ),
     )
     if len(ordered) != len(plans):
-        return False
+        for _message_id, binding in ordered:
+            _record_fold_failure(
+                binding,
+                "fold delivery-part count does not match bindings",
+                fold_state,
+                attempted=False,
+            )
+        return bool(
+            fold_state
+            and fold_state.get("changed", 0) != changed_before
+        )
     attempted = False
     for fallback_ordinal, (message_id, binding) in enumerate(ordered):
         if (
-            not message_id
-            or binding.get("folded")
+            binding.get("folded")
             or binding.get("fold_unavailable")
             or int(binding.get("fold_attempts") or 0)
             >= _FOLD_ATTEMPT_CAP
         ):
+            continue
+        if not message_id:
+            _record_fold_failure(
+                binding,
+                "fold binding has no message id",
+                fold_state,
+                attempted=False,
+            )
             continue
         if (
             fold_state is not None
@@ -3961,16 +4573,34 @@ def _fold_superseded_final(
         if str(message_id) == str(
             entry.get("last_clean_message_id") or ""
         ):
+            _record_fold_failure(
+                binding,
+                "historical fold binding aliases the latest message",
+                fold_state,
+                attempted=False,
+            )
             continue
         # The binding itself owns the bot identity. The latest entry's bot can
         # describe another delivery and must not authorize this historical edit.
         stored_bot_kind = str(binding.get("bot_kind") or "")
         if not stored_bot_kind or stored_bot_kind != bot_kind:
+            _record_fold_failure(
+                binding,
+                "fold binding bot identity is unavailable or mismatched",
+                fold_state,
+                attempted=False,
+            )
             continue
         ordinal = binding.get("part_ordinal")
         if not isinstance(ordinal, int):
             ordinal = fallback_ordinal
         if not 0 <= ordinal < len(plans):
+            _record_fold_failure(
+                binding,
+                "fold binding part ordinal is outside the delivery plan",
+                fold_state,
+                attempted=False,
+            )
             continue
         operation = _capture_entry_operation(
             store,
@@ -3979,6 +4609,16 @@ def _fold_superseded_final(
             message_id=message_id,
         )
         try:
+            if fold_state is not None:
+                fold_state["attempted"] = (
+                    fold_state.get("attempted", 0) + 1
+                )
+            global_remaining = _delivery_write_budget(runtime).remaining
+            fold_remaining = (
+                max(0, _FOLD_PASS_CAP - fold_state.get("issued", 0))
+                if fold_state is not None
+                else global_remaining
+            )
             execution = _execute_accounted_delivery_write(
                 store,
                 runtime,
@@ -3998,9 +4638,9 @@ def _fold_superseded_final(
                     kwargs={
                         "telegram": telegram,
                         "api_token": api_token,
-                        "max_physical_writes": _delivery_write_budget(
-                            runtime
-                        ).remaining,
+                        "max_physical_writes": min(
+                            global_remaining, fold_remaining
+                        ),
                     },
                 ),
             )
@@ -4009,9 +4649,9 @@ def _fold_superseded_final(
             _compare_and_apply_entry_operation(store, operation)
             current = state.find_message_binding(store, message_id)
             if current is not None:
-                current["fold_attempts"] = (
-                    int(current.get("fold_attempts") or 0) + 1
-                )
+                _record_fold_failure(current, exc, fold_state)
+            elif fold_state is not None:
+                fold_state["failed"] = fold_state.get("failed", 0) + 1
             if fold_state is not None:
                 fold_state["issued"] = (
                     fold_state.get("issued", 0) + 1
@@ -4029,10 +4669,16 @@ def _fold_superseded_final(
         error = str(sent.get("error") or "").lower()
         if sent.get("ok") and sent.get("collapse_applied") is True:
             binding["folded"] = True
+            binding.pop("fold_error", None)
+            if fold_state is not None:
+                fold_state["folded"] = fold_state.get("folded", 0) + 1
             continue
         if sent.get("ok"):
-            binding["fold_attempts"] = (
-                int(binding.get("fold_attempts") or 0) + 1
+            _record_fold_failure(
+                binding,
+                "rich Response details presentation was not applied "
+                f"(format={sent.get('format') or 'unknown'})",
+                fold_state,
             )
             continue
         if (
@@ -4041,11 +4687,20 @@ def _fold_superseded_final(
             or "not found" in error
         ):
             binding["fold_unavailable"] = True
+            _record_fold_failure(
+                binding,
+                sent.get("error") or sent.get("kind") or "fold unavailable",
+                fold_state,
+            )
             continue
-        binding["fold_attempts"] = (
-            int(binding.get("fold_attempts") or 0) + 1
+        _record_fold_failure(
+            binding,
+            sent.get("error") or sent.get("kind") or "response fold failed",
+            fold_state,
         )
-    return attempted
+    return attempted or bool(
+        fold_state and fold_state.get("changed", 0) != changed_before
+    )
 
 def _stamp_worker_binding_refusal(entry: dict[str, Any]) -> str:
     """Persist the exact gate that keeps a snapshot-observed pane unbound."""
@@ -4522,6 +5177,7 @@ def _sync_topic_pinned(
                 runtime,
                 operation,
                 result,
+                chat_id=chat_id,
                 kind="topic_pinned",
             )
 
@@ -4822,6 +5478,7 @@ def _sync_retired_worker_topics(
                         runtime,
                         operation,
                         result,
+                        chat_id=chat_id,
                         kind="retired_topic_notice",
                     )
                 )
@@ -7156,13 +7813,32 @@ def _stage_final_plan(
     )
     if (
         isinstance(exact_hold, dict)
-        and exact_hold.get("request_phase")
-        == "pending_plan_binding_gap"
+        and exact_hold.get("request_phase") == "oversize_presentation"
+    ):
+        _notify_oversize_final(
+            store,
+            _turn_feed_item(item, entry),
+            entry,
+            runtime,
+            chat_id=config.telegram_chat_id(store),
+            turn_id=_turn_id(item),
+            content_hash=revision,
+            part_count=exact_hold.get("required_part_count"),
+        )
+    if (
+        isinstance(exact_hold, dict)
         and exact_hold.get("operator_attention_required") is True
+        and not (
+            exact_hold.get("status") == "retry_authorized"
+            and entry.get("pending_content_revision") == revision
+            and isinstance(entry.get("pending_plan_generation"), int)
+            and not isinstance(entry.get("pending_plan_generation"), bool)
+            and int(entry["pending_plan_generation"]) > 1
+        )
     ):
         raise _TurnContentError(
             "invalid_pending_plan",
-            "completed final is held after a multipart binding gap",
+            "final revision is held after an incomplete multipart plan",
         )
 
     def _prepare_begin_kwargs(part_count: int) -> dict[str, Any]:
@@ -7312,7 +7988,27 @@ def _stage_final_plan(
 
     page_calls = _materialize_turn_item(item, runtime)
     feed_item = _turn_feed_item(item, entry)
-    parts = _prepare_final_delivery_parts(feed_item)
+    try:
+        parts = _prepare_final_delivery_parts(feed_item)
+    except _TurnContentError as exc:
+        if exc.status == "oversize_presentation":
+            _record_oversize_final_delivery(
+                store,
+                entry,
+                turn_id=_turn_id(item),
+                content_hash=revision,
+            )
+            _notify_oversize_final(
+                store,
+                feed_item,
+                entry,
+                runtime,
+                chat_id=config.telegram_chat_id(store),
+                turn_id=_turn_id(item),
+                content_hash=revision,
+                part_count=exc.part_count,
+            )
+        raise
     if not parts:
         raise _TurnContentError(
             "invalid_presentation_plan",
@@ -7320,11 +8016,14 @@ def _stage_final_plan(
         )
     if runtime.dry_run:
         _clear_abandoned_plan_handle(entry)
-        entry["pending_turn_id"] = _turn_id(item)
-        entry["pending_content_revision"] = revision
-        entry["pending_plan_token"] = "dry-run"
-        entry["pending_turn_part_count"] = len(parts)
-        entry["pending_turn_job_count"] = len(parts)
+        _set_pending_turn_plan(
+            entry,
+            turn_id=_turn_id(item),
+            revision=revision,
+            plan_token="dry-run",
+            part_count=len(parts),
+            job_count=len(parts),
+        )
         entry["pending_turn_user_hash"] = _turn_user_hash(item)
         entry["pending_plan_generation"] = 1
         entry.pop("pending_stream_submission_id", None)
@@ -7383,6 +8082,28 @@ def _stage_final_plan(
         raise _TurnContentError(
             "invalid_prepare_response", "prepare begin returned invalid state"
         )
+    # Stamp the parent before creating children.  If child creation stops, the
+    # ordinary pass barrier persists a named, ageing plan instead of leaving a
+    # route-local pin with no clock.  Re-observing the same token never resets
+    # the clock.
+    begin_job_count = begin.get("job_count")
+    _set_pending_turn_plan(
+        entry,
+        turn_id=_turn_id(item),
+        revision=revision,
+        plan_token=plan_token,
+        part_count=len(parts),
+        job_count=(
+            int(begin_job_count)
+            if isinstance(begin_job_count, int)
+            and not isinstance(begin_job_count, bool)
+            and begin_job_count >= 0
+            else 0
+        ),
+    )
+    final_identity = item.get(_TURN_FINAL_IDENTITY_KEY)
+    if isinstance(final_identity, str) and final_identity:
+        entry["pending_final_identity"] = final_identity
     if state_name == "preparing":
         for ordinal, part in enumerate(parts):
             part_operation = _capture_entry_operation(
@@ -7516,11 +8237,14 @@ def _stage_final_plan(
             "prepare response returned an invalid plan generation",
         )
     _clear_abandoned_plan_handle(entry)
-    entry["pending_turn_id"] = _turn_id(item)
-    entry["pending_content_revision"] = revision
-    entry["pending_plan_token"] = plan_token
-    entry["pending_turn_part_count"] = len(parts)
-    entry["pending_turn_job_count"] = int(job_count or 0)
+    _set_pending_turn_plan(
+        entry,
+        turn_id=_turn_id(item),
+        revision=revision,
+        plan_token=plan_token,
+        part_count=len(parts),
+        job_count=int(job_count or 0),
+    )
     entry["pending_turn_user_hash"] = _turn_user_hash(item)
     entry["pending_plan_generation"] = generation
     entry.pop("pending_stream_submission_id", None)
@@ -7545,10 +8269,22 @@ def _prepare_final_delivery_parts(
     """
 
     try:
-        return prepare_turn_delivery_parts(
+        parts = prepare_turn_delivery_parts(
             feed_item,
             rich_transport=False,
         )
+        # Keep canonical planning reconstructable at every size.  The cap is a
+        # delivery policy: reject the whole logical send into an observable
+        # terminal hold before any physical card is attempted.
+        if len(parts) > TURN_DELIVERY_MAX_PARTS:
+            raise PresentationOversizeError(len(parts))
+        return parts
+    except PresentationOversizeError as exc:
+        raise _TurnContentError(
+            "oversize_presentation",
+            str(exc),
+            part_count=exc.part_count,
+        ) from exc
     except PresentationContentError as exc:
         raise _TurnContentError(
             "invalid_presentation_plan",
@@ -7722,6 +8458,17 @@ def _deliver_final(
         store, turn_id
     )
     if isinstance(exact_record, dict) and not retry_missing:
+        if exact_record.get("request_phase") == "oversize_presentation":
+            _notify_oversize_final(
+                store,
+                _turn_feed_item(item, entry),
+                entry,
+                runtime,
+                chat_id=chat_id,
+                turn_id=turn_id,
+                content_hash=content_hash,
+                part_count=exact_record.get("required_part_count"),
+            )
         _reconcile_partial_final_hold(
             store,
             entry,
@@ -7776,6 +8523,28 @@ def _deliver_final(
         entry.pop("tendwire_rebind_catchup_pending", None)
         return False
     feed_item = _turn_feed_item(presentation_item, entry)
+    try:
+        _prepare_final_delivery_parts(feed_item)
+    except _TurnContentError as exc:
+        if exc.status == "oversize_presentation":
+            _record_oversize_final_delivery(
+                store,
+                entry,
+                turn_id=turn_id,
+                content_hash=content_hash,
+            )
+            _notify_oversize_final(
+                store,
+                feed_item,
+                entry,
+                runtime,
+                chat_id=chat_id,
+                turn_id=turn_id,
+                content_hash=content_hash,
+                part_count=exc.part_count,
+            )
+            return False
+        raise
     if runtime.dry_run:
         state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
         _set_final_delivery(
@@ -8184,6 +8953,9 @@ def _sync_turns(
         "physical_writes": 0,
         "work_pending": 0,
         "failed_writes": 0,
+        "response_fold_attempted": 0,
+        "response_folded": 0,
+        "response_fold_failed": 0,
     }
     budget = _delivery_write_budget(runtime)
     budget_start = budget.spent
@@ -8266,7 +9038,13 @@ def _sync_turns(
             )
     seen_final_workers: set[str] = set()
     seen_working_workers: set[str] = set()
-    fold_state: dict[str, int] = {"issued": 0}
+    fold_state: dict[str, int] = {
+        "issued": 0,
+        "attempted": 0,
+        "folded": 0,
+        "failed": 0,
+        "changed": 0,
+    }
     fairness_cursor_candidate = ""
     turn_count = len(delivery_turns)
     for idx, item in enumerate(delivery_turns):
@@ -8306,8 +9084,6 @@ def _sync_turns(
                 latest_turn_id = latest_completed_turn_by_worker.get(
                     worker_key
                 )
-            if not list_finals_are_authoritative and _content_revision(item):
-                continue
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 delivered = False
                 content_hash = _content_revision(item) or _turn_content_hash(item, "final")
@@ -8316,6 +9092,8 @@ def _sync_turns(
                 counts["updated"] += int(_fold_superseded_final(store, item, entry, runtime, chat_id=chat_id, fold_state=fold_state))
                 if budget.spent > writes_before:
                     counts["physical_writes"] = budget.spent - budget_start
+                continue
+            if not list_finals_are_authoritative and _content_revision(item):
                 continue
             if worker_key in seen_final_workers:
                 continue
@@ -8508,6 +9286,9 @@ def _sync_turns(
             yield_barrier()
     if fairness_cursor_candidate and counts["work_pending"] > 1:
         store["telegram_delivery_turn_cursor"] = fairness_cursor_candidate
+    counts["response_fold_attempted"] = fold_state["attempted"]
+    counts["response_folded"] = fold_state["folded"]
+    counts["response_fold_failed"] = fold_state["failed"]
     return counts
 
 
@@ -9294,6 +10075,21 @@ def _maybe_complete_turn_plan(
             "canonical_message_id": canonical_message_id,
         },
     )
+    partial = state.find_partial_final_delivery(
+        store, _turn_id(item), revision
+    )
+    if (
+        isinstance(partial, dict)
+        and partial.get("request_phase") == "pending_plan_incomplete"
+        and partial.get("status") == "retry_authorized"
+    ):
+        state.complete_partial_final_retry(
+            store,
+            turn_id=_turn_id(item),
+            content_hash=revision,
+            message_ids=list(message_ids),
+            now=time.time(),
+        )
     _set_final_delivery(
         entry,
         turn_id=_turn_id(item),
@@ -9317,6 +10113,7 @@ def _maybe_complete_turn_plan(
         "pending_plan_token",
         "pending_turn_part_count",
         "pending_turn_job_count",
+        "pending_turn_started_at",
         "pending_turn_user_hash",
         "pending_stream_submission_id",
         "pending_plan_generation",
@@ -9526,15 +10323,73 @@ def _abandon_pending_turn_plan(
     )
     entry["abandoned_plan_token"] = plan_token
     entry["abandoned_content_revision"] = revision
-    entry.pop("pending_plan_token", None)
-    entry.pop("pending_content_revision", None)
-    entry.pop("pending_turn_suppressed", None)
+    entry["abandoned_turn_id"] = entry.get("pending_turn_id")
+    entry["abandoned_turn_part_count"] = entry.get(
+        "pending_turn_part_count"
+    )
+    entry["abandoned_turn_job_count"] = entry.get(
+        "pending_turn_job_count"
+    )
+    entry["abandoned_plan_generation"] = entry.get(
+        "pending_plan_generation", 1
+    )
+    entry["abandoned_replaces_failed_plan_token"] = entry.get(
+        "replaces_failed_plan_token"
+    )
+    for field in (
+        "pending_turn_id",
+        "pending_content_revision",
+        "pending_plan_token",
+        "pending_turn_part_count",
+        "pending_turn_job_count",
+        "pending_turn_started_at",
+        "pending_turn_user_hash",
+        "pending_stream_submission_id",
+        "pending_plan_generation",
+        "pending_acknowledged_prefix_count",
+        "replaces_failed_plan_token",
+        "pending_final_identity",
+        "pending_working_predecessor_turn_id",
+        "pending_turn_suppressed",
+    ):
+        entry.pop(field, None)
     return True
 
 
 def _clear_abandoned_plan_handle(entry: dict[str, Any]) -> None:
-    entry.pop("abandoned_plan_token", None)
-    entry.pop("abandoned_content_revision", None)
+    for field in (
+        "abandoned_plan_token",
+        "abandoned_content_revision",
+        "abandoned_turn_id",
+        "abandoned_turn_part_count",
+        "abandoned_turn_job_count",
+        "abandoned_plan_generation",
+        "abandoned_replaces_failed_plan_token",
+    ):
+        entry.pop(field, None)
+
+
+def _pending_final_source_owner_is_valid(
+    store: dict[str, Any], entry: dict[str, Any]
+) -> bool:
+    """Fail closed before reconciling a plan rooted in a durable source."""
+
+    final_identity = entry.get("pending_final_identity")
+    if not isinstance(final_identity, str) or not final_identity:
+        return True
+    owner = _canonical_final_source_owner(
+        _turn_final_source_owners(store).get(final_identity)
+    )
+    identity = state.entry_stable_identity(entry)
+    return bool(
+        owner is not None
+        and identity is not None
+        and owner["turn_id"] == entry.get("pending_turn_id")
+        and owner["content_revision"]
+        == entry.get("pending_content_revision")
+        and owner["stable_key"] == identity[0]
+        and owner["stable_key_version"] == identity[1]
+    )
 
 
 def _reconcile_completed_turn_plans(
@@ -9567,6 +10422,21 @@ def _reconcile_completed_turn_plans(
             or not isinstance(part_count, int)
             or part_count <= 0
         ):
+            continue
+        _set_pending_turn_plan(
+            entry,
+            turn_id=turn_id,
+            revision=revision,
+            plan_token=plan_token,
+            part_count=part_count,
+            job_count=(
+                int(entry.get("pending_turn_job_count"))
+                if isinstance(entry.get("pending_turn_job_count"), int)
+                and not isinstance(entry.get("pending_turn_job_count"), bool)
+                else 0
+            ),
+        )
+        if not _pending_final_source_owner_is_valid(store, entry):
             continue
         operation = _capture_entry_operation(
             store,
@@ -9615,12 +10485,32 @@ def _reconcile_completed_turn_plans(
             for receipt in state.tendwire_turn_jobs(store).values()
         )
         if failed or dead_receipt:
-            if _abandon_pending_turn_plan(
+            created_job_count = observed.get("job_count")
+            held = _hold_incomplete_pending_plan(
+                store,
+                entry,
+                turn_id=turn_id,
+                plan_token=plan_token,
+                revision=revision,
+                part_count=part_count,
+                created_job_count=(
+                    created_job_count
+                    if isinstance(created_job_count, int)
+                    and not isinstance(created_job_count, bool)
+                    else None
+                ),
+                error=(
+                    "multipart parent reached a terminal state before all "
+                    "declared parts completed"
+                ),
+            )
+            abandoned = _abandon_pending_turn_plan(
                 store,
                 entry,
                 plan_token=plan_token,
                 revision=revision,
-            ):
+            )
+            if held or abandoned:
                 reconciled += 1
                 _checkpoint_turn_job(runtime)
             continue
@@ -9634,6 +10524,7 @@ def _reconcile_completed_turn_plans(
                 "pending_plan_token",
                 "pending_turn_part_count",
                 "pending_turn_job_count",
+                "pending_turn_started_at",
                 "pending_turn_user_hash",
                 "pending_stream_submission_id",
                 "pending_plan_generation",
@@ -9654,6 +10545,40 @@ def _reconcile_completed_turn_plans(
             or observed_token != plan_token
             or observed.get("state") != "completed"
         ):
+            if (
+                observed.get("ok") is True
+                and observed_token == plan_token
+                and _pending_turn_plan_age(entry)
+                >= config.partial_final_escalation_seconds()
+            ):
+                created_job_count = observed.get("job_count")
+                held = _hold_incomplete_pending_plan(
+                    store,
+                    entry,
+                    turn_id=turn_id,
+                    plan_token=plan_token,
+                    revision=revision,
+                    part_count=part_count,
+                    created_job_count=(
+                        created_job_count
+                        if isinstance(created_job_count, int)
+                        and not isinstance(created_job_count, bool)
+                        else None
+                    ),
+                    error=(
+                        "multipart parent exceeded its bounded active window "
+                        "before all declared parts completed"
+                    ),
+                )
+                abandoned = _abandon_pending_turn_plan(
+                    store,
+                    entry,
+                    plan_token=plan_token,
+                    revision=revision,
+                )
+                if held or abandoned:
+                    reconciled += 1
+                    _checkpoint_turn_job(runtime)
             continue
         job_count = observed.get("job_count")
         if (
@@ -9736,6 +10661,7 @@ _TURN_FINAL_FAILURE_REASON_CODES = frozenset(
         "invalid_pending_plan",
         "invalid_prepare_response",
         "invalid_presentation_plan",
+        "oversize_presentation",
         "invalid_recovery_predecessor_receipt",
         "invalid_turn_final_job",
         "missing_message_owner_token",
@@ -10055,6 +10981,7 @@ def _complete_suppressed_turn_plan(
         "pending_plan_token",
         "pending_turn_part_count",
         "pending_turn_job_count",
+        "pending_turn_started_at",
         "pending_turn_user_hash",
         "pending_stream_submission_id",
         "pending_plan_generation",
@@ -10806,20 +11733,23 @@ def _drain_turn_final(
             )
             break
         _clear_abandoned_plan_handle(entry)
-        entry["pending_turn_id"] = _turn_id(item)
-        entry["pending_content_revision"] = revision
-        entry["pending_plan_token"] = plan_token
-        entry["pending_turn_part_count"] = part_count
         if source_identity:
             entry["pending_final_identity"] = source_identity
         prior_expected = entry.get("pending_turn_job_count")
-        entry["pending_turn_job_count"] = max(
-            int(prior_expected)
-            if isinstance(prior_expected, int)
-            and not isinstance(prior_expected, bool)
-            else 0,
-            sequence + 1,
-            part_count,
+        _set_pending_turn_plan(
+            entry,
+            turn_id=_turn_id(item),
+            revision=revision,
+            plan_token=plan_token,
+            part_count=part_count,
+            job_count=max(
+                int(prior_expected)
+                if isinstance(prior_expected, int)
+                and not isinstance(prior_expected, bool)
+                else 0,
+                sequence + 1,
+                part_count,
+            ),
         )
         if not entry.get("pending_turn_user_hash"):
             entry["pending_turn_user_hash"] = _turn_user_hash(item)
@@ -12322,6 +13252,39 @@ def _drain_turn_final(
         for pending_entry in state.source_worker_entries(
             store
         ).values():
+            if (
+                pending_entry.get("pending_plan_token")
+                == failed_plan_token
+                and pending_entry.get("pending_content_revision")
+                == failed_revision
+            ):
+                failed_part_count = pending_entry.get(
+                    "pending_turn_part_count"
+                )
+                failed_turn_id = str(
+                    pending_entry.get("pending_turn_id") or ""
+                )
+                if (
+                    failed_turn_id
+                    and isinstance(failed_part_count, int)
+                    and not isinstance(failed_part_count, bool)
+                    and failed_part_count > 0
+                ):
+                    terminal_changed = (
+                        _hold_incomplete_pending_plan(
+                            store,
+                            pending_entry,
+                            turn_id=failed_turn_id,
+                            plan_token=failed_plan_token,
+                            revision=failed_revision,
+                            part_count=failed_part_count,
+                            error=(
+                                "multipart child dead-lettered before its "
+                                "parent plan completed"
+                            ),
+                        )
+                        or terminal_changed
+                    )
             terminal_changed = (
                 _abandon_pending_turn_plan(
                     store,
@@ -12407,6 +13370,7 @@ def _sync_pinned(
                 runtime,
                 captured,
                 result,
+                chat_id=chat_id,
                 kind="global_pinned",
             )
 
@@ -13911,6 +14875,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "physical_writes": 0,
                 "work_pending": 0,
                 "failed_writes": 0,
+                "response_fold_attempted": 0,
+                "response_folded": 0,
+                "response_fold_failed": 0,
             }
         else:
             with state.lock_phase("sync.turns"):
@@ -14145,6 +15112,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         now=time.time(),
         escalation_seconds=config.partial_final_escalation_seconds(),
     )
+    response_fold_health = state.response_fold_health(store)
     completed_deliveries = (
         int(turn_counts["sent"])
         + int(submission_counts["sent"])
@@ -14174,7 +15142,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "physical_writes": _delivery_write_budget(runtime).spent,
     }
     overall_ok = bool(
-        partial_final_health["ok"] and not delivery_stalled
+        partial_final_health["ok"]
+        and not delivery_stalled
+        and response_fold_health["ok"]
     )
     return {
         "ok": overall_ok,
@@ -14183,7 +15153,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 "status": (
                     partial_final_health["status"]
                     if partial_final_health["ok"] is not True
-                    else outbound_delivery_health["status"]
+                    else (
+                        outbound_delivery_health["status"]
+                        if delivery_stalled
+                        else response_fold_health["status"]
+                    )
                 )
             }
             if not overall_ok
@@ -14201,6 +15175,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "sent": turn_counts["sent"] + submission_counts["sent"],
         "routing_repaired": routing_repaired,
         "turn_updates": turn_counts["updated"] + submission_counts["updated"],
+        "response_folds": {
+            "attempted": int(
+                turn_counts.get("response_fold_attempted") or 0
+            ),
+            "folded": int(turn_counts.get("response_folded") or 0),
+            "failed": int(
+                turn_counts.get("response_fold_failed") or 0
+            ),
+        },
         "submission_working": submission_counts,
         **(
             {"tendwire_delta_sync": _delta_health(delta, now=observed_at)}
@@ -14219,4 +15202,5 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "telegram_backpressure": telegram_backpressure,
         "outbound_delivery": outbound_delivery_health,
         "outbound_partial_finals": partial_final_health,
+        "outbound_response_folds": response_fold_health,
     }

@@ -24,6 +24,8 @@ from .safe import compact_ws, short_hash
 DELIVERED_TURN_LEDGER_LIMIT = 10000
 PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION = 3
 PARTIAL_FINAL_DELIVERY_LIMIT = 512
+PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT = 64
+RESPONSE_FOLD_ATTEMPT_CAP = 3
 TENDWIRE_TURN_JOB_LIMIT = 20001
 TENDWIRE_TURN_JOB_STALE_COPY_LIMIT = 8
 ORPHANED_CREATED_TOPIC_LIMIT = 200
@@ -3954,6 +3956,103 @@ def active_partial_final_deliveries(
     ]
 
 
+def _partial_final_created_at(
+    record: dict[str, Any], *, now: float
+) -> float:
+    value = record.get("created_at")
+    return (
+        float(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        else float(now)
+    )
+
+
+def _partial_final_operator_row(
+    record: dict[str, Any], *, now: float
+) -> dict[str, Any]:
+    row = {
+        key: deepcopy(record.get(key))
+        for key in (
+            "turn_id",
+            "content_hash",
+            "blocked_revision_content_hash",
+            "superseded_by_content_hash",
+            "superseded_at",
+            "supersession",
+            "supersession_message_ids",
+            "terminal_outcome",
+            "status",
+            "request_phase",
+            "transport_disposition",
+            "original_worker_id",
+            "original_topic_id",
+            "original_bot_kind",
+            "current_worker_id",
+            "current_topic_id",
+            "current_bot_kind",
+            "recovery_action",
+            "error",
+            "created_at",
+            "updated_at",
+            "required_part_count",
+            "content_locator",
+            "oversize_notice_status",
+            "oversize_notice_error",
+            "oversize_notice_attempt_count",
+            "oversize_notice_attempt_cap",
+            "oversize_notice_terminal",
+        )
+    }
+    row["age_seconds"] = max(
+        0.0, float(now) - _partial_final_created_at(record, now=now)
+    )
+    resolution_action = {
+        "delivery_unknown": "accept-partial",
+        "not_delivered": "retry-missing",
+    }.get(str(record.get("terminal_outcome") or ""))
+    row["resolution_action"] = resolution_action
+    if resolution_action:
+        row["resolution_command"] = [
+            "herdres",
+            "resolve-partial-final",
+            "--turn-id",
+            str(record.get("turn_id") or ""),
+            "--content-hash",
+            str(record.get("content_hash") or ""),
+            "--action",
+            resolution_action,
+            "--request-id",
+            "<unique-request-id>",
+        ]
+    return row
+
+
+def partial_final_delivery_operator_rows(
+    data: dict[str, Any], *, now: float
+) -> list[dict[str, Any]]:
+    """Return every active hold with identity and supported recovery action.
+
+    This intentionally has no presentation cap: it backs an operator-invoked
+    listing rather than the continuously journaled health result. Normal state
+    bounds unresolved records at ``PARTIAL_FINAL_DELIVERY_LIMIT``; if legacy
+    state exceeds that bound, dropping identities here would make the excess
+    obligations impossible to resolve without reading private state.
+    """
+
+    records = sorted(
+        active_partial_final_deliveries(data),
+        key=lambda record: (
+            _partial_final_created_at(record, now=now),
+            str(record.get("turn_id") or ""),
+            str(record.get("content_hash") or ""),
+        ),
+    )
+    return [
+        _partial_final_operator_row(record, now=now)
+        for record in records
+    ]
+
+
 def partial_final_delivery_health(
     data: dict[str, Any],
     *,
@@ -3963,29 +4062,123 @@ def partial_final_delivery_health(
     """Return the operator-facing health state for incomplete final delivery."""
 
     records = active_partial_final_deliveries(data)
-    if not records:
+    stalled_plans: list[tuple[float, str, dict[str, Any]]] = []
+    for entry_key, entry in source_worker_entries(data).items():
+        plan_token = compact_ws(entry.get("pending_plan_token"), 280)
+        turn_id = compact_ws(entry.get("pending_turn_id"), 200)
+        started_at = entry.get("pending_turn_started_at")
+        if (
+            not plan_token.startswith("twplan1.")
+            or not turn_id
+            or not isinstance(started_at, (int, float))
+            or isinstance(started_at, bool)
+        ):
+            continue
+        age = max(0.0, float(now) - float(started_at))
+        if age >= float(escalation_seconds):
+            stalled_plans.append((age, entry_key, entry))
+    stalled_plans.sort(key=lambda row: (-row[0], row[1]))
+    if not records and not stalled_plans:
         return {
             "ok": True,
             "status": "healthy",
             "signal": "",
             "held_count": 0,
+            "stalled_plan_count": 0,
             "escalation_seconds": int(escalation_seconds),
         }
 
-    def created_at(record: dict[str, Any]) -> float:
-        value = record.get("created_at")
+    first_stalled: dict[str, Any] | None = None
+    if stalled_plans:
+        stalled_age, entry_key, entry = stalled_plans[0]
+        first_stalled = {
+            "entry_key": entry_key,
+            "turn_id": str(entry.get("pending_turn_id") or ""),
+            "content_hash": str(
+                entry.get("pending_content_revision") or ""
+            ),
+            "plan_token": str(entry.get("pending_plan_token") or ""),
+            "worker_id": str(
+                entry.get("tendwire_worker_id")
+                or entry.get("active_worker_id")
+                or ""
+            ),
+            "topic_id": str(entry.get("topic_id") or ""),
+            "started_at": float(entry["pending_turn_started_at"]),
+            "age_seconds": stalled_age,
+            "declared_part_count": entry.get("pending_turn_part_count"),
+            "created_job_count": entry.get("pending_turn_job_count"),
+        }
+    if not records:
+        return {
+            "ok": False,
+            "status": "pending_turn_plan_stalled",
+            "signal": "outbound_pending_turn_plan_stalled",
+            "held_count": 0,
+            "stalled_plan_count": len(stalled_plans),
+            "escalation_seconds": int(escalation_seconds),
+            "oldest_age_seconds": stalled_plans[0][0],
+            "first_stalled_plan": first_stalled,
+        }
+
+    ordered = sorted(
+        records,
+        key=lambda record: (
+            _partial_final_created_at(record, now=now),
+            str(record.get("turn_id") or ""),
+            str(record.get("content_hash") or ""),
+        ),
+    )
+    operator_rows = partial_final_delivery_operator_rows(data, now=now)
+
+    def bounded_projection(
+        selected: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        total = len(selected)
+        returned = min(total, PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT)
+        omitted = total - returned
         return (
-            float(value)
-            if isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            else float(now)
+            deepcopy(selected[:returned]),
+            {
+                "total": total,
+                "returned": returned,
+                "omitted": omitted,
+                "truncated": omitted > 0,
+                "limit": PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT,
+            },
         )
 
-    ordered = sorted(records, key=created_at)
+    active_holds, active_holds_projection = bounded_projection(operator_rows)
+    oversize_notice_rows = [
+        row
+        for row in operator_rows
+        if row.get("request_phase") == "oversize_presentation"
+        and str(row.get("oversize_notice_status") or "not_attempted")
+        != "accepted"
+    ]
+    (
+        oversize_notice_attention,
+        oversize_notice_attention_projection,
+    ) = (
+        deepcopy(oversize_notice_rows),
+        {
+            "total": len(oversize_notice_rows),
+            "returned": len(oversize_notice_rows),
+            "omitted": 0,
+            "truncated": False,
+            "limit": None,
+        },
+    )
     first = ordered[0]
-    age = max(0.0, float(now) - created_at(first))
+    age = max(
+        0.0,
+        float(now) - _partial_final_created_at(first, now=now),
+    )
     escalated = any(
-        max(0.0, float(now) - created_at(record))
+        max(
+            0.0,
+            float(now) - _partial_final_created_at(record, now=now),
+        )
         >= float(escalation_seconds)
         for record in records
     )
@@ -4009,35 +4202,32 @@ def partial_final_delivery_health(
     else:
         status = "partial_final_not_delivered"
         signal = "outbound_partial_final_not_delivered"
-    return {
+    result = {
         "ok": False,
         "status": status,
         "signal": signal,
         "held_count": len(records),
+        "stalled_plan_count": len(stalled_plans),
         "escalation_seconds": int(escalation_seconds),
         "oldest_age_seconds": age,
-        "first_hold": {
-            key: deepcopy(first.get(key))
-            for key in (
-                "turn_id",
-                "content_hash",
-                "blocked_revision_content_hash",
-                "superseded_by_content_hash",
-                "superseded_at",
-                "supersession",
-                "supersession_message_ids",
-                "terminal_outcome",
-                "status",
-                "original_worker_id",
-                "original_topic_id",
-                "original_bot_kind",
-                "current_worker_id",
-                "current_topic_id",
-                "current_bot_kind",
-                "recovery_action",
-            )
-        },
+        # Keep the historical single-record projection for compatibility, but
+        # never make operator discovery depend on which hold sorts first.
+        "first_hold": operator_rows[0],
+        "active_holds": active_holds,
+        "active_holds_projection": active_holds_projection,
+        "operator_listing_command": ["herdres", "list-partial-finals"],
+        # This independently scans and returns every attention record. Unlike
+        # the general health list it is intentionally uncapped: a large set of
+        # failed notices is itself an incident, and identities must remain
+        # actionable even if the manual listing command is unavailable.
+        "oversize_notice_attention": oversize_notice_attention,
+        "oversize_notice_attention_projection": (
+            oversize_notice_attention_projection
+        ),
     }
+    if first_stalled is not None:
+        result["first_stalled_plan"] = first_stalled
+    return result
 
 
 def _clear_embedded_partial_final_delivery(
@@ -4744,6 +4934,72 @@ def message_bindings(data: dict[str, Any]) -> dict[str, Any]:
         bindings = {}
         data["telegram_message_bindings"] = bindings
     return bindings
+
+
+def response_fold_health(data: dict[str, Any]) -> dict[str, Any]:
+    """Expose durable failures to collapse superseded Responses.
+
+    A binding keeps ``fold_error`` until a later successful edit clears it.
+    Reaching the attempt cap is terminal for the automatic sweep, so it must
+    remain distinguishable from a retryable failure even on passes that make
+    no new provider attempt.
+    """
+
+    failures: list[dict[str, Any]] = []
+    for message_id, raw_binding in message_bindings(data).items():
+        if not isinstance(raw_binding, dict) or raw_binding.get("folded"):
+            continue
+        error = compact_ws(raw_binding.get("fold_error"), 240)
+        if not error:
+            continue
+        try:
+            attempts = max(0, int(raw_binding.get("fold_attempts") or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        terminal = bool(
+            raw_binding.get("fold_unavailable")
+            or attempts >= RESPONSE_FOLD_ATTEMPT_CAP
+        )
+        failures.append(
+            {
+                "message_id": compact_ws(message_id, 80),
+                "worker_id": compact_ws(
+                    raw_binding.get("worker_id"), 160
+                ),
+                "turn_id": compact_ws(raw_binding.get("turn_id"), 160),
+                "attempts": attempts,
+                "terminal": terminal,
+                "error": error,
+            }
+        )
+    terminal_count = sum(bool(item["terminal"]) for item in failures)
+    if not failures:
+        return {
+            "ok": True,
+            "status": "healthy",
+            "signal": "",
+            "failed_count": 0,
+            "terminal_count": 0,
+            "attempt_cap": RESPONSE_FOLD_ATTEMPT_CAP,
+        }
+    terminal = terminal_count > 0
+    return {
+        "ok": False,
+        "status": (
+            "response_fold_terminal"
+            if terminal
+            else "response_fold_failed"
+        ),
+        "signal": (
+            "outbound_response_fold_terminal"
+            if terminal
+            else "outbound_response_fold_failed"
+        ),
+        "failed_count": len(failures),
+        "terminal_count": terminal_count,
+        "attempt_cap": RESPONSE_FOLD_ATTEMPT_CAP,
+        "first_failure": failures[0],
+    }
 
 
 def bind_message_to_worker(

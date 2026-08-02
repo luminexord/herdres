@@ -196,6 +196,7 @@ class TelegramClient:
         notify: bool = False,
         reply_markup: dict[str, Any] | None = None,
         max_physical_writes: int | None = None,
+        ambiguous_errors_are_unknown: bool = False,
     ) -> dict[str, Any]:
         write_limit = (
             max(0, int(max_physical_writes))
@@ -312,6 +313,18 @@ class TelegramClient:
                         "error": sanitize_text(str(exc), 300),
                     }
                 )
+                if (
+                    ambiguous_errors_are_unknown
+                    and classify_telegram_error(exc) == "transient"
+                    and "can't parse" not in last_error.lower()
+                ):
+                    return {
+                        "ok": False,
+                        "kind": "delivery_unknown",
+                        "delivery_unknown": True,
+                        "error": sanitize_text(last_error, 300),
+                        "physical_writes": len(rejected_formats),
+                    }
         outcome = {
             "ok": False,
             "error": sanitize_text(last_error, 300),
@@ -320,6 +333,7 @@ class TelegramClient:
         if (
             write_limit is not None
             and len(attempted_variants) < len(variants)
+            and not ambiguous_errors_are_unknown
         ):
             outcome["kind"] = "operation_budget_exhausted"
             outcome["error"] = (

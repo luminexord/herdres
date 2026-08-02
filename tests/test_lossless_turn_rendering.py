@@ -127,7 +127,8 @@ def test_every_planned_render_and_fallback_is_bounded():
         assert rich.count("<li>") <= TELEGRAM_RICH_BLOCK_LIMIT
 
     assert render_turn_delivery_part_html(item, parts[0]).startswith(
-        f"<b>✅ Response 1/{len(parts)}</b><br><br>"
+        "<details open><summary>✅ "
+        f"<b>Response 1/{len(parts)}</b></summary>"
     )
     assert "trailing blanks stay" in render_turn_delivery_part_html(item, parts[-1])
 
@@ -163,7 +164,9 @@ def test_short_turn_plans_one_part_with_byte_identical_rendering():
         },
     ]
     assert render_turn_delivery_part_html(item, parts[0]) == existing
-    assert existing.startswith("<b>✅ Response</b><br><br><h4>Fix it</h4>")
+    assert existing.startswith(
+        "<details open><summary>✅ <b>Response</b></summary><h4>Fix it</h4>"
+    )
     assert "<details open><summary>💬 <b>You</b></summary><footer>Question</footer></details>" in existing
 
 
