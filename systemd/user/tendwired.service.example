@@ -1,6 +1,8 @@
-# Tendwire daemon unit — TEMPLATE. Herdres (source-only) requires a running tendwired; copy this to
-# ~/.config/systemd/user/tendwired.service, adjust the PYTHONPATH to your tendwire checkout, then:
-#   systemctl --user daemon-reload && systemctl --user enable --now tendwired.service
+# Tendwire daemon base unit, installed and refreshed by install-user.sh. The installer refuses
+# symlinks and locally diverged base units, tracks its last managed base outside systemd's unit tree,
+# backs up a canonical unit before replacement, and never touches tendwired.service.d. Keep
+# host-specific overrides (including a non-default Tendwire checkout) in operator drop-ins rather
+# than editing this repository-managed file.
 #
 # LOAD-BEARING settings (each one broke prod when wrong):
 #  * TENDWIRE_HERDR_BIN must point at herdr_turn_adapter.py (installed by install-user.sh), NOT the
@@ -25,7 +27,7 @@ KillSignal=SIGTERM
 TimeoutStopSec=20
 FinalKillSignal=SIGKILL
 Type=simple
-# Adjust to your tendwire checkout (or drop if tendwire is pip-installed):
+# Default checkout path; override PYTHONPATH in a host-specific drop-in when needed:
 Environment=PYTHONPATH=%h/tendwire/src
 Environment=TENDWIRE_HERDR_BACKEND=socket
 Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr_turn_adapter.py

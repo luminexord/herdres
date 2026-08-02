@@ -1,6 +1,16 @@
 #!/usr/bin/env sh
 set -eu
 
+# Install all systemd units, the managed comparison baseline, legacy-unit
+# cleanup, and the source marker through held O_NOFOLLOW directory descriptors.
+# The helper validates every existing component and target before staging any
+# bytes, then revalidates immediately before dirfd-relative atomic renames.
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "python3 is required to install Herdres safely." >&2
+    exit 1
+fi
+python3 scripts/install_user_units.py --home "$HOME" --source-root "$PWD"
+
 install -Dm755 herdres.py "$HOME/.local/bin/herdres"
 install -Dm755 herdres_gateway.py "$HOME/.local/bin/herdres-gateway"
 # Turn adapter: the tendwire daemon captures turn content by running `herdr pane turn`, which some
@@ -274,14 +284,10 @@ else:
 validate_existing()
 KEYPY
 
-mkdir -p "$HOME/.config/systemd/user" "$HOME/.local/share/herdres"
-cp systemd/user/herdres.service systemd/user/herdres-gateway.service "$HOME/.config/systemd/user/"
-rm -f "$HOME/.config/systemd/user/herdres.timer"
-rm -f "$HOME/.config/systemd/user/herdres-speech.service"
-rm -rf "$HOME/.config/systemd/user/herdres-gateway.service.d"
-printf '%s\n' "$PWD" > "$HOME/.local/share/herdres/source"
-
 printf '%s\n' "Installed source-only Herdres."
 printf '%s\n' "Edit $HOME/.config/herdres/herdres.env, then run:"
 printf '%s\n' "  systemctl --user daemon-reload"
 printf '%s\n' "  systemctl --user enable --now herdres.service herdres-gateway.service"
+printf '%s\n' "tendwired.service was installed/refreshed but was not enabled or started."
+printf '%s\n' "Keep host-specific tendwired settings in tendwired.service.d drop-ins."
+printf '%s\n' "  systemctl --user cat tendwired.service"
