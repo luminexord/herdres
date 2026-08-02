@@ -205,7 +205,10 @@ def _merge_accepted_notification_journal(
     for receipt_id, record in receipts.items():
         if receipt_id in applied_ids:
             continue
-        if record.get("kind") == "created_topic":
+        if record.get("kind") in {
+            "created_topic",
+            "ambiguous_created_topic",
+        }:
             created = telegram.setdefault("accepted_created_topics", {})
             if not isinstance(created, dict):
                 created = {}

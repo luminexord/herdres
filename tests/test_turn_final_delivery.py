@@ -2373,6 +2373,68 @@ def test_stage_final_plan_returns_current_owner_for_suppression_marker(
     assert persisted_entry["pending_turn_suppressed"]["turn_id"] == turn_id
 
 
+def test_final_plan_keeps_repeated_user_text_for_exact_coverage(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    item = _turn_row(
+        "turn-repeated-user-final",
+        "twrev1.repeated_user_final",
+        "deployment succeeded",
+        user="continue",
+    )
+    tendwire = TurnFinalTendwire(item)
+    initial = _store()
+    _key, initial_entry, _created = state.upsert_worker_entry(
+        initial,
+        _source_worker(tendwire.snapshot()["workers"][0]),
+    )
+    initial_entry["topic_id"] = "77"
+    initial_entry["last_turn_id"] = "turn-previous"
+    initial_entry["last_clean_user_hash"] = source_sync._turn_user_hash(
+        item
+    )
+    state.save_state(initial, state_path)
+
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        _key, entry = state.find_worker_entry_by_stable_key(
+            current, _stable_key("worker-1")
+        )
+        assert entry is not None
+        runtime = source_sync._offlock_runtime(
+            current,
+            _runtime(tendwire, DeletingTelegram(), max_sends=8),
+        )
+        staged, _pages, entry = source_sync._stage_final_plan(
+            current, item, entry, runtime
+        )
+
+    assert staged is True
+    token = str(entry["pending_plan_token"])
+    spans = [
+        span
+        for ordinal in sorted(tendwire._plans[token]["parts"])
+        for span in tendwire._plans[token]["parts"][ordinal]
+    ]
+    assert spans == [
+        {"field": "user_text", "start_char": 0, "end_char": 8},
+        {
+            "field": "assistant_final_text",
+            "start_char": 0,
+            "end_char": len("deployment succeeded"),
+        },
+    ]
+
+
+def test_turn_final_reason_preserves_plan_incomplete():
+    assert source_sync._turn_final_reason_code("plan_incomplete") == (
+        "plan_incomplete"
+    )
+
+
 def test_turn_final_revalidates_after_old_copy_retirement(
     tmp_path, monkeypatch
 ):

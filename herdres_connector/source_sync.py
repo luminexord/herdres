@@ -55,7 +55,10 @@ from .telegram_delivery import (
 from .tendwire_client import TendwireClient, TendwireError
 
 RENDER_VERSION = "telegram-rich-v28-primary-dual-bound"
-PRESENTATION_VERSION = "turn-present-v29"
+PRESENTATION_VERSION = "turn-present-v30"
+_SUPPORTED_PRESENTATION_VERSIONS = frozenset(
+    {"turn-present-v29", PRESENTATION_VERSION}
+)
 TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
 _SUBMISSION_ID_KEY = "_herdres_submission_id"
@@ -2206,6 +2209,51 @@ def _accepted_created_topics(
     return records
 
 
+def _ambiguous_created_topic_for_entry(
+    store: dict[str, Any], entry: dict[str, Any]
+) -> dict[str, Any] | None:
+    entry_key, entry_type = _entry_operation_key(store, entry)
+    identity = state.entry_stable_identity(entry)
+    space_id = _entry_space_id(entry)
+    for record in _accepted_created_topics(
+        store, create=False
+    ).values():
+        if (
+            not isinstance(record, dict)
+            or record.get("kind") != "ambiguous_created_topic"
+        ):
+            continue
+        owner = record.get("owner")
+        if not isinstance(owner, dict) or owner.get("entry_type") != entry_type:
+            continue
+        if entry_type == "worker" and identity is not None:
+            if (
+                owner.get("stable_key"),
+                owner.get("stable_key_version"),
+            ) == identity:
+                return record
+        elif entry_type == "space" and space_id:
+            if str(owner.get("space_id") or "") == space_id:
+                return record
+        elif entry_key and owner.get("entry_key") == entry_key:
+            return record
+    return None
+
+
+def _stamp_ambiguous_topic_create(
+    entry: dict[str, Any], record: Mapping[str, Any]
+) -> None:
+    entry["binding_state"] = "quarantined:ambiguous_topic_create"
+    entry["ambiguous_topic_create_name"] = compact_ws(
+        record.get("topic_name"), 120
+    )
+    entry["ambiguous_topic_create_at_unix"] = float(
+        record.get("observed_at_unix") or time.time()
+    )
+    entry["last_topic_error"] = compact_ws(record.get("error"), 240)
+    entry.pop("binding_topic_id", None)
+
+
 def _checkpoint_accepted_created_topic(
     store: dict[str, Any],
     runtime: SyncRuntime,
@@ -2216,17 +2264,29 @@ def _checkpoint_accepted_created_topic(
 ) -> str:
     """Journal a non-idempotent accepted topic before owner disposition."""
 
-    if not isinstance(result, Mapping) or result.get("ok") is not True:
+    if not isinstance(result, Mapping):
         return ""
     topic_id = str(result.get("topic_id") or "")
-    if not topic_id:
+    if result.get("ok") is True and topic_id:
+        record = {
+            "kind": "created_topic",
+            "topic_id": topic_id,
+            "topic_name": compact_ws(topic_name, 120),
+            "owner": _operation_provenance(operation),
+        }
+    elif result.get("ambiguous_acceptance"):
+        record = {
+            "kind": "ambiguous_created_topic",
+            "topic_name": compact_ws(topic_name, 120),
+            "error": compact_ws(result.get("error"), 240),
+            "observed_at_unix": time.time(),
+            "owner": _operation_provenance(operation),
+        }
+        current = _resolve_operation_entry(store, operation)
+        if current is not None and not current.get("topic_id"):
+            _stamp_ambiguous_topic_create(current, record)
+    else:
         return ""
-    record = {
-        "kind": "created_topic",
-        "topic_id": topic_id,
-        "topic_name": compact_ws(topic_name, 120),
-        "owner": _operation_provenance(operation),
-    }
     receipt_id = short_hash(record, 32)
     _accepted_created_topics(store, create=True).setdefault(
         receipt_id, record
@@ -2275,7 +2335,21 @@ def _recover_accepted_created_topics(
             else _OfflockEntryResolution(_OFFLOCK_ABANDON)
         )
         entry = resolution.entry
-        if (
+        if record.get("kind") == "ambiguous_created_topic":
+            current = (
+                _resolve_operation_entry(store, operation)
+                if operation is not None
+                else None
+            )
+            if current is None or current.get("topic_id"):
+                continue
+            _stamp_ambiguous_topic_create(current, record)
+            # This receipt is the independent create guard. Mutable routing
+            # state may later overwrite binding_state, so retain the durable
+            # owner/name record until an explicit audited adopt/reset clears
+            # the ambiguity.
+            continue
+        elif (
             topic_id
             and resolution.disposition == _OFFLOCK_APPLY
             and entry is not None
@@ -3477,6 +3551,14 @@ def _turn_feed_item(
     return turn_item_from_source(presentation, entry)
 
 
+def _canonical_final_feed_item(
+    item: dict[str, Any], entry: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a lossless feed item for a Tendwire canonical final plan."""
+
+    return turn_item_from_source(item, entry)
+
+
 def _changed_final_should_send_new_message(item: dict[str, Any], entry: dict[str, Any]) -> bool:
     user_hash = _turn_user_hash(item)
     if not user_hash:
@@ -4086,6 +4168,16 @@ def _ensure_topic(
         entry["binding_state"] = _BINDING_STATE_BOUND
         entry["binding_topic_id"] = str(entry["topic_id"])
         return False, False
+    ambiguous_record = _ambiguous_created_topic_for_entry(store, entry)
+    if ambiguous_record is not None:
+        _stamp_ambiguous_topic_create(entry, ambiguous_record)
+    if entry.get("binding_state") == "quarantined:ambiguous_topic_create":
+        # createForumTopic has no idempotency key. A transport failure after
+        # submission may still have created the topic, so blindly retrying can
+        # mint an untracked duplicate on every sync pass. Keep this owner
+        # quarantined until an operator inventories/adopts or resets topics.
+        entry.pop("binding_topic_id", None)
+        return False, False
     if str(entry.get("entry_type") or "") == "worker":
         identity = state.entry_stable_identity(entry)
         if identity is not None and any(
@@ -4194,6 +4286,17 @@ def _ensure_topic(
             runtime.checkpoint()
         return True, True
     entry["last_topic_error"] = compact_ws(created.get("error"), 240)
+    if created.get("ambiguous_acceptance"):
+        _stamp_ambiguous_topic_create(
+            entry,
+            {
+                "topic_name": topic_name,
+                "error": created.get("error"),
+                "observed_at_unix": time.time(),
+            },
+        )
+        entry.pop("binding_topic_id", None)
+        return False, False
     entry["binding_state"] = (
         "create_error:"
         + (entry["last_topic_error"] or "unknown_create_error")
@@ -5076,7 +5179,7 @@ def _sync_sources(
         if entry.get("topic_id"):
             entry["binding_state"] = _BINDING_STATE_BOUND
             entry["binding_topic_id"] = str(entry["topic_id"])
-        else:
+        elif entry.get("binding_state") != "quarantined:ambiguous_topic_create":
             entry["binding_state"] = _BINDING_STATE_PENDING_CREATE
             entry.pop("binding_topic_id", None)
         # Apply the cwd-based, disambiguated name before the topic is created (once it has a topic_id
@@ -5666,21 +5769,34 @@ def _cleanup_topics(
                 name=delete_topic_name,
                 reason="done_council_space_topic",
             )
-        if not runtime.dry_run:
-            if should_delete:
-                finalize_deleted_space_worker_aliases(
-                    cleared_worker_keys, "done_council_space_topic"
-                )
-            if not should_delete or delete_resolution.disposition == _OFFLOCK_APPLY:
-                current_entry = (
-                    delete_resolution.entry if should_delete else entry
-                )
+        if not runtime.dry_run and should_delete:
+            finalize_deleted_space_worker_aliases(
+                cleared_worker_keys, "done_council_space_topic"
+            )
+            if delete_resolution.disposition == _OFFLOCK_APPLY:
+                current_entry = delete_resolution.entry
                 assert current_entry is not None
                 current_key, _kind = _entry_operation_key(
                     store, current_entry
                 )
                 pop_space(current_key)
                 result["pruned"] += 1
+        elif not runtime.dry_run:
+            # Snapshot absence is not proof that a long-lived space/topic was
+            # deleted. Retain its identity and topic binding so a transient
+            # source blip cannot orphan the live Telegram topic and remint a
+            # duplicate when the same space returns.
+            before_retained = (
+                entry.get("binding_state"),
+                entry.get("binding_topic_id"),
+            )
+            entry["binding_state"] = _BINDING_STATE_ABSENT
+            entry.pop("binding_topic_id", None)
+            result["changed"] = result["changed"] or before_retained != (
+                entry.get("binding_state"),
+                entry.get("binding_topic_id"),
+            )
+            continue
         result["changed"] = True
     return result
 
@@ -7165,11 +7281,14 @@ def _stage_final_plan(
             "completed final is held after a multipart binding gap",
         )
 
-    def _prepare_begin_kwargs(part_count: int) -> dict[str, Any]:
+    def _prepare_begin_kwargs(
+        part_count: int,
+        presentation_version: str = PRESENTATION_VERSION,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "turn_id": _turn_id(item),
             "content_revision": revision,
-            "presentation_version": PRESENTATION_VERSION,
+            "presentation_version": presentation_version,
             "part_count": part_count,
         }
         if source_ref is not None:
@@ -7219,7 +7338,13 @@ def _stage_final_plan(
                 reason=(
                     "tendwire.connector_prepare_begin: reconcile pending plan"
                 ),
-                kwargs=_prepare_begin_kwargs(pending_count),
+                kwargs=_prepare_begin_kwargs(
+                    pending_count,
+                    str(
+                        entry.get("pending_presentation_version")
+                        or "turn-present-v29"
+                    ),
+                ),
             ),
         )
         observed, resolution = execution.result, execution.resolution
@@ -7311,8 +7436,13 @@ def _stage_final_plan(
         return False, 0, entry
 
     page_calls = _materialize_turn_item(item, runtime)
-    feed_item = _turn_feed_item(item, entry)
+    # Final plans are a lossless projection of Tendwire's canonical revision.
+    # Repeated-prompt suppression is a working-card display policy; applying it
+    # here drops a required user_text span and makes Tendwire reject the plan as
+    # incomplete before any Telegram job can be created.
+    feed_item = _canonical_final_feed_item(item, entry)
     parts = _prepare_final_delivery_parts(feed_item)
+    _validate_final_plan_exact_coverage(item, parts)
     if not parts:
         raise _TurnContentError(
             "invalid_presentation_plan",
@@ -7327,6 +7457,7 @@ def _stage_final_plan(
         entry["pending_turn_job_count"] = len(parts)
         entry["pending_turn_user_hash"] = _turn_user_hash(item)
         entry["pending_plan_generation"] = 1
+        entry["pending_presentation_version"] = PRESENTATION_VERSION
         entry.pop("pending_stream_submission_id", None)
         if entry.get("last_stream_submission_id"):
             entry["pending_stream_submission_id"] = str(
@@ -7523,6 +7654,7 @@ def _stage_final_plan(
     entry["pending_turn_job_count"] = int(job_count or 0)
     entry["pending_turn_user_hash"] = _turn_user_hash(item)
     entry["pending_plan_generation"] = generation
+    entry["pending_presentation_version"] = PRESENTATION_VERSION
     entry.pop("pending_stream_submission_id", None)
     if entry.get("last_stream_submission_id"):
         entry["pending_stream_submission_id"] = str(
@@ -7554,6 +7686,64 @@ def _prepare_final_delivery_parts(
             "invalid_presentation_plan",
             str(exc),
         ) from exc
+
+
+def _validate_final_plan_exact_coverage(
+    item: dict[str, Any], parts: list[dict[str, Any]]
+) -> None:
+    """Reject lossy local plans before creating a durable Tendwire plan."""
+
+    content = item.get("content")
+    fields = content.get("fields") if isinstance(content, dict) else None
+    if not isinstance(fields, dict):
+        raise _TurnContentError(
+            "invalid_presentation_plan",
+            "completed turn has no canonical field descriptors",
+        )
+    spans_by_field: dict[str, list[tuple[int, int]]] = {}
+    for part in parts:
+        for span in part.get("spans") or []:
+            field = str(span.get("field") or "")
+            start = span.get("start_char")
+            end = span.get("end_char")
+            if (
+                field not in {"user_text", "assistant_final_text"}
+                or isinstance(start, bool)
+                or not isinstance(start, int)
+                or isinstance(end, bool)
+                or not isinstance(end, int)
+            ):
+                raise _TurnContentError(
+                    "invalid_presentation_plan",
+                    "final presentation contains an invalid content span",
+                )
+            spans_by_field.setdefault(field, []).append((start, end))
+    for field in ("user_text", "assistant_final_text"):
+        descriptor = fields.get(field)
+        if not isinstance(descriptor, dict):
+            raise _TurnContentError(
+                "invalid_presentation_plan",
+                f"completed turn is missing {field} descriptor",
+            )
+        expected = (
+            int(descriptor.get("char_length") or 0)
+            if descriptor.get("availability") == "complete"
+            else 0
+        )
+        spans = spans_by_field.get(field, [])
+        cursor = 0
+        for start, end in spans:
+            if start != cursor or end <= start or end > expected:
+                raise _TurnContentError(
+                    "invalid_presentation_plan",
+                    f"final presentation does not exactly cover {field}",
+                )
+            cursor = end
+        if cursor != expected:
+            raise _TurnContentError(
+                "invalid_presentation_plan",
+                f"final presentation does not exactly cover {field}",
+            )
 
 
 def _notify_unbound_final(
@@ -9133,7 +9323,8 @@ def _validate_turn_final_item(item: dict[str, Any]) -> dict[str, Any]:
     ordinal = payload.get("part_ordinal")
     part_count = payload.get("part_count")
     if (
-        payload.get("presentation_version") != PRESENTATION_VERSION
+        payload.get("presentation_version")
+        not in _SUPPORTED_PRESENTATION_VERSIONS
         or payload.get("operation") not in {"upsert", "retire"}
         or any(
             isinstance(value, bool)
@@ -9320,6 +9511,7 @@ def _maybe_complete_turn_plan(
         "pending_turn_user_hash",
         "pending_stream_submission_id",
         "pending_plan_generation",
+        "pending_presentation_version",
         "pending_acknowledged_prefix_count",
         "replaces_failed_plan_token",
         "pending_final_identity",
@@ -9637,6 +9829,7 @@ def _reconcile_completed_turn_plans(
                 "pending_turn_user_hash",
                 "pending_stream_submission_id",
                 "pending_plan_generation",
+                "pending_presentation_version",
                 "pending_acknowledged_prefix_count",
                 "replaces_failed_plan_token",
                 "pending_final_identity",
@@ -9739,6 +9932,7 @@ _TURN_FINAL_FAILURE_REASON_CODES = frozenset(
         "invalid_recovery_predecessor_receipt",
         "invalid_turn_final_job",
         "missing_message_owner_token",
+        "plan_incomplete",
         "prepare_failed",
         "presentation_plan_mismatch",
         "receipt_reservation_failed",
@@ -10058,6 +10252,7 @@ def _complete_suppressed_turn_plan(
         "pending_turn_user_hash",
         "pending_stream_submission_id",
         "pending_plan_generation",
+        "pending_presentation_version",
         "pending_acknowledged_prefix_count",
         "replaces_failed_plan_token",
         "pending_final_identity",
@@ -10214,7 +10409,7 @@ def _drain_post_ack_reconciliations(
             if item is None:
                 continue
             _materialize_turn_item(item, runtime)
-            feed_item = _turn_feed_item(item, entry)
+            feed_item = _canonical_final_feed_item(item, entry)
             try:
                 plans = _prepare_final_delivery_parts(feed_item)
             except _TurnContentError as exc:
@@ -10832,6 +11027,10 @@ def _drain_turn_final(
             )
         if "pending_plan_generation" not in entry:
             entry["pending_plan_generation"] = 1
+        entry["pending_presentation_version"] = str(
+            payload.get("presentation_version")
+            or PRESENTATION_VERSION
+        )
 
         advanced_prior = False
         for prior_key, prior_receipt in list(
@@ -10909,7 +11108,7 @@ def _drain_turn_final(
                 )
                 break
             result["content_pages"] += page_calls
-            feed_item = _turn_feed_item(item, entry)
+            feed_item = _canonical_final_feed_item(item, entry)
             try:
                 plans = _prepare_final_delivery_parts(feed_item)
             except _TurnContentError as exc:

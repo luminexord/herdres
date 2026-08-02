@@ -2113,6 +2113,187 @@ def test_sync_once_wires_topic_lifecycle_cleanup(monkeypatch):
     assert isinstance(calls[0][3], float)
 
 
+def test_transient_space_absence_retains_topic_identity_and_reuses_it(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "space")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    store = _store()
+    telegram = FakeTelegram()
+    live = FakeTendwire()
+
+    sync_once(store, SyncRuntime(live, telegram, with_outbox=False))
+    original_key, original = next(iter(state.source_space_entries(store).items()))
+    original_topic = str(original["topic_id"])
+    assert len(telegram.topics) == 1
+
+    absent = FakeTendwire(workers=[], spaces=[])
+    sync_once(store, SyncRuntime(absent, telegram, with_outbox=False))
+    retained = state.source_space_entries(store)[original_key]
+    assert retained["stale_space_topic"] is True
+    assert str(retained["topic_id"]) == original_topic
+    assert telegram.deleted_topics == []
+
+    repeated_absence = sync_once(
+        store, SyncRuntime(absent, telegram, with_outbox=False)
+    )
+    assert repeated_absence["topic_cleanup"]["changed"] is False
+
+    sync_once(store, SyncRuntime(live, telegram, with_outbox=False))
+    restored = state.source_space_entries(store)[original_key]
+    assert "stale_space_topic" not in restored
+    assert str(restored["topic_id"]) == original_topic
+    assert len(telegram.topics) == 1
+
+
+def test_ambiguous_topic_create_is_quarantined_and_never_retried(monkeypatch):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "space")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+
+    class AmbiguousCreateTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.create_attempts = 0
+
+        def create_topic(self, _chat_id, _name, icon_color=None):
+            self.create_attempts += 1
+            return {
+                "ok": False,
+                "error": "timed out after submit",
+                "ambiguous_acceptance": True,
+            }
+
+    store = _store()
+    telegram = AmbiguousCreateTelegram()
+    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
+
+    sync_once(store, runtime)
+    sync_once(store, runtime)
+
+    entry = next(iter(state.source_space_entries(store).values()))
+    assert telegram.create_attempts == 1
+    assert entry["binding_state"] == "quarantined:ambiguous_topic_create"
+    assert entry["ambiguous_topic_create_name"] == "Project"
+    assert "topic_id" not in entry
+
+
+def test_worker_ambiguous_topic_create_survives_refresh_and_restart(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+
+    class AmbiguousCreateTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.create_attempts = 0
+
+        def create_topic(self, _chat_id, _name, icon_color=None):
+            self.create_attempts += 1
+            return {
+                "ok": False,
+                "error": "connection closed after submit",
+                "ambiguous_acceptance": True,
+            }
+
+    telegram = AmbiguousCreateTelegram()
+    store = _store()
+    sync_once(
+        store,
+        SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+    )
+    state.save_state(store, state_path)
+    restarted = state.load_state(state_path)
+
+    sync_once(
+        restarted,
+        SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+    )
+
+    entry = next(iter(state.source_worker_entries(restarted).values()))
+    entry["binding_state"] = "quarantined:ambiguous_route"
+    sync_once(
+        restarted,
+        SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
+    )
+
+    assert telegram.create_attempts == 1
+    assert entry["binding_state"] == "quarantined:ambiguous_topic_create"
+    assert any(
+        record.get("kind") == "ambiguous_created_topic"
+        for record in restarted["telegram"][
+            "accepted_created_topics"
+        ].values()
+    )
+
+
+def test_ambiguous_create_owner_churn_keeps_durable_quarantine(monkeypatch):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    worker = _source_worker(
+        {
+            "id": "worker-1",
+            "name": "Alpha",
+            "status": "idle",
+            "space_id": "space-1",
+            "fingerprint": "fp-before",
+        }
+    )
+    _key, entry, _created = state.upsert_worker_entry(store, worker)
+
+    class ChurningAmbiguousTelegram(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.create_attempts = 0
+
+        def create_topic(self, _chat_id, _name, icon_color=None):
+            self.create_attempts += 1
+            entry["tendwire_fingerprint"] = "fp-after"
+            return {
+                "ok": False,
+                "error": "SSL EOF after submit",
+                "ambiguous_acceptance": True,
+            }
+
+    telegram = ChurningAmbiguousTelegram()
+    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
+    source_sync._ensure_topic(
+        store, worker, entry, runtime, chat_id="-100"
+    )
+    source_sync._ensure_topic(
+        store, worker, entry, runtime, chat_id="-100"
+    )
+
+    assert telegram.create_attempts == 1
+    assert entry["binding_state"] == "quarantined:ambiguous_topic_create"
+    assert any(
+        record.get("kind") == "ambiguous_created_topic"
+        for record in store["telegram"]["accepted_created_topics"].values()
+    )
+
+
+def test_create_topic_marks_transport_failure_as_ambiguous(monkeypatch):
+    def timeout(*_args, **_kwargs):
+        raise TimeoutError("response timed out after submit")
+
+    monkeypatch.setattr(
+        "herdres_connector.telegram_delivery.urllib.request.urlopen",
+        timeout,
+    )
+    result = TelegramClient(token="test-token").create_topic(
+        "test-chat", "Project"
+    )
+
+    assert result["ok"] is False
+    assert result["ambiguous_acceptance"] is True
+
+
 def test_status_overview_uses_old_pane_board_shape():
     html = render_status_overview(
         [
