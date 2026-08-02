@@ -10796,9 +10796,22 @@ def _drain_turn_final(
                     source_ref=ref,
                 )
             except _TurnContentError as exc:
-                _fail_turn_final(
-                    runtime, ref, f"{exc.status}: {exc}", result
-                )
+                if exc.conflict:
+                    # Tendwire plan operations are idempotent, but the local
+                    # route can legitimately move while the state lock is
+                    # released. Preserve the source root so its next lease can
+                    # reconcile the accepted plan to the replacement topic.
+                    _defer_turn_final(
+                        runtime,
+                        ref,
+                        "transient_delivery",
+                        result,
+                        delay_seconds=1,
+                    )
+                else:
+                    _fail_turn_final(
+                        runtime, ref, f"{exc.status}: {exc}", result
+                    )
                 break
             except TendwireError:
                 # The provider boundary names transport/process failures.

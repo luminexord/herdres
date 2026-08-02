@@ -6522,6 +6522,91 @@ def test_prepare_exception_defers_source_root_then_retries_once(
     assert len(telegram.sent) + len(telegram.edited) == 1
 
 
+def test_prepare_owner_rebind_defers_source_root_then_delivers_to_new_topic(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0"
+    )
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(state_path)
+    )
+    replacement_topic_id = "16000"
+    store = _store()
+    state.save_state(store, state_path)
+
+    class RebindAfterPrepareTendwire(TurnFinalTendwire):
+        def __init__(self, row):
+            super().__init__(
+                row,
+                emit_ready=True,
+                turn_schema_version=2,
+            )
+            self.rebind_armed = True
+
+        def connector_prepare_begin(self, **kwargs):
+            accepted = super().connector_prepare_begin(**kwargs)
+            if self.rebind_armed:
+                self.rebind_armed = False
+                concurrent = state.load_state(state_path)
+                _entry_key, entry = (
+                    state.find_worker_entry_by_stable_key(
+                        concurrent, _stable_key("worker-1")
+                    )
+                )
+                assert entry is not None
+                entry["topic_id"] = replacement_topic_id
+                state.save_state(concurrent, state_path)
+            return accepted
+
+    tendwire = RebindAfterPrepareTendwire(
+        _turn_row(
+            "turn-prepare-owner-rebind",
+            "twrev1.prepare_owner_rebind",
+            "deliver once on the replacement topic",
+        )
+    )
+    tendwire.turns = lambda: {
+        "ok": True,
+        "schema_version": 2,
+        "turns": [],
+    }
+    telegram = DeletingTelegram()
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        first = sync_once(
+            current,
+            _runtime(tendwire, telegram, max_sends=10),
+        )
+
+    assert first["tendwire_turn_final"]["deferred"] == 1
+    assert first["tendwire_turn_final"]["failed"] == 0
+    assert tendwire.defer_calls[-1][1] == "transient_delivery"
+    assert tendwire.fail_calls == []
+    assert telegram.sent == []
+    assert telegram.edited == []
+
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        second = sync_once(
+            current,
+            _runtime(tendwire, telegram, max_sends=10),
+        )
+
+    assert second["tendwire_turn_final"]["delivered"] == 1
+    assert second["tendwire_turn_final"]["acked"] == 1
+    assert second["tendwire_turn_final"]["failed"] == 0
+    assert len(telegram.sent) + len(telegram.edited) == 1
+    assert telegram.sent[0][2]["thread_id"] == replacement_topic_id
+    assert [call[0] for call in tendwire.prepare_calls].count("begin") == 2
+
+
 def test_conflicting_job_attached_source_fails_before_second_page_or_send(
     monkeypatch,
 ):
