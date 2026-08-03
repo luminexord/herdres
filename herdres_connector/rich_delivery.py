@@ -60,6 +60,12 @@ WORKLOG_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_WORKLOG_MAX_CHARS", "12
 RICH_FALLBACK_MAX_CHARS = MESSAGE_TEXT_LIMIT
 TURN_DELIVERY_PLAN_SCHEMA_VERSION = 1
 TURN_DELIVERY_PLAIN_SOURCE_CHARS = min(SPLIT_TEXT_LIMIT, MESSAGE_TEXT_LIMIT)
+# Eight owner-visible cards is the hard presentation ceiling for one logical
+# turn.  It preserves the existing exact 20K-answer path while preventing the
+# unbounded 11+ card plans that caused issue #228. Beyond this, emitting an
+# incomplete prefix would be silent data loss; callers surface an explicit
+# oversize outcome instead.
+TURN_DELIVERY_MAX_PARTS = 8
 PROMPT_PREVIEW_CHARS = 80
 USER_PROMPT_LABEL = "You"
 RESPONSE_LABEL = "Response"
@@ -79,6 +85,18 @@ _INLINE_LINK_SCHEMES = ("http://", "https://", "mailto:", "tg://")
 
 class PresentationContentError(RuntimeError):
     """Expected inability to fit specific valid content in one presentation."""
+
+
+class PresentationOversizeError(PresentationContentError):
+    """Exact content would require more owner-visible cards than permitted."""
+
+    def __init__(self, part_count: int):
+        self.part_count = int(part_count)
+        super().__init__(
+            "turn requires "
+            f"{self.part_count} cards; hard maximum is "
+            f"{TURN_DELIVERY_MAX_PARTS}"
+        )
 
 
 def _html_text(value: Any, max_chars: int = MAX_REPLY_CHARS) -> str:
@@ -514,23 +532,26 @@ def render_final_reply_html(value: str, *, seen_heading: bool = False) -> str:
     return _render_final_reply_blocks(clean.splitlines(), seen_heading=seen_heading)
 
 
-def render_assistant_response_html(assistant_final: str, *, label: str = RESPONSE_LABEL) -> str:
-    # The Response is the answer the reader came for, so it renders as the open
-    # top-level body (not buried in a <details> card): a bold marker, one blank
-    # line, then the rich blocks.
-    #
-    # Spacing note (empirical, from Telegram rich rendering): <p>/<h4> block
-    # margins are negligible (a <p> title glues to the body) and a single <br>
-    # glues too -- only a blank line (<br><br>) makes a visible gap. To keep that
-    # gap to ONE empty line rather than a huge one, the body's headings are
-    # demoted to <h4> (negligible top margin) so a full <h3> heading doesn't stack
-    # its own margin on top of the blank line below the title.
+def render_assistant_response_html(
+    assistant_final: str,
+    *,
+    label: str = RESPONSE_LABEL,
+    open_by_default: bool = True,
+) -> str:
+    # The owner wants the Response itself to be expandable: the newest final is
+    # open, and the historical-final sweep re-renders the same details block
+    # closed once a newer final supersedes it. Keep the answer in this one block
+    # so changing presentation never duplicates or rewrites its content.
     clean = str(assistant_final or "").strip()
     if not clean:
         return ""
     body_html = render_final_reply_html(clean, seen_heading=True) or _rich_paragraph(clean)
-    marker = f"<b>{RESPONSE_ICON} {_html_text(label or RESPONSE_LABEL, 80)}</b>"
-    return f"{marker}<br><br>{body_html}"
+    return _rich_details_quote_html(
+        label or RESPONSE_LABEL,
+        body_html,
+        icon=RESPONSE_ICON,
+        open_by_default=open_by_default,
+    )
 
 
 def render_source_v2_working_update_html(worklog_text: str, *, label: str = WORKING_LABEL) -> str:
@@ -557,63 +578,20 @@ def render_source_v2_working_update_html(worklog_text: str, *, label: str = WORK
 
 
 def render_turn_item_html(item: dict[str, Any]) -> str:
-    # Layout (source mode): the Response is the open, prominent top-level body;
-    # the user prompt (and any in-progress worklog) are de-emphasized collapsible
-    # sections below it. No redundant top worker title -- the Telegram topic
-    # already names the worker, and an extra <h3> only added a margin-bearing
-    # block above the first section.
+    # Layout (source mode): the Response is an open details block until a newer
+    # final supersedes it, while the user prompt (and any in-progress worklog)
+    # are de-emphasized collapsible sections below it. No redundant top worker
+    # title -- the Telegram topic already names the worker.
     user_text = str(item.get("user_text") or "").strip()
     worklog_text = str(item.get("worklog_text") or item.get("assistant_stream_text") or "").strip()
     worklog_label = str(item.get("worklog_label") or WORKING_LABEL).strip() or WORKING_LABEL
     assistant_final = str(item.get("assistant_final_text") or "").strip()
     parts: list[str] = []
-    if assistant_final and item.get("collapse_response"):
-        # sendMessage does not support the rich-message <details> element.
-        # Use Bot API's expandable blockquote so the provider-applied payload
-        # is genuinely collapsed and contains the answer exactly once. Keep
-        # every sibling section on sendMessage-supported markup too; one
-        # unsupported <details>/<footer> would make Telegram reject the whole
-        # edit and fall back to an expanded plain rendering.
-        body_html = "<br>".join(
-            _rich_inline(line, MAX_REPLY_CHARS)
-            for line in sanitize_text(
-                assistant_final, MAX_REPLY_CHARS
-            ).splitlines()
-        )
-        label = _html_text(
-            str(item.get("response_label") or RESPONSE_LABEL), 80
-        )
-        response_html = (
-            f"<b>{RESPONSE_ICON} {label}</b>\n"
-            f"<blockquote expandable>{body_html}</blockquote>"
-        )
-        parts.append(response_html)
-        if user_text:
-            user_body = "<br>".join(
-                _rich_inline(line, MAX_REPLY_CHARS)
-                for line in sanitize_text(
-                    user_text, MAX_REPLY_CHARS
-                ).splitlines()
-            )
-            parts.append(
-                f"<b>{YOU_ICON} {USER_PROMPT_LABEL}</b>\n"
-                f"<blockquote>{user_body}</blockquote>"
-            )
-        if worklog_text:
-            worklog_body = "<br>".join(
-                _rich_inline(line, 900)
-                for line in sanitize_text(
-                    worklog_text, WORKLOG_MAX_CHARS
-                ).splitlines()
-            )
-            parts.append(
-                f"<b>{WORKING_ICON} "
-                f"{_html_text(worklog_label, 80)}</b>\n"
-                f"<blockquote>{worklog_body}</blockquote>"
-            )
-        return "\n\n".join(parts).strip()
-    else:
-        response_html = render_assistant_response_html(assistant_final, label=str(item.get("response_label") or RESPONSE_LABEL))
+    response_html = render_assistant_response_html(
+        assistant_final,
+        label=str(item.get("response_label") or RESPONSE_LABEL),
+        open_by_default=not bool(item.get("collapse_response")),
+    )
     if response_html:
         parts.append(response_html)
     if user_text:
@@ -823,7 +801,9 @@ def prepare_turn_delivery_parts(
 
     Production plans to the stricter plain bound even though rich is attempted
     first. That makes a provider rejection degradable without changing the
-    durable part coordinates or inventing a second lifecycle.
+    durable part coordinates or inventing a second lifecycle. This canonical
+    planner is deliberately lossless and uncapped; the logical-delivery caller
+    applies the owner-visible physical-card ceiling and records its outcome.
     """
     if live or str(item.get("kind") or "").lower() != "turn":
         return []
@@ -1270,9 +1250,9 @@ def edit_rich_message(
             RuntimeError("Telegram physical-write budget exhausted"),
             physical_writes=0,
         )
-    # Collapse edits use the same allowlist boundary as canonical sends:
-    # preserve expandable blockquotes, but turn unsupported builder markup
-    # such as <br> into the literal newlines accepted by Telegram.
+    # A rich-only presentation (currently the closed Response details block)
+    # degrades through the normal readable Telegram allowlist. The fallback is
+    # intentionally expanded: sendMessage cannot preserve rich-card details.
     fallback = (
         telegram_html(str(html_text or ""), limit=MAX_REPLY_CHARS).strip()
         if preserve_plain_html
@@ -1397,13 +1377,12 @@ def edit_rich_message(
                 "supported",
             )
     if preserve_plain_html:
-        # TelegramClient reports ``html-no-expandable`` or ``plain`` when it
-        # had to shed the expandable blockquote. Those are readable edits, but
-        # they are not folds and must never authorize binding["folded"].
+        # Only sendRichMessage can apply the Response details presentation.
+        # Any HTML/plain fallback is readable and expanded, so it must never
+        # authorize binding["folded"].
         result["collapse_applied"] = bool(
             result.get("ok")
-            and str(result.get("format") or "html")
-            in {"html", "rich"}
+            and str(result.get("format") or "") == "rich"
         )
     return result
 

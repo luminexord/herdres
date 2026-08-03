@@ -175,19 +175,38 @@ class _RichCardRecipientParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.text: list[str] = []
         self.tags: list[str] = []
+        self.details: list[dict[str, object]] = []
         self.table_rows: list[list[str]] = []
         self._row: list[str] | None = None
         self._cell: list[str] | None = None
+        self._details_stack: list[dict[str, object]] = []
+        self._in_summary = 0
 
-    def handle_starttag(self, tag, _attrs):
+    def handle_starttag(self, tag, attrs):
         self.tags.append(tag)
-        if tag == "tr":
+        if tag == "details":
+            detail = {
+                "type": "PageBlockDetails",
+                "open": any(name == "open" for name, _value in attrs),
+                "summary": [],
+                "body": [],
+            }
+            self.details.append(detail)
+            self._details_stack.append(detail)
+        elif tag == "summary":
+            self._in_summary += 1
+        elif tag == "tr":
             self._row = []
         elif tag in {"th", "td"} and self._row is not None:
             self._cell = []
 
     def handle_endtag(self, tag):
-        if tag in {"th", "td"} and self._row is not None:
+        if tag == "summary":
+            self._in_summary = max(0, self._in_summary - 1)
+        elif tag == "details":
+            if self._details_stack:
+                self._details_stack.pop()
+        elif tag in {"th", "td"} and self._row is not None:
             self._row.append("".join(self._cell or []))
             self._cell = None
         elif tag == "tr" and self._row is not None:
@@ -196,6 +215,11 @@ class _RichCardRecipientParser(HTMLParser):
 
     def handle_data(self, data):
         self.text.append(data)
+        if self._details_stack:
+            target = (
+                "summary" if self._in_summary else "body"
+            )
+            self._details_stack[-1][target].append(data)
         if self._cell is not None:
             self._cell.append(data)
 
@@ -234,6 +258,14 @@ class RichCardRecipientTelegram(RecipientTelegram):
             "format": "rich",
             "text": "".join(parser.text),
             "blocks": list(parser.tags),
+            "details": [
+                {
+                    **detail,
+                    "summary": "".join(detail["summary"]),
+                    "body": "".join(detail["body"]),
+                }
+                for detail in parser.details
+            ],
             "table_rows": parser.table_rows,
         }
         if method == "editMessageText":
@@ -567,7 +599,7 @@ def test_quoted_reply_separates_author_label_from_recipient_text():
         ),
     ],
 )
-def test_formatted_multiline_collapse_edit_preserves_recipient_entities(
+def test_formatted_multiline_fold_fallback_is_readable_but_not_collapsed(
     item,
     expected_url,
 ):
@@ -583,7 +615,7 @@ def test_formatted_multiline_collapse_edit_preserves_recipient_entities(
 
     assert result["ok"] is True
     assert result["format"] == "html"
-    assert result["collapse_applied"] is True
+    assert result["collapse_applied"] is False
     assert len(client.attempts) == 1
     assert client.attempts[0]["method"] == "editMessageText"
     assert "<br>" not in client.attempts[0]["text"]
@@ -596,10 +628,13 @@ def test_formatted_multiline_collapse_edit_preserves_recipient_entities(
         "type": "TextUrl",
         "url": expected_url,
     } in received["entities"]
-    assert "**" not in received["text"]
-    assert "`" not in received["text"]
-    assert "*italic detail*" not in received["text"]
-    assert "[reference](" not in received["text"]
+    # Working keeps its established plain-text summary preview above the
+    # formatted body; the response and prompt have no markdown-bearing preview.
+    if expected_url != "https://example.test/worklog":
+        assert "**" not in received["text"]
+        assert "`" not in received["text"]
+        assert "*italic detail*" not in received["text"]
+        assert "[reference](" not in received["text"]
 
 
 @pytest.mark.parametrize(

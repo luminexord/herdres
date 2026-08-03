@@ -3,13 +3,17 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import time
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import herdres
 import pytest
 from herdres_connector import config, doctor, source_sync, state
-from herdres_connector.rich_delivery import split_legacy_message_ids
+from herdres_connector.rich_delivery import (
+    TURN_DELIVERY_PLAIN_SOURCE_CHARS,
+    split_legacy_message_ids,
+)
 from herdres_connector.source_sync import PRESENTATION_VERSION, SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import RateLimited, TelegramClient, TelegramError
 from test_source_only import FakeTelegram, _source_worker, _store
@@ -1091,6 +1095,721 @@ def test_turn_final_drain_does_not_exceed_feed_write_budget(
     assert result["tendwire_turn_final"]["operations"] == 0
 
 
+def test_stopped_mid_creation_plan_ages_to_visible_terminal_hold(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "HERDRES_PARTIAL_FINAL_ESCALATION_SECONDS", "30"
+    )
+    store = _store()
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-mid-create",
+                "status": "working",
+                "space_id": "space-1",
+                "fingerprint": "mid-create-fp",
+            }
+        ),
+        topic_id="77",
+    )
+    source_sync._set_pending_turn_plan(
+        entry,
+        turn_id="turn-mid-create",
+        revision="twrev1.mid_create",
+        plan_token="twplan1.mid_create",
+        part_count=11,
+        job_count=7,
+        now=time.time() - 31,
+    )
+    for ordinal in range(7):
+        state.reserve_tendwire_turn_job(
+            store,
+            f"turn-final:twplan1.mid_create:{ordinal:06d}",
+            plan_token="twplan1.mid_create",
+            content_revision="twrev1.mid_create",
+            operation="upsert",
+            sequence_index=ordinal,
+            part_ordinal=ordinal,
+            part_count=11,
+            bot_kind="manager",
+        )
+
+    class StoppedPlan:
+        def connector_prepare_commit(self, *, plan_token):
+            return {
+                "ok": True,
+                "plan_token": plan_token,
+                "state": "active",
+                "job_count": 7,
+            }
+
+    visible_before_reconcile = doctor.outbound_partial_finals(store)
+    checkpoints = []
+    changed = source_sync._reconcile_completed_turn_plans(
+        store,
+        SyncRuntime(
+            StoppedPlan(),
+            DeletingTelegram(),
+            with_outbox=True,
+            checkpoint=lambda: checkpoints.append("checkpoint"),
+        ),
+        pending_entry=entry,
+    )
+    hold = state.find_partial_final_delivery(
+        store, "turn-mid-create", "twrev1.mid_create"
+    )
+
+    assert visible_before_reconcile["ok"] is False
+    assert (
+        visible_before_reconcile["status"]
+        == "pending_turn_plan_stalled"
+    )
+    stalled = visible_before_reconcile["first_stalled_plan"]
+    assert stalled["turn_id"] == "turn-mid-create"
+    assert stalled["plan_token"] == "twplan1.mid_create"
+    assert stalled["worker_id"] == "worker-mid-create"
+    assert stalled["topic_id"] == "77"
+    assert stalled["age_seconds"] >= 30
+    assert changed == 1
+    assert checkpoints == ["checkpoint"]
+    assert hold is not None
+    assert hold["status"] == "held"
+    assert hold["request_phase"] == "pending_plan_incomplete"
+    assert hold["created_part_ordinals"] == list(range(7))
+    assert hold["reported_created_job_count"] == 7
+    assert hold["unwitnessed_created_job_count"] == 0
+    assert hold["missing_part_ordinals"] == [7, 8, 9, 10]
+    assert hold["operator_attention_required"] is True
+    assert "pending_turn_id" not in entry
+    assert doctor.outbound_partial_finals(store)["ok"] is False
+
+
+def test_dead_lettered_child_immediately_holds_parent_plan(monkeypatch):
+    monkeypatch.setenv(
+        "HERDRES_PARTIAL_FINAL_ESCALATION_SECONDS", "300"
+    )
+    store = _store()
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-dead-child",
+                "status": "working",
+                "space_id": "space-1",
+                "fingerprint": "dead-child-fp",
+            }
+        ),
+        topic_id="78",
+    )
+    source_sync._set_pending_turn_plan(
+        entry,
+        turn_id="turn-dead-child",
+        revision="twrev1.dead_child",
+        plan_token="twplan1.dead_child",
+        part_count=3,
+        job_count=2,
+    )
+    job_key = "turn-final:twplan1.dead_child:000001"
+    state.reserve_tendwire_turn_job(
+        store,
+        job_key,
+        plan_token="twplan1.dead_child",
+        content_revision="twrev1.dead_child",
+        operation="upsert",
+        sequence_index=1,
+        part_ordinal=1,
+        part_count=3,
+        bot_kind="manager",
+    )
+    state.update_tendwire_turn_job(
+        store, job_key, substate="failed"
+    )
+
+    class FailedPlan:
+        def connector_prepare_commit(self, *, plan_token):
+            return {
+                "ok": True,
+                "plan_token": plan_token,
+                "state": "failed",
+                "job_count": 2,
+            }
+
+    changed = source_sync._reconcile_completed_turn_plans(
+        store,
+        SyncRuntime(
+            FailedPlan(), DeletingTelegram(), with_outbox=True
+        ),
+        pending_entry=entry,
+    )
+    hold = state.find_partial_final_delivery(
+        store, "turn-dead-child", "twrev1.dead_child"
+    )
+
+    assert changed == 1
+    assert hold is not None
+    assert hold["request_phase"] == "pending_plan_incomplete"
+    assert hold["created_part_ordinals"] == [1]
+    assert hold["reported_created_job_count"] == 2
+    assert hold["unwitnessed_created_job_count"] == 1
+    assert hold["missing_part_ordinals"] == [0, 2]
+    assert hold["failed_part_index"] == 1
+    assert doctor.outbound_partial_finals(store)["ok"] is False
+
+
+def test_oversize_final_is_explicit_terminal_and_delivers_topic_notice(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
+    store = _store()
+    exact_answer = "x" * (TURN_DELIVERY_PLAIN_SOURCE_CHARS * 8 + 1)
+    row = _turn_row(
+        "turn-oversize",
+        "twrev1.oversize",
+        exact_answer,
+        user="legitimate large request",
+    )
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+        topic_id="77",
+    )
+    telegram = DeletingTelegram()
+
+    with pytest.raises(source_sync._TurnContentError) as raised:
+        source_sync._stage_final_plan(
+            store,
+            row,
+            entry,
+            SyncRuntime(
+                TurnFinalTendwire(row),
+                telegram,
+                dry_run=False,
+                with_outbox=False,
+            ),
+        )
+
+    hold = state.find_partial_final_delivery(
+        store, "turn-oversize", "twrev1.oversize"
+    )
+    assert raised.value.status == "oversize_presentation"
+    assert hold is not None
+    assert hold["request_phase"] == "oversize_presentation"
+    assert hold["terminal_outcome"] == "not_delivered"
+    assert hold["recovery_action"] == (
+        "retrieve-canonical-source-or-supersede-with-shorter-answer"
+    )
+    assert len(telegram.recipient_messages) == 1
+    notice = next(iter(telegram.recipient_messages.values()))["content"]
+    assert "Answer held: exceeds Telegram card limit" in notice
+    assert "turn-oversize" in notice
+    assert f"{len(exact_answer):,} characters" in notice
+    assert hashlib.sha256(exact_answer.encode()).hexdigest() in notice
+    assert "authenticated Tendwire source" in notice
+    assert exact_answer not in notice
+    assert hold["message_ids"] == []
+    assert hold["oversize_notice_status"] == "accepted"
+    assert hold["oversize_notice_message_id"] in (
+        telegram.recipient_messages
+    )
+    assert hold["answer_char_length"] == len(exact_answer)
+    assert hold["answer_sha256"] == hashlib.sha256(
+        exact_answer.encode()
+    ).hexdigest()
+    assert "pending_turn_started_at" not in entry
+    assert state.delivered_turns(store) == {}
+    assert doctor.outbound_partial_finals(store)["ok"] is False
+
+
+class AmbiguousAcceptedOversizeNoticeTelegram(TelegramClient):
+    def __init__(self):
+        super().__init__(token="test")
+        object.__setattr__(self, "recipient_messages", [])
+        object.__setattr__(self, "attempts", 0)
+
+    def api(self, method, payload):
+        assert method == "sendMessage"
+        self.attempts += 1
+        self.recipient_messages.append(str(payload.get("text") or ""))
+        raise TelegramError(
+            "network response lost after Telegram accepted the message"
+        )
+
+
+class RejectedOversizeNoticeTelegram(TelegramClient):
+    def __init__(self):
+        super().__init__(token="test")
+        object.__setattr__(self, "attempts", [])
+
+    def api(self, method, payload):
+        assert method == "sendMessage"
+        self.attempts.append(str(payload.get("parse_mode") or "plain"))
+        raise TelegramError("Bad Request: oversize notice rejected")
+
+
+def _legacy_oversize_notice_case(telegram):
+    store = _store()
+    row = _turn_row(
+        "turn-oversize-notice-failure",
+        "twrev1.oversize_notice_failure",
+        "x" * (TURN_DELIVERY_PLAIN_SOURCE_CHARS * 8 + 1),
+        user="legitimate large request",
+    )
+    row.pop("content")
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-1",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-1",
+            }
+        ),
+        topic_id="77",
+    )
+    runtime = SyncRuntime(
+        TurnFinalTendwire(
+            _turn_row(
+                "unused",
+                "twrev1.unused",
+                "unused",
+            )
+        ),
+        telegram,
+        with_outbox=False,
+        max_sends=8,
+    )
+    return store, row, entry, runtime
+
+
+def test_ambiguous_oversize_notice_accepts_once_without_plain_replay():
+    telegram = AmbiguousAcceptedOversizeNoticeTelegram()
+    store, row, entry, runtime = _legacy_oversize_notice_case(telegram)
+
+    assert not source_sync._deliver_final(
+        store, row, entry, runtime, chat_id="-100"
+    )
+    # A later pass must not retry a possibly accepted owner-visible send.
+    runtime.delivery_write_budget = None
+    assert not source_sync._deliver_final(
+        store, row, entry, runtime, chat_id="-100"
+    )
+
+    hold = next(iter(state.active_partial_final_deliveries(store)))
+    health = doctor.outbound_partial_finals(store)
+    assert telegram.attempts == 1
+    assert len(telegram.recipient_messages) == 1
+    assert "Answer held: exceeds Telegram card limit" in (
+        telegram.recipient_messages[0]
+    )
+    assert hold["oversize_notice_status"] == "delivery_unknown"
+    assert hold["oversize_notice_terminal"] is True
+    assert health["first_hold"]["oversize_notice_status"] == (
+        "delivery_unknown"
+    )
+
+
+def test_rejected_oversize_notice_retries_three_times_then_is_terminal():
+    telegram = RejectedOversizeNoticeTelegram()
+    store, row, entry, runtime = _legacy_oversize_notice_case(telegram)
+
+    assert not source_sync._deliver_final(
+        store, row, entry, runtime, chat_id="-100"
+    )
+    first_health = doctor.outbound_partial_finals(store)
+    assert first_health["first_hold"]["oversize_notice_status"] == (
+        "failed"
+    )
+    assert "oversize notice rejected" in first_health["first_hold"][
+        "oversize_notice_error"
+    ]
+
+    # Two more definite attempts reach the cap; the fourth pass is a no-op.
+    for _attempt in range(source_sync._OVERSIZE_NOTICE_ATTEMPT_CAP):
+        runtime.delivery_write_budget = None
+        assert not source_sync._deliver_final(
+            store, row, entry, runtime, chat_id="-100"
+        )
+
+    hold = next(iter(state.active_partial_final_deliveries(store)))
+    health = doctor.outbound_partial_finals(store)
+    assert telegram.attempts == ["HTML", "HTML", "HTML"]
+    assert hold["oversize_notice_attempt_count"] == 3
+    assert hold["oversize_notice_attempt_cap"] == 3
+    assert hold["oversize_notice_status"] == "terminal_failed"
+    assert hold["oversize_notice_terminal"] is True
+    assert "oversize notice rejected" in hold["oversize_notice_error"]
+    assert health["first_hold"]["oversize_notice_status"] == (
+        "terminal_failed"
+    )
+    assert health["first_hold"]["oversize_notice_attempt_count"] == 3
+    assert "oversize notice rejected" in health["first_hold"][
+        "oversize_notice_error"
+    ]
+    assert "pending_turn_started_at" not in entry
+
+
+def _operator_hold_record(
+    turn_id: str,
+    content_hash: str,
+    *,
+    created_at: float,
+    notice_status: str | None = None,
+    notice_error: str = "",
+) -> dict:
+    record = {
+        "schema_version": state.PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION,
+        "turn_id": turn_id,
+        "content_hash": content_hash,
+        "status": "held",
+        "request_phase": "partial_final_delivery",
+        "terminal_outcome": "delivery_unknown",
+        "transport_disposition": "accepted_prefix",
+        "delivery_complete": False,
+        "operator_attention_required": True,
+        "automatic_replay_authorized": False,
+        "recovery_action": "accept-partial",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "original_worker_id": "worker-1",
+        "original_topic_id": "77",
+        "current_worker_id": "worker-1",
+        "current_topic_id": "77",
+        "error": "multipart final incomplete",
+    }
+    if notice_status is not None:
+        record.update(
+            {
+                "request_phase": "oversize_presentation",
+                "transport_disposition": "not_delivered",
+                "terminal_outcome": "not_delivered",
+                "recovery_action": (
+                    "retrieve-canonical-source-or-supersede-with-shorter-answer"
+                ),
+                "oversize_notice_status": notice_status,
+                "oversize_notice_error": notice_error,
+                "oversize_notice_attempt_count": 3,
+                "oversize_notice_attempt_cap": 3,
+                "oversize_notice_terminal": notice_status in {
+                    "delivery_unknown",
+                    "terminal_failed",
+                },
+            }
+        )
+    return record
+
+
+def _store_operator_holds(store: dict, records: list[dict]) -> None:
+    ledger = state.partial_final_deliveries(store, create=True)
+    for record in records:
+        ledger[
+            state.partial_final_delivery_key(
+                record["turn_id"], record["content_hash"]
+            )
+        ] = record
+
+
+def test_later_terminal_oversize_notice_is_visible_behind_older_hold():
+    store = _store()
+    _store_operator_holds(
+        store,
+        [
+            _operator_hold_record(
+                "turn-older-unknown",
+                "twrev1.older_unknown",
+                created_at=1.0,
+            ),
+            _operator_hold_record(
+                "turn-later-oversize",
+                "twrev1.later_oversize",
+                created_at=2.0,
+                notice_status="terminal_failed",
+                notice_error="notice rejected by Telegram",
+            ),
+        ],
+    )
+
+    health = state.partial_final_delivery_health(
+        store, now=10.0, escalation_seconds=300
+    )
+
+    assert health["first_hold"]["turn_id"] == "turn-older-unknown"
+    assert [row["turn_id"] for row in health["active_holds"]] == [
+        "turn-older-unknown",
+        "turn-later-oversize",
+    ]
+    attention = health["oversize_notice_attention"]
+    assert len(attention) == 1
+    assert attention[0]["turn_id"] == "turn-later-oversize"
+    assert attention[0]["oversize_notice_status"] == "terminal_failed"
+    assert attention[0]["oversize_notice_error"] == (
+        "notice rejected by Telegram"
+    )
+    assert health["oversize_notice_attention_projection"] == {
+        "total": 1,
+        "returned": 1,
+        "omitted": 0,
+        "truncated": False,
+        "limit": None,
+    }
+
+
+def test_operator_can_enumerate_every_active_hold_and_notice_failure():
+    store = _store()
+    records = [
+        _operator_hold_record(
+            "turn-held-generic",
+            "twrev1.held_generic",
+            created_at=1.0,
+        ),
+        _operator_hold_record(
+            "turn-notice-failed",
+            "twrev1.notice_failed",
+            created_at=2.0,
+            notice_status="failed",
+            notice_error="definite rejection",
+        ),
+        _operator_hold_record(
+            "turn-notice-unknown",
+            "twrev1.notice_unknown",
+            created_at=3.0,
+            notice_status="delivery_unknown",
+            notice_error="response lost after acceptance",
+        ),
+    ]
+    _store_operator_holds(store, records)
+
+    health = doctor.outbound_partial_finals(store, now=10.0)
+
+    assert {
+        (row["turn_id"], row["content_hash"])
+        for row in health["active_holds"]
+    } == {
+        (record["turn_id"], record["content_hash"])
+        for record in records
+    }
+    assert {
+        (
+            row["turn_id"],
+            row["oversize_notice_status"],
+            row["oversize_notice_error"],
+        )
+        for row in health["oversize_notice_attention"]
+    } == {
+        ("turn-notice-failed", "failed", "definite rejection"),
+        (
+            "turn-notice-unknown",
+            "delivery_unknown",
+            "response lost after acceptance",
+        ),
+    }
+
+
+def test_partial_final_health_projection_reports_visible_overflow():
+    store = _store()
+    total = state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT + 1
+    records = [
+        _operator_hold_record(
+            f"turn-overflow-{index:03d}",
+            f"twrev1.overflow_{index:03d}",
+            created_at=float(index),
+            notice_status="terminal_failed",
+            notice_error=f"rejection {index}",
+        )
+        for index in range(total)
+    ]
+    _store_operator_holds(store, records)
+
+    health = state.partial_final_delivery_health(
+        store, now=1000.0, escalation_seconds=300
+    )
+
+    assert len(health["active_holds"]) == (
+        state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT
+    )
+    assert health["active_holds_projection"] == {
+        "total": total,
+        "returned": state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT,
+        "omitted": 1,
+        "truncated": True,
+        "limit": state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT,
+    }
+    assert len(health["oversize_notice_attention"]) == total
+    assert health["oversize_notice_attention"][-1]["turn_id"] == (
+        "turn-overflow-064"
+    )
+    assert health["oversize_notice_attention"][-1][
+        "oversize_notice_error"
+    ] == "rejection 64"
+    assert health["oversize_notice_attention_projection"] == {
+        "total": total,
+        "returned": total,
+        "omitted": 0,
+        "truncated": False,
+        "limit": None,
+    }
+    assert health["operator_listing_command"] == [
+        "herdres",
+        "list-partial-finals",
+    ]
+
+
+def test_list_partial_finals_reaches_omitted_identity_and_drives_resolution(
+    monkeypatch, capsys
+):
+    store = _store()
+    total = state.PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT + 1
+    records = [
+        _operator_hold_record(
+            f"turn-{index:03d}",
+            f"twrev1.hold_{index:03d}",
+            created_at=float(index),
+            notice_status="terminal_failed",
+            notice_error=f"rejection-{index:03d}",
+        )
+        for index in range(total)
+    ]
+    _store_operator_holds(store, records)
+    monkeypatch.setattr(herdres.config, "load_env_file", lambda: None)
+    monkeypatch.setattr(
+        herdres.config, "require_source_mode", lambda: None
+    )
+    monkeypatch.setattr(herdres.state, "load_state", lambda: store)
+    list_args = herdres.build_parser().parse_args(
+        ["list-partial-finals"]
+    )
+
+    assert list_args.func(list_args) == 0
+    listing = json.loads(capsys.readouterr().out)
+
+    assert listing["complete"] is True
+    assert listing["active_count"] == total
+    assert len(listing["holds"]) == total
+    omitted = next(
+        row for row in listing["holds"] if row["turn_id"] == "turn-064"
+    )
+    assert omitted["content_hash"] == "twrev1.hold_064"
+    assert omitted["oversize_notice_status"] == "terminal_failed"
+    assert omitted["oversize_notice_error"] == "rejection-064"
+    assert omitted["resolution_action"] == "retry-missing"
+    assert omitted["resolution_command"] == [
+        "herdres",
+        "resolve-partial-final",
+        "--turn-id",
+        "turn-064",
+        "--content-hash",
+        "twrev1.hold_064",
+        "--action",
+        "retry-missing",
+        "--request-id",
+        "<unique-request-id>",
+    ]
+
+    monkeypatch.setattr(
+        herdres.state, "state_lock", lambda: nullcontext()
+    )
+
+    def save_candidate(candidate):
+        saved = deepcopy(candidate)
+        store.clear()
+        store.update(saved)
+
+    monkeypatch.setattr(herdres.state, "save_state", save_candidate)
+    assert herdres.cmd_resolve_partial_final(
+        SimpleNamespace(
+            turn_id=omitted["turn_id"],
+            content_hash=omitted["content_hash"],
+            action=omitted["resolution_action"],
+            request_id="operator-list-resolution-064",
+        )
+    ) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    assert resolved["status"] == "partial_final_recovery_authorized"
+    assert resolved["turn_id"] == "turn-064"
+    assert resolved["content_hash"] == "twrev1.hold_064"
+    assert state.find_partial_final_delivery(
+        store, "turn-064", "twrev1.hold_064"
+    )["status"] == "retry_authorized"
+
+
+def test_sync_loop_journals_later_oversize_notice_failure(
+    monkeypatch, capsys
+):
+    store = _store()
+    _store_operator_holds(
+        store,
+        [
+            _operator_hold_record(
+                "turn-older-unknown",
+                "twrev1.older_unknown",
+                created_at=1.0,
+            ),
+            _operator_hold_record(
+                "turn-journaled-oversize",
+                "twrev1.journaled_oversize",
+                created_at=2.0,
+                notice_status="terminal_failed",
+                notice_error="journal-visible Telegram rejection",
+            ),
+        ],
+    )
+    health = state.partial_final_delivery_health(
+        store, now=10.0, escalation_seconds=300
+    )
+    result = {
+        "ok": False,
+        "status": health["status"],
+        "outbound_partial_finals": health,
+    }
+
+    class StopLoop(RuntimeError):
+        pass
+
+    class FakeDispatcher:
+        def __init__(self, *_args, **_kwargs):
+            self.stopped = False
+
+        def start(self):
+            return None
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr(herdres.config, "load_env_file", lambda: None)
+    monkeypatch.setattr(herdres.config, "require_source_mode", lambda: None)
+    monkeypatch.setattr(
+        herdres.config, "tendwire_db_path", lambda: "/tmp/tendwire-test.db"
+    )
+    monkeypatch.setattr(herdres, "OutboundDispatcher", FakeDispatcher)
+    monkeypatch.setattr(herdres, "_sync_pass", lambda: result)
+    def stop_sleep(_seconds):
+        raise StopLoop
+
+    monkeypatch.setattr(time, "sleep", stop_sleep)
+
+    with pytest.raises(StopLoop):
+        herdres.cmd_sync(SimpleNamespace(loop=1.0))
+
+    journaled = json.loads(capsys.readouterr().out.strip())
+    attention = journaled["outbound_partial_finals"][
+        "oversize_notice_attention"
+    ]
+    assert attention[0]["turn_id"] == "turn-journaled-oversize"
+    assert attention[0]["oversize_notice_status"] == "terminal_failed"
+    assert attention[0]["oversize_notice_error"] == (
+        "journal-visible Telegram rejection"
+    )
+
+
 def test_short_inline_stages_and_delivers_without_page_fetch_then_two_syncs_noop(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     row = _turn_row("turn-short", "twrev1.short", "short exact final", user="exact prompt")
@@ -1378,7 +2097,9 @@ def test_revision_growth_shrink_and_wrong_owner_converge_without_surplus(monkeyp
     store = _store()
     store["telegram"]["managed_bots"] = {"claude": {"enabled": True, "token": "claude-token"}}
     telegram = DeletingTelegram()
-    first_text = "A paragraph.\n\n" * 2_500
+    # Keep this lifecycle regression below the explicit eight-card oversize
+    # terminal; oversize behavior has its own recipient-state regression.
+    first_text = "A paragraph.\n\n" * 800
     tendwire = TurnFinalTendwire(_turn_row("turn-revise", "twrev1.r1", first_text))
     sync_once(store, _runtime(tendwire, telegram, max_sends=100))
     entry = next(iter(state.source_worker_entries(store).values()))
@@ -1386,7 +2107,7 @@ def test_revision_growth_shrink_and_wrong_owner_converge_without_surplus(monkeyp
     first_count = len(entry["last_clean_message_ids"])
     assert first_count > 1
 
-    growth = "B changed.\n\n" * 7_000
+    growth = "B changed.\n\n" * 1_500
     tendwire.row = _turn_row("turn-revise", "twrev1.r2", growth)
     grow_result = sync_once(store, _runtime(tendwire, telegram, max_sends=100))
     grown_ids = list(entry["last_clean_message_ids"])

@@ -3150,7 +3150,7 @@ def test_source_working_turn_renders_working_not_response():
 
     assert item["assistant_final_text"] == ""
     assert item["worklog_text"] == "I am checking the current path."
-    assert "✅ Response" not in html
+    assert "✅ <b>Response" not in html
     assert "Working" in html
     assert "I am checking the current path." in html
 
@@ -3169,7 +3169,7 @@ def test_source_completed_stream_only_turn_can_render_response():
 
     assert item["assistant_final_text"] == "Final text from a completed stream-only turn."
     assert item["worklog_text"] == ""
-    assert "✅ Response" in html
+    assert "✅ <b>Response" in html
     assert "Final text from a completed stream-only turn." in html
 
 
@@ -3881,9 +3881,11 @@ def test_final_response_renders_common_markdown_as_telegram_html():
 
     assert "##" not in html
     assert "**" not in html
-    # No redundant top worker title; the Response is the open top-level section.
+    # No redundant top worker title; the newest Response details block is open.
     assert "<h3>Alpha</h3>" not in html
-    assert html.startswith("<b>✅ Response</b><br><br>")
+    assert html.startswith(
+        "<details open><summary>✅ <b>Response</b></summary>"
+    )
     assert "<h4>Fix it</h4>" in html
     assert "<ul>" in html
     assert "<li>keep <b>bold</b></li>" in html
@@ -3906,7 +3908,9 @@ def test_long_final_response_uses_full_visible_response_section():
         }
     )
 
-    assert html.startswith("<b>✅ Response</b><br><br>")
+    assert html.startswith(
+        "<details open><summary>✅ <b>Response</b></summary>"
+    )
     assert "<blockquote>" not in html
     assert "<blockquote expandable>" not in html
     assert "##" not in html
@@ -3927,7 +3931,7 @@ def test_oversize_rich_response_falls_back_without_raw_markdown_or_truncation(mo
             {
                 "id": "turn-huge",
                 "worker_id": "worker-1",
-                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 1_100 + tail,
+                "assistant_final_text": "## **Long**\n\n" + "- keep **rich** sections\n" * 950 + tail,
                 "complete": True,
             }
         ]
@@ -3952,6 +3956,66 @@ def test_oversize_rich_response_falls_back_without_raw_markdown_or_truncation(mo
     assert "**" not in sent_text
 
 
+def test_over_part_cap_source_final_is_visible_terminal_without_prefix(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    telegram = FakeTelegram()
+    exact_answer = "- exact legitimate answer line\n" * 1_100
+    turns = {
+        "turns": [
+            {
+                "id": "turn-over-part-cap",
+                "worker_id": "worker-1",
+                "assistant_final_text": exact_answer,
+                "complete": True,
+            }
+        ]
+    }
+
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(turns=turns),
+            telegram,
+            with_outbox=False,
+            max_sends=100,
+        ),
+    )
+    hold = next(
+        record
+        for record in state.active_partial_final_deliveries(store)
+        if record["turn_id"] == "turn-over-part-cap"
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "partial_final_not_delivered"
+    assert result["feed_sent"] == 0
+    notices = [
+        sent
+        for sent in telegram.sent
+        if "Answer held: exceeds Telegram card limit" in sent[1]
+    ]
+    assert len(notices) == 1
+    assert notices[0][2]["thread_id"] == "77"
+    assert "turn-over-part-cap" in notices[0][1]
+    assert f"{len(exact_answer):,} characters" in notices[0][1]
+    assert hashlib.sha256(exact_answer.encode()).hexdigest() in notices[0][1]
+    assert "authenticated Tendwire source" in notices[0][1]
+    assert not any(
+        "exact legitimate answer line" in sent[1]
+        for sent in telegram.sent
+    )
+    assert hold["request_phase"] == "oversize_presentation"
+    assert hold["terminal_outcome"] == "not_delivered"
+    assert hold["message_ids"] == []
+    assert hold["oversize_notice_status"] == "accepted"
+    assert "pending_turn_started_at" not in next(
+        iter(state.source_worker_entries(store).values())
+    )
+
+
 def test_sync_sends_all_long_final_response_parts(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
@@ -3970,7 +4034,9 @@ def test_sync_sends_all_long_final_response_parts(monkeypatch):
 
     result = sync_once(store, SyncRuntime(FakeTendwire(turns=turns), telegram, with_outbox=False))
 
-    response_messages = [sent[1] for sent in telegram.sent if "✅ Response" in sent[1]]
+    response_messages = [
+        sent[1] for sent in telegram.sent if "✅ <b>Response" in sent[1]
+    ]
     assert result["feed_sent"] == 1
     assert len(response_messages) >= 1
     assert any(tail in message for message in response_messages)
@@ -4005,13 +4071,15 @@ Pushed:
 
 def test_medium_final_response_renders_as_single_message():
     # A medium response (~1350 chars rendered) fits one rich message, so it is
-    # delivered as a SINGLE part with a plain "Response" marker -- no "1/N" split.
+    # delivered as a SINGLE open Response details block -- no "1/N" split.
     parts = render_feed_item_delivery_html_parts(
         {"kind": "turn", "assistant_final_text": _recent_cutoff_response_text()}
     )
 
     assert len(parts) == 1
-    assert parts[0].startswith("<b>✅ Response</b><br><br>")
+    assert parts[0].startswith(
+        "<details open><summary>✅ <b>Response</b></summary>"
+    )
     assert "4557d20 Prevent child bot target races" in parts[0]
     assert "branch: <code>tendwired</code>" in parts[0]
 
@@ -4052,26 +4120,31 @@ def test_promoted_working_final_edits_in_place_as_single_message(monkeypatch):
     assert "4557d20 Prevent child bot target races" in edited_html
     assert "branch: <code>tendwired</code>" in edited_html
     # Single message -- no "Response i/N" split labels anywhere.
-    assert "✅ Response 1/" not in edited_html
-    assert "✅ Response 1/" not in "\n".join(sent[1] for sent in telegram.sent)
+    assert "✅ <b>Response 1/" not in edited_html
+    assert "✅ <b>Response 1/" not in "\n".join(
+        sent[1] for sent in telegram.sent
+    )
 
 
 def test_oversize_response_splits_losslessly_into_labeled_parts():
     # A response too large for one rich message still splits, losslessly, into
     # labeled "Response i/N" parts -- each under the per-message cap.
     tail = "TAIL_MARKER_LOSSLESS"
-    text = "## **Long**\n\n" + ("- keep **rich** sections\n" * 1_100) + tail
+    text = "## **Long**\n\n" + ("- keep **rich** sections\n" * 950) + tail
     parts = render_feed_item_delivery_html_parts({"kind": "turn", "assistant_final_text": text})
 
     assert len(render_turn_item_html({"kind": "turn", "assistant_final_text": text})) > MAX_RICH_HTML_CHARS
     assert len(parts) > 1
     total = len(parts)
     for index, part in enumerate(parts, start=1):
-        assert part.startswith(f"<b>✅ Response {index}/{total}</b><br><br>")
+        assert part.startswith(
+            "<details open><summary>✅ "
+            f"<b>Response {index}/{total}</b></summary>"
+        )
         assert len(part) <= MAX_RICH_HTML_CHARS
     combined = "\n".join(parts)
     assert tail in combined                       # nothing cut
-    assert combined.count("<b>✅ Response ") == total  # one marker per part
+    assert combined.count("<summary>✅ <b>Response ") == total
 
 
 def test_promote_to_final_uses_bounded_formatted_sends_above_edit_cap(monkeypatch):
@@ -4109,10 +4182,14 @@ def test_promote_to_final_uses_bounded_formatted_sends_above_edit_cap(monkeypatc
     assert full_html_len > 3900            # above legacy edit cap -> cannot edit
     assert full_html_len <= MAX_RICH_HTML_CHARS
 
-    response_messages = [sent[1] for sent in telegram.sent if "✅ Response" in sent[1]]
+    response_messages = [
+        sent[1] for sent in telegram.sent if "✅ <b>Response" in sent[1]
+    ]
     assert result["feed_sent"] == 1
     assert len(response_messages) > 1
-    assert response_messages[0].startswith("<b>✅ Response 1/")
+    assert response_messages[0].startswith(
+        "<details open><summary>✅ <b>Response 1/"
+    )
     assert any(tail in message for message in response_messages)
 
 
@@ -5295,7 +5372,13 @@ def test_ten_global_status_deliveries_use_two_durability_barriers_each(
 
 @pytest.mark.parametrize(
     "kind",
-    ["topic_pinned", "retired_topic_notice", "global_pinned"],
+    [
+        "topic_pinned",
+        "retired_topic_notice",
+        "global_pinned",
+        "oversize_notice",
+        "oversize_notice_ambiguous",
+    ],
 )
 def test_notification_acceptance_journal_closes_crash_seam(
     tmp_path, monkeypatch, kind
@@ -5307,6 +5390,13 @@ def test_notification_acceptance_journal_closes_crash_seam(
     initial = _notification_race_store(
         retired=kind == "retired_topic_notice"
     )
+    if kind.startswith("oversize_notice"):
+        source_sync._record_oversize_final_delivery(
+            initial,
+            initial["panes"]["worker:notification-race"],
+            turn_id="turn-oversize-receipt",
+            content_hash="twrev1.oversize_receipt",
+        )
     state.save_state(initial, state_path)
     telegram = CrashNotificationTelegram()
 
@@ -5314,6 +5404,21 @@ def test_notification_acceptance_journal_closes_crash_seam(
         raise RuntimeError("crash after notification acceptance")
 
     def deliver(current, runtime):
+        if kind.startswith("oversize_notice"):
+            return bool(
+                source_sync._notify_oversize_final(
+                    current,
+                    {
+                        "assistant_final_text": "exact oversized answer",
+                    },
+                    current["panes"]["worker:notification-race"],
+                    runtime,
+                    chat_id="-100",
+                    turn_id="turn-oversize-receipt",
+                    content_hash="twrev1.oversize_receipt",
+                    part_count=9,
+                )
+            )
         if kind == "topic_pinned":
             entry = current["panes"]["worker:notification-race"]
             return source_sync._sync_topic_pinned(
@@ -5365,6 +5470,17 @@ def test_notification_acceptance_journal_closes_crash_seam(
         assert len(
             current["telegram"]["accepted_notification_messages"]
         ) == 1
+        if kind == "oversize_notice_ambiguous":
+            receipt = next(
+                iter(
+                    current["telegram"][
+                        "accepted_notification_messages"
+                    ].values()
+                )
+            )
+            # The provider acceptance remains durable, but current ownership
+            # can no longer be proven from the receipt after restart.
+            receipt["provenance"] = {}
         runtime = source_sync._offlock_runtime(
             current,
             SyncRuntime(
@@ -5379,7 +5495,9 @@ def test_notification_acceptance_journal_closes_crash_seam(
         retired, pending = source_sync._drain_accepted_notifications(
             current, runtime, chat_id="-100"
         )
-        assert deliver(current, runtime)
+        delivered_again = deliver(current, runtime)
+        if not kind.startswith("oversize_notice"):
+            assert delivered_again
         state.save_state(current, state_path)
 
     deleted_ids = {message_id for _chat, message_id in telegram.deleted_messages}
@@ -5387,7 +5505,40 @@ def test_notification_acceptance_journal_closes_crash_seam(
         str(row[3]) for row in telegram.sent
     } - deleted_ids
     assert (retired, pending) == (1, 0)
-    assert visible_ids == {"101"}
+    if kind.startswith("oversize_notice"):
+        # Count accepted provider sends and recipient deliveries across the
+        # crash. A surviving-set assertion alone cannot detect delete/resend.
+        assert len(telegram.sent) == 1
+        assert [str(row[3]) for row in telegram.sent] == ["100"]
+        assert delivered_again is False
+        assert "Answer held: exceeds Telegram card limit" in telegram.sent[0][1]
+        assert telegram.deleted_messages == []
+        assert visible_ids == {"100"}
+        hold = state.find_partial_final_delivery(
+            current,
+            "turn-oversize-receipt",
+            "twrev1.oversize_receipt",
+        )
+        assert hold["oversize_notice_status"] == (
+            "delivery_unknown"
+            if kind == "oversize_notice_ambiguous"
+            else "accepted"
+        )
+        assert hold["oversize_notice_message_id"] == "100"
+        if kind == "oversize_notice":
+            assert state.find_message_binding(current, "100") is not None
+        else:
+            health = state.partial_final_delivery_health(
+                current, now=0.0, escalation_seconds=300
+            )
+            assert health["oversize_notice_attention"][0][
+                "turn_id"
+            ] == "turn-oversize-receipt"
+            assert health["oversize_notice_attention"][0][
+                "oversize_notice_status"
+            ] == "delivery_unknown"
+    else:
+        assert visible_ids == {"101"}
     assert not state.accepted_notification_journal_path(
         state_path
     ).exists()
