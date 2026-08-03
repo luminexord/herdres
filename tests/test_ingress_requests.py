@@ -1803,6 +1803,11 @@ def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
     assert record["submission_id"] == submission_id
     assert record["submission_state"] == "pending_observation"
     assert record["turn_id"] is None
+    assert record["transport_disposition"] == "written_to_pty"
+    assert record["request_phase"] == "accepted_unverified"
+    assert record["terminal_outcome"] == "delivery_unknown"
+    assert record["outcome"]["checkpoint"] == "hold"
+    assert record["operator_attention_required"] is True
     assert record["target_owner"]["stable_key"].startswith("wsk1_")
     source_workers = [
         {
@@ -1892,6 +1897,13 @@ def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
     assert record["submission_state"] == "linked"
     assert record["turn_id"] == "turn-observed"
     assert record["linked_at"] is not None
+    assert record["transport_disposition"] == "submitted"
+    assert record["request_phase"] == "terminal"
+    assert record["terminal_outcome"] == "delivered"
+    assert record["outcome"]["checkpoint"] == "advance"
+    assert record["operator_attention_required"] is False
+    assert record["blocked_reason"] is None
+    assert record["next_action"] is None
     entry = next(iter(state.source_worker_entries(submission_store).values()))
     assert entry["last_stream_submission_id"] == submission_id
     assert entry["last_stream_turn_id"] == "turn-observed"

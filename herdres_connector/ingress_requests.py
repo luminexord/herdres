@@ -1606,6 +1606,24 @@ def link_submission(
         turn_id,
         now=timestamp,
     )
+    # A transport acceptance is intentionally held until Tendwire's source
+    # stream correlates the durable submission with one authoritative turn.
+    # Promote only that exact held state: unrelated terminal outcomes and
+    # receipts that are still pending observation remain conservative.
+    if (
+        submission_state == "linked"
+        and record.get("turn_id") == turn_id
+        and record.get("transport_disposition") == "written_to_pty"
+        and record.get("request_phase") == "accepted_unverified"
+        and record.get("terminal_outcome") == "delivery_unknown"
+    ):
+        record_terminal_outcome(
+            record,
+            transport_disposition="submitted",
+            request_phase="terminal",
+            terminal_outcome="delivered",
+            now=timestamp,
+        )
     return record, record != before
 
 
