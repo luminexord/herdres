@@ -262,6 +262,140 @@ def test_claude_prompt_identity_is_stable_from_working_through_final(tmp_path):
     assert final["complete"] is True
 
 
+def test_claude_visible_usage_limit_completes_latest_open_turn(monkeypatch):
+    turn = {
+        "available": True,
+        "pane_id": "pane-1",
+        "agent": "claude",
+        "agent_session_id": "session-1",
+        "turn_id": "prompt-1",
+        "complete": False,
+        "user_text": "don't do anything about it just tell me why",
+        "assistant_final_text": "",
+    }
+    monkeypatch.setattr(
+        adapter,
+        "pane_recent_text",
+        lambda _pane_id: """
+❯ don't do anything about it just tell me why
+  ⎿  You've hit your weekly limit · resets Aug 5, 9am
+     (Asia/Hong_Kong)
+     /usage-credits to finish what you’re working on.
+
+✻ Crunched for 2s
+
+❯
+""",
+    )
+
+    completed = adapter._complete_claude_terminal_error(turn, "pane-1")
+
+    assert completed["turn_id"] == "prompt-1"
+    assert completed["complete"] is True
+    assert completed["complete_reason"] == "usage_limit"
+    assert "weekly limit" in completed["assistant_final_text"]
+    assert "/usage-credits" in completed["assistant_final_text"]
+    assert completed["recent_turns"][-1]["turn_id"] == "prompt-1"
+
+
+def test_claude_visible_old_limit_does_not_complete_newer_prompt(monkeypatch):
+    turn = {
+        "turn_id": "prompt-2",
+        "complete": False,
+        "user_text": "this prompt is newer than the visible limit",
+    }
+    monkeypatch.setattr(
+        adapter,
+        "pane_recent_text",
+        lambda _pane_id: """
+❯ old prompt
+  ⎿  You've hit your weekly limit
+     /usage-credits to finish what you’re working on.
+❯ this prompt is newer than the visible limit
+""",
+    )
+
+    assert adapter._complete_claude_terminal_error(turn, "pane-1") == turn
+
+
+def test_claude_visible_usage_limit_replaces_previous_completed_top_level(monkeypatch):
+    turn = {
+        "turn_id": "previous-turn",
+        "complete": True,
+        "user_text": "previous prompt",
+        "assistant_final_text": "previous answer",
+        "has_open_turn": True,
+        "open_turn_id": "prompt-current",
+        "open_user_text": "current prompt that hit the limit",
+        "recent_turns": [{"turn_id": "previous-turn", "complete": True}],
+    }
+    monkeypatch.setattr(
+        adapter,
+        "pane_recent_text",
+        lambda _pane_id: """
+❯ current prompt that hit the limit
+  ⎿  You've hit your weekly limit
+     /usage-credits to finish what you’re working on.
+❯
+""",
+    )
+
+    completed = adapter._complete_claude_terminal_error(turn, "pane-1")
+
+    assert completed["turn_id"] == "prompt-current"
+    assert completed["user_text"] == "current prompt that hit the limit"
+    assert completed["complete"] is True
+    assert completed["recent_turns"][-1]["turn_id"] == "prompt-current"
+
+
+def test_claude_visible_limit_requires_full_prompt_corroboration(monkeypatch):
+    turn = {
+        "turn_id": "prompt-3",
+        "complete": False,
+        "user_text": "a prompt absent from this bounded terminal snapshot",
+    }
+    monkeypatch.setattr(
+        adapter,
+        "pane_recent_text",
+        lambda _pane_id: """
+  ⎿  You've hit your weekly limit
+     /usage-credits to finish what you’re working on.
+""",
+    )
+
+    assert adapter._complete_claude_terminal_error(turn, "pane-1") == turn
+
+
+def test_claude_structured_api_error_completes_without_pane_scrape(monkeypatch):
+    turn = {
+        "turn_id": "prompt-api-error",
+        "complete": False,
+        "user_text": "current prompt",
+        "api_error": {
+            "code": "rate_limit",
+            "text": "You've hit your weekly limit · resets Aug 5, 9am (Asia/Hong_Kong)",
+        },
+    }
+    monkeypatch.setattr(
+        adapter,
+        "pane_recent_text",
+        lambda _pane_id: (_ for _ in ()).throw(
+            AssertionError("structured errors must not scrape the pane")
+        ),
+    )
+
+    completed = adapter._complete_claude_terminal_error(
+        turn,
+        "pane-1",
+        allow_visible_fallback=False,
+    )
+
+    assert completed["turn_id"] == "prompt-api-error"
+    assert completed["complete"] is True
+    assert completed["complete_reason"] == "usage_limit"
+    assert completed["assistant_final_text"].endswith("(Asia/Hong_Kong)")
+
+
 def test_claude_internal_automation_final_does_not_replace_real_turn(tmp_path):
     transcript = tmp_path / "claude-internal.jsonl"
     _append_claude_event(transcript, _claude_user("prompt-1", "Please inspect this."))

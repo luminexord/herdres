@@ -94,6 +94,13 @@ _SECRET_KV_RE = re.compile(
     r"([\"']?\s*[:=]\s*[\"']?)(\S+)"
 )
 _URL_CRED_RE = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
+_CLAUDE_USAGE_LIMIT_RE = re.compile(
+    r"\byou(?:['\N{RIGHT SINGLE QUOTATION MARK}])?ve hit your "
+    r"(?:weekly|monthly|daily|five[- ]?hour)?\s*limit\b",
+    re.IGNORECASE,
+)
+_CLAUDE_USAGE_CREDITS_RE = re.compile(r"/usage-credits\b", re.IGNORECASE)
+_CLAUDE_TUI_MESSAGE_PREFIX_RE = re.compile(r"^[\s⎿│┃┆┊●•]+")
 
 
 def _redact_secrets(text: str) -> str:
@@ -1026,6 +1033,124 @@ def pane_recent_text(pane_id: str) -> str:
     return ""
 
 
+def _claude_visible_usage_limit(pane_id: str, prompt_text: str) -> str | None:
+    """Return a terminal-only Claude usage-limit message for the latest prompt.
+
+    Claude Code does not write weekly-limit failures to its JSONL transcript.
+    We therefore use the pane only as corroborating evidence: the complete
+    normalized latest prompt must appear before the last limit marker, and no
+    later copy of that prompt may follow it.  Ambiguous or truncated evidence
+    fails closed and leaves the turn open for a later authoritative event.
+    """
+
+    prompt = normalize_for_match(prompt_text)
+    if len(prompt) < 8:
+        return None
+    pane_text = pane_recent_text(pane_id)
+    if not pane_text.strip():
+        return None
+    normalized = normalize_for_match(pane_text)
+    prompt_index = normalized.rfind(prompt)
+    matches = list(_CLAUDE_USAGE_LIMIT_RE.finditer(normalized))
+    if prompt_index < 0 or not matches:
+        return None
+    limit_index = matches[-1].start()
+    if prompt_index >= limit_index:
+        return None
+
+    lines = pane_text.splitlines()
+    marker_line = -1
+    for index, line in enumerate(lines):
+        if _CLAUDE_USAGE_LIMIT_RE.search(normalize_for_match(line)):
+            marker_line = index
+    if marker_line < 0:
+        return None
+    captured: list[str] = []
+    for line in lines[marker_line : marker_line + 5]:
+        clean = _CLAUDE_TUI_MESSAGE_PREFIX_RE.sub("", _strip_control(line)).strip()
+        if not clean:
+            if captured:
+                break
+            continue
+        if clean.startswith(("✻", "❯", "─")):
+            break
+        captured.append(clean)
+    message = _redact_secrets("\n".join(captured)).strip()
+    if not _CLAUDE_USAGE_LIMIT_RE.search(normalize_for_match(message)):
+        return None
+    if not _CLAUDE_USAGE_CREDITS_RE.search(message):
+        return None
+    return sanitize_bounded_text(message, 600)
+
+
+def _claude_structured_api_error(turn: dict[str, Any]) -> str | None:
+    error = turn.get("api_error")
+    if not isinstance(error, dict):
+        return None
+    text = _redact_secrets(
+        _strip_control(str(error.get("text") or ""))
+    ).strip()
+    if text:
+        return sanitize_bounded_text(text, 600)
+    code = _redact_secrets(
+        _strip_control(str(error.get("code") or ""))
+    ).strip()
+    if code:
+        return f"Claude ended this turn with an API error ({code[:120]})."
+    return "Claude ended this turn with an API error."
+
+
+def _complete_claude_terminal_error(
+    turn: dict[str, Any],
+    pane_id: str,
+    *,
+    allow_visible_fallback: bool = True,
+) -> dict[str, Any]:
+    """Promote a structured or corroborated terminal failure to a real final."""
+
+    if turn.get("complete") is True and turn.get("has_open_turn") is not True:
+        return turn
+    has_open_turn = turn.get("has_open_turn") is True
+    turn_id = str(
+        turn.get("open_turn_id") if has_open_turn else turn.get("turn_id") or ""
+    ).strip()
+    user_text = str(
+        turn.get("open_user_text") if has_open_turn else turn.get("user_text") or ""
+    ).strip()
+    if not turn_id or not user_text:
+        return turn
+    error_text = _claude_structured_api_error(turn)
+    if not error_text and allow_visible_fallback:
+        error_text = _claude_visible_usage_limit(pane_id, user_text)
+    if not error_text:
+        return turn
+    usage_limit = bool(_CLAUDE_USAGE_LIMIT_RE.search(normalize_for_match(error_text)))
+
+    completed = {
+        "available": True,
+        "pane_id": pane_id,
+        "agent": "claude",
+        "agent_session_id": turn.get("agent_session_id"),
+        "turn_id": turn_id,
+        "complete": True,
+        "complete_reason": "usage_limit" if usage_limit else "api_error",
+        "started_at": None,
+        "completed_at": None,
+        "user_text": user_text,
+        "assistant_final_text": error_text,
+    }
+    if turn.get("model"):
+        completed["model"] = turn["model"]
+    recent = [
+        dict(item)
+        for item in turn.get("recent_turns", [])
+        if isinstance(item, dict) and str(item.get("turn_id") or "") != turn_id
+    ]
+    recent.append(dict(completed))
+    completed["recent_turns"] = recent[-RECENT_TURNS:]
+    return completed
+
+
 def claude_sibling_count(pane: dict[str, Any]) -> int:
     """Number of claude panes sharing this pane's foreground cwd (including it).
 
@@ -1327,7 +1452,13 @@ def infer_claude_turn_from_visible_pane(pane: dict[str, Any], pane_id: str) -> d
             # Herdr's cached agent_session.value went stale (e.g. /resume after a
             # 529); the live pid map wins. Surfaced for observability only.
             turn["herdr_session_id"] = herdr_sid
-        return result_turn(turn)
+        return result_turn(
+            _complete_claude_terminal_error(
+                turn,
+                pane_id,
+                allow_visible_fallback=str(pane.get("agent_status") or "") == "idle",
+            )
+        )
 
     # SECONDARY: Herdr's cached agent_session.value. A definite id, but cached at
     # pane-bind and stale across a resume/restart, so it ranks below the live pid
@@ -1337,7 +1468,13 @@ def infer_claude_turn_from_visible_pane(pane: dict[str, Any], pane_id: str) -> d
         if path is not None and path.exists():
             turn = extract_claude_turn(path, pane_id, herdr_sid)
             turn["session_match_source"] = "herdr_agent_session"
-            return result_turn(turn)
+            return result_turn(
+                _complete_claude_terminal_error(
+                    turn,
+                    pane_id,
+                    allow_visible_fallback=str(pane.get("agent_status") or "") == "idle",
+                )
+            )
 
     candidates: list[tuple[float, Path, dict[str, Any]]] = []
     for path in claude_candidate_paths_for_pane(pane):
