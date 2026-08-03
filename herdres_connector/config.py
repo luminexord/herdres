@@ -13,6 +13,7 @@ DEFAULT_STATE_PATH = HOME / ".local/share/herdres/state.json"
 DEFAULT_OFFSET_PATH = HOME / ".local/share/herdres/gateway.offset"
 DEFAULT_PROCESSED_PATH = HOME / ".local/share/herdres/gateway_processed_messages.json"
 DEFAULT_TENDWIRE_DB_PATH = HOME / ".local/share/tendwire/tendwire.db"
+DEFAULT_TENDWIRE_SOCKET_PATH = HOME / ".local/share/tendwire/tendwire.sock"
 DEFAULT_REQUEST_ID_KEY_PATH = HOME / ".local/share/herdres/request-id.key"
 DEFAULT_INBOUND_SPOOL_PATH = HOME / ".local/share/herdres/inbound_spool.db"
 DEFAULT_HERDRES_ENV_PATH = HOME / ".config/herdres/herdres.env"
@@ -56,6 +57,18 @@ def processed_path(env: Any | None = None) -> Path:
 def tendwire_db_path(env: Any | None = None) -> Path:
     source = os.environ if env is None else env
     return Path(source.get("HERDRES_TENDWIRE_DB_PATH", source.get("TENDWIRE_DB_PATH", DEFAULT_TENDWIRE_DB_PATH))).expanduser()
+
+
+def tendwire_socket_path(env: Any | None = None) -> Path:
+    """Return the authoritative Tendwire daemon socket for child CLI calls."""
+
+    source = os.environ if env is None else env
+    return Path(
+        source.get(
+            "HERDRES_TENDWIRE_SOCKET_PATH",
+            source.get("TENDWIRE_SOCKET_PATH", DEFAULT_TENDWIRE_SOCKET_PATH),
+        )
+    ).expanduser()
 
 
 def tendwire_timeout_seconds(env: Any | None = None) -> float:

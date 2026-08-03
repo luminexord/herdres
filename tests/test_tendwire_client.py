@@ -993,6 +993,22 @@ def test_implicit_development_client_retains_source_checkout_fallback(
     ]
 
 
+def test_child_cli_is_always_bound_to_authoritative_tendwire_daemon(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TENDWIRE_SOCKET_PATH", raising=False)
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_SOCKET_PATH",
+        "/run/user/1000/tendwire-authoritative.sock",
+    )
+
+    child_env = TendwireClient()._env()
+
+    assert child_env["TENDWIRE_SOCKET_PATH"] == (
+        "/run/user/1000/tendwire-authoritative.sock"
+    )
+
+
 def test_path_qualified_env_wrapper_cannot_reintroduce_private_secret(monkeypatch):
     calls = []
     secret = "path-wrapper-private-secret"

@@ -637,6 +637,11 @@ class TendwireClient:
             current = env.get("PYTHONPATH", "")
             env["PYTHONPATH"] = str(source) if not current else f"{source}{os.pathsep}{current}"
         env.setdefault("TENDWIRE_DB_PATH", str(config.tendwire_db_path()))
+        # Every mutating Telegram command must enter the long-running daemon:
+        # it owns the ACP runtime/session coordinator.  A CLI subprocess with
+        # only the SQLite path can fall back to a direct legacy sender and
+        # report an ambiguous post-write result.
+        env["TENDWIRE_SOCKET_PATH"] = str(config.tendwire_socket_path(env))
         env.setdefault("TENDWIRE_HERDR_BACKEND", os.getenv("TENDWIRE_HERDR_BACKEND", "socket"))
         return env
 
