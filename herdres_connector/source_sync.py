@@ -7343,6 +7343,10 @@ def _deliver_working(
             )
         )
     )
+    if not edit_attempted and not _notification_acceptance_capacity_available(
+        store
+    ):
+        return False
     operation = _capture_entry_operation(
         store,
         entry,
@@ -7350,8 +7354,39 @@ def _deliver_working(
         message_id=str(entry.get("last_stream_message_id") or "")
         if edit_attempted
         else "",
-        observe=("last_stream_message_id",) if edit_attempted else (),
+        observe=(
+            ("last_stream_message_id",)
+            if edit_attempted
+            else (
+                "last_stream_message_id",
+                "last_stream_turn_id",
+                "last_stream_submission_id",
+            )
+        ),
     )
+    accepted_receipt_id = ""
+
+    def checkpoint_working_card(
+        result: Any, captured: _OfflockEntryOperation
+    ) -> None:
+        nonlocal accepted_receipt_id
+        accepted_receipt_id = _checkpoint_accepted_notification(
+            store,
+            runtime,
+            captured,
+            result,
+            chat_id=chat_id,
+            kind="working_card:"
+            + short_hash(
+                {
+                    "turn_id": turn_id,
+                    "submission_id": submission_id,
+                },
+                20,
+            ),
+            bot_kind=bot_kind,
+        )
+
     if edit_attempted:
         execution = _execute_accounted_delivery_write(
             store,
@@ -7391,6 +7426,7 @@ def _deliver_working(
                     ).remaining,
                 },
             ),
+            acceptance_checkpoint=checkpoint_working_card,
         )
     sent, resolution = execution.result, execution.resolution
     if (
@@ -7411,10 +7447,20 @@ def _deliver_working(
         entry = resolution.entry
         assert entry is not None
         _clear_stream_delivery_keys(entry)
-        if _delivery_write_budget(runtime).remaining == 0:
+        if (
+            _delivery_write_budget(runtime).remaining == 0
+            or not _notification_acceptance_capacity_available(store)
+        ):
             return False
         operation = _capture_entry_operation(
-            store, entry, topic_id=thread_id
+            store,
+            entry,
+            topic_id=thread_id,
+            observe=(
+                "last_stream_message_id",
+                "last_stream_turn_id",
+                "last_stream_submission_id",
+            ),
         )
         execution = _execute_accounted_delivery_write(
             store,
@@ -7437,6 +7483,7 @@ def _deliver_working(
                     ).remaining,
                 },
             ),
+            acceptance_checkpoint=checkpoint_working_card,
         )
         sent, resolution = execution.result, execution.resolution
     if not sent.get("ok") and _topic_missing(sent.get("error")):
@@ -7467,6 +7514,9 @@ def _deliver_working(
                     bot_kind=bot_kind,
                     submission_id=submission_id,
                 )
+            # The accepted-card receipt remains durable. The ordinary
+            # accepted-notification drain deletes this losing physical send
+            # after a concurrent stream/submission writer won ownership.
             return False
         entry = resolution.entry
         assert entry is not None
@@ -7490,6 +7540,7 @@ def _deliver_working(
             bot_kind=bot_kind,
             submission_id=submission_id,
         )
+        _complete_accepted_notification(store, accepted_receipt_id)
         return True
     if resolution.disposition != _OFFLOCK_APPLY:
         return False

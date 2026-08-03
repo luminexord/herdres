@@ -5601,6 +5601,82 @@ def test_topic_pin_rebind_checkpoints_and_retires_accepted_card(
     ] == "101"
 
 
+def test_concurrent_working_send_retires_losing_accepted_card(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
+    state.save_state(_notification_race_store(), state_path)
+
+    def publish_winning_card(current):
+        entry = current["panes"]["worker:notification-race"]
+        source_sync._set_stream_delivery(
+            entry,
+            turn_id="turn-winner",
+            content_hash="winner-hash",
+            message_id="900",
+            bot_kind="codex",
+        )
+        state.bind_message_to_worker(
+            current,
+            "900",
+            entry,
+            topic_id="77",
+            kind="working",
+            turn_id="turn-winner",
+            bot_kind="codex",
+        )
+
+    telegram = RebindingNotificationTelegram(
+        state_path, publish_winning_card
+    )
+    with state.state_lock(state_path):
+        current = state.load_state(state_path)
+        runtime = source_sync._offlock_runtime(
+            current,
+            SyncRuntime(
+                FakeTendwire(),
+                telegram,
+                with_outbox=False,
+                checkpoint=lambda: state.save_state(current, state_path),
+            ),
+        )
+        entry = current["panes"]["worker:notification-race"]
+        delivered = source_sync._deliver_working(
+            current,
+            {
+                "id": "turn-loser",
+                "worker_id": "worker-notification",
+                "space_id": "space-1",
+                "assistant_stream_text": "losing concurrent update",
+                "complete": False,
+            },
+            entry,
+            runtime,
+            chat_id="-100",
+        )
+
+        assert delivered is False
+        assert len(
+            current["telegram"]["accepted_notification_messages"]
+        ) == 1
+        assert state.find_message_binding(current, "100")["kind"] == (
+            "working_stale"
+        )
+        retired, pending = source_sync._drain_accepted_notifications(
+            current, runtime, chat_id="-100"
+        )
+
+    entry = current["panes"]["worker:notification-race"]
+    assert (retired, pending) == (1, 0)
+    assert telegram.deleted_messages == [("-100", "100")]
+    assert state.find_message_binding(current, "100") is None
+    assert entry["last_stream_message_id"] == "900"
+    assert entry["last_stream_turn_id"] == "turn-winner"
+    assert not current["telegram"].get("accepted_notification_messages")
+
+
 def test_retired_notice_rebind_checkpoints_and_retires_accepted_card(
     tmp_path, monkeypatch
 ):
