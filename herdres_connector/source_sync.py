@@ -13715,12 +13715,17 @@ def _sync_topic_pinned_statuses(
                 is_space
                 and bool(entry.get("topic_id"))
                 and not entry.get("stale_space_topic")
-                and _entry_open_for_pin(entry)
             )
         return (
             not is_space
             and bool(entry.get("topic_id"))
-            and _worker_visible_on_status_board(entry)
+            and (
+                entry.get("live_in_snapshot") is True
+                or (
+                    "live_in_snapshot" not in entry
+                    and _entry_open_for_pin(entry)
+                )
+            )
         )
 
     updated = 0

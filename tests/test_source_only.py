@@ -5113,7 +5113,7 @@ def test_space_topic_pin_loop_skips_historical_worker_rows(monkeypatch):
             "entry_type": "space",
             "topic_name": "Live",
             "topic_id": "77",
-            "status": "idle",
+            "status": "failed",
         }
     }
     store["panes"] = {
@@ -5168,6 +5168,14 @@ def test_worker_topic_pin_loop_skips_space_and_historical_rows(monkeypatch):
             "status": "idle",
             "live_in_snapshot": True,
         },
+        "worker:live-failed": {
+            "source": "tendwire",
+            "entry_type": "worker",
+            "topic_name": "Live failed worker",
+            "topic_id": "89",
+            "status": "failed",
+            "live_in_snapshot": True,
+        },
         "worker:historical": {
             "source": "tendwire",
             "entry_type": "worker",
@@ -5192,9 +5200,9 @@ def test_worker_topic_pin_loop_skips_space_and_historical_rows(monkeypatch):
         yield_barrier=lambda: yields.append(True),
     )
 
-    assert updated == 1
-    assert calls == ["Live worker"]
-    assert yields == [True]
+    assert updated == 2
+    assert calls == ["Live worker", "Live failed worker"]
+    assert yields == [True, True]
 
 
 def test_topic_pinned_status_reuses_legacy_topic_pin(monkeypatch):
