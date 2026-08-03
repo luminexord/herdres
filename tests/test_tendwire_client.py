@@ -407,16 +407,16 @@ def test_command_v3_negotiation_accepts_nullable_turn_and_v2_fallback(
     )
 
 
-def test_command_v2_rejects_nullable_turn_id(client_runner):
+def test_command_v2_accepts_nullable_turn_id(client_runner):
     client, _calls, responses = client_runner
     accepted = _accepted_result()
     accepted["turn_id"] = None
-    responses.append({"body": _command_response(result=accepted)})
+    response = _command_response(result=accepted)
+    responses.append({"body": response})
 
     result = client.command(_command_request())
 
-    assert result["status"] == "request_state_uncertain"
-    assert result["action"] == "send_instruction"
+    assert result == response
 
 
 def test_command_rejects_unsolicited_v3_envelope(client_runner):

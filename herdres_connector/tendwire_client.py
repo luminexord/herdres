@@ -332,10 +332,14 @@ def _valid_accepted_command_result(
         return False
     turn_id = value.get("turn_id")
     if "turn_id" in value:
-        if turn_id is None:
-            if response_schema_version != 3:
-                return False
-        elif not isinstance(turn_id, str) or not turn_id.strip():
+        # Tendwire schema v2 may report an accepted transport before its
+        # observational turn link exists. A null turn_id is therefore not a
+        # delivery ambiguity: terminal_accepted plus the submitted transport
+        # fields below remain the authoritative evidence. Schema v3 adds a
+        # submission_id, but does not change this nullable-link lifecycle.
+        if turn_id is not None and (
+            not isinstance(turn_id, str) or not turn_id.strip()
+        ):
             return False
     submission_id = value.get("submission_id")
     if "submission_id" in value and (
