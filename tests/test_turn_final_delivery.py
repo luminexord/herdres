@@ -11,6 +11,7 @@ import herdres
 import pytest
 from herdres_connector import config, doctor, source_sync, state
 from herdres_connector.rich_delivery import (
+    RICH_SPLIT_CHUNK_CHARS,
     TURN_DELIVERY_PLAIN_SOURCE_CHARS,
     split_legacy_message_ids,
 )
@@ -1095,6 +1096,135 @@ def test_turn_final_drain_does_not_exceed_feed_write_budget(
     assert result["tendwire_turn_final"]["operations"] == 0
 
 
+def test_sparse_legacy_rebind_cannot_downgrade_plan_binding():
+    store = _store()
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-binding-preserve",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "binding-preserve-fp",
+            }
+        ),
+        topic_id="77",
+    )
+    state.bind_message_to_worker(
+        store,
+        "501",
+        entry,
+        topic_id="77",
+        kind="final",
+        turn_id="turn-binding-preserve",
+        bot_kind="manager",
+        content_revision="twrev1.binding_preserve",
+        plan_token="twplan1.binding_preserve",
+        part_ordinal=0,
+        part_count=1,
+        tendwire_job_key=(
+            "turn-final:twplan1.binding_preserve:000000"
+        ),
+        delivery_format="rich",
+    )
+
+    state.bind_message_to_worker(
+        store,
+        "501",
+        entry,
+        topic_id="77",
+        kind="final",
+        turn_id="turn-binding-preserve",
+        bot_kind="manager",
+    )
+
+    binding = state.find_message_binding(store, "501")
+    assert binding is not None
+    assert binding["content_revision"] == "twrev1.binding_preserve"
+    assert binding["plan_token"] == "twplan1.binding_preserve"
+    assert binding["part_ordinal"] == 0
+    assert binding["part_count"] == 1
+    assert binding["delivery_format"] == "rich"
+
+
+def test_completed_plan_repairs_sparse_acknowledged_binding():
+    store = _store()
+    _key, entry, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-binding-repair",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "binding-repair-fp",
+            }
+        ),
+        topic_id="77",
+    )
+    source_sync._set_pending_turn_plan(
+        entry,
+        turn_id="turn-binding-repair",
+        revision="twrev1.binding_repair",
+        plan_token="twplan1.binding_repair",
+        part_count=1,
+        job_count=1,
+    )
+    job_key = "turn-final:twplan1.binding_repair:000000"
+    state.reserve_tendwire_turn_job(
+        store,
+        job_key,
+        plan_token="twplan1.binding_repair",
+        content_revision="twrev1.binding_repair",
+        operation="upsert",
+        sequence_index=0,
+        part_ordinal=0,
+        part_count=1,
+        telegram_message_id="502",
+        bot_kind="manager",
+    )
+    state.update_tendwire_turn_job(
+        store,
+        job_key,
+        substate="telegram_applied",
+        telegram_message_id="502",
+    )
+    state.update_tendwire_turn_job(
+        store,
+        job_key,
+        substate="acknowledged",
+    )
+    state.bind_message_to_worker(
+        store,
+        "502",
+        entry,
+        topic_id="77",
+        kind="final",
+        turn_id="turn-binding-repair",
+        bot_kind="manager",
+    )
+
+    completed = source_sync._maybe_complete_turn_plan(
+        store,
+        {
+            "id": "turn-binding-repair",
+            "worker_id": "worker-binding-repair",
+            "space_id": "space-1",
+        },
+        entry,
+        plan_token="twplan1.binding_repair",
+        revision="twrev1.binding_repair",
+    )
+
+    assert completed is True
+    binding = state.find_message_binding(store, "502")
+    assert binding is not None
+    assert binding["plan_token"] == "twplan1.binding_repair"
+    assert binding["content_revision"] == "twrev1.binding_repair"
+    assert binding["part_ordinal"] == 0
+    assert entry["last_clean_message_id"] == "502"
+    assert entry["last_clean_content_revision"] == "twrev1.binding_repair"
+
+
 def test_stopped_mid_creation_plan_ages_to_visible_terminal_hold(
     monkeypatch,
 ):
@@ -1263,7 +1393,7 @@ def test_oversize_final_is_explicit_terminal_and_delivers_topic_notice(
 ):
     monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
     store = _store()
-    exact_answer = "x" * (TURN_DELIVERY_PLAIN_SOURCE_CHARS * 8 + 1)
+    exact_answer = "x" * (RICH_SPLIT_CHUNK_CHARS * 8 + 1)
     row = _turn_row(
         "turn-oversize",
         "twrev1.oversize",
@@ -1360,7 +1490,7 @@ def _legacy_oversize_notice_case(telegram):
     row = _turn_row(
         "turn-oversize-notice-failure",
         "twrev1.oversize_notice_failure",
-        "x" * (TURN_DELIVERY_PLAIN_SOURCE_CHARS * 8 + 1),
+        "x" * (RICH_SPLIT_CHUNK_CHARS * 8 + 1),
         user="legitimate large request",
     )
     row.pop("content")
@@ -3707,6 +3837,7 @@ def test_oversized_table_row_or_header_delivers_losslessly(
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
     tendwire = TurnFinalTendwire(
         _turn_row(
             f"turn-{revision.rsplit('.', 1)[-1]}",
@@ -3733,6 +3864,7 @@ def test_fitting_large_header_repeats_on_every_continuation(
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
     header = "H" * 3_300
     table = "\n".join(
         [
@@ -3770,6 +3902,7 @@ def test_oversized_continued_header_is_not_repeated_past_effective_limit(
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "1")
     header = "H" * 3_850
     table = "\n".join(
         [
@@ -3966,9 +4099,9 @@ def test_rich_state_uses_rich_primary_without_extra_physical_writes(
         store, _runtime(tendwire, telegram, max_sends=100)
     )
 
-    assert result["tendwire_turn_final"]["operations"] == 2
-    assert result["tendwire_turn_final"]["acked"] == 2
-    assert len(telegram.sent) == 2
+    assert result["tendwire_turn_final"]["operations"] == 8
+    assert result["tendwire_turn_final"]["acked"] == 8
+    assert len(telegram.sent) == 8
     assert all(
         method == "sendRichMessage"
         for method, _payload, _token in telegram.api_calls

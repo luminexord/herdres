@@ -5026,6 +5026,7 @@ def bind_message_to_worker(
     if not message or message == "0":
         return
     bindings = message_bindings(data)
+    existing = bindings.get(message)
     binding = {
         "topic_id": str(topic_id or entry.get("topic_id") or ""),
         "worker_id": str(entry.get("tendwire_worker_id") or entry.get("active_worker_id") or ""),
@@ -5073,6 +5074,26 @@ def bind_message_to_worker(
                 "tendwire_job_key": tendwire_job_key,
             }
         )
+    elif (
+        isinstance(existing, dict)
+        and str(existing.get("kind") or "") == "final"
+        and str(kind or "") == "final"
+        and str(existing.get("turn_id") or "") == str(turn_id or "")
+    ):
+        # A modern Tendwire final binding is the durable receipt that joins an
+        # acknowledged provider write back to its exact plan slot. Legacy
+        # reconciliation may rediscover the same Telegram card without plan
+        # metadata; that weaker observation must not downgrade the binding.
+        for field in (
+            "content_revision",
+            "plan_token",
+            "part_ordinal",
+            "part_count",
+            "tendwire_job_key",
+            "delivery_format",
+        ):
+            if field in existing:
+                binding[field] = existing[field]
     identity = entry_stable_identity(entry)
     if identity is not None:
         binding["stable_key"] = identity[0]

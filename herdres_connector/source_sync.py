@@ -58,9 +58,9 @@ from .telegram_delivery import (
 from .tendwire_client import TendwireClient, TendwireError
 
 RENDER_VERSION = "telegram-rich-v28-primary-dual-bound"
-PRESENTATION_VERSION = "turn-present-v30"
+PRESENTATION_VERSION = "turn-present-v31"
 _SUPPORTED_PRESENTATION_VERSIONS = frozenset(
-    {"turn-present-v29", PRESENTATION_VERSION}
+    {"turn-present-v29", "turn-present-v30", PRESENTATION_VERSION}
 )
 TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
@@ -8118,7 +8118,10 @@ def _stage_final_plan(
     # incomplete before any Telegram job can be created.
     feed_item = _canonical_final_feed_item(item, entry)
     try:
-        parts = _prepare_final_delivery_parts(feed_item)
+        parts = _prepare_final_delivery_parts(
+            feed_item,
+            rich_transport=config.rich_messages_enabled(),
+        )
     except _TurnContentError as exc:
         if exc.status == "oversize_presentation":
             _record_oversize_final_delivery(
@@ -8392,6 +8395,8 @@ def _stage_final_plan(
 
 def _prepare_final_delivery_parts(
     feed_item: dict[str, Any],
+    *,
+    rich_transport: bool = False,
 ) -> list[dict[str, Any]]:
     """Turn expected content limits into a per-item outcome.
 
@@ -8403,7 +8408,7 @@ def _prepare_final_delivery_parts(
     try:
         parts = prepare_turn_delivery_parts(
             feed_item,
-            rich_transport=False,
+            rich_transport=rich_transport,
         )
         # Keep canonical planning reconstructable at every size.  The cap is a
         # delivery policy: reject the whole logical send into an observable
@@ -10220,6 +10225,48 @@ def _maybe_complete_turn_plan(
         or part_count <= 0
     ):
         return False
+    # Provider acknowledgements and their exact Telegram ids are already
+    # durable in the job ledger. If a weaker legacy final observation
+    # overwrote only the plan fields on the same bound card, restore those
+    # fields before evaluating completeness. Conflicting or missing bindings
+    # still fail closed into the existing operator-visible hold.
+    for job_key, receipt in state.tendwire_turn_jobs(store).items():
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("plan_token") != plan_token
+            or receipt.get("content_revision") != revision
+            or receipt.get("substate") != "acknowledged"
+        ):
+            continue
+        message_id = str(receipt.get("telegram_message_id") or "")
+        binding = state.find_message_binding(store, message_id)
+        ordinal = receipt.get("part_ordinal")
+        receipt_part_count = receipt.get("part_count")
+        if (
+            not message_id
+            or message_id == "0"
+            or not isinstance(binding, dict)
+            or str(binding.get("kind") or "") != "final"
+            or str(binding.get("turn_id") or "") != _turn_id(item)
+            or isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or not 0 <= ordinal < part_count
+            or receipt_part_count != part_count
+        ):
+            continue
+        expected = {
+            "content_revision": revision,
+            "plan_token": plan_token,
+            "part_ordinal": ordinal,
+            "part_count": part_count,
+            "tendwire_job_key": job_key,
+        }
+        if any(
+            binding.get(field) not in (None, "", value)
+            for field, value in expected.items()
+        ):
+            continue
+        binding.update(expected)
     selected_bindings: dict[int, tuple[str, dict[str, Any]]] = {}
     for message_id, binding in _final_delivery_bindings(
         store, _turn_id(item)
@@ -11338,7 +11385,10 @@ def _drain_post_ack_reconciliations(
             _materialize_turn_item(item, runtime)
             feed_item = _canonical_final_feed_item(item, entry)
             try:
-                plans = _prepare_final_delivery_parts(feed_item)
+                plans = _prepare_final_delivery_parts(
+                    feed_item,
+                    rich_transport=config.rich_messages_enabled(),
+                )
             except _TurnContentError as exc:
                 # This message has already been acknowledged upstream.  Keep
                 # the durable local reconciliation obligation in place and
@@ -12053,7 +12103,10 @@ def _drain_turn_final(
             result["content_pages"] += page_calls
             feed_item = _canonical_final_feed_item(item, entry)
             try:
-                plans = _prepare_final_delivery_parts(feed_item)
+                plans = _prepare_final_delivery_parts(
+                    feed_item,
+                    rich_transport=config.rich_messages_enabled(),
+                )
             except _TurnContentError as exc:
                 _fail_turn_final(
                     runtime,
