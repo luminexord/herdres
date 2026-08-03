@@ -7320,6 +7320,64 @@ def test_temporarily_unroutable_root_defers_before_pages_or_plan(
     assert telegram.edited == []
 
 
+def test_stale_final_ready_root_is_suppressed_without_telegram(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_FINAL_CATCHUP_MAX_SECONDS", "300"
+    )
+
+    class StaleReadyTendwire(TurnFinalTendwire):
+        def turn_final_poll(self, *, limit=1, lease_seconds=60):
+            result = super().turn_final_poll(
+                limit=limit, lease_seconds=lease_seconds
+            )
+            for item in result.get("items", []):
+                if str(item.get("key") or "").startswith(
+                    "turn-final:revision:"
+                ):
+                    item["created_at"] = "2026-01-01T00:00:00+00:00"
+            return result
+
+    row = _turn_row(
+        "turn-stale-live-window",
+        "twrev1.stale_live_window",
+        "historical final must not reach Telegram",
+    )
+    tendwire = StaleReadyTendwire(
+        row, emit_ready=True, turn_schema_version=2
+    )
+    tendwire.turns = lambda: {
+        "ok": True,
+        "schema_version": 2,
+        "turns": [],
+    }
+    telegram = DeletingTelegram()
+    store = _store()
+
+    result = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=10)
+    )
+
+    assert result["tendwire_turn_final"]["suppressed_stale"] == 1
+    assert result["tendwire_turn_final"]["acked"] == 1
+    # One plan job reached its terminal applied/suppressed outcome; this
+    # counter tracks job completion, not a Telegram write.
+    assert result["tendwire_turn_final"]["delivered"] == 1
+    assert telegram.sent == []
+    assert telegram.edited == []
+    delivered = state.delivered_turns(store)
+    record = delivered[
+        "final:turn-stale-live-window:twrev1.stale_live_window"
+    ]
+    assert record["suppressed"] is True
+    entry = next(iter(state.source_worker_entries(store).values()))
+    assert "pending_turn_suppressed" not in entry
+    assert "pending_plan_token" not in entry
+
+
 def test_prepare_exception_defers_source_root_then_retries_once(
     monkeypatch,
 ):

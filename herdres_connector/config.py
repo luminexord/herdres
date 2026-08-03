@@ -554,6 +554,19 @@ def cleanup_max_ops(env: Any | None = None) -> int:
     return min(100, max(0, value))
 
 
+def final_catchup_max_seconds(env: Any | None = None) -> int:
+    """Maximum age of a queued final that may still reach Telegram."""
+    source = os.environ if env is None else env
+    raw = source.get("HERDRES_TENDWIRE_FINAL_CATCHUP_MAX_SECONDS", "300")
+    if raw is None or not str(raw).strip():
+        raw = "300"
+    try:
+        value = int(str(raw))
+    except (TypeError, ValueError):
+        return 300
+    return min(86400, max(0, value))
+
+
 def managed_bots_enabled(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "0") or "").strip().lower()

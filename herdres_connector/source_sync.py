@@ -9,6 +9,7 @@ import time
 import weakref
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 from . import accounts, config, decisions, ingress_requests, speech, state
@@ -11138,6 +11139,32 @@ def _turns_by_id_for_catchup(
     return rows
 
 
+def _final_ready_lease_exceeds_live_window(
+    lease: Mapping[str, Any], *, now: datetime | None = None
+) -> bool:
+    """Return true only for a provably old final-ready root.
+
+    Older Tendwire runtimes omit ``created_at``; those leases remain eligible
+    instead of being guessed stale. A zero window disables historical catch-up
+    while still allowing a root created in the current second.
+    """
+
+    raw = lease.get("created_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    try:
+        created_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if created_at.tzinfo is None:
+        return False
+    observed_at = now or datetime.now(timezone.utc)
+    return (
+        observed_at.astimezone(timezone.utc)
+        - created_at.astimezone(timezone.utc)
+    ).total_seconds() > config.final_catchup_max_seconds()
+
+
 def _ensure_rebind_catchup_bound(
     entry: dict[str, Any],
     turns_payload: dict[str, Any],
@@ -11616,6 +11643,7 @@ def _drain_turn_final(
         "deferred": 0,
         "uncertain": 0,
         "staged": 0,
+        "suppressed_stale": 0,
         "content_pages": 0,
         "changed": False,
     }
@@ -11692,6 +11720,9 @@ def _drain_turn_final(
             break
 
         if payload["operation"] == "materialize":
+            suppress_stale = _final_ready_lease_exceeds_live_window(
+                lease
+            )
             try:
                 item = _final_ready_row(payload)
             except _TurnContentError as exc:
@@ -11727,11 +11758,13 @@ def _drain_turn_final(
                         allow_bind=True,
                     )
                 )
-                suppress_historical = _suppress_rebind_catchup_root(
-                    entry,
-                    payload,
-                    turns_payload,
-                    turn_projection,
+                suppress_historical = suppress_stale or (
+                    _suppress_rebind_catchup_root(
+                        entry,
+                        payload,
+                        turns_payload,
+                        turn_projection,
+                    )
                 )
             if not owner_matches:
                 _defer_turn_final(
@@ -11868,8 +11901,13 @@ def _drain_turn_final(
                     ),
                     "turn_id": _turn_id(item),
                     "content_revision": _content_revision(item),
-                    "reason": "rebind_catchup_older_than_bound",
+                    "reason": (
+                        "final_ready_exceeded_live_window"
+                        if suppress_stale
+                        else "rebind_catchup_older_than_bound"
+                    ),
                 }
+                result["suppressed_stale"] += int(suppress_stale)
             materialized_sources[source_identity] = (
                 payload,
                 item,
