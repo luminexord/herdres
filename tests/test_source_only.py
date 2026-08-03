@@ -5027,6 +5027,99 @@ def test_space_topic_pin_renders_worker_board_not_space_summary(monkeypatch):
     assert "Project" not in topic_status_html
 
 
+def test_space_topic_pin_loop_skips_historical_worker_rows(monkeypatch):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "space")
+    store = _store()
+    store["spaces"] = {
+        "workspace:live": {
+            "source": "tendwire",
+            "entry_type": "space",
+            "topic_name": "Live",
+            "topic_id": "77",
+            "status": "idle",
+        }
+    }
+    store["panes"] = {
+        f"worker:historical-{index}": {
+            "source": "tendwire",
+            "entry_type": "worker",
+            "topic_name": f"Historical {index}",
+            "topic_id": str(100 + index),
+            "status": "idle",
+            "live_in_snapshot": False,
+        }
+        for index in range(100)
+    }
+    calls = []
+    yields = []
+
+    def record(_store, entry, _runtime, **_kwargs):
+        calls.append(entry["topic_name"])
+        return True
+
+    monkeypatch.setattr(source_sync, "_sync_topic_pinned", record)
+    updated = source_sync._sync_topic_pinned_statuses(
+        store,
+        SyncRuntime(FakeTendwire(), FakeTelegram(), with_outbox=False),
+        chat_id="-100",
+        yield_barrier=lambda: yields.append(True),
+    )
+
+    assert updated == 1
+    assert calls == ["Live"]
+    assert yields == [True]
+
+
+def test_worker_topic_pin_loop_skips_space_and_historical_rows(monkeypatch):
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    store = _store()
+    store["spaces"] = {
+        "workspace:historical": {
+            "source": "tendwire",
+            "entry_type": "space",
+            "topic_name": "Historical space",
+            "topic_id": "77",
+            "status": "idle",
+        }
+    }
+    store["panes"] = {
+        "worker:live": {
+            "source": "tendwire",
+            "entry_type": "worker",
+            "topic_name": "Live worker",
+            "topic_id": "88",
+            "status": "idle",
+            "live_in_snapshot": True,
+        },
+        "worker:historical": {
+            "source": "tendwire",
+            "entry_type": "worker",
+            "topic_name": "Historical worker",
+            "topic_id": "99",
+            "status": "idle",
+            "live_in_snapshot": False,
+        },
+    }
+    calls = []
+    yields = []
+
+    def record(_store, entry, _runtime, **_kwargs):
+        calls.append(entry["topic_name"])
+        return True
+
+    monkeypatch.setattr(source_sync, "_sync_topic_pinned", record)
+    updated = source_sync._sync_topic_pinned_statuses(
+        store,
+        SyncRuntime(FakeTendwire(), FakeTelegram(), with_outbox=False),
+        chat_id="-100",
+        yield_barrier=lambda: yields.append(True),
+    )
+
+    assert updated == 1
+    assert calls == ["Live worker"]
+    assert yields == [True]
+
+
 def test_topic_pinned_status_reuses_legacy_topic_pin(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()

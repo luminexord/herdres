@@ -12744,12 +12744,30 @@ def _sync_topic_pinned_statuses(
     yield_barrier: Callable[[], None] | None = None,
     account_usage: dict[str, Any] | None = None,
 ) -> int:
+    def owns_topic_pin(entry: dict[str, Any]) -> bool:
+        is_space = str(entry.get("entry_type") or "") == "space"
+        if config.source_topic_mode() == "space":
+            return (
+                is_space
+                and bool(entry.get("topic_id"))
+                and not entry.get("stale_space_topic")
+                and _entry_open_for_pin(entry)
+            )
+        return (
+            not is_space
+            and bool(entry.get("topic_id"))
+            and _worker_visible_on_status_board(entry)
+        )
+
     updated = 0
     for entry_key in list(state.source_entries(store)):
+        entry = state.source_entries(store).get(entry_key)
+        if entry is None or not owns_topic_pin(entry):
+            continue
         if yield_barrier is not None:
             yield_barrier()
         entry = state.source_entries(store).get(entry_key)
-        if entry is None:
+        if entry is None or not owns_topic_pin(entry):
             continue
         updated += int(
             _sync_topic_pinned(
