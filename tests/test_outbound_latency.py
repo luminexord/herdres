@@ -7,14 +7,98 @@ from types import SimpleNamespace
 
 import herdres
 import pytest
-from herdres_connector import config, ingress_requests, state
+from herdres_connector import config, ingress_requests, source_sync, state
 from test_source_only import (
     FakeTelegram,
+    FakeTendwire,
     REQUEST_ID,
     _accepted_command_response,
     _source_worker,
     _store,
 )
+
+
+def test_real_sync_flock_hands_off_to_production_outbound_pass(
+    tmp_path, monkeypatch
+) -> None:
+    """Slow reconciliation cannot starve a connector poll sharing the real flock."""
+
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MAX_CREATES", "0")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "0")
+    workers = [
+        _source_worker(
+            {
+                "id": f"worker-{index}",
+                "name": f"Worker {index}",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": f"fp-{index}",
+                "meta": {"agent": "codex"},
+            }
+        )
+        for index in (1, 2)
+    ]
+    tendwire = FakeTendwire(workers=workers)
+    telegram = FakeTelegram()
+    monkeypatch.setattr(herdres, "TendwireClient", lambda: tendwire)
+    monkeypatch.setattr(
+        herdres, "TelegramClient", lambda token="", dry_run=False: telegram
+    )
+    state.save_state(_store(), state_path)
+
+    first_worker_held = threading.Event()
+    release_first_worker = threading.Event()
+    poll_seen = threading.Event()
+    full_done = threading.Event()
+    failures: list[BaseException] = []
+    original_upsert = source_sync.state.upsert_worker_entry
+    upserts = 0
+
+    def slow_upsert(*args, **kwargs):
+        nonlocal upserts
+        result = original_upsert(*args, **kwargs)
+        upserts += 1
+        if upserts == 1:
+            first_worker_held.set()
+            assert release_first_worker.wait(2)
+        return result
+
+    def connector_drain(*_args, **_kwargs):
+        assert not full_done.is_set()
+        poll_seen.set()
+        return {"ok": True, "changed": False}
+
+    monkeypatch.setattr(source_sync.state, "upsert_worker_entry", slow_upsert)
+    monkeypatch.setattr(herdres, "drain_outbound_once", connector_drain)
+
+    def full_pass() -> None:
+        try:
+            herdres._sync_pass(with_outbox=False)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+        finally:
+            full_done.set()
+
+    full = threading.Thread(target=full_pass)
+    full.start()
+    assert first_worker_held.wait(2)
+    outbound = threading.Thread(target=herdres._outbound_pass)
+    outbound.start()
+    assert herdres._OUTBOUND_WAITING.wait(2)
+    release_first_worker.set()
+    assert poll_seen.wait(2)
+    assert not full_done.is_set()
+    outbound.join(2)
+    full.join(2)
+    assert not outbound.is_alive()
+    assert not full.is_alive()
+    assert failures == []
 
 
 def test_connector_poll_cadence_is_independent_of_long_reconciliation(

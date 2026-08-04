@@ -18,11 +18,12 @@ from herdres_connector.tendwire_client import TendwireClient
 
 def _paired_source() -> Path:
     configured = os.getenv("HERDRES_PAIRED_TENDWIRE_SOURCE_DIR")
-    source = (
-        Path(configured).expanduser()
-        if configured
-        else Path(__file__).resolve().parents[3] / "src"
-    )
+    if not configured:
+        pytest.skip(
+            "set HERDRES_PAIRED_TENDWIRE_SOURCE_DIR to an explicit Tendwire src directory",
+            allow_module_level=True,
+        )
+    source = Path(configured).expanduser().resolve()
     if not (source / "tendwire" / "daemon_api.py").is_file():
         pytest.fail(
             "paired Tendwire source is required; set "
@@ -150,20 +151,25 @@ def test_real_socket_poll_binding_ack_and_ack_response_loss(tmp_path: Path) -> N
         assert status == "delivered"
         assert client.connector_poll(limit=1)["items"] == []
 
-        invalid = connector.prepare(
-            {
-                "schema_version": 1,
-                "action": "recover",
-                "name": "turn-final",
-                "failed_plan_token": "twplan1.missing",
-                "request_id": "recover:invalid",
-            }
-        )
+        invalid_ids = ("recover:invalid", "telegram.request", "HERDRESrequest")
+        invalid = []
+        for request_id in invalid_ids:
+            invalid.append(
+                connector.prepare(
+                    {
+                        "schema_version": 1,
+                        "action": "recover",
+                        "name": "turn-final",
+                        "failed_plan_token": "twplan1.missing",
+                        "request_id": request_id,
+                    }
+                )
+            )
         valid = client.connector_prepare_recover(
             failed_plan_token="twplan1.missing",
             request_id="recover.request-42_ok",
         )
-        assert invalid["status"] == "invalid_params"
+        assert {result["status"] for result in invalid} == {"invalid_params"}
         assert valid["status"] != "invalid_params"
         assert valid["status"] != "invalid_connector_response"
     finally:

@@ -5775,7 +5775,7 @@ def test_malformed_acknowledged_prefix_stops_before_recovery_rpc(
     code = herdres.cmd_recover_turn_final(
         SimpleNamespace(
             plan_token="twplan1.failed",
-            request_id=f"malformed-prefix-{field}",
+            request_id="malformed-prefix-case",
         )
     )
     output = json.loads(capsys.readouterr().out)
@@ -7172,6 +7172,10 @@ def test_turn_final_lease_seconds_default_and_bounds():
         ("recover.request-42_ok", True),
         ("recover:request", False),
         ("recover/request", False),
+        ("telegram.request", False),
+        ("HERDRESrequest", False),
+        ("chat-id", False),
+        ("delivery_1", False),
         ("", False),
     ],
 )

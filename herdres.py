@@ -35,6 +35,7 @@ from herdres_connector.tendwire_client import (
     TendwireClient,
     command_process_ambiguous,
     command_process_not_started,
+    valid_recovery_request_id,
 )
 
 VERSION = "0.7.0rc4-tendwired-source-only"
@@ -44,6 +45,19 @@ TERMINAL_SUCCESS_REPLIES = {
     "Sent to Tendwire worker.",
     BUSY_SEND_REPLY,
 }
+_OUTBOUND_WAITING = threading.Event()
+_OUTBOUND_ACQUIRED = threading.Event()
+
+
+def _handoff_to_waiting_outbound() -> None:
+    """Give an announced connector poll one bounded flock acquisition window."""
+
+    if _OUTBOUND_WAITING.is_set():
+        _OUTBOUND_ACQUIRED.wait(timeout=1.0)
+    else:
+        time.sleep(0)
+
+
 REKEYED_TOPIC_QUARANTINE_REPLY = (
     "This pane was re-keyed after a Herdr restart; a fresh topic is being "
     "created. Please use the new pane topic when it appears."
@@ -74,6 +88,7 @@ def _runtime(
     dry_run: bool = False,
     with_outbox: bool = True,
     checkpoint: Callable[[], None] | None = None,
+    lock_handoff: Callable[[], None] | None = None,
 ) -> SyncRuntime:
     token = config.telegram_token()
     runtime = SyncRuntime(
@@ -85,6 +100,7 @@ def _runtime(
     # SyncRuntime intentionally remains constructible by old callers. The source executor consumes
     # this optional seam when it needs a durable receipt before acknowledging a Tendwire job.
     runtime.checkpoint = checkpoint
+    runtime.lock_handoff = lock_handoff
     return runtime
 
 
@@ -469,8 +485,8 @@ def _submit_ingress_command_record(
             state.save_state(store)
             return outcome
 
-        # Construct the child only after deadline/cache preflight. command_json
-        # sends these exact UTF-8 bytes rather than reserializing the request.
+        # Construct the AF_UNIX client only after deadline/cache preflight.
+        # command_json parses only the exact durably stored UTF-8 request.
         _ingress_timing_log(
             "tendwire_submit_sent",
             request_id,
@@ -649,7 +665,7 @@ def _submit_ingress_command_record(
         ):
             # The only legal byte rewrite is a one-time removal of the stale
             # worker fingerprint. Recheck the immutable deadline before both
-            # the durable rewrite and the second child start.
+            # the durable rewrite and the second socket request.
             retry_at = time.time()
             if retry_at >= record["deadline_at"]:
                 outcome = ingress_requests.quarantine_request(
@@ -737,7 +753,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             prepared = prepared or shell_created
             if changed or prepared:
                 # First-seen lifecycle bounds are durable before routing,
-                # speech preparation, or child-process construction for legacy
+                # speech preparation, or AF_UNIX request construction for legacy
                 # direct callers. Lane mode already has those exact bytes and
                 # bounds in the durable spool, so it folds this shell write into
                 # the canonical request commit below.
@@ -1025,6 +1041,7 @@ def _sync_pass(*, with_outbox: bool = True) -> dict[str, Any]:
                     dry_run=False,
                     with_outbox=with_outbox,
                     checkpoint=checkpoint,
+                    lock_handoff=_handoff_to_waiting_outbound,
                 ),
             )
         if result.get("changed"):
@@ -1036,30 +1053,38 @@ def _sync_pass(*, with_outbox: bool = True) -> dict[str, Any]:
 def _outbound_pass() -> dict[str, Any]:
     """Drain connector work without snapshot, turn, pending, or pane scans."""
 
-    with state.state_lock(phase="outbound_pass.load"):
-        with state.lock_phase("outbound_pass.load"):
-            store = state.load_state()
+    _OUTBOUND_ACQUIRED.clear()
+    _OUTBOUND_WAITING.set()
+    try:
+        with state.state_lock(phase="outbound_pass.load"):
+            _OUTBOUND_ACQUIRED.set()
+            _OUTBOUND_WAITING.clear()
+            with state.lock_phase("outbound_pass.load"):
+                store = state.load_state()
 
-        def checkpoint() -> None:
-            if not state.lock_held():
-                raise RuntimeError("outbound checkpoint requires the held state lock")
-            with state.lock_phase("outbound.checkpoint"):
-                state.save_state(store)
+            def checkpoint() -> None:
+                if not state.lock_held():
+                    raise RuntimeError("outbound checkpoint requires the held state lock")
+                with state.lock_phase("outbound.checkpoint"):
+                    state.save_state(store)
 
-        with state.lock_phase("outbound.drain"):
-            result = drain_outbound_once(
-                store,
-                _runtime(
-                    dry_run=False,
-                    with_outbox=True,
-                    checkpoint=checkpoint,
-                ),
-                chat_id=config.telegram_chat_id(store),
-            )
-        if result.get("changed"):
-            with state.lock_phase("outbound_pass.final_save"):
-                state.save_state(store)
-    return result
+            with state.lock_phase("outbound.drain"):
+                result = drain_outbound_once(
+                    store,
+                    _runtime(
+                        dry_run=False,
+                        with_outbox=True,
+                        checkpoint=checkpoint,
+                    ),
+                    chat_id=config.telegram_chat_id(store),
+                )
+            if result.get("changed"):
+                with state.lock_phase("outbound_pass.final_save"):
+                    state.save_state(store)
+        return result
+    finally:
+        _OUTBOUND_WAITING.clear()
+        _OUTBOUND_ACQUIRED.set()
 
 
 def _connector_poll_loop(stop: threading.Event) -> None:
@@ -1241,14 +1266,7 @@ def _valid_recovery_plan_token(value: Any) -> bool:
 
 
 def _valid_recovery_request_id(value: Any) -> bool:
-    return bool(
-        isinstance(value, str)
-        and 1 <= len(value) <= 128
-        and all(
-            char.isascii() and (char.isalnum() or char in "._-")
-            for char in value
-        )
-    )
+    return valid_recovery_request_id(value)
 
 
 def _recovery_audits(store: dict[str, Any]) -> dict[str, Any]:

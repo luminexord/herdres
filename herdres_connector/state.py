@@ -380,8 +380,8 @@ def reload_state_in_place(data: dict[str, Any], path: Path | None = None) -> Non
 # yield between items. The held fd + release depth are THREAD-LOCAL: fcntl.flock is per open-file
 # description, so an in-process caller with two concurrent state_lock() holders (e.g. an embedded
 # runner) would let one thread's released_lock() unlock another thread's fd; per-thread state keeps
-# each holder dropping only its OWN fd. (Prod routes inbound commands through subprocesses, one holder
-# per process, where this is equivalent to a module global.)
+# each holder dropping only its own fd. Production AF_UNIX request and connector workers can therefore
+# contend in either threads or separate processes without sharing descriptor ownership.
 _LOCK_STATE = threading.local()
 _LOCK_HOLD_WARN_SECONDS = 2.0
 _LOCK_HOLD_OBSERVERS: list[Any] = []

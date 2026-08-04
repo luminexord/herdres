@@ -74,6 +74,7 @@ consumer/reconciliation contract together as one compatible release pair:
 
 ```sh
 # From the Tendwire checkout:
+TENDWIRE_CHECKOUT="$(pwd -P)"
 python -m pytest -q \
   tests/test_worker_stable_key.py \
   tests/test_commands.py \
@@ -85,7 +86,9 @@ python -m pytest -q \
   tests/test_store.py
 
 # From the Herdres checkout:
-python -m pytest -q \
+TENDWIRE_SOURCE="$(cd -- "${TENDWIRE_CHECKOUT:?set TENDWIRE_CHECKOUT to the clean Tendwire checkout}" && pwd -P)/src"
+test -f "$TENDWIRE_SOURCE/tendwire/daemon_api.py"
+HERDRES_PAIRED_TENDWIRE_SOURCE_DIR="$TENDWIRE_SOURCE" python -m pytest -q \
   tests/test_source_only.py \
   tests/test_command_ingress_idempotency.py \
   tests/test_stable_worker_key.py \
@@ -123,7 +126,7 @@ The paired gate must establish all of the following:
 - Manager and managed-bot polling cursors are keyed to stable receiving-bot
   kinds, not token-derived runtime keys, so token rotation preserves polling
   position.
-- On first sight of an update, before routing or child creation, Herdres
+- On first sight of an update, before routing or AF_UNIX submission, Herdres
   persists immutable `created_at`, `deadline_at`, and `retain_until` bounds.
   It then persists canonical schema-v1 request JSON before command start.
   Every retry reconstructs the same request object and text. The sole rewrite is one
@@ -136,8 +139,8 @@ The paired gate must establish all of the following:
   statuses paired with either `terminal_rejected` or `no_receipt`.
 - Pre-send socket failures are definite; timeout, EOF, malformed/non-UTF-8
   output, or wrong schema/shape/correlation after request start remains
-  transport ambiguity. No schema-v2 disposition or private process detail is
-  forged from it.
+  transport ambiguity. No schema-v2 disposition or private implementation
+  detail is forged from it.
 - Disposition, never status alone, controls lifecycle. In particular,
   `backend_unavailable` + `no_receipt` retains the checkpoint for retry, while
   `backend_unavailable` + `terminal_rejected` caches failure and advances.
@@ -145,13 +148,13 @@ The paired gate must establish all of the following:
   (`86400` default/fallback), does not slide with `updated_at`, retry,
   redelivery, or configuration changes, and expires at equality. Before client
   creation and after a retryable response, deadline expiry quarantines instead
-  of starting another child.
+  of starting another socket request.
 - `retain_until` is first-seen plus the horizon and `86400`: `172800` default,
   `86460` minimum, `691200` maximum. It is immutable and pruning is strictly
   after it. The paired Tendwire retry horizon is at least the Herdres horizon,
   and Tendwire receipt age is at least the Herdres retention bound. Tendwire's
   `604800`/`2592000`/`4096` defaults satisfy the pair.
-- `terminal_accepted` and `terminal_rejected` cache an exact sanitized child
+- `terminal_accepted` and `terminal_rejected` cache an exact sanitized ingress
   outcome. `terminal_uncertain`, deadline expiry, and unsafe/corrupt evidence
   are quarantined (locally dead-lettered) with the fixed reply `Could not send
   safely. Refresh status and choose the target again.` and checkpoint
@@ -161,10 +164,9 @@ The paired gate must establish all of the following:
 - Only the exact allowlisted public command object reaches Tendwire; its
   request ID satisfies `[A-Za-z0-9._-]{1,128}` and Herdres uses the narrower
   `hri1_…` form. No raw Telegram receiver/update/chat/topic/message/reply/user
-  ID, bot token, or private/backend route crosses. The Tendwire child
-  environment retains public overrides while stripping Telegram and private
-  ingress, gateway, managed-bot, state, request-key, and binary-selector
-  variables.
+  ID, bot token, or private/backend route crosses. No CLI environment or
+  process output crosses this boundary; the client uses only the configured
+  owner-private AF_UNIX daemon endpoint.
 - The Herdres state, Herdres request-ID key, Tendwire database, and Tendwire
   installation key/marker/sentinel are backed up quiescently and restored as
   one set. A replaced Herdres key changes every derived ID and is not recovery.
@@ -287,11 +289,12 @@ issues an explicit command for that failed generation:
 ```sh
 herdres tendwire recover-turn-final \
   --plan-token twplan1.<failed-plan> \
-  --request-id operator-2026.07.11:1
+  --request-id operator-2026.07.11-1
 ```
 
-The request ID is 1–128 ASCII `[A-Za-z0-9._:-]` characters and is both the
-idempotency key and audit key. Local preflight must stop before RPC with:
+The request ID is 1–128 ASCII `[A-Za-z0-9._-]` characters, excludes reserved
+public-boundary vocabulary, and is both the idempotency key and audit key.
+Local preflight must stop before RPC with:
 
 - `invalid_recovery_request` for a malformed/bounded-coordinate failure;
 - `recovery_request_conflict` when the request ID is bound elsewhere;

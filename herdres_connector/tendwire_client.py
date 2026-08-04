@@ -1,4 +1,4 @@
-"""Bounded AF_UNIX client for Tendwire's public daemon API."""
+"""Strict, bounded AF_UNIX client for Tendwire's public daemon API."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from . import config
 from .ingress_identity import validate_request_id
@@ -33,8 +33,6 @@ TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
 TURN_LIST_PAGE_LIMIT = 250
 TURN_LIST_MAX_PAGES = 256
-TURN_DELTA_SCHEMA_VERSION = 1
-TURN_DELTA_PROJECTION_SCHEMA_VERSION = 2
 CONNECTOR_SCHEMA_VERSION = 1
 TURN_FINAL_CONNECTOR = "turn-final"
 CONNECTOR_PREPARE_MAX_SPANS = 256
@@ -43,198 +41,129 @@ CONNECTOR_PROCESS_TIMEOUT_SECONDS = 20
 DAEMON_API_SCHEMA_VERSION = 1
 DAEMON_MAX_FRAME_BYTES = 1024 * 1024
 
-_SEND_FIELDS = {"schema_version", "action", "request_id", "dry_run", "target", "instruction"}
-_DECISION_FIELDS = {"schema_version", "action", "request_id", "dry_run", "target", "params"}
-_RESPONSE_FIELDS = {
-    "schema_version", "action", "request_id", "ok", "dry_run", "status",
-    "disposition", "result", "error", "warnings",
+_COMMAND_FIELDS = {
+    "send_instruction": ({"schema_version", "action", "request_id", "dry_run", "target", "instruction"}, {"response_schema_version"}),
+    "answer_decision": ({"schema_version", "action", "request_id", "dry_run", "target", "params"}, set()),
 }
-_SEND_RESULT_REQUIRED = {
-    "target", "delivery_state", "transport_state", "target_state_at_send",
-    "observed_turn_state",
-}
+_RESPONSE_FIELDS = {"schema_version", "action", "request_id", "ok", "dry_run", "status", "disposition", "result", "error", "warnings"}
+_SEND_RESULT_FIELDS = {"target", "delivery_state", "transport_state", "target_state_at_send", "observed_turn_state"}
 _SEND_RESULT_OPTIONAL = {"submission_id", "submission_verdict", "turn_id"}
-_SEND_REJECTIONS = {
-    "rejected", "stale_target", "backend_unavailable", "backend_unsupported",
-    "ambiguous_backend_target", "backend_failed", "duplicate_request",
-}
-_SEND_NO_RECEIPT = {
-    "invalid_request", "rejected", "not_found", "ambiguous_target", "stale_target",
-    "backend_unavailable", "backend_unsupported", "ambiguous_backend_target", "backend_failed",
-}
-_DECISION_FAILURES = {
-    "decision_not_pending", "invalid_selection", "unsupported_decision", "unknown_worker",
-}
-_DISPOSITIONS = {
-    "no_receipt", "in_progress", "terminal_accepted", "terminal_rejected", "terminal_uncertain",
-}
-_EXACT_PROTOCOL_TEXT_KEYS = {
-    "user_text", "assistant_final_text", "text", "plan_token", "failed_plan_token",
-    "recovered_plan_token", "replaces_plan_token", "recovers_plan_token", "final_identity",
-    "content_revision", "key",
-}
-_ALLOWED_PROTOCOL_TOKEN_KEYS = {
-    "plan_token", "failed_plan_token", "recovered_plan_token", "replaces_plan_token",
-    "recovers_plan_token",
-}
+_SEND_REJECTIONS = {"rejected", "stale_target", "backend_unavailable", "backend_unsupported", "ambiguous_backend_target", "backend_failed", "duplicate_request"}
+_SEND_NO_RECEIPT = _SEND_REJECTIONS | {"invalid_request", "not_found", "ambiguous_target"}
+_DECISION_FAILURES = {"decision_not_pending", "invalid_selection", "unsupported_decision", "unknown_worker"}
+_DISPOSITIONS = {"no_receipt", "in_progress", "terminal_accepted", "terminal_rejected", "terminal_uncertain"}
+_EXACT_PROTOCOL_TEXT_KEYS = {"user_text", "assistant_final_text", "text", "plan_token", "failed_plan_token", "recovered_plan_token", "replaces_plan_token", "recovers_plan_token", "final_identity", "content_revision", "key"}
+_ALLOWED_PROTOCOL_TOKEN_KEYS = {"plan_token", "failed_plan_token", "recovered_plan_token", "replaces_plan_token", "recovers_plan_token"}
+_PUBLIC_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+_OPAQUE_CHARS = _PUBLIC_CHARS - {"."}
+_FORBIDDEN_RECOVERY_TEXT = ("telegram", "herdr", "herdres", "backend_target", "pane_id", "session_id", "terminal_id", "chat_id", "topic_id", "message_id", "bot_token", "shell", "argv", "connector", "delivery")
 _NOT_STARTED = object()
 _AMBIGUOUS = object()
 
 
-class _TransportResult(dict[str, Any]):
-    __slots__ = ("_not_started", "_ambiguous")
+class _RPCResult(dict[str, Any]):
+    __slots__ = ("origin", "_not_started", "_ambiguous")
+
+    def __init__(self, value: Mapping[str, Any], *, origin: str) -> None:
+        super().__init__(value)
+        self.origin = origin
+        self._not_started = None
+        self._ambiguous = None
 
 
 def command_process_ambiguous(result: Any) -> bool:
-    return (
-        isinstance(result, _TransportResult)
-        and getattr(result, "_ambiguous", None) is _AMBIGUOUS
-    )
+    return isinstance(result, _RPCResult) and result._ambiguous is _AMBIGUOUS
 
 
 def command_process_not_started(result: Any) -> bool:
-    return (
-        isinstance(result, _TransportResult)
-        and getattr(result, "_not_started", None) is _NOT_STARTED
-    )
+    return isinstance(result, _RPCResult) and result._not_started is _NOT_STARTED
+
+
+def _keys(value: Any, required: set[str], optional: set[str] = frozenset()) -> bool:
+    return isinstance(value, dict) and required <= set(value) <= required | set(optional)
+
+
+def _text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _opaque(value: Any, prefix: str, *, limit: int = 264) -> bool:
+    return bool(isinstance(value, str) and value.startswith(prefix) and len(prefix) < len(value) <= limit and all(char in _OPAQUE_CHARS for char in value[len(prefix) :]))
+
+
+def valid_recovery_request_id(value: Any) -> bool:
+    if not isinstance(value, str) or not 1 <= len(value) <= 128:
+        return False
+    if any(char not in _PUBLIC_CHARS for char in value):
+        return False
+    lowered = value.lower()
+    compact = "".join(char for char in lowered if char.isalnum())
+    return not any(token in lowered or token.replace("_", "") in compact for token in _FORBIDDEN_RECOVERY_TEXT)
 
 
 def _invalid_command_request() -> dict[str, Any]:
-    return {
-        "ok": False,
-        "status": "invalid_request",
-        "error": "Herdres command request is not an exact public command object",
-    }
+    return {"ok": False, "status": "invalid_request", "error": "Herdres command request is not an exact public command object"}
 
 
-def _request_state_uncertain(request: dict[str, Any]) -> dict[str, Any]:
-    result = _TransportResult({
-        "ok": False,
-        "status": "request_state_uncertain",
-        "error": "Tendwire command result was lost after request start",
-        "request_id": request["request_id"],
-        "action": request["action"],
-    })
+def _request_state_uncertain(request: dict[str, Any]) -> _RPCResult:
+    result = _RPCResult({"ok": False, "status": "request_state_uncertain", "error": "Tendwire command result was lost after request start", "request_id": request["request_id"], "action": request["action"]}, origin="transport")
     result._ambiguous = _AMBIGUOUS
     return result
 
 
 def _exact_command_request(value: Any) -> dict[str, Any] | None:
-    if (
-        not isinstance(value, dict)
-        or type(value.get("schema_version")) is not int
-        or value["schema_version"] != 1
-        or value.get("dry_run") is not False
-    ):
+    if not isinstance(value, dict) or value.get("action") not in _COMMAND_FIELDS:
+        return None
+    required, optional = _COMMAND_FIELDS[value["action"]]
+    if not _keys(value, required, optional) or value.get("schema_version") != 1:
+        return None
+    if isinstance(value.get("schema_version"), bool) or value.get("dry_run") is not False:
         return None
     try:
         validate_request_id(value.get("request_id"))
     except ValueError:
         return None
     target = value.get("target")
-    if not isinstance(target, dict) or any(
-        not isinstance(item, str) or not item.strip()
-        for item in target.values()
-    ):
+    if not isinstance(target, dict) or not all(_text(item) for item in target.values()):
         return None
-    if value.get("action") == "send_instruction":
-        if set(value) not in (_SEND_FIELDS, _SEND_FIELDS | {"response_schema_version"}):
-            return None
-        if set(target) not in ({"worker_id"}, {"worker_id", "worker_fingerprint"}, {"space_id"}):
-            return None
+    if value["action"] == "send_instruction":
+        allowed_targets = ({"worker_id"}, {"worker_id", "worker_fingerprint"}, {"space_id"})
         instruction = value.get("instruction")
-        if (
-            not isinstance(instruction, dict)
-            or set(instruction) != {"text"}
-            or not isinstance(instruction.get("text"), str)
-            or not instruction["text"]
-        ):
-            return None
-        if "response_schema_version" in value and value["response_schema_version"] != 3:
-            return None
-        return value
-    if (
-        value.get("action") != "answer_decision"
-        or set(value) != _DECISION_FIELDS
-        or set(target) != {"worker_id"}
-    ):
+        valid = set(target) in allowed_targets and _keys(instruction, {"text"})
+        valid = valid and isinstance(instruction["text"], str) and bool(instruction["text"])
+        valid = valid and value.get("response_schema_version", 3) == 3
+        return value if valid else None
+    if set(target) != {"worker_id"} or not _keys(value.get("params"), {"decision_ref", "selection"}):
         return None
-    params = value.get("params")
-    if (
-        not isinstance(params, dict)
-        or set(params) != {"decision_ref", "selection"}
-        or not isinstance(params.get("decision_ref"), str)
-        or not params["decision_ref"].strip()
-    ):
-        return None
-    selection = params.get("selection")
-    if not isinstance(selection, dict):
+    params = value["params"]
+    selection = params["selection"]
+    if not _text(params["decision_ref"]) or not isinstance(selection, dict):
         return None
     if set(selection) == {"text"}:
-        text = selection["text"]
-        return value if isinstance(text, str) and bool(text.strip()) else None
+        return value if _text(selection["text"]) else None
     refs = selection.get("option_refs")
-    valid_refs = set(selection) == {"option_refs"} and isinstance(refs, list)
-    if valid_refs:
-        valid_refs = all(
-            isinstance(item, str) and bool(item.strip()) for item in refs
-        )
-    if valid_refs:
-        valid_refs = len(refs) == len(set(refs))
-    return value if valid_refs else None
+    valid = set(selection) == {"option_refs"} and isinstance(refs, list)
+    valid = valid and all(_text(item) for item in refs) and len(refs) == len(set(refs))
+    return value if valid else None
 
 
 def _valid_response_shell(response: Any, request: dict[str, Any], schemas: set[int]) -> bool:
-    return (
-        isinstance(response, dict)
-        and set(response) == _RESPONSE_FIELDS
-        and type(response.get("schema_version")) is int
-        and response["schema_version"] in schemas
-        and response.get("request_id") == request["request_id"]
-        and response.get("action") == request["action"]
-        and response.get("dry_run") is False
-        and type(response.get("ok")) is bool
-        and isinstance(response.get("status"), str) and bool(response["status"])
-        and response.get("disposition") in _DISPOSITIONS
-        and isinstance(response.get("warnings"), list)
-        and all(isinstance(v, str) for v in response["warnings"])
-        and public_prune(response) == response
-    )
+    if not isinstance(response, dict) or set(response) != _RESPONSE_FIELDS:
+        return False
+    return bool(type(response.get("schema_version")) is int and response["schema_version"] in schemas and response.get("request_id") == request["request_id"] and response.get("action") == request["action"] and response.get("dry_run") is False and type(response.get("ok")) is bool and _text(response.get("status")) and response.get("disposition") in _DISPOSITIONS and isinstance(response.get("warnings"), list) and all(isinstance(item, str) for item in response["warnings"]) and public_prune(response) == response)
 
 
 def _valid_send_result(result: Any, request: dict[str, Any], schema: int) -> bool:
-    if (
-        not isinstance(result, dict)
-        or not _SEND_RESULT_REQUIRED
-        <= set(result)
-        <= _SEND_RESULT_REQUIRED | _SEND_RESULT_OPTIONAL
-    ):
+    if not _keys(result, _SEND_RESULT_FIELDS, _SEND_RESULT_OPTIONAL):
         return False
-    target = result.get("target")
-    requested_worker = request["target"].get("worker_id")
-    turn_id = result.get("turn_id")
-    submission_id = result.get("submission_id")
-    return (
-        isinstance(target, dict) and set(target) == {"worker_id"}
-        and isinstance(target.get("worker_id"), str) and bool(target["worker_id"].strip())
-        and (not isinstance(requested_worker, str) or target["worker_id"] == requested_worker)
-        and result.get("delivery_state") == result.get("transport_state") == "submitted"
-        and isinstance(result.get("target_state_at_send"), str)
-        and bool(result["target_state_at_send"].strip())
-        and result.get("observed_turn_state")
-        in {"pending_observation", "observed", "complete", "linked"}
-        and (
-            "turn_id" not in result
-            or turn_id is None
-            or isinstance(turn_id, str) and bool(turn_id.strip())
-        )
-        and (
-            "submission_id" not in result
-            or isinstance(submission_id, str) and bool(submission_id.strip())
-        )
-        and result.get("submission_verdict", "submitted") in {"submitted", "written_to_pty"}
-        and not (schema == 2 and "submission_id" in result)
-    )
+    target = result["target"]
+    requested = request["target"].get("worker_id")
+    return bool(_keys(target, {"worker_id"}) and _text(target["worker_id"]) and (not isinstance(requested, str) or target["worker_id"] == requested) and result.get("delivery_state") == result.get("transport_state") == "submitted" and _text(result.get("target_state_at_send")) and result.get("observed_turn_state") in {"pending_observation", "observed", "complete", "linked"} and ("turn_id" not in result or result["turn_id"] is None or _text(result["turn_id"])) and ("submission_id" not in result or _text(result["submission_id"])) and result.get("submission_verdict", "submitted") in {"submitted", "written_to_pty"} and not (schema == 2 and "submission_id" in result))
+
+
+def _valid_failure(response: dict[str, Any]) -> bool:
+    error = response.get("error")
+    return bool(response.get("result") is None and isinstance(error, dict) and error.get("code") in {None, response["status"]} and _text(error.get("message")))
 
 
 def _validated_command_response(response: Any, request: dict[str, Any]) -> dict[str, Any] | None:
@@ -243,30 +172,14 @@ def _validated_command_response(response: Any, request: dict[str, Any]) -> dict[
         return None
     status, disposition = response["status"], response["disposition"]
     if response["ok"] is True:
-        accepted = (
-            status == "accepted"
-            and disposition == "terminal_accepted"
-            and response.get("error") is None
-            and _valid_send_result(
-                response.get("result"), request, response["schema_version"]
-            )
-        )
-        return response if accepted else None
-    error = response.get("error")
-    if (
-        not isinstance(error, dict)
-        or not isinstance(error.get("message"), str)
-        or not error["message"]
-        or error.get("code") not in {None, status}
-    ):
-        return None
-    allowed = (
-        disposition == "in_progress" and status == "pending"
-        or disposition == "terminal_uncertain" and status == "request_state_uncertain"
-        or disposition == "terminal_rejected" and status in _SEND_REJECTIONS
-        or disposition == "no_receipt" and status in _SEND_NO_RECEIPT
-    )
-    return response if allowed else None
+        valid = status == "accepted" and disposition == "terminal_accepted"
+        valid = valid and response.get("error") is None and _valid_send_result(response.get("result"), request, response["schema_version"])
+        return response if valid else None
+    allowed = disposition == "in_progress" and status == "pending"
+    allowed = allowed or disposition == "terminal_uncertain" and status == "request_state_uncertain"
+    allowed = allowed or disposition == "terminal_rejected" and status in _SEND_REJECTIONS
+    allowed = allowed or disposition == "no_receipt" and status in _SEND_NO_RECEIPT
+    return response if allowed and _valid_failure(response) else None
 
 
 def _validated_decision_response(response: Any, request: dict[str, Any]) -> dict[str, Any] | None:
@@ -275,120 +188,45 @@ def _validated_decision_response(response: Any, request: dict[str, Any]) -> dict
     status, disposition = response["status"], response["disposition"]
     if response["ok"] is True:
         result = response.get("result")
-        target = result.get("target") if isinstance(result, dict) else None
-        decision = result.get("decision") if isinstance(result, dict) else None
-        valid = (
-            status == "accepted"
-            and disposition == "terminal_accepted"
-            and response.get("error") is None
-            and isinstance(result, dict)
-            and set(result)
-            == {
-                "target",
-                "decision",
-                "delivery_state",
-                "transport_state",
-                "observed_pending_state",
-            }
-            and target == request["target"]
-            and decision == {"decision_ref": request["params"]["decision_ref"]}
-            and result.get("delivery_state") == result.get("transport_state") == "submitted"
-            and result.get("observed_pending_state") == "pending_observation"
-        )
+        fields = {"target", "decision", "delivery_state", "transport_state", "observed_pending_state"}
+        valid = status == "accepted" and disposition == "terminal_accepted" and response.get("error") is None
+        valid = valid and _keys(result, fields) and result["target"] == request["target"]
+        valid = valid and result["decision"] == {"decision_ref": request["params"]["decision_ref"]}
+        valid = valid and result["delivery_state"] == result["transport_state"] == "submitted" and result["observed_pending_state"] == "pending_observation"
         return response if valid else None
-    error = response.get("error")
-    if (
-        response.get("result") is not None
-        or not isinstance(error, dict)
-        or error.get("code") != status
-        or not isinstance(error.get("message"), str)
-        or not error["message"]
-    ):
-        return None
-    allowed = (
-        status == "answer_in_progress"
-        and disposition in {"no_receipt", "in_progress"}
-    ) or (
-        status in _DECISION_FAILURES
-        and disposition in {"no_receipt", "terminal_rejected"}
-    )
-    return response if allowed else None
+    allowed = status == "answer_in_progress" and disposition in {"no_receipt", "in_progress"}
+    allowed = allowed or status in _DECISION_FAILURES and disposition in {"no_receipt", "terminal_rejected"}
+    return response if allowed and _valid_failure(response) else None
 
 
-def _protocol_prune(
-    value: Any,
-    *,
-    _depth: int = 0,
-    _budget: list[int] | None = None,
-    _seen: set[int] | None = None,
-    _exact: bool = False,
-) -> Any:
-    if _budget is None:
-        _budget = [PRIVATE_STRUCTURE_MAX_ITEMS]
-    if _seen is None:
-        _seen = set()
-    _budget[0] -= 1
-    if _budget[0] < 0 or _depth > PRIVATE_STRUCTURE_MAX_DEPTH:
+def _protocol_prune(value: Any, *, _depth: int = 0, _budget: list[int] | None = None, _seen: set[int] | None = None, _exact: bool = False) -> Any:
+    budget = [PRIVATE_STRUCTURE_MAX_ITEMS] if _budget is None else _budget
+    seen = set() if _seen is None else _seen
+    budget[0] -= 1
+    if budget[0] < 0 or _depth > PRIVATE_STRUCTURE_MAX_DEPTH:
         return None
-    if isinstance(value, dict):
-        if id(value) in _seen:
+    if isinstance(value, (dict, list)):
+        if id(value) in seen:
             return None
-        _seen.add(id(value))
+        seen.add(id(value))
+    if isinstance(value, dict):
         clean: dict[str, Any] = {}
         for raw_key, item in value.items():
             key = str(raw_key)
-            forbidden = (
-                key in FORBIDDEN_PUBLIC_KEYS
-                or "secret" in key.lower()
-                or (
-                    "token" in key.lower()
-                    and key not in _ALLOWED_PROTOCOL_TOKEN_KEYS
-                )
-            )
-            if forbidden:
-                continue
-            clean[key] = _protocol_prune(
-                item,
-                _depth=_depth + 1,
-                _budget=_budget,
-                _seen=_seen,
-                _exact=key in _EXACT_PROTOCOL_TEXT_KEYS,
-            )
+            forbidden = key in FORBIDDEN_PUBLIC_KEYS or "secret" in key.lower()
+            forbidden = forbidden or "token" in key.lower() and key not in _ALLOWED_PROTOCOL_TOKEN_KEYS
+            if not forbidden:
+                clean[key] = _protocol_prune(item, _depth=_depth + 1, _budget=budget, _seen=seen, _exact=key in _EXACT_PROTOCOL_TEXT_KEYS)
         return clean
     if isinstance(value, list):
-        if id(value) in _seen:
-            return None
-        _seen.add(id(value))
-        return [
-            _protocol_prune(
-                item,
-                _depth=_depth + 1,
-                _budget=_budget,
-                _seen=_seen,
-                _exact=_exact,
-            )
-            for item in value
-        ]
+        return [_protocol_prune(item, _depth=_depth + 1, _budget=budget, _seen=seen, _exact=_exact) for item in value]
     if isinstance(value, str):
         return value if _exact else sanitize_text(value, PRUNE_TEXT_LIMIT)
     return value
 
 
-def _schema_error(
-    status: str,
-    message: str,
-    *,
-    received: Any,
-    required_key: str,
-    required_version: int,
-) -> dict[str, Any]:
-    return {
-        "ok": False,
-        "status": status,
-        "error": message,
-        required_key: required_version,
-        "received_schema_version": received,
-    }
+def _schema_error(status: str, message: str, received: Any, key: str, version: int) -> dict[str, Any]:
+    return {"ok": False, "status": status, "error": message, key: version, "received_schema_version": received}
 
 
 @dataclass(frozen=True)
@@ -397,24 +235,14 @@ class TendwireClient:
     socket_path: str | Path | None = None
 
     def _timeout_seconds(self) -> float:
-        if self.timeout is not None:
-            return max(1.0, float(self.timeout))
-        return config.tendwire_timeout_seconds()
+        return max(1.0, float(self.timeout)) if self.timeout is not None else config.tendwire_timeout_seconds()
 
     def _path(self) -> Path:
         return Path(self.socket_path or config.tendwire_socket_path()).expanduser()
 
     @staticmethod
-    def _transport_error(
-        status: str, message: str, *, started: bool
-    ) -> dict[str, Any]:
-        result = _TransportResult(
-            {
-                "ok": False,
-                "status": status,
-                "error": sanitize_text(message, 300),
-            }
-        )
+    def _transport_error(status: str, message: str, *, started: bool) -> _RPCResult:
+        result = _RPCResult({"ok": False, "status": status, "error": sanitize_text(message, 300)}, origin="transport")
         if started:
             result._ambiguous = _AMBIGUOUS
         else:
@@ -427,33 +255,20 @@ class TendwireClient:
             raise OSError("Tendwire socket path must be an absolute leaf")
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
         nofollow = getattr(os, "O_NOFOLLOW", 0)
-        parent_fd = os.open("/", flags)
-        pin_fd = -1
+        parent_fd, pin_fd = os.open("/", flags), -1
         try:
             for part in path.parts[1:-1]:
                 next_fd = os.open(part, flags | nofollow, dir_fd=parent_fd)
                 os.close(parent_fd)
                 parent_fd = next_fd
             parent = os.fstat(parent_fd)
-            insecure_parent = stat.S_IMODE(parent.st_mode) & (
-                stat.S_IWGRP | stat.S_IWOTH
-            )
-            if parent.st_uid != os.geteuid() or insecure_parent:
+            if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o022:
                 raise OSError("Tendwire socket parent is not private and owned")
             current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-            insecure_socket = stat.S_IMODE(current.st_mode) & ~0o600
-            if (
-                not stat.S_ISSOCK(current.st_mode)
-                or current.st_uid != os.geteuid()
-                or insecure_socket
-            ):
+            if not stat.S_ISSOCK(current.st_mode) or current.st_uid != os.geteuid() or stat.S_IMODE(current.st_mode) & ~0o600:
                 raise OSError("Tendwire endpoint is not a private owned socket")
-            path_flag = getattr(os, "O_PATH", os.O_RDONLY)
-            pin_fd = os.open(
-                path.name,
-                path_flag | nofollow | getattr(os, "O_CLOEXEC", 0),
-                dir_fd=parent_fd,
-            )
+            pin_flags = getattr(os, "O_PATH", os.O_RDONLY) | nofollow | getattr(os, "O_CLOEXEC", 0)
+            pin_fd = os.open(path.name, pin_flags, dir_fd=parent_fd)
             pinned = os.fstat(pin_fd)
             identity = (current.st_dev, current.st_ino)
             if (pinned.st_dev, pinned.st_ino) != identity or not stat.S_ISSOCK(pinned.st_mode):
@@ -467,9 +282,7 @@ class TendwireClient:
 
     @staticmethod
     def _anchored_socket_address(parent_fd: int, leaf: str) -> str:
-        """Name ``leaf`` through the retained parent, never through its ancestors."""
-
-        if os.name != "posix" or not isinstance(parent_fd, int) or parent_fd < 0:
+        if os.name != "posix" or parent_fd < 0:
             raise OSError("Tendwire socket anchoring is unsupported")
         expected = os.fstat(parent_fd)
         anchor = f"/proc/self/fd/{parent_fd}"
@@ -477,10 +290,7 @@ class TendwireClient:
             current = os.stat(anchor)
         except OSError:
             raise OSError("Tendwire socket anchoring is unavailable") from None
-        if (
-            not stat.S_ISDIR(expected.st_mode)
-            or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
-        ):
+        if not stat.S_ISDIR(expected.st_mode) or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
             raise OSError("Tendwire socket anchor is invalid")
         return f"{anchor}/{leaf}"
 
@@ -490,17 +300,10 @@ class TendwireClient:
             raise OSError("Tendwire daemon peer validation is unsupported")
         credentials = struct.Struct("3i")
         try:
-            raw = conn.getsockopt(
-                socket.SOL_SOCKET,
-                socket.SO_PEERCRED,
-                credentials.size,
-            )
-            peer_pid, peer_uid, peer_gid = credentials.unpack(raw)
+            pid, uid, gid = credentials.unpack(conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, credentials.size))
         except (OSError, struct.error):
             raise OSError("Tendwire daemon peer validation failed") from None
-        if peer_pid <= 0 or peer_uid < 0 or peer_gid < 0:
-            raise OSError("Tendwire daemon peer validation failed")
-        if peer_uid != os.geteuid():
+        if pid <= 0 or uid != os.geteuid() or gid < 0:
             raise OSError("Tendwire daemon peer is not owned by this user")
 
     @staticmethod
@@ -533,95 +336,53 @@ class TendwireClient:
                 complete = True
 
     @staticmethod
-    def _outer_result(response: Any, request_id: str) -> dict[str, Any]:
+    def _outer_result(response: Any, request_id: str) -> _RPCResult:
         fields = {"schema_version", "ok", "status", "result", "error", "id"}
-        invalid_shell = (
-            not isinstance(response, dict)
-            or set(response) != fields
-            or response.get("schema_version") != DAEMON_API_SCHEMA_VERSION
-            or isinstance(response.get("schema_version"), bool)
-            or response.get("id") != request_id
-            or type(response.get("ok")) is not bool
+        valid = bool(
+            isinstance(response, dict)
+            and set(response) == fields
+            and type(response.get("schema_version")) is int
+            and response["schema_version"] == DAEMON_API_SCHEMA_VERSION
+            and response.get("id") == request_id
+            and type(response.get("ok")) is bool
         )
-        if invalid_shell:
+        if not valid:
             raise ValueError("Tendwire daemon returned an invalid response envelope")
         if response["ok"] is True:
-            if (
-                response.get("status") != "ok"
-                or not isinstance(response.get("result"), dict)
-                or response.get("error") is not None
-            ):
+            if response.get("status") != "ok" or not isinstance(response.get("result"), dict) or response.get("error") is not None:
                 raise ValueError("Tendwire daemon returned an invalid success envelope")
-            return response["result"]
+            return _RPCResult(response["result"], origin="inner")
         error = response.get("error")
         if (
             response.get("status") != "error"
             or response.get("result") is not None
             or not isinstance(error, dict)
-            or not isinstance(error.get("code"), str)
-            or not error["code"]
-            or not isinstance(error.get("message"), str)
-            or not error["message"]
+            or not _text(error.get("code"))
+            or not _text(error.get("message"))
         ):
             raise ValueError("Tendwire daemon returned an invalid error envelope")
-        return {"ok": False, "status": error["code"], "error": public_prune(error)}
+        return _RPCResult({"ok": False, "status": error["code"], "error": public_prune(error)}, origin="outer")
 
-    def _request(
-        self,
-        method: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout: float | None = None,
-    ) -> dict[str, Any]:
+    def _request(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> _RPCResult:
         request_id = f"r{secrets.token_hex(12)}"
         try:
-            payload = {
-                "id": request_id,
-                "method": method,
-                "params": dict(params or {}),
-            }
-            raw = json.dumps(
-                payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8") + b"\n"
+            payload = {"id": request_id, "method": method, "params": dict(params or {})}
+            raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
         except (TypeError, ValueError, UnicodeError):
-            return self._transport_error(
-                "invalid_request",
-                "Tendwire request is not bounded JSON",
-                started=False,
-            )
+            return self._transport_error("invalid_request", "Tendwire request is not bounded JSON", started=False)
         if len(raw) > DAEMON_MAX_FRAME_BYTES:
-            return self._transport_error(
-                "request_too_large",
-                "Tendwire request exceeds the size bound",
-                started=False,
-            )
-        timeout_seconds = (
-            self._timeout_seconds()
-            if timeout is None
-            else max(1.0, float(timeout))
-        )
-        deadline = time.monotonic() + timeout_seconds
+            return self._transport_error("request_too_large", "Tendwire request exceeds the size bound", started=False)
+        deadline = time.monotonic() + (self._timeout_seconds() if timeout is None else max(1.0, float(timeout)))
         started = False
         parent_fd = pin_fd = -1
         try:
-            path = self._path()
-            parent_fd, pin_fd, leaf, identity = self._pin_socket(path)
-            address = self._anchored_socket_address(parent_fd, leaf)
+            parent_fd, pin_fd, leaf, identity = self._pin_socket(self._path())
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
                 conn.settimeout(max(0.001, deadline - time.monotonic()))
-                conn.connect(address)
+                conn.connect(self._anchored_socket_address(parent_fd, leaf))
                 current = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
                 pinned = os.fstat(pin_fd)
-                if (
-                    (current.st_dev, current.st_ino) != identity
-                    or (pinned.st_dev, pinned.st_ino) != identity
-                    or not stat.S_ISSOCK(current.st_mode)
-                    or not stat.S_ISSOCK(pinned.st_mode)
-                ):
+                if (current.st_dev, current.st_ino) != identity or (pinned.st_dev, pinned.st_ino) != identity:
                     raise OSError("Tendwire socket changed during connection")
                 self._validate_peer(conn)
                 started = True
@@ -629,11 +390,7 @@ class TendwireClient:
                 frame = self._read_frame(conn, deadline)
             return self._outer_result(json.loads(frame.decode("utf-8")), request_id)
         except (TimeoutError, socket.timeout):
-            return self._transport_error(
-                "daemon_timeout",
-                "Tendwire daemon request timed out",
-                started=started,
-            )
+            return self._transport_error("daemon_timeout", "Tendwire daemon request timed out", started=started)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             return self._transport_error("daemon_protocol_error", str(exc), started=started)
         except OSError as exc:
@@ -646,18 +403,18 @@ class TendwireClient:
                 os.close(parent_fd)
 
     @staticmethod
-    def _clean(result: dict[str, Any], *, protocol: bool = False) -> dict[str, Any]:
+    def _clean(result: Mapping[str, Any], *, protocol: bool = False) -> dict[str, Any]:
         clean = _protocol_prune(result) if protocol else public_prune(result)
-        if isinstance(clean, dict):
-            return clean
-        return {
-            "ok": False,
-            "status": "daemon_protocol_error",
-            "error": "invalid Tendwire result",
-        }
+        return clean if isinstance(clean, dict) else {"ok": False, "status": "daemon_protocol_error", "error": "invalid Tendwire result"}
 
     def snapshot(self) -> dict[str, Any]:
         return self._clean(self._request("snapshot.get"))
+
+    def pending(self) -> dict[str, Any]:
+        return self._clean(self._request("pending.list"))
+
+    def doctor(self) -> dict[str, Any]:
+        return self._clean(self._request("health.get", timeout=10))
 
     def turns(self) -> dict[str, Any]:
         merged: dict[str, Any] | None = None
@@ -673,51 +430,22 @@ class TendwireClient:
                 return result
             turns = result.get("turns")
             if result.get("schema_version") != 2 or not isinstance(turns, list):
-                return _schema_error(
-                    "upgrade_required",
-                    "Tendwire turn.list schema v2 is required",
-                    received=result.get("schema_version"),
-                    required_key="required_turn_schema_version",
-                    required_version=2,
-                )
-            invalid_content = any(
-                not isinstance(row, dict)
-                or not isinstance(row.get("content"), dict)
-                or row["content"].get("schema_version") != 1
-                for row in turns
-            )
-            if invalid_content:
-                return _schema_error(
-                    "unsupported_content_schema",
-                    "Every turn requires content schema v1",
-                    received=None,
-                    required_key="supported_content_schema_version",
-                    required_version=1,
-                )
+                return _schema_error("upgrade_required", "Tendwire turn.list schema v2 is required", result.get("schema_version"), "required_turn_schema_version", 2)
+            bad_content = any(not isinstance(row, dict) or not isinstance(row.get("content"), dict) or row["content"].get("schema_version") != 1 for row in turns)
+            if bad_content:
+                return _schema_error("unsupported_content_schema", "Every turn requires content schema v1", None, "supported_content_schema_version", 1)
             merged = dict(result) if merged is None else merged
             rows.extend(turns)
             cursor = result.get("next_cursor")
             if cursor is None and result.get("has_more") is not True:
                 merged.update({"turns": rows, "next_cursor": None, "has_more": False})
                 return merged
-            if not isinstance(cursor, str) or not cursor or cursor in seen:
+            if not _text(cursor) or cursor in seen:
                 break
             seen.add(cursor)
-        return _schema_error(
-            "unsupported_content_schema",
-            "Tendwire turn.list pagination is invalid",
-            received=None,
-            required_key="supported_content_schema_version",
-            required_version=1,
-        )
+        return _schema_error("unsupported_content_schema", "Tendwire turn.list pagination is invalid", None, "supported_content_schema_version", 1)
 
-    def turn_delta(
-        self,
-        *,
-        watermark: str | None = None,
-        cursor: str | None = None,
-        limit: int | None = None,
-    ) -> dict[str, Any]:
+    def turn_delta(self, *, watermark: str | None = None, cursor: str | None = None, limit: int | None = None) -> dict[str, Any]:
         if watermark is not None and cursor is not None:
             raise ValueError("watermark and cursor are mutually exclusive")
         page_limit = config.tendwire_delta_limit() if limit is None else int(limit)
@@ -730,58 +458,24 @@ class TendwireClient:
             params["cursor"] = str(cursor)
         result = self._clean(self._request("turn.delta", params), protocol=True)
         error = result.get("error")
-        error_code = str(error.get("code") or "").lower() if isinstance(error, dict) else ""
+        code = str(error.get("code") or "").lower() if isinstance(error, dict) else ""
         status = str(result.get("status") or "").lower()
-        unsupported = {"unsupported_method", "unknown_method"}
-        if status in unsupported or error_code in unsupported:
-            return {
-                "ok": False,
-                "status": "unsupported_method",
-                "schema_version": 1,
-                "projection_schema_version": 2,
-            }
+        if status in {"unsupported_method", "unknown_method"} or code in {"unsupported_method", "unknown_method"}:
+            return {"ok": False, "status": "unsupported_method", "schema_version": 1, "projection_schema_version": 2}
         if status in {"daemon_timeout", "daemon_unavailable", "daemon_protocol_error"}:
-            return {
-                "ok": False,
-                "status": "transport_ambiguous",
-                "transport_status": status,
-                "error": sanitize_text(result.get("error") or status, 300),
-            }
+            return {"ok": False, "status": "transport_ambiguous", "transport_status": status, "error": sanitize_text(result.get("error") or status, 300)}
         return result
 
-    def turn_content_get(
-        self,
-        turn_id: str,
-        content_revision: str,
-        field: str,
-        cursor: str | None = None,
-    ) -> dict[str, Any]:
-        params: dict[str, Any] = {
-            "schema_version": 1,
-            "turn_id": str(turn_id),
-            "content_revision": str(content_revision),
-            "field": str(field),
-        }
+    def turn_content_get(self, turn_id: str, content_revision: str, field: str, cursor: str | None = None) -> dict[str, Any]:
+        params = {"schema_version": 1, "turn_id": str(turn_id), "content_revision": str(content_revision), "field": str(field)}
         if cursor is not None:
             params["cursor"] = str(cursor)
         result = self._clean(self._request("turn.content.get", params), protocol=True)
         if result.get("ok") is False:
             return result
         if result.get("schema_version") != 1 or not isinstance(result.get("text"), str):
-            return _schema_error(
-                "unsupported_content_schema",
-                "Tendwire turn.content.get schema v1 with exact text is required",
-                received=result.get("schema_version"),
-                required_key="supported_content_schema_version",
-                required_version=1,
-            )
+            return _schema_error("unsupported_content_schema", "Tendwire turn.content.get schema v1 with exact text is required", result.get("schema_version"), "supported_content_schema_version", 1)
         return result
-
-    def pending(self) -> dict[str, Any]:
-        return self._clean(self._request("pending.list"))
-
-    def doctor(self) -> dict[str, Any]:
-        return self._clean(self._request("health.get", timeout=10))
 
     def command_json(self, request_json: str) -> dict[str, Any]:
         try:
@@ -796,15 +490,11 @@ class TendwireClient:
         result = self._request("command.submit", public_request, timeout=60)
         if command_process_not_started(result):
             return result
-        if command_process_ambiguous(result):
+        if command_process_ambiguous(result) or (isinstance(result, _RPCResult) and result.origin == "outer"):
             return _request_state_uncertain(public_request)
-        if public_request["action"] == "answer_decision":
-            validated = _validated_decision_response(result, public_request)
-        else:
-            validated = _validated_command_response(result, public_request)
-        if validated is None:
-            return _request_state_uncertain(public_request)
-        return public_prune(validated)
+        validator = _validated_decision_response if public_request["action"] == "answer_decision" else _validated_command_response
+        validated = validator(result, public_request)
+        return public_prune(validated) if validated is not None else _request_state_uncertain(public_request)
 
     def command(self, request: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -812,227 +502,79 @@ class TendwireClient:
         except (TypeError, ValueError):
             return _invalid_command_request()
 
-    def _connector(
-        self,
-        method: str,
-        params: dict[str, Any],
-        *,
-        protocol: bool = False,
-    ) -> dict[str, Any]:
-        result = self._request(
-            f"connector.{method}",
-            params,
-            timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS,
-        )
-        clean = self._clean(result, protocol=protocol)
-        if isinstance(result, _TransportResult):
+    def _connector(self, method: str, params: dict[str, Any], *, protocol: bool = False) -> dict[str, Any]:
+        raw = self._request(f"connector.{method}", params, timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS)
+        clean = self._clean(raw, protocol=protocol)
+        if isinstance(raw, _RPCResult) and raw.origin in {"transport", "outer"}:
             return clean
         if self._valid_connector_result(method, params, clean):
             return clean
-        return _schema_error(
-            "invalid_connector_response",
-            "Tendwire connector returned a malformed schema-v1 envelope",
-            received=clean.get("schema_version"),
-            required_key="supported_content_schema_version",
-            required_version=CONNECTOR_SCHEMA_VERSION,
-        )
+        return _schema_error("invalid_connector_response", "Tendwire connector returned a malformed schema-v1 envelope", clean.get("schema_version"), "supported_content_schema_version", 1)
 
     @staticmethod
-    def _valid_connector_result(
-        method: str,
-        params: dict[str, Any],
-        result: dict[str, Any],
-    ) -> bool:
-        status = result.get("status")
-        ok = result.get("ok")
+    def _valid_connector_result(method: str, params: dict[str, Any], result: dict[str, Any]) -> bool:
+        status, ok = result.get("status"), result.get("ok")
         name = str(params.get("name") or "")
-        common = (
-            type(result.get("schema_version")) is int
-            and result["schema_version"] == CONNECTOR_SCHEMA_VERSION
-            and type(ok) is bool
-            and isinstance(status, str)
-            and bool(status)
-        )
-        if not common:
+        if type(result.get("schema_version")) is not int or result["schema_version"] != 1:
+            return False
+        if type(ok) is not bool or not _text(status):
             return False
         if ok is False:
             error = result.get("error")
-            return (
-                isinstance(result.get("host_id"), str)
-                and bool(result["host_id"])
-                and result.get("name") == name
-                and isinstance(error, dict)
-                and error.get("code") == status
-                and isinstance(error.get("message"), str)
-                and bool(error["message"])
-            )
+            return bool(_text(result.get("host_id")) and result.get("name") == name and isinstance(error, dict) and error.get("code") == status and _text(error.get("message")))
         if result.get("error") is not None:
             return False
         if method == "prepare":
             return TendwireClient._valid_prepare_result(params, result)
-        if (
-            not isinstance(result.get("host_id"), str)
-            or not result["host_id"]
-            or result.get("name") != name
-        ):
+        if not _text(result.get("host_id")) or result.get("name") != name:
             return False
         if method == "poll":
-            items = result.get("items")
-            return status == "ok" and isinstance(items, list) and all(
-                TendwireClient._valid_connector_item(item) for item in items
-            )
-        if method in {"ack", "fail", "defer"}:
-            expected = {
-                "ack": {"acknowledged"},
-                "fail": {"retry_scheduled", "attempts_exhausted", "superseded"},
-                "defer": {"deferred", "superseded"},
-            }[method]
-            return (
-                status in expected
-                and result.get("ref") == str(params.get("ref") or "")
-                and TendwireClient._valid_opaque(result.get("ref"), "twref1.")
-                and isinstance(result.get("key"), str)
-                and bool(result["key"])
-                and type(result.get("attempt")) is int
-                and result["attempt"] > 0
-                and (
-                    status not in {"retry_scheduled", "deferred"}
-                    or isinstance(result.get("available_at"), str)
-                    and bool(result["available_at"])
-                )
-            )
-        return False
+            return status == "ok" and isinstance(result.get("items"), list) and all(TendwireClient._valid_connector_item(item) for item in result["items"])
+        expected = {
+            "ack": {"acknowledged"},
+            "fail": {"retry_scheduled", "attempts_exhausted", "superseded"},
+            "defer": {"deferred", "superseded"},
+        }.get(method)
+        return bool(expected and status in expected and result.get("ref") == str(params.get("ref") or "") and _opaque(result.get("ref"), "twref1.") and _text(result.get("key")) and type(result.get("attempt")) is int and result["attempt"] > 0 and (status not in {"retry_scheduled", "deferred"} or _text(result.get("available_at"))))
 
     @staticmethod
-    def _valid_prepare_result(
-        params: dict[str, Any], result: dict[str, Any]
-    ) -> bool:
+    def _valid_prepare_result(params: dict[str, Any], result: dict[str, Any]) -> bool:
         action = params.get("action")
         if action == "recover":
-            integer_fields = (
-                "generation",
-                "acknowledged_prefix_count",
-                "executable_job_count",
-                "retained_failed_job_count",
-                "prior_attempt_count",
-            )
-            return (
-                result.get("status") == "recovered"
-                and result.get("failed_plan_token") == params.get("failed_plan_token")
-                and TendwireClient._valid_opaque(result.get("failed_plan_token"), "twplan1.")
-                and TendwireClient._valid_opaque(result.get("plan_token"), "twplan1.")
-                and TendwireClient._valid_opaque(result.get("content_revision"), "twrev1.")
-                and isinstance(result.get("state"), str)
-                and bool(result["state"])
-                and all(type(result.get(key)) is int for key in integer_fields)
-                and type(result.get("idempotent_replay")) is bool
-            )
-        valid_plan = (
-            result.get("status") == "ok"
-            and isinstance(result.get("host_id"), str)
-            and bool(result["host_id"])
-            and result.get("name") == str(params.get("name") or "")
-            and TendwireClient._valid_opaque(result.get("plan_token"), "twplan1.")
-        )
+            integers = ("generation", "acknowledged_prefix_count", "executable_job_count", "retained_failed_job_count", "prior_attempt_count")
+            return bool(result.get("status") == "recovered" and result.get("failed_plan_token") == params.get("failed_plan_token") and _opaque(result.get("failed_plan_token"), "twplan1.") and _opaque(result.get("plan_token"), "twplan1.") and _opaque(result.get("content_revision"), "twrev1.") and _text(result.get("state")) and all(type(result.get(key)) is int for key in integers) and type(result.get("idempotent_replay")) is bool)
+        valid_plan = bool(result.get("status") == "ok" and _text(result.get("host_id")) and result.get("name") == str(params.get("name") or "") and _opaque(result.get("plan_token"), "twplan1."))
         if action == "part":
-            return (
-                valid_plan
-                and result.get("ordinal") == params.get("ordinal")
-                and type(result.get("accepted_parts")) is int
-                and result["accepted_parts"] > 0
-            )
-        count_key = "part_count" if action == "begin" else "job_count"
-        return (
-            valid_plan
-            and action in {"begin", "commit"}
-            and isinstance(result.get("state"), str)
-            and bool(result["state"])
-            and type(result.get("generation")) is int
-            and type(result.get(count_key)) is int
-            and result[count_key] >= (1 if action == "begin" else 0)
-            and (
-                action != "begin"
-                or type(result.get("accepted_parts")) is int
-                and result["accepted_parts"] >= 0
-            )
-        )
+            return bool(valid_plan and result.get("ordinal") == params.get("ordinal") and type(result.get("accepted_parts")) is int and result["accepted_parts"] > 0)
+        count = "part_count" if action == "begin" else "job_count"
+        return bool(valid_plan and action in {"begin", "commit"} and _text(result.get("state")) and type(result.get("generation")) is int and type(result.get(count)) is int and result[count] >= (1 if action == "begin" else 0) and (action != "begin" or type(result.get("accepted_parts")) is int and result["accepted_parts"] >= 0))
 
     @staticmethod
     def _valid_connector_item(item: Any) -> bool:
-        return (
-            isinstance(item, dict)
-            and TendwireClient._valid_opaque(item.get("ref"), "twref1.")
-            and isinstance(item.get("key"), str)
-            and bool(item["key"])
-            and type(item.get("attempt")) is int
-            and item["attempt"] > 0
-            and isinstance(item.get("leased_until"), str)
-            and bool(item["leased_until"])
-            and isinstance(item.get("available_at"), str)
-            and bool(item["available_at"])
-            and isinstance(item.get("payload"), dict)
-        )
+        return bool(isinstance(item, dict) and _opaque(item.get("ref"), "twref1.") and _text(item.get("key")) and type(item.get("attempt")) is int and item["attempt"] > 0 and _text(item.get("leased_until")) and _text(item.get("available_at")) and isinstance(item.get("payload"), dict))
 
-    @staticmethod
-    def _valid_opaque(value: Any, prefix: str) -> bool:
-        if not isinstance(value, str) or not value.startswith(prefix):
-            return False
-        body = value[len(prefix) :]
-        return bool(body) and len(value) <= 264 and all(
-            char.isascii() and (char.isalnum() or char in "_-")
-            for char in body
-        )
-
-    def connector_poll(
-        self,
-        *,
-        name: str = "attention",
-        limit: int = 3,
-        lease_seconds: int = 60,
-    ) -> dict[str, Any]:
+    def connector_poll(self, *, name: str = "attention", limit: int = 3, lease_seconds: int = 60) -> dict[str, Any]:
         return self._connector(
             "poll",
             {"name": name, "limit": limit, "lease_seconds": lease_seconds},
             protocol=name == TURN_FINAL_CONNECTOR,
         )
 
-    def connector_ack(
-        self,
-        ref: str,
-        response: dict[str, Any] | None = None,
-        *,
-        name: str = "attention",
-    ) -> dict[str, Any]:
+    def connector_ack(self, ref: str, response: dict[str, Any] | None = None, *, name: str = "attention") -> dict[str, Any]:
         params: dict[str, Any] = {"name": name, "ref": str(ref)}
         if response is not None:
-            params["response"] = (
-                _protocol_prune(response)
-                if name == TURN_FINAL_CONNECTOR
-                else public_prune(response)
-            )
+            params["response"] = _protocol_prune(response) if name == TURN_FINAL_CONNECTOR else public_prune(response)
         return self._connector("ack", params, protocol=name == TURN_FINAL_CONNECTOR)
 
-    def connector_fail(
-        self,
-        ref: str,
-        error: str,
-        *,
-        name: str = "attention",
-    ) -> dict[str, Any]:
+    def connector_fail(self, ref: str, error: str, *, name: str = "attention") -> dict[str, Any]:
         return self._connector(
             "fail",
-            {
-                "name": name,
-                "ref": str(ref),
-                "reason": sanitize_text(error, 240),
-            },
+            {"name": name, "ref": str(ref), "reason": sanitize_text(error, 240)},
             protocol=name == TURN_FINAL_CONNECTOR,
         )
 
     def _prepare(self, request: dict[str, Any]) -> dict[str, Any]:
-        encoded = json.dumps(
-            request, separators=(",", ":"), ensure_ascii=False
-        ).encode("utf-8")
+        encoded = json.dumps(request, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         if len(encoded) > CONNECTOR_PREPARE_MAX_REQUEST_BYTES:
             return {
                 "ok": False,
@@ -1042,135 +584,41 @@ class TendwireClient:
             }
         return self._connector("prepare", request, protocol=True)
 
-    def connector_prepare_begin(
-        self,
-        *,
-        turn_id: str,
-        content_revision: str,
-        presentation_version: str,
-        part_count: int,
-        source_ref: str | None = None,
-    ) -> dict[str, Any]:
-        request: dict[str, Any] = {
-            "schema_version": 1,
-            "action": "begin",
-            "name": TURN_FINAL_CONNECTOR,
-            "turn_id": str(turn_id),
-            "content_revision": str(content_revision),
-            "presentation_version": str(presentation_version),
-            "part_count": part_count,
-        }
+    def connector_prepare_begin(self, *, turn_id: str, content_revision: str, presentation_version: str, part_count: int, source_ref: str | None = None) -> dict[str, Any]:
+        request: dict[str, Any] = {"schema_version": 1, "action": "begin", "name": TURN_FINAL_CONNECTOR, "turn_id": str(turn_id), "content_revision": str(content_revision), "presentation_version": str(presentation_version), "part_count": part_count}
         if source_ref is not None:
             request["source_ref"] = str(source_ref)
         return self._prepare(request)
 
-    def connector_prepare_part(
-        self,
-        *,
-        plan_token: str,
-        ordinal: int,
-        spans: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        if not isinstance(spans, list) or not 1 <= len(spans) <= CONNECTOR_PREPARE_MAX_SPANS:
-            return {
-                "ok": False,
-                "status": "invalid_prepare_part",
-                "error": (
-                    f"spans must contain 1..{CONNECTOR_PREPARE_MAX_SPANS} "
-                    "canonical ranges"
-                ),
-            }
-
-        def invalid_span(span: Any) -> bool:
-            return (
-                not isinstance(span, dict)
-                or set(span) != {"field", "start_char", "end_char"}
-                or span.get("field")
-                not in {"user_text", "assistant_final_text"}
-                or type(span.get("start_char")) is not int
-                or type(span.get("end_char")) is not int
-                or span["start_char"] < 0
-                or span["end_char"] <= span["start_char"]
-            )
-
-        if any(invalid_span(span) for span in spans):
-            return {
-                "ok": False,
-                "status": "invalid_prepare_part",
-                "error": "each span must be a non-empty canonical user/final range",
-            }
-        return self._prepare(
-            {
-                "schema_version": 1,
-                "action": "part",
-                "name": TURN_FINAL_CONNECTOR,
-                "plan_token": str(plan_token),
-                "ordinal": ordinal,
-                "spans": spans,
-            }
+    def connector_prepare_part(self, *, plan_token: str, ordinal: int, spans: list[dict[str, Any]]) -> dict[str, Any]:
+        valid = isinstance(spans, list) and 1 <= len(spans) <= CONNECTOR_PREPARE_MAX_SPANS
+        valid = valid and all(
+            _keys(span, {"field", "start_char", "end_char"})
+            and span["field"] in {"user_text", "assistant_final_text"}
+            and type(span["start_char"]) is int
+            and type(span["end_char"]) is int
+            and 0 <= span["start_char"] < span["end_char"]
+            for span in spans
         )
+        if not valid:
+            return {"ok": False, "status": "invalid_prepare_part", "error": "spans must contain bounded non-empty canonical ranges"}
+        request = {"schema_version": 1, "action": "part", "name": TURN_FINAL_CONNECTOR, "plan_token": str(plan_token), "ordinal": ordinal, "spans": spans}
+        return self._prepare(request)
 
-    def connector_prepare_commit(
-        self,
-        *,
-        plan_token: str,
-        source_ref: str | None = None,
-    ) -> dict[str, Any]:
-        request: dict[str, Any] = {
-            "schema_version": 1,
-            "action": "commit",
-            "name": TURN_FINAL_CONNECTOR,
-            "plan_token": str(plan_token),
-        }
+    def connector_prepare_commit(self, *, plan_token: str, source_ref: str | None = None) -> dict[str, Any]:
+        request: dict[str, Any] = {"schema_version": 1, "action": "commit", "name": TURN_FINAL_CONNECTOR, "plan_token": str(plan_token)}
         if source_ref is not None:
             request["source_ref"] = str(source_ref)
         return self._prepare(request)
 
-    def connector_prepare_recover(
-        self,
-        *,
-        failed_plan_token: str,
-        request_id: str,
-    ) -> dict[str, Any]:
-        token_ok = (
-            isinstance(failed_plan_token, str)
-            and failed_plan_token.startswith("twplan1.")
-            and 8 < len(failed_plan_token) <= 264
-            and all(
-                char.isascii() and (char.isalnum() or char in "_-")
-                for char in failed_plan_token[8:]
-            )
-        )
-        request_ok = (
-            isinstance(request_id, str)
-            and 1 <= len(request_id) <= 128
-            and all(
-                char.isascii() and (char.isalnum() or char in "._-")
-                for char in request_id
-            )
-        )
-        if not token_ok or not request_ok:
-            return {
-                "ok": False,
-                "status": "invalid_recovery_request",
-                "error": "recovery coordinates must be public-safe opaque values",
-            }
-        return self._prepare(
-            {
-                "schema_version": 1,
-                "action": "recover",
-                "name": TURN_FINAL_CONNECTOR,
-                "failed_plan_token": failed_plan_token,
-                "request_id": request_id,
-            }
-        )
+    def connector_prepare_recover(self, *, failed_plan_token: str, request_id: str) -> dict[str, Any]:
+        if not _opaque(failed_plan_token, "twplan1.") or not valid_recovery_request_id(request_id):
+            return {"ok": False, "status": "invalid_recovery_request", "error": "recovery coordinates must be public-safe opaque values"}
+        request = {"schema_version": 1, "action": "recover", "name": TURN_FINAL_CONNECTOR, "failed_plan_token": failed_plan_token, "request_id": request_id}
+        return self._prepare(request)
 
     def turn_final_poll(self, *, limit: int = 1, lease_seconds: int = 60) -> dict[str, Any]:
-        return self.connector_poll(
-            name=TURN_FINAL_CONNECTOR,
-            limit=limit,
-            lease_seconds=lease_seconds,
-        )
+        return self.connector_poll(name=TURN_FINAL_CONNECTOR, limit=limit, lease_seconds=lease_seconds)
 
     def turn_final_ack(self, ref: str, response: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.connector_ack(ref, response, name=TURN_FINAL_CONNECTOR)
@@ -1178,19 +626,8 @@ class TendwireClient:
     def turn_final_fail(self, ref: str, reason: str) -> dict[str, Any]:
         return self.connector_fail(ref, reason, name=TURN_FINAL_CONNECTOR)
 
-    def turn_final_defer(
-        self,
-        ref: str,
-        reason: str = "",
-        *,
-        available_at: str | None = None,
-        delay_seconds: int | None = None,
-    ) -> dict[str, Any]:
-        params: dict[str, Any] = {
-            "name": TURN_FINAL_CONNECTOR,
-            "ref": str(ref),
-            "reason": sanitize_text(reason, 240),
-        }
+    def turn_final_defer(self, ref: str, reason: str = "", *, available_at: str | None = None, delay_seconds: int | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"name": TURN_FINAL_CONNECTOR, "ref": str(ref), "reason": sanitize_text(reason, 240)}
         if available_at is not None:
             params["available_at"] = str(available_at)
         if delay_seconds is not None:
