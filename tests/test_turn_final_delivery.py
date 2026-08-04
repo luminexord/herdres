@@ -7434,6 +7434,65 @@ def test_prepare_exception_defers_source_root_then_retries_once(
     assert len(telegram.sent) + len(telegram.edited) == 1
 
 
+def test_prepare_commit_exception_reuses_checkpointed_presentation_version(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+
+    class CommitFailsOnce(TurnFinalTendwire):
+        def __init__(self, row):
+            super().__init__(
+                row,
+                emit_ready=True,
+                turn_schema_version=2,
+            )
+            self.commit_failure_armed = True
+
+        def connector_prepare_commit(self, **kwargs):
+            if self.commit_failure_armed:
+                self.commit_failure_armed = False
+                raise source_sync.TendwireError(
+                    "transient commit transport failure"
+                )
+            return super().connector_prepare_commit(**kwargs)
+
+    tendwire = CommitFailsOnce(
+        _turn_row(
+            "turn-commit-retry",
+            "twrev1.commit_retry",
+            "deliver exactly once after interrupted commit",
+        )
+    )
+    tendwire.turns = lambda: {
+        "ok": True,
+        "schema_version": 2,
+        "turns": [],
+    }
+    telegram = DeletingTelegram()
+    store = _store()
+
+    first = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    entry = next(iter(state.source_worker_entries(store).values()))
+    pending_token = entry["pending_plan_token"]
+    assert first["tendwire_turn_final"]["deferred"] == 1
+    assert entry["pending_presentation_version"] == PRESENTATION_VERSION
+    assert tendwire._plans[pending_token]["parts"]
+    assert telegram.sent == []
+    assert telegram.edited == []
+
+    second = sync_once(
+        store, _runtime(tendwire, telegram, max_sends=1)
+    )
+    assert second["tendwire_turn_final"]["delivered"] == 1
+    assert second["tendwire_turn_final"]["acked"] == 1
+    assert second["tendwire_turn_final"]["operations"] == 1
+    assert len(tendwire._plans) == 1
+    assert len(telegram.sent) + len(telegram.edited) == 1
+
+
 def test_prepare_owner_rebind_defers_source_root_then_delivers_to_new_topic(
     tmp_path,
     monkeypatch,

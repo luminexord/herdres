@@ -8287,6 +8287,13 @@ def _stage_final_plan(
             else 0
         ),
     )
+    # The parent checkpoint is the durable resume contract for every child
+    # and commit call below.  Persist the protocol version with that parent,
+    # not only after a successful commit: if the process or transport stops
+    # after prepare-part, the retry must reopen the same plan version/token.
+    # Falling back to the legacy version here creates a second empty plan and
+    # permanently rejects the source final.
+    entry["pending_presentation_version"] = PRESENTATION_VERSION
     final_identity = item.get(_TURN_FINAL_IDENTITY_KEY)
     if isinstance(final_identity, str) and final_identity:
         entry["pending_final_identity"] = final_identity
