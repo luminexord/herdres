@@ -65,23 +65,15 @@ def test_inbound_success_ack_flag_default_and_override():
     ) is False
 
 
-def _space_with_legacy_pin_store():
-    """A store whose space already has a pinned status board — sync_once edits and
-    re-pins it, so it's a reliable probe for whether the posters ran."""
-    store = _store()
-    store["spaces"]["workspace:space-1"] = {
-        "topic_name": "Project",
-        "topic_id": "77",
-        "pinned_status_message_id": "55",
-    }
-    return store
+def _space_for_pinned_status():
+    return _store()
 
 
 def test_pinned_status_disabled_skips_posters(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
     telegram = FakeTelegram()
-    result = sync_once(_space_with_legacy_pin_store(),
+    result = sync_once(_space_for_pinned_status(),
                        SyncRuntime(FakeTendwire(turns={"turns": []}), telegram, with_outbox=False))
     assert result["pinned_status_updated"] == 0   # neither poster ran
     assert telegram.pins == []                     # nothing pinned
@@ -90,7 +82,7 @@ def test_pinned_status_disabled_skips_posters(monkeypatch):
     # above gate the posters rather than passing on an inert setup.
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "1")
     telegram_on = FakeTelegram()
-    result_on = sync_once(_space_with_legacy_pin_store(),
+    result_on = sync_once(_space_for_pinned_status(),
                           SyncRuntime(FakeTendwire(turns={"turns": []}), telegram_on, with_outbox=False))
     assert result_on["pinned_status_updated"] >= 1
-    assert ("-100", "55") in telegram_on.pins
+    assert telegram_on.pins

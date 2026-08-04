@@ -119,9 +119,9 @@ The paired gate must establish all of the following:
   are excluded. Same-update redelivery and managed-bot token rotation retain
   the same ID; every distinct update has a different ID even for identical
   text. Identical content does not merge distinct commands.
-- Manager and managed-bot polling offsets are keyed to stable receiving-bot
-  kinds, not token-derived runtime keys; a current legacy managed-bot offset
-  migrates to the stable path, so token rotation preserves polling position.
+- Manager and managed-bot polling cursors are keyed to stable receiving-bot
+  kinds, not token-derived runtime keys, so token rotation preserves polling
+  position.
 - On first sight of an update, before routing or child creation, Herdres
   persists immutable `created_at`, `deadline_at`, and `retain_until` bounds.
   It then persists canonical schema-v1 request JSON before command start.

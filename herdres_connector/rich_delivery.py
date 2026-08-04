@@ -987,7 +987,15 @@ def _partial_terminal_outcome(result: dict[str, Any]) -> str:
 
 
 def _with_delivery_identity(result: dict[str, Any]) -> dict[str, Any]:
-    ids = split_legacy_message_ids(result)
+    raw_ids = result.get("message_ids")
+    ids = (
+        [str(item) for item in raw_ids if str(item or "").strip()]
+        if isinstance(raw_ids, list)
+        else []
+    )
+    if not ids:
+        message_id = str(result.get("message_id") or "").strip()
+        ids = [message_id] if message_id else []
     if ids:
         result.setdefault("message_ids", ids)
         result.setdefault("canonical_message_id", ids[0])
@@ -1612,7 +1620,11 @@ def send_feed_item(
                     format_state_updates
                 )
             return result
-        message_ids.extend(split_legacy_message_ids(result))
+        raw_ids = result.get("message_ids")
+        if isinstance(raw_ids, list):
+            message_ids.extend(
+                str(item) for item in raw_ids if str(item or "").strip()
+            )
         formats.append(str(result.get("format") or ""))
         update = result.get(DELIVERY_FORMAT_STATE_UPDATE_KEY)
         if isinstance(update, dict):
@@ -1658,16 +1670,6 @@ def edit_feed_item(
         preserve_plain_html=bool(item.get("collapse_response")),
         max_physical_writes=max_physical_writes,
     )
-
-
-def split_legacy_message_ids(result: dict[str, Any]) -> list[str]:
-    raw_ids = result.get("message_ids")
-    if isinstance(raw_ids, list):
-        ids = [str(item) for item in raw_ids if str(item or "").strip()]
-        if ids:
-            return ids
-    message_id = str(result.get("message_id") or "").strip()
-    return [message_id] if message_id else []
 
 
 def plain_chunks_for_result(text: str) -> list[str]:

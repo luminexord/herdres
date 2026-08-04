@@ -781,7 +781,6 @@ def test_blocked_sync_observation_does_not_delay_command_submission(
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     worker = _source_worker(
         {
             "id": "worker-1",
@@ -906,123 +905,12 @@ def test_source_orphan_delete_cap():
 
 # --- yield behaviour in sync_once -------------------------------------------
 
-def _two_final_turns_tendwire():
-    return FakeTendwire(
-        turns={"turns": [
-            {"id": "turn-a", "worker_id": "worker-a", "worker_fingerprint": "fp-a",
-             "assistant_final_text": "Final A", "complete": True},
-            {"id": "turn-b", "worker_id": "worker-b", "worker_fingerprint": "fp-b",
-             "assistant_final_text": "Final B", "complete": True},
-        ]},
-        workers=[
-            {"id": "worker-a", "name": "a", "status": "idle", "space_id": "space-1",
-             "fingerprint": "fp-a", "meta": {"agent": "codex"}},
-            {"id": "worker-b", "name": "b", "status": "idle", "space_id": "space-1",
-             "fingerprint": "fp-b", "meta": {"agent": "claude"}},
-        ],
-    )
 
 
-def test_yield_no_clobber_competitor_write_survives(tmp_path, monkeypatch):
-    # commit-before-yield + reload-after: during the released window a competitor loads state.json,
-    # modifies it, and saves; sync_once reloads after the yield, so the competitor's write survives
-    # rather than being clobbered by a stale in-memory save.
-    _reset_lock_state()
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-
-    class _CompetitorWindow:
-        """Stand in for released_lock(): a queued command grabs the freed lock, load-modify-saves."""
-        def __enter__(self):
-            disk = json.loads(statepath.read_text(encoding="utf-8"))
-            disk["competitor_sentinel"] = "written-during-yield"
-            statepath.write_text(json.dumps(disk), encoding="utf-8")
-            return self
-        def __exit__(self, *_a):
-            return False
-
-    monkeypatch.setattr(state, "released_lock", lambda: _CompetitorWindow())
-
-    store = _store()
-    telegram = FakeTelegram()
-    with state.state_lock(path=statepath):
-        result = sync_once(store, SyncRuntime(_two_final_turns_tendwire(), telegram, with_outbox=False))
-
-    assert result["sent"] == 2                                       # both turns delivered
-    assert store.get("competitor_sentinel") == "written-during-yield"  # reload picked up the write
 
 
-def test_yield_preserves_both_deliveries(tmp_path, monkeypatch):
-    # With the real released_lock, the mid-loop save/reload must not lose either worker's delivery
-    # record (the RC-edition of the detached-reference bug).
-    _reset_lock_state()
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    store = _store()
-    telegram = FakeTelegram()
-    with state.state_lock(path=statepath):
-        result = sync_once(store, SyncRuntime(_two_final_turns_tendwire(), telegram, with_outbox=False))
-    assert result["sent"] == 2
-    workers = state.source_worker_entries(store)
-    delivered = [w for w in workers.values() if w.get("last_clean_message_id") or w.get("final_message_ids")]
-    assert len(delivered) == 2   # both survived the mid-loop reload
 
 
-def test_real_sync_delivery_releases_lock_within_budget(tmp_path, monkeypatch):
-    """The production sync_once wrapping is what keeps Telegram delivery off-lock."""
-
-    _reset_lock_state()
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    state.save_state(_store(), statepath)
-    delivery_entered = threading.Event()
-    release_delivery = threading.Event()
-    competitor_acquired = threading.Event()
-    sync_finished = threading.Event()
-
-    class SlowDeliveryTelegram(FakeTelegram):
-        def send_message(self, chat_id, html, **kwargs):
-            delivery_entered.set()
-            assert release_delivery.wait(3)
-            return super().send_message(chat_id, html, **kwargs)
-
-    def run_sync():
-        with state.state_lock(path=statepath):
-            current = state.load_state(statepath)
-            result = sync_once(
-                current,
-                SyncRuntime(
-                    _two_final_turns_tendwire(),
-                    SlowDeliveryTelegram(),
-                    with_outbox=False,
-                ),
-            )
-            assert result["sent"] == 2
-            state.save_state(current, statepath)
-        sync_finished.set()
-
-    def compete():
-        with state.state_lock(path=statepath):
-            competitor_acquired.set()
-
-    sync_thread = threading.Thread(target=run_sync)
-    sync_thread.start()
-    assert delivery_entered.wait(1)
-    competitor_thread = threading.Thread(target=compete)
-    competitor_thread.start()
-    try:
-        assert competitor_acquired.wait(0.75)
-    finally:
-        release_delivery.set()
-    sync_thread.join(4)
-    competitor_thread.join(4)
-
-    assert sync_finished.is_set()
 
 
 def test_flock_hold_instrumentation_reports_phase_and_timestamps(

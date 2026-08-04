@@ -781,7 +781,6 @@ def test_phase3_delete_records_provider_fact_after_concurrent_rebind(
             "reason": "dormant_pane_ttl",
         }
     ]
-    assert state.find_legacy_topic_id_by_name(current, "Live alias") == ""
 
 
 def test_delete_outcome_receipt_replay_is_idempotent(monkeypatch):

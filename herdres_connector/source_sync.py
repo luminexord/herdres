@@ -29,7 +29,6 @@ from .rich_delivery import (
     render_feed_item_html,
     send_feed_item,
     send_turn_delivery_part,
-    split_legacy_message_ids,
     turn_item_from_source,
 )
 from .safe import (
@@ -60,9 +59,6 @@ from .tendwire_client import TendwireClient, TendwireError
 
 RENDER_VERSION = "telegram-rich-v28-primary-dual-bound"
 PRESENTATION_VERSION = "turn-present-v31"
-_SUPPORTED_PRESENTATION_VERSIONS = frozenset(
-    {"turn-present-v29", "turn-present-v30", PRESENTATION_VERSION}
-)
 TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
 _SUBMISSION_ID_KEY = "_herdres_submission_id"
@@ -2739,7 +2735,11 @@ def _record_partial_final_delivery(
         and prior.get("status") == "retry_authorized"
         else []
     )
-    for message_id in split_legacy_message_ids(result):
+    raw_message_ids = result.get("message_ids")
+    for message_id in (
+        raw_message_ids if isinstance(raw_message_ids, list) else []
+    ):
+        message_id = str(message_id)
         if message_id not in message_ids:
             message_ids.append(message_id)
     canonical_message_id = message_ids[0] if message_ids else ""
@@ -3004,7 +3004,8 @@ def _notify_oversize_final(
     )
     sent = execution.result
     writes = _telegram_physical_writes(sent)
-    message_ids = split_legacy_message_ids(sent) if sent.get("ok") else []
+    message_id = str(sent.get("message_id") or "").strip()
+    message_ids = [message_id] if sent.get("ok") and message_id else []
     current_record = state.find_partial_final_delivery(
         store, turn_id, content_hash
     )
@@ -3634,21 +3635,6 @@ def _validate_turn_row(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _validate_turns_payload(payload: dict[str, Any]) -> dict[str, Any]:
     schema = payload.get("schema_version")
-    if type(schema) is int and schema == 1:
-        # Direct-call Goal 01B compatibility. The production TendwireClient
-        # negotiates schema v2 and refuses daemon/CLI v1 responses.
-        rows = payload.get("turns")
-        if not isinstance(rows, list):
-            return payload
-        validated = dict(payload)
-        validated["turns"] = [
-            _quarantined_turn_row(row, "private_agent_content")
-            if isinstance(row, dict)
-            and _contains_private_agent_turn_fields(row)
-            else row
-            for row in rows
-        ]
-        return validated
     if type(schema) is not int or schema != TURN_SCHEMA_VERSION:
         raise _TurnContentError(
             "upgrade_required", "Tendwire turn schema v2 is required"
@@ -3847,8 +3833,9 @@ def _materialize_turn_item(
         )
     content = item.get("content")
     if not isinstance(content, dict):
-        # Legacy direct-call fixtures carry their canonical inline values.
-        return 0
+        raise _TurnContentError(
+            "unsupported_content_schema", "turn content schema v1 is required"
+        )
     fields = content["fields"]
     revision = str(content["content_revision"])
     materialized = dict(item)
@@ -4861,13 +4848,6 @@ def _ensure_topic(
             # duplicate minting a second topic.
             entry["binding_state"] = "quarantined:stable_identity_collision"
             return False, False
-    reused = state.find_legacy_topic_id_by_name(store, entry.get("topic_name") or "")
-    if reused:
-        entry["topic_id"] = reused
-        entry["binding_state"] = _BINDING_STATE_BOUND
-        entry["binding_topic_id"] = str(reused)
-        _complete_topic_recovery(entry, reused)
-        return False, False
     if runtime.dry_run:
         entry["binding_state"] = _BINDING_STATE_PENDING_CREATE
         entry.pop("binding_topic_id", None)
@@ -5100,21 +5080,6 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
     return False
 
 
-def _legacy_pinned_message_id_for_topic(store: dict[str, Any], topic_id: str) -> str:
-    if not topic_id:
-        return ""
-    spaces = store.get("spaces") if isinstance(store.get("spaces"), dict) else {}
-    for entry in spaces.values():
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("topic_id") or "") != topic_id:
-            continue
-        message_id = str(entry.get("pinned_status_message_id") or "")
-        if message_id:
-            return message_id
-    return ""
-
-
 def _record_topic_pinned_status(entry: dict[str, Any], *, message_id: str, content_hash: str, pinned: bool = False) -> None:
     entry["pinned_status_message_id"] = str(message_id)
     entry["pinned_status_hash"] = content_hash
@@ -5231,7 +5196,7 @@ def _sync_topic_pinned(
     if account_html:
         html = f"{html}\n{account_html}"
     content_hash = short_hash(html, 20)
-    message_id = str(entry.get("pinned_status_message_id") or "") or _legacy_pinned_message_id_for_topic(store, thread_id)
+    message_id = str(entry.get("pinned_status_message_id") or "")
     if message_id and entry.get("pinned_status_hash") == content_hash and entry.get("pinned_status_pinned"):
         return False
     if runtime.dry_run:
@@ -5403,9 +5368,7 @@ def _assign_worker_topic_names(
     """Map each not-yet-topiced worker id -> a unique topic name (cwd basename, numbered on collision).
     Names already bound to a created topic are reserved and never renumbered, so numbers stay stable as
     panes come and go. Ordered by the shared canonical observation key for deterministic numbering."""
-    # Reserved names are compared case-INSENSITIVELY to match _ensure_topic's reuse lookup
-    # (find_legacy_topic_id_by_name uses .casefold()); otherwise "Foo"/"foo" would look distinct here
-    # yet still collapse into one topic there.
+    # Telegram topic names are case-insensitive, so reserve them the same way.
     def _is_variant_of(current: str, base: str) -> bool:
         # "gitmoot" and "gitmoot 3" are both variants of base "gitmoot" — keep them (stable numbering).
         cur, b = current.casefold(), base.casefold()
@@ -8061,6 +8024,14 @@ def _stage_final_plan(
             raise _TurnContentError(
                 "invalid_pending_plan", "pending plan has invalid part count"
             )
+        pending_presentation_version = entry.get(
+            "pending_presentation_version"
+        )
+        if pending_presentation_version != PRESENTATION_VERSION:
+            raise _TurnContentError(
+                "invalid_pending_plan",
+                "pending plan has an unsupported presentation version",
+            )
         operation = _capture_entry_operation(
             store,
             entry,
@@ -8078,10 +8049,7 @@ def _stage_final_plan(
                 ),
                 kwargs=_prepare_begin_kwargs(
                     pending_count,
-                    str(
-                        entry.get("pending_presentation_version")
-                        or "turn-present-v29"
-                    ),
+                    pending_presentation_version,
                 ),
             ),
         )
@@ -8932,7 +8900,12 @@ def _deliver_final(
         ),
     )
     sent, resolution = execution.result, execution.resolution
-    message_ids = split_legacy_message_ids(sent)
+    raw_message_ids = sent.get("message_ids")
+    message_ids = (
+        [str(item) for item in raw_message_ids if str(item or "").strip()]
+        if isinstance(raw_message_ids, list)
+        else []
+    )
     if not sent.get("ok"):
         if (
             (sent.get("partial") is True and message_ids)
@@ -9194,7 +9167,6 @@ def _sync_turns(
     chat_id: str,
     live_worker_ids: set[str] | None = None,
     yield_barrier: Any | None = None,
-    list_finals_are_authoritative: bool = True,
     checkpoint_after_delivery: bool = False,
     retained_projection: dict[str, Any] | None = None,
 ) -> dict[str, int]:
@@ -9357,7 +9329,7 @@ def _sync_turns(
                 if budget.spent > writes_before:
                     counts["physical_writes"] = budget.spent - budget_start
                 continue
-            if not list_finals_are_authoritative and _content_revision(item):
+            if _content_revision(item):
                 continue
             if worker_key in seen_final_workers:
                 continue
@@ -9380,16 +9352,6 @@ def _sync_turns(
                 delivery_thread_id = str(
                     entry.get("topic_id") or ""
                 )
-                prior_final_message_ids = {
-                    message_id
-                    for message_id, _binding in (
-                        _final_delivery_bindings(
-                            store,
-                            _turn_id(item),
-                            topic_id=delivery_thread_id,
-                        )
-                    )
-                }
                 writes_before = budget.spent
                 delivered = (
                     _deliver_final(
@@ -9410,37 +9372,6 @@ def _sync_turns(
                     counts["failed_writes"] += int(bool(writes_used))
                     if writes_used:
                         fairness_cursor_candidate = _turn_id(item)
-                if delivered:
-                    # Legacy inline direct-call compatibility; v2 finals are spoken only after the
-                    # complete ordered plan is acknowledged.
-                    delivery_bindings = _final_delivery_bindings(
-                        store,
-                        _turn_id(item),
-                        topic_id=delivery_thread_id,
-                    )
-                    new_delivery_bindings = [
-                        binding
-                        for binding in delivery_bindings
-                        if binding[0]
-                        not in prior_final_message_ids
-                    ]
-                    reply_binding = (
-                        new_delivery_bindings[0]
-                        if new_delivery_bindings
-                        else delivery_bindings[-1]
-                        if delivery_bindings
-                        else None
-                    )
-                    entry = _speak_reply(
-                        store, item, entry, entry_key, runtime,
-                        chat_id=chat_id,
-                        thread_id=delivery_thread_id,
-                        reply_to=(
-                            reply_binding[0]
-                            if reply_binding is not None
-                            else None
-                        ),
-                    )
         elif item.get("assistant_stream_text") or _turn_is_working_placeholder(item, entry):
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 continue
@@ -10161,8 +10092,7 @@ def _validate_turn_final_item(item: dict[str, Any]) -> dict[str, Any]:
     ordinal = payload.get("part_ordinal")
     part_count = payload.get("part_count")
     if (
-        payload.get("presentation_version")
-        not in _SUPPORTED_PRESENTATION_VERSIONS
+        payload.get("presentation_version") != PRESENTATION_VERSION
         or payload.get("operation") not in {"upsert", "retire"}
         or any(
             isinstance(value, bool)
@@ -14055,14 +13985,11 @@ def _tendwire_non_success(runtime: SyncRuntime, status: str) -> dict[str, Any]:
     }
 
 
-_TURN_SCHEMA_VERSION = 1
-
-
 def _unsupported_turn_schema_version(
     runtime: SyncRuntime, received: Any
 ) -> dict[str, Any]:
     result = _tendwire_non_success(runtime, "unsupported_turn_schema_version")
-    result["required_turn_schema_version"] = _TURN_SCHEMA_VERSION
+    result["required_turn_schema_version"] = TURN_SCHEMA_VERSION
     if isinstance(received, str):
         safe_received: Any = compact_ws(received, 80)
     elif received is None or isinstance(received, (bool, int, float)):
@@ -14091,22 +14018,6 @@ def _herdr_backend_explicitly_unhealthy(snapshot: dict[str, Any]) -> bool:
 _DELTA_STATE_KEY = "tendwire_delta_sync"
 _DELTA_SCHEMA_VERSION = 1
 _DELTA_PROJECTION_SCHEMA_VERSION = 2
-_DELTA_TRANSPORT_STATUS = "transport_ambiguous"
-_DELTA_TRANSIENT_FAILURE_THRESHOLD = 4
-_DELTA_FALLBACK_BASE_SECONDS = 60
-_DELTA_FALLBACK_MAX_SECONDS = 3600
-_DELTA_WATERMARK_RECOVERY = frozenset(
-    {"invalid_watermark", "expired_watermark"}
-)
-_DELTA_TERMINAL_FALLBACK = frozenset(
-    {
-        "bootstrap_too_large",
-        "cross_host_watermark",
-        "incompatible_schema",
-        "invalid_cursor",
-        "expired_cursor",
-    }
-)
 
 
 def _new_delta_state(*, reason: str, now: float) -> dict[str, Any]:
@@ -14139,15 +14050,18 @@ def _delta_state(store: dict[str, Any], *, now: float) -> dict[str, Any]:
         or current.get("projection_schema_version")
         != _DELTA_PROJECTION_SCHEMA_VERSION
         or not isinstance(current.get("projection"), dict)
+        or current.get("status") not in {"active", "bootstrapping"}
     ):
-        current = _new_delta_state(reason="invalid_local_state", now=now)
-        store[_DELTA_STATE_KEY] = current
+        raise _TurnContentError(
+            "invalid_delta_state",
+            "persisted turn-delta state is not supported",
+        )
     return current
 
 
 def _delta_health(delta: dict[str, Any] | None, *, now: float | None = None) -> dict[str, Any]:
     if not isinstance(delta, dict):
-        return {"state": "fallback", "watermark_age_seconds": None, "last_batch": {}}
+        return {"state": "bootstrapping", "watermark_age_seconds": None, "last_batch": {}}
     clock = time.time() if now is None else now
     updated_at = delta.get("watermark_updated_at")
     age: int | None = None
@@ -14173,7 +14087,7 @@ def _delta_health(delta: dict[str, Any] | None, *, now: float | None = None) -> 
     state_name = str(delta.get("status") or "bootstrapping")
     result: dict[str, Any] = {
         "state": state_name
-        if state_name in {"active", "fallback", "bootstrapping"}
+        if state_name in {"active", "bootstrapping"}
         else "bootstrapping",
         "watermark_age_seconds": age,
         "last_batch": batch,
@@ -14292,8 +14206,8 @@ def _validate_delta_page(
                 ):
                     # Privacy quarantine changes presentation, not journal
                     # identity. It must not advance the checkpoint under a
-                    # different turn key. Legacy content-schema isolation keeps
-                    # its established row-local behavior below this boundary.
+                    # different turn key. Content-schema isolation remains
+                    # row-local below this boundary.
                     raise _TurnContentError(
                         "delta_protocol_ambiguous",
                         "Tendwire turn.delta projection identity mismatched",
@@ -14491,138 +14405,19 @@ def _clear_projection_stale_cards(store: dict[str, Any], projection: dict[str, A
     return cleared
 
 
-def _set_delta_fallback(
-    delta: dict[str, Any],
-    reason: str,
-    *,
-    terminal: bool,
-    now: float,
-) -> None:
-    delta["status"] = "fallback"
-    delta["pending_cursor"] = None
-    delta["bootstrap_state"] = None
-    delta["health_flag"] = f"turn_delta_{compact_ws(reason, 48)}"
-    delta["fallback_kind"] = "terminal" if terminal else "transient"
-    delta["fallback_reason"] = compact_ws(reason, 48)
-    if terminal:
-        delta.pop("fallback_attempt", None)
-        delta.pop("fallback_retry_at", None)
-        delta.pop("fallback_probe", None)
-        return
-    previous_attempt = delta.get("fallback_attempt")
-    attempt = (
-        previous_attempt + 1
-        if isinstance(previous_attempt, int)
-        and not isinstance(previous_attempt, bool)
-        and previous_attempt >= 0
-        else 1
-    )
-    delay = min(
-        _DELTA_FALLBACK_BASE_SECONDS
-        * (2 ** min(attempt - 1, 16)),
-        _DELTA_FALLBACK_MAX_SECONDS,
-    )
-    delta["fallback_attempt"] = attempt
-    delta["fallback_retry_at"] = now + delay
-    delta.pop("fallback_probe", None)
-
-
-def _normalize_delta_fallback(delta: dict[str, Any], *, now: float) -> str:
-    kind = delta.get("fallback_kind")
-    if kind in {"terminal", "transient"}:
-        return str(kind)
-    health_flag = compact_ws(delta.get("health_flag"), 80)
-    reason = (
-        health_flag.removeprefix("turn_delta_")
-        if health_flag.startswith("turn_delta_")
-        else "legacy_fallback"
-    )
-    terminal = reason in {
-        "unsupported",
-        *_DELTA_TERMINAL_FALLBACK,
-    }
-    delta["fallback_kind"] = "terminal" if terminal else "transient"
-    delta["fallback_reason"] = reason
-    if not terminal:
-        # Older versions made transient fallback permanent. Probe once
-        # immediately after upgrade, then use the normal persisted backoff.
-        delta["fallback_attempt"] = 0
-        delta["fallback_retry_at"] = now
-    return str(delta["fallback_kind"])
-
-
-def _begin_delta_fallback_probe(delta: dict[str, Any], *, now: float) -> None:
-    watermark = delta.get("watermark")
-    if isinstance(watermark, str) and watermark:
-        delta["status"] = "active"
-        delta["pending_cursor"] = None
-    else:
-        _begin_delta_rebootstrap(
-            delta,
-            reason="transient_fallback_recovery",
-            now=now,
-        )
-    delta["fallback_probe"] = True
-
-
-def _record_delta_transient_failure(
+def _record_delta_failure(
     delta: dict[str, Any], *, status: str, now: float
-) -> bool:
+) -> None:
     delta["last_error_at"] = now
-    failure_count = int(delta.get("failure_count") or 0) + 1
-    delta["failure_count"] = failure_count
+    delta["failure_count"] = int(delta.get("failure_count") or 0) + 1
     safe_status = compact_ws(status, 48)
     delta["health_flag"] = f"turn_delta_{safe_status}"
-    if delta.get("fallback_probe") or (
-        failure_count >= _DELTA_TRANSIENT_FAILURE_THRESHOLD
-    ):
-        _set_delta_fallback(
-            delta,
-            f"repeated_{safe_status}",
-            terminal=False,
-            now=now,
-        )
-        return True
-    return False
 
 
-def _clear_delta_fallback_recovery(delta: dict[str, Any]) -> None:
+def _clear_delta_failure(delta: dict[str, Any]) -> None:
     delta["failure_count"] = 0
-    for key in (
-        "fallback_kind",
-        "fallback_reason",
-        "fallback_attempt",
-        "fallback_retry_at",
-        "fallback_probe",
-        "last_error_at",
-        "health_flag",
-    ):
+    for key in ("last_error_at", "health_flag"):
         delta.pop(key, None)
-
-
-def _begin_delta_rebootstrap(delta: dict[str, Any], *, reason: str, now: float) -> None:
-    previous = delta.get("bootstrap_state")
-    attempt = (
-        int(previous.get("attempt") or 0) + 1
-        if isinstance(previous, dict)
-        else 1
-    )
-    delta.update(
-        {
-            "status": "bootstrapping",
-            "watermark": None,
-            "pending_cursor": None,
-            "projection": {},
-            "bootstrap_state": {
-                "reason": reason,
-                "attempt": attempt,
-                "pages_applied": 0,
-                "started_at": now,
-            },
-            "failure_count": 0,
-            "health_flag": f"turn_delta_{reason}",
-        }
-    )
 
 
 def _observe_turn_delta(
@@ -14637,16 +14432,6 @@ def _observe_turn_delta(
         return result
 
     delta = _delta_state(store, now=now)
-    if delta.get("status") == "fallback":
-        fallback_kind = _normalize_delta_fallback(delta, now=now)
-        retry_at = delta.get("fallback_retry_at")
-        if fallback_kind == "terminal" or (
-            isinstance(retry_at, (int, float))
-            and not isinstance(retry_at, bool)
-            and now < float(retry_at)
-        ):
-            return {"kind": "full", "delta": delta, "reason": "fallback"}
-        _begin_delta_fallback_probe(delta, now=now)
     if _delta_full_reconcile_due(delta, now=now):
         return {"kind": "full", "delta": delta, "reason": "reconcile"}
     cursor = delta.get("pending_cursor")
@@ -14662,73 +14447,40 @@ def _observe_turn_delta(
     )
     if page.get("ok") is False:
         status = _delta_error_code(page) or "delta_failed"
-        delta["last_error_at"] = now
-        if status == "unsupported_method":
-            _set_delta_fallback(
-                delta, "unsupported", terminal=True, now=now
-            )
-            return transition(
-                {"kind": "full", "delta": delta, "reason": "unsupported"}
-            )
-        if status == _DELTA_TRANSPORT_STATUS:
-            fell_back = _record_delta_transient_failure(
-                delta, status=status, now=now
-            )
-            return transition(
-                {
-                    "kind": "full" if fell_back else "empty",
-                    "delta": delta,
-                    "reason": status,
-                }
-            )
-        if status in _DELTA_WATERMARK_RECOVERY and cursor is None and watermark is not None:
-            _begin_delta_rebootstrap(delta, reason=status, now=now)
-            return transition(
-                {"kind": "empty", "delta": delta, "reason": status}
-            )
-        if status in _DELTA_TERMINAL_FALLBACK or (
-            status in _DELTA_WATERMARK_RECOVERY
-            and delta.get("status") == "bootstrapping"
-        ):
-            _set_delta_fallback(
-                delta, status, terminal=True, now=now
-            )
-            return transition(
-                {"kind": "full", "delta": delta, "reason": status}
-            )
-        fell_back = _record_delta_transient_failure(
-            delta, status=status, now=now
-        )
+        _record_delta_failure(delta, status=status, now=now)
         return transition(
             {
-                "kind": "full" if fell_back else "empty",
+                "kind": "error",
                 "delta": delta,
                 "reason": status,
+                "status": f"turn_delta_{compact_ws(status, 48)}",
             }
         )
     try:
         upserts, removals, aggregate = _validate_delta_page(page)
     except _TurnContentError:
-        fell_back = _record_delta_transient_failure(
+        _record_delta_failure(
             delta, status="delta_protocol_ambiguous", now=now
         )
         return transition(
             {
-                "kind": "full" if fell_back else "empty",
+                "kind": "error",
                 "delta": delta,
                 "reason": "delta_protocol_ambiguous",
+                "status": "turn_delta_delta_protocol_ambiguous",
             }
         )
     expected_mode = "bootstrap" if watermark is None and delta.get("status") == "bootstrapping" else "changes"
     if page.get("mode") != expected_mode:
-        fell_back = _record_delta_transient_failure(
+        _record_delta_failure(
             delta, status="delta_protocol_ambiguous", now=now
         )
         return transition(
             {
-                "kind": "full" if fell_back else "empty",
+                "kind": "error",
                 "delta": delta,
                 "reason": "delta_protocol_ambiguous",
+                "status": "turn_delta_delta_protocol_ambiguous",
             }
         )
     if (
@@ -14749,7 +14501,7 @@ def _observe_turn_delta(
     for removal in removals:
         turn_id = str(removal["turn_id"])
         projection.pop(turn_id, None)
-    _clear_delta_fallback_recovery(delta)
+    _clear_delta_failure(delta)
     delta["last_batch"] = {
         "mode": str(page["mode"]),
         **aggregate,
@@ -15030,8 +14782,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     )
     backpressure_sequence = _telegram_backpressure_sequence(store)
     observed_at = time.time()
-    with state.lock_phase("sync.observe"):
-        observed = _observe_sync_inputs(store, runtime, now=observed_at)
+    try:
+        with state.lock_phase("sync.observe"):
+            observed = _observe_sync_inputs(store, runtime, now=observed_at)
+    except _TurnContentError as exc:
+        return _tendwire_non_success(runtime, exc.status)
     if observed.get("unhealthy"):
         return _tendwire_non_success(runtime, "tendwire_herdr_unhealthy")
     if observed.get("cursor_conflict"):
@@ -15042,6 +14797,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     observed_snapshot_workers: list[dict[str, Any]] = []
     if delta_observation is not None:
         delta = delta_observation["delta"]
+        if delta_observation.get("kind") == "error":
+            return _tendwire_non_success(
+                runtime,
+                str(delta_observation.get("status") or "turn_delta_failed"),
+            )
     turns_payload = observed["turns"]
     pending_payload = observed["pending"]
     for name, payload in (("snapshot", snapshot), ("turns", turns_payload), ("pending", pending_payload)):
@@ -15050,10 +14810,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     turn_schema = turns_payload.get("schema_version")
     if (
         type(turn_schema) is not int
-        or turn_schema not in {_TURN_SCHEMA_VERSION, TURN_SCHEMA_VERSION}
+        or turn_schema != TURN_SCHEMA_VERSION
     ):
         return _unsupported_turn_schema_version(runtime, turn_schema)
-    list_finals_are_authoritative = turn_schema != TURN_SCHEMA_VERSION
     chat_id = config.telegram_chat_id(store)
     with state.lock_phase("sync.validate"):
         try:
@@ -15189,7 +14948,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             store,
             turns_payload,
             pending_payload,
-            skip_v2_finals=not list_finals_are_authoritative,
+            skip_v2_finals=True,
             complete=bootstrap_complete,
         )
     live_worker_ids = {
@@ -15234,7 +14993,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                     chat_id=chat_id,
                     live_worker_ids=live_worker_ids,
                     yield_barrier=yield_barrier,
-                    list_finals_are_authoritative=list_finals_are_authoritative,
                     checkpoint_after_delivery=(
                         delta_observation is not None
                         and delta_observation.get("kind") == "delta"
@@ -15259,10 +15017,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             )
         try:
             turns_payload = _validate_turns_payload(relisted)
-            relisted_schema = turns_payload.get("schema_version")
-            relisted_finals_are_authoritative = (
-                relisted_schema != TURN_SCHEMA_VERSION
-            )
             with state.lock_phase("sync.turns_relist"):
                 turn_counts = _sync_turns(
                     store,
@@ -15273,7 +15027,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                     live_worker_ids=live_worker_ids,
                     relist_on_conflict=False,
                     yield_barrier=yield_barrier,
-                    list_finals_are_authoritative=relisted_finals_are_authoritative,
                     checkpoint_after_delivery=(
                         delta_observation is not None
                         and delta_observation.get("kind") == "delta"

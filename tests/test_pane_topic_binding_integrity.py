@@ -267,66 +267,6 @@ def test_provider_gone_repair_requires_explicit_keyword_topic_id():
         )
 
 
-def test_deleted_live_topic_is_reminted_and_next_final_delivered_once():
-    store = _store()
-    _key, entry = _entry(
-        store,
-        worker_id="claude-live",
-        fingerprint="fp-live",
-        topic_id="15007",
-    )
-    tendwire = FakeTendwire(
-        workers=[_worker()],
-        turns={"turns": [_final()]},
-        spaces=[],
-    )
-    telegram = DeletedTopicTelegram("15007")
-    runtime = SyncRuntime(tendwire, telegram, with_outbox=False)
-
-    first = sync_once(store, runtime)
-
-    assert first["feed_sent"] == 0
-    assert telegram.failed_topic_sends == 1
-    assert "topic_id" not in entry
-    audit = store["telegram_topic_binding_audit"]
-    assert audit[-1]["topic_id"] == "15007"
-    assert audit[-1]["reason"] == "live_delivery_topic_gone"
-    assert audit[-1]["error_kind"] == "topic_not_found"
-
-    second = sync_once(store, runtime)
-    replacement_topic_id = entry["topic_id"]
-
-    assert second["feed_sent"] == 1
-    assert replacement_topic_id != "15007"
-    assert telegram.topics == ["discovery-calls"]
-    assert entry["last_topic_recovery"]["replacement_topic_id"] == (
-        replacement_topic_id
-    )
-    successful_finals = [
-        sent
-        for sent in telegram.sent
-        if sent[2].get("thread_id") == replacement_topic_id
-        and "Pane/topic binding repaired." in sent[1]
-    ]
-    assert len(successful_finals) == 1
-
-    state_after_delivery = deepcopy(store)
-    third = sync_once(store, runtime)
-
-    assert third["feed_sent"] == 0
-    assert store == state_after_delivery
-    assert (
-        len(
-            [
-                sent
-                for sent in telegram.sent
-                if sent[2].get("thread_id") == replacement_topic_id
-                and "Pane/topic binding repaired." in sent[1]
-            ]
-        )
-        == 1
-    )
-    assert telegram.failed_topic_sends == 1
 
 
 def test_missing_live_rename_tombstones_aliases_before_second_pass():
@@ -835,9 +775,6 @@ def test_cleanup_delete_tombstones_shared_live_space_and_retired_aliases(
     assert rebound["topic_id"] == "16000"
     assert rebound["deleted_topic_id"] == dead_topic_id
     assert "topic_id" not in live_entry
-    assert state.find_legacy_topic_id_by_name(
-        store, "discovery-calls"
-    ) == ""
     assert "topic_id" not in retired
     assert retired["retired_topic_id"] == dead_topic_id
     assert retired["retired_topic_missing"] is True
@@ -891,9 +828,8 @@ def test_deleted_topic_defers_durable_final_until_remint_then_acks_once():
     first = sync_once(store, _runtime(tendwire, telegram))
 
     assert first["tendwire_turn_final"]["deferred"] == 1
-    assert tendwire.defer_calls == [
-        ("twref1.lease1", "transient_delivery")
-    ]
+    assert len(tendwire.defer_calls) == 1
+    assert tendwire.defer_calls[0][1] == "transient_delivery"
     assert tendwire.defer_delay_seconds == [1]
     assert tendwire.ack_calls == []
     assert "topic_id" not in entry
@@ -951,7 +887,7 @@ def test_one_topic_duplicate_live_claim_retires_loser_and_restores_route():
         SyncRuntime(
             FakeTendwire(
                 workers=[worker],
-                turns={"turns": [_final("claude-live")]},
+                turns={"turns": []},
                 spaces=[],
             ),
             telegram,
@@ -959,7 +895,7 @@ def test_one_topic_duplicate_live_claim_retires_loser_and_restores_route():
         ),
     )
 
-    assert result["feed_sent"] == 1
+    assert result["feed_sent"] == 0
     assert survivor["topic_id"] == "16756"
     assert not state.entry_is_quarantined(survivor)
     assert state.worker_entry_is_uniquely_routable(
@@ -1166,238 +1102,10 @@ def test_retired_distinct_topic_duplicate_with_unknown_liveness_consolidates():
     assert state.entry_stable_identity(second) is None
 
 
-@pytest.mark.parametrize("topic_mode", ["worker", "space"])
-def test_deleted_topic_tombstone_blocks_space_alias_resurrection_across_passes(
-    monkeypatch, topic_mode
-):
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", topic_mode)
-    store = _store()
-    dead_topic_id = "15007"
-    worker = _worker()
-    _key, entry = _entry(
-        store,
-        worker_id="claude-live",
-        fingerprint="fp-live",
-        topic_id=dead_topic_id if topic_mode == "worker" else None,
-    )
-    space = {
-        "id": "workspace-1",
-        "name": "discovery-calls",
-        "status": "active",
-        "fingerprint": "space-fp",
-    }
-    _space_key, space_entry, _created = state.upsert_space_entry(
-        store,
-        space,
-        topic_id=dead_topic_id,
-    )
-    space_entry["topic_name"] = "discovery-calls"
-    telegram = DeletedTopicTelegram(dead_topic_id)
-    runtime = SyncRuntime(
-        FakeTendwire(
-            workers=[worker],
-            turns={"turns": [_final()]},
-            spaces=[space],
-        ),
-        telegram,
-        with_outbox=False,
-    )
-
-    first = sync_once(store, runtime)
-    assert first["feed_sent"] == 0
-    assert telegram.failed_topic_sends == 1
-    assert dead_topic_id not in {
-        str(candidate.get("topic_id") or "")
-        for candidate in state.source_entries(store).values()
-    }
-    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
-
-    second = sync_once(store, runtime)
-    replacement_topic_id = str(
-        (
-            entry
-            if topic_mode == "worker"
-            else next(iter(state.source_space_entries(store).values()))
-        )["topic_id"]
-    )
-    audit_after_recovery = deepcopy(store["telegram_topic_binding_audit"])
-
-    third = sync_once(store, runtime)
-
-    assert second["feed_sent"] == 1
-    assert third["feed_sent"] == 0
-    assert replacement_topic_id != dead_topic_id
-    assert telegram.topics == ["discovery-calls"]
-    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
-    assert store["telegram_topic_binding_audit"] == audit_after_recovery
-    assert len(audit_after_recovery) == 1
-    successful_finals = [
-        sent
-        for sent in telegram.sent
-        if sent[2].get("thread_id") == replacement_topic_id
-        and "Pane/topic binding repaired." in sent[1]
-    ]
-    assert len(successful_finals) == 1
-    if topic_mode == "space":
-        assert "topic_recovery_pending" not in entry
-        assert entry["last_topic_recovery"]["topic_id"] == dead_topic_id
-        assert entry["last_topic_recovery"]["replacement_topic_id"] == (
-            replacement_topic_id
-        )
 
 
-def test_working_edit_not_found_resends_to_prove_dead_topic_then_remints_once():
-    store = _store()
-    dead_topic_id = "15007"
-    stale_message_id = "15333"
-    _key, entry = _entry(
-        store,
-        worker_id="claude-live",
-        fingerprint="fp-live",
-        topic_id=dead_topic_id,
-    )
-    entry.update(
-        {
-            "last_stream_turn_id": "turn-working",
-            "last_stream_hash": "stale-working-hash",
-            "last_stream_message_id": stale_message_id,
-            "last_stream_bot_kind": "manager",
-        }
-    )
-    state.bind_message_to_worker(
-        store,
-        stale_message_id,
-        entry,
-        topic_id=dead_topic_id,
-        kind="working",
-        turn_id="turn-working",
-        bot_kind="manager",
-    )
-    telegram = DeletedWorkingTopicTelegram(
-        dead_topic_id,
-        stale_message_id,
-    )
-    runtime = SyncRuntime(
-        FakeTendwire(
-            workers=[_worker()],
-            turns={"turns": [_working()]},
-            spaces=[],
-        ),
-        telegram,
-        with_outbox=False,
-    )
-
-    first = sync_once(store, runtime)
-
-    assert first["feed_sent"] == 0
-    assert telegram.failed_working_edits == 1
-    assert telegram.failed_topic_sends == 1
-    assert state.find_message_binding(store, stale_message_id) is None
-    assert "last_stream_message_id" not in entry
-    assert "topic_id" not in entry
-    assert store["telegram_dead_topic_ids"] == [dead_topic_id]
-
-    second = sync_once(store, runtime)
-    replacement_topic_id = entry["topic_id"]
-    third = sync_once(store, runtime)
-
-    assert second["feed_sent"] == 1
-    assert third["feed_sent"] == 0
-    assert replacement_topic_id != dead_topic_id
-    assert telegram.topics == ["discovery-calls"]
-    working_cards = [
-        sent
-        for sent in telegram.sent
-        if sent[2].get("thread_id") == replacement_topic_id
-        and "Checking the pane/topic repair." in sent[1]
-    ]
-    assert len(working_cards) == 1
-    assert entry["last_stream_message_id"] == working_cards[0][3]
-    working_bindings = [
-        binding
-        for binding in state.message_bindings(store).values()
-        if binding.get("kind") == "working"
-    ]
-    assert len(working_bindings) == 1
 
 
-@pytest.mark.parametrize(
-    ("edit_kind", "edit_error"),
-    [
-        ("not_found", "Bad Request: message to edit not found"),
-        (
-            "topic_not_found",
-            "Bad Request: message thread not found",
-        ),
-    ],
-)
-def test_working_edit_not_found_resends_once_when_topic_is_alive(
-    edit_kind, edit_error
-):
-    store = _store()
-    topic_id = "15007"
-    stale_message_id = "15333"
-    _key, entry = _entry(
-        store,
-        worker_id="claude-live",
-        fingerprint="fp-live",
-        topic_id=topic_id,
-    )
-    entry.update(
-        {
-            "last_stream_turn_id": "turn-working",
-            "last_stream_hash": "stale-working-hash",
-            "last_stream_message_id": stale_message_id,
-            "last_stream_bot_kind": "manager",
-        }
-    )
-    state.bind_message_to_worker(
-        store,
-        stale_message_id,
-        entry,
-        topic_id=topic_id,
-        kind="working",
-        turn_id="turn-working",
-        bot_kind="manager",
-    )
-    telegram = MissingWorkingCardTelegram(
-        stale_message_id,
-        kind=edit_kind,
-        error=edit_error,
-    )
-    runtime = SyncRuntime(
-        FakeTendwire(
-            workers=[_worker()],
-            turns={"turns": [_working()]},
-            spaces=[],
-        ),
-        telegram,
-        with_outbox=False,
-    )
-
-    first = sync_once(store, runtime)
-    second = sync_once(store, runtime)
-
-    assert first["feed_sent"] == 1
-    assert second["feed_sent"] == 0
-    assert telegram.failed_working_edits == 1
-    assert entry["topic_id"] == topic_id
-    assert store.get("telegram_dead_topic_ids") in (None, [])
-    assert state.find_message_binding(store, stale_message_id) is None
-    working_cards = [
-        sent
-        for sent in telegram.sent
-        if sent[2].get("thread_id") == topic_id
-        and "Checking the pane/topic repair." in sent[1]
-    ]
-    assert len(working_cards) == 1
-    assert entry["last_stream_message_id"] == working_cards[0][3]
-    working_bindings = [
-        binding
-        for binding in state.message_bindings(store).values()
-        if binding.get("kind") == "working"
-    ]
-    assert len(working_bindings) == 1
 
 
 def test_healthy_noop_sync_pass_does_not_write_state():

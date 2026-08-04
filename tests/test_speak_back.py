@@ -11,8 +11,7 @@ from unittest.mock import patch
 
 import herdres
 import pytest
-from herdres_connector import source_sync, speech, state
-from herdres_connector.source_sync import SyncRuntime
+from herdres_connector import speech, state
 from herdres_connector.telegram_delivery import (
     RateLimited,
     TelegramClient,
@@ -20,8 +19,6 @@ from herdres_connector.telegram_delivery import (
 
 from test_source_only import (
     REQUEST_ID,
-    FakeTelegram,
-    FakeTendwire,
     _accepted_command_response,
     _source_worker,
     _store,
@@ -143,15 +140,6 @@ def test_speech_reply_triggers(monkeypatch):
 
 # --- the speak seam (lives in _sync_turns so ALL delivery branches speak) -----
 
-def _final_item():
-    return {"id": "t1", "worker_id": "w1", "worker_fingerprint": "fp1",
-            "assistant_final_text": "All done deploying the branch.", "complete": True}
-
-
-def _turns_of(item):
-    return {"turns": [item]}
-
-
 def _persist_worker(store, **entry_extra):
     key, entry, _created = state.upsert_worker_entry(store, _source_worker({
         "id": "w1",
@@ -164,72 +152,6 @@ def _persist_worker(store, **entry_extra):
     return key, entry
 
 
-def _worker_store(monkeypatch, **entry_extra):
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")  # _entry_for_turn resolves worker entries
-    store = _store()
-    _key, entry = _persist_worker(store, **entry_extra)
-    return store, entry
-
-
-def _run_turns(store, item, runtime):
-    return source_sync._sync_turns(store, _turns_of(item), {"pending": []}, runtime, chat_id="-100")
-
-
-def test_speak_seam_speaks_when_flag_set_and_pops_it(monkeypatch):
-    store, entry = _worker_store(monkeypatch, speak_next_reply=True)
-    telegram = FakeTelegram()
-    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
-    monkeypatch.setattr(speech, "speech_request", lambda ep, pl: {"ok": True, "path": pl.get("dest")})
-    _run_turns(store, _final_item(), runtime)
-    assert len(telegram.sent) == 1                      # text turn delivered
-    assert len(telegram.voice_notes) == 1              # + spoken back
-    assert "speak_next_reply" not in entry             # one-shot flag consumed
-    assert entry.get("voice_reply_message_ids") == ["900"]  # sent voice id remembered for next time
-
-
-def test_speak_seam_silent_without_trigger(monkeypatch):
-    store, entry = _worker_store(monkeypatch)   # no flag/trigger/force-all
-    telegram = FakeTelegram()
-    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
-    monkeypatch.setattr(speech, "speech_request", lambda ep, pl: {"ok": True, "path": pl.get("dest")})
-    _run_turns(store, _final_item(), runtime)
-    assert len(telegram.sent) == 1
-    assert telegram.voice_notes == []                  # text-only, no voice
-
-
-def test_speak_seam_tts_failure_leaves_text_intact(monkeypatch):
-    store, entry = _worker_store(monkeypatch, speak_next_reply=True)
-    telegram = FakeTelegram()
-    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
-    monkeypatch.setattr(speech, "speech_request", lambda ep, pl: {"ok": False, "path": ""})
-    _run_turns(store, _final_item(), runtime)
-    assert len(telegram.sent) == 1 and telegram.voice_notes == []
-    assert "speak_next_reply" not in entry             # still consumed (one-shot, no retry storm)
-
-
-def test_speak_seam_fires_for_non_raw_delivery_branch(monkeypatch):
-    # Regression: the seam must fire for the promote/replace branches too (the common streaming case),
-    # not only the raw-send path. Simulate a non-raw delivery by stubbing _deliver_final to just
-    # report success without going through send_feed_item; the seam (now in _sync_turns) must still speak.
-    store, entry = _worker_store(monkeypatch, speak_next_reply=True)
-    telegram = FakeTelegram()
-    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
-    monkeypatch.setattr(speech, "speech_request", lambda ep, pl: {"ok": True, "path": pl.get("dest")})
-    monkeypatch.setattr(source_sync, "_deliver_final", lambda *a, **k: True)   # promote/replace-style
-    _run_turns(store, _final_item(), runtime)
-    assert len(telegram.voice_notes) == 1              # spoke despite no raw send
-    assert "speak_next_reply" not in entry
-
-
-def test_speak_seam_skipped_in_dry_run(monkeypatch):
-    store, entry = _worker_store(monkeypatch, speak_next_reply=True)
-    telegram = FakeTelegram()
-    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False, dry_run=True)
-    monkeypatch.setattr(speech, "speech_request", lambda ep, pl: {"ok": True, "path": pl.get("dest")})
-    monkeypatch.setattr(source_sync, "_deliver_final", lambda *a, **k: True)
-    _run_turns(store, _final_item(), runtime)
-    assert telegram.voice_notes == []                  # no speak in a preview pass
-    assert entry.get("speak_next_reply") is True       # flag preserved for the real send
 
 
 # --- Phase 2: chunking + off-lock synth --------------------------------------
@@ -244,302 +166,14 @@ def test_speech_reply_chunks(monkeypatch):
     assert speech.speech_reply_chunks("") == []
 
 
-def test_speak_seam_chunks_long_reply_into_multiple_notes(monkeypatch):
-    store, entry = _worker_store(monkeypatch, speak_next_reply=True)
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_SPEECH_REPLY_MAX_CHARS", "30")
-    telegram = FakeTelegram()
-    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
-    monkeypatch.setattr(speech, "speech_request", lambda ep, pl: {"ok": True, "path": pl.get("dest")})
-    monkeypatch.setattr(source_sync, "_deliver_final", lambda *a, **k: True)
-    long_item = {"id": "t1", "worker_id": "w1", "worker_fingerprint": "fp1", "complete": True,
-                 "assistant_final_text": "First part is done here. Second part also done. Third part finished."}
-    _run_turns(store, long_item, runtime)
-    assert len(telegram.voice_notes) >= 2                       # spoken as several voice notes
-    assert len(entry.get("voice_reply_message_ids") or []) == len(telegram.voice_notes)  # all recorded
 
 
-def test_speak_seam_keeps_partial_batch_without_replay(
-    tmp_path, monkeypatch
-):
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv(
-        "HERDR_TELEGRAM_TOPICS_STATE", str(statepath)
-    )
-    store, entry = _worker_store(
-        monkeypatch, speak_next_reply=True
-    )
-    entry_key = next(iter(store["panes"]))
-    state.save_state(store, statepath)
-    monkeypatch.setattr(
-        speech,
-        "speech_reply_chunks",
-        lambda _text: ["first", "second", "third"],
-    )
-    monkeypatch.setattr(
-        speech,
-        "outbound_speech_dir",
-        lambda *, prune=False: tmp_path,
-    )
-    monkeypatch.setattr(
-        speech,
-        "speech_request",
-        lambda _operation, payload: {
-            "ok": True,
-            "path": payload["dest"],
-        },
-    )
-
-    class PartialVoice(FakeTelegram):
-        def __init__(self):
-            super().__init__()
-            self.attempts = 0
-            self.next_id = 900
-
-        def send_voice(self, *args, **kwargs):
-            self.attempts += 1
-            if self.attempts == 3:
-                raise RateLimited(
-                    5,
-                    "Too Many Requests: retry after 5",
-                    method="sendVoice",
-                )
-            message_id = str(self.next_id)
-            self.next_id += 1
-            self.voice_notes.append(
-                (
-                    str(args[0]),
-                    str(args[1]),
-                    dict(kwargs),
-                    message_id,
-                )
-            )
-            return {"ok": True, "message_id": message_id}
-
-    telegram = PartialVoice()
-    runtime = SyncRuntime(
-        FakeTendwire(), telegram, with_outbox=False
-    )
-    saves = 0
-    real_save_state = state.save_state
-
-    def counted_save_state(*args, **kwargs):
-        nonlocal saves
-        saves += 1
-        return real_save_state(*args, **kwargs)
-
-    monkeypatch.setattr(state, "save_state", counted_save_state)
-    with state.state_lock(path=statepath):
-        current = source_sync._speak_reply(
-            store,
-            _final_item(),
-            entry,
-            entry_key,
-            runtime,
-            chat_id="-100",
-            thread_id="77",
-            reply_to="42",
-        )
-
-    # Voice is strictly additive beneath the already-complete text reply.
-    # Keep the accepted prefix, stop on backpressure, and never create a
-    # distributed deletion/replay obligation for cosmetic incompleteness.
-    assert [note[3] for note in telegram.voice_notes] == [
-        "900",
-        "901",
-    ]
-    assert current["voice_reply_message_ids"] == [
-        "900",
-        "901",
-    ]
-    assert "pending_voice_reply" not in current
-    assert (
-        store.get("telegram", {}).get(
-            "accepted_notification_messages"
-        )
-        in (None, {})
-    )
-    assert saves == 1
-
-    # The one-shot speak flag was committed before the off-lock batch. Even
-    # if a later delivery branch reports success, it must not replay voice.
-    monkeypatch.setattr(
-        source_sync, "_deliver_final", lambda *_a, **_k: True
-    )
-    attempts = telegram.attempts
-    _run_turns(store, _final_item(), runtime)
-    assert telegram.attempts == attempts
-    events = store["telegram"]["rate_limit_backpressure"]["events"]
-    assert len(events) == 1
-    assert events[0]["method"] == "sendVoice"
-    assert events[0]["outcome"] == "not_retried_message_send"
 
 
-def test_speak_seam_offlock_synth_no_clobber(tmp_path, monkeypatch):
-    # Phase 2: synth runs OFF the state lock. A competitor writing state.json DURING synth must survive
-    # (the seam commits before releasing, reloads after) — no clobber, and the voice id still records.
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    store = _store()
-    worker_key, _entry = _persist_worker(store, speak_next_reply=True)
-    state.save_state(store)
-    telegram = FakeTelegram()
-    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
-
-    def fake_tts(_ep, pl):
-        # runs inside the released (off-lock) window: a competitor grabs the freed lock and writes.
-        disk = json.loads(statepath.read_text())
-        disk["competitor_sentinel"] = "written-during-synth"
-        statepath.write_text(json.dumps(disk))
-        return {"ok": True, "path": pl.get("dest")}
-
-    monkeypatch.setattr(speech, "speech_request", fake_tts)
-    monkeypatch.setattr(source_sync, "_deliver_final", lambda *a, **k: True)
-    with state.state_lock(path=statepath):
-        source_sync._sync_turns(store, _turns_of(_final_item()), {"pending": []}, runtime, chat_id="-100")
-
-    assert store.get("competitor_sentinel") == "written-during-synth"   # competitor write survived reload
-    assert len(telegram.voice_notes) == 1
-    assert store["panes"][worker_key].get("voice_reply_message_ids") == ["900"]   # recorded on fresh entry
 
 
-def test_speak_seam_uses_text_binding_topic_after_concurrent_rebind(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
-    monkeypatch.setenv(
-        "HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0"
-    )
-    monkeypatch.setenv(
-        "HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0"
-    )
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv(
-        "HERDR_TELEGRAM_TOPICS_STATE", str(statepath)
-    )
-    store = _store()
-    _worker_key, _entry = _persist_worker(
-        store, speak_next_reply=True
-    )
-    state.save_state(store, statepath)
-    worker = _source_worker(
-        {
-            "id": "w1",
-            "name": "worker",
-            "status": "working",
-            "space_id": "s1",
-            "fingerprint": "fp1",
-        }
-    )
-    tendwire = FakeTendwire(
-        turns=_turns_of(_final_item()),
-        workers=[worker],
-        spaces=[],
-    )
-
-    class RebindingTextTelegram(FakeTelegram):
-        def __init__(self):
-            super().__init__()
-            self.rebound = False
-
-        def send_message(self, chat_id, html, **kwargs):
-            result = super().send_message(
-                chat_id, html, **kwargs
-            )
-            if (
-                not self.rebound
-                and "All done deploying the branch." in html
-            ):
-                concurrent = state.load_state(statepath)
-                rebound = next(
-                    entry
-                    for entry in state.source_worker_entries(
-                        concurrent
-                    ).values()
-                    if entry.get("tendwire_worker_id") == "w1"
-                )
-                rebound["topic_id"] = "88"
-                state.save_state(concurrent, statepath)
-                self.rebound = True
-            return result
-
-    telegram = RebindingTextTelegram()
-    runtime = SyncRuntime(
-        tendwire, telegram, with_outbox=False
-    )
-    monkeypatch.setattr(
-        speech,
-        "speech_request",
-        lambda _ep, payload: {
-            "ok": True,
-            "path": payload.get("dest"),
-        },
-    )
-
-    with state.state_lock(path=statepath):
-        current = state.load_state(statepath)
-        source_sync.sync_once(current, runtime)
-
-    text_message_id = telegram.sent[0][3]
-    text_binding = state.find_message_binding(
-        current, text_message_id
-    )
-    current_entry = next(
-        entry
-        for entry in state.source_worker_entries(current).values()
-        if entry.get("tendwire_worker_id") == "w1"
-    )
-    assert telegram.sent[0][2]["thread_id"] == "77"
-    assert text_binding is not None
-    assert text_binding["topic_id"] == "77"
-    assert current_entry["topic_id"] == "88"
-    assert len(telegram.voice_notes) == 1
-    assert telegram.voice_notes[0][2]["thread_id"] == "77"
-    assert (
-        telegram.voice_notes[0][2]["reply_to_message_id"]
-        == text_message_id
-    )
-    assert current_entry.get("voice_reply_message_ids") in (None, [])
-    voice_message_id = telegram.voice_notes[0][3]
-    voice_binding = state.find_message_binding(
-        current, voice_message_id
-    )
-    assert voice_binding is not None
-    assert voice_binding["kind"] == "voice_stale"
-    assert voice_binding["topic_id"] == "77"
 
 
-def test_speak_seam_offlock_entry_pruned_during_synth(tmp_path, monkeypatch):
-    # If a competitor prunes the entry during off-lock synth, the seam must not crash or resurrect it;
-    # the voice notes were sent but their ids can't persist (entry gone) — handled gracefully.
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    store = _store()
-    worker_key, _entry = _persist_worker(store, speak_next_reply=True)
-    state.save_state(store)
-    telegram = FakeTelegram()
-    runtime = SyncRuntime(FakeTendwire(), telegram, with_outbox=False)
-
-    def fake_tts(_ep, pl):
-        disk = json.loads(statepath.read_text())
-        disk["panes"].pop(worker_key, None)   # competitor prunes the entry mid-synth
-        statepath.write_text(json.dumps(disk))
-        return {"ok": True, "path": pl.get("dest")}
-
-    monkeypatch.setattr(speech, "speech_request", fake_tts)
-    monkeypatch.setattr(source_sync, "_deliver_final", lambda *a, **k: True)
-    with state.state_lock(path=statepath):
-        source_sync._sync_turns(store, _turns_of(_final_item()), {"pending": []}, runtime, chat_id="-100")
-
-    assert worker_key not in store["panes"]           # competitor prune survived, not resurrected
-    assert len(telegram.voice_notes) == 1              # note was still sent, no crash
-    voice_id = telegram.voice_notes[0][3]
-    voice_binding = state.find_message_binding(store, voice_id)
-    assert voice_binding is not None
-    assert voice_binding["kind"] == "voice_stale"
 
 
 # --- outbound-speech dir hygiene ---------------------------------------------

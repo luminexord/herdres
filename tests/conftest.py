@@ -16,4 +16,3 @@ def _no_real_account_probes(monkeypatch):
     # Most pre-lane unit tests call the legacy poll helper directly. Keep those
     # fixtures hermetic while dedicated lane tests exercise the production
     # default and explicitly opt into the durable spool.
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "0")
