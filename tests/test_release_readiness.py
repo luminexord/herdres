@@ -65,7 +65,7 @@ def test_rc_docs_use_explicit_paired_release_gate() -> None:
     assert "Tendwire `0.1.0rc5`" in readme
     assert "Python 3.13" in readme
     assert "complete paired" in release
-    assert "HERDRES_PAIRED_TENDWIRE_SOURCE_DIR=/absolute/tendwire/src" in release
+    assert "paired socket probe" in release
     assert "Never restart Herdr" in release
 
 

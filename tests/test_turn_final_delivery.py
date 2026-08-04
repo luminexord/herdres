@@ -1949,22 +1949,8 @@ def test_sync_loop_journals_later_oversize_notice_failure(
     class StopLoop(RuntimeError):
         pass
 
-    class FakeDispatcher:
-        def __init__(self, *_args, **_kwargs):
-            self.stopped = False
-
-        def start(self):
-            return None
-
-        def stop(self):
-            self.stopped = True
-
     monkeypatch.setattr(herdres.config, "load_env_file", lambda: None)
     monkeypatch.setattr(herdres.config, "require_source_mode", lambda: None)
-    monkeypatch.setattr(
-        herdres.config, "tendwire_db_path", lambda: "/tmp/tendwire-test.db"
-    )
-    monkeypatch.setattr(herdres, "OutboundDispatcher", FakeDispatcher)
     monkeypatch.setattr(herdres, "_sync_pass", lambda: result)
     def stop_sleep(_seconds):
         raise StopLoop
@@ -4451,9 +4437,6 @@ def test_doctor_composes_inbound_and_outbound_health_without_masking(
         doctor, "source_services", lambda: {"ok": True}
     )
     monkeypatch.setattr(doctor, "legacy_timer", lambda: {"ok": True})
-    monkeypatch.setattr(
-        doctor, "sqlite_integrity", lambda: {"ok": True}
-    )
     monkeypatch.setattr(
         doctor, "tendwire_backend", lambda _client=None: {"ok": True}
     )

@@ -23,11 +23,9 @@ from herdres_connector.managed_bots import (
     managed_bot_kind_for_username,
 )
 from herdres_connector.safe import compact_ws, public_prune, sanitize_text, short_hash
-from herdres_connector.outbound_dispatcher import OutboundDispatcher
 from herdres_connector.source_sync import (
     SyncRuntime,
     deliver_submission_working_card,
-    drain_outbound_once,
     sync_once,
 )
 from herdres_connector.telegram_delivery import TelegramClient
@@ -1033,37 +1031,6 @@ def _sync_pass() -> dict[str, Any]:
     return result
 
 
-def _outbound_pass() -> dict[str, Any]:
-    """Drain connector work independently of the full sync-pass duration."""
-
-    with state.state_lock(phase="outbound_pass.load"):
-        with state.lock_phase("outbound_pass.load"):
-            store = state.load_state()
-
-        def checkpoint() -> None:
-            if not state.lock_held():
-                raise RuntimeError(
-                    "outbound checkpoint requires the held state lock"
-                )
-            with state.lock_phase("outbound.checkpoint"):
-                state.save_state(store)
-
-        with state.lock_phase("outbound.drain"):
-            result = drain_outbound_once(
-                store,
-                _runtime(
-                    dry_run=False,
-                    with_outbox=True,
-                    checkpoint=checkpoint,
-                ),
-                chat_id=config.telegram_chat_id(store),
-            )
-        if result.get("changed"):
-            with state.lock_phase("outbound_pass.final_save"):
-                state.save_state(store)
-    return result
-
-
 def cmd_sync(args: argparse.Namespace) -> int:
     config.load_env_file()
     config.require_source_mode()
@@ -1072,40 +1039,24 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return _json(_sync_pass())
     import time as _time
 
-    def outbound_error(exc: Exception) -> None:
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "status": "outbound_pass_failed",
-                    "error": sanitize_text(str(exc), 300),
-                }
-            ),
-            flush=True,
-        )
-
-    dispatcher = OutboundDispatcher(
-        _outbound_pass,
-        database_path=config.tendwire_db_path(),
-        on_error=outbound_error,
-    )
-    dispatcher.start()
-    try:
-        while True:
-            started = _time.monotonic()
-            try:
-                result = _sync_pass()
-                if result.get("ok") is not True:
-                    # The long-running service is the active probe: emit its
-                    # structured health result to the journal every pass so a
-                    # terminal fold failure does not depend on a human running
-                    # `herdres doctor` first.
-                    print(json.dumps(result), flush=True)
-            except Exception as exc:  # noqa: BLE001 - keep the loop alive across transient failures
-                print(json.dumps({"ok": False, "status": "sync_pass_failed", "error": sanitize_text(str(exc), 300)}), flush=True)
-            _time.sleep(max(0.5, interval - (_time.monotonic() - started)))
-    finally:
-        dispatcher.stop()
+    while True:
+        started = _time.monotonic()
+        try:
+            result = _sync_pass()
+            if result.get("ok") is not True:
+                print(json.dumps(result), flush=True)
+        except Exception as exc:  # noqa: BLE001 - survive transient failures
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status": "sync_pass_failed",
+                        "error": sanitize_text(str(exc), 300),
+                    }
+                ),
+                flush=True,
+            )
+        _time.sleep(max(0.5, interval - (_time.monotonic() - started)))
 
 
 def cmd_command(_args: argparse.Namespace) -> int:

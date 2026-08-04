@@ -2650,9 +2650,6 @@ def test_doctor_is_unhealthy_only_for_live_unbound_panes(monkeypatch):
     )
     monkeypatch.setattr(doctor, "legacy_timer", lambda: {"ok": True})
     monkeypatch.setattr(
-        doctor, "sqlite_integrity", lambda: {"ok": True}
-    )
-    monkeypatch.setattr(
         doctor, "tendwire_backend", lambda _client=None: {"ok": True}
     )
     monkeypatch.setattr(

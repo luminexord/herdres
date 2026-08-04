@@ -11,7 +11,6 @@ from typing import Any
 HOME = Path.home()
 DEFAULT_STATE_PATH = HOME / ".local/share/herdres/state.json"
 DEFAULT_PROCESSED_PATH = HOME / ".local/share/herdres/gateway_processed_messages.json"
-DEFAULT_TENDWIRE_DB_PATH = HOME / ".local/share/tendwire/tendwire.db"
 DEFAULT_TENDWIRE_SOCKET_PATH = HOME / ".local/share/tendwire/tendwire.sock"
 DEFAULT_REQUEST_ID_KEY_PATH = HOME / ".local/share/herdres/request-id.key"
 DEFAULT_INBOUND_SPOOL_PATH = HOME / ".local/share/herdres/inbound_spool.db"
@@ -48,13 +47,8 @@ def processed_path(env: Any | None = None) -> Path:
     return Path(source.get("HERDR_TELEGRAM_TOPICS_GATEWAY_PROCESSED", DEFAULT_PROCESSED_PATH)).expanduser()
 
 
-def tendwire_db_path(env: Any | None = None) -> Path:
-    source = os.environ if env is None else env
-    return Path(source.get("HERDRES_TENDWIRE_DB_PATH", source.get("TENDWIRE_DB_PATH", DEFAULT_TENDWIRE_DB_PATH))).expanduser()
-
-
 def tendwire_socket_path(env: Any | None = None) -> Path:
-    """Return the authoritative Tendwire daemon socket for child CLI calls."""
+    """Return the authoritative Tendwire daemon socket."""
 
     source = os.environ if env is None else env
     return Path(

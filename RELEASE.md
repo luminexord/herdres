@@ -17,14 +17,13 @@ python3 scripts/herdr_smoke.py --fixture-dir tests/fixtures/herdr/live_smoke/ok
 python3 -m build
 python3 scripts/release_artifacts.py artifacts dist
 
-# Herdres checkout; bind pairing explicitly to avoid a skipped test
-HERDRES_PAIRED_TENDWIRE_SOURCE_DIR=/absolute/tendwire/src \
-  python3 -m pytest -q
+# Herdres checkout
+python3 -m pytest -q
 python3 -m compileall -q herdres.py herdres_gateway.py herdres_connector tests
 ```
 
-The paired run must execute rather than skip `tests/test_tendwire_cli_pairing.py`
-and must retain `direct_herdr_calls=0`, exact turn/pending/command schemas,
+The recorded paired socket probe must use a temporary Tendwire daemon and
+retain `direct_herdr_calls=0`, exact turn/pending/command schemas,
 stable-owner migration, neutral outbox behavior, and the two forced no-op sync
 proof. Record both commits and the Tendwire wheel/sdist digests.
 
