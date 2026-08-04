@@ -3,8 +3,6 @@
 #   systemctl --user daemon-reload && systemctl --user enable --now tendwired.service
 #
 # LOAD-BEARING settings:
-#  * TENDWIRE_HERDR_BACKEND=socket is required for command submission. Tendwire's default `cli`
-#    backend is observation-only and rejects mutations rather than forwarding them to Herdr.
 #  * TENDWIRE_HERDR_BIN points directly at the raw Herdr binary used by the ACP coordinator.
 #  * TENDWIRE_RECONCILE_INTERVAL_SECONDS: worker->pane bindings are validated by fingerprint on every
 #    command submit, and fingerprints churn whenever a turn completes. Keep the 15-second default so
@@ -23,7 +21,6 @@ FinalKillSignal=SIGKILL
 Type=simple
 # Adjust to your tendwire checkout (or drop if tendwire is pip-installed):
 Environment=PYTHONPATH=%h/tendwire/src
-Environment=TENDWIRE_HERDR_BACKEND=socket
 Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr
 Environment=TENDWIRE_HERDR_TIMEOUT_SECONDS=6
 Environment=TENDWIRE_RECONCILE_INTERVAL_SECONDS=15
