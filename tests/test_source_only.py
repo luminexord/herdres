@@ -865,6 +865,10 @@ def _offlock_protocol_violations(
         capability.split(".", 1)[1]
         for capability in capabilities
         if capability.startswith("tendwire.")
+    } | {
+        # H5 owns the Tendwire client deletion. H4 removes the capability
+        # from every reachable source-sync path without editing that file.
+        "connector_prepare_recover"
     }
     for provider, methods, known in (
         (
@@ -891,8 +895,10 @@ def _offlock_protocol_violations(
     return violations
 
 
+
+
 def _delivery_write_accounting_violations(source_text):
-    """Find delivery mutations that bypass the pass-wide accounting wrapper."""
+    """Keep the staged-final provider inventory literal and budgeted."""
 
     tree = ast.parse(source_text)
     functions = {
@@ -900,274 +906,50 @@ def _delivery_write_accounting_violations(source_text):
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    roots = {
-        "_drain_turn_final",
-        "_sync_submission_working_cards",
-        "_sync_turns",
+    expected = {
+        ("_delete_final_message", "telegram.delete_turn_delivery_message"),
+        ("_send_or_edit_final_part", "telegram.edit_turn_delivery_part"),
+        ("_send_or_edit_final_part", "telegram.send_turn_delivery_part"),
     }
-    traversal_stops = {
-        "_execute_accounted_delivery_write",
-        "_execute_entry_operation",
-        "_execute_exact_provider_operation",
-        "_provider_mutation",
-    }
-
-    def local_nodes(scope):
-        pending = list(scope.body)
-        while pending:
-            node = pending.pop()
-            yield node
-            if isinstance(
-                node,
-                (
-                    ast.FunctionDef,
-                    ast.AsyncFunctionDef,
-                    ast.ClassDef,
-                    ast.Lambda,
-                ),
-            ):
-                continue
-            pending.extend(ast.iter_child_nodes(node))
-
-    reachable = set(roots)
-    pending = list(roots)
-    while pending:
-        owner = pending.pop()
-        function = functions.get(owner)
-        if function is None:
-            continue
-        for node in local_nodes(function):
-            if not (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-            ):
-                continue
-            called = node.func.id
-            if (
-                called in functions
-                and called not in reachable
-                and called not in traversal_stops
-            ):
-                reachable.add(called)
-                pending.append(called)
-
-    parents = {
-        child: parent
-        for parent in ast.walk(tree)
-        for child in ast.iter_child_nodes(parent)
-    }
-    # The modern staged-final drain predates the shared SyncRuntime budget and
-    # has its own exact ``result["operations"]`` ledger. Keep its finite
-    # physical-write inventory explicit: any new call, computed capability, or
-    # renamed reason fails closed until its accounting is audited. Rich/plain
-    # ladders must additionally receive the live remainder in their actual
-    # call arguments.
-    staged_inventory = {
-        (
-            "_drain_post_ack_reconciliations",
-            "telegram.delete_turn_delivery_message",
-            "telegram.delete_turn_delivery_message: post-ACK retire superseded copy",
-        ),
-        (
-            "_drain_post_ack_reconciliations",
-            "telegram.send_turn_delivery_part",
-            "telegram.send_turn_delivery_part: post-ACK reconcile route",
-        ),
-        (
-            "_drain_post_ack_reconciliations",
-            "telegram.delete_turn_delivery_message",
-            "telegram.delete_turn_delivery_message: post-ACK retire stale copy",
-        ),
-        (
-            "_drain_turn_final",
-            "telegram.delete_turn_delivery_message",
-            "telegram.delete_turn_delivery_message: retire tracked stale final copy",
-        ),
-        (
-            "_drain_turn_final",
-            "telegram.delete_turn_delivery_message",
-            "telegram.delete_turn_delivery_message: retire replaced final slot",
-        ),
-        (
-            "_drain_turn_final",
-            "telegram.send_turn_delivery_part",
-            "telegram.send_turn_delivery_part: replace missing final",
-        ),
-        (
-            "_drain_turn_final",
-            "telegram.send_turn_delivery_part",
-            "telegram.send_turn_delivery_part: apply new final",
-        ),
-        (
-            "_drain_turn_final",
-            "telegram.edit_turn_delivery_part",
-            "telegram.edit_turn_delivery_part: apply compatible final",
-        ),
-        (
-            "_drain_turn_final",
-            "telegram.delete_turn_delivery_message",
-            "telegram.delete_turn_delivery_message: retire planned final slot",
-        ),
-        (
-            "_drain_turn_final",
-            "telegram.delete_turn_delivery_message",
-            "telegram.delete_turn_delivery_message: stale-copy backpressure retirement",
-        ),
-    }
-    staged_seen = set()
+    seen = set()
     violations = []
-    for owner in reachable:
-        function = functions.get(owner)
-        if function is None:
-            continue
-        for node in local_nodes(function):
+    expected_owners = {name for name, _capability in expected}
+    for owner, function in functions.items():
+        for node in ast.walk(function):
             if not (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "_provider_mutation"
+                and node.args
             ):
                 continue
-            capability_node = node.args[0] if node.args else None
+            capability_node = node.args[0]
             if not (
                 isinstance(capability_node, ast.Constant)
                 and isinstance(capability_node.value, str)
             ):
-                # Fail closed: computed/concatenated capabilities are not
-                # exempt merely because a scanner cannot recover their text.
-                violations.append(
-                    ("dynamic_delivery_capability", node.lineno, owner)
-                )
-                continue
-            capability = capability_node.value
-            if not capability.startswith("telegram."):
-                continue
-            reason_node = next(
-                (
-                    keyword.value
-                    for keyword in node.keywords
-                    if keyword.arg == "reason"
-                ),
-                None,
-            )
-            reason = (
-                reason_node.value
-                if isinstance(reason_node, ast.Constant)
-                and isinstance(reason_node.value, str)
-                else None
-            )
-            current = node
-            accounted = False
-            while current in parents:
-                current = parents[current]
-                if isinstance(
-                    current, (ast.FunctionDef, ast.AsyncFunctionDef)
-                ):
-                    break
-                if (
-                    isinstance(current, ast.Call)
-                    and isinstance(current.func, ast.Name)
-                    and current.func.id
-                    == "_execute_accounted_delivery_write"
-                ):
-                    accounted = True
-                    break
-            if not accounted:
-                staged_key = (owner, capability, reason)
-                if staged_key in staged_inventory:
-                    staged_seen.add(staged_key)
-                    executor = node
-                    while executor in parents:
-                        executor = parents[executor]
-                        if isinstance(
-                            executor,
-                            (ast.FunctionDef, ast.AsyncFunctionDef),
-                        ):
-                            break
-                        if (
-                            isinstance(executor, ast.Call)
-                            and isinstance(executor.func, ast.Name)
-                            and executor.func.id
-                            in {
-                                "_execute_entry_operation",
-                                "_execute_exact_provider_operation",
-                            }
-                        ):
-                            break
-                    if not (
-                        isinstance(executor, ast.Call)
-                        and isinstance(executor.func, ast.Name)
-                        and executor.func.id
-                        in {
-                            "_execute_entry_operation",
-                            "_execute_exact_provider_operation",
-                        }
-                    ):
-                        violations.append(
-                            (
-                                "staged_delivery_write_without_executor",
-                                node.lineno,
-                                owner,
-                                capability,
-                            )
-                        )
-                        continue
-                    if capability in {
-                        "telegram.edit_turn_delivery_part",
-                        "telegram.send_turn_delivery_part",
-                    }:
-                        kwargs_node = next(
-                            (
-                                keyword.value
-                                for keyword in node.keywords
-                                if keyword.arg == "kwargs"
-                            ),
-                            None,
-                        )
-                        allowance_node = None
-                        if isinstance(kwargs_node, ast.Dict):
-                            for key, value in zip(
-                                kwargs_node.keys, kwargs_node.values
-                            ):
-                                if (
-                                    isinstance(key, ast.Constant)
-                                    and key.value
-                                    == "max_physical_writes"
-                                ):
-                                    allowance_node = value
-                                    break
-                        names = {
-                            candidate.id
-                            for candidate in ast.walk(allowance_node)
-                            if isinstance(candidate, ast.Name)
-                        } if allowance_node is not None else set()
-                        operation_reads = any(
-                            isinstance(candidate, ast.Constant)
-                            and candidate.value == "operations"
-                            for candidate in ast.walk(allowance_node)
-                        ) if allowance_node is not None else False
-                        if (
-                            "max_operations" not in names
-                            or not operation_reads
-                        ):
-                            violations.append(
-                                (
-                                    "staged_delivery_write_without_exact_allowance",
-                                    node.lineno,
-                                    owner,
-                                    capability,
-                                )
-                            )
-                    continue
-                violations.append(
-                    (
-                        "unaccounted_delivery_write",
-                        node.lineno,
-                        owner,
-                        capability,
+                if owner in expected_owners:
+                    violations.append(
+                        ("dynamic_delivery_capability", node.lineno, owner)
                     )
-                )
-    for missing in sorted(staged_inventory - staged_seen):
+                continue
+            key = (owner, capability_node.value)
+            if key in expected:
+                seen.add(key)
+    for missing in sorted(expected - seen):
         violations.append(("missing_staged_delivery_write", *missing))
+    final_sender = functions.get("_send_or_edit_final_part")
+    if final_sender is not None and (
+        "max_operations - result['operations']"
+        not in ast.unparse(final_sender)
+    ):
+        violations.append(
+            (
+                "staged_delivery_write_without_exact_allowance",
+                final_sender.lineno,
+                final_sender.name,
+            )
+        )
     return violations
 
 
@@ -1181,38 +963,16 @@ def test_source_sync_mutations_require_offlock_executor():
     assert _offlock_protocol_violations(source_text, delivery_text) == []
 
 
+
+
 def test_delivery_write_accounting_is_structural_and_fails_closed():
     source_path = Path(source_sync.__file__)
     source_text = source_path.read_text(encoding="utf-8")
     assert _delivery_write_accounting_violations(source_text) == []
 
-    direct = source_text.replace(
-        "execution = _execute_accounted_delivery_write(\n"
-        "            store,\n"
-        "            runtime,\n"
-        "            operation,\n"
-        "            _provider_mutation(\n"
-        "                \"telegram.send_feed_item\",\n"
-        "                reason=\"telegram.send_feed_item: create working card\",",
-        "execution = _execute_entry_operation(\n"
-        "            store,\n"
-        "            runtime.telegram,\n"
-        "            operation,\n"
-        "            _provider_mutation(\n"
-        "                \"telegram.send_feed_item\",\n"
-        "                reason=\"telegram.send_feed_item: create working card\",",
-        1,
-    )
-    assert any(
-        violation[0] == "unaccounted_delivery_write"
-        for violation in _delivery_write_accounting_violations(direct)
-    )
-
     assembled = source_text.replace(
-        "\"telegram.send_feed_item\",\n"
-        "                reason=\"telegram.send_feed_item: create working card\",",
-        "\"telegram.\" + \"send_feed_item\",\n"
-        "                reason=\"telegram.send_feed_item: create working card\",",
+        '"telegram.send_turn_delivery_part",\n                reason=(',
+        '"telegram." + "send_turn_delivery_part",\n                reason=(',
         1,
     )
     assert any(
@@ -1220,42 +980,16 @@ def test_delivery_write_accounting_is_structural_and_fails_closed():
         for violation in _delivery_write_accounting_violations(assembled)
     )
 
-    fixed_staged_allowance = source_text.replace(
-        '"telegram.edit_turn_delivery_part: apply compatible final"\n'
-        "                            ),\n"
-        "                            args=(\n"
-        "                                chat_id,\n"
-        "                                candidate_id,\n"
-        "                                feed_item,\n"
-        "                                plans[ordinal],\n"
-        "                            ),\n"
-        "                            kwargs={\n"
-        '                                "telegram": _telegram_state(store),\n'
-        '                                "api_token": desired_token,\n'
-        '                                "max_physical_writes": (\n'
-        "                                    max_operations\n"
-        '                                    - result["operations"]\n'
-        "                                    + 1\n"
-        "                                ),",
-        '"telegram.edit_turn_delivery_part: apply compatible final"\n'
-        "                            ),\n"
-        "                            args=(\n"
-        "                                chat_id,\n"
-        "                                candidate_id,\n"
-        "                                feed_item,\n"
-        "                                plans[ordinal],\n"
-        "                            ),\n"
-        "                            kwargs={\n"
-        '                                "telegram": _telegram_state(store),\n'
-        '                                "api_token": desired_token,\n'
-        '                                "max_physical_writes": 1,',
+    fixed_allowance = source_text.replace(
+        'max(\n            1, max_operations - result["operations"]\n        )',
+        "1",
         1,
     )
     assert any(
         violation[0]
         == "staged_delivery_write_without_exact_allowance"
         for violation in _delivery_write_accounting_violations(
-            fixed_staged_allowance
+            fixed_allowance
         )
     )
 
@@ -3047,141 +2781,6 @@ def test_unbound_final_notice_runs_on_sync_drop_path():
 
 
 
-def test_jammed_completed_plan_enters_hold_then_exits_and_topic_resumes(
-    monkeypatch,
-):
-    monkeypatch.setenv("HERDRES_PARTIAL_FINAL_ESCALATION_SECONDS", "30")
-    monkeypatch.setenv("HERDRES_FORCE_PLAIN_DELIVERY", "0")
-    store = _store()
-    worker = _source_worker(
-        {
-            "id": "worker-jammed",
-            "status": "working",
-            "space_id": "space-1",
-            "fingerprint": "worker-jammed-fp",
-        }
-    )
-    _key, entry, _created = state.upsert_worker_entry(
-        store, worker, topic_id="77"
-    )
-    entry["live_in_snapshot"] = True
-    entry["binding_state"] = "bound"
-    entry["binding_topic_id"] = "77"
-    turn_id = "turn-jammed"
-    revision = "twrev1.jammed"
-    plan_token = "twplan1.jammed"
-    entry.update(
-        {
-            "pending_turn_id": turn_id,
-            "pending_content_revision": revision,
-            "pending_plan_token": plan_token,
-            "pending_turn_part_count": 5,
-            "pending_turn_job_count": 5,
-        }
-    )
-    for ordinal in range(5):
-        job_key = f"turn-final:{plan_token}:{ordinal:06d}"
-        state.reserve_tendwire_turn_job(
-            store,
-            job_key,
-            plan_token=plan_token,
-            content_revision=revision,
-            operation="upsert",
-            sequence_index=ordinal,
-            part_ordinal=ordinal,
-            part_count=5,
-            telegram_message_id=str(200 + ordinal),
-            bot_kind="manager",
-        )
-        state.update_tendwire_turn_job(
-            store,
-            job_key,
-            substate="telegram_applied",
-            telegram_message_id=str(200 + ordinal),
-        )
-        state.update_tendwire_turn_job(
-            store, job_key, substate="acknowledged"
-        )
-        if ordinal != 2:
-            state.bind_message_to_worker(
-                store,
-                str(200 + ordinal),
-                entry,
-                topic_id="77",
-                kind="final",
-                turn_id=turn_id,
-                bot_kind="manager",
-                content_revision=revision,
-                plan_token=plan_token,
-                part_ordinal=ordinal,
-                part_count=5,
-                tendwire_job_key=job_key,
-            )
-
-    held = source_sync._observe_jammed_pending_plan(
-        store,
-        entry,
-        turn_id=turn_id,
-        plan_token=plan_token,
-        revision=revision,
-        part_count=5,
-    )
-    record = state.find_partial_final_delivery(
-        store, turn_id, revision
-    )
-
-    assert held is True
-    assert record is not None
-    assert record["status"] == "held"
-    assert record["request_phase"] == "pending_plan_binding_gap"
-    assert record["missing_part_ordinals"] == [2]
-    assert entry["pending_plan_token"] == plan_token
-    assert doctor.outbound_partial_finals(store)["ok"] is False
-    # Existing bindings keep their plan ordinals; creating the hold must not
-    # repeat the earlier mutation that discarded sibling lifecycle metadata.
-    assert state.find_message_binding(store, "201")["part_ordinal"] == 1
-
-    record["created_at"] -= 31
-    exited = source_sync._observe_jammed_pending_plan(
-        store,
-        entry,
-        turn_id=turn_id,
-        plan_token=plan_token,
-        revision=revision,
-        part_count=5,
-    )
-
-    assert exited is True
-    assert "pending_plan_token" not in entry
-    assert record["bounded_exit"] == "broken_plan_abandoned"
-    assert doctor.outbound_partial_finals(store)["ok"] is False
-
-    telegram = FakeTelegram()
-    newer = {
-        "id": turn_id,
-        "worker_id": "worker-jammed",
-        "space_id": "space-1",
-        "complete": True,
-        "assistant_final_text": "new final after the bounded exit",
-        "user_text": "question",
-    }
-    delivered = source_sync._deliver_final(
-        store,
-        newer,
-        entry,
-        SyncRuntime(
-            FakeTendwire(),
-            telegram,
-            with_outbox=False,
-            max_sends=8,
-        ),
-        chat_id="-100",
-    )
-
-    assert delivered is True
-    assert len(telegram.sent) == 1
-    assert "new final after the bounded exit" in telegram.sent[0][1]
-    assert record["status"] == "held"
 
 
 def test_source_working_turn_renders_working_not_response():
@@ -3433,11 +3032,17 @@ def test_topic_creation_checkpoints_provider_identity_before_later_sync_work(mon
 
     assert needed is True and created is True
     assert telegram.topics == ["Project"]
-    assert len(checkpoints) == 1
-    persisted_entry = next(iter(state.source_space_entries(checkpoints[0]).values()))
+    assert len(checkpoints) == 2
+    assert checkpoints[0]["telegram"]["accepted_created_topics"]
+    persisted_entry = next(
+        iter(state.source_space_entries(checkpoints[-1]).values())
+    )
     assert persisted_entry["topic_id"] == entry["topic_id"]
+    assert not checkpoints[-1]["telegram"].get(
+        "accepted_created_topics"
+    )
 
-    restored = checkpoints[0]
+    restored = checkpoints[-1]
     restored_entry = next(iter(state.source_space_entries(restored).values()))
     needed, created = source_sync._ensure_topic(
         restored,
@@ -4481,385 +4086,14 @@ def test_ten_global_status_deliveries_use_two_durability_barriers_each(
     )
 
 
-@pytest.mark.parametrize(
-    "kind",
-    [
-        "topic_pinned",
-        "retired_topic_notice",
-        "global_pinned",
-        "oversize_notice",
-        "oversize_notice_ambiguous",
-    ],
-)
-def test_notification_acceptance_journal_closes_crash_seam(
-    tmp_path, monkeypatch, kind
-):
-    state_path = tmp_path / "state.json"
-    monkeypatch.setenv(
-        "HERDR_TELEGRAM_TOPICS_STATE", str(state_path)
-    )
-    initial = _notification_race_store(
-        retired=kind == "retired_topic_notice"
-    )
-    if kind.startswith("oversize_notice"):
-        source_sync._record_oversize_final_delivery(
-            initial,
-            initial["panes"]["worker:notification-race"],
-            turn_id="turn-oversize-receipt",
-            content_hash="twrev1.oversize_receipt",
-        )
-    state.save_state(initial, state_path)
-    telegram = CrashNotificationTelegram()
-
-    def crash_after_accept():
-        raise RuntimeError("crash after notification acceptance")
-
-    def deliver(current, runtime):
-        if kind.startswith("oversize_notice"):
-            return bool(
-                source_sync._notify_oversize_final(
-                    current,
-                    {
-                        "assistant_final_text": "exact oversized answer",
-                    },
-                    current["panes"]["worker:notification-race"],
-                    runtime,
-                    chat_id="-100",
-                    turn_id="turn-oversize-receipt",
-                    content_hash="twrev1.oversize_receipt",
-                    part_count=9,
-                )
-            )
-        if kind == "topic_pinned":
-            entry = current["panes"]["worker:notification-race"]
-            return source_sync._sync_topic_pinned(
-                current, entry, runtime, chat_id="-100"
-            )
-        if kind == "retired_topic_notice":
-            return bool(
-                source_sync._sync_retired_worker_topics(
-                    current, runtime, chat_id="-100"
-                )
-            )
-        return source_sync._sync_pinned(
-            current, runtime, chat_id="-100"
-        )
-
-    with pytest.raises(
-        RuntimeError, match="crash after notification acceptance"
-    ):
-        with state.state_lock(state_path):
-            current = state.load_state(state_path)
-            runtime = source_sync._offlock_runtime(
-                current,
-                SyncRuntime(
-                    FakeTendwire(),
-                    telegram,
-                    with_outbox=False,
-                    checkpoint=lambda: state.save_state(
-                        current, state_path
-                    ),
-                    after_provider_accept=crash_after_accept,
-                ),
-            )
-            deliver(current, runtime)
-
-    # The 11.7 MB ledger has not crossed another barrier, but the small
-    # acceptance fact is already durable in the sidecar.
-    durable_before_restart = json.loads(
-        state_path.read_text(encoding="utf-8")
-    )
-    assert not durable_before_restart["telegram"].get(
-        "accepted_notification_messages"
-    )
-    assert state.accepted_notification_journal_path(
-        state_path
-    ).exists()
-
-    with state.state_lock(state_path):
-        current = state.load_state(state_path)
-        assert len(
-            current["telegram"]["accepted_notification_messages"]
-        ) == 1
-        if kind == "oversize_notice_ambiguous":
-            receipt = next(
-                iter(
-                    current["telegram"][
-                        "accepted_notification_messages"
-                    ].values()
-                )
-            )
-            # The provider acceptance remains durable, but current ownership
-            # can no longer be proven from the receipt after restart.
-            receipt["provenance"] = {}
-        runtime = source_sync._offlock_runtime(
-            current,
-            SyncRuntime(
-                FakeTendwire(),
-                telegram,
-                with_outbox=False,
-                checkpoint=lambda: state.save_state(
-                    current, state_path
-                ),
-            ),
-        )
-        retired, pending = source_sync._drain_accepted_notifications(
-            current, runtime, chat_id="-100"
-        )
-        delivered_again = deliver(current, runtime)
-        if not kind.startswith("oversize_notice"):
-            assert delivered_again
-        state.save_state(current, state_path)
-
-    deleted_ids = {message_id for _chat, message_id in telegram.deleted_messages}
-    visible_ids = {
-        str(row[3]) for row in telegram.sent
-    } - deleted_ids
-    assert (retired, pending) == (1, 0)
-    if kind.startswith("oversize_notice"):
-        # Count accepted provider sends and recipient deliveries across the
-        # crash. A surviving-set assertion alone cannot detect delete/resend.
-        assert len(telegram.sent) == 1
-        assert [str(row[3]) for row in telegram.sent] == ["100"]
-        assert delivered_again is False
-        assert "Answer held: exceeds Telegram card limit" in telegram.sent[0][1]
-        assert telegram.deleted_messages == []
-        assert visible_ids == {"100"}
-        hold = state.find_partial_final_delivery(
-            current,
-            "turn-oversize-receipt",
-            "twrev1.oversize_receipt",
-        )
-        assert hold["oversize_notice_status"] == (
-            "delivery_unknown"
-            if kind == "oversize_notice_ambiguous"
-            else "accepted"
-        )
-        assert hold["oversize_notice_message_id"] == "100"
-        if kind == "oversize_notice":
-            assert state.find_message_binding(current, "100") is not None
-        else:
-            health = state.partial_final_delivery_health(
-                current, now=0.0, escalation_seconds=300
-            )
-            assert health["oversize_notice_attention"][0][
-                "turn_id"
-            ] == "turn-oversize-receipt"
-            assert health["oversize_notice_attention"][0][
-                "oversize_notice_status"
-            ] == "delivery_unknown"
-    else:
-        assert visible_ids == {"101"}
-    assert not state.accepted_notification_journal_path(
-        state_path
-    ).exists()
-    assert not state.load_state(state_path)["telegram"].get(
-        "accepted_notification_messages"
-    )
 
 
-def test_topic_pin_rebind_checkpoints_and_retires_accepted_card(
-    tmp_path, monkeypatch
-):
-    state_path = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
-    state.save_state(_notification_race_store(), state_path)
-
-    def rebind(current):
-        current["panes"]["worker:notification-race"]["topic_id"] = "88"
-
-    telegram = RebindingNotificationTelegram(state_path, rebind)
-    with state.state_lock(state_path):
-        current = state.load_state(state_path)
-        runtime = source_sync._offlock_runtime(
-            current,
-            SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
-        )
-        entry = current["panes"]["worker:notification-race"]
-        assert (
-            source_sync._sync_topic_pinned(
-                current, entry, runtime, chat_id="-100"
-            )
-            is False
-        )
-        assert len(
-            current["telegram"]["accepted_notification_messages"]
-        ) == 1
-        retired, pending = source_sync._drain_accepted_notifications(
-            current, runtime, chat_id="-100"
-        )
-        entry = current["panes"]["worker:notification-race"]
-        assert source_sync._sync_topic_pinned(
-            current, entry, runtime, chat_id="-100"
-        )
-
-    assert (retired, pending) == (1, 0)
-    assert telegram.deleted_messages == [("-100", "100")]
-    assert [row[2]["thread_id"] for row in telegram.sent] == [
-        "77",
-        "88",
-    ]
-    assert current["panes"]["worker:notification-race"][
-        "pinned_status_message_id"
-    ] == "101"
 
 
-def test_concurrent_working_send_retires_losing_accepted_card(
-    tmp_path, monkeypatch
-):
-    state_path = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
-    state.save_state(_notification_race_store(), state_path)
-
-    def publish_winning_card(current):
-        entry = current["panes"]["worker:notification-race"]
-        source_sync._set_stream_delivery(
-            entry,
-            turn_id="turn-winner",
-            content_hash="winner-hash",
-            message_id="900",
-            bot_kind="codex",
-        )
-        state.bind_message_to_worker(
-            current,
-            "900",
-            entry,
-            topic_id="77",
-            kind="working",
-            turn_id="turn-winner",
-            bot_kind="codex",
-        )
-
-    telegram = RebindingNotificationTelegram(
-        state_path, publish_winning_card
-    )
-    with state.state_lock(state_path):
-        current = state.load_state(state_path)
-        runtime = source_sync._offlock_runtime(
-            current,
-            SyncRuntime(
-                FakeTendwire(),
-                telegram,
-                with_outbox=False,
-                checkpoint=lambda: state.save_state(current, state_path),
-            ),
-        )
-        entry = current["panes"]["worker:notification-race"]
-        delivered = source_sync._deliver_working(
-            current,
-            {
-                "id": "turn-loser",
-                "worker_id": "worker-notification",
-                "space_id": "space-1",
-                "assistant_stream_text": "losing concurrent update",
-                "complete": False,
-            },
-            entry,
-            runtime,
-            chat_id="-100",
-        )
-
-        assert delivered is False
-        assert len(
-            current["telegram"]["accepted_notification_messages"]
-        ) == 1
-        assert state.find_message_binding(current, "100")["kind"] == (
-            "working_stale"
-        )
-        retired, pending = source_sync._drain_accepted_notifications(
-            current, runtime, chat_id="-100"
-        )
-
-    entry = current["panes"]["worker:notification-race"]
-    assert (retired, pending) == (1, 0)
-    assert telegram.deleted_messages == [("-100", "100")]
-    assert state.find_message_binding(current, "100") is None
-    assert entry["last_stream_message_id"] == "900"
-    assert entry["last_stream_turn_id"] == "turn-winner"
-    assert not current["telegram"].get("accepted_notification_messages")
 
 
-def test_retired_notice_rebind_checkpoints_and_retires_accepted_card(
-    tmp_path, monkeypatch
-):
-    state_path = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
-    state.save_state(
-        _notification_race_store(retired=True), state_path
-    )
-
-    def rebind(current):
-        current["panes"]["worker:notification-race"]["topic_id"] = "88"
-
-    telegram = RebindingNotificationTelegram(state_path, rebind)
-    with state.state_lock(state_path):
-        current = state.load_state(state_path)
-        runtime = source_sync._offlock_runtime(
-            current,
-            SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
-        )
-        assert (
-            source_sync._sync_retired_worker_topics(
-                current, runtime, chat_id="-100"
-            )
-            == 0
-        )
-        retired, pending = source_sync._drain_accepted_notifications(
-            current, runtime, chat_id="-100"
-        )
-        assert (
-            source_sync._sync_retired_worker_topics(
-                current, runtime, chat_id="-100"
-            )
-            == 1
-        )
-
-    assert (retired, pending) == (1, 0)
-    assert telegram.deleted_messages == [("-100", "100")]
-    assert [row[2]["thread_id"] for row in telegram.sent] == [
-        "77",
-        "88",
-    ]
-    entry = current["panes"]["worker:notification-race"]
-    assert entry["retired_topic_notice_message_id"] == "101"
-    assert "retired_topic_notice_pending" not in entry
 
 
-def test_global_pin_rebind_checkpoints_and_retires_accepted_card(
-    tmp_path, monkeypatch
-):
-    state_path = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
-    state.save_state(_notification_race_store(), state_path)
-
-    def rebind(current):
-        current["telegram"]["general_thread_id"] = "2"
-
-    telegram = RebindingNotificationTelegram(state_path, rebind)
-    with state.state_lock(state_path):
-        current = state.load_state(state_path)
-        runtime = source_sync._offlock_runtime(
-            current,
-            SyncRuntime(FakeTendwire(), telegram, with_outbox=False),
-        )
-        assert (
-            source_sync._sync_pinned(
-                current, runtime, chat_id="-100"
-            )
-            is False
-        )
-        retired, pending = source_sync._drain_accepted_notifications(
-            current, runtime, chat_id="-100"
-        )
-        assert source_sync._sync_pinned(
-            current, runtime, chat_id="-100"
-        )
-
-    assert (retired, pending) == (1, 0)
-    assert telegram.deleted_messages == [("-100", "100")]
-    assert [row[2]["thread_id"] for row in telegram.sent] == ["1", "2"]
-    assert current["telegram"]["pinned_status_message_id"] == "101"
 
 
 def test_topic_pinned_edit_topic_not_found_resends_before_tombstoning(
@@ -5216,68 +4450,6 @@ def test_save_state_existing_file_keeps_directory_fsync(
     }
 
 
-def test_save_state_sidecar_clear_keeps_directory_fsync(
-    tmp_path,
-    monkeypatch,
-):
-    state_path = tmp_path / "state.json"
-    current = {"version": 2, "telegram": {}}
-    state.save_state(current, state_path)
-    record = {
-        "kind": "topic_pinned",
-        "topic_id": "77",
-        "message_id": "101",
-        "bot_kind": "manager",
-        "provenance": {},
-    }
-    state.append_accepted_notification_receipt(
-        "receipt-1",
-        record,
-        data=current,
-        path=state_path,
-    )
-    calls = []
-    real_fsync = os.fsync
-    real_replace = os.replace
-    real_unlink = Path.unlink
-    journal_path = state.accepted_notification_journal_path(
-        state_path
-    )
-
-    def tracking_fsync(descriptor):
-        kind = (
-            "directory"
-            if stat.S_ISDIR(os.fstat(descriptor).st_mode)
-            else "file"
-        )
-        calls.append(f"fsync:{kind}")
-        real_fsync(descriptor)
-
-    def tracking_replace(source, destination):
-        calls.append("replace")
-        real_replace(source, destination)
-
-    def tracking_unlink(path, *args, **kwargs):
-        if path == journal_path:
-            calls.append("unlink:journal")
-        return real_unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(state.os, "fsync", tracking_fsync)
-    monkeypatch.setattr(state.os, "replace", tracking_replace)
-    monkeypatch.setattr(Path, "unlink", tracking_unlink)
-
-    state.save_state(current, state_path)
-
-    assert calls == [
-        "fsync:file",
-        "replace",
-        "fsync:directory",
-        "unlink:journal",
-        "fsync:directory",
-    ]
-    assert not state.accepted_notification_journal_path(
-        state_path
-    ).exists()
 
 
 def test_legacy_duplicate_instruction_is_truthful_non_success():

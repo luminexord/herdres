@@ -182,29 +182,6 @@ def inbound_lanes(
     }
 
 
-def outbound_partial_finals(
-    store: dict[str, Any] | None = None,
-    *,
-    now: float | None = None,
-) -> dict[str, Any]:
-    """Expose incomplete owner-visible finals as a structured failure."""
-
-    try:
-        current = state.load_state() if store is None else store
-    except RuntimeError as exc:
-        return {
-            "ok": False,
-            "status": "error",
-            "signal": "outbound_partial_final_probe_failed",
-            "error": sanitize_text(str(exc), 200),
-        }
-    return state.partial_final_delivery_health(
-        current,
-        now=time.time() if now is None else float(now),
-        escalation_seconds=config.partial_final_escalation_seconds(),
-    )
-
-
 def outbound_response_folds(
     store: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -274,7 +251,6 @@ def run_doctor(client: TendwireClient | None = None) -> dict[str, Any]:
         "tendwire_delta_feed": tendwire_delta_feed(),
         "inbound_lanes": inbound_lanes(),
         "outbound_unbound_live_panes": outbound_unbound_live_panes(),
-        "outbound_partial_finals": outbound_partial_finals(),
         "outbound_response_folds": outbound_response_folds(),
     }
     return {"ok": all(item.get("ok") for item in checks.values()), "checks": checks}

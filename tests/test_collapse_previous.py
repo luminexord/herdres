@@ -351,6 +351,12 @@ def test_multipart_rich_final_folds_every_recipient_message(monkeypatch):
         bot_kind=MANAGER_BOT_KIND,
     )
     telegram = _ReadbackTelegram()
+    telegram.seed(
+        "501",
+        render_turn_item_html(
+            _turn_item(assistant_final_text="New answer")
+        ),
+    )
 
     _sync_turns(
         store,
@@ -626,33 +632,6 @@ def test_sync_consumer_propagates_terminal_fold_health(monkeypatch):
     )
 
 
-def test_doctor_consumer_propagates_terminal_fold_health(monkeypatch):
-    store = _folded_store(monkeypatch)
-    binding = state.message_bindings(store)["400"]
-    binding["fold_attempts"] = source_sync._FOLD_ATTEMPT_CAP
-    binding["fold_error"] = "recipient rejected fold"
-    monkeypatch.setattr(doctor, "source_services", lambda: {"ok": True})
-    monkeypatch.setattr(doctor, "legacy_timer", lambda: {"ok": True})
-    monkeypatch.setattr(doctor, "sqlite_integrity", lambda: {"ok": True})
-    monkeypatch.setattr(
-        doctor, "tendwire_backend", lambda _client=None: {"ok": True}
-    )
-    monkeypatch.setattr(doctor, "tendwire_delta_feed", lambda: {"ok": True})
-    monkeypatch.setattr(doctor, "inbound_lanes", lambda: {"ok": True})
-    monkeypatch.setattr(
-        doctor, "outbound_unbound_live_panes", lambda: {"ok": True}
-    )
-    monkeypatch.setattr(
-        doctor, "outbound_partial_finals", lambda: {"ok": True}
-    )
-    monkeypatch.setattr(doctor.state, "load_state", lambda: store)
-
-    result = doctor.run_doctor()
-
-    assert result["ok"] is False
-    assert result["checks"]["outbound_response_folds"]["signal"] == (
-        "outbound_response_fold_terminal"
-    )
 
 
 def test_fold_skipped_when_binding_lacks_bot_kind(monkeypatch):
