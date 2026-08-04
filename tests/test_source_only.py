@@ -2175,7 +2175,6 @@ def _store():
         "telegram": {"chat_id": "-100", "general_thread_id": "1"},
         "panes": {},
         "spaces": {},
-        "tendwired_bootstrap_complete": True,
         "tendwire_delta_sync": {
             "schema_version": 1,
             "projection_schema_version": 2,

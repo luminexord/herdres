@@ -100,7 +100,6 @@ def _store():
         "telegram": {"chat_id": "-100", "general_thread_id": "1"},
         "panes": {},
         "spaces": {},
-        "tendwired_bootstrap_complete": True,
     }
 
 

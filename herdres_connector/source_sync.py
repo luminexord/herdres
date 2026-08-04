@@ -9,7 +9,6 @@ import time
 import weakref
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 from . import accounts, config, decisions, ingress_requests, speech, state
@@ -4332,7 +4331,6 @@ def _record_final_delivery_success(
         _clear_stream_delivery_state(entry, turn_id)
     if submission_id:
         _complete_submission_receipt(store, submission_id)
-    entry.pop("tendwire_rebind_catchup_pending", None)
 
 
 def _promote_working_to_final(
@@ -4518,22 +4516,6 @@ def _replace_changed_final(
         bot_kind=bot_kind,
     )
     return True
-
-
-def _suppress_historical_final(store: dict[str, Any], item: dict[str, Any], content_hash: str) -> bool:
-    turn_id = _turn_id(item)
-    if not turn_id or _final_turn_delivered(store, turn_id):
-        return False
-    return state.mark_delivered(
-        store,
-        f"final:{turn_id}:{content_hash}",
-        {
-            "worker_id": compact_ws(item.get("worker_id"), 160),
-            "turn_id": turn_id,
-            "suppressed": "historical_same_worker_turn",
-        },
-    )
-
 
 
 _FOLD_ATTEMPT_CAP = state.RESPONSE_FOLD_ATTEMPT_CAP
@@ -8751,7 +8733,6 @@ def _deliver_final(
         exact_final_visible_here or placeholder_here
     ):
         _repair_delivered_final_entry(store, item, entry, content_hash)
-        entry.pop("tendwire_rebind_catchup_pending", None)
         return False
     feed_item = _turn_feed_item(presentation_item, entry)
     try:
@@ -8786,7 +8767,6 @@ def _deliver_final(
             render_version=RENDER_VERSION,
             placeholder=True,
         )
-        entry.pop("tendwire_rebind_catchup_pending", None)
         return True
     send_changed_as_new = _changed_final_should_send_new_message(item, entry)
     if _final_turn_delivered(store, turn_id) and visible_here:
@@ -9088,74 +9068,6 @@ def _deliver_pending(
     return False
 
 
-def _bootstrap_existing_turns(
-    store: dict[str, Any],
-    turns_payload: dict[str, Any],
-    pending_payload: dict[str, Any],
-    *,
-    skip_v2_finals: bool = False,
-    complete: bool = True,
-) -> int:
-    """Record current Tendwire rows as seen on first deployment.
-
-    The pre-slim source ledger used different identities. Without this bootstrap,
-    the first source-only sync can repost historical rows. This migration is
-    intentionally one-way and Telegram-silent.
-    """
-    if store.get("tendwired_bootstrap_complete"):
-        return 0
-    skipped = 0
-    for item in _turns(turns_payload):
-        if _turn_has_content_outcome(item):
-            continue
-        _key, entry = _entry_for_turn(store, item)
-        if entry is None:
-            continue
-        turn_id = _turn_id(item)
-        if not turn_id:
-            continue
-        if _turn_has_complete_final(item):
-            if skip_v2_finals and _content_revision(item):
-                continue
-            revision = _content_revision(item)
-            content_hash = revision or _turn_content_hash(item, "final")
-            identity = f"final:{turn_id}:{content_hash}"
-            record = {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id}
-            if revision:
-                record["content_revision"] = revision
-                entry["last_clean_content_revision"] = revision
-            state.mark_delivered(store, identity, record)
-            _set_final_delivery(entry, turn_id=turn_id, content_hash=content_hash, placeholder=True)
-            skipped += 1
-            continue
-        if item.get("assistant_stream_text"):
-            _set_stream_delivery(entry, turn_id=turn_id, content_hash=_turn_content_hash(item, "working"), placeholder=True)
-            skipped += 1
-    for item in _pending(pending_payload):
-        _key, entry = _entry_for_turn(store, item)
-        if entry is None:
-            continue
-        pending_id = compact_ws(item.get("id") or item.get("pending_id") or item.get("turn_id"), 200)
-        if not pending_id:
-            continue
-        content_hash = short_hash({"pending": pending_id, "text": item.get("prompt_text") or item.get("text")}, 20)
-        state.mark_delivered(
-            store,
-            f"pending:{pending_id}:{content_hash}",
-            {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id},
-        )
-        skipped += 1
-    previous_seen = store.get("tendwired_bootstrap_seen")
-    store["tendwired_bootstrap_seen"] = (
-        int(previous_seen)
-        if isinstance(previous_seen, int) and not isinstance(previous_seen, bool)
-        else 0
-    ) + skipped
-    if complete:
-        store["tendwired_bootstrap_complete"] = True
-    return skipped
-
-
 def _sync_turns(
     store: dict[str, Any],
     turns_payload: dict[str, Any],
@@ -9213,7 +9125,6 @@ def _sync_turns(
             )
         ]
     latest_content_turn_by_worker: dict[str, str] = {}
-    latest_completed_turn_by_worker: dict[str, str] = {}
     placeholder_turn_ids_by_worker: dict[str, set[str]] = {}
     # Pass 1: real content only (user prompt, stream, or a completed final).
     # Tendwire store output is already ordered by per-worker observed recency.
@@ -9231,10 +9142,6 @@ def _sync_turns(
         if not _turn_has_real_content(item):
             continue
         latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
-        if _turn_has_complete_final(item):
-            latest_completed_turn_by_worker.setdefault(
-                worker_key, _turn_id(item)
-            )
     # Pass 2: synthetic "Work is in progress." placeholders only fill workers
     # with no real turn at all — a placeholder must never outrank a real turn.
     for item in turns:
@@ -9315,14 +9222,7 @@ def _sync_turns(
         latest_turn_id = latest_content_turn_by_worker.get(worker_key)
         complete = _turn_has_complete_final(item)
         if complete:
-            if entry.get("tendwire_rebind_catchup_pending"):
-                latest_turn_id = latest_completed_turn_by_worker.get(
-                    worker_key
-                )
             if latest_turn_id and _turn_id(item) != latest_turn_id:
-                delivered = False
-                content_hash = _content_revision(item) or _turn_content_hash(item, "final")
-                counts["updated"] += int(_suppress_historical_final(store, item, content_hash))
                 writes_before = budget.spent
                 counts["updated"] += int(_fold_superseded_final(store, item, entry, runtime, chat_id=chat_id, fold_state=fold_state))
                 if budget.spent > writes_before:
@@ -10380,7 +10280,6 @@ def _maybe_complete_turn_plan(
         "replaces_failed_plan_token",
         "pending_final_identity",
         "pending_working_predecessor_turn_id",
-        "pending_turn_suppressed",
         "abandoned_plan_token",
         "abandoned_content_revision",
     ):
@@ -10393,7 +10292,6 @@ def _maybe_complete_turn_plan(
     else:
         _clear_stream_delivery_state(entry, _turn_id(item))
     _record_delivery_success(entry, bot_kind)
-    entry.pop("tendwire_rebind_catchup_pending", None)
     return True
 
 
@@ -10609,7 +10507,6 @@ def _abandon_pending_turn_plan(
         "replaces_failed_plan_token",
         "pending_final_identity",
         "pending_working_predecessor_turn_id",
-        "pending_turn_suppressed",
     ):
         entry.pop(field, None)
     return True
@@ -10792,7 +10689,6 @@ def _reconcile_completed_turn_plans(
                 "replaces_failed_plan_token",
                 "pending_final_identity",
                 "pending_working_predecessor_turn_id",
-                "pending_turn_suppressed",
                 "abandoned_plan_token",
                 "abandoned_content_revision",
             ):
@@ -10856,11 +10752,7 @@ def _reconcile_completed_turn_plans(
                 isinstance(receipt, dict)
                 and receipt.get("plan_token") == plan_token
                 and receipt.get("substate")
-                in {
-                    "telegram_applied",
-                    "old_slot_retired",
-                    "suppressed",
-                }
+                in {"telegram_applied", "old_slot_retired"}
             ):
                 state.update_tendwire_turn_job(
                     store, job_key, substate="acknowledged"
@@ -10874,22 +10766,12 @@ def _reconcile_completed_turn_plans(
             "worker_id": _entry_worker_id(entry),
             "space_id": _entry_space_id(entry),
         }
-        completed = (
-            _complete_suppressed_turn_plan(
-                store,
-                item,
-                entry,
-                plan_token=plan_token,
-                revision=revision,
-            )
-            if _suppressed_turn_plan(entry, plan_token, revision)
-            else _maybe_complete_turn_plan(
-                store,
-                item,
-                entry,
-                plan_token=plan_token,
-                revision=revision,
-            )
+        completed = _maybe_complete_turn_plan(
+            store,
+            item,
+            entry,
+            plan_token=plan_token,
+            revision=revision,
         )
         if completed:
             reconciled += 1
@@ -11085,206 +10967,6 @@ def _defer_turn_final(
         )
 
 
-def _turns_by_id_for_catchup(
-    turns_payload: dict[str, Any],
-    turn_projection: Mapping[str, Any] | None,
-) -> dict[str, dict[str, Any]]:
-    rows: dict[str, dict[str, Any]] = {}
-    candidates = list(_turns(turns_payload))
-    if isinstance(turn_projection, Mapping):
-        candidates.extend(
-            item
-            for item in turn_projection.values()
-            if isinstance(item, dict)
-        )
-    for item in candidates:
-        turn_id = _turn_id(item)
-        if not turn_id or _turn_has_content_outcome(item):
-            continue
-        current = rows.get(turn_id)
-        if current is None or _turn_recency(item) > _turn_recency(current):
-            rows[turn_id] = item
-    return rows
-
-
-def _final_ready_lease_exceeds_live_window(
-    lease: Mapping[str, Any], *, now: datetime | None = None
-) -> bool:
-    """Return true only for a provably old final-ready root.
-
-    Older Tendwire runtimes omit ``created_at``; those leases remain eligible
-    instead of being guessed stale. A zero window disables historical catch-up
-    while still allowing a root created in the current second.
-    """
-
-    raw = lease.get("created_at")
-    if not isinstance(raw, str) or not raw.strip():
-        return False
-    try:
-        created_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if created_at.tzinfo is None:
-        return False
-    observed_at = now or datetime.now(timezone.utc)
-    return (
-        observed_at.astimezone(timezone.utc)
-        - created_at.astimezone(timezone.utc)
-    ).total_seconds() > config.final_catchup_max_seconds()
-
-
-def _ensure_rebind_catchup_bound(
-    entry: dict[str, Any],
-    turns_payload: dict[str, Any],
-    turn_projection: Mapping[str, Any] | None,
-) -> tuple[dict[str, str] | None, dict[str, dict[str, Any]]]:
-    rows = _turns_by_id_for_catchup(turns_payload, turn_projection)
-    existing = entry.get("tendwire_rebind_catchup_bound")
-    if isinstance(existing, dict):
-        turn_id = str(existing.get("turn_id") or "")
-        updated_at = str(existing.get("updated_at") or "")
-        if turn_id and updated_at:
-            return {
-                "turn_id": turn_id,
-                "updated_at": updated_at,
-            }, rows
-    pending = entry.get("tendwire_rebind_catchup_pending")
-    identity = state.entry_stable_identity(entry)
-    if not isinstance(pending, dict) or identity is None:
-        return None, rows
-    completed = [
-        item
-        for item in rows.values()
-        if _turn_stable_identity(item) == identity
-        and _turn_has_complete_final(item)
-        and _turn_recency(item)
-    ]
-    if not completed:
-        return None, rows
-    newest_at = max(_turn_recency(item) for item in completed)
-    newest = [
-        item for item in completed if _turn_recency(item) == newest_at
-    ]
-    last_turn_id = str(entry.get("last_turn_id") or "")
-    chosen = next(
-        (item for item in newest if _turn_id(item) == last_turn_id),
-        newest[0] if len(newest) == 1 else None,
-    )
-    if chosen is None:
-        return None, rows
-    bound = {
-        "turn_id": _turn_id(chosen),
-        "updated_at": _turn_recency(chosen),
-    }
-    entry["tendwire_rebind_catchup_bound"] = dict(bound)
-    return bound, rows
-
-
-def _suppress_rebind_catchup_root(
-    entry: dict[str, Any],
-    payload: dict[str, Any],
-    turns_payload: dict[str, Any],
-    turn_projection: Mapping[str, Any] | None,
-) -> bool:
-    bound, rows = _ensure_rebind_catchup_bound(
-        entry, turns_payload, turn_projection
-    )
-    if bound is None:
-        return False
-    item = rows.get(str(payload.get("turn_id") or ""))
-    if item is None or _turn_stable_identity(item) != state.entry_stable_identity(
-        entry
-    ):
-        return False
-    updated_at = _turn_recency(item)
-    if not updated_at:
-        return False
-    if updated_at > bound["updated_at"]:
-        entry.pop("tendwire_rebind_catchup_bound", None)
-        entry.pop("tendwire_rebind_catchup_pending", None)
-        return False
-    return (
-        _turn_id(item) != bound["turn_id"]
-        and updated_at <= bound["updated_at"]
-    )
-
-
-def _suppressed_turn_plan(
-    entry: dict[str, Any], plan_token: str, revision: str
-) -> bool:
-    marker = entry.get("pending_turn_suppressed")
-    return bool(
-        isinstance(marker, dict)
-        and marker.get("plan_token") == plan_token
-        and marker.get("content_revision") == revision
-    )
-
-
-def _complete_suppressed_turn_plan(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    *,
-    plan_token: str,
-    revision: str,
-) -> bool:
-    if not _suppressed_turn_plan(entry, plan_token, revision):
-        return False
-    expected_jobs = entry.get("pending_turn_job_count")
-    receipts = [
-        receipt
-        for receipt in state.tendwire_turn_jobs(store).values()
-        if isinstance(receipt, dict)
-        and receipt.get("plan_token") == plan_token
-    ]
-    if (
-        isinstance(expected_jobs, bool)
-        or not isinstance(expected_jobs, int)
-        or expected_jobs <= 0
-        or len(receipts) < expected_jobs
-        or any(
-            receipt.get("substate") != "acknowledged"
-            or isinstance(receipt.get("post_ack_reconcile"), dict)
-            for receipt in receipts
-        )
-    ):
-        return False
-    state.mark_delivered(
-        store,
-        f"final:{_turn_id(item)}:{revision}",
-        {
-            "worker_id": entry.get("tendwire_worker_id"),
-            "turn_id": _turn_id(item),
-            "content_revision": revision,
-            "suppressed": True,
-        },
-    )
-    _clear_final_source_owner(
-        store, entry.get("pending_final_identity")
-    )
-    for field in (
-        "pending_turn_id",
-        "pending_content_revision",
-        "pending_plan_token",
-        "pending_turn_part_count",
-        "pending_turn_job_count",
-        "pending_turn_started_at",
-        "pending_turn_user_hash",
-        "pending_stream_submission_id",
-        "pending_plan_generation",
-        "pending_presentation_version",
-        "pending_acknowledged_prefix_count",
-        "replaces_failed_plan_token",
-        "pending_final_identity",
-        "pending_working_predecessor_turn_id",
-        "pending_turn_suppressed",
-        "abandoned_plan_token",
-        "abandoned_content_revision",
-    ):
-        entry.pop(field, None)
-    return True
-
-
 def _turn_final_ack_obligation(
     store: dict[str, Any],
     job_key: str,
@@ -11367,22 +11049,6 @@ def _drain_post_ack_reconciliations(
             turn_id=turn_id,
             revision=revision,
         )
-        if obligation.get("kind") == "suppressed":
-            state.clear_tendwire_turn_job_post_ack_reconcile(
-                store, job_key
-            )
-            if item is not None:
-                _complete_suppressed_turn_plan(
-                    store,
-                    item,
-                    entry,
-                    plan_token=plan_token,
-                    revision=revision,
-                )
-            result["changed"] = True
-            _checkpoint_turn_job(runtime)
-            continue
-
         stale = obligation.get("stale_copies")
         if not isinstance(stale, list):
             stale = []
@@ -11617,7 +11283,6 @@ def _drain_turn_final(
         "deferred": 0,
         "uncertain": 0,
         "staged": 0,
-        "suppressed_stale": 0,
         "content_pages": 0,
         "changed": False,
     }
@@ -11694,9 +11359,6 @@ def _drain_turn_final(
             break
 
         if payload["operation"] == "materialize":
-            suppress_stale = _final_ready_lease_exceeds_live_window(
-                lease
-            )
             try:
                 item = _final_ready_row(payload)
             except _TurnContentError as exc:
@@ -11721,7 +11383,6 @@ def _drain_turn_final(
                     )
                 owner_matches = False
                 owner_bound = False
-                suppress_historical = False
             else:
                 owner_matches, owner_bound = (
                     _bind_or_verify_final_source_owner(
@@ -11730,14 +11391,6 @@ def _drain_turn_final(
                         _entry_key,
                         entry,
                         allow_bind=True,
-                    )
-                )
-                suppress_historical = suppress_stale or (
-                    _suppress_rebind_catchup_root(
-                        entry,
-                        payload,
-                        turns_payload,
-                        turn_projection,
                     )
                 )
             if not owner_matches:
@@ -11868,20 +11521,6 @@ def _drain_turn_final(
                 entry["pending_working_predecessor_turn_id"] = (
                     predecessor_turn_id
                 )
-            if suppress_historical:
-                entry["pending_turn_suppressed"] = {
-                    "plan_token": str(
-                        entry.get("pending_plan_token") or ""
-                    ),
-                    "turn_id": _turn_id(item),
-                    "content_revision": _content_revision(item),
-                    "reason": (
-                        "final_ready_exceeded_live_window"
-                        if suppress_stale
-                        else "rebind_catchup_older_than_bound"
-                    ),
-                }
-                result["suppressed_stale"] += int(suppress_stale)
             materialized_sources[source_identity] = (
                 payload,
                 item,
@@ -11910,7 +11549,6 @@ def _drain_turn_final(
             in {
                 "telegram_applied",
                 "old_slot_retired",
-                "suppressed",
                 "acknowledged",
             }
         )
@@ -12342,203 +11980,6 @@ def _drain_turn_final(
             )
             result["_terminal_failure"] = True
             break
-
-        if _suppressed_turn_plan(entry, plan_token, revision):
-            if substate not in {"suppressed", "acknowledged"}:
-                state.update_tendwire_turn_job(
-                    store, job_key, substate="suppressed"
-                )
-                _checkpoint_turn_job(runtime)
-                substate = "suppressed"
-            suppressed_ack_operation = _capture_entry_operation(
-                store,
-                entry,
-                topic_id=str(entry.get("topic_id") or ""),
-                plan_token=plan_token,
-                revision=revision,
-            )
-            if (
-                _compare_and_apply_entry_operation(
-                    store, suppressed_ack_operation
-                ).disposition
-                != _OFFLOCK_APPLY
-            ):
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "transient_delivery",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=1,
-                )
-                break
-            ack_obligation = _turn_final_ack_obligation(
-                store,
-                job_key,
-                suppressed_ack_operation,
-                kind="suppressed",
-                turn_id=_turn_id(item),
-                plan_token=plan_token,
-                revision=revision,
-                ordinal=ordinal,
-                part_count=part_count,
-            )
-            state.record_tendwire_turn_job_post_ack_reconcile(
-                store,
-                job_key,
-                ack_obligation,
-                acknowledged=False,
-            )
-            _checkpoint_turn_job(runtime)
-            execution = _execute_entry_operation(
-                store,
-                runtime.tendwire,
-                suppressed_ack_operation,
-                _provider_mutation(
-                    "tendwire.turn_final_ack",
-                    reason=(
-                        "tendwire.turn_final_ack: acknowledge suppressed plan"
-                    ),
-                    args=(
-                        ref,
-                        {
-                            "outcome": "applied",
-                            "job_key": job_key,
-                        },
-                    ),
-                ),
-            )
-            ack = execution.result
-            suppressed_ack_resolution = execution.resolution
-            if (
-                suppressed_ack_resolution.disposition
-                != _OFFLOCK_APPLY
-            ):
-                if ack.get("ok") is not False:
-                    ack_obligation["status"] = "reconcile"
-                    state.record_tendwire_turn_job_post_ack_reconcile(
-                        store, job_key, ack_obligation
-                    )
-                    _checkpoint_turn_job(runtime)
-                    result["delivered"] += 1
-                    result["acked"] += 1
-                    result["changed"] = True
-                    continue
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "transient_delivery",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=1,
-                )
-                break
-            entry = suppressed_ack_resolution.entry
-            assert entry is not None
-            if ack.get("ok") is False:
-                observe_operation = _capture_entry_operation(
-                    store,
-                    entry,
-                    topic_id=str(entry.get("topic_id") or ""),
-                    plan_token=plan_token,
-                    revision=revision,
-                )
-                execution = _execute_entry_operation(
-                    store,
-                    runtime.tendwire,
-                    observe_operation,
-                    _provider_mutation(
-                        "tendwire.connector_prepare_commit",
-                        reason=(
-                            "tendwire.connector_prepare_commit: observe "
-                            "suppressed ACK conflict"
-                        ),
-                        kwargs={"plan_token": plan_token},
-                    ),
-                )
-                observed = execution.result
-                observe_resolution = execution.resolution
-                if observe_resolution.disposition != _OFFLOCK_APPLY:
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "transient_delivery",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=1,
-                    )
-                    break
-                entry = observe_resolution.entry
-                assert entry is not None
-                advanced = False
-                if (
-                    observed.get("ok") is True
-                    and observed.get("plan_token") == plan_token
-                    and observed.get("state") == "completed"
-                ):
-                    for receipt_key, observed_receipt in list(
-                        state.tendwire_turn_jobs(store).items()
-                    ):
-                        if (
-                            isinstance(observed_receipt, dict)
-                            and observed_receipt.get("plan_token")
-                            == plan_token
-                            and observed_receipt.get("substate")
-                            in {
-                                "suppressed",
-                                "telegram_applied",
-                                "old_slot_retired",
-                            }
-                        ):
-                            state.update_tendwire_turn_job(
-                                store,
-                                receipt_key,
-                                substate="acknowledged",
-                            )
-                            state.clear_tendwire_turn_job_post_ack_reconcile(
-                                store, receipt_key
-                            )
-                            advanced = True
-                    advanced = (
-                        _complete_suppressed_turn_plan(
-                            store,
-                            item,
-                            entry,
-                            plan_token=plan_token,
-                            revision=revision,
-                        )
-                        or advanced
-                    )
-                if advanced:
-                    _checkpoint_turn_job(runtime)
-                result["status"] = str(
-                    ack.get("status") or "turn_final_ack_failed"
-                )
-                result["changed"] = True
-                break
-            if substate != "acknowledged":
-                state.update_tendwire_turn_job(
-                    store, job_key, substate="acknowledged"
-                )
-            state.clear_tendwire_turn_job_post_ack_reconcile(
-                store, job_key
-            )
-            _checkpoint_turn_job(runtime)
-            result["delivered"] += 1
-            result["acked"] += 1
-            result["changed"] = True
-            if _complete_suppressed_turn_plan(
-                store,
-                item,
-                entry,
-                plan_token=plan_token,
-                revision=revision,
-            ):
-                _checkpoint_turn_job(runtime)
-            continue
 
         if substate in {
             "telegram_applied",
@@ -13539,7 +12980,6 @@ def _drain_turn_final(
                 "retryable",
                 "telegram_applied",
                 "old_slot_retired",
-                "suppressed",
             }
         ):
             state.update_tendwire_turn_job(
@@ -14930,7 +14370,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 to_worker_id=to_worker_id,
                 reason=resolution["reason"],
                 observed_at=observed_at,
-                evidence_turn_id=resolution["evidence_turn_id"],
             )
         )
     with state.lock_phase("sync.lifecycle_cleanup"):
@@ -14961,26 +14400,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     with state.lock_phase("sync.routing"):
         routing_repaired = _repair_space_mode_routing_state(store)
         message_bindings = _backfill_message_bindings(store)
-    bootstrap_complete = True
-    if delta_observation is not None:
-        bootstrap_complete = (
-            delta_observation.get("kind") in {"full", "noop"}
-            or (
-                delta_observation.get("kind") == "delta"
-                and (
-                    delta_observation.get("page", {}).get("mode") == "changes"
-                    or delta_observation.get("page", {}).get("has_more") is False
-                )
-            )
-        )
-    with state.lock_phase("sync.bootstrap"):
-        bootstrapped = _bootstrap_existing_turns(
-            store,
-            turns_payload,
-            pending_payload,
-            skip_v2_finals=True,
-            complete=bootstrap_complete,
-        )
     live_worker_ids = {
         compact_ws(worker.get("id"), 160)
         for worker in observed_snapshot_workers
@@ -15000,43 +14419,29 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             and delta_observation.get("page", {}).get("mode") == "bootstrap"
             else turns_payload
         )
-        if bootstrapped:
-            turn_counts = {
-                "feed_sent": 0,
-                "sent": 0,
-                "updated": 0,
-                "content_pages": 0,
-                "physical_writes": 0,
-                "work_pending": 0,
-                "failed_writes": 0,
-                "response_fold_attempted": 0,
-                "response_folded": 0,
-                "response_fold_failed": 0,
-            }
-        else:
-            with state.lock_phase("sync.turns"):
-                turn_counts = _sync_turns(
-                    store,
-                    feed_turns_payload,
-                    pending_payload,
-                    runtime,
-                    chat_id=chat_id,
-                    live_worker_ids=live_worker_ids,
-                    yield_barrier=yield_barrier,
-                    checkpoint_after_delivery=(
-                        delta_observation is not None
-                        and delta_observation.get("kind") == "delta"
-                        and delta_observation.get("page", {}).get("mode")
-                        == "changes"
-                    ),
-                    retained_projection=(
-                        delta.get("projection")
-                        if delta_observation is not None
-                        and delta_observation.get("kind") == "delta"
-                        and isinstance(delta, dict)
-                        else None
-                    ),
-                )
+        with state.lock_phase("sync.turns"):
+            turn_counts = _sync_turns(
+                store,
+                feed_turns_payload,
+                pending_payload,
+                runtime,
+                chat_id=chat_id,
+                live_worker_ids=live_worker_ids,
+                yield_barrier=yield_barrier,
+                checkpoint_after_delivery=(
+                    delta_observation is not None
+                    and delta_observation.get("kind") == "delta"
+                    and delta_observation.get("page", {}).get("mode")
+                    == "changes"
+                ),
+                retained_projection=(
+                    delta.get("projection")
+                    if delta_observation is not None
+                    and delta_observation.get("kind") == "delta"
+                    and isinstance(delta, dict)
+                    else None
+                ),
+            )
     except _TurnContentError as exc:
         if not exc.conflict:
             return _tendwire_non_success(runtime, exc.status)
@@ -15112,7 +14517,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         or submission_counts["sent"]
         or submission_counts["updated"]
         or submission_link_updates
-        or bootstrapped
         or topic_cleanup.get("changed")
         or message_bindings
         or reconciled_turn_plans
@@ -15318,7 +14722,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             if delta is not None
             else {}
         ),
-        "bootstrap_seen": bootstrapped,
         "message_bindings": message_bindings,
         "topic_cleanup": topic_cleanup,
         "content_pages": int(turn_counts["content_pages"])
