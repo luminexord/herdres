@@ -299,9 +299,11 @@ def _managed_bot_kind_for_alias(store: dict[str, Any], alias: str) -> str:
 
 
 
-def _target_for_entry(entry: dict[str, Any]) -> dict[str, str | int]:
-    # Stable ownership survives frontend replacement and fingerprint churn.
-    # Prefer the authenticated v1 source identity whenever it is exact.
+def _stable_owner_for_entry(
+    entry: dict[str, Any],
+) -> tuple[str, int] | None:
+    """Return durable owner evidence without changing the wire selector."""
+
     identity = state.entry_stable_identity(entry)
     if identity is None and str(entry.get("entry_type") or "") == "space":
         active_identity = (
@@ -310,11 +312,15 @@ def _target_for_entry(entry: dict[str, Any]) -> dict[str, str | int]:
         )
         if state.valid_stable_worker_key_pair(*active_identity):
             identity = active_identity
-    if identity is not None:
-        return {
-            "stable_key": identity[0],
-            "stable_key_version": identity[1],
-        }
+    return identity
+
+
+def _target_for_entry(entry: dict[str, Any]) -> dict[str, str]:
+    # The installed Tendwire command contract accepts worker/fingerprint,
+    # space, and name selectors, but not stable-key selectors. Stable identity
+    # remains the separately persisted target_owner for v3 submission
+    # correlation; it must not leak into the external request until Tendwire's
+    # request contract is upgraded in lockstep.
     worker_id = str(entry.get("active_worker_id") or entry.get("tendwire_worker_id") or "").strip()
     fingerprint = str(entry.get("active_worker_fingerprint") or entry.get("tendwire_fingerprint") or "").strip()
     if worker_id:
@@ -994,7 +1000,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             and record.get("target_owner") is None
             and config.command_response_schema_version() == 3
         ):
-            target_identity = state.entry_stable_identity(entry)
+            target_identity = _stable_owner_for_entry(entry)
             if target_identity is not None:
                 ingress_requests.attach_target_owner(
                     record,

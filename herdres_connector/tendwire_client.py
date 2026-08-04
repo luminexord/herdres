@@ -754,7 +754,12 @@ class TendwireClient:
             ]
             if cursor is not None:
                 args.extend(("--cursor", cursor))
-            result = self.call(args)
+            # Preserve the exact bounded protocol structure until
+            # source_sync._validate_turn_row applies the same private-ACP
+            # quarantine used by turn.delta. Generic public pruning here would
+            # erase the evidence and make fallback/full reconciliation accept
+            # a row that the primary delta path rejects.
+            result = self.call(args, protocol=True)
             if result.get("ok") is False:
                 return result
             received = result.get("schema_version")
