@@ -26,17 +26,30 @@ import tempfile
 path = sys.argv[1]
 adapter = re.compile(r"^Environment=TENDWIRE_HERDR_BIN=.*/herdr_turn_adapter\.py$")
 real_bin = re.compile(r"^Environment=HERDR_REAL_BIN=.*$")
+backend = re.compile(r"^Environment=TENDWIRE_HERDR_BACKEND=.*$")
 with open(path, encoding="utf-8") as source:
     lines = source.read().splitlines(keepends=True)
+has_backend = any(
+    backend.fullmatch(line.rstrip("\r\n"))
+    for line in lines
+)
 rewritten = []
 replaced = False
+backend_written = False
 for line in lines:
     body = line.rstrip("\r\n")
     ending = line[len(body):]
     if adapter.fullmatch(body):
+        if not has_backend:
+            rewritten.append("Environment=TENDWIRE_HERDR_BACKEND=socket\n")
+            backend_written = True
         rewritten.append("Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr" + (ending or "\n"))
         replaced = True
-    elif not real_bin.fullmatch(body) and body != "Environment=TENDWIRE_HERDR_BACKEND=socket":
+    elif backend.fullmatch(body):
+        if not backend_written:
+            rewritten.append("Environment=TENDWIRE_HERDR_BACKEND=socket" + (ending or "\n"))
+            backend_written = True
+    elif not real_bin.fullmatch(body):
         rewritten.append(line)
 if not replaced:
     raise SystemExit("legacy adapter line disappeared during tendwired.service migration")
