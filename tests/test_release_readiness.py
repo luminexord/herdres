@@ -151,6 +151,29 @@ def test_runtime_imports_no_herdr_backend_client_and_reports_zero_direct_calls()
     assert not re.search(r"""[\[(]\s*["']herdr["']""", text), "herdres runtime must not spawn a bare herdr binary"
 
 
+def test_tendwire_transport_has_no_cli_fallback_or_database_watcher() -> None:
+    client = (REPO_ROOT / "herdres_connector/tendwire_client.py").read_text(
+        encoding="utf-8"
+    )
+    launcher = (REPO_ROOT / "herdres.py").read_text(encoding="utf-8")
+
+    assert not (REPO_ROOT / "herdres_connector/outbound_dispatcher.py").exists()
+    for forbidden in (
+        "subprocess",
+        "HERDRES_TENDWIRE_BIN",
+        "TENDWIRE_BIN",
+        "tendwire.cli",
+    ):
+        assert forbidden not in client
+    for forbidden in (
+        "OutboundDispatcher",
+        "_DatabaseWakeWatcher",
+        "inotify",
+        "tendwire_db_path",
+    ):
+        assert forbidden not in launcher
+
+
 def test_herdr_plugin_manifest_has_safe_non_delivery_actions() -> None:
     manifest = tomllib.loads(
         (REPO_ROOT / "herdr-plugin.toml").read_text(encoding="utf-8")

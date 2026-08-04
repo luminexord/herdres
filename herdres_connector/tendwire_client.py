@@ -428,6 +428,7 @@ class TendwireClient:
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         parent_fd = os.open("/", flags)
+        pin_fd = -1
         try:
             for part in path.parts[1:-1]:
                 next_fd = os.open(part, flags | nofollow, dir_fd=parent_fd)
@@ -459,8 +460,48 @@ class TendwireClient:
                 raise OSError("Tendwire socket changed while pinning")
             return parent_fd, pin_fd, path.name, identity
         except Exception:
+            if pin_fd >= 0:
+                os.close(pin_fd)
             os.close(parent_fd)
             raise
+
+    @staticmethod
+    def _anchored_socket_address(parent_fd: int, leaf: str) -> str:
+        """Name ``leaf`` through the retained parent, never through its ancestors."""
+
+        if os.name != "posix" or not isinstance(parent_fd, int) or parent_fd < 0:
+            raise OSError("Tendwire socket anchoring is unsupported")
+        expected = os.fstat(parent_fd)
+        anchor = f"/proc/self/fd/{parent_fd}"
+        try:
+            current = os.stat(anchor)
+        except OSError:
+            raise OSError("Tendwire socket anchoring is unavailable") from None
+        if (
+            not stat.S_ISDIR(expected.st_mode)
+            or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise OSError("Tendwire socket anchor is invalid")
+        return f"{anchor}/{leaf}"
+
+    @staticmethod
+    def _validate_peer(conn: socket.socket) -> None:
+        if not hasattr(socket, "SO_PEERCRED"):
+            raise OSError("Tendwire daemon peer validation is unsupported")
+        credentials = struct.Struct("3i")
+        try:
+            raw = conn.getsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_PEERCRED,
+                credentials.size,
+            )
+            peer_pid, peer_uid, peer_gid = credentials.unpack(raw)
+        except (OSError, struct.error):
+            raise OSError("Tendwire daemon peer validation failed") from None
+        if peer_pid <= 0 or peer_uid < 0 or peer_gid < 0:
+            raise OSError("Tendwire daemon peer validation failed")
+        if peer_uid != os.geteuid():
+            raise OSError("Tendwire daemon peer is not owned by this user")
 
     @staticmethod
     def _read_frame(conn: socket.socket, deadline: float) -> bytes:
@@ -569,21 +610,20 @@ class TendwireClient:
         try:
             path = self._path()
             parent_fd, pin_fd, leaf, identity = self._pin_socket(path)
+            address = self._anchored_socket_address(parent_fd, leaf)
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
                 conn.settimeout(max(0.001, deadline - time.monotonic()))
-                conn.connect(str(path))
+                conn.connect(address)
                 current = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
-                if (current.st_dev, current.st_ino) != identity:
+                pinned = os.fstat(pin_fd)
+                if (
+                    (current.st_dev, current.st_ino) != identity
+                    or (pinned.st_dev, pinned.st_ino) != identity
+                    or not stat.S_ISSOCK(current.st_mode)
+                    or not stat.S_ISSOCK(pinned.st_mode)
+                ):
                     raise OSError("Tendwire socket changed during connection")
-                if hasattr(socket, "SO_PEERCRED"):
-                    peer_bytes = conn.getsockopt(
-                        socket.SOL_SOCKET,
-                        socket.SO_PEERCRED,
-                        struct.calcsize("3i"),
-                    )
-                    _pid, peer_uid, _gid = struct.unpack("3i", peer_bytes)
-                    if peer_uid != os.geteuid():
-                        raise OSError("Tendwire daemon peer is not owned by this user")
+                self._validate_peer(conn)
                 started = True
                 conn.sendall(raw)
                 frame = self._read_frame(conn, deadline)
@@ -784,7 +824,164 @@ class TendwireClient:
             params,
             timeout=CONNECTOR_PROCESS_TIMEOUT_SECONDS,
         )
-        return self._clean(result, protocol=protocol)
+        clean = self._clean(result, protocol=protocol)
+        if isinstance(result, _TransportResult):
+            return clean
+        if self._valid_connector_result(method, params, clean):
+            return clean
+        return _schema_error(
+            "invalid_connector_response",
+            "Tendwire connector returned a malformed schema-v1 envelope",
+            received=clean.get("schema_version"),
+            required_key="supported_content_schema_version",
+            required_version=CONNECTOR_SCHEMA_VERSION,
+        )
+
+    @staticmethod
+    def _valid_connector_result(
+        method: str,
+        params: dict[str, Any],
+        result: dict[str, Any],
+    ) -> bool:
+        status = result.get("status")
+        ok = result.get("ok")
+        name = str(params.get("name") or "")
+        common = (
+            type(result.get("schema_version")) is int
+            and result["schema_version"] == CONNECTOR_SCHEMA_VERSION
+            and type(ok) is bool
+            and isinstance(status, str)
+            and bool(status)
+        )
+        if not common:
+            return False
+        if ok is False:
+            error = result.get("error")
+            return (
+                isinstance(result.get("host_id"), str)
+                and bool(result["host_id"])
+                and result.get("name") == name
+                and isinstance(error, dict)
+                and error.get("code") == status
+                and isinstance(error.get("message"), str)
+                and bool(error["message"])
+            )
+        if result.get("error") is not None:
+            return False
+        if method == "prepare":
+            return TendwireClient._valid_prepare_result(params, result)
+        if (
+            not isinstance(result.get("host_id"), str)
+            or not result["host_id"]
+            or result.get("name") != name
+        ):
+            return False
+        if method == "poll":
+            items = result.get("items")
+            return status == "ok" and isinstance(items, list) and all(
+                TendwireClient._valid_connector_item(item) for item in items
+            )
+        if method in {"ack", "fail", "defer"}:
+            expected = {
+                "ack": {"acknowledged"},
+                "fail": {"retry_scheduled", "attempts_exhausted", "superseded"},
+                "defer": {"deferred", "superseded"},
+            }[method]
+            return (
+                status in expected
+                and result.get("ref") == str(params.get("ref") or "")
+                and TendwireClient._valid_opaque(result.get("ref"), "twref1.")
+                and isinstance(result.get("key"), str)
+                and bool(result["key"])
+                and type(result.get("attempt")) is int
+                and result["attempt"] > 0
+                and (
+                    status not in {"retry_scheduled", "deferred"}
+                    or isinstance(result.get("available_at"), str)
+                    and bool(result["available_at"])
+                )
+            )
+        return False
+
+    @staticmethod
+    def _valid_prepare_result(
+        params: dict[str, Any], result: dict[str, Any]
+    ) -> bool:
+        action = params.get("action")
+        if action == "recover":
+            integer_fields = (
+                "generation",
+                "acknowledged_prefix_count",
+                "executable_job_count",
+                "retained_failed_job_count",
+                "prior_attempt_count",
+            )
+            return (
+                result.get("status") == "recovered"
+                and result.get("failed_plan_token") == params.get("failed_plan_token")
+                and TendwireClient._valid_opaque(result.get("failed_plan_token"), "twplan1.")
+                and TendwireClient._valid_opaque(result.get("plan_token"), "twplan1.")
+                and TendwireClient._valid_opaque(result.get("content_revision"), "twrev1.")
+                and isinstance(result.get("state"), str)
+                and bool(result["state"])
+                and all(type(result.get(key)) is int for key in integer_fields)
+                and type(result.get("idempotent_replay")) is bool
+            )
+        valid_plan = (
+            result.get("status") == "ok"
+            and isinstance(result.get("host_id"), str)
+            and bool(result["host_id"])
+            and result.get("name") == str(params.get("name") or "")
+            and TendwireClient._valid_opaque(result.get("plan_token"), "twplan1.")
+        )
+        if action == "part":
+            return (
+                valid_plan
+                and result.get("ordinal") == params.get("ordinal")
+                and type(result.get("accepted_parts")) is int
+                and result["accepted_parts"] > 0
+            )
+        count_key = "part_count" if action == "begin" else "job_count"
+        return (
+            valid_plan
+            and action in {"begin", "commit"}
+            and isinstance(result.get("state"), str)
+            and bool(result["state"])
+            and type(result.get("generation")) is int
+            and type(result.get(count_key)) is int
+            and result[count_key] >= (1 if action == "begin" else 0)
+            and (
+                action != "begin"
+                or type(result.get("accepted_parts")) is int
+                and result["accepted_parts"] >= 0
+            )
+        )
+
+    @staticmethod
+    def _valid_connector_item(item: Any) -> bool:
+        return (
+            isinstance(item, dict)
+            and TendwireClient._valid_opaque(item.get("ref"), "twref1.")
+            and isinstance(item.get("key"), str)
+            and bool(item["key"])
+            and type(item.get("attempt")) is int
+            and item["attempt"] > 0
+            and isinstance(item.get("leased_until"), str)
+            and bool(item["leased_until"])
+            and isinstance(item.get("available_at"), str)
+            and bool(item["available_at"])
+            and isinstance(item.get("payload"), dict)
+        )
+
+    @staticmethod
+    def _valid_opaque(value: Any, prefix: str) -> bool:
+        if not isinstance(value, str) or not value.startswith(prefix):
+            return False
+        body = value[len(prefix) :]
+        return bool(body) and len(value) <= 264 and all(
+            char.isascii() and (char.isalnum() or char in "_-")
+            for char in body
+        )
 
     def connector_poll(
         self,
@@ -832,18 +1029,6 @@ class TendwireClient:
             protocol=name == TURN_FINAL_CONNECTOR,
         )
 
-    @staticmethod
-    def _connector_schema(result: dict[str, Any]) -> dict[str, Any]:
-        if result.get("ok") is False or result.get("schema_version") == 1:
-            return result
-        return _schema_error(
-            "unsupported_content_schema",
-            "Tendwire connector schema v1 is required",
-            received=result.get("schema_version"),
-            required_key="supported_content_schema_version",
-            required_version=1,
-        )
-
     def _prepare(self, request: dict[str, Any]) -> dict[str, Any]:
         encoded = json.dumps(
             request, separators=(",", ":"), ensure_ascii=False
@@ -855,7 +1040,7 @@ class TendwireClient:
                 "error": "connector.prepare request exceeds the Herdres client bound",
                 "max_request_bytes": CONNECTOR_PREPARE_MAX_REQUEST_BYTES,
             }
-        return self._connector_schema(self._connector("prepare", request, protocol=True))
+        return self._connector("prepare", request, protocol=True)
 
     def connector_prepare_begin(
         self,
@@ -960,7 +1145,7 @@ class TendwireClient:
             isinstance(request_id, str)
             and 1 <= len(request_id) <= 128
             and all(
-                char.isascii() and (char.isalnum() or char in "._:-")
+                char.isascii() and (char.isalnum() or char in "._-")
                 for char in request_id
             )
         )
@@ -981,18 +1166,17 @@ class TendwireClient:
         )
 
     def turn_final_poll(self, *, limit: int = 1, lease_seconds: int = 60) -> dict[str, Any]:
-        result = self.connector_poll(
+        return self.connector_poll(
             name=TURN_FINAL_CONNECTOR,
             limit=limit,
             lease_seconds=lease_seconds,
         )
-        return self._connector_schema(result)
 
     def turn_final_ack(self, ref: str, response: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._connector_schema(self.connector_ack(ref, response, name=TURN_FINAL_CONNECTOR))
+        return self.connector_ack(ref, response, name=TURN_FINAL_CONNECTOR)
 
     def turn_final_fail(self, ref: str, reason: str) -> dict[str, Any]:
-        return self._connector_schema(self.connector_fail(ref, reason, name=TURN_FINAL_CONNECTOR))
+        return self.connector_fail(ref, reason, name=TURN_FINAL_CONNECTOR)
 
     def turn_final_defer(
         self,
@@ -1011,4 +1195,4 @@ class TendwireClient:
             params["available_at"] = str(available_at)
         if delay_seconds is not None:
             params["delay_seconds"] = int(delay_seconds)
-        return self._connector_schema(self._connector("defer", params, protocol=True))
+        return self._connector("defer", params, protocol=True)

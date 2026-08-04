@@ -43,7 +43,7 @@ start the persistent Tendwire, Herdres, and gateway user services.
 Telegram topic input
   -> herdres-gateway
   -> herdres command
-  -> tendwire command --json
+  -> Tendwire command.submit over the protected Unix socket
 
 herdres sync
   -> tendwire snapshot/turn.delta/pending/connector
@@ -83,6 +83,7 @@ default as a safety net. Configure the page/repair behavior with:
 
 ```text
 HERDRES_TENDWIRE_TIMEOUT_SECONDS=60
+HERDRES_TENDWIRE_CONNECTOR_POLL_SECONDS=1
 HERDRES_TENDWIRE_DELTA_LIMIT=500
 HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION=2
 HERDRES_TENDWIRE_FULL_RECONCILE_SECONDS=3600
@@ -100,11 +101,11 @@ older Tendwire even when v3 was requested.
 
 Outbound delivery is not paced by the full source reconciliation. A durable v3
 submission receipt immediately renders its one working card, and
-`herdres sync --loop` runs a separate coalescing connector dispatcher. SQLite
-database/WAL commit notifications wake that dispatcher when Tendwire enqueues a
-turn-final job; a one-second fallback covers missed notifications and deferred
-jobs. The dispatcher uses only Tendwire's existing connector API and the same
-Telegram/state delivery machinery as the normal sync tail.
+`herdres sync --loop` runs a small connector-only poll loop independently of
+the full reconciliation. It polls once per second by default (configure
+`HERDRES_TENDWIRE_CONNECTOR_POLL_SECONDS`) and uses only Tendwire's public
+connector API plus the same Telegram/state delivery machinery as a one-shot
+sync. Herdres does not inspect Tendwire's database or watch SQLite/WAL files.
 
 ### Durable inbound lanes
 
@@ -155,7 +156,7 @@ Tendwire submission.
 
 Accepted sends do not post a redundant terminal success card by default: the
 working card already shows that the message is being handled. Set
-`HERDRES_INBOUND_SUCCESS_ACK=1` to restore the legacy byte-identical replies
+`HERDRES_INBOUND_SUCCESS_ACK=1` to restore the same fixed replies
 (`Sent to Tendwire worker.` and
 `Submitted to busy Tendwire worker.`). This gateway-only flag is read for each
 inbound call and never suppresses the instant queued acknowledgement or any
@@ -351,7 +352,7 @@ installed, running, or available. The root contains canonical content
 descriptors and the public identity pair, never a private checkpoint, Telegram
 routing, credentials, or message state.
 
-After leasing a `final_ready` root and materializing its exact canonical
+After leasing a `final_ready` root and materializing its canonical
 content, Herdres derives ordered multipart presentation ranges. Prepare
 begin/part/commit sends only neutral field/start/end spans, never turn text;
 the leased `source_ref` is bound on begin and commit, while part requests carry
@@ -707,7 +708,7 @@ This branch runs two user services (plus the Tendwire daemon):
 
 - `herdres.service` — the source sync loop (`herdres sync --loop`). It reads
   Tendwire snapshots/turns/pending and drives Telegram topics, messages, and
-  pinned status. Its wakeable outbound dispatcher drains working/final cards
+  pinned status. Its bounded connector poll loop drains working/final cards
   independently of long reconciliation passes. This replaces the old
   `herdres.timer`; there is no timer unit on this branch.
 - `herdres-gateway.service` — inbound Telegram polling; forwards topic input to
@@ -717,8 +718,8 @@ This branch runs two user services (plus the Tendwire daemon):
 
 ## Send transport
 
-Herdres submits every outbound instruction through Tendwire's public command
-path (`command.submit`, invoked as `tendwire command --json`). Herdres never
+Herdres submits every outbound instruction through Tendwire's public
+`command.submit` method over the protected local daemon socket. Herdres never
 sees or handles `pane_id`, `terminal_id`, or `send_keys` — those never appear in
 public or source-mode state. Tendwire owns the private send target and may, for
 delivery reliability, drive a private Herdr pane transport internally; that is a

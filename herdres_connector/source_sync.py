@@ -1994,7 +1994,7 @@ def _resolve_stable_worker_generations(
             else:
                 # A replacement snapshot row without a turn is not evidence
                 # of ownership. Hide it from source upsert and preserve the
-                # incumbent route byte-for-byte.
+                # incumbent route unchanged.
                 excluded_worker_refs.update(id(worker) for worker in generations)
             continue
         if reason == "freshest_turn_activity":

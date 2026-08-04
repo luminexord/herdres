@@ -1951,7 +1951,8 @@ def test_sync_loop_journals_later_oversize_notice_failure(
 
     monkeypatch.setattr(herdres.config, "load_env_file", lambda: None)
     monkeypatch.setattr(herdres.config, "require_source_mode", lambda: None)
-    monkeypatch.setattr(herdres, "_sync_pass", lambda: result)
+    monkeypatch.setattr(herdres, "_sync_pass", lambda **_kwargs: result)
+    monkeypatch.setattr(herdres, "_outbound_pass", lambda: {"ok": True})
     def stop_sleep(_seconds):
         raise StopLoop
 
@@ -7163,6 +7164,19 @@ def test_turn_final_lease_seconds_default_and_bounds():
         )
         == 60
     )
+
+
+@pytest.mark.parametrize(
+    ("request_id", "valid"),
+    [
+        ("recover.request-42_ok", True),
+        ("recover:request", False),
+        ("recover/request", False),
+        ("", False),
+    ],
+)
+def test_recovery_request_id_uses_paired_public_grammar(request_id, valid):
+    assert herdres._valid_recovery_request_id(request_id) is valid
 
 
 def test_slow_final_materialization_stays_within_configured_root_lease(

@@ -90,18 +90,20 @@ python -m pytest -q \
   tests/test_command_ingress_idempotency.py \
   tests/test_stable_worker_key.py \
   tests/test_tendwire_client.py \
+  tests/test_tendwire_socket_pairing.py \
   tests/test_turn_final_delivery.py \
+  tests/test_outbound_latency.py \
   tests/test_offlock_delivery.py
 HERDRES_TENDWIRE_MODE=source ./herdres.py tendwire source-smoke --with-outbox
 ```
 
-The exact Herdres `tests/test_command_ingress_idempotency.py`,
-`tests/test_tendwire_client.py`, and `tests/test_turn_final_delivery.py` suites
-in this block are the hermetic Goal 11 ingress/client and Goal 10 final-delivery
-gates. The listed Tendwire command, connector, and store tests are the paired
-producer gate. Every listed test must pass before any stateful sync. The
-repeated `source-smoke --with-outbox` remains only the shallow preflight
-described above.
+The Herdres ingress/client/final-delivery suites in this block are hermetic
+contract gates. `tests/test_tendwire_socket_pairing.py` is the executable real
+server/API/SQLite pair: it proves poll, provider binding, ACK, empty repoll, and
+ACK-response loss followed by authoritative empty repoll. The listed Tendwire
+command, connector, and store tests are the producer gate. Every listed test
+must pass before any stateful sync. The repeated `source-smoke --with-outbox`
+remains only the shallow preflight described above.
 
 The paired gate must establish all of the following:
 
@@ -124,18 +126,18 @@ The paired gate must establish all of the following:
 - On first sight of an update, before routing or child creation, Herdres
   persists immutable `created_at`, `deadline_at`, and `retain_until` bounds.
   It then persists canonical schema-v1 request JSON before command start.
-  Every retry sends those exact UTF-8 bytes. The sole rewrite is one
+  Every retry reconstructs the same request object and text. The sole rewrite is one
   `stale_target` + `no_receipt` removal of `worker_fingerprint`, durably stored
   before the same-ID retry.
-- The paired CLI returns the exact ten-field schema-v2 response. Herdres checks
+- The paired socket endpoint returns the exact ten-field schema-v2 response. Herdres checks
   action/request/dry-run correlation, public pruning, and each complete
   disposition tuple: accepted/`terminal_accepted`, pending/`in_progress`,
   request-state-uncertain/`terminal_uncertain`, and the allowed rejection
   statuses paired with either `terminal_rejected` or `no_receipt`.
-- CLI exit `0` pairs only with `ok: true`, and exit `1` only with `ok: false`.
-  Exit `2`, malformed/non-UTF-8 output, timeout, wrong schema/shape/correlation,
-  or any exit/body mismatch remains private process ambiguity. No schema-v2
-  disposition or private process/stdout/stderr detail is forged from it.
+- Pre-send socket failures are definite; timeout, EOF, malformed/non-UTF-8
+  output, or wrong schema/shape/correlation after request start remains
+  transport ambiguity. No schema-v2 disposition or private process detail is
+  forged from it.
 - Disposition, never status alone, controls lifecycle. In particular,
   `backend_unavailable` + `no_receipt` retains the checkpoint for retry, while
   `backend_unavailable` + `terminal_rejected` caches failure and advances.
@@ -314,7 +316,7 @@ generation. Herdres adds that audit's retained-failure count to the current
 failed tail and binds the inherited identity and cumulative count into
 preflight revalidation. Audits needed by pending replacements are protected
 from bounded-detail eviction; an all-protected audit table fails before RPC
-rather than stranding a later generation. The old receipts remain byte-for-byte
+rather than stranding a later generation. The old receipt values remain
 unchanged. Herdres clones the contiguous acknowledged prefix, retargets only
 its bindings,
 records the request-keyed audit, validates the suffix's predecessor against the

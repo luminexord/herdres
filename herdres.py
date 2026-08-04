@@ -12,6 +12,7 @@ import argparse
 import copy
 import json
 import sys
+import threading
 import time
 from typing import Any, Callable
 
@@ -26,6 +27,7 @@ from herdres_connector.safe import compact_ws, public_prune, sanitize_text, shor
 from herdres_connector.source_sync import (
     SyncRuntime,
     deliver_submission_working_card,
+    drain_outbound_once,
     sync_once,
 )
 from herdres_connector.telegram_delivery import TelegramClient
@@ -982,8 +984,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             state.save_state(store)
             return outcome
         if attached:
-            # Exact canonical bytes are fsynced before Tendwire can observe the
-            # request, and every retry reads only this stored string.
+            # Canonical JSON is fsynced before Tendwire can observe the request,
+            # and every retry reads only this stored string.
             state.save_state(store)
         _ingress_timing_log(
             "canonical_commit",
@@ -1005,7 +1007,7 @@ def callback_reply(_payload: dict[str, Any]) -> dict[str, Any]:
     return {"handled": True, "reply": "This source-only Herdres branch does not use Telegram callbacks."}
 
 
-def _sync_pass() -> dict[str, Any]:
+def _sync_pass(*, with_outbox: bool = True) -> dict[str, Any]:
     with state.state_lock(phase="sync_pass.load"):
         with state.lock_phase("sync_pass.load"):
             store = state.load_state()
@@ -1021,7 +1023,7 @@ def _sync_pass() -> dict[str, Any]:
                 store,
                 _runtime(
                     dry_run=False,
-                    with_outbox=True,
+                    with_outbox=with_outbox,
                     checkpoint=checkpoint,
                 ),
             )
@@ -1029,6 +1031,56 @@ def _sync_pass() -> dict[str, Any]:
             with state.lock_phase("sync_pass.final_save"):
                 state.save_state(store)
     return result
+
+
+def _outbound_pass() -> dict[str, Any]:
+    """Drain connector work without snapshot, turn, pending, or pane scans."""
+
+    with state.state_lock(phase="outbound_pass.load"):
+        with state.lock_phase("outbound_pass.load"):
+            store = state.load_state()
+
+        def checkpoint() -> None:
+            if not state.lock_held():
+                raise RuntimeError("outbound checkpoint requires the held state lock")
+            with state.lock_phase("outbound.checkpoint"):
+                state.save_state(store)
+
+        with state.lock_phase("outbound.drain"):
+            result = drain_outbound_once(
+                store,
+                _runtime(
+                    dry_run=False,
+                    with_outbox=True,
+                    checkpoint=checkpoint,
+                ),
+                chat_id=config.telegram_chat_id(store),
+            )
+        if result.get("changed"):
+            with state.lock_phase("outbound_pass.final_save"):
+                state.save_state(store)
+    return result
+
+
+def _connector_poll_loop(stop: threading.Event) -> None:
+    cadence = config.tendwire_connector_poll_seconds()
+    while not stop.is_set():
+        started = time.monotonic()
+        try:
+            _outbound_pass()
+        except Exception as exc:  # noqa: BLE001 - retain the bounded poll loop
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status": "outbound_pass_failed",
+                        "error": sanitize_text(str(exc), 300),
+                    }
+                ),
+                flush=True,
+            )
+        remaining = cadence - (time.monotonic() - started)
+        stop.wait(max(0.0, remaining))
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -1039,24 +1091,36 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return _json(_sync_pass())
     import time as _time
 
-    while True:
-        started = _time.monotonic()
-        try:
-            result = _sync_pass()
-            if result.get("ok") is not True:
-                print(json.dumps(result), flush=True)
-        except Exception as exc:  # noqa: BLE001 - survive transient failures
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "status": "sync_pass_failed",
-                        "error": sanitize_text(str(exc), 300),
-                    }
-                ),
-                flush=True,
-            )
-        _time.sleep(max(0.5, interval - (_time.monotonic() - started)))
+    stop = threading.Event()
+    poller = threading.Thread(
+        target=_connector_poll_loop,
+        args=(stop,),
+        name="herdres-connector-poll",
+        daemon=True,
+    )
+    poller.start()
+    try:
+        while True:
+            started = _time.monotonic()
+            try:
+                result = _sync_pass(with_outbox=False)
+                if result.get("ok") is not True:
+                    print(json.dumps(result), flush=True)
+            except Exception as exc:  # noqa: BLE001 - survive transient failures
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "status": "sync_pass_failed",
+                            "error": sanitize_text(str(exc), 300),
+                        }
+                    ),
+                    flush=True,
+                )
+            _time.sleep(max(0.5, interval - (_time.monotonic() - started)))
+    finally:
+        stop.set()
+        poller.join(timeout=max(1.0, config.tendwire_connector_poll_seconds() + 0.5))
 
 
 def cmd_command(_args: argparse.Namespace) -> int:
@@ -1181,7 +1245,7 @@ def _valid_recovery_request_id(value: Any) -> bool:
         isinstance(value, str)
         and 1 <= len(value) <= 128
         and all(
-            char.isascii() and (char.isalnum() or char in "._:-")
+            char.isascii() and (char.isalnum() or char in "._-")
             for char in value
         )
     )

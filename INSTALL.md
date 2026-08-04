@@ -101,8 +101,9 @@ An ordinary service restart must retain the private Herdres state file,
 Herdres request-ID key, stable polling-offset files, and Tendwire database
 unchanged. Before private route reconstruction, Herdres returns any cached
 terminal or quarantined child outcome for a redelivered request ID. A retained
-retryable record replays only its stored exact UTF-8 request bytes; token,
-routing, transcription, or worker-state churn cannot rebuild or replace them.
+retryable record reconstructs only its stored canonical request object and
+text; token, routing, transcription, or worker-state churn cannot rebuild or
+replace them.
 The sole exception is the one persisted removal of `worker_fingerprint` after
 `stale_target` with disposition `no_receipt`. Terminal and quarantine cache
 survives restart and route loss, bypasses Tendwire client construction, sends

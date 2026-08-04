@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import struct
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -120,6 +121,28 @@ def _return(value: dict[str, Any]) -> Responder:
     return lambda _request: value
 
 
+def _connector_poll(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": "host-public",
+        "name": "turn-final",
+        "items": items,
+    }
+
+
+def _connector_item(ref: str = "twref1.public") -> dict[str, Any]:
+    return {
+        "ref": ref,
+        "key": "turn-final:revision:twfinal1.public",
+        "attempt": 1,
+        "leased_until": "2026-08-05T12:01:00+00:00",
+        "available_at": "2026-08-05T12:00:00+00:00",
+        "payload": {"safe": True},
+    }
+
+
 def test_protocol_prune_is_bounded_and_preserves_exact_protocol_text_and_tokens() -> None:
     nested: dict[str, Any] = {}
     for _ in range(200):
@@ -215,6 +238,76 @@ def test_socket_parent_and_endpoint_must_be_private_owned_entries(tmp_path: Path
     assert "parent" in result["error"]
 
 
+def test_socket_connect_is_anchored_when_configured_ancestor_is_replaced(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original_connect = socket.socket.connect
+    moved = tmp_path / "daemon-pinned"
+    seen: list[str] = []
+
+    def replace_ancestor_then_connect(conn: socket.socket, address: str) -> None:
+        seen.append(str(address))
+        parent = tmp_path / "daemon"
+        parent.rename(moved)
+        parent.mkdir(mode=0o700)
+        original_connect(conn, address)
+
+    monkeypatch.setattr(socket.socket, "connect", replace_ancestor_then_connect)
+    with _daemon(tmp_path, [_return({"ok": True})]) as (client, _calls):
+        assert client.snapshot() == {"ok": True}
+    assert len(seen) == 1
+    assert seen[0].startswith("/proc/self/fd/")
+
+
+@pytest.mark.parametrize(
+    "credential_fault",
+    ["unavailable", "malformed", "negative", "wrong_owner"],
+)
+def test_socket_peer_credentials_fail_closed(
+    tmp_path: Path, monkeypatch, credential_fault: str
+) -> None:
+    parent = tmp_path / "peer"
+    parent.mkdir(mode=0o700)
+    path = parent / "tendwire.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    os.chmod(path, 0o600)
+    listener.listen()
+    accepted = threading.Event()
+
+    def accept_once() -> None:
+        conn, _ = listener.accept()
+        accepted.set()
+        conn.close()
+
+    thread = threading.Thread(target=accept_once, daemon=True)
+    thread.start()
+    if credential_fault == "malformed":
+        monkeypatch.setattr(socket.socket, "getsockopt", lambda *_args: b"bad")
+    elif credential_fault == "negative":
+        monkeypatch.setattr(
+            socket.socket,
+            "getsockopt",
+            lambda *_args: struct.pack("3i", -1, os.geteuid(), os.getegid()),
+        )
+    elif credential_fault == "wrong_owner":
+        monkeypatch.setattr(
+            socket.socket,
+            "getsockopt",
+            lambda *_args: struct.pack("3i", os.getpid(), os.geteuid() + 1, os.getegid()),
+        )
+    else:
+        monkeypatch.delattr(socket, "SO_PEERCRED")
+    try:
+        result = TendwireClient(socket_path=path, timeout=1).snapshot()
+    finally:
+        thread.join(timeout=2)
+        listener.close()
+    assert accepted.is_set()
+    assert result["status"] == "daemon_unavailable"
+    assert "peer" in result["error"]
+
+
 def test_turn_projection_paginates_and_preserves_exact_restored_text(tmp_path: Path) -> None:
     exact = "final\n" + "界" * 20_000
     first = {
@@ -246,22 +339,30 @@ def test_turn_delta_and_content_map_to_daemon_methods_without_retry(tmp_path: Pa
 
 def test_connector_helpers_use_connector_rpc_and_preserve_plan_token_bytes(tmp_path: Path) -> None:
     token = "twplan1.Exact_TOKEN-bytes"
+    item = _connector_item()
+    item["payload"] = {"plan_token": token}
     responses = [
-        {"schema_version": 1, "ok": True, "status": "ok", "items": [{"ref": "twref1.public", "payload": {"plan_token": token}}]},
-        {"schema_version": 1, "ok": True, "status": "acknowledged", "plan_token": token},
-        {"schema_version": 1, "ok": True, "status": "deferred"},
-        {"schema_version": 1, "ok": True, "status": "begun", "plan_token": token},
+        _connector_poll([item]),
+        {"schema_version": 1, "ok": True, "status": "acknowledged", "host_id": "host-public", "name": "turn-final", "ref": "twref1.public", "key": item["key"], "attempt": 1},
+        {"schema_version": 1, "ok": True, "status": "deferred", "host_id": "host-public", "name": "turn-final", "ref": "twref1.public", "key": item["key"], "attempt": 1, "available_at": "2026-08-05T12:02:00+00:00"},
+        {"schema_version": 1, "ok": True, "status": "ok", "host_id": "host-public", "name": "turn-final", "plan_token": token, "state": "preparing", "generation": 1, "part_count": 1, "accepted_parts": 0},
+        {"schema_version": 1, "ok": True, "status": "ok", "host_id": "host-public", "name": "turn-final", "plan_token": token, "ordinal": 0, "accepted_parts": 1},
+        {"schema_version": 1, "ok": True, "status": "ok", "host_id": "host-public", "name": "turn-final", "plan_token": token, "state": "active", "generation": 1, "job_count": 1},
     ]
     with _daemon(tmp_path, [_return(v) for v in responses]) as (client, calls):
         polled = client.turn_final_poll(limit=2, lease_seconds=45)
         acked = client.turn_final_ack("twref1.public", {"plan_token": token, "message_id": "private"})
         deferred = client.turn_final_defer("twref1.public", "later", delay_seconds=5)
         begun = client.connector_prepare_begin(turn_id="turn-1", content_revision="twrev1.public", presentation_version="v1", part_count=1)
+        part = client.connector_prepare_part(plan_token=token, ordinal=0, spans=[{"field": "assistant_final_text", "start_char": 0, "end_char": 4}])
+        committed = client.connector_prepare_commit(plan_token=token)
     assert polled["items"][0]["payload"]["plan_token"] == token
-    assert acked["plan_token"] == token
+    assert acked["status"] == "acknowledged"
     assert begun["plan_token"] == token
+    assert part["accepted_parts"] == 1
+    assert committed["job_count"] == 1
     assert deferred["status"] == "deferred"
-    assert [call["method"] for call in calls] == ["connector.poll", "connector.ack", "connector.defer", "connector.prepare"]
+    assert [call["method"] for call in calls] == ["connector.poll", "connector.ack", "connector.defer", "connector.prepare", "connector.prepare", "connector.prepare"]
     assert calls[1]["params"]["response"] == {"plan_token": token}
 
 
@@ -269,12 +370,11 @@ def test_ack_response_loss_is_not_retried_and_repoll_observes_authoritative_stat
     state = {"acked": False}
 
     def poll(_request: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "schema_version": 1,
-            "ok": True,
-            "status": "ok",
-            "items": [] if state["acked"] else [{"ref": "twref1.loss", "payload": {"safe": True}}],
-        }
+        response = _connector_poll(
+            [] if state["acked"] else [_connector_item("twref1.loss")]
+        )
+        response["name"] = "attention"
+        return response
 
     def lost_ack(_request: dict[str, Any]) -> None:
         state["acked"] = True
@@ -293,6 +393,53 @@ def test_prepare_rejects_invalid_ranges_and_recovery_coordinates_without_rpc(tmp
     assert client.connector_prepare_part(plan_token="twplan1.public", ordinal=0, spans=[])["status"] == "invalid_prepare_part"
     assert client.connector_prepare_part(plan_token="twplan1.public", ordinal=0, spans=[{"field": "assistant_final_text", "start_char": 2, "end_char": 1}])["status"] == "invalid_prepare_part"
     assert client.connector_prepare_recover(failed_plan_token="bad", request_id="ok")["status"] == "invalid_recovery_request"
+    assert client.connector_prepare_recover(failed_plan_token="twplan1.public", request_id="bad:id")["status"] == "invalid_recovery_request"
+
+
+def test_prepare_accepts_public_safe_recovery_request_id(tmp_path: Path) -> None:
+    response = {
+        "schema_version": 1,
+        "ok": True,
+        "status": "recovered",
+        "failed_plan_token": "twplan1.failed",
+        "plan_token": "twplan1.recovered",
+        "generation": 2,
+        "content_revision": "twrev1.public",
+        "state": "active",
+        "acknowledged_prefix_count": 0,
+        "executable_job_count": 1,
+        "retained_failed_job_count": 1,
+        "prior_attempt_count": 1,
+        "idempotent_replay": False,
+    }
+    with _daemon(tmp_path, [_return(response)]) as (client, calls):
+        result = client.connector_prepare_recover(
+            failed_plan_token="twplan1.failed",
+            request_id="recover.request-42_ok",
+        )
+    assert result["status"] == "recovered"
+    assert calls[0]["params"]["request_id"] == "recover.request-42_ok"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"ok": True, "status": "ok", "host_id": "host-public", "name": "turn-final", "items": []},
+        {"schema_version": True, "ok": True, "status": "ok", "host_id": "host-public", "name": "turn-final", "items": []},
+        {"schema_version": 1, "status": "ok", "host_id": "host-public", "name": "turn-final", "items": []},
+        {"schema_version": 1, "ok": "yes", "status": "ok", "host_id": "host-public", "name": "turn-final", "items": []},
+        {"schema_version": 1, "ok": True, "host_id": "host-public", "name": "turn-final", "items": []},
+        {"schema_version": 1, "ok": True, "status": "ok", "host_id": "host-public", "name": "turn-final"},
+        {"schema_version": 1, "ok": True, "status": "ok", "host_id": "host-public", "name": "turn-final", "items": [{"ref": "twref1.bad", "payload": {}}]},
+        {"schema_version": 1, "ok": False, "status": "invalid_params", "host_id": "host-public", "name": "turn-final", "error": {"code": "wrong", "message": "bad"}},
+    ],
+)
+def test_connector_schema_validation_rejects_malformed_envelopes(
+    tmp_path: Path, response: dict[str, Any]
+) -> None:
+    with _daemon(tmp_path, [_return(response)]) as (client, _calls):
+        result = client.turn_final_poll()
+    assert result["status"] == "invalid_connector_response"
 
 
 def test_configured_socket_and_timeout_are_bounded(monkeypatch) -> None:
