@@ -2264,6 +2264,7 @@ def test_gateway_default_suppresses_terminal_success_and_cached_replay(
     _configured_state(state_path)
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
+    monkeypatch.setenv("HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "3")
     monkeypatch.delenv("HERDRES_INBOUND_SUCCESS_ACK", raising=False)
     command_calls: list[str] = []
     working_cards: list[str] = []
@@ -2272,7 +2273,10 @@ def test_gateway_default_suppresses_terminal_success_and_cached_replay(
     class Client:
         def command_json(self, request_json):
             command_calls.append(request_json)
-            response = _accepted_command_response(json.loads(request_json))
+            request = json.loads(request_json)
+            assert request["response_schema_version"] == 3
+            response = _accepted_command_response(request)
+            response["schema_version"] = 3
             response["result"]["submission_id"] = "submission-1"
             return response
 

@@ -41,6 +41,7 @@ def test_submission_acceptance_delivers_working_card_within_three_seconds(
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "0")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "3")
     store = _store()
     worker = _source_worker(
         {
@@ -60,7 +61,9 @@ def test_submission_acceptance_delivers_working_card_within_three_seconds(
     class Client:
         def command_json(self, request_json):
             request = json.loads(request_json)
+            assert request["response_schema_version"] == 3
             accepted = _accepted_command_response(request)
+            accepted["schema_version"] = 3
             accepted["result"].update(
                 {
                     "submission_id": "twsub1.latency",
