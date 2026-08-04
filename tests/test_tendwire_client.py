@@ -931,6 +931,7 @@ def test_tendwire_child_env_strips_private_ingress_and_keeps_tendwire_overrides(
     for key, value in private.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("TENDWIRE_DB_PATH", "/public/tendwire.db")
+    monkeypatch.setenv("TENDWIRE_HERDR_BACKEND", "socket")
 
     child_env = TendwireClient()._env()
 
@@ -940,6 +941,7 @@ def test_tendwire_child_env_strips_private_ingress_and_keeps_tendwire_overrides(
     assert all(key not in child_env for key in private)
     assert "HERDRES_TENDWIRE_BIN" not in child_env
     assert "TENDWIRE_BIN" not in child_env
+    assert "TENDWIRE_HERDR_BACKEND" not in child_env
     assert all(
         "secret" not in value and "/private/" not in value
         for value in child_env.values()

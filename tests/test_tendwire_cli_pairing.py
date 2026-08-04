@@ -55,7 +55,6 @@ def _paired_env(tmp_path: Path, source: Path) -> dict[str, str]:
             "TENDWIRE_DATA_DIR": str(tmp_path / "data"),
             "TENDWIRE_DB_PATH": str(tmp_path / "tendwire.db"),
             "TENDWIRE_HOST_ID": "herdres-paired-cli",
-            "TENDWIRE_HERDR_BACKEND": "socket",
             "TENDWIRE_SOCKET_PATH": str(tmp_path / "missing-tendwire.sock"),
         }
     )
@@ -140,7 +139,6 @@ def test_herdres_client_preserves_real_exit_one_rejection_without_retry(
         "TENDWIRE_DATA_DIR",
         "TENDWIRE_DB_PATH",
         "TENDWIRE_HOST_ID",
-        "TENDWIRE_HERDR_BACKEND",
         "TENDWIRE_SOCKET_PATH",
     ):
         monkeypatch.setenv(key, env[key])
