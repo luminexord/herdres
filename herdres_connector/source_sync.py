@@ -821,6 +821,14 @@ def _operation_binding_entry(
         "tendwire_worker_id": operation.owner_generation[3],
         "tendwire_fingerprint": operation.owner_generation[4],
         "tendwire_space_id": operation.owner_generation[5],
+        # Include the local binding aliases as well.  Most callers pass this
+        # snapshot through state.bind_message_to_worker(), but post-ACK
+        # reconciliation applies it directly to an existing binding.  Keeping
+        # both views aligned prevents a reply from following a stale pane
+        # owner in a shared space topic.
+        "worker_id": operation.owner_generation[3],
+        "worker_fingerprint": operation.owner_generation[4],
+        "space_id": operation.owner_generation[5],
     }
     if operation.pane_uuid:
         entry["pane_uuid"] = operation.pane_uuid
@@ -828,6 +836,8 @@ def _operation_binding_entry(
     if operation.stable_key:
         entry["tendwire_stable_key"] = operation.stable_key
         entry["tendwire_stable_key_version"] = operation.stable_key_version
+        entry["stable_key"] = operation.stable_key
+        entry["stable_key_version"] = operation.stable_key_version
     return entry
 
 

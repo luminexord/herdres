@@ -750,6 +750,25 @@ def message_binding_stable_identity(binding: dict[str, Any]) -> tuple[str, int] 
     return stable_key, STABLE_WORKER_KEY_VERSION
 
 
+def message_binding_source_identity(
+    binding: dict[str, Any],
+) -> tuple[str, int] | None:
+    """Return the exact Tendwire source identity recorded during final ACK.
+
+    Space topics deliberately host more than one worker.  The ordinary
+    ``stable_key`` fields describe the local presentation binding and can be
+    rewritten while a durable pane identity is consolidated.  Modern final
+    delivery reconciliation additionally records the immutable ACP/Tendwire
+    source in ``tendwire_stable_key``; reply routing must prefer that owner.
+    """
+
+    stable_key = binding.get("tendwire_stable_key")
+    version = binding.get("tendwire_stable_key_version")
+    if not valid_stable_worker_key_pair(stable_key, version):
+        return None
+    return stable_key, STABLE_WORKER_KEY_VERSION
+
+
 def valid_pane_uuid(value: Any, version: Any = PANE_UUID_VERSION) -> bool:
     """Return whether a value is a canonical Herdres-owned v4 pane UUID."""
     return (
@@ -1335,6 +1354,7 @@ def _retarget_durable_bindings(
     data: dict[str, Any],
     entry: dict[str, Any],
     *,
+    previous_owners: tuple[dict[str, Any], ...],
     related_topic_ids: set[str],
     surviving_topic_id: str,
 ) -> None:
@@ -1347,6 +1367,47 @@ def _retarget_durable_bindings(
         return
     for binding in bindings.values():
         if not isinstance(binding, dict):
+            continue
+        binding_pane_uuid = message_binding_pane_uuid(binding)
+        binding_identity = message_binding_stable_identity(binding)
+        has_pane_fields = (
+            "pane_uuid" in binding or "pane_uuid_version" in binding
+        )
+        has_stable_fields = (
+            "stable_key" in binding or "stable_key_version" in binding
+        )
+        owned = False
+        for previous in previous_owners:
+            previous_pane_uuid = entry_pane_uuid(previous)
+            previous_identity = entry_continuity_identity(previous)
+            if binding_pane_uuid:
+                owned = binding_pane_uuid == previous_pane_uuid
+            elif has_pane_fields:
+                owned = False
+            elif binding_identity is not None:
+                owned = binding_identity == previous_identity
+            elif has_stable_fields:
+                owned = False
+            else:
+                owned = _binding_matches_previous_entry(
+                    binding,
+                    worker_id=str(
+                        previous.get("tendwire_worker_id")
+                        or previous.get("worker_id")
+                        or ""
+                    ),
+                    fingerprint=str(
+                        previous.get("tendwire_fingerprint") or ""
+                    ),
+                    space_id=str(
+                        previous.get("tendwire_space_id")
+                        or previous.get("space_id")
+                        or ""
+                    ),
+                )
+            if owned:
+                break
+        if not owned:
             continue
         topic_id = str(binding.get("topic_id") or "")
         if topic_id not in related_topic_ids:
@@ -1659,6 +1720,7 @@ def reconcile_durable_pane_identities(
         }
         related_topic_ids.discard("")
         surviving_topic_id = str(survivor.get("topic_id") or "")
+        previous_owners = tuple(deepcopy(entries[key]) for key in group)
 
         protected = {
             "topic_id",
@@ -1723,6 +1785,7 @@ def reconcile_durable_pane_identities(
         _retarget_durable_bindings(
             data,
             survivor,
+            previous_owners=previous_owners,
             related_topic_ids=related_topic_ids,
             surviving_topic_id=surviving_topic_id,
         )

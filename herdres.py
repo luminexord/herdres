@@ -18,7 +18,10 @@ from typing import Any, Callable
 from herdres_connector import config, decisions, doctor, speech, state
 from herdres_connector import ingress_requests
 from herdres_connector.ingress_identity import validate_request_id
-from herdres_connector.managed_bots import managed_bot_kind_for_username
+from herdres_connector.managed_bots import (
+    managed_bot_kind_for_entry,
+    managed_bot_kind_for_username,
+)
 from herdres_connector.safe import compact_ws, public_prune, sanitize_text, short_hash
 from herdres_connector.outbound_dispatcher import OutboundDispatcher
 from herdres_connector.source_sync import (
@@ -167,10 +170,21 @@ def _worker_entry_from_reply(store: dict[str, Any], payload: dict[str, Any]) -> 
     )
     if not binding or "routing_quarantined" in binding:
         return None, None
+    source_identity = state.message_binding_source_identity(binding)
+    has_source_fields = (
+        "tendwire_stable_key" in binding
+        or "tendwire_stable_key_version" in binding
+    )
     pane_uuid = state.message_binding_pane_uuid(binding)
     identity = state.message_binding_stable_identity(binding)
     has_stable_fields = "stable_key" in binding or "stable_key_version" in binding
-    if pane_uuid:
+    if source_identity is not None:
+        key, entry = state.find_worker_entry_by_stable_key(
+            store, source_identity[0]
+        )
+    elif has_source_fields:
+        return None, None
+    elif pane_uuid:
         key, entry = state.find_worker_entry_by_pane_uuid(store, pane_uuid)
     elif "pane_uuid" in binding or "pane_uuid_version" in binding:
         return None, None
@@ -188,6 +202,38 @@ def _worker_entry_from_reply(store: dict[str, Any], payload: dict[str, Any]) -> 
             return None, None
         if bound_space and bound_space != str(entry.get("tendwire_space_id") or entry.get("space_id") or ""):
             return None, None
+    binding_bot_kind = str(binding.get("bot_kind") or "").strip().lower()
+    entry_bot_kind = managed_bot_kind_for_entry(entry)
+    if (
+        source_identity is None
+        and binding_bot_kind
+        and binding_bot_kind != "manager"
+        and entry_bot_kind
+        and binding_bot_kind != entry_bot_kind
+    ):
+        # A shared-topic pane reconciliation in older releases could rewrite
+        # the local binding to the other pane.  The managed bot that authored
+        # the Telegram message is an exact per-agent witness.  Recover only
+        # when that kind names one unique worker in the same space; otherwise
+        # the ordinary fail-closed checks below reject the reply.
+        binding_space_id = str(binding.get("space_id") or "")
+        kind_matches = [
+            (candidate_key, candidate)
+            for candidate_key, candidate in state.source_worker_entries(
+                store
+            ).items()
+            if state.worker_entry_is_uniquely_routable(
+                store, candidate_key, candidate
+            )
+            and str(
+                candidate.get("tendwire_space_id")
+                or candidate.get("space_id")
+                or ""
+            )
+            == binding_space_id
+            and managed_bot_kind_for_entry(candidate) == binding_bot_kind
+        ]
+        key, entry = kind_matches[0] if len(kind_matches) == 1 else (None, None)
     if (
         key is None
         or entry is None

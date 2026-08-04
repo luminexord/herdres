@@ -6715,6 +6715,109 @@ def test_stable_reply_binding_requires_resolved_worker_topic_ownership():
         assert resolved_key == worker_key
         assert resolved_worker is worker
 
+
+def test_reply_prefers_exact_tendwire_source_over_corrupt_shared_topic_binding():
+    store = _store()
+    codex_key, codex, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "codex",
+                "name": "codex",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-codex",
+                "meta": {
+                    "agent": "codex",
+                    "stable_key": "wsk1_" + "c" * 64,
+                    "stable_key_version": 1,
+                },
+            }
+        ),
+        topic_id="77",
+    )
+    _kimi_key, kimi, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "kimi",
+                "name": "kimi",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-kimi",
+                "meta": {
+                    "agent": "kimi",
+                    "stable_key": "wsk1_" + "d" * 64,
+                    "stable_key_version": 1,
+                },
+            }
+        ),
+        topic_id="77",
+    )
+    state.bind_message_to_worker(
+        store, "500", kimi, topic_id="77", kind="final", bot_kind="codex"
+    )
+    binding = state.message_bindings(store)["500"]
+    binding["tendwire_stable_key"] = codex["tendwire_stable_key"]
+    binding["tendwire_stable_key_version"] = 1
+
+    resolved_key, resolved_worker = herdres._worker_entry_from_reply(
+        store, {"reply_to_message_id": "500", "topic_id": "77"}
+    )
+
+    assert resolved_key == codex_key
+    assert resolved_worker is codex
+
+
+def test_reply_uses_unique_authoring_bot_to_heal_legacy_shared_topic_binding():
+    store = _store()
+    codex_key, codex, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "codex",
+                "name": "codex",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-codex",
+                "meta": {
+                    "agent": "codex",
+                    "stable_key": "wsk1_" + "e" * 64,
+                    "stable_key_version": 1,
+                },
+            }
+        ),
+        topic_id="77",
+    )
+    _kimi_key, kimi, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "kimi",
+                "name": "kimi",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-kimi",
+                "meta": {
+                    "agent": "kimi",
+                    "stable_key": "wsk1_" + "f" * 64,
+                    "stable_key_version": 1,
+                },
+            }
+        ),
+        topic_id="77",
+    )
+    state.bind_message_to_worker(
+        store, "500", kimi, topic_id="77", kind="final", bot_kind="codex"
+    )
+
+    resolved_key, resolved_worker = herdres._worker_entry_from_reply(
+        store, {"reply_to_message_id": "500", "topic_id": "77"}
+    )
+
+    assert resolved_key == codex_key
+    assert resolved_worker is codex
+
 def test_stable_reply_binding_ignores_positional_worker_id_collision_on_worker_and_space_topics():
     store = _store()
     worker_key, worker, _created = _stable_reply_worker(store)
