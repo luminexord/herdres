@@ -154,10 +154,10 @@ queries Herdr.
 Tendwire store schema v14 final-ready materialization roots use exact payload
 `schema_version: 2` and repeat that same public opaque `stable_key` plus exact
 integer `stable_key_version: 1` to bind retained work to worker continuity.
-Herdres never treats these public coordinates as private checkpoint data, and a
-schema-v1 root cannot be routed by reusable worker or space IDs alone. No
-Telegram routing, credentials, message state, or private checkpoint belongs in
-the root.
+Herdres never treats these public coordinates as an exact Telegram binding or
+delivered identity, and a schema-v1 root cannot be routed by reusable worker or
+space IDs alone. No Telegram routing, credentials, message state, exact binding,
+or delivered identity belongs in the root.
 
 ## Herdres itself
 

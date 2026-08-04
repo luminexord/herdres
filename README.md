@@ -348,8 +348,8 @@ integer `stable_key_version: 1`, binding retained work to the accepted worker
 continuity identity. A schema-v1 root never routes by reusable `worker_id` or
 `space_id` alone. Root creation and retention do not depend on Herdres being
 installed, running, or available. The root contains canonical content
-descriptors and the public identity pair, never a private checkpoint, Telegram
-routing, credentials, or message state.
+descriptors and the public identity pair, never an exact Telegram binding,
+delivered identity, provider routing, credentials, or message state.
 
 After leasing a `final_ready` root, Herdres materializes the exact canonical
 content and asks Tendwire to commit neutral ordered presentation spans. Tendwire

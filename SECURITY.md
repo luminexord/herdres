@@ -3,19 +3,21 @@
 The tendwired branch keeps direct Herdr access out of Herdres.
 
 Herdres private state may contain Telegram chat/topic/message IDs, bot tokens
-and routing/ownership, ingress command request records, final message bindings,
-and stable-job checkpoints and receipts. Retain that state across restart and
-never publish it. Public JSON from Herdres commands is pruned so it does not
+and routing/ownership, ingress command request records, exact Telegram message
+bindings, delivered identities used for deduplication, and compact
+accepted-topic receipts. Retain that state across restart and never publish it.
+Public JSON from Herdres commands is pruned so it does not
 expose tokens, socket paths, raw backend targets, command stdout/stderr,
-Telegram IDs, or private checkpoints.
+Telegram IDs, exact message bindings, delivered identities, or ingress state.
 
 The connector boundary remains neutral. Herdres sends Tendwire only bounded
 canonical character ranges, Tendwire-issued stable public identities/tokens
 and job keys, leased `source_ref` values, and neutral outcome or reason codes.
 It never sends Telegram chat/topic/message IDs, bot tokens or routing, or
-provider error prose to Tendwire. Tendwire owns canonical content, durable
-final-ready roots, range validation, jobs, leases, ACK/dead-letter state, and
-retention; Herdres owns Telegram formatting and private provider state.
+provider error prose to Tendwire. Tendwire exclusively owns canonical content,
+durable final-ready roots, range validation, connector jobs, leases, attempts,
+recovery, ACK/dead-letter state, and retention. Herdres owns Telegram
+formatting and private provider state.
 
 When Herdres invokes the Tendwire CLI, it builds a child environment that keeps
 public Tendwire overrides but removes Telegram variables and private ingress,
@@ -108,19 +110,20 @@ recovery operation.
 ## Final delivery ambiguity
 
 Dead-letter inspection is bounded and public-safe, and retry selects one exact
-public `final_identity`; neither surface exposes Herdres's private checkpoint
-or Telegram routing. Provider acceptance without a recorded receipt remains
-ambiguous, so an explicit retry may duplicate a Telegram operation and must
-not be represented as provider-perfect exactly-once.
+public `final_identity`; neither surface exposes Herdres's exact Telegram
+bindings, delivered identities, or provider routing. Provider acceptance
+without an exact message binding remains ambiguous, so an explicit retry may
+duplicate a Telegram operation and must not be represented as provider-perfect
+exactly-once.
 
 The `final_ready` materialization-root payload uses exact integer
 `schema_version: 2` and carries an exact public opaque `stable_key` plus integer
 `stable_key_version: 1`. That pair binds retained work to the accepted worker
-continuity identity; it is protocol metadata, not a private checkpoint or
-secret. A schema-v1 root cannot authorize routing through reusable `worker_id`
-or `space_id` values alone. Canonical descriptors and the public identity pair
-may cross this boundary; Telegram routing, credentials, message state, and
-private checkpoints never do.
+continuity identity; it is protocol metadata, not a private Telegram binding,
+delivered identity, or secret. A schema-v1 root cannot authorize routing through
+reusable `worker_id` or `space_id` values alone. Canonical descriptors and the
+public identity pair may cross this boundary; Telegram routing, credentials,
+message state, exact bindings, and delivered identities never do.
 
 ## Stable worker handle boundary
 
@@ -176,9 +179,9 @@ binding topic directly or through its matching Tendwire source-space topic.
 
 A one-time migration can annotate only an unambiguous, live absent-identity or
 legacy-24 entry for the same compatible current valid-v1 worker. It preserves
-the existing topic, message bindings, and delivery ledgers and does not replay
-already delivered turns. Ambiguity or a failed sanity check is quarantined
-instead of being rebound.
+the existing topic, exact message bindings, and delivered identities used for
+deduplication and does not replay already delivered turns. Ambiguity or a failed
+sanity check is quarantined instead of being rebound.
 
 Normal verification:
 

@@ -208,9 +208,9 @@ The paired gate must establish all of the following:
   `schema_version: 2` and carries the exact public opaque
   `stable_key`/integer-`1` `stable_key_version` pair, binding retained work to
   the accepted worker continuity identity. A schema-v1 root never routes by
-  reusable worker or space IDs alone, and no private checkpoint or Telegram
-  state crosses in the root. A schema-v2 turn-list final remains observational
-  only and never by itself marks the final delivered.
+  reusable worker or space IDs alone, and no exact Telegram binding, delivered
+  identity, or provider state crosses in the root. A schema-v2 turn-list final
+  remains observational only and never by itself marks the final delivered.
 - Herdres leases the root, materializes exact content, and submits neutral
   ordered spans. Tendwire owns durable roots, plans, ordered jobs, leases,
   retries, and dead-letter state.
