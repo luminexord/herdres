@@ -396,7 +396,7 @@ def test_claude_structured_api_error_completes_without_pane_scrape(monkeypatch):
     assert completed["assistant_final_text"].endswith("(Asia/Hong_Kong)")
 
 
-def test_claude_internal_automation_final_does_not_replace_real_turn(tmp_path):
+def test_claude_internal_automation_continues_real_turn_without_phantom_prompt(tmp_path):
     transcript = tmp_path / "claude-internal.jsonl"
     _append_claude_event(transcript, _claude_user("prompt-1", "Please inspect this."))
     _append_claude_event(transcript, _claude_assistant("assistant-final", "Inspection complete.", final=True))
@@ -414,10 +414,38 @@ def test_claude_internal_automation_final_does_not_replace_real_turn(tmp_path):
 
     assert turn["turn_id"] == "prompt-1"
     assert turn["user_text"] == "Please inspect this."
-    assert turn["assistant_final_text"] == "Inspection complete."
+    assert turn["assistant_final_text"] == "Internal automation result."
     assert len(turn["recent_turns"]) == 1
     assert "private automation" not in encoded
-    assert "Internal automation result" not in encoded
+
+
+def test_claude_meta_skill_and_command_expansions_stay_under_owner_prompt(tmp_path):
+    transcript = tmp_path / "claude-meta.jsonl"
+    _append_claude_event(transcript, _claude_user("prompt-1", "Please implement the fix."))
+    _append_claude_event(
+        transcript,
+        _claude_assistant("assistant-progress", "Checking the implementation.", final=False),
+    )
+    skill = _claude_user("skill-1", "Base directory for this skill: /private\nSkill body")
+    skill["isMeta"] = True
+    _append_claude_event(transcript, skill)
+    command = _claude_user("command-1", "Invoke the internal rescue agent with these instructions")
+    command["isMeta"] = True
+    _append_claude_event(transcript, command)
+    _append_claude_event(
+        transcript,
+        _claude_assistant("assistant-final", "The fix is now running.", final=True),
+    )
+
+    turn = adapter.extract_claude_turn(transcript, "pane-1", "session-1")
+    encoded = json.dumps(turn)
+
+    assert turn["turn_id"] == "prompt-1"
+    assert turn["user_text"] == "Please implement the fix."
+    assert turn["assistant_final_text"] == "The fix is now running."
+    assert len(turn["recent_turns"]) == 1
+    assert "Base directory for this skill" not in encoded
+    assert "internal rescue agent" not in encoded
 
 
 def test_claude_compaction_summary_provenance_omits_prompt_but_keeps_answer(

@@ -701,6 +701,32 @@ def is_internal_claude_user_text(text: str) -> bool:
     ))
 
 
+def is_internal_claude_user_event(event: dict[str, Any], text: str) -> bool:
+    """Return whether a Claude ``user`` record is runtime-owned context.
+
+    Claude's JSONL format uses the user role for more than owner input.  Tool
+    results, skill bodies, slash-command expansions, and background task
+    notifications are all fed back to the model as user messages.  Only the
+    first kind of user record should open a Tendwire turn; the others continue
+    the owner prompt that caused them.
+
+    Prefer structured provenance over matching the rendered text.  The text
+    check remains for older Claude versions and runtime notifications that do
+    not carry a dedicated flag.
+    """
+
+    if event.get("isMeta") is True or event.get("sourceToolAssistantUUID"):
+        return True
+    msg = event.get("message") if isinstance(event.get("message"), dict) else {}
+    content = msg.get("content")
+    if isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "tool_result"
+        for block in content
+    ):
+        return True
+    return is_internal_claude_user_text(text)
+
+
 def codex_session_path(session_id: str) -> Path | None:
     base = Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
     sessions = base / "sessions"
@@ -1713,7 +1739,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     continue
                 if (
                     text
-                    and not is_internal_claude_user_text(text)
+                    and not is_internal_claude_user_event(event, text)
                     and not compact_summary
                 ):
                     # A real human prompt: it opens a new turn boundary. It also
@@ -1728,12 +1754,19 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     latest_stream_updated_at = ""
                     worklog_parts = []
                 else:
-                    # Internal (<task-notification> etc.) or empty user event. It
-                    # still marks a turn boundary, but must NOT destroy a real
-                    # prompt that has not yet been answered — otherwise the reply
-                    # to that prompt would post with an empty "You asked" block.
-                    real_prompt_armed = bool(pending_user_text) and pending_user_uuid != consumed_user_uuid
-                    if not real_prompt_armed:
+                    # Internal (<task-notification>, skill/slash-command
+                    # expansion, tool result, etc.) or empty user event. Claude
+                    # uses user-role records to continue its own work; preserve
+                    # the last real owner prompt so interim/final follow-ups edit
+                    # that one Telegram card. This applies even after an
+                    # end_turn: background completion notifications resume the
+                    # same owner turn rather than materializing a phantom prompt.
+                    if pending_user_text:
+                        incomplete_user = True
+                        pending_api_error = None
+                        latest_stream_text = ""
+                        latest_stream_updated_at = ""
+                    else:
                         pending_user_text = ""
                         pending_user_uuid = uuid
                         # Claude explicitly identifies compaction summaries by
