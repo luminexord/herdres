@@ -1792,9 +1792,6 @@ def _gateway_child(
     }
 
 
-_STABLE_TARGET_WORKERS: dict[str, str] = {}
-
-
 def _source_worker(worker, *, stable_identity=True):
     """Return a test worker with a deterministic valid identity by default."""
     result = dict(worker)
@@ -1808,10 +1805,6 @@ def _source_worker(worker, *, stable_identity=True):
         meta["stable_key"] = "wsk1_" + hashlib.sha256(material.encode()).hexdigest()
         meta["stable_key_version"] = 1
     result["meta"] = meta
-    stable_key = meta.get("stable_key")
-    worker_id = result.get("id")
-    if isinstance(stable_key, str) and isinstance(worker_id, str) and worker_id:
-        _STABLE_TARGET_WORKERS[stable_key] = worker_id
     return result
 
 
@@ -1832,11 +1825,7 @@ def _worker_target(worker_id: str, fingerprint: str) -> dict[str, str]:
 
 def _accepted_command_response(request):
     target = request.get("target", {})
-    worker_id = str(
-        target.get("worker_id")
-        or _STABLE_TARGET_WORKERS.get(str(target.get("stable_key") or ""))
-        or "worker-1"
-    )
+    worker_id = str(target.get("worker_id") or "worker-1")
     return {
         "schema_version": 2,
         "action": "send_instruction",

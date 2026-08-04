@@ -316,11 +316,9 @@ def _stable_owner_for_entry(
 
 
 def _target_for_entry(entry: dict[str, Any]) -> dict[str, str]:
-    # The installed Tendwire command contract accepts worker/fingerprint,
-    # space, and name selectors, but not stable-key selectors. Stable identity
-    # remains the separately persisted target_owner for v3 submission
-    # correlation; it must not leak into the external request until Tendwire's
-    # request contract is upgraded in lockstep.
+    # The command wire accepts worker/fingerprint or space selectors. Stable
+    # identity remains the separately persisted target_owner for v3 submission
+    # correlation and never enters the external request.
     worker_id = str(entry.get("active_worker_id") or entry.get("tendwire_worker_id") or "").strip()
     fingerprint = str(entry.get("active_worker_fingerprint") or entry.get("tendwire_fingerprint") or "").strip()
     if worker_id:
@@ -471,52 +469,6 @@ def _submit_ingress_command_record(
             state.save_state(store)
             return outcome
 
-        if (
-            record.get("target_owner") is None
-            and '"response_schema_version":3' in request_json
-        ):
-            try:
-                request = json.loads(request_json)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                request = None
-            target = request.get("target") if isinstance(request, dict) else None
-            identity = None
-            if isinstance(target, dict) and state.valid_stable_worker_key_pair(
-                target.get("stable_key"), target.get("stable_key_version")
-            ):
-                # The canonical target is the immutable routing authority. In
-                # particular, a space entry may carry only its active worker's
-                # stable identity, and the mutable worker row may disappear
-                # while Tendwire is processing the command.
-                identity = (
-                    target["stable_key"],
-                    target["stable_key_version"],
-                )
-            else:
-                worker_id = (
-                    str(target.get("worker_id") or "")
-                    if isinstance(target, dict)
-                    else ""
-                )
-                _entry_key, owner_entry = state.find_worker_entry_by_id(
-                    store, worker_id
-                )
-                identity = (
-                    state.entry_stable_identity(owner_entry)
-                    if isinstance(owner_entry, dict)
-                    else None
-                )
-            if identity is not None:
-                ingress_requests.attach_target_owner(
-                    record,
-                    identity[0],
-                    identity[1],
-                    now=now,
-                )
-                # The submission owner must survive route loss and process
-                # restart before any mutating child can start.
-                state.save_state(store)
-
         # Construct the child only after deadline/cache preflight. command_json
         # sends these exact UTF-8 bytes rather than reserializing the request.
         _ingress_timing_log(
@@ -579,28 +531,6 @@ def _submit_ingress_command_record(
             )
             submission_id = result.get("submission_id")
             if isinstance(submission_id, str) and submission_id:
-                if record.get("target_owner") is None:
-                    accepted_target = result.get("target")
-                    accepted_worker_id = (
-                        str(accepted_target.get("worker_id") or "")
-                        if isinstance(accepted_target, dict)
-                        else ""
-                    )
-                    _entry_key, accepted_entry = state.find_worker_entry_by_id(
-                        store, accepted_worker_id
-                    )
-                    accepted_identity = (
-                        state.entry_stable_identity(accepted_entry)
-                        if isinstance(accepted_entry, dict)
-                        else None
-                    )
-                    if accepted_identity is not None:
-                        ingress_requests.attach_target_owner(
-                            record,
-                            accepted_identity[0],
-                            accepted_identity[1],
-                            now=transitioned_at,
-                        )
                 try:
                     ingress_requests.attach_submission_receipt(
                         record,
@@ -1014,6 +944,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 # same fsync for durable-spool callers.
                 if not durable_spool:
                     state.save_state(store)
+            if record.get("target_owner") is None:
+                return _local_ingress_outcome(
+                    store,
+                    record,
+                    reason="missing durable target owner",
+                    reply=SAFE_SEND_FAILURE_REPLY,
+                )
         try:
             request = _command_request(entry, payload, text)
         except ValueError:

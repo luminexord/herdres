@@ -32,7 +32,6 @@ from test_source_only import (
     _accepted_command_response,
     _failed_command_response,
     _source_worker,
-    _stable_target,
     _store,
 )
 
@@ -1669,11 +1668,6 @@ def test_poison_head_quarantines_visibly_without_delaying_other_lane(
             request = json.loads(request_json)
             target = request["target"]
             worker_id = target.get("worker_id")
-            if worker_id is None:
-                worker_id = {
-                    _stable_target("worker-a", "fp-worker-a")["stable_key"]: "worker-a",
-                    _stable_target("worker-b", "fp-worker-b")["stable_key"]: "worker-b",
-                }.get(target.get("stable_key"))
             assert worker_id is not None
             backend_events.append((worker_id, time.monotonic()))
             if worker_id == "worker-a":

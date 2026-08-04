@@ -247,8 +247,9 @@ Herdres sends an exact schema-v1 `send_instruction` object containing only
 `schema_version`, `action`, `request_id`, `dry_run`, `target`, and
 `instruction`; `dry_run` is false, `instruction` contains only nonempty
 `text`, and `target` is exactly one of `{worker_id}`,
-`{worker_id, worker_fingerprint}`, `{space_id}`, `{name}`, or
-`{name, space_id}`, with nonempty string values. Tendwire's general request-ID
+`{worker_id, worker_fingerprint}`, or `{space_id}`, with nonempty string
+values. Stable owner identity is persisted separately for v3 submission
+correlation and is never a command wire selector. Tendwire's general request-ID
 grammar is `[A-Za-z0-9._-]{1,128}`; Herdres emits and locally requires its
 narrower canonical 48-character `hri1_…` form. Raw Telegram receiver, update,
 chat, topic, message, reply, and user IDs, bot tokens, private routes, and

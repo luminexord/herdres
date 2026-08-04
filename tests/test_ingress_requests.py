@@ -40,24 +40,23 @@ def _request(request_id: str = REQUEST_ID) -> dict[str, object]:
     }
 
 
-def test_canonical_request_accepts_only_exact_v1_stable_owner_target():
-    request = _request()
-    request["target"] = {
-        "stable_key": "wsk1_" + "a" * 64,
-        "stable_key_version": 1,
-    }
-
-    encoded = ingress_requests.canonical_request_json(request)
-
-    assert json.loads(encoded)["target"] == request["target"]
-    for invalid in (
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1},
         {"stable_key": "wsk1_short", "stable_key_version": 1},
         {"stable_key": "wsk1_" + "a" * 64, "stable_key_version": True},
         {"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 2},
-    ):
-        request["target"] = invalid
-        with pytest.raises(ValueError, match="exact public command"):
-            ingress_requests.canonical_request_json(request)
+        {"name": "Alpha"},
+        {"name": "Alpha", "space_id": "space-1"},
+    ],
+)
+def test_canonical_request_rejects_unsupported_wire_target(target):
+    request = _request()
+    request["target"] = target
+
+    with pytest.raises(ValueError, match="exact public command"):
+        ingress_requests.canonical_request_json(request)
 
 
 def _setup_command_state(tmp_path, monkeypatch, *, request_id: str = REQUEST_ID) -> None:
@@ -1194,15 +1193,12 @@ def test_corrupt_current_record_is_a_non_destructive_global_barrier() -> None:
     assert store[ingress_requests.RECORDS_KEY][REQUEST_ID] is corrupt_record
 
 
-def test_mismatched_stable_target_owner_blocks_dispatch_without_rewrite(
+def test_unsupported_stable_wire_target_in_durable_record_blocks_dispatch(
     tmp_path, monkeypatch
 ) -> None:
     _setup_command_state(tmp_path, monkeypatch)
     now = herdres.time.time()
     store = state.load_state()
-    entry = next(iter(state.source_worker_entries(store).values()))
-    identity = state.entry_stable_identity(entry)
-    assert identity is not None
     record, _changed = ingress_requests.ensure_request_shell(
         store,
         REQUEST_ID,
@@ -1213,13 +1209,18 @@ def test_mismatched_stable_target_owner_blocks_dispatch_without_rewrite(
     request = _request()
     request["response_schema_version"] = 3
     request["target"] = {
-        "stable_key": identity[0],
-        "stable_key_version": identity[1],
+        "stable_key": "wsk1_" + "a" * 64,
+        "stable_key_version": 1,
     }
-    ingress_requests.attach_request_json(
-        record,
-        ingress_requests.canonical_request_json(request),
-        now=now,
+    record.update(
+        request_json=json.dumps(
+            request,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        state="retryable",
+        request_phase="ready",
     )
     ingress_requests.attach_target_owner(
         record,
@@ -1232,7 +1233,7 @@ def test_mismatched_stable_target_owner_blocks_dispatch_without_rewrite(
 
     class ForbiddenClient:
         def __init__(self):
-            raise AssertionError("corrupt owner must block before dispatch")
+            raise AssertionError("unsupported target must block before dispatch")
 
     monkeypatch.setattr(herdres, "TendwireClient", ForbiddenClient)
 
@@ -1242,6 +1243,89 @@ def test_mismatched_stable_target_owner_blocks_dispatch_without_rewrite(
         herdres.command_reply(_payload())
 
     assert state.load_state() == before
+
+
+def test_v3_durable_request_without_owner_blocks_before_reconstruction_or_dispatch(
+    tmp_path, monkeypatch
+) -> None:
+    _setup_command_state(tmp_path, monkeypatch)
+    now = herdres.time.time()
+    store = state.load_state()
+    record, _changed = ingress_requests.ensure_request_shell(
+        store,
+        REQUEST_ID,
+        now=now,
+        retry_horizon=60,
+        retention=120,
+    )
+    request = _request()
+    request["response_schema_version"] = 3
+    record.update(
+        request_json=ingress_requests.canonical_request_json(request),
+        state="retryable",
+        request_phase="ready",
+    )
+    state.save_state(store)
+
+    def forbidden_reconstruction(*_args, **_kwargs):
+        raise AssertionError("v3 owner must never be reconstructed")
+
+    class ForbiddenClient:
+        def __init__(self):
+            raise AssertionError("owner-less v3 replay must not dispatch")
+
+    monkeypatch.setattr(state, "find_worker_entry_by_id", forbidden_reconstruction)
+    monkeypatch.setattr(
+        ingress_requests, "attach_target_owner", forbidden_reconstruction
+    )
+    monkeypatch.setattr(herdres, "TendwireClient", ForbiddenClient)
+
+    with pytest.raises(
+        RuntimeError, match="^ingress request record store is corrupt$"
+    ):
+        herdres.command_reply(_payload())
+
+
+def test_v3_space_without_stable_owner_fails_before_dispatch(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "space")
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "3"
+    )
+    store = _store()
+    space_key, space, _created = state.upsert_space_entry(
+        store,
+        {
+            "id": "space-1",
+            "name": "Project",
+            "status": "active",
+            "fingerprint": "space-fp",
+        },
+        topic_id="77",
+    )
+    state.save_state(store)
+    monkeypatch.setattr(
+        state,
+        "find_entry_by_thread",
+        lambda _store, _thread_id: (space_key, space),
+    )
+
+    class ForbiddenClient:
+        def __init__(self):
+            raise AssertionError("owner-less v3 space must not dispatch")
+
+    monkeypatch.setattr(herdres, "TendwireClient", ForbiddenClient)
+
+    result = herdres.command_reply(_payload())
+
+    assert result["checkpoint"] == "hold"
+    record = state.load_state()[ingress_requests.RECORDS_KEY][REQUEST_ID]
+    assert record["state"] == "quarantined"
+    assert record["target_owner"] is None
+    assert record["request_json"] is None
+    assert record["blocked_reason"] == "missing durable target owner"
 
 
 @pytest.mark.parametrize(
@@ -1503,6 +1587,42 @@ def test_v2_command_does_not_attach_submission_owner(tmp_path, monkeypatch) -> N
     assert result["transport_disposition"] == "written_to_pty"
     record = state.load_state()[ingress_requests.RECORDS_KEY][REQUEST_ID]
     assert record["target_owner"] is None
+
+
+def test_v3_missing_durable_owner_is_not_reconstructed_from_response(
+    tmp_path, monkeypatch
+) -> None:
+    _setup_command_state(tmp_path, monkeypatch)
+    monkeypatch.setenv(
+        "HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "3"
+    )
+    submission_id = "twsub1." + ("a" * 64)
+
+    class V3Client:
+        def command_json(self, request_json):
+            request = json.loads(request_json)
+            concurrent = state.load_state()
+            concurrent[ingress_requests.RECORDS_KEY][REQUEST_ID][
+                "target_owner"
+            ] = None
+            state.save_state(concurrent)
+            response = _accepted_command_response(request)
+            response["schema_version"] = 3
+            response["result"].update(
+                {"submission_id": submission_id, "turn_id": None}
+            )
+            return response
+
+    monkeypatch.setattr(herdres, "TendwireClient", V3Client)
+
+    with pytest.raises(
+        RuntimeError, match="^ingress request record store is corrupt$"
+    ):
+        herdres.command_reply(_payload())
+
+    record = state.load_state()[ingress_requests.RECORDS_KEY][REQUEST_ID]
+    assert record["target_owner"] is None
+    assert record["submission_id"] is None
 
 
 def test_v3_submission_receipt_renders_working_and_links_delta(

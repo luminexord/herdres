@@ -287,28 +287,9 @@ def test_command_serializes_only_exact_allowlisted_public_request(client_runner)
     )
 
 
-def test_command_accepts_exact_stable_owner_target(client_runner):
-    client, calls, responses = client_runner
-    responses.append({"body": _command_response()})
-    request = _command_request()
-    request["target"] = {
-        "stable_key": "wsk1_" + "a" * 64,
-        "stable_key_version": 1,
-    }
-
-    result = client.command(request)
-
-    assert result["status"] == "accepted"
-    assert json.loads(calls[0][1]["input"].decode("utf-8")) == request
-
-
 def test_command_accepts_current_tendwire_v3_acp_submission_envelope(client_runner):
     client, calls, responses = client_runner
     request = _command_request()
-    request["target"] = {
-        "stable_key": "wsk1_" + "a" * 64,
-        "stable_key_version": 1,
-    }
     request["response_schema_version"] = 3
     accepted = _accepted_result()
     accepted.update(
@@ -342,12 +323,15 @@ def test_command_rejects_unknown_accepted_submission_verdict(client_runner):
 @pytest.mark.parametrize(
     "target",
     [
+        {"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1},
         {"stable_key": "wsk1_short", "stable_key_version": 1},
         {"stable_key": "wsk1_" + "a" * 64, "stable_key_version": True},
         {"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 2},
+        {"name": "worker-public"},
+        {"name": "worker-public", "space_id": "space-public"},
     ],
 )
-def test_command_rejects_malformed_stable_owner_target(client_runner, target):
+def test_command_rejects_unsupported_wire_target(client_runner, target):
     client, calls, _responses = client_runner
     request = _command_request()
     request["target"] = target

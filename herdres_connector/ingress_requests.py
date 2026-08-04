@@ -14,7 +14,7 @@ from typing import Any
 
 from .ingress_identity import validate_request_id
 from .safe import sanitize_text
-from .state import valid_stable_worker_key_pair
+
 
 RECORDS_KEY = "tendwire_ingress_command_requests"
 RECORD_SCHEMA_VERSION = 4
@@ -132,12 +132,9 @@ _COMMAND_REQUEST_FIELDS = frozenset(
 _COMMAND_REQUEST_V3_FIELDS = _COMMAND_REQUEST_FIELDS | {"response_schema_version"}
 _COMMAND_TARGET_SHAPES = frozenset(
     {
-        frozenset({"stable_key", "stable_key_version"}),
         frozenset({"worker_id"}),
         frozenset({"worker_id", "worker_fingerprint"}),
         frozenset({"space_id"}),
-        frozenset({"name"}),
-        frozenset({"name", "space_id"}),
     }
 )
 _SUBMISSION_STATES = frozenset(
@@ -380,17 +377,14 @@ def _valid_command_request(request: Any) -> bool:
         return False
     target = request.get("target")
     instruction = request.get("instruction")
-    target_valid = False
-    if isinstance(target, dict) and frozenset(target) in _COMMAND_TARGET_SHAPES:
-        if frozenset(target) == frozenset({"stable_key", "stable_key_version"}):
-            target_valid = valid_stable_worker_key_pair(
-                target.get("stable_key"), target.get("stable_key_version")
-            )
-        else:
-            target_valid = all(
-                isinstance(value, str) and bool(value.strip())
-                for value in target.values()
-            )
+    target_valid = (
+        isinstance(target, dict)
+        and frozenset(target) in _COMMAND_TARGET_SHAPES
+        and all(
+            isinstance(value, str) and bool(value.strip())
+            for value in target.values()
+        )
+    )
     return (
         target_valid
         and isinstance(instruction, dict)
@@ -448,26 +442,6 @@ def _valid_target_owner(value: Any) -> bool:
         and type(value.get("stable_key_version")) is int
         and value["stable_key_version"] == 1
     )
-
-
-def _target_owner_matches_request(request_json: Any, target_owner: Any) -> bool:
-    """Correlate an exact stable request target with any persisted owner."""
-
-    if not isinstance(request_json, str) or target_owner is None:
-        return True
-    try:
-        request = json.loads(request_json)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return False
-    target = request.get("target") if isinstance(request, dict) else None
-    if not isinstance(target, dict) or not valid_stable_worker_key_pair(
-        target.get("stable_key"), target.get("stable_key_version")
-    ):
-        return True
-    return target_owner == {
-        "stable_key": target["stable_key"],
-        "stable_key_version": target["stable_key_version"],
-    }
 
 
 def _valid_submission_fields(record: dict[str, Any]) -> bool:
@@ -623,10 +597,13 @@ def _valid_record(record: Any, request_id: str) -> bool:
         return False
     if request_json is not None and _request_id_from_json(request_json) != request_id:
         return False
-    if not _target_owner_matches_request(
-        request_json, record.get("target_owner")
-    ):
-        return False
+    if isinstance(request_json, str):
+        request = json.loads(request_json)
+        if (
+            request.get("response_schema_version") == 3
+            and record.get("target_owner") is None
+        ):
+            return False
     if record["stale_target_refreshed"] and not isinstance(request_json, str):
         return False
     if terminal_outcome == "delivery_unknown":
