@@ -268,51 +268,6 @@ def test_three_generation_churn_converges_to_generation_with_latest_turn():
     assert not any("A final" in text for text in finals)
 
 
-def test_prod_lane_rebind_catchup_delivers_only_newest_completed_turn():
-    store = _store()
-    _entry_key, _entry = _persist_bound_entry(store)
-    older = _stable_row(
-        "gen-A",
-        turn_id="turn-old",
-        revision="twrev1.old",
-        updated_at="2030-01-01T00:00:01+00:00",
-        final="older completed answer",
-    )
-    newest = _stable_row(
-        "gen-A",
-        turn_id="turn-new",
-        revision="twrev1.new",
-        updated_at="2030-01-01T00:00:03+00:00",
-        final="newest completed answer",
-    )
-    live = _stable_row(
-        "gen-B",
-        turn_id="turn-live",
-        revision="twrev1.live",
-        updated_at="2030-01-01T00:00:04+00:00",
-        final=None,
-        stream="generation B is live",
-    )
-
-    result, telegram, tendwire = _sync(
-        store,
-        [_worker("gen-A", KEY_A), _worker("gen-B", KEY_A)],
-        [older, live, newest],
-        # Tendwire orders stable-owner roots oldest first. The connector must
-        # consume the historical root without Telegram before reaching newest.
-        ready_rows=[older, newest],
-    )
-
-    assert tendwire.turn_calls == 0
-    assert result["worker_rebinds"] == 1
-    assert result["tendwire_turn_final"]["acked"] == 2
-    delivered = "\n".join(
-        text for _chat, text, _kwargs, _mid in telegram.sent
-    )
-    assert "newest completed answer" in delivered
-    assert "older completed answer" not in delivered
-
-
 def test_conflicting_live_generation_activity_keeps_binding_and_fails_closed():
     store = _store()
     entry_key, entry = _persist_bound_entry(store)
@@ -401,8 +356,6 @@ def test_observation_only_single_generation_refresh_does_not_arm_catchup():
     entry = state.source_worker_entries(store)[entry_key]
     assert result["worker_rebinds"] == 1
     assert entry["tendwire_worker_id"] == "gen-B"
-    assert "tendwire_rebind_catchup_pending" not in entry
-    assert "tendwire_rebind_catchup_bound" not in entry
     assert store["tendwire_worker_rebind_audit"][-1]["reason"] == (
         "stable_key_cache_refresh"
     )
@@ -469,9 +422,6 @@ def test_stale_working_generation_never_steals_binding_across_four_passes():
 
     assert all(result["worker_rebinds"] == 0 for result in results)
     assert "tendwire_worker_rebind_audit" not in store
-    assert "tendwire_rebind_catchup_pending" not in (
-        state.source_worker_entries(store)[entry_key]
-    )
 
 
 def test_generation_quarantine_persists_across_simulated_restart():

@@ -64,7 +64,6 @@ def _store() -> dict:
                 "active_worker_stable_key_version": 1,
             }
         },
-        "tendwired_bootstrap_complete": True,
     }
 
 

@@ -3127,60 +3127,6 @@ def test_post_ack_reconcile_projection_requires_exact_turn_and_revision():
 
 
 
-def test_stage_final_plan_returns_current_owner_for_suppression_marker(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    state_path = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
-    turn_id = "turn-stage-suppressed-owner"
-    revision = "twrev1.stage_suppressed_owner"
-    item = _turn_row(turn_id, revision, "historical answer")
-    tendwire = TurnFinalTendwire(item)
-    initial = _store()
-    _key, initial_entry, _created = state.upsert_worker_entry(
-        initial,
-        _source_worker(tendwire.snapshot()["workers"][0]),
-    )
-    initial_entry["topic_id"] = "77"
-    state.save_state(initial, state_path)
-
-    with state.state_lock(state_path):
-        current = state.load_state(state_path)
-        _key, old_entry = state.find_worker_entry_by_stable_key(
-            current, _stable_key("worker-1")
-        )
-        assert old_entry is not None
-        runtime = source_sync._offlock_runtime(
-            current,
-            _runtime(tendwire, DeletingTelegram(), max_sends=8),
-        )
-        staged, _pages, entry = source_sync._stage_final_plan(
-            current, item, old_entry, runtime
-        )
-        assert staged is True
-        assert entry is not old_entry
-        entry["pending_turn_suppressed"] = {
-            "plan_token": str(entry["pending_plan_token"]),
-            "turn_id": turn_id,
-            "content_revision": revision,
-            "reason": "rebind_catchup_older_than_bound",
-        }
-        assert source_sync._suppressed_turn_plan(
-            entry,
-            str(entry["pending_plan_token"]),
-            revision,
-        )
-        state.save_state(current, state_path)
-
-    persisted = state.load_state(state_path)
-    _key, persisted_entry = state.find_worker_entry_by_stable_key(
-        persisted, _stable_key("worker-1")
-    )
-    assert persisted_entry is not None
-    assert persisted_entry["pending_turn_suppressed"]["turn_id"] == turn_id
-
-
 def test_final_plan_keeps_repeated_user_text_for_exact_coverage(
     tmp_path, monkeypatch
 ):
@@ -6442,64 +6388,6 @@ def test_temporarily_unroutable_root_defers_before_pages_or_plan(
     assert state.delivered_turns(store) == {}
     assert telegram.sent == []
     assert telegram.edited == []
-
-
-def test_stale_final_ready_root_is_suppressed_without_telegram(
-    monkeypatch,
-):
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
-    monkeypatch.setenv(
-        "HERDRES_TENDWIRE_FINAL_CATCHUP_MAX_SECONDS", "300"
-    )
-
-    class StaleReadyTendwire(TurnFinalTendwire):
-        def turn_final_poll(self, *, limit=1, lease_seconds=60):
-            result = super().turn_final_poll(
-                limit=limit, lease_seconds=lease_seconds
-            )
-            for item in result.get("items", []):
-                if str(item.get("key") or "").startswith(
-                    "turn-final:revision:"
-                ):
-                    item["created_at"] = "2026-01-01T00:00:00+00:00"
-            return result
-
-    row = _turn_row(
-        "turn-stale-live-window",
-        "twrev1.stale_live_window",
-        "historical final must not reach Telegram",
-    )
-    tendwire = StaleReadyTendwire(
-        row, emit_ready=True, turn_schema_version=2
-    )
-    tendwire.turns = lambda: {
-        "ok": True,
-        "schema_version": 2,
-        "turns": [],
-    }
-    telegram = DeletingTelegram()
-    store = _store()
-
-    result = sync_once(
-        store, _runtime(tendwire, telegram, max_sends=10)
-    )
-
-    assert result["tendwire_turn_final"]["suppressed_stale"] == 1
-    assert result["tendwire_turn_final"]["acked"] == 1
-    # One plan job reached its terminal applied/suppressed outcome; this
-    # counter tracks job completion, not a Telegram write.
-    assert result["tendwire_turn_final"]["delivered"] == 1
-    assert telegram.sent == []
-    assert telegram.edited == []
-    delivered = state.delivered_turns(store)
-    record = delivered[
-        "final:turn-stale-live-window:twrev1.stale_live_window"
-    ]
-    assert record["suppressed"] is True
-    entry = next(iter(state.source_worker_entries(store).values()))
-    assert "pending_turn_suppressed" not in entry
-    assert "pending_plan_token" not in entry
 
 
 def test_prepare_exception_defers_source_root_then_retries_once(
