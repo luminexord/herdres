@@ -4418,3 +4418,134 @@ def test_crash_after_binding_checkpoint_repolls_without_provider_mutation(
     ) == provider_writes
     entry = next(iter(state.source_worker_entries(persisted).values()))
     assert entry["last_clean_message_ids"] == [message_id]
+
+
+def test_committed_ack_response_loss_keeps_checkpointed_local_completion(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    row = _turn_row(
+        "turn-committed-ack-loss",
+        "twrev1.committed_ack_loss",
+        "committed before response loss",
+    )
+    tendwire = TurnFinalTendwire(row)
+    tendwire.ack_committed_response_lost_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+    checkpoints = []
+
+    first = sync_once(
+        store,
+        _runtime(
+            tendwire,
+            telegram,
+            max_sends=1,
+            checkpoint=lambda: checkpoints.append(deepcopy(store)),
+        ),
+    )
+
+    assert first["tendwire_turn_final"]["operations"] == 1
+    assert first["tendwire_turn_final"]["acked"] == 0
+    assert first["tendwire_turn_final"]["status"] == "timeout"
+    persisted = checkpoints[-1]
+    entry = next(iter(state.source_worker_entries(persisted).values()))
+    message_ids = list(entry["last_clean_message_ids"])
+    assert len(message_ids) == 1
+    assert entry["last_clean_content_revision"] == (
+        "twrev1.committed_ack_loss"
+    )
+    assert "pending_plan_token" not in entry
+    assert (
+        "final:turn-committed-ack-loss:twrev1.committed_ack_loss"
+        in state.delivered_turns(persisted)
+    )
+    provider_writes = (
+        len(telegram.sent),
+        len(telegram.edited),
+        len(telegram.deleted_messages),
+    )
+    page_calls = len(tendwire.page_calls)
+
+    resumed = sync_once(
+        persisted,
+        _runtime(tendwire, telegram, max_sends=1),
+    )
+
+    assert resumed["tendwire_turn_final"]["polled"] == 0
+    assert resumed["tendwire_turn_final"]["operations"] == 0
+    assert len(tendwire.page_calls) == page_calls
+    assert (
+        len(telegram.sent),
+        len(telegram.edited),
+        len(telegram.deleted_messages),
+    ) == provider_writes
+    entry = next(iter(state.source_worker_entries(persisted).values()))
+    assert entry["last_clean_message_ids"] == message_ids
+    assert "pending_plan_token" not in entry
+
+
+def test_multipart_prefix_ack_loss_restart_replays_binding_without_resend(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    text = ("ordered multipart answer\n\n" * 900) + "FINAL_TAIL"
+    row = _turn_row(
+        "turn-multipart-prefix",
+        "twrev1.multipart_prefix",
+        text,
+    )
+    tendwire = TurnFinalTendwire(row)
+    tendwire.ack_loss_once = True
+    telegram = DeletingTelegram()
+    store = _store()
+    checkpoints = []
+
+    first = sync_once(
+        store,
+        _runtime(
+            tendwire,
+            telegram,
+            max_sends=1,
+            checkpoint=lambda: checkpoints.append(deepcopy(store)),
+        ),
+    )
+
+    plan = tendwire._plans["twplan1.plan1"]
+    part_count = int(plan["part_count"])
+    assert part_count > 1
+    assert first["tendwire_turn_final"]["operations"] == 1
+    assert first["tendwire_turn_final"]["acked"] == 0
+    persisted = checkpoints[-1]
+    prefix = [
+        (message_id, binding)
+        for message_id, binding in state.message_bindings(
+            persisted
+        ).items()
+        if binding.get("turn_id") == row["id"]
+        and binding.get("content_revision")
+        == "twrev1.multipart_prefix"
+    ]
+    assert len(prefix) == 1
+    prefix_message_id = prefix[0][0]
+    writes_after_prefix = len(telegram.sent)
+    resumed = sync_once(
+        persisted,
+        _runtime(tendwire, telegram, max_sends=100),
+    )
+
+    assert resumed["tendwire_turn_final"]["acked"] == part_count
+    assert resumed["tendwire_turn_final"]["operations"] == part_count - 1
+    assert len(telegram.sent) == writes_after_prefix + part_count - 1
+    entry = next(iter(state.source_worker_entries(persisted).values()))
+    message_ids = entry["last_clean_message_ids"]
+    assert len(message_ids) == part_count
+    assert message_ids[0] == prefix_message_id
+    assert len(set(message_ids)) == part_count
+    assert "pending_plan_token" not in entry
+    assert (
+        "final:turn-multipart-prefix:twrev1.multipart_prefix"
+        in state.delivered_turns(persisted)
+    )

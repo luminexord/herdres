@@ -3055,6 +3055,72 @@ def test_topic_creation_checkpoints_provider_identity_before_later_sync_work(mon
     assert telegram.topics == ["Project"]
 
 
+def test_topic_create_acceptance_crash_restarts_from_compact_receipt(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    store = _store()
+    source = {
+        "id": "space-acceptance-crash",
+        "name": "Acceptance crash",
+        "status": "active",
+        "fingerprint": "space-acceptance-crash-fp",
+    }
+    _key, entry, _created = state.upsert_space_entry(store, source)
+    telegram = FakeTelegram()
+    checkpoints = []
+
+    def crash_at_first_barrier():
+        checkpoints.append(copy.deepcopy(store))
+        raise RuntimeError("crash after topic acceptance")
+
+    runtime = SyncRuntime(
+        FakeTendwire(),
+        telegram,
+        with_outbox=False,
+        checkpoint=crash_at_first_barrier,
+    )
+    with pytest.raises(
+        RuntimeError, match="crash after topic acceptance"
+    ):
+        source_sync._ensure_topic(
+            store,
+            source,
+            entry,
+            runtime,
+            chat_id="-100",
+        )
+
+    assert telegram.topics == ["Acceptance crash"]
+    persisted = checkpoints[-1]
+    assert persisted["telegram"]["accepted_created_topics"]
+    persisted_entry = next(
+        iter(state.source_space_entries(persisted).values())
+    )
+    assert not persisted_entry.get("topic_id")
+    resumed_runtime = SyncRuntime(
+        FakeTendwire(), telegram, with_outbox=False
+    )
+
+    assert source_sync._recover_accepted_created_topics(
+        persisted, resumed_runtime
+    ) == 1
+    persisted_entry = next(
+        iter(state.source_space_entries(persisted).values())
+    )
+    assert persisted_entry["topic_id"] == "77"
+    needed, created = source_sync._ensure_topic(
+        persisted,
+        source,
+        persisted_entry,
+        resumed_runtime,
+        chat_id="-100",
+    )
+    assert needed is False and created is False
+    assert telegram.topics == ["Acceptance crash"]
+    assert not persisted["telegram"].get("accepted_created_topics")
+
+
 def test_worker_topic_creation_refuses_second_topic_for_same_stable_owner(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")

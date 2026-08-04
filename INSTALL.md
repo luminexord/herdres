@@ -120,7 +120,7 @@ absent identity or a legacy 24-character lowercase hexadecimal identity are not
 independently routable. They are eligible only for one-time migration when a
 compatible current observation supplies an exact valid-v1 identity for the same
 unambiguous, live worker. The migration retains the existing Telegram topic,
-message bindings, and delivery ledgers, does not replay delivered turns, and
+message bindings, and delivered identities, does not replay delivered turns, and
 does not change `HERDRES_SOURCE_TOPIC_MODE` or any Telegram topic deletion
 policy.
 

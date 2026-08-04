@@ -23,9 +23,7 @@ from .rich_delivery import (
     TURN_DELIVERY_MAX_PARTS,
     edit_feed_item,
     edit_turn_delivery_part,
-    feed_item_requires_send_split,
     prepare_turn_delivery_parts,
-    render_feed_item_html,
     send_feed_item,
     send_turn_delivery_part,
     turn_item_from_source,
@@ -43,7 +41,6 @@ from .safe import (
 )
 from .telegram_delivery import (
     DELIVERY_FORMAT_STATE_UPDATE_KEY,
-    MESSAGE_TEXT_LIMIT,
     TOPIC_ICON_COLORS,
     RateLimited,
     TelegramClient,
@@ -3191,16 +3188,6 @@ def _canonical_final_feed_item(
     return turn_item_from_source(item, entry)
 
 
-def _changed_final_should_send_new_message(item: dict[str, Any], entry: dict[str, Any]) -> bool:
-    user_hash = _turn_user_hash(item)
-    if not user_hash:
-        return False
-    if entry.get("last_turn_id") != _turn_id(item):
-        return False
-    previous = str(entry.get("last_clean_user_hash") or "")
-    return bool(previous and previous != user_hash)
-
-
 def _working_delivery_item(item: dict[str, Any]) -> dict[str, Any]:
     if item.get("assistant_stream_text") or item.get("assistant_final_text"):
         return item
@@ -3252,18 +3239,6 @@ def _final_delivery_bindings(
     ]
 
 
-def _final_turn_delivered(store: dict[str, Any], turn_id: str) -> bool:
-    if not turn_id:
-        return False
-    prefix = f"final:{turn_id}:"
-    for identity, record in state.delivered_turns(store).items():
-        if str(identity).startswith(prefix):
-            return True
-        if isinstance(record, dict) and str(record.get("turn_id") or "") == turn_id:
-            return True
-    return False
-
-
 def _clear_open_turn_final_delivery_state(store: dict[str, Any], entry: dict[str, Any], turn_id: str) -> bool:
     """Remove stale final-delivery markers for a turn Tendwire still reports open.
 
@@ -3294,30 +3269,6 @@ def _clear_open_turn_final_delivery_state(store: dict[str, Any], entry: dict[str
     return changed
 
 
-def _repair_delivered_final_entry(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], content_hash: str) -> bool:
-    turn_id = _turn_id(item)
-    topic_id = str(entry.get("topic_id") or "")
-    final_bindings = _final_delivery_bindings(
-        store, turn_id, topic_id=topic_id
-    )
-    if not final_bindings:
-        return False
-    message_ids = [
-        message_id
-        for message_id, _binding in final_bindings
-        if message_id
-    ]
-    bot_kind = str(final_bindings[-1][1].get("bot_kind") or "")
-    return _set_final_delivery(
-        entry,
-        turn_id=turn_id,
-        content_hash=content_hash,
-        user_hash=_turn_user_hash(item),
-        message_ids=message_ids,
-        bot_kind=bot_kind or None,
-    )
-
-
 def _clear_stream_delivery_state(entry: dict[str, Any], turn_id: str) -> None:
     if entry.get("last_stream_turn_id") != turn_id:
         return
@@ -3346,247 +3297,6 @@ def _complete_submission_receipt(
             now=completed_at,
         )
     return False
-
-
-def _record_final_delivery_success(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    *,
-    thread_id: str,
-    message_ids: list[str],
-    content_hash: str,
-    identity: str,
-    bot_kind: str,
-) -> None:
-    turn_id = _turn_id(item)
-    submission_id = str(entry.get("last_stream_submission_id") or "")
-    canonical_message_id = message_ids[0] if message_ids else ""
-    for message_id in message_ids:
-        state.bind_message_to_worker(
-            store,
-            message_id,
-            entry,
-            topic_id=thread_id,
-            kind="final",
-            turn_id=turn_id,
-            bot_kind=bot_kind,
-        )
-        binding = state.find_message_binding(store, message_id)
-        if binding is not None:
-            binding["message_ids"] = list(message_ids)
-            binding["canonical_message_id"] = canonical_message_id
-    state.mark_delivered(
-        store,
-        identity,
-        {
-            "worker_id": entry.get("tendwire_worker_id"),
-            "turn_id": turn_id,
-            "message_ids": list(message_ids),
-            "canonical_message_id": canonical_message_id,
-        },
-    )
-    _set_final_delivery(
-        entry,
-        turn_id=turn_id,
-        content_hash=content_hash,
-        user_hash=_turn_user_hash(item),
-        message_ids=message_ids,
-        bot_kind=bot_kind,
-        render_version=RENDER_VERSION,
-    )
-    _record_delivery_success(entry, bot_kind)
-    if submission_id:
-        _clear_stream_delivery_keys(entry)
-    else:
-        _clear_stream_delivery_state(entry, turn_id)
-    if submission_id:
-        _complete_submission_receipt(store, submission_id)
-
-
-def _promote_working_to_final(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    thread_id: str,
-    content_hash: str,
-    identity: str,
-) -> bool:
-    turn_id = _turn_id(item)
-    stream_message_id = str(entry.get("last_stream_message_id") or "")
-    submission_id = _stream_submission_id(item, entry)
-    same_card = entry.get("last_stream_turn_id") == turn_id or bool(
-        submission_id
-        and entry.get("last_stream_submission_id") == submission_id
-    )
-    if not stream_message_id or not same_card:
-        return False
-    telegram = _telegram_state(store)
-    api_token, bot_kind = _delivery_bot(store, entry)
-    stored_bot_kind = str(entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND)
-    if stored_bot_kind != bot_kind:
-        return False
-    feed_item = _turn_feed_item(item, entry)
-    # Telegram legacy edits cannot split. If the final view is too large for a
-    # single safe edit, use the send path instead so long responses are split.
-    if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(feed_item):
-        return False
-    operation = _capture_entry_operation(
-        store,
-        entry,
-        topic_id=thread_id,
-        message_id=stream_message_id,
-        observe=("last_stream_message_id",),
-    )
-    execution = _execute_accounted_delivery_write(
-        store,
-        runtime,
-        operation,
-        _provider_mutation(
-            "telegram.edit_feed_item",
-            reason=(
-                "telegram.edit_feed_item: promote working card to final"
-            ),
-            args=(chat_id, stream_message_id, feed_item),
-            kwargs={
-                "telegram": telegram,
-                "api_token": api_token,
-                "max_physical_writes": _delivery_write_budget(
-                    runtime
-                ).remaining,
-            },
-        ),
-    )
-    sent, resolution = execution.result, execution.resolution
-    if not sent.get("ok") or resolution.disposition != _OFFLOCK_APPLY:
-        return False
-    entry = resolution.entry
-    assert entry is not None
-    edited_message_id = str(sent.get("message_id") or "").strip()
-    message_id = edited_message_id if edited_message_id and edited_message_id != "0" else stream_message_id
-    _record_final_delivery_success(
-        store,
-        item,
-        entry,
-        thread_id=thread_id,
-        message_ids=[message_id],
-        content_hash=content_hash,
-        identity=identity,
-        bot_kind=bot_kind,
-    )
-    return True
-
-
-def _replace_changed_final(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    thread_id: str,
-    content_hash: str,
-    identity: str,
-) -> bool:
-    bindings = _final_delivery_bindings(
-        store, _turn_id(item), topic_id=thread_id
-    )
-    if not bindings:
-        return False
-    api_token, bot_kind = _delivery_bot(store, entry)
-    if any(
-        str(binding.get("bot_kind") or "")
-        not in {"", bot_kind}
-        for _message_id, binding in bindings
-    ):
-        return False
-    feed_item = _turn_feed_item(item, entry)
-    try:
-        plans = _prepare_final_delivery_parts(feed_item)
-    except _TurnContentError:
-        return False
-    ordered = sorted(
-        bindings,
-        key=lambda pair: (
-            pair[1].get("part_ordinal")
-            if isinstance(pair[1].get("part_ordinal"), int)
-            else len(bindings),
-            pair[0],
-        ),
-    )
-    if len(ordered) != len(plans):
-        return False
-    message_ids: list[str] = []
-    current_entry = entry
-    for fallback_ordinal, (message_id, binding) in enumerate(ordered):
-        if _delivery_write_budget(runtime).remaining == 0:
-            return False
-        ordinal = binding.get("part_ordinal")
-        if not isinstance(ordinal, int):
-            ordinal = fallback_ordinal
-        if not 0 <= ordinal < len(plans):
-            return False
-        operation = _capture_entry_operation(
-            store,
-            current_entry,
-            topic_id=thread_id,
-            message_id=message_id,
-        )
-        execution = _execute_accounted_delivery_write(
-            store,
-            runtime,
-            operation,
-            _provider_mutation(
-                "telegram.edit_turn_delivery_part",
-                reason=(
-                    "telegram.edit_turn_delivery_part: replace "
-                    "changed final part"
-                ),
-                args=(
-                    chat_id,
-                    message_id,
-                    feed_item,
-                    plans[ordinal],
-                ),
-                kwargs={
-                    "telegram": _telegram_state(store),
-                    "api_token": api_token,
-                    "max_physical_writes": _delivery_write_budget(
-                        runtime
-                    ).remaining,
-                },
-            ),
-        )
-        sent, resolution = execution.result, execution.resolution
-        if (
-            not sent.get("ok")
-            or resolution.disposition != _OFFLOCK_APPLY
-        ):
-            return False
-        current_entry = resolution.entry
-        assert current_entry is not None
-        edited_message_id = str(
-            sent.get("message_id") or ""
-        ).strip()
-        message_ids.append(
-            edited_message_id
-            if edited_message_id and edited_message_id != "0"
-            else message_id
-        )
-    _record_final_delivery_success(
-        store,
-        item,
-        current_entry,
-        thread_id=thread_id,
-        message_ids=message_ids,
-        content_hash=content_hash,
-        identity=identity,
-        bot_kind=bot_kind,
-    )
-    return True
 
 
 _FOLD_ATTEMPT_CAP = state.RESPONSE_FOLD_ATTEMPT_CAP
@@ -9656,9 +9366,7 @@ def _apply_turn_final_lease(
             ref=ref,
             max_operations=max_operations,
         )
-    if not applied or not _ack_turn_final(
-        runtime, ref, str(lease["key"]), result
-    ):
+    if not applied:
         return False
     if payload["operation"] == "upsert" and _complete_turn_plan_from_bindings(
         store,
@@ -9669,7 +9377,9 @@ def _apply_turn_final_lease(
         part_count=part_count,
     ):
         _checkpoint_turn_job(runtime)
-    return True
+    return _ack_turn_final(
+        runtime, ref, str(lease["key"]), result
+    )
 
 
 def _drain_turn_final(
