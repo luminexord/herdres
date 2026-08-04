@@ -10,7 +10,6 @@ from typing import Any
 
 HOME = Path.home()
 DEFAULT_STATE_PATH = HOME / ".local/share/herdres/state.json"
-DEFAULT_OFFSET_PATH = HOME / ".local/share/herdres/gateway.offset"
 DEFAULT_PROCESSED_PATH = HOME / ".local/share/herdres/gateway_processed_messages.json"
 DEFAULT_TENDWIRE_DB_PATH = HOME / ".local/share/tendwire/tendwire.db"
 DEFAULT_TENDWIRE_SOCKET_PATH = HOME / ".local/share/tendwire/tendwire.sock"
@@ -42,11 +41,6 @@ def load_env_file(path: str | Path | None = None) -> None:
 def state_path(env: Any | None = None) -> Path:
     source = os.environ if env is None else env
     return Path(source.get("HERDR_TELEGRAM_TOPICS_STATE", DEFAULT_STATE_PATH)).expanduser()
-
-
-def offset_path(env: Any | None = None) -> Path:
-    source = os.environ if env is None else env
-    return Path(source.get("HERDR_TELEGRAM_TOPICS_GATEWAY_OFFSET", DEFAULT_OFFSET_PATH)).expanduser()
 
 
 def processed_path(env: Any | None = None) -> Path:
@@ -224,14 +218,6 @@ def command_response_schema_version(env: Any | None = None) -> int:
     except (TypeError, ValueError):
         return 2
     return value if value in {2, 3} else 2
-
-
-def inbound_lanes_enabled(env: Any | None = None) -> bool:
-    """Enable the durable, independently dispatched Telegram ingress lanes."""
-
-    source = os.environ if env is None else env
-    value = str(source.get("HERDRES_INBOUND_LANES", "1") or "").strip().lower()
-    return value not in {"0", "false", "no", "off"}
 
 
 def inbound_spool_path(env: Any | None = None) -> Path:

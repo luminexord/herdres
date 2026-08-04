@@ -7,10 +7,10 @@ import json
 import pytest
 
 import herdres
-from herdres_connector import source_sync, state
+from herdres_connector import state
 from herdres_connector.source_sync import SyncRuntime, _worker_entry_for_turn, sync_once
 
-from test_source_only import FakeTelegram, FakeTendwire, _store
+from test_source_only import FakeTelegram, FakeTendwire as _FakeTendwire, _store
 
 
 KEY_A = "wsk1_" + "a" * 64
@@ -18,6 +18,13 @@ KEY_B = "wsk1_" + "b" * 64
 KEY_C = "wsk1_" + "c" * 64
 LEGACY_KEY = "d" * 24
 _AUTO_VERSION = object()
+
+
+class FakeTendwire(_FakeTendwire):
+    def __init__(self, *, turns=None, **kwargs):
+        current_turns = dict(turns) if turns is not None else {"turns": []}
+        current_turns.setdefault("schema_version", 2)
+        super().__init__(turns=current_turns, **kwargs)
 
 
 def _normalize_generated_pane_uuids(value):
@@ -276,8 +283,10 @@ def test_malformed_or_unknown_pairs_are_quarantined_and_never_persisted(stable_k
 @pytest.mark.parametrize(
     "worker",
     [
-        _worker("claude-2"),
-        _worker("claude-2", "source-spoof", version=1),
+        _worker("claude-2", status="idle"),
+        _worker(
+            "claude-2", "source-spoof", version=1, status="idle"
+        ),
     ],
     ids=["missing", "malformed"],
 )
@@ -487,638 +496,7 @@ def test_exact_v1_identity_return_does_not_heal_other_quarantine_reasons():
     assert state.find_worker_entry_by_stable_key(store, KEY_A) == (None, None)
 
 
-def test_private_missing_version_planner_and_mutator_preserve_state_and_are_idempotent():
-    store = _store()
-    key, entry = _persisted_missing_version_worker(
-        store,
-        "claude-2",
-        KEY_A,
-        fingerprint="fp-old",
-        topic_id="26",
-    )
-    entry.update(
-        {
-            "last_clean_message_id": "500",
-            "last_clean_message_ids": ["500", "502"],
-            "last_turn_id": "turn-old",
-            "last_stream_message_id": "501",
-            "last_stream_turn_id": "turn-live",
-            "pinned_status_message_id": "600",
-            "managed_account_id": "claude-primary",
-            "bootstrap_placeholder": True,
-            "future_private_field": {"keep": ["exactly", 1]},
-        }
-    )
-    state.bind_message_to_worker(
-        store, "500", entry, topic_id="26", kind="final", turn_id="turn-old"
-    )
-    state.bind_message_to_worker(
-        store, "501", entry, topic_id="26", kind="working", turn_id="turn-live"
-    )
-    state.message_bindings(store)["shared-unrelated"] = {
-        "topic_id": "26",
-        "worker_id": "unrelated-worker",
-        "worker_fingerprint": "unrelated-fingerprint",
-        "space_id": "w1",
-        "kind": "final",
-        "turn_id": "unrelated-history",
-    }
-    state.mark_delivered(
-        store,
-        "final:turn-old:hash",
-        {"worker_id": "claude-2", "turn_id": "turn-old"},
-    )
-    store["tendwired_bootstrap_complete"] = True
-    ledger_before = deepcopy(state.delivered_turns(store))
-    incoming = _worker("claude-2", KEY_A, fingerprint="fp-current")
-
-    plan = state.plan_persisted_stable_key_migrations(store, [incoming])
-    assert plan.blocked_stable_keys == frozenset()
-    assert len(plan.migrations) == 1
-    assert plan.migrations[0].action == "adopt"
-    assert plan.migrations[0].candidate_key == key
-    assert plan.migrations[0].compatible_binding_ids == ("500", "501")
-    assert plan.migrations[0].quarantine_binding_ids == ()
-    adopted = state.apply_persisted_stable_key_migration_plan(
-        store, [incoming], plan
-    )
-
-    assert adopted == {id(incoming): key}
-    assert entry["topic_id"] == "26"
-    assert entry["last_clean_message_ids"] == ["500", "502"]
-    assert entry["last_stream_message_id"] == "501"
-    assert entry["pinned_status_message_id"] == "600"
-    assert entry["managed_account_id"] == "claude-primary"
-    assert entry["future_private_field"] == {"keep": ["exactly", 1]}
-    assert entry["bootstrap_placeholder"] is True
-    assert store["tendwired_bootstrap_complete"] is True
-    assert state.delivered_turns(store) == ledger_before
-    assert entry["tendwire_stable_key"] == KEY_A
-    assert entry["tendwire_stable_key_version"] == 1
-    assert entry["tendwire_fingerprint"] == "fp-current"
-    for message_id in ("500", "501"):
-        binding = state.find_message_binding(store, message_id, topic_id="26")
-        assert binding["worker_id"] == "claude-2"
-        assert binding["worker_fingerprint"] == "fp-current"
-        assert binding["space_id"] == "w1"
-        assert binding["stable_key"] == KEY_A
-        assert binding["stable_key_version"] == 1
-    unrelated = state.message_bindings(store)["shared-unrelated"]
-    assert unrelated["worker_id"] == "unrelated-worker"
-    assert "stable_key" not in unrelated
-    assert "routing_quarantined" not in unrelated
-
-    stable_snapshot = deepcopy(store)
-    repeated_plan = state.plan_persisted_stable_key_migrations(
-        store, [incoming]
-    )
-    assert repeated_plan.migrations == ()
-    assert state.apply_persisted_stable_key_migration_plan(
-        store, [incoming], repeated_plan
-    ) == {}
-    assert store == stable_snapshot
-
-
-def test_production_shaped_missing_version_migration_is_order_reload_and_delivery_safe():
-    def run(*, reverse: bool):
-        store = _store()
-        adopt_key, adoptable = _persisted_missing_version_worker(
-            store,
-            "claude-2",
-            KEY_A,
-            topic_id="26",
-            fingerprint="fp-old-a",
-        )
-        adoptable.update(
-            {
-                "pinned_status_message_id": "600",
-                "managed_account_id": "claude-primary",
-                "last_clean_message_ids": ["500"],
-                "last_stream_message_id": "501",
-                "last_stream_turn_id": "turn-working",
-                "delivery_private": {"attempt": 7, "receipt": "kept"},
-            }
-        )
-        state.bind_message_to_worker(
-            store,
-            "500",
-            adoptable,
-            topic_id="26",
-            kind="final",
-            turn_id="turn-old",
-        )
-        state.bind_message_to_worker(
-            store,
-            "501",
-            adoptable,
-            topic_id="26",
-            kind="working",
-            turn_id="turn-working",
-        )
-        state.bind_message_to_worker(
-            store,
-            "502",
-            adoptable,
-            topic_id="99",
-            kind="final",
-            turn_id="wrong-topic",
-        )
-        stale_a = deepcopy(adoptable)
-        stale_a.update(
-            {
-                "tendwire_worker_id": "stale-a",
-                "worker_id": "stale-a",
-                "tendwire_fingerprint": "fp-stale-a",
-                "topic_id": "90",
-                "tendwire_stable_key_version": "1",
-            }
-        )
-        store["panes"]["persisted:stale-a"] = stale_a
-
-        no_claimant_key, no_claimant = _persisted_missing_version_worker(
-            store,
-            "claude-3",
-            KEY_B,
-            topic_id="28",
-            fingerprint="fp-old-b",
-        )
-        collision_key, collision_a = _persisted_missing_version_worker(
-            store,
-            "claude-4",
-            KEY_C,
-            topic_id="30",
-            fingerprint="fp-old-c1",
-        )
-        collision_b = deepcopy(collision_a)
-        collision_b["tendwire_fingerprint"] = "fp-old-c2"
-        collision_b["topic_id"] = "31"
-        store["panes"]["persisted:collision-c2"] = collision_b
-        store["telegram_message_bindings"]["900"] = {
-            "topic_id": "30",
-            "worker_id": "other-worker",
-            "worker_fingerprint": "other-fingerprint",
-            "space_id": "w1",
-            "stable_key": KEY_C,
-            "kind": "final",
-            "turn_id": "conflicting-reply",
-        }
-        store["tendwired_bootstrap_complete"] = True
-        state.mark_delivered(
-            store,
-            "final:turn-old:existing",
-            {"worker_id": "claude-2", "turn_id": "turn-old"},
-        )
-        ledger_before = deepcopy(state.delivered_turns(store))
-        workers = [
-            _worker("claude-2", KEY_A, fingerprint="fp-current-a"),
-            _worker("claude-4", KEY_C, fingerprint="fp-current-c"),
-        ]
-        if reverse:
-            store["panes"] = dict(reversed(list(store["panes"].items())))
-            store["telegram_message_bindings"] = dict(
-                reversed(list(store["telegram_message_bindings"].items()))
-            )
-            workers.reverse()
-
-        plan = state.plan_persisted_stable_key_migrations(store, workers)
-        decisions = {
-            migration.stable_key: (
-                migration.action,
-                migration.reason,
-                migration.candidate_key,
-            )
-            for migration in plan.migrations
-        }
-        assert decisions == {
-            KEY_A: ("adopt", "", adopt_key),
-            KEY_B: ("wait", "no_current_claimant", None),
-            KEY_C: ("block", "multiple_persisted_candidates", None),
-        }
-        assert plan.blocked_stable_keys == frozenset({KEY_C})
-
-        turns = {"turns": []}
-        first_telegram = FakeTelegram()
-        first = sync_once(
-            store,
-            SyncRuntime(
-                FakeTendwire(workers=workers, turns=turns),
-                first_telegram,
-                with_outbox=False,
-            ),
-        )
-
-        entries = state.source_worker_entries(store)
-        migrated = entries[adopt_key]
-        assert migrated["topic_id"] == "26"
-        assert migrated["tendwire_stable_key_version"] == 1
-        assert migrated["tendwire_fingerprint"] == "fp-current-a"
-        assert migrated["pinned_status_message_id"] == "600"
-        assert migrated["managed_account_id"] == "claude-primary"
-        assert migrated["delivery_private"] == {
-            "attempt": 7,
-            "receipt": "kept",
-        }
-        assert state.entry_is_quarantined(entries["persisted:stale-a"])
-        assert "tendwire_stable_key_version" not in entries[no_claimant_key]
-        assert not state.entry_is_quarantined(entries[no_claimant_key])
-        assert state.entry_is_quarantined(entries[collision_key])
-        assert state.entry_is_quarantined(
-            entries["persisted:collision-c2"]
-        )
-        compatible_final = state.message_bindings(store)["500"]
-        compatible_working = state.message_bindings(store)["501"]
-        for binding in (compatible_final, compatible_working):
-            assert binding["worker_id"] == "claude-2"
-            assert binding["worker_fingerprint"] == "fp-current-a"
-            assert binding["stable_key"] == KEY_A
-            assert binding["stable_key_version"] == 1
-            assert "routing_quarantined" not in binding
-        assert compatible_working["kind"] == "working"
-        assert state.message_bindings(store)["502"][
-            "routing_quarantined"
-        ] is True
-        assert state.message_bindings(store)["900"][
-            "routing_quarantined"
-        ] is True
-        assert state.delivered_turns(store) == ledger_before
-        assert first["feed_sent"] == 0
-        assert first_telegram.sent == []
-        assert first_telegram.topics == []
-
-        first_bytes = json.dumps(
-            store, sort_keys=True, separators=(",", ":")
-        )
-        reloaded = json.loads(first_bytes)
-        second_telegram = FakeTelegram()
-        second = sync_once(
-            reloaded,
-            SyncRuntime(
-                FakeTendwire(workers=workers, turns=turns),
-                second_telegram,
-                with_outbox=False,
-            ),
-        )
-        second_bytes = json.dumps(
-            reloaded, sort_keys=True, separators=(",", ":")
-        )
-        assert second_bytes == first_bytes
-        assert second["feed_sent"] == 0
-        assert second_telegram.sent == []
-        assert second_telegram.topics == []
-        normalized = deepcopy(reloaded)
-        normalized.get("telegram", {}).get(
-            "forum_topic_icons", {}
-        ).pop("fetched_at", None)
-        return json.dumps(
-            _normalize_generated_pane_uuids(normalized),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-    assert run(reverse=False) == run(reverse=True)
-
-
-def test_blocked_shared_topic_migration_preserves_unrelated_binding_history():
-    store = _store()
-    _candidate_key, candidate = _persisted_missing_version_worker(
-        store,
-        "claude-2",
-        KEY_A,
-        topic_id="26",
-        fingerprint="fp-old-1",
-    )
-    duplicate = deepcopy(candidate)
-    duplicate["tendwire_fingerprint"] = "fp-old-2"
-    store["panes"]["persisted:duplicate"] = duplicate
-    bindings = state.message_bindings(store)
-    bindings["candidate-owner"] = {
-        "topic_id": "26",
-        "worker_id": "claude-2",
-        "worker_fingerprint": "fp-old-1",
-        "space_id": "w1",
-        "kind": "final",
-    }
-    bindings["current-owner"] = {
-        "topic_id": "26",
-        "worker_id": "claude-2",
-        "worker_fingerprint": "fp-current",
-        "space_id": "w1",
-        "kind": "working",
-    }
-    bindings["exact-key-owner"] = {
-        "topic_id": "99",
-        "worker_id": "unrelated-exact-key",
-        "worker_fingerprint": "fp-unrelated-exact-key",
-        "space_id": "other-space",
-        "stable_key": KEY_A,
-        "stable_key_version": 1,
-        "kind": "final",
-    }
-    unrelated_ids = []
-    for index in range(250):
-        message_id = f"shared-{index:03d}"
-        unrelated_ids.append(message_id)
-        bindings[message_id] = {
-            "topic_id": "26",
-            "worker_id": f"unrelated-worker-{index}",
-            "worker_fingerprint": f"unrelated-fingerprint-{index}",
-            "space_id": "w1",
-            "kind": "final",
-        }
-    incoming = _worker(
-        "claude-2", KEY_A, fingerprint="fp-current"
-    )
-
-    plan = state.plan_persisted_stable_key_migrations(store, [incoming])
-    assert plan.migrations[0].reason == "multiple_persisted_candidates"
-    assert plan.migrations[0].quarantine_binding_ids == (
-        "candidate-owner",
-        "current-owner",
-        "exact-key-owner",
-    )
-
-    copied = deepcopy(store)
-    binding_count = len(state.message_bindings(copied))
-    state.apply_persisted_stable_key_migration_plan(
-        copied, [incoming], plan
-    )
-
-    copied_bindings = state.message_bindings(copied)
-    assert len(copied_bindings) == binding_count
-    for message_id in unrelated_ids:
-        assert "routing_quarantined" not in copied_bindings[message_id]
-    for message_id in (
-        "candidate-owner",
-        "current-owner",
-        "exact-key-owner",
-    ):
-        assert copied_bindings[message_id]["routing_quarantined"] is True
-
-
-def test_private_migration_has_no_worker_id_fallback_and_revalidates_before_apply():
-    store = _store()
-    candidate_key, candidate = _persisted_missing_version_worker(
-        store,
-        "claude-2",
-        KEY_B,
-        topic_id="26",
-        fingerprint="fp-old",
-    )
-    incoming = _worker(
-        "claude-2", KEY_A, fingerprint="fp-current"
-    )
-
-    plan = state.plan_persisted_stable_key_migrations(store, [incoming])
-    assert plan.migrations[0].action == "wait"
-    assert state.apply_persisted_stable_key_migration_plan(
-        store, [incoming], plan
-    ) == {}
-    reservations = state.precompute_worker_entry_reservations(
-        store, [incoming]
-    )
-    assert reservations[id(incoming)] is None
-    assert "tendwire_stable_key_version" not in candidate
-
-    exact = _worker("claude-2", KEY_B, fingerprint="fp-current")
-    exact_plan = state.plan_persisted_stable_key_migrations(
-        store, [exact]
-    )
-    assert exact_plan.migrations[0].candidate_key == candidate_key
-    candidate["agent"] = "codex"
-    before = deepcopy(store)
-    assert state.apply_persisted_stable_key_migration_plan(
-        store, [exact], exact_plan
-    ) == {}
-    assert store == before
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("source", "legacy"),
-        ("entry_type", "space"),
-        ("tendwire_worker_id", "other-worker"),
-        ("worker_id", "other-worker"),
-        ("tendwire_space_id", "w2"),
-        ("space_id", "w2"),
-        ("agent", "codex"),
-        ("tendwire_raw_status", "closed"),
-        ("stable_key_quarantined", False),
-    ],
-)
-def test_private_candidate_requires_exact_live_source_worker_compatibility(
-    field, value
-):
-    store = _store()
-    _key, candidate = _persisted_missing_version_worker(
-        store,
-        "claude-2",
-        KEY_A,
-        topic_id="26",
-        fingerprint="fp-old",
-    )
-    candidate[field] = value
-    incoming = _worker("claude-2", KEY_A, fingerprint="fp-current")
-
-    plan = state.plan_persisted_stable_key_migrations(store, [incoming])
-
-    assert plan.blocked_stable_keys == frozenset({KEY_A})
-    assert plan.migrations[0].action == "block"
-    assert plan.migrations[0].reason == "incompatible_persisted_candidate"
-
-
-def test_private_candidate_requires_one_live_topic_owner_but_ignores_closed_history():
-    store = _store()
-    candidate_key, candidate = _persisted_missing_version_worker(
-        store,
-        "claude-2",
-        KEY_A,
-        topic_id="26",
-        fingerprint="fp-old",
-    )
-    closed_history = deepcopy(candidate)
-    closed_history.update(
-        {
-            "tendwire_stable_key": KEY_B,
-            "tendwire_stable_key_version": 1,
-            "tendwire_raw_status": "closed",
-        }
-    )
-    store["panes"]["closed:topic-owner"] = closed_history
-    state.message_bindings(store)["700"] = {
-        "topic_id": "26",
-        "worker_id": "claude-2",
-        "worker_fingerprint": closed_history["tendwire_fingerprint"],
-        "space_id": "w1",
-        "stable_key": KEY_B,
-        "stable_key_version": 1,
-        "kind": "final",
-        "turn_id": "closed-history",
-    }
-    state.message_bindings(store)["701"] = {
-        "topic_id": "26",
-        "worker_id": "claude-2",
-        "worker_fingerprint": "fp-old",
-        "space_id": "w1",
-        "kind": "working",
-        "turn_id": "candidate-working",
-    }
-    incoming = _worker(
-        "claude-2", KEY_A, fingerprint="fp-current"
-    )
-
-    safe = state.plan_persisted_stable_key_migrations(store, [incoming])
-    assert safe.migrations[0].action == "adopt"
-    assert safe.migrations[0].candidate_key == candidate_key
-    assert safe.migrations[0].stale_entry_keys == (
-        "closed:topic-owner",
-    )
-    assert safe.migrations[0].quarantine_binding_ids == ("700",)
-    assert safe.migrations[0].compatible_binding_ids == ("701",)
-
-    live_owner = deepcopy(closed_history)
-    live_owner["tendwire_raw_status"] = "working"
-    store["panes"]["live:topic-owner"] = live_owner
-    blocked = state.plan_persisted_stable_key_migrations(store, [incoming])
-    assert blocked.migrations[0].action == "block"
-    assert blocked.migrations[0].reason == "ambiguous_topic_owner"
-    del store["panes"]["live:topic-owner"]
-    assert state.apply_persisted_stable_key_migration_plan(
-        store, [incoming], safe
-    ) == {id(incoming): candidate_key}
-    assert state.entry_is_quarantined(closed_history)
-    assert state.message_bindings(store)["700"]["routing_quarantined"] is True
-    compatible = state.message_bindings(store)["701"]
-    assert compatible["worker_fingerprint"] == "fp-current"
-    assert compatible["stable_key"] == KEY_A
-    assert compatible["stable_key_version"] == 1
-    assert "routing_quarantined" not in compatible
-
-
-def test_private_candidate_rejects_existing_v1_owner_and_multiple_current_claimants():
-    store = _store()
-    _candidate_key, candidate = _persisted_missing_version_worker(
-        store, "claude-2", KEY_A, topic_id="26"
-    )
-    exact_owner = deepcopy(candidate)
-    exact_owner.update(
-        {
-            "tendwire_worker_id": "other-worker",
-            "worker_id": "other-worker",
-            "tendwire_fingerprint": "fp-other",
-            "topic_id": "28",
-            "tendwire_stable_key_version": 1,
-        }
-    )
-    store["panes"]["exact:v1-owner"] = exact_owner
-    incoming = _worker("claude-2", KEY_A)
-
-    exact_owner_plan = state.plan_persisted_stable_key_migrations(
-        store, [incoming]
-    )
-    assert exact_owner_plan.migrations[0].reason == "existing_exact_v1_owner"
-
-    del store["panes"]["exact:v1-owner"]
-    multiple_plan = state.plan_persisted_stable_key_migrations(
-        store,
-        [
-            incoming,
-            _worker("other-worker", KEY_A, fingerprint="fp-other"),
-        ],
-    )
-    assert multiple_plan.migrations[0].reason == "multiple_current_claimants"
-    assert multiple_plan.blocked_stable_keys == frozenset({KEY_A})
-
-
-def test_conflicting_reply_owner_blocks_and_is_quarantined_without_adoption():
-    store = _store()
-    candidate_key, candidate = _persisted_missing_version_worker(
-        store,
-        "claude-2",
-        KEY_A,
-        topic_id="26",
-        fingerprint="fp-old",
-    )
-    state.message_bindings(store)["900"] = {
-        "topic_id": "26",
-        "worker_id": "other-worker",
-        "worker_fingerprint": "fp-other",
-        "space_id": "w1",
-        "stable_key": KEY_A,
-        "kind": "final",
-    }
-    incoming = _worker("claude-2", KEY_A, fingerprint="fp-current")
-
-    plan = state.plan_persisted_stable_key_migrations(store, [incoming])
-    assert plan.migrations[0].reason == "conflicting_binding_owner"
-    assert state.apply_persisted_stable_key_migration_plan(
-        store, [incoming], plan
-    ) == {}
-
-    assert state.entry_is_quarantined(
-        state.source_worker_entries(store)[candidate_key]
-    )
-    assert "tendwire_stable_key_version" not in candidate
-    assert state.message_bindings(store)["900"]["routing_quarantined"] is True
-
-
-def test_candidate_topic_binding_with_different_exact_v1_key_blocks_adoption():
-    store = _store()
-    candidate_key, candidate = _persisted_missing_version_worker(
-        store,
-        "claude-2",
-        KEY_A,
-        topic_id="26",
-        fingerprint="fp-old",
-    )
-    state.message_bindings(store)["901"] = {
-        "topic_id": "26",
-        "worker_id": "claude-2",
-        "worker_fingerprint": "fp-old",
-        "space_id": "w1",
-        "stable_key": KEY_B,
-        "stable_key_version": 1,
-        "kind": "working",
-        "turn_id": "different-key",
-    }
-    incoming = _worker("claude-2", KEY_A, fingerprint="fp-current")
-
-    plan = state.plan_persisted_stable_key_migrations(store, [incoming])
-    assert plan.migrations[0].reason == "conflicting_binding_owner"
-    assert state.apply_persisted_stable_key_migration_plan(
-        store, [incoming], plan
-    ) == {}
-
-    assert state.entry_is_quarantined(
-        state.source_worker_entries(store)[candidate_key]
-    )
-    assert "tendwire_stable_key_version" not in candidate
-    assert state.message_bindings(store)["901"]["stable_key"] == KEY_B
-    assert state.message_bindings(store)["901"]["stable_key_version"] == 1
-    assert state.message_bindings(store)["901"]["routing_quarantined"] is True
-
-
-@pytest.mark.parametrize(
-    "persisted_version",
-    [None, "1", 2, True],
-)
-def test_only_absent_persisted_version_field_is_a_private_candidate(
-    persisted_version,
-):
-    store = _store()
-    _key, entry = _persisted_missing_version_worker(
-        store, "claude-2", KEY_A, topic_id="26"
-    )
-    entry["tendwire_stable_key_version"] = persisted_version
-    incoming = _worker("claude-2", KEY_A)
-
-    plan = state.plan_persisted_stable_key_migrations(store, [incoming])
-
-    assert plan.migrations == ()
-    assert state.worker_stable_identity(incoming) == (KEY_A, 1)
-
-
-def test_legacy_migration_requires_unambiguous_live_same_worker_and_sanity():
+def test_unsupported_persisted_identity_is_quarantined_not_adopted():
     store = _store()
     old_key, old = _persisted_legacy_worker(
         store, "claude-2", legacy_value=LEGACY_KEY, topic_id="26"
@@ -1134,32 +512,6 @@ def test_legacy_migration_requires_unambiguous_live_same_worker_and_sanity():
     assert state.entry_is_quarantined(old) is True
     assert old["topic_id"] == "26"
     assert current["tendwire_stable_key"] == KEY_A
-
-
-def test_valid_migration_and_restart_never_create_a_duplicate_topic():
-    store = _store()
-    _key, first_entry = _persisted_missing_version_worker(
-        store, "claude-2", KEY_A, topic_id="26"
-    )
-    topic_id = first_entry["topic_id"]
-
-    migration_telegram = FakeTelegram()
-    sync_once(
-        store,
-        SyncRuntime(FakeTendwire(workers=[_worker("claude-2", KEY_A)]), migration_telegram, with_outbox=False),
-    )
-    restart_telegram = FakeTelegram()
-    sync_once(
-        store,
-        SyncRuntime(FakeTendwire(workers=[_worker("claude-2-2", KEY_A)]), restart_telegram, with_outbox=False),
-    )
-
-    assert len(state.source_worker_entries(store)) == 1
-    entry = next(iter(state.source_worker_entries(store).values()))
-    assert entry["topic_id"] == topic_id
-    assert entry["tendwire_worker_id"] == "claude-2-2"
-    assert migration_telegram.topics == []
-    assert restart_telegram.topics == []
 
 
 def test_restart_repoints_all_constrained_historical_bindings_and_replies():
@@ -1200,41 +552,6 @@ def test_restart_repoints_all_constrained_historical_bindings_and_replies():
     assert store["telegram_message_bindings"]["999"]["worker_id"] == "claude-2"
 
 
-def test_restart_replays_zero_old_turns_and_preserves_ledger_and_message():
-    store = _store()
-    first_telegram = FakeTelegram()
-    first_turns = {"turns": [_final_turn("claude-2")]}
-    first = sync_once(
-        store,
-        SyncRuntime(
-            FakeTendwire(workers=[_worker("claude-2", KEY_A)], turns=first_turns),
-            first_telegram,
-            with_outbox=False,
-        ),
-    )
-    ledger_before = deepcopy(state.delivered_turns(store))
-    final_message_id = next(sent[3] for sent in first_telegram.sent if "Full final answer" in sent[1])
-
-    second_telegram = FakeTelegram()
-    second_turns = {"turns": [_final_turn("claude-2-2")]}
-    second = sync_once(
-        store,
-        SyncRuntime(
-            FakeTendwire(workers=[_worker("claude-2-2", KEY_A)], turns=second_turns),
-            second_telegram,
-            with_outbox=False,
-        ),
-    )
-
-    assert first["feed_sent"] == 1
-    assert second["feed_sent"] == 0
-    assert second_telegram.sent == []
-    assert second_telegram.topics == []
-    assert state.delivered_turns(store) == ledger_before
-    binding = state.find_message_binding(store, final_message_id)
-    assert binding["worker_id"] == "claude-2-2"
-    assert binding["stable_key"] == KEY_A
-
 
 @pytest.mark.parametrize("topic_mode", ["worker", "space"])
 def test_fresh_duplicate_key_claimants_are_all_quarantined_without_routing_or_topics(
@@ -1242,7 +559,10 @@ def test_fresh_duplicate_key_claimants_are_all_quarantined_without_routing_or_to
 ):
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", topic_mode)
     store = _store()
-    workers = [_worker("claude-2", KEY_A), _worker("claude-3", KEY_A)]
+    workers = [
+        _worker("claude-2", KEY_A, status="idle"),
+        _worker("claude-3", KEY_A, status="idle"),
+    ]
     turns = {"turns": [_final_turn("claude-2"), _final_turn("claude-3", turn_id="turn-2")]}
     first_telegram = FakeTelegram()
 
@@ -1308,104 +628,6 @@ def test_persisted_duplicate_stable_key_consolidates_to_oldest_topic():
     assert any(kwargs.get("thread_id") == "28" for _chat, _text, kwargs, _mid in telegram.sent)
 
 
-def test_duplicate_consolidation_redelivers_newest_final_to_surviving_topic_once():
-    store = _store()
-    old_key, old_owner, _created = state.upsert_worker_entry(
-        store, _worker("worker-old", KEY_B), topic_id="26"
-    )
-    newer_key, newer_owner, _created = state.upsert_worker_entry(
-        store, _worker("worker-new", KEY_C), topic_id="28"
-    )
-    for entry in (old_owner, newer_owner):
-        entry["tendwire_stable_key"] = KEY_A
-        entry["tendwire_stable_key_version"] = 1
-        entry["tendwire_last_seen_at"] = "2000-01-01T00:00:00+00:00"
-
-    old_owner.update(
-        {
-            "last_turn_id": "turn-old",
-            "last_clean_hash": "old-hash",
-            "last_clean_message_id": "500",
-            "last_clean_message_ids": ["500"],
-        }
-    )
-    state.bind_message_to_worker(
-        store,
-        "500",
-        old_owner,
-        topic_id="26",
-        kind="final",
-        turn_id="turn-old",
-    )
-    newest = _final_turn(
-        "worker-current", turn_id="turn-new", text="Newest final answer"
-    )
-    newest_hash = source_sync._turn_content_hash(newest, "final")
-    newer_owner.update(
-        {
-            "last_turn_id": "turn-new",
-            "last_clean_hash": newest_hash,
-            "last_clean_message_id": "501",
-            "last_clean_message_ids": ["501"],
-        }
-    )
-    state.bind_message_to_worker(
-        store,
-        "501",
-        newer_owner,
-        topic_id="28",
-        kind="final",
-        turn_id="turn-new",
-    )
-    identity = f"final:turn-new:{newest_hash}"
-    state.mark_delivered(
-        store, identity, {"worker_id": "worker-new", "turn_id": "turn-new"}
-    )
-    current = _worker("worker-current", KEY_A)
-
-    first_telegram = FakeTelegram()
-    first = sync_once(
-        store,
-        SyncRuntime(
-            FakeTendwire(workers=[current], turns={"turns": [newest]}),
-            first_telegram,
-            with_outbox=False,
-        ),
-    )
-
-    survivor = state.source_worker_entries(store)[old_key]
-    assert state.entry_is_retired(state.source_worker_entries(store)[newer_key])
-    assert survivor["topic_id"] == "26"
-    assert survivor["last_turn_id"] == "turn-new"
-    assert first["feed_sent"] == 1
-    final_sends = [
-        sent
-        for sent in first_telegram.sent
-        if sent[2].get("thread_id") == "26"
-        and "Newest final answer" in sent[1]
-    ]
-    assert len(final_sends) == 1
-    assert identity in state.delivered_turns(store)
-    assert {
-        binding["topic_id"]
-        for binding in state.message_bindings(store).values()
-        if binding.get("turn_id") == "turn-new"
-    } == {"26", "28"}
-
-    second_telegram = FakeTelegram()
-    second = sync_once(
-        store,
-        SyncRuntime(
-            FakeTendwire(workers=[current], turns={"turns": [newest]}),
-            second_telegram,
-            with_outbox=False,
-        ),
-    )
-    assert second["feed_sent"] == 0
-    assert not any(
-        "Newest final answer" in text
-        for _chat, text, _kwargs, _message_id in second_telegram.sent
-    )
 
 
 def test_closed_key_reuse_never_adopts_or_routes_the_closed_entry():
@@ -1710,7 +932,7 @@ def test_malformed_stored_identity_is_unroutable_everywhere(stored_key, stored_v
     ) == (None, None)
 
 
-def test_absent_and_legacy24_persisted_identities_are_migration_only():
+def test_absent_and_noncurrent_persisted_identities_are_unroutable():
     store = _store()
     absent_key, absent = _persisted_legacy_worker(
         store, "claude-2", topic_id="26"
@@ -2291,8 +1513,8 @@ def test_quarantined_exact_v1_owner_heals_after_stable_key_duplicate_consolidati
                 new_key,
                 new_owner,
             )
-            assert result["feed_sent"] == int(pass_index == 1)
-            assert len(telegram.sent) == int(pass_index == 1)
+            assert result["feed_sent"] == 0
+            assert telegram.sent == []
             if topic_mode == "worker":
                 assert new_owner["topic_id"] == "26"
                 assert telegram.topics == []
@@ -2411,7 +1633,19 @@ def test_terminal_snapshot_duplicates_are_order_and_repeat_idempotent_without_de
         )
         for status in statuses
     ]
-    turns = {"turns": [_final_turn("worker-1")]}
+    turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-identical",
+                "assistant_stream_text": "Still working",
+                "complete": False,
+            }
+            if "working" in statuses
+            else _final_turn("worker-1")
+        ]
+    }
 
     def run(observations):
         store = _store()
@@ -2457,6 +1691,7 @@ def test_missing_and_malformed_same_id_rows_have_total_slot_order_on_repeat():
     missing = _worker(
         "worker-1",
         space="space-1",
+        status="idle",
         fingerprint="fp-identical",
     )
     malformed = _worker(
@@ -2464,6 +1699,7 @@ def test_missing_and_malformed_same_id_rows_have_total_slot_order_on_repeat():
         "malformed",
         version=1,
         space="space-1",
+        status="idle",
         fingerprint="fp-identical",
     )
 
@@ -2621,7 +1857,7 @@ def test_explicit_unhealthy_herdr_snapshot_preserves_authenticated_state_until_h
     original_ledger = deepcopy(state.delivered_turns(store))
     original_topic = next(iter(original_entries.values()))["topic_id"]
 
-    assert initial["feed_sent"] == 1
+    assert initial["feed_sent"] == 0
     assert initial_telegram.topics == ["telegram-bot"]
 
     degraded_tendwire = _BackendHealthTendwire(
@@ -2709,7 +1945,12 @@ def test_explicit_unhealthy_herdr_snapshot_preserves_authenticated_state_until_h
     recovered_entries = state.source_worker_entries(store)
     assert recovered["ok"] is True
     assert recovered["feed_sent"] == 0
-    assert (recovery_tendwire.snapshot_calls, recovery_tendwire.turn_calls, recovery_tendwire.pending_calls) == (1, 1, 1)
+    assert (
+        recovery_tendwire.snapshot_calls,
+        len(recovery_tendwire.delta_calls),
+        recovery_tendwire.turn_calls,
+        recovery_tendwire.pending_calls,
+    ) == (1, 1, 0, 1)
     assert len(recovered_entries) == 1
     assert next(iter(recovered_entries.values()))["topic_id"] == original_topic
     assert next(iter(recovered_entries.values()))["tendwire_worker_id"] == "claude-2-2"
@@ -2744,5 +1985,10 @@ def test_absent_malformed_or_non_herdr_backend_health_remains_compatible(backend
 
     assert result["ok"] is True
     assert result["created"] == 2
-    assert (tendwire.snapshot_calls, tendwire.turn_calls, tendwire.pending_calls) == (1, 1, 1)
+    assert (
+        tendwire.snapshot_calls,
+        len(tendwire.delta_calls),
+        tendwire.turn_calls,
+        tendwire.pending_calls,
+    ) == (1, 1, 0, 1)
     assert telegram.topics == ["telegram-bot"]

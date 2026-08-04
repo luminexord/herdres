@@ -65,8 +65,8 @@ def test_assign_reserves_locked_names_and_numbers_around_them():
 
 
 def test_assign_dedup_is_case_insensitive():
-    # _ensure_topic's reuse match casefolds, so "Foo"/"foo" must be numbered apart here too, else they
-    # collapse into one topic. And a new pane must number around a locked topic that differs only in case.
+    # Telegram topic-name comparisons casefold, so "Foo"/"foo" must be numbered apart. A new pane
+    # must also number around a locked topic that differs only in case.
     store = {"version": 2, "spaces": {}, "panes": {}}
     got, _r, _bases = source_sync._assign_worker_topic_names(store, [_w("/root/Foo", "a"), _w("/root/foo", "b")])
     assert got["a"] == "Foo" and got["b"] == "foo 2"
@@ -110,8 +110,8 @@ def test_assign_keeps_matching_names_and_numbered_variants():
 
 
 def test_rename_candidates_old_name_stays_reserved():
-    # While a rename is pending, a NEW pane must not take the old name (it would collide into the
-    # old topic via _ensure_topic's reuse-by-name). It gets a numbered variant instead.
+    # While a rename is pending, a NEW pane must not claim the old topic's name. It gets a
+    # numbered variant instead.
     store = {"version": 2, "spaces": {}, "panes": {
         "worker:a": _wentry("a", topic_id="1", topic_name="doro"),
     }}

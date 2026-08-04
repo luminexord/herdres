@@ -630,7 +630,6 @@ def test_enqueue_constraint_failure_is_loud_and_does_not_advance_cursor(
 def test_legacy_blocked_jam_uses_block_transition_clock(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
     _enqueue(
@@ -681,7 +680,6 @@ def test_legacy_blocked_jam_uses_block_transition_clock(
 def test_legacy_fresh_processing_clock_is_unknown_not_a_long_stall(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
     _enqueue(
@@ -739,7 +737,6 @@ def test_legacy_fresh_processing_clock_is_unknown_not_a_long_stall(
 def test_legacy_fresh_retry_is_not_stalled_during_backoff(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
     _enqueue(
@@ -803,7 +800,6 @@ def test_legacy_fresh_retry_is_not_stalled_during_backoff(
 def test_successive_retries_preserve_continuous_obstruction_clock(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
     _enqueue(
@@ -879,7 +875,6 @@ def test_successive_retries_preserve_continuous_obstruction_clock(
 def test_mixed_version_retry_clock_survives_current_claim_and_retry(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
     _enqueue(
@@ -966,7 +961,6 @@ def test_mixed_version_retry_clock_survives_current_claim_and_retry(
 def test_prior_crash_startup_reclaim_preserves_retry_obstruction(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool, head_seq = _prior_crashed_retry_lane(
         tmp_path / "spool.db",
         first_update_id=70,
@@ -1021,7 +1015,6 @@ def test_prior_crash_startup_reclaim_preserves_retry_obstruction(
 def test_prior_crash_expired_reclaim_preserves_retry_obstruction(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool, head_seq = _prior_crashed_retry_lane(
         tmp_path / "spool.db",
         first_update_id=80,
@@ -1278,7 +1271,6 @@ def test_hold_terminalizes_at_bound_while_dispatch_capacity_is_busy(
 
 
 def test_stalled_lane_is_a_structured_doctor_signal(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
     started = 2_000.0
@@ -1334,7 +1326,6 @@ def test_stall_age_tracks_continuous_head_obstruction_and_clears_on_drain(
 ) -> None:
     """Old followers do not age a lane before its current head obstructs it."""
 
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
     follower_age_started = 1_000.0
@@ -1658,7 +1649,6 @@ def test_poison_head_quarantines_visibly_without_delaying_other_lane(
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     monkeypatch.setenv("HERDRES_INBOUND_SUCCESS_ACK", "1")
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     monkeypatch.setattr(config, "command_retry_horizon_seconds", lambda _env=None: 0.5)
     monkeypatch.setattr(config, "command_request_retention_seconds", lambda _env=None: 1.0)
     spool = IngressLaneSpool(tmp_path / "spool.db")
@@ -1755,7 +1745,6 @@ def test_lane_overflow_notifies_once_and_advances_cursor(tmp_path, monkeypatch) 
     spool.initialize_cursor("manager", 41)
     _enqueue(spool, _update(40, 77, "already queued"), "77")
     notices: list[tuple[str, str]] = []
-    mirrors: list[int] = []
     durable_commit_wakes = 0
     monkeypatch.setenv("HERDRES_INBOUND_LANE_DEPTH", "1")
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
@@ -1784,9 +1773,6 @@ def test_lane_overflow_notifies_once_and_advances_cursor(tmp_path, monkeypatch) 
         "_notify_lane_overflow",
         lambda _token, route, lane: notices.append((route["topic_id"], lane)),
     )
-    monkeypatch.setattr(
-        herdres_gateway, "_save_offset", lambda offset, _key: mirrors.append(offset)
-    )
 
     def wake_after_commit() -> None:
         nonlocal durable_commit_wakes
@@ -1804,7 +1790,6 @@ def test_lane_overflow_notifies_once_and_advances_cursor(tmp_path, monkeypatch) 
     assert spool.cursor("manager") == 42
     assert len(spool.rows()) == 1
     assert notices == [("77", lane_key("manager", "77"))]
-    assert mirrors == [42]
     assert durable_commit_wakes == 1
 
 
@@ -1840,7 +1825,7 @@ def test_lane_overflow_notice_uses_real_sixty_second_throttle(
     assert [topic for _chat, _message, topic in sent] == ["77", "77"]
 
 
-def test_cursor_commit_survives_failure_before_legacy_mirror(tmp_path, monkeypatch) -> None:
+def test_cursor_commit_survives_spool_reopen(tmp_path, monkeypatch) -> None:
     spool_path = tmp_path / "spool.db"
     spool = IngressLaneSpool(spool_path)
     spool.initialize_cursor("manager", 50)
@@ -1853,11 +1838,6 @@ def test_cursor_commit_survives_failure_before_legacy_mirror(tmp_path, monkeypat
         return [update] if offset == 50 else []
 
     monkeypatch.setattr(herdres_gateway, "get_updates", updates)
-    monkeypatch.setattr(
-        herdres_gateway,
-        "_save_offset",
-        lambda *_args: (_ for _ in ()).throw(OSError("simulated crash window")),
-    )
 
     herdres_gateway._poll_once_lanes(
         "manager", "token", timeout_seconds=0, request_id_key=REQUEST_ID_KEY, spool=spool
@@ -1876,24 +1856,47 @@ def test_cursor_commit_survives_failure_before_legacy_mirror(tmp_path, monkeypat
     assert len(reopened_spool.rows()) == 1
 
 
-def test_first_lane_start_migrates_legacy_receiver_cursor(tmp_path, monkeypatch) -> None:
-    base = tmp_path / "gateway.offset"
-    base.write_text("91", encoding="utf-8")
+def test_first_start_discards_history_at_telegram_newest_boundary(
+    tmp_path, monkeypatch
+) -> None:
+    requests: list[dict[str, object]] = []
+    history = [{"update_id": update_id} for update_id in range(250)]
+
+    def api(_token, method, payload):
+        requests.append({"method": method, **payload})
+        assert payload["offset"] == -1
+        return {"ok": True, "result": history[-1:]}
+
+    monkeypatch.setattr(herdres_gateway, "_api", api)
+    newest = herdres_gateway.get_updates("token", -1, timeout_seconds=0)
+    assert newest == [{"update_id": 249}]
+    assert requests == [
+        {
+            "method": "getUpdates",
+            "timeout": 0,
+            "allowed_updates": '["message","callback_query"]',
+            "offset": -1,
+        }
+    ]
+
     spool = IngressLaneSpool(tmp_path / "spool.db")
-    offsets: list[int] = []
-    monkeypatch.setattr(herdres_gateway.config, "offset_path", lambda: base)
     monkeypatch.setattr(
         herdres_gateway,
         "get_updates",
-        lambda _token, offset, *, timeout_seconds: offsets.append(offset) or [],
+        lambda _token, offset, *, timeout_seconds: (
+            newest if offset == -1 else []
+        ),
     )
-
     herdres_gateway._poll_once_lanes(
-        "manager", "token", timeout_seconds=0, request_id_key=REQUEST_ID_KEY, spool=spool
+        "manager",
+        "token",
+        timeout_seconds=0,
+        request_id_key=REQUEST_ID_KEY,
+        spool=spool,
     )
 
-    assert offsets == [91]
-    assert spool.cursor("manager") == 91
+    assert spool.cursor("manager") == 250
+    assert spool.rows() == []
 
 
 def test_unverified_ingress_cache_never_marks_refetched_update_done(
@@ -1930,7 +1933,6 @@ def test_unverified_ingress_cache_never_marks_refetched_update_done(
         "get_updates",
         lambda *_args, **_kwargs: [update],
     )
-    monkeypatch.setattr(herdres_gateway, "_save_offset", lambda *_args: None)
 
     herdres_gateway._poll_once_lanes(
         "manager", "token", timeout_seconds=0, request_id_key=REQUEST_ID_KEY, spool=spool
@@ -1940,40 +1942,6 @@ def test_unverified_ingress_cache_never_marks_refetched_update_done(
     assert len(rows) == 1
     assert rows[0]["state"] == "pending"
     assert rows[0]["notify_state"] == "pending"
-
-
-def test_feature_flag_off_uses_legacy_synchronous_path(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "0")
-    handled: list[int] = []
-    saved: list[int] = []
-    monkeypatch.setattr(herdres_gateway, "_read_offset", lambda _key: 60)
-    monkeypatch.setattr(
-        herdres_gateway,
-        "get_updates",
-        lambda *_args, **_kwargs: [_update(60, 77, "legacy")],
-    )
-    monkeypatch.setattr(
-        herdres_gateway,
-        "handle_update",
-        lambda update, *_args, **_kwargs: (
-            handled.append(update["update_id"]) or herdres_gateway.CHECKPOINT_ADVANCE
-        ),
-    )
-    monkeypatch.setattr(
-        herdres_gateway, "_save_offset", lambda offset, _key: saved.append(offset)
-    )
-    monkeypatch.setattr(
-        herdres_gateway,
-        "IngressLaneSpool",
-        lambda *_args, **_kwargs: pytest.fail("flag-off path opened the spool"),
-    )
-
-    herdres_gateway._poll_once(
-        "manager", "token", timeout_seconds=0, request_id_key=REQUEST_ID_KEY
-    )
-
-    assert handled == [60]
-    assert saved == [61]
 
 
 def _kill_stage_child(
@@ -2186,9 +2154,6 @@ def test_tendwire_submit_releases_state_lock_and_preserves_concurrent_write(
 
 
 def test_lane_configuration_defaults_and_bounds() -> None:
-    assert config.inbound_lanes_enabled({}) is True
-    assert config.inbound_lanes_enabled({"HERDRES_INBOUND_LANES": "0"}) is False
-    assert config.inbound_lanes_enabled({"HERDRES_INBOUND_LANES": "1"}) is True
     assert config.inbound_dispatch_workers({}) == 8
     assert config.inbound_dispatch_workers({"HERDRES_INBOUND_DISPATCH_WORKERS": "0"}) == 1
     assert config.inbound_lane_depth({}) == 32
@@ -2276,7 +2241,6 @@ def test_direct_command_keeps_success_reply_without_instant_ack(
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     monkeypatch.setenv("HERDRES_INBOUND_SUCCESS_ACK", "0")
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
 
     class Client:
         def command_json(self, request_json):
@@ -2433,7 +2397,6 @@ def test_production_lane_ack_order_and_terminal_reply_policy(
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
     monkeypatch.setenv("HERDRES_INBOUND_SUCCESS_ACK", success_ack)
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     spool = IngressLaneSpool(tmp_path / "spool.db")
     update_ids = {
         "busy_success": 93 if success_ack == "1" else 94,
@@ -2515,7 +2478,6 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
     _configured_state(state_path)
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
     monkeypatch.setenv("HERDRES_INBOUND_DISPATCH_WORKERS", "8")
     monkeypatch.setenv("HERDRES_INBOUND_LANE_BACKOFF_SECONDS", "2")
     monkeypatch.setattr(herdres_gateway, "LONG_POLL_SECONDS", 0)
@@ -2567,7 +2529,6 @@ def test_poll_worker_wakes_real_dispatcher_after_every_durable_commit(
             timings[hop][int(update_id)] = time.monotonic()
 
     monkeypatch.setattr(herdres_gateway, "get_updates", fake_get_updates)
-    monkeypatch.setattr(herdres_gateway, "_save_offset", lambda *_args: None)
     monkeypatch.setattr(herdres_gateway, "_timing_log", capture_timing)
     monkeypatch.setattr(
         herdres_gateway,

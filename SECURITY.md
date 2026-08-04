@@ -39,9 +39,8 @@ The canonical public form is `hri1_` followed by the 43-character unpadded
 URL-safe base64 encoding of an HMAC-SHA256 digest. Its versioned MAC scope is
 exactly the stable receiving-bot identity and Telegram `update_id`, `chat_id`,
 and `message_id`. It excludes bot tokens, text, topic/reply metadata, Telegram
-user identity, and resolved Tendwire target. Managed-bot polling offsets use
-the same stable bot kind rather than a token-derived runtime key, with the
-current legacy token-keyed offset migrated to the stable path. Token rotation
+user identity, and resolved Tendwire target. Managed-bot polling cursors use
+the same stable bot kind rather than a token-derived runtime key. Token rotation
 therefore preserves both polling position and request identity without
 disclosing raw coordinates to Tendwire. The ID is an idempotency coordinate,
 not an authentication credential; Tendwire does not receive the key and cannot

@@ -142,99 +142,6 @@ def _timing_log(
         pass
 
 
-def _legacy_offset_path_for(key: str = MANAGER_BOT_KIND) -> Path:
-    if key == MANAGER_BOT_KIND:
-        return config.offset_path()
-    safe = "".join(
-        char if char.isalnum() or char in {"-", "_"} else "_"
-        for char in str(key or "managed")
-    )
-    base = config.offset_path()
-    return base.with_name(f"{base.name}.{safe}")
-
-
-def _offset_path_for(key: str = MANAGER_BOT_KIND) -> Path:
-    receiver_kind = managed_bot_kind_for_key(key) or str(key or MANAGER_BOT_KIND)
-    return _legacy_offset_path_for(receiver_kind)
-
-
-def _read_offset_checkpoint(path: Path) -> int:
-    try:
-        raw = path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise RuntimeError("offset checkpoint could not be read") from exc
-    if not raw or re.fullmatch(r"[0-9]+", raw) is None:
-        raise RuntimeError("offset checkpoint is corrupt")
-    return int(raw)
-
-
-def _legacy_offset_paths_for_managed_kind(key: str) -> list[Path]:
-    receiver_kind = managed_bot_kind_for_key(key)
-    if not receiver_kind:
-        return []
-    base = config.offset_path()
-    prefix = f"{base.name}.managed-{receiver_kind}-"
-    try:
-        candidates = sorted(
-            (candidate for candidate in base.parent.iterdir() if candidate.name.startswith(prefix)),
-            key=lambda candidate: candidate.name,
-        )
-    except FileNotFoundError:
-        return []
-    valid_name = re.compile(
-        rf"^{re.escape(prefix)}[0-9a-f]{{12}}$"
-    )
-    if any(valid_name.fullmatch(candidate.name) is None for candidate in candidates):
-        raise RuntimeError(
-            f"legacy offset evidence is ambiguous for managed kind {receiver_kind}"
-        )
-    return candidates
-
-
-def _migrate_legacy_managed_offsets(key: str) -> int | None:
-    legacy_paths = _legacy_offset_paths_for_managed_kind(key)
-    if not legacy_paths:
-        return None
-    checkpoints = [_read_offset_checkpoint(legacy) for legacy in legacy_paths]
-    checkpoint = min(checkpoints)
-    _save_offset(checkpoint, key)
-    for legacy in legacy_paths:
-        legacy.unlink()
-    return checkpoint
-
-
-
-
-def _read_offset(key: str = MANAGER_BOT_KIND) -> int | None:
-    path = _offset_path_for(key)
-    if path.exists() or path.is_symlink():
-        return _read_offset_checkpoint(path)
-    return _migrate_legacy_managed_offsets(key)
-
-
-def _load_offset(key: str = MANAGER_BOT_KIND) -> int:
-    return _read_offset(key) or 0
-
-
-def _save_offset(offset: int, key: str = MANAGER_BOT_KIND) -> None:
-    path = _offset_path_for(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("x", encoding="utf-8") as handle:
-            handle.write(str(int(offset)))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 
 
 def _api(token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -953,28 +860,8 @@ def handle_update(
     )
 
 
-def _drain_backlog(key: str, token: str) -> int | None:
-    try:
-        updates = get_updates(token, None, timeout_seconds=0)
-    except Exception:
-        return None
-    if not updates:
-        return None
-    offset = int(updates[-1].get("update_id") or 0) + 1
-    _save_offset(offset, key)
-    log(f"drained {len(updates)} backlog update(s) for {key}")
-    return offset
-
-
 def _receiver_id_for_key(key: str) -> str:
     return managed_bot_kind_for_key(key) or key
-
-
-def _mirror_offset_best_effort(offset: int, key: str) -> None:
-    try:
-        _save_offset(offset, key)
-    except Exception as exc:  # noqa: BLE001 - SQLite cursor is authoritative in lane mode
-        log(f"legacy offset mirror failed for {key}: {sanitize_text(str(exc), 160)}")
 
 
 def _poll_once_lanes(
@@ -989,20 +876,21 @@ def _poll_once_lanes(
     receiver_kind = _receiver_id_for_key(key)
     offset = spool.cursor(receiver_kind)
     if offset is None:
-        legacy_offset = _read_offset(key)
-        if legacy_offset is None:
-            backlog = get_updates(token, None, timeout_seconds=0)
-            if backlog:
-                last_update_id = backlog[-1].get("update_id")
-                if type(last_update_id) is not int or last_update_id < 0:
-                    raise RuntimeError("backlog contains an invalid update id")
-                legacy_offset = spool.initialize_cursor(
-                    receiver_kind, last_update_id + 1
-                )
-                _mirror_offset_best_effort(legacy_offset, key)
-                log(f"drained {len(backlog)} backlog update(s) for {key}")
-            return
-        offset = spool.initialize_cursor(receiver_kind, legacy_offset)
+        # Telegram defines a negative offset as "start from the end" and
+        # forgets all preceding updates. Requesting only the newest boundary
+        # prevents an arbitrarily deep historical backlog from leaking into
+        # the first live poll.
+        backlog = get_updates(token, -1, timeout_seconds=0)
+        offset = 0
+        if backlog:
+            last_update_id = backlog[-1].get("update_id")
+            if type(last_update_id) is not int or last_update_id < 0:
+                raise RuntimeError("backlog contains an invalid update id")
+            offset = last_update_id + 1
+        offset = spool.initialize_cursor(receiver_kind, offset)
+        if backlog:
+            log(f"drained {len(backlog)} backlog update(s) for {key}")
+        return
 
     poll_started = time.monotonic()
     updates = get_updates(token, offset, timeout_seconds=timeout_seconds)
@@ -1017,7 +905,6 @@ def _poll_once_lanes(
     # Loading the multi-megabyte state once per update made polling fall behind
     # precisely when Telegram returned a burst.
     store = state.load_state()
-    mirror_offset: int | None = None
     for update in updates:
         raw_update_id = update.get("update_id")
         if type(raw_update_id) is not int or raw_update_id < 0:
@@ -1039,7 +926,6 @@ def _poll_once_lanes(
                 break
             if preview.get("action") != "spool":
                 offset = spool.advance_cursor(receiver_kind, update_id + 1)
-                mirror_offset = offset
                 continue
 
             request_id = str(preview["request_id"])
@@ -1059,7 +945,6 @@ def _poll_once_lanes(
                 already_done=_cached_ingress_terminal(store, request_id),
             )
             offset = result.next_update_id
-            mirror_offset = offset
             _timing_log(
                 "durable_enqueue_commit",
                 request_id=request_id,
@@ -1087,13 +972,6 @@ def _poll_once_lanes(
                 f"{type(exc).__name__}: {sanitize_text(str(exc), 200)}"
             )
             break
-    # SQLite is authoritative in lane mode. Mirror only the final cursor for the
-    # whole Telegram response instead of fsyncing the legacy rollback file once
-    # per update.
-    if mirror_offset is not None:
-        _mirror_offset_best_effort(mirror_offset, key)
-
-
 class _InboundLaneDispatcher:
     def __init__(
         self,
@@ -1716,45 +1594,15 @@ def _poll_once(
     spool: IngressLaneSpool | None = None,
     on_enqueue: Callable[[], None] | None = None,
 ) -> None:
-    if config.inbound_lanes_enabled():
-        lane_spool = spool if spool is not None else IngressLaneSpool()
-        _poll_once_lanes(
-            key,
-            token,
-            timeout_seconds=timeout_seconds,
-            request_id_key=request_id_key,
-            spool=lane_spool,
-            on_enqueue=on_enqueue,
-        )
-        return
-    offset = _read_offset(key)
-    if offset is None:
-        offset = _drain_backlog(key, token)
-        if offset is not None:
-            return
-    for update in get_updates(token, offset, timeout_seconds=timeout_seconds):
-        raw_update_id = update.get("update_id")
-        if type(raw_update_id) is not int or raw_update_id < 0:
-            log(f"invalid update id for {key}; offset retained")
-            break
-        update_id = raw_update_id
-        try:
-            checkpoint = handle_update(
-                update,
-                token,
-                receiver_id=_receiver_id_for_key(key),
-                request_id_key=request_id_key,
-                bot_key=key,
-            )
-        except Exception as exc:  # noqa: BLE001 - redelivery keeps the same opaque request identity
-            log(f"update {update_id} failed for {key}: {type(exc).__name__}: {sanitize_text(str(exc), 200)}")
-            break
-        if checkpoint != CHECKPOINT_ADVANCE:
-            log(f"update {update_id} retained for {key}: {checkpoint}")
-            break
-        if offset is None or update_id >= offset:
-            offset = update_id + 1
-            _save_offset(offset, key)
+    lane_spool = spool if spool is not None else IngressLaneSpool()
+    _poll_once_lanes(
+        key,
+        token,
+        timeout_seconds=timeout_seconds,
+        request_id_key=request_id_key,
+        spool=lane_spool,
+        on_enqueue=on_enqueue,
+    )
 
 
 def _poll_worker(
@@ -1857,13 +1705,8 @@ def run() -> int:
     except RuntimeError:
         log("Herdres request identity key is missing or unsafe")
         return 1
-    lanes_enabled = config.inbound_lanes_enabled()
-    spool = IngressLaneSpool() if lanes_enabled else None
-    dispatcher = (
-        _InboundLaneDispatcher(spool, request_id_key)
-        if spool is not None
-        else None
-    )
+    spool = IngressLaneSpool()
+    dispatcher = _InboundLaneDispatcher(spool, request_id_key)
     workers: dict[str, dict[str, Any]] = {}
     log("started")
     while True:

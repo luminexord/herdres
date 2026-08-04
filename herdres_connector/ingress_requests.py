@@ -18,8 +18,6 @@ from .state import valid_stable_worker_key_pair
 
 RECORDS_KEY = "tendwire_ingress_command_requests"
 RECORD_SCHEMA_VERSION = 4
-PREVIOUS_RECORD_SCHEMA_VERSION = 3
-LEGACY_RECORD_SCHEMA_VERSION = 2
 CHILD_SCHEMA_VERSION = 2
 RECORD_STATES = frozenset({"resolving", "retryable", "terminal", "quarantined"})
 TRANSPORT_DISPOSITIONS = frozenset(
@@ -39,9 +37,6 @@ TRANSPORT_DISPOSITIONS = frozenset(
 )
 PERSISTED_TRANSPORT_DISPOSITIONS = TRANSPORT_DISPOSITIONS - {"terminal_accepted"}
 RETRYABLE_DISPOSITIONS = frozenset({"no_receipt", "in_progress"})
-_LEGACY_TERMINAL_DISPOSITIONS = frozenset(
-    {"terminal_accepted", "terminal_rejected"}
-)
 REQUEST_PHASES = frozenset(
     {
         "resolving",
@@ -85,10 +80,6 @@ TERMINAL_OUTCOME_PHASES = {
         {"accepted_unverified", "queued", "terminal"}
     ),
 }
-# Public response validation still consumes Tendwire's legacy spelling. Records
-# never persist it: ``terminal_accepted`` is normalized to Herdr's
-# ``written_to_pty`` transport verdict at the reduction boundary.
-DISPOSITIONS = TRANSPORT_DISPOSITIONS
 QUARANTINE_REPLY = "Could not send safely. Refresh status and choose the target again."
 _CORRUPT_RECORDS_ERROR = "ingress request record store is corrupt"
 
@@ -123,27 +114,6 @@ _RECORD_FIELDS = frozenset(
         "linked_at",
     }
 )
-_V3_RECORD_FIELDS = (
-    _RECORD_FIELDS
-    - {
-        "transport_disposition",
-        "request_phase",
-        "terminal_outcome",
-        "checkpoint_already_advanced",
-        "operator_attention_required",
-        "blocked_reason",
-        "next_action",
-        "dedup_witness",
-    }
-) | {"last_disposition"}
-_V2_RECORD_FIELDS = _V3_RECORD_FIELDS - {
-    "submission_id",
-    "submission_state",
-    "turn_id",
-    "target_owner",
-    "submitted_at",
-    "linked_at",
-}
 _CHILD_FIELDS = frozenset(
     {
         "schema_version",
@@ -156,10 +126,6 @@ _CHILD_FIELDS = frozenset(
         "reply",
     }
 )
-_LEGACY_RECORD_FIELDS = frozenset(
-    {"request", "created_at", "updated_at", "last_status", "terminal_at"}
-)
-_LEGACY_REQUIRED_FIELDS = frozenset({"request", "created_at", "updated_at"})
 _COMMAND_REQUEST_FIELDS = frozenset(
     {"schema_version", "action", "request_id", "dry_run", "target", "instruction"}
 )
@@ -547,35 +513,6 @@ def _valid_submission_fields(record: dict[str, Any]) -> bool:
     )
 
 
-def _valid_legacy_child(value: Any, request_id: str) -> bool:
-    fields = frozenset(
-        {
-            "schema_version",
-            "handled",
-            "request_id",
-            "checkpoint",
-            "disposition",
-            "reply",
-        }
-    )
-    return (
-        isinstance(value, dict)
-        and frozenset(value) == fields
-        and value.get("schema_version") == 1
-        and type(value.get("handled")) is bool
-        and value.get("request_id") == request_id
-        and value.get("checkpoint") == "advance"
-        and value.get("disposition")
-        in {"terminal_accepted", "terminal_rejected", "terminal_uncertain", None}
-        and isinstance(value.get("reply"), str)
-        and value["reply"] == _fixed_reply(value["reply"])
-        and not (
-            value["handled"] is False
-            and (value["disposition"] is not None or value["reply"])
-        )
-    )
-
-
 def _valid_dedup_witness(value: Any) -> bool:
     if value is None:
         return True
@@ -629,101 +566,6 @@ def _valid_dedup_witness(value: Any) -> bool:
         and comparison == "different"
     )
     return not value["automatic_replay_authorized"] or expected_authorization
-
-
-def _valid_legacy_record_version(
-    record: Any,
-    request_id: str,
-    *,
-    schema_version: int,
-    fields: frozenset[str],
-) -> bool:
-    if not isinstance(record, dict) or frozenset(record) != fields:
-        return False
-    created_at = _timestamp(record.get("created_at"))
-    updated_at = _timestamp(record.get("updated_at"))
-    deadline_at = _timestamp(record.get("deadline_at"))
-    retain_until = _timestamp(record.get("retain_until"))
-    state = record.get("state")
-    request_json = record.get("request_json")
-    last_disposition = record.get("last_disposition")
-    terminal_at = record.get("terminal_at")
-    quarantined_at = record.get("quarantined_at")
-    outcome = record.get("outcome")
-    if (
-        record.get("schema_version") != schema_version
-        or record.get("request_id") != request_id
-        or created_at is None
-        or updated_at is None
-        or deadline_at is None
-        or retain_until is None
-        or not created_at <= updated_at
-        or not created_at < deadline_at < retain_until
-        or state not in RECORD_STATES
-        or last_disposition not in DISPOSITIONS | {None}
-        or type(record.get("stale_target_refreshed")) is not bool
-    ):
-        return False
-    if request_json is not None and _request_id_from_json(request_json) != request_id:
-        return False
-    if not _target_owner_matches_request(
-        request_json, record.get("target_owner")
-    ):
-        return False
-    if schema_version == PREVIOUS_RECORD_SCHEMA_VERSION and not _valid_submission_fields(record):
-        return False
-    if record["stale_target_refreshed"] and not isinstance(request_json, str):
-        return False
-    if state == "resolving":
-        return (
-            request_json is None
-            and updated_at == created_at
-            and last_disposition is None
-            and record["stale_target_refreshed"] is False
-            and terminal_at is None
-            and quarantined_at is None
-            and record.get("quarantine_reason") is None
-            and outcome is None
-        )
-    if state == "retryable":
-        return (
-            isinstance(request_json, str)
-            and last_disposition in RETRYABLE_DISPOSITIONS | {None}
-            and terminal_at is None
-            and quarantined_at is None
-            and record.get("quarantine_reason") is None
-            and outcome is None
-        )
-    if state == "terminal":
-        terminal_timestamp = _timestamp(terminal_at)
-        return (
-            isinstance(request_json, str)
-            and last_disposition in _LEGACY_TERMINAL_DISPOSITIONS
-            and terminal_timestamp is not None
-            and terminal_timestamp <= updated_at
-            and (
-                schema_version == PREVIOUS_RECORD_SCHEMA_VERSION
-                or terminal_timestamp == updated_at
-            )
-            and quarantined_at is None
-            and record.get("quarantine_reason") is None
-            and _valid_legacy_child(outcome, request_id)
-            and outcome.get("disposition") == last_disposition
-        )
-    quarantine_timestamp = _timestamp(quarantined_at)
-    return (
-        last_disposition in {"terminal_uncertain", None}
-        and (
-            last_disposition is None
-            or isinstance(request_json, str)
-        )
-        and terminal_at is None
-        and quarantine_timestamp == updated_at
-        and isinstance(record.get("quarantine_reason"), str)
-        and bool(record["quarantine_reason"])
-        and _valid_legacy_child(outcome, request_id)
-        and outcome.get("disposition") == last_disposition
-    )
 
 
 def _valid_record(record: Any, request_id: str) -> bool:
@@ -861,24 +703,6 @@ def _valid_record(record: Any, request_id: str) -> bool:
     )
 
 
-def _valid_v3_record(record: Any, request_id: str) -> bool:
-    return _valid_legacy_record_version(
-        record,
-        request_id,
-        schema_version=PREVIOUS_RECORD_SCHEMA_VERSION,
-        fields=_V3_RECORD_FIELDS,
-    )
-
-
-def _valid_v2_record(record: Any, request_id: str) -> bool:
-    return _valid_legacy_record_version(
-        record,
-        request_id,
-        schema_version=LEGACY_RECORD_SCHEMA_VERSION,
-        fields=_V2_RECORD_FIELDS,
-    )
-
-
 def _new_record(
     request_id: str,
     *,
@@ -929,215 +753,8 @@ def _new_record(
     }
 
 
-def _migrate_v2_to_v3(value: Any, request_id: str) -> dict[str, Any] | None:
-    if not _valid_v2_record(value, request_id):
-        return None
-    migrated = copy.deepcopy(value)
-    migrated.update(
-        {
-            "schema_version": PREVIOUS_RECORD_SCHEMA_VERSION,
-            "submission_id": None,
-            "submission_state": None,
-            "turn_id": None,
-            "target_owner": None,
-            "submitted_at": None,
-            "linked_at": None,
-        }
-    )
-    return migrated if _valid_v3_record(migrated, request_id) else None
-
-
-def _historical_outcome(
-    old_disposition: Any,
-    *,
-    linked_submission: bool,
-) -> tuple[str | None, str, str, str | None]:
-    """Map v3 history according to its retained authoritative evidence."""
-
-    if old_disposition == "terminal_accepted":
-        if linked_submission:
-            return (
-                "submitted",
-                "terminal",
-                "delivered",
-                None,
-            )
-        return (
-            "written_to_pty",
-            "accepted_unverified",
-            "delivery_unknown",
-            "historical_terminal_accepted_unverified",
-        )
-    if old_disposition == "terminal_rejected":
-        return (
-            "terminal_rejected",
-            "terminal",
-            "not_delivered",
-            "historical_provider_rejection",
-        )
-    return (
-        normalize_transport_disposition(old_disposition),
-        "terminal",
-        "delivery_unknown",
-        "historical_delivery_truth_unrecoverable",
-    )
-
-
-def _migrate_v3_record(value: Any, request_id: str) -> dict[str, Any] | None:
-    if not _valid_v3_record(value, request_id):
-        return None
-    migrated = copy.deepcopy(value)
-    old_disposition = migrated.pop("last_disposition")
-    migrated["schema_version"] = RECORD_SCHEMA_VERSION
-    migrated.update(
-        {
-            "transport_disposition": normalize_transport_disposition(
-                old_disposition
-            ),
-            "request_phase": "resolving",
-            "terminal_outcome": None,
-            "checkpoint_already_advanced": False,
-            "operator_attention_required": False,
-            "blocked_reason": None,
-            "next_action": None,
-            "dedup_witness": None,
-        }
-    )
-    if migrated["state"] == "resolving":
-        pass
-    elif migrated["state"] == "retryable":
-        migrated["request_phase"] = "retryable"
-    else:
-        linked_submission = (
-            old_disposition == "terminal_accepted"
-            and migrated.get("submission_state") == "linked"
-            and isinstance(migrated.get("turn_id"), str)
-            and bool(migrated["turn_id"].strip())
-        )
-        transport, phase, terminal_outcome, reason = _historical_outcome(
-            old_disposition,
-            linked_submission=linked_submission,
-        )
-        delivered = terminal_outcome == "delivered"
-        migrated.update(
-            {
-                "state": "terminal",
-                "transport_disposition": transport,
-                "request_phase": phase,
-                "terminal_outcome": terminal_outcome,
-                "checkpoint_already_advanced": True,
-                "operator_attention_required": not delivered,
-                "blocked_reason": reason,
-                "next_action": (
-                    None
-                    if delivered
-                    else "inspect historical ingress evidence"
-                ),
-                "terminal_at": (
-                    migrated.get("terminal_at")
-                    or migrated.get("quarantined_at")
-                    or migrated["updated_at"]
-                ),
-                "quarantined_at": None,
-                "quarantine_reason": None,
-                "outcome": child_result(
-                    request_id,
-                    checkpoint="advance" if delivered else "hold",
-                    transport_disposition=transport,
-                    request_phase=phase,
-                    terminal_outcome=terminal_outcome,
-                ),
-            }
-        )
-    return migrated if _valid_record(migrated, request_id) else None
-
-
-def _migrate_v2_record(value: Any, request_id: str) -> dict[str, Any] | None:
-    v3 = _migrate_v2_to_v3(value, request_id)
-    return _migrate_v3_record(v3, request_id) if v3 is not None else None
-
-
-def _legacy_request_json(
-    value: Any,
-    request_id: str,
-    *,
-    now: float,
-) -> str | None:
-    if (
-        not isinstance(value, dict)
-        or not _LEGACY_REQUIRED_FIELDS <= frozenset(value)
-        or not frozenset(value) <= _LEGACY_RECORD_FIELDS
-    ):
-        return None
-    request = value.get("request")
-    created_at = _timestamp(value.get("created_at"))
-    updated_at = _timestamp(value.get("updated_at"))
-    terminal_at = (
-        _timestamp(value.get("terminal_at"))
-        if "terminal_at" in value
-        else None
-    )
-    if (
-        not isinstance(request, dict)
-        or created_at is None
-        or updated_at is None
-        or not created_at <= updated_at
-        or created_at > now
-        or (
-            "last_status" in value
-            and (
-                not isinstance(value.get("last_status"), str)
-                or not value["last_status"]
-            )
-        )
-        or (
-            "terminal_at" in value
-            and (terminal_at is None or terminal_at < created_at)
-        )
-    ):
-        return None
-    try:
-        request_json = canonical_request_json(request)
-    except ValueError:
-        return None
-    if _request_id_from_json(request_json) != request_id:
-        return None
-    return request_json
-
-
-def _legacy_record(
-    value: Any,
-    request_id: str,
-    *,
-    now: float,
-    retry_horizon: float,
-    retention: float,
-) -> dict[str, Any] | None:
-    request_json = _legacy_request_json(value, request_id, now=now)
-    if request_json is None:
-        return None
-    created_at = _timestamp(value.get("created_at"))
-    updated_at = _timestamp(value.get("updated_at"))
-    if created_at is None or updated_at is None:
-        return None
-    record = _new_record(
-        request_id,
-        now=created_at,
-        retry_horizon=retry_horizon,
-        retention=retention,
-    )
-    record["updated_at"] = updated_at
-    record["state"] = "retryable"
-    record["request_json"] = request_json
-    record["request_phase"] = "retryable"
-    # Legacy status text is deliberately not authoritative finality evidence.
-    return record
-
-
 def _validated_records_mapping(
     store: dict[str, Any],
-    *,
-    now: float,
 ) -> dict[str, Any] | None:
     """Validate the complete retained evidence set without mutating it."""
 
@@ -1153,12 +770,7 @@ def _validated_records_mapping(
             raise RuntimeError(_CORRUPT_RECORDS_ERROR) from None
         if (
             canonical_id != request_id
-            or (
-                not _valid_record(record, canonical_id)
-                and not _valid_v3_record(record, canonical_id)
-                and not _valid_v2_record(record, canonical_id)
-                and _legacy_request_json(record, canonical_id, now=now) is None
-            )
+            or not _valid_record(record, canonical_id)
         ):
             raise RuntimeError(_CORRUPT_RECORDS_ERROR)
     return records
@@ -1173,14 +785,10 @@ def cached_terminal_outcome(
     timestamp = _timestamp(now)
     if timestamp is None:
         raise ValueError("invalid ingress timestamp")
-    records = _validated_records_mapping(store, now=timestamp)
+    records = _validated_records_mapping(store)
     if records is None or request_id not in records:
         return None
     record = records[request_id]
-    if not _valid_record(record, request_id):
-        # Pre-v4 records require conservative migration before their old
-        # checkpoint semantics can be interpreted.
-        return None
     if record["state"] not in {"terminal", "quarantined"}:
         return None
     return _copy_child_result(record["outcome"])
@@ -1258,7 +866,7 @@ def ensure_request_shell(
     timestamp = _timestamp(now)
     if timestamp is None:
         raise ValueError("invalid ingress timestamp")
-    raw_records = _validated_records_mapping(store, now=timestamp)
+    raw_records = _validated_records_mapping(store)
     if raw_records is None:
         record = _new_record(
             request_id,
@@ -1277,28 +885,7 @@ def ensure_request_shell(
         )
         raw_records[request_id] = record
         return record, True
-    current = raw_records[request_id]
-    if _valid_record(current, request_id):
-        return current, False
-    migrated_v3 = _migrate_v3_record(current, request_id)
-    if migrated_v3 is not None:
-        raw_records[request_id] = migrated_v3
-        return migrated_v3, True
-    migrated_v2 = _migrate_v2_record(current, request_id)
-    if migrated_v2 is not None:
-        raw_records[request_id] = migrated_v2
-        return migrated_v2, True
-    migrated = _legacy_record(
-        current,
-        request_id,
-        now=timestamp,
-        retry_horizon=retry_horizon,
-        retention=retention,
-    )
-    if migrated is None:
-        raise RuntimeError(_CORRUPT_RECORDS_ERROR)
-    raw_records[request_id] = migrated
-    return migrated, True
+    return raw_records[request_id], False
 
 
 def preflight_request(
@@ -1584,7 +1171,7 @@ def link_submission(
     timestamp = _timestamp(now)
     if timestamp is None:
         raise ValueError("invalid ingress timestamp")
-    records = _validated_records_mapping(store, now=timestamp)
+    records = _validated_records_mapping(store)
     if records is None:
         return None, False
     matches = [
@@ -1630,12 +1217,12 @@ def link_submission(
 def retained_submission_records(
     store: dict[str, Any], *, now: float
 ) -> list[dict[str, Any]]:
-    """Return validated receipt records; older records are inert fallback."""
+    """Return validated current receipt records."""
 
     timestamp = _timestamp(now)
     if timestamp is None:
         raise ValueError("invalid ingress timestamp")
-    records = _validated_records_mapping(store, now=timestamp)
+    records = _validated_records_mapping(store)
     if records is None:
         return []
     return [
@@ -1768,19 +1355,11 @@ def operator_status_rows(
     timestamp = _timestamp(now)
     if timestamp is None:
         raise ValueError("invalid ingress timestamp")
-    records = _validated_records_mapping(store, now=timestamp)
+    records = _validated_records_mapping(store)
     if records is None:
         return []
     rows: list[dict[str, Any]] = []
-    for request_id, raw in records.items():
-        record = raw if _valid_record(raw, request_id) else None
-        if record is None:
-            migrated = _migrate_v3_record(raw, request_id)
-            if migrated is None:
-                migrated = _migrate_v2_record(raw, request_id)
-            record = migrated
-        if record is None:
-            continue
+    for request_id, record in records.items():
         witness = record.get("dedup_witness")
         rows.append(
             {
@@ -1856,25 +1435,14 @@ def stale_target_refresh_json(record: dict[str, Any], *, now: float) -> str | No
 
 
 def prune_requests(store: dict[str, Any], *, now: float) -> bool:
-    """Prune valid v3 records only after validating all retained evidence."""
+    """Prune current records only after validating all retained evidence."""
 
     timestamp = _timestamp(now)
     if timestamp is None:
         raise ValueError("invalid ingress timestamp")
-    records = _validated_records_mapping(store, now=timestamp)
+    records = _validated_records_mapping(store)
     if records is None:
         return False
-    changed = False
-    for request_id, record in list(records.items()):
-        migrated = _migrate_v3_record(record, request_id)
-        if migrated is not None:
-            records[request_id] = migrated
-            changed = True
-            continue
-        migrated = _migrate_v2_record(record, request_id)
-        if migrated is not None:
-            records[request_id] = migrated
-            changed = True
     expired = [
         request_id
         for request_id, record in records.items()
@@ -1883,4 +1451,4 @@ def prune_requests(store: dict[str, Any], *, now: float) -> bool:
     ]
     for request_id in expired:
         records.pop(request_id)
-    return changed or bool(expired)
+    return bool(expired)

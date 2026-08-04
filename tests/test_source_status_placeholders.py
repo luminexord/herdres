@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from herdres_connector import state
 from herdres_connector.source_sync import SyncRuntime, sync_once
-from test_source_only import _source_worker
+from test_source_only import (
+    FakeTendwire as _SourceFakeTendwire,
+    _source_worker,
+)
 
 
-class FakeTendwire:
+class FakeTendwire(_SourceFakeTendwire):
     def __init__(self, turns=None, workers=None, spaces=None):
-        self._turns = dict(turns) if turns is not None else {"turns": []}
-        self._turns.setdefault("schema_version", 1)
         raw_workers = workers if workers is not None else [
             {
                 "id": "worker-live",
@@ -19,8 +20,7 @@ class FakeTendwire:
                 "meta": {"agent": "claude", "raw_status": "working"},
             }
         ]
-        self._workers = [_source_worker(worker) for worker in raw_workers]
-        self._spaces = spaces if spaces is not None else [
+        raw_spaces = spaces if spaces is not None else [
             {
                 "id": "space-workers",
                 "name": "Workers",
@@ -28,18 +28,11 @@ class FakeTendwire:
                 "fingerprint": "space-fp",
             }
         ]
-
-    def snapshot(self):
-        return {"ok": True, "workers": self._workers, "spaces": self._spaces}
-
-    def turns(self):
-        return self._turns
-
-    def pending(self):
-        return {"pending_interactions": []}
-
-    def connector_poll(self, **_kwargs):
-        return {"ok": True, "items": []}
+        super().__init__(
+            turns=turns,
+            workers=raw_workers,
+            spaces=raw_spaces,
+        )
 
 
 class FakeTelegram:
@@ -111,97 +104,8 @@ def _store():
     }
 
 
-def test_repaired_same_turn_id_with_changed_final_edits_existing_final(monkeypatch):
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    store = _store()
-    telegram = FakeTelegram()
-    tendwire = FakeTendwire(
-        turns={
-            "turns": [
-                {
-                    "id": "turn-reused",
-                    "worker_id": "worker-live",
-                    "space_id": "space-workers",
-                    "assistant_final_text": "old final",
-                    "complete": True,
-                }
-            ]
-        }
-    )
-    tendwire._workers[0]["status"] = "idle"
-    tendwire._workers[0]["meta"].pop("raw_status", None)
-
-    first = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
-    worker = next(iter(state.source_worker_entries(store).values()))
-    first_message_id = worker["last_clean_message_id"]
-    tendwire._turns = {
-        "schema_version": 1,
-        "turns": [
-            {
-                "id": "turn-reused",
-                "worker_id": "worker-live",
-                "space_id": "space-workers",
-                "assistant_final_text": "new final",
-                "complete": True,
-            }
-        ]
-    }
-    second = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
-    third = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
-
-    assert first["feed_sent"] == 1
-    assert second["feed_sent"] == 0
-    assert third["feed_sent"] == 1
-    assert worker["last_clean_message_id"] == first_message_id
-    assert any(edit[1] == first_message_id and "new final" in edit[2] for edit in telegram.edited)
 
 
-def test_same_turn_id_with_new_user_prompt_sends_new_visible_final(monkeypatch):
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    store = _store()
-    telegram = FakeTelegram()
-    tendwire = FakeTendwire(
-        turns={
-            "turns": [
-                {
-                    "id": "turn-reused",
-                    "worker_id": "worker-live",
-                    "space_id": "space-workers",
-                    "user_text": "old prompt",
-                    "assistant_final_text": "old final",
-                    "complete": True,
-                }
-            ]
-        }
-    )
-    tendwire._workers[0]["status"] = "idle"
-    tendwire._workers[0]["meta"].pop("raw_status", None)
-
-    first = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
-    first_sent_count = len(telegram.sent)
-    worker = next(iter(state.source_worker_entries(store).values()))
-    first_message_id = worker["last_clean_message_id"]
-    tendwire._turns = {
-        "schema_version": 1,
-        "turns": [
-            {
-                "id": "turn-reused",
-                "worker_id": "worker-live",
-                "space_id": "space-workers",
-                "user_text": "test",
-                "assistant_final_text": "new final",
-                "complete": True,
-            }
-        ]
-    }
-    second = sync_once(store, SyncRuntime(tendwire, telegram, with_outbox=False))
-
-    assert first["feed_sent"] == 1
-    assert second["feed_sent"] == 1
-    assert len(telegram.sent) == first_sent_count + 1
-    assert worker["last_clean_message_id"] != first_message_id
-    assert "new final" in telegram.sent[-1][1]
-    assert not any(edit[1] == first_message_id and "new final" in edit[2] for edit in telegram.edited)
 
 
 def test_turn_with_matching_worker_in_different_space_is_not_cross_delivered(monkeypatch):

@@ -60,7 +60,7 @@ def tendwire_delta_feed() -> dict[str, Any]:
     except RuntimeError as exc:
         return {
             "ok": False,
-            "state": "fallback",
+            "state": "error",
             "watermark_age_seconds": None,
             "last_batch": {},
             "health_flag": sanitize_text(str(exc), 80),
@@ -74,8 +74,14 @@ def tendwire_delta_feed() -> dict[str, Any]:
             "last_batch": {},
         }
     status = str(delta.get("status") or "bootstrapping")
-    if status not in {"active", "fallback", "bootstrapping"}:
-        status = "bootstrapping"
+    if status not in {"active", "bootstrapping"}:
+        return {
+            "ok": False,
+            "state": "error",
+            "watermark_age_seconds": None,
+            "last_batch": {},
+            "health_flag": "invalid_delta_state",
+        }
     updated_at = delta.get("watermark_updated_at")
     age: int | None = None
     if isinstance(updated_at, (int, float)) and not isinstance(updated_at, bool):
@@ -117,8 +123,6 @@ def inbound_lanes(
 ) -> dict[str, Any]:
     """Expose a structured failure signal for a non-draining ingress lane."""
 
-    if not config.inbound_lanes_enabled():
-        return {"ok": True, "status": "disabled"}
     db_path = path or config.inbound_spool_path()
     if not db_path.exists():
         return {"ok": True, "status": "bootstrapping"}

@@ -161,78 +161,6 @@ def _record(
     return record
 
 
-def _old_v3_record(
-    request_id: str,
-    *,
-    now: float = 100.0,
-    terminal_disposition: str | None = None,
-    linked: bool = False,
-) -> dict[str, object]:
-    current = _record(
-        request_id,
-        now=now,
-        with_request=True,
-    )
-    for field in (
-        "transport_disposition",
-        "request_phase",
-        "terminal_outcome",
-        "checkpoint_already_advanced",
-        "operator_attention_required",
-        "blocked_reason",
-        "next_action",
-        "dedup_witness",
-    ):
-        current.pop(field)
-    current["schema_version"] = 3
-    current["last_disposition"] = terminal_disposition
-    if terminal_disposition is not None:
-        current["state"] = (
-            "quarantined"
-            if terminal_disposition == "terminal_uncertain"
-            else "terminal"
-        )
-        current["updated_at"] = now + 2
-        current["terminal_at"] = (
-            None if current["state"] == "quarantined" else now + 2
-        )
-        current["quarantined_at"] = (
-            now + 2 if current["state"] == "quarantined" else None
-        )
-        current["quarantine_reason"] = (
-            "legacy uncertainty"
-            if current["state"] == "quarantined"
-            else None
-        )
-        current["outcome"] = {
-            "schema_version": 1,
-            "handled": True,
-            "request_id": request_id,
-            "checkpoint": "advance",
-            "disposition": terminal_disposition,
-            "reply": (
-                "Sent to Tendwire worker."
-                if terminal_disposition == "terminal_accepted"
-                else "Could not send safely."
-            ),
-        }
-        if linked:
-            current.update(
-                {
-                    "submission_id": "submission-verified",
-                    "submission_state": "linked",
-                    "turn_id": "turn-verified",
-                    "target_owner": {
-                        "stable_key": f"wsk1_{'a' * 64}",
-                        "stable_key_version": 1,
-                    },
-                    "submitted_at": now + 1,
-                    "linked_at": now + 2,
-                }
-            )
-    return current
-
-
 def test_record_bounds_do_not_slide_and_deadline_equality_quarantines() -> None:
     store: dict[str, object] = {}
     record, child, changed = ingress_requests.preflight_request(
@@ -309,100 +237,6 @@ def test_pruning_is_strictly_after_immutable_retain_until() -> None:
     assert REQUEST_ID in store[ingress_requests.RECORDS_KEY]
     assert ingress_requests.prune_requests(store, now=220.000001) is True
     assert REQUEST_ID not in store[ingress_requests.RECORDS_KEY]
-
-
-def test_legacy_record_migrates_once_without_status_finality() -> None:
-    legacy_request = _request()
-    store = {
-        ingress_requests.RECORDS_KEY: {
-            REQUEST_ID: {
-                "request": legacy_request,
-                "created_at": 100.0,
-                "updated_at": 125.0,
-                "last_status": "accepted",
-                "terminal_at": 125.0,
-            }
-        }
-    }
-
-    record, changed = ingress_requests.ensure_request_shell(
-        store,
-        REQUEST_ID,
-        now=130.0,
-        retry_horizon=60,
-        retention=120,
-    )
-    assert changed is True
-    assert record["state"] == "retryable"
-    assert record["transport_disposition"] is None
-    assert record["outcome"] is None
-    assert record["request_json"] == ingress_requests.canonical_request_json(
-        legacy_request
-    )
-    assert (record["created_at"], record["deadline_at"], record["retain_until"]) == (
-        100.0,
-        160.0,
-        220.0,
-    )
-
-    same, changed = ingress_requests.ensure_request_shell(
-        store,
-        REQUEST_ID,
-        now=140.0,
-        retry_horizon=600,
-        retention=1200,
-    )
-    assert same is record
-    assert changed is False
-
-
-def test_v2_record_migrates_additively_to_current_schema() -> None:
-    original = _old_v3_record(REQUEST_ID)
-    v2 = {
-        key: copy.deepcopy(value)
-        for key, value in original.items()
-        if key
-        not in {
-            "submission_id",
-            "submission_state",
-            "turn_id",
-            "target_owner",
-            "submitted_at",
-            "linked_at",
-        }
-    }
-    v2["schema_version"] = 2
-    store = {ingress_requests.RECORDS_KEY: {REQUEST_ID: v2}}
-
-    migrated, changed = ingress_requests.ensure_request_shell(
-        store,
-        REQUEST_ID,
-        now=130.0,
-        retry_horizon=60,
-        retention=120,
-    )
-
-    assert changed is True
-    assert migrated["schema_version"] == 4
-    assert migrated["request_json"] == v2["request_json"]
-    assert {
-        key: migrated[key]
-        for key in (
-            "submission_id",
-            "submission_state",
-            "turn_id",
-            "target_owner",
-            "submitted_at",
-            "linked_at",
-        )
-    } == {
-        "submission_id": None,
-        "submission_state": None,
-        "turn_id": None,
-        "target_owner": None,
-        "submitted_at": None,
-        "linked_at": None,
-    }
 
 
 def test_not_delivered_outcome_leaves_checkpoint_unadvanced() -> None:
@@ -1305,105 +1139,6 @@ def test_ingress_result_guard_scans_module_scope() -> None:
         exec("removed = result.get('disposition')", namespace)
 
 
-def test_unlinked_historical_terminal_accepted_migrates_to_unknown() -> None:
-    legacy = _old_v3_record(
-        REQUEST_ID,
-        terminal_disposition="terminal_accepted",
-    )
-    store = {ingress_requests.RECORDS_KEY: {REQUEST_ID: legacy}}
-
-    migrated, changed = ingress_requests.ensure_request_shell(
-        store,
-        REQUEST_ID,
-        now=130.0,
-        retry_horizon=60,
-        retention=120,
-    )
-
-    assert changed is True
-    assert migrated["schema_version"] == 4
-    assert migrated["transport_disposition"] == "written_to_pty"
-    assert migrated["request_phase"] == "accepted_unverified"
-    assert migrated["terminal_outcome"] == "delivery_unknown"
-    assert migrated["terminal_outcome"] != "delivered"
-    assert migrated["checkpoint_already_advanced"] is True
-    assert migrated["outcome"]["checkpoint"] == "hold"
-    assert migrated["operator_attention_required"] is True
-
-
-def test_linked_historical_terminal_accepted_migrates_to_delivered() -> None:
-    legacy = _old_v3_record(
-        REQUEST_ID,
-        terminal_disposition="terminal_accepted",
-        linked=True,
-    )
-    store = {ingress_requests.RECORDS_KEY: {REQUEST_ID: legacy}}
-
-    migrated, changed = ingress_requests.ensure_request_shell(
-        store,
-        REQUEST_ID,
-        now=130.0,
-        retry_horizon=60,
-        retention=120,
-    )
-
-    assert changed is True
-    assert migrated["schema_version"] == 4
-    assert migrated["transport_disposition"] == "submitted"
-    assert migrated["request_phase"] == "terminal"
-    assert migrated["terminal_outcome"] == "delivered"
-    assert migrated["checkpoint_already_advanced"] is True
-    assert migrated["outcome"]["checkpoint"] == "advance"
-    assert migrated["operator_attention_required"] is False
-    assert migrated["blocked_reason"] is None
-    assert migrated["next_action"] is None
-
-    same, changed = ingress_requests.ensure_request_shell(
-        store,
-        REQUEST_ID,
-        now=131.0,
-        retry_horizon=60,
-        retention=120,
-    )
-    assert same is migrated
-    assert changed is False
-
-
-@pytest.mark.parametrize(
-    ("legacy_disposition", "transport", "terminal_outcome"),
-    [
-        ("terminal_rejected", "terminal_rejected", "not_delivered"),
-        ("terminal_uncertain", "terminal_uncertain", "delivery_unknown"),
-    ],
-)
-def test_historical_non_success_receipts_migrate_without_rewriting_truth(
-    legacy_disposition, transport, terminal_outcome
-) -> None:
-    store = {
-        ingress_requests.RECORDS_KEY: {
-            REQUEST_ID: _old_v3_record(
-                REQUEST_ID,
-                terminal_disposition=legacy_disposition,
-            )
-        }
-    }
-
-    migrated, changed = ingress_requests.ensure_request_shell(
-        store,
-        REQUEST_ID,
-        now=130.0,
-        retry_horizon=60,
-        retention=120,
-    )
-
-    assert changed is True
-    assert migrated["transport_disposition"] == transport
-    assert migrated["terminal_outcome"] == terminal_outcome
-    assert migrated["checkpoint_already_advanced"] is True
-    assert migrated["outcome"]["checkpoint"] == "hold"
-    assert migrated["operator_attention_required"] is True
-
-
 def test_dedup_witness_contract_authorizes_only_positive_nonreceipt() -> None:
     record = _record(REQUEST_ID, with_request=True)
     ingress_requests.record_terminal_outcome(
@@ -1770,7 +1505,7 @@ def test_v2_command_does_not_attach_submission_owner(tmp_path, monkeypatch) -> N
     assert record["target_owner"] is None
 
 
-def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
+def test_v3_submission_receipt_renders_working_and_links_delta(
     tmp_path, monkeypatch
 ) -> None:
     _setup_command_state(tmp_path, monkeypatch)
@@ -1824,7 +1559,7 @@ def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
         submission_store,
         herdres.SyncRuntime(
             FakeTendwire(
-                turns={"schema_version": 1, "turns": []},
+                turns={"schema_version": 2, "turns": []},
                 workers=source_workers,
             ),
             submission_telegram,
@@ -1833,27 +1568,6 @@ def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
     )
     assert len(submission_telegram.sent) == 1
 
-    legacy_store = _store()
-    legacy_telegram = FakeTelegram()
-    legacy_turn = {
-        "id": "turn-predicted",
-        "worker_id": "worker-1",
-        "space_id": "space-1",
-        "complete": False,
-        "user_text": "original instruction",
-    }
-    herdres.sync_once(
-        legacy_store,
-        herdres.SyncRuntime(
-            FakeTendwire(
-                turns={"schema_version": 1, "turns": [legacy_turn]}
-            ),
-            legacy_telegram,
-            with_outbox=False,
-        ),
-    )
-    assert submission_telegram.sent[0][1] == legacy_telegram.sent[0][1]
-
     linked_turn = _turn_row(
         "turn-observed", "twrev1.observed", None, user="original instruction"
     )
@@ -1861,12 +1575,16 @@ def test_v3_submission_receipt_renders_legacy_identical_working_and_links_delta(
     linked_turn["submission_state"] = "linked"
 
     class LinkedDelta(FakeTendwire):
-        def turn_delta(self, **_kwargs):
+        def turn_delta(self, **kwargs):
             return {
                 "schema_version": 1,
                 "projection_schema_version": 2,
                 "host_id": "host-public",
-                "mode": "bootstrap",
+                "mode": (
+                    "bootstrap"
+                    if kwargs.get("watermark") is None
+                    else "changes"
+                ),
                 "changes": [
                     {
                         "op": "upsert",
@@ -2200,7 +1918,7 @@ def test_v3_ack_loss_replays_submission_once_without_duplicate_working(
     ]
     runtime = lambda: herdres.SyncRuntime(
         FakeTendwire(
-            turns={"schema_version": 1, "turns": []}, workers=workers
+            turns={"schema_version": 2, "turns": []}, workers=workers
         ),
         telegram,
         with_outbox=False,
@@ -2343,64 +2061,6 @@ def test_retryable_response_at_deadline_is_quarantined_not_retried(
         disposition=None,
         reply=ingress_requests.QUARANTINE_REPLY,
     )
-
-
-def test_invalid_legacy_timestamps_are_preserved_behind_global_barrier() -> None:
-    store = {
-        ingress_requests.RECORDS_KEY: {
-            REQUEST_ID: {
-                "request": _request(),
-                "created_at": 100.0,
-                "updated_at": "not-a-timestamp",
-            }
-        }
-    }
-    before = copy.deepcopy(store)
-
-    with pytest.raises(
-        RuntimeError, match="^ingress request record store is corrupt$"
-    ):
-        ingress_requests.preflight_request(
-            store,
-            REQUEST_ID,
-            now=110.0,
-            retry_horizon=60,
-            retention=120,
-        )
-
-    assert store == before
-
-
-def test_malformed_v2_with_legacy_request_blocks_without_client_or_rewrite(
-    tmp_path, monkeypatch
-) -> None:
-    _setup_command_state(tmp_path, monkeypatch)
-    store = state.load_state()
-    store[ingress_requests.RECORDS_KEY] = {
-        REQUEST_ID: {
-            "schema_version": 2,
-            "request": _request(),
-            "created_at": 100.0,
-            "updated_at": 101.0,
-            "state": "terminal",
-            "terminal_at": 101.0,
-        }
-    }
-    state.save_state(store)
-    state_path = tmp_path / "state.json"
-    original = state_path.read_bytes()
-    monkeypatch.setattr(herdres.time, "time", lambda: 110.0)
-
-    class ForbiddenClient:
-        def __init__(self):
-            raise AssertionError("malformed v2 evidence must never be replayed")
-
-    monkeypatch.setattr(herdres, "TendwireClient", ForbiddenClient)
-    with pytest.raises(
-        RuntimeError, match="^ingress request record store is corrupt$"
-    ):
-        herdres.command_reply(_payload())
-    assert state_path.read_bytes() == original
 
 
 def test_direct_redelivery_blocks_terminal_evidence_under_different_key(

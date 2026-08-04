@@ -217,7 +217,6 @@ def _run(store, monkeypatch, flag="1", telegram=None):
         {"pending": []},
         runtime,
         chat_id="-100",
-        list_finals_are_authoritative=False,
     )
     return telegram
 
@@ -561,7 +560,6 @@ def test_fold_failure_bounded_by_attempt_cap(monkeypatch):
                 {"pending": []},
                 runtime,
                 chat_id="-100",
-                list_finals_are_authoritative=False,
             )
         )
     binding = state.message_bindings(store)["400"]
@@ -687,7 +685,6 @@ def test_presend_fold_error_survives_pass_level_save(monkeypatch, tmp_path):
         {"pending": []},
         SyncRuntime(FakeTendwire(), FakeTelegram(), with_outbox=False),
         chat_id="-100",
-        list_finals_are_authoritative=False,
     )
     # This is the same aggregate decision used by sync_once/_sync_pass: one
     # pass-level save, never a per-binding save.
@@ -754,7 +751,6 @@ def test_fold_pass_cap_limits_physical_rejection_ladder(monkeypatch):
         {"pending": []},
         runtime,
         chat_id="-100",
-        list_finals_are_authoritative=False,
     )
 
     # Fold one uses rich + readable fallback. Only one write remains for the

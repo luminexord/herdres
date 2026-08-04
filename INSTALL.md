@@ -52,20 +52,18 @@ do not replace the state file with an editor write while services are running.
 
 The key makes Telegram ingress request IDs stable across gateway restart,
 Telegram redelivery, and managed-bot token rotation. Manager and managed-bot
-polling offsets are keyed by stable receiving-bot kind rather than bot token;
-the current legacy token-keyed managed-bot offset is migrated to that stable
-path, so rotation does not reset its polling position. Back up the key with
+polling cursors are keyed by stable receiving-bot kind rather than bot token,
+so rotation does not reset polling position. Back up the key with
 Herdres state and restore the same file with mode `0600` before restarting the
 gateway. Deleting, regenerating, or changing the key path without restoring
 the original key changes every derived request ID and can make an already-seen
 Telegram update appear to be a new mutation.
 
-When `HERDRES_INBOUND_LANES=1`, the authoritative receiving-bot cursors and
-pending updates live in the separate SQLite WAL selected by
+The authoritative receiving-bot cursors and pending updates live in the
+separate SQLite WAL selected by
 `HERDRES_INBOUND_SPOOL_PATH` (default
-`~/.local/share/herdres/inbound_spool.db`). The legacy offset files are only
-atomic, fsynced rollback mirrors. Stop the gateway before backing up or
-restoring the spool so SQLite can checkpoint its WAL consistently.
+`~/.local/share/herdres/inbound_spool.db`). Stop the gateway before backing up
+or restoring the spool so SQLite can checkpoint its WAL consistently.
 
 ### Tendwire worker continuity key
 
@@ -188,7 +186,6 @@ HERDRES_TELEGRAM_CHAT_ID=...
 HERDR_TELEGRAM_TOPICS_STATE=~/.local/share/herdres/state.json
 HERDRES_REQUEST_ID_KEY_PATH=~/.local/share/herdres/request-id.key
 HERDRES_COMMAND_RETRY_HORIZON_SECONDS=86400
-HERDRES_INBOUND_LANES=1
 HERDRES_INBOUND_DISPATCH_WORKERS=8
 HERDRES_INBOUND_LANE_DEPTH=32
 HERDRES_INBOUND_LANE_BACKOFF_SECONDS=2
@@ -197,14 +194,6 @@ HERDRES_INBOUND_LANE_STALL_SECONDS=5
 TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.db
 HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS=60
 ```
-
-Upgrade migration: lane execution and acknowledgement live in
-`herdres-gateway.service`, so both shipped Herdres units set
-`HERDRES_INBOUND_LANES=1`. An active `HERDRES_INBOUND_LANES=0` left in
-`~/.config/herdres/herdres.env` by older installation guidance overrides those
-unit defaults. Re-running `./install-user.sh` treats running the installer as
-consent to comment out only that legacy rollback line; it preserves the line
-under an explanatory marker so you can deliberately uncomment it to roll back.
 
 `HERDRES_COMMAND_RETRY_HORIZON_SECONDS` fixes the retry deadline from the
 record's first-seen time; it does not configure a sliding idle timeout. Unset,
