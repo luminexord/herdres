@@ -131,6 +131,7 @@ class TurnFinalTendwire:
         self.ack_committed_response_lost_once = False
         self.commit_response_lost_once = False
         self.completed_observe_lost_once = False
+        self.delta_calls = []
 
     def _ready_payload(self):
         revision = self.row["content"]["content_revision"]
@@ -253,6 +254,9 @@ class TurnFinalTendwire:
         }
 
     def turn_delta(self, *, cursor=None, watermark=None, limit=500):
+        self.delta_calls.append(
+            {"cursor": cursor, "watermark": watermark, "limit": limit}
+        )
         assert cursor is None
         assert limit > 0
         payload = self.turns()
@@ -2979,10 +2983,10 @@ def test_turn_final_rebind_during_ack_records_local_reconciliation(
     assert len(tendwire.ack_calls) == 1
     assert [sent[2]["thread_id"] for sent in telegram.sent] == ["77"]
 
+    page_calls_after_ack = list(tendwire.page_calls)
+    sends_after_ack = len(telegram.sent)
+    checkpoint = current["tendwire_delta_sync"]["watermark"]
     real_planner = source_sync.prepare_turn_delivery_parts
-    # A current delta event re-observes the acknowledged source and retries
-    # its pending local reconciliation on the next pass.
-    tendwire.row["updated_at"] = "2030-01-01T00:00:01Z"
     monkeypatch.setattr(
         source_sync,
         "prepare_turn_delivery_parts",
@@ -3015,6 +3019,9 @@ def test_turn_final_rebind_during_ack_records_local_reconciliation(
         "attempts": 1,
     }
     assert len(tendwire.ack_calls) == 1
+    assert tendwire.delta_calls[-1]["watermark"] == checkpoint
+    assert tendwire.page_calls == page_calls_after_ack
+    assert len(telegram.sent) == sends_after_ack
     monkeypatch.setattr(
         source_sync,
         "prepare_turn_delivery_parts",
@@ -3026,6 +3033,7 @@ def test_turn_final_rebind_during_ack_records_local_reconciliation(
         healed = sync_once(
             current, _runtime(tendwire, telegram, max_sends=8)
         )
+        state.save_state(current, state_path)
 
     receipt = next(iter(state.tendwire_turn_jobs(current).values()))
     bindings = [
@@ -3041,12 +3049,80 @@ def test_turn_final_rebind_during_ack_records_local_reconciliation(
     assert receipt.get("post_ack_reconcile") is None
     assert len(tendwire.ack_calls) == 1
     assert tendwire.defer_calls == []
+    assert tendwire.delta_calls[-1]["watermark"] == checkpoint
+    assert tendwire.page_calls == page_calls_after_ack
     assert [sent[2]["thread_id"] for sent in telegram.sent] == [
         "77",
         "16000",
     ]
     assert len(bindings) == 1
     assert bindings[0]["topic_id"] == "16000"
+
+    sends_after_heal = len(telegram.sent)
+    with state.state_lock(path=state_path):
+        current = state.load_state(state_path)
+        settled = sync_once(
+            current, _runtime(tendwire, telegram, max_sends=8)
+        )
+
+    assert settled["tendwire_turn_final"]["polled"] == 0
+    assert (
+        settled["tendwire_turn_final"].get("post_ack_reconciled", 0)
+        == 0
+    )
+    assert tendwire.delta_calls[-1]["watermark"] == checkpoint
+    assert tendwire.page_calls == page_calls_after_ack
+    assert len(telegram.sent) == sends_after_heal
+
+
+def test_post_ack_reconcile_projection_requires_exact_turn_and_revision():
+    row = _turn_row(
+        "turn-exact-retained",
+        "twrev1.exact_retained",
+        "retained answer",
+    )
+    empty = {"schema_version": 2, "turns": []}
+
+    assert source_sync._post_ack_reconcile_item(
+        empty,
+        {row["id"]: row},
+        turn_id=row["id"],
+        revision=row["content"]["content_revision"],
+    ) is row
+
+    wrong_turn = deepcopy(row)
+    wrong_turn["id"] = "turn-wrong-retained"
+    assert source_sync._post_ack_reconcile_item(
+        empty,
+        {row["id"]: wrong_turn},
+        turn_id=row["id"],
+        revision=row["content"]["content_revision"],
+    ) is None
+
+    wrong_revision = deepcopy(row)
+    wrong_revision["content"]["content_revision"] = "twrev1.wrong"
+    assert source_sync._post_ack_reconcile_item(
+        empty,
+        {row["id"]: wrong_revision},
+        turn_id=row["id"],
+        revision=row["content"]["content_revision"],
+    ) is None
+
+    collision = deepcopy(row)
+    collision["id"] = "turn-revision-collision"
+    assert source_sync._post_ack_reconcile_item(
+        {"schema_version": 2, "turns": [collision]},
+        {row["id"]: row},
+        turn_id=row["id"],
+        revision=row["content"]["content_revision"],
+    ) is None
+
+    assert source_sync._post_ack_reconcile_item(
+        {"schema_version": 2, "turns": [row, deepcopy(row)]},
+        {row["id"]: row},
+        turn_id=row["id"],
+        revision=row["content"]["content_revision"],
+    ) is None
 
 
 

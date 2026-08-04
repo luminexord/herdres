@@ -65,8 +65,8 @@ def test_assign_reserves_locked_names_and_numbers_around_them():
 
 
 def test_assign_dedup_is_case_insensitive():
-    # _ensure_topic's reuse match casefolds, so "Foo"/"foo" must be numbered apart here too, else they
-    # collapse into one topic. And a new pane must number around a locked topic that differs only in case.
+    # Telegram topic-name comparisons casefold, so "Foo"/"foo" must be numbered apart. A new pane
+    # must also number around a locked topic that differs only in case.
     store = {"version": 2, "spaces": {}, "panes": {}}
     got, _r, _bases = source_sync._assign_worker_topic_names(store, [_w("/root/Foo", "a"), _w("/root/foo", "b")])
     assert got["a"] == "Foo" and got["b"] == "foo 2"

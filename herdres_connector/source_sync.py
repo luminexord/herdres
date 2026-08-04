@@ -9923,6 +9923,45 @@ def _turn_item_by_revision(
     return matches[0] if len(matches) == 1 else None
 
 
+def _post_ack_reconcile_item(
+    turns_payload: dict[str, Any],
+    turn_projection: Mapping[str, Any] | None,
+    *,
+    turn_id: str,
+    revision: str,
+) -> dict[str, Any] | None:
+    """Resolve only the exact validated source of a durable ACK obligation."""
+
+    if not turn_id or not revision:
+        return None
+    current = [
+        item
+        for item in _turns(turns_payload)
+        if _content_revision(item) == revision
+    ]
+    if current:
+        if len(current) != 1:
+            return None
+        first = current[0]
+        if (
+            _turn_id(first) != turn_id
+            or _turn_has_content_outcome(first)
+        ):
+            return None
+        return first
+    if not isinstance(turn_projection, Mapping):
+        return None
+    retained = turn_projection.get(turn_id)
+    if (
+        not isinstance(retained, dict)
+        or _turn_id(retained) != turn_id
+        or _content_revision(retained) != revision
+        or _turn_has_content_outcome(retained)
+    ):
+        return None
+    return retained
+
+
 def _slot_binding(
     store: dict[str, Any],
     *,
@@ -11293,6 +11332,7 @@ def _drain_post_ack_reconciliations(
     chat_id: str,
     max_operations: int,
     result: dict[str, Any],
+    turn_projection: Mapping[str, Any] | None = None,
 ) -> None:
     """Drain acknowledged work locally; Tendwire must never be polled again."""
 
@@ -11319,8 +11359,14 @@ def _drain_post_ack_reconciliations(
             _checkpoint_turn_job(runtime)
             continue
         plan_token = str(obligation.get("plan_token") or "")
+        turn_id = str(obligation.get("turn_id") or "")
         revision = str(obligation.get("content_revision") or "")
-        item = _turn_item_by_revision(turns_payload, revision)
+        item = _post_ack_reconcile_item(
+            turns_payload,
+            turn_projection,
+            turn_id=turn_id,
+            revision=revision,
+        )
         if obligation.get("kind") == "suppressed":
             state.clear_tendwire_turn_job_post_ack_reconcile(
                 store, job_key
@@ -11591,6 +11637,7 @@ def _drain_turn_final(
         chat_id=chat_id,
         max_operations=max_operations,
         result=result,
+        turn_projection=turn_projection,
     )
     if result["operations"] >= max_operations:
         return result
