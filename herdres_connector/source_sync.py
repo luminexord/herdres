@@ -9368,15 +9368,28 @@ def _apply_turn_final_lease(
         )
     if not applied:
         return False
-    if payload["operation"] == "upsert" and _complete_turn_plan_from_bindings(
-        store,
-        item,
-        entry,
-        plan_token=plan_token,
-        revision=revision,
-        part_count=part_count,
-    ):
-        _checkpoint_turn_job(runtime)
+    if payload["operation"] == "upsert":
+        _entry_key, authoritative_entry = _resolve_final_source_entry(
+            store, item
+        )
+        if authoritative_entry is None:
+            _defer_turn_final(
+                runtime,
+                ref,
+                "transient_delivery",
+                result,
+                delay_seconds=1,
+            )
+            return False
+        if _complete_turn_plan_from_bindings(
+            store,
+            item,
+            authoritative_entry,
+            plan_token=plan_token,
+            revision=revision,
+            part_count=part_count,
+        ):
+            _checkpoint_turn_job(runtime)
     return _ack_turn_final(
         runtime, ref, str(lease["key"]), result
     )

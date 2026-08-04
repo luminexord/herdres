@@ -80,8 +80,8 @@ Treat these six items as one operational backup and restore unit:
 1. the Herdres state selected by `HERDR_TELEGRAM_TOPICS_STATE` (default
    `~/.local/share/herdres/state.json`), which contains private Telegram
    topic/message IDs, bot credentials and routing/ownership, ingress command
-   request records, final bindings, and stable-job delivery
-   checkpoints/receipts;
+   request records, exact final bindings, delivered identities, and the compact
+   accepted-topic receipt;
 2. the Herdres request-ID key selected by `HERDRES_REQUEST_ID_KEY_PATH`;
 3. the Tendwire database selected by `TENDWIRE_DB_PATH`;
 4. Tendwire's `installation.key`;
@@ -107,13 +107,11 @@ The sole exception is the one persisted removal of `worker_fingerprint` after
 survives restart and route loss, bypasses Tendwire client construction, sends
 the same sanitized reply, and advances the polling offset.
 
-Herdres also resumes stable-job checkpoints under fresh transient lease refs,
-ACKs already-applied work without repeating the Telegram operation, and
-reconciles a completed pending plan when the final ACK response or
-completed-plan observation was lost. A pending plan confirmed as `superseded`
-or `plan_not_found` is cleared before its newer durable root is handled; every
-other unresolved state continues to block the newer root. Do not clear or edit
-either state store, polling offsets, or replace either key as part of a restart.
+Tendwire alone resumes durable final jobs and recovery under fresh transient
+lease refs. Herdres re-polls that outbox and uses its fsynced exact Telegram
+bindings and delivered identities to ACK already-applied work without repeating
+the provider operation. Do not clear or edit either state store, polling
+offsets, or replace either key as part of a restart.
 
 An ordinary upgrade must retain this state set. Persisted Herdres workers with
 absent identity or a legacy 24-character lowercase hexadecimal identity are not
@@ -233,11 +231,12 @@ request receipt for the configured horizon and suppress the repeated mutation;
 do not replace this paired receipt continuity with a local `submitting` marker.
 
 The final-root lease covers canonical paging, range-only presentation-plan
-begin/part/commit staging, and ACK. It uses 900 seconds when unset, empty, or
+begin/part/commit staging, and ACK. It uses 60 seconds when unset, empty, or
 invalid and clamps configured values to 60 through 3600 seconds. Keep it long
 enough for the largest expected completed response. Tendwire owns durable
-final-ready roots, jobs, leases, ACK/dead-letter state, and retention; Herdres
-owns private Telegram provider state and stable-job checkpoints.
+final-ready roots, jobs, outbox recovery, leases, ACK/dead-letter state, and
+retention. Herdres owns private provider state, exact Telegram bindings,
+delivered identities, and the compact accepted-topic receipt.
 
 Start only the source connector services:
 

@@ -181,8 +181,8 @@ The paired gate must establish all of the following:
 - Tendwire's SQLite store is schema version `14` and provides turn-list-v2
   observational projections, immutable content pages, durable retained
   `final_ready` roots, range-only turn-final plans, restart-stable ordered jobs,
-  leases/ACK/dead-letter state, and explicit replacement-generation records
-  expected by this Herdres consumer. Do not qualify either side in isolation.
+  outbox recovery, and leases/ACK/dead-letter state expected by this Herdres
+  consumer. Do not qualify either side in isolation.
 - Production Herdres requests and accepts only exact integer `2` in the
   top-level Tendwire turn-list response. A v1 producer returns
   `upgrade_required`; a missing or unsupported content schema returns
@@ -217,11 +217,11 @@ The paired gate must establish all of the following:
 - Before Telegram mutation, Herdres checks for one exact message binding by job
   key, turn, revision, plan, ordinal, and part count. A match is ACK replay
   evidence and causes zero Telegram writes.
-- After a successful Telegram mutation, Herdres checkpoints that exact message
-  binding in the ordinary state file. When every part is bound, it checkpoints
-  ordered local completion and clears pending presentation fields before
-  issuing the Tendwire ACK. Committed-ACK response loss therefore restarts with
-  complete local state and no duplicate provider mutation.
+- After a successful Telegram mutation, Herdres fsyncs that exact message
+  binding. When every part is bound, it fsyncs the ordered message ids and
+  delivered identity and clears pending presentation fields before issuing the
+  Tendwire ACK. Tendwire alone owns job/outbox recovery; restart re-polls it and
+  the exact Telegram binding prevents a duplicate provider mutation.
 - Working-to-final edits, multipart ordering, supersession, retirement,
   managed-bot ownership, folds, and reply routing remain binding-driven.
   Missing retire targets are idempotent; route changes quarantine and retire
@@ -262,12 +262,11 @@ The paired gate must establish all of the following:
   repeated faulty snapshots create no duplicate state entries or topics.
 - Reply binding resolution additionally requires the resolved worker to own the
   binding topic directly or through its matching Tendwire source-space topic.
-- Goal 01B recovery still flows through Tendwire's existing `turn.list`
-  refresh and durable public source projection; Herdres never refreshes Herdr
-  itself.
+- Recovery flows through Tendwire's durable public projection and outbox;
+  Herdres never maintains a local job ledger or refreshes Herdr itself.
 - For a matching editable Working card, the authoritative completed revision
   uses the same ordered plan and produces one Working-to-final edit; repeated
-  identical source syncs make paging, prepare, edit/send, and ledger no-ops.
+  identical source syncs make paging, prepare, edit/send, and binding no-ops.
 - An exception after possible Telegram acceptance or an omitted message receipt
   is `delivery_uncertain`. It is failed closed, not automatically replayed, and
   these checks do not establish perfect provider exactly-once behavior.

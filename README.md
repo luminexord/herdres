@@ -14,8 +14,8 @@ final-ready roots and retention, pending interactions, command routing,
 backend health, range-only presentation staging, and ordered connector jobs,
 leases, ACK state, and dead-letter state. Herdres owns Telegram polling,
 topics, presentation planning and formatting, message send/edit, compact
-working updates, continuation messages, private provider state, local
-stable-job checkpoints, and Telegram delivery dedup.
+working updates, continuation messages, private provider state, exact Telegram
+bindings, delivered identities, and the compact accepted-topic receipt.
 
 **Requires [Tendwire](https://github.com/plotarmordev/tendwire)** — Herdres has
 no functionality without it. See [INSTALL.md](INSTALL.md) for setup order.
@@ -357,17 +357,16 @@ owns the durable root, presentation plan, ordered delivery jobs, leases,
 retries, and dead-letter state. Herdres owns Telegram rendering and the private
 mapping from an exact Tendwire job to its accepted Telegram message.
 
-For every leased upsert, Herdres first checks for one exact message binding
-matching job key, turn, revision, plan, ordinal, and part count. An existing
-exact binding is replay evidence: Herdres performs no send or edit and proceeds
-to the Tendwire ACK. Otherwise it performs one Telegram mutation, stores the
-returned message id with those exact coordinates, and checkpoints the ordinary
-Herdres state before ACK. Once every ordinal is represented by exactly one
-binding, Herdres records the ordered message ids and delivered identity, clears
-the pending presentation fields, and checkpoints that completion before the
-ACK can commit. Thus an ACK that commits in Tendwire but loses its response
-still leaves restart-complete local presentation state, while an uncommitted
-ACK replay uses the exact binding without duplicating Telegram work.
+For every Tendwire-leased upsert, Herdres first checks for one exact Telegram
+binding matching job key, turn, revision, plan, ordinal, and part count. An
+existing exact binding is replay evidence: Herdres performs no send or edit and
+proceeds to the Tendwire ACK. Otherwise it performs one Telegram mutation,
+persists the returned message id with those exact coordinates, and fsyncs that
+binding before ACK. Once every ordinal is represented exactly once, Herdres
+fsyncs the ordered message ids and delivered identity and clears the pending
+presentation fields before ACK. Tendwire alone owns the durable job, outbox,
+and recovery state; a restart re-polls it and uses Herdres's exact binding to
+avoid duplicate Telegram work.
 
 Working-card replacement, multipart ordering, revision supersession, old-slot
 retirement, managed-bot ownership, response folding, and reply routing all use
@@ -470,8 +469,8 @@ Tendwire worker entry that solely owns its live topic, with no existing exact-v1
 owner or conflicting reply binding. With no current claimant, the candidate is
 left unchanged to wait for a later observation. A safe adoption adds version
 `1`, refreshes the public observation fields, retargets only compatible owned
-bindings, and preserves the topic, message history, private state, and delivery
-ledger. Repeating it is a no-op.
+bindings, and preserves the topic, message history, private state, and delivered
+identities. Repeating it is a no-op.
 
 Multiple current claimants, multiple persisted candidates, incompatible state,
 ambiguous live topic ownership, an existing exact-v1 owner, or conflicting
@@ -636,9 +635,9 @@ HERDR_TELEGRAM_TOPICS_STATE="$backup_path" \
 
 Keep the copy private. A compatible pair uses Tendwire store schema `14`,
 top-level turn-list schema `2`, content-schema-v1 descriptors/pages, and the
-turn-final prepare/lease/ACK/recovery protocol. The dry check must succeed with
-`direct_herdr_calls=0` before a live sync; it does not save the copied Herdres
-state or send/edit Telegram messages. If verification fails, leave the live
+Tendwire-owned turn-final outbox prepare/lease/ACK protocol. The dry check must
+succeed with `direct_herdr_calls=0` before a live sync; it does not save the
+copied Herdres state or send/edit Telegram messages. If verification fails, leave the live
 state untouched. Do not repair continuity by editing state, copying public
 handles, deleting individual key files, or rotating identity.
 
@@ -675,9 +674,9 @@ HERDRES_TENDWIRE_MODE=source ./herdres.py doctor
 HERDRES_TENDWIRE_MODE=source ./herdres.py tendwire source-smoke --with-outbox
 ```
 
-The focused tests cover Goal 01B continuity/quarantine and recovered-final
-single-edit behavior, Goal 11 stable ingress identity and exact-request
-redelivery, schema-v2 descriptor isolation, lazy exact paging, neutral
-multipart plans, durable checkpoint/ACK resumption, explicit uncertainty, and
-one-shot failed-plan recovery. `source-smoke` must run against a copied state
-file and report `direct_herdr_calls=0`.
+The focused tests cover continuity and quarantine, stable ingress identity and
+exact-request redelivery, schema-v2 descriptor isolation, lazy exact paging,
+neutral multipart plans, Tendwire-outbox recovery through exact Telegram
+bindings, explicit uncertainty, and one-shot failed-plan recovery.
+`source-smoke` must run against a copied state file and report
+`direct_herdr_calls=0`.

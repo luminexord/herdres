@@ -38,6 +38,28 @@ from test_source_only import (
     _source_worker,
     _store,
 )
+from test_turn_final_delivery import (
+    DeletingTelegram,
+    TurnFinalTendwire,
+    _runtime as _turn_runtime,
+    _turn_row,
+)
+
+
+_PENDING_FINAL_FIELDS = {
+    "pending_turn_id",
+    "pending_content_revision",
+    "pending_plan_token",
+    "pending_turn_part_count",
+    "pending_turn_job_count",
+    "pending_turn_started_at",
+    "pending_turn_user_hash",
+    "pending_stream_submission_id",
+    "pending_plan_generation",
+    "pending_presentation_version",
+    "pending_final_identity",
+    "pending_working_predecessor_turn_id",
+}
 
 
 def _reset_lock_state():
@@ -55,6 +77,75 @@ def _competitor_can_acquire(lock_path) -> bool:
             return False
         fcntl.flock(fh, fcntl.LOCK_UN)
         return True
+
+
+def _fsynced_turn_pass(
+    statepath,
+    tendwire,
+    telegram,
+    *,
+    max_sends: int,
+    after_provider_accept=None,
+):
+    with state.state_lock(path=statepath):
+        store = state.load_state(statepath)
+
+        def checkpoint() -> None:
+            assert state.lock_actually_held()
+            state.save_state(store, statepath)
+
+        result = sync_once(
+            store,
+            _turn_runtime(
+                tendwire,
+                telegram,
+                max_sends=max_sends,
+                checkpoint=checkpoint,
+                after_provider_accept=(
+                    None
+                    if after_provider_accept is None
+                    else lambda: after_provider_accept(store)
+                ),
+            ),
+        )
+        if result.get("changed"):
+            state.save_state(store, statepath)
+    return result, state.load_state(statepath)
+
+
+def _seed_fsynced_turn_state(statepath, row) -> None:
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": row["worker_id"],
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": row.get("space_id") or "space-1",
+                "fingerprint": row["worker_fingerprint"],
+                "meta": {
+                    "agent": "codex",
+                    "stable_key": row["stable_key"],
+                    "stable_key_version": row["stable_key_version"],
+                },
+            }
+        ),
+        topic_id="77",
+    )
+    state.save_state(store, statepath)
+
+
+def _final_bindings(store, turn_id: str):
+    return sorted(
+        (
+            (message_id, binding)
+            for message_id, binding in state.message_bindings(store).items()
+            if binding.get("kind") == "final"
+            and binding.get("turn_id") == turn_id
+        ),
+        key=lambda item: item[1]["part_ordinal"],
+    )
 
 
 # --- machinery ---------------------------------------------------------------
@@ -341,6 +432,189 @@ def test_guarded_outbox_checkpoints_before_ack_and_replay_only_acks(
             "delivered_identities"
         ]
     ) == 1
+
+
+def test_fsynced_committed_ack_loss_restart_keeps_completed_identity(
+    tmp_path, monkeypatch
+) -> None:
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    row = _turn_row(
+        "turn-fsynced-committed-loss",
+        "twrev1.fsynced_committed_loss",
+        "accepted exactly once",
+    )
+    _seed_fsynced_turn_state(statepath, row)
+    tendwire = TurnFinalTendwire(row)
+    tendwire.ack_committed_response_lost_once = True
+    telegram = DeletingTelegram()
+
+    first, persisted = _fsynced_turn_pass(
+        statepath, tendwire, telegram, max_sends=1
+    )
+
+    assert first["tendwire_turn_final"]["operations"] == 1
+    assert first["tendwire_turn_final"]["acked"] == 0
+    assert first["tendwire_turn_final"]["status"] == "timeout"
+    bindings = _final_bindings(persisted, row["id"])
+    assert len(bindings) == 1
+    message_ids = [message_id for message_id, _binding in bindings]
+    assert len(telegram.sent) == 1
+    assert telegram.edited == []
+    assert telegram.deleted_messages == []
+    assert [sent[3] for sent in telegram.sent] == message_ids
+    entry = next(iter(state.source_worker_entries(persisted).values()))
+    assert entry["last_clean_message_ids"] == message_ids
+    assert entry["last_clean_content_revision"] == row["content"][
+        "content_revision"
+    ]
+    assert entry["last_clean_plan_token"] == "twplan1.plan1"
+    assert _PENDING_FINAL_FIELDS.isdisjoint(entry)
+    identity = (
+        f"final:{row['id']}:"
+        f"{row['content']['content_revision']}"
+    )
+    delivered = state.delivered_turns(persisted)[identity]
+    assert delivered["message_ids"] == message_ids
+    assert delivered["content_revision"] == row["content"][
+        "content_revision"
+    ]
+    writes = len(telegram.sent) + len(telegram.edited)
+
+    restarted, restarted_store = _fsynced_turn_pass(
+        statepath, tendwire, telegram, max_sends=1
+    )
+
+    assert restarted["tendwire_turn_final"]["polled"] == 0
+    assert restarted["tendwire_turn_final"]["operations"] == 0
+    assert len(telegram.sent) + len(telegram.edited) == writes == 1
+    restarted_entry = next(
+        iter(state.source_worker_entries(restarted_store).values())
+    )
+    assert restarted_entry["last_clean_message_ids"] == message_ids
+    assert _PENDING_FINAL_FIELDS.isdisjoint(restarted_entry)
+
+
+def test_fsynced_upsert_defers_when_reloaded_owner_is_absent(
+    tmp_path, monkeypatch
+) -> None:
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    row = _turn_row(
+        "turn-owner-removed-offlock",
+        "twrev1.owner_removed_offlock",
+        "accepted after owner removal",
+    )
+    _seed_fsynced_turn_state(statepath, row)
+    tendwire = TurnFinalTendwire(row)
+
+    telegram = DeletingTelegram()
+
+    def remove_owner_after_binding(store) -> None:
+        concurrent = state.load_state(statepath)
+        concurrent["panes"] = {}
+        state.save_state(concurrent, statepath)
+        state.reload_state_in_place(store, statepath)
+
+    result, persisted = _fsynced_turn_pass(
+        statepath,
+        tendwire,
+        telegram,
+        max_sends=1,
+        after_provider_accept=remove_owner_after_binding,
+    )
+
+    assert len(telegram.sent) == 1
+    assert tendwire.ack_calls == []
+    assert len(tendwire.defer_calls) == 1
+    assert tendwire.defer_calls[0][1] == "transient_delivery"
+    assert result["tendwire_turn_final"]["acked"] == 0
+    assert result["tendwire_turn_final"]["deferred"] == 1
+    assert state.source_worker_entries(persisted) == {}
+
+
+@pytest.mark.parametrize(
+    "ack_loss_flag",
+    ["ack_loss_once", "ack_committed_response_lost_once"],
+)
+def test_fsynced_multipart_ack_loss_restart_writes_each_ordinal_once(
+    tmp_path, monkeypatch, ack_loss_flag
+) -> None:
+    statepath = tmp_path / f"{ack_loss_flag}.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    text = ("ordered fsynced multipart answer\n\n" * 900) + "FINAL_TAIL"
+    row = _turn_row(
+        f"turn-fsynced-{ack_loss_flag}",
+        f"twrev1.fsynced_{ack_loss_flag}",
+        text,
+    )
+    _seed_fsynced_turn_state(statepath, row)
+    tendwire = TurnFinalTendwire(row)
+    setattr(tendwire, ack_loss_flag, True)
+    telegram = DeletingTelegram()
+
+    first, prefix_store = _fsynced_turn_pass(
+        statepath, tendwire, telegram, max_sends=1
+    )
+
+    part_count = int(tendwire._plans["twplan1.plan1"]["part_count"])
+    assert part_count > 1
+    assert first["tendwire_turn_final"]["operations"] == 1
+    assert first["tendwire_turn_final"]["acked"] == 0
+    assert len(_final_bindings(prefix_store, row["id"])) == 1
+    assert len(telegram.sent) == 1
+
+    resumed, converged = _fsynced_turn_pass(
+        statepath, tendwire, telegram, max_sends=part_count + 1
+    )
+
+    bindings = _final_bindings(converged, row["id"])
+    message_ids = [message_id for message_id, _binding in bindings]
+    assert [binding["part_ordinal"] for _message_id, binding in bindings] == list(
+        range(part_count)
+    )
+    assert [sent[3] for sent in telegram.sent] == message_ids
+    assert len(telegram.sent) == part_count
+    assert len(set(message_ids)) == part_count
+    assert telegram.edited == []
+    assert telegram.deleted_messages == []
+    entry = next(iter(state.source_worker_entries(converged).values()))
+    assert entry["last_clean_message_ids"] == message_ids
+    assert entry["last_clean_content_revision"] == row["content"][
+        "content_revision"
+    ]
+    assert entry["last_clean_plan_token"] == "twplan1.plan1"
+    assert _PENDING_FINAL_FIELDS.isdisjoint(entry)
+    identity = (
+        f"final:{row['id']}:"
+        f"{row['content']['content_revision']}"
+    )
+    assert state.delivered_turns(converged)[identity][
+        "message_ids"
+    ] == message_ids
+    assert resumed["tendwire_turn_final"]["operations"] == part_count - 1
+
+    restarted, restarted_store = _fsynced_turn_pass(
+        statepath, tendwire, telegram, max_sends=part_count + 1
+    )
+
+    assert restarted["tendwire_turn_final"]["polled"] == 0
+    assert restarted["tendwire_turn_final"]["operations"] == 0
+    assert len(telegram.sent) == part_count
+    restarted_entry = next(
+        iter(state.source_worker_entries(restarted_store).values())
+    )
+    assert restarted_entry["last_clean_message_ids"] == message_ids
+    assert _PENDING_FINAL_FIELDS.isdisjoint(restarted_entry)
 
 
 def test_guarded_topic_icon_catalog_persists_and_is_reused(
