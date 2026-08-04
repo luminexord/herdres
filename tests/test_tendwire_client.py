@@ -226,6 +226,7 @@ def test_command_uses_one_daemon_rpc_and_accepts_exact_v3_response(tmp_path: Pat
         lambda body: body.update(schema_version=4),
         lambda body: body.update(disposition="no_receipt"),
         lambda body: body["result"].update(backend_target="private"),
+        lambda body: body["result"].update(target=None),
         lambda body: body["result"].update(submission_verdict="unknown"),
     ],
 )
@@ -607,6 +608,7 @@ def test_prepare_accepts_public_safe_recovery_request_id(tmp_path: Path) -> None
         {"schema_version": 1, "ok": True, "host_id": "host-public", "name": "turn-final", "items": []},
         {"schema_version": 1, "ok": True, "status": "ok", "host_id": "host-public", "name": "turn-final"},
         {"schema_version": 1, "ok": True, "status": "ok", "host_id": "host-public", "name": "turn-final", "items": [{"ref": "twref1.bad", "payload": {}}]},
+        {"schema_version": 1, "ok": True, "status": "ok", "host_id": "host-public", "name": "turn-final", "items": [{"ref": "twref1.bad", "key": "bad", "attempt": "one", "leased_until": "later", "available_at": "now", "payload": {}}]},
         {"schema_version": 1, "ok": False, "status": "invalid_params", "host_id": "host-public", "name": "turn-final", "error": {"code": "wrong", "message": "bad"}},
     ],
 )

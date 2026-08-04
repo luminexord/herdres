@@ -197,7 +197,6 @@ class SyncRuntime:
     with_outbox: bool = True
     max_sends: int = 8
     checkpoint: Callable[[], None] | None = None
-    lock_handoff: Callable[[], None] | None = None
     after_provider_accept: Callable[[], None] | None = None
     delivery_write_budget: _DeliveryWriteBudget | None = None
 
@@ -1715,7 +1714,6 @@ def _offlock_runtime(
         with_outbox=runtime.with_outbox,
         max_sends=runtime.max_sends,
         checkpoint=runtime.checkpoint,
-        lock_handoff=runtime.lock_handoff,
         after_provider_accept=runtime.after_provider_accept,
         delivery_write_budget=runtime.delivery_write_budget,
     )
@@ -14133,7 +14131,6 @@ def _observe_sync_inputs(
         max_sends=runtime.max_sends,
         # Private observation must never checkpoint its speculative copy.
         checkpoint=None,
-        lock_handoff=runtime.lock_handoff,
         after_provider_accept=runtime.after_provider_accept,
     )
     with state.released_lock():
@@ -14320,8 +14317,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             return
         state.save_state(store)
         with state.released_lock():
-            if runtime.lock_handoff is not None:
-                runtime.lock_handoff()
+            pass
         state.reload_state_in_place(store)
 
     yield_barrier = (

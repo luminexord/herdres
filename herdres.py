@@ -45,19 +45,6 @@ TERMINAL_SUCCESS_REPLIES = {
     "Sent to Tendwire worker.",
     BUSY_SEND_REPLY,
 }
-_OUTBOUND_WAITING = threading.Event()
-_OUTBOUND_ACQUIRED = threading.Event()
-
-
-def _handoff_to_waiting_outbound() -> None:
-    """Give an announced connector poll one bounded flock acquisition window."""
-
-    if _OUTBOUND_WAITING.is_set():
-        _OUTBOUND_ACQUIRED.wait(timeout=1.0)
-    else:
-        time.sleep(0)
-
-
 REKEYED_TOPIC_QUARANTINE_REPLY = (
     "This pane was re-keyed after a Herdr restart; a fresh topic is being "
     "created. Please use the new pane topic when it appears."
@@ -88,7 +75,6 @@ def _runtime(
     dry_run: bool = False,
     with_outbox: bool = True,
     checkpoint: Callable[[], None] | None = None,
-    lock_handoff: Callable[[], None] | None = None,
 ) -> SyncRuntime:
     token = config.telegram_token()
     runtime = SyncRuntime(
@@ -100,7 +86,6 @@ def _runtime(
     # SyncRuntime intentionally remains constructible by old callers. The source executor consumes
     # this optional seam when it needs a durable receipt before acknowledging a Tendwire job.
     runtime.checkpoint = checkpoint
-    runtime.lock_handoff = lock_handoff
     return runtime
 
 
@@ -1041,7 +1026,6 @@ def _sync_pass(*, with_outbox: bool = True) -> dict[str, Any]:
                     dry_run=False,
                     with_outbox=with_outbox,
                     checkpoint=checkpoint,
-                    lock_handoff=_handoff_to_waiting_outbound,
                 ),
             )
         if result.get("changed"):
@@ -1053,38 +1037,30 @@ def _sync_pass(*, with_outbox: bool = True) -> dict[str, Any]:
 def _outbound_pass() -> dict[str, Any]:
     """Drain connector work without snapshot, turn, pending, or pane scans."""
 
-    _OUTBOUND_ACQUIRED.clear()
-    _OUTBOUND_WAITING.set()
-    try:
-        with state.state_lock(phase="outbound_pass.load"):
-            _OUTBOUND_ACQUIRED.set()
-            _OUTBOUND_WAITING.clear()
-            with state.lock_phase("outbound_pass.load"):
-                store = state.load_state()
+    with state.state_lock(phase="outbound_pass.load"):
+        with state.lock_phase("outbound_pass.load"):
+            store = state.load_state()
 
-            def checkpoint() -> None:
-                if not state.lock_held():
-                    raise RuntimeError("outbound checkpoint requires the held state lock")
-                with state.lock_phase("outbound.checkpoint"):
-                    state.save_state(store)
+        def checkpoint() -> None:
+            if not state.lock_held():
+                raise RuntimeError("outbound checkpoint requires the held state lock")
+            with state.lock_phase("outbound.checkpoint"):
+                state.save_state(store)
 
-            with state.lock_phase("outbound.drain"):
-                result = drain_outbound_once(
-                    store,
-                    _runtime(
-                        dry_run=False,
-                        with_outbox=True,
-                        checkpoint=checkpoint,
-                    ),
-                    chat_id=config.telegram_chat_id(store),
-                )
-            if result.get("changed"):
-                with state.lock_phase("outbound_pass.final_save"):
-                    state.save_state(store)
-        return result
-    finally:
-        _OUTBOUND_WAITING.clear()
-        _OUTBOUND_ACQUIRED.set()
+        with state.lock_phase("outbound.drain"):
+            result = drain_outbound_once(
+                store,
+                _runtime(
+                    dry_run=False,
+                    with_outbox=True,
+                    checkpoint=checkpoint,
+                ),
+                chat_id=config.telegram_chat_id(store),
+            )
+        if result.get("changed"):
+            with state.lock_phase("outbound_pass.final_save"):
+                state.save_state(store)
+    return result
 
 
 def _connector_poll_loop(stop: threading.Event) -> None:
