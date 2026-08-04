@@ -252,6 +252,47 @@ class TurnFinalTendwire:
             "turns": [deepcopy(self.row)],
         }
 
+    def turn_delta(self, *, cursor=None, watermark=None, limit=500):
+        assert cursor is None
+        assert limit > 0
+        payload = self.turns()
+        rows = deepcopy(payload.get("turns", []))
+        revision = hashlib.sha256(
+            json.dumps(rows, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        checkpoint = f"twdelta1.turn_final_{revision}"
+        changes = []
+        if watermark != checkpoint:
+            changes.extend(
+                {
+                    "op": "upsert",
+                    "turn_id": str(
+                        row.get("id") or row.get("turn_id") or ""
+                    ),
+                    "changed_at": "2030-01-01T00:00:00Z",
+                    "turn": row,
+                }
+                if isinstance(row, dict)
+                else row
+                for row in rows
+            )
+        return {
+            "schema_version": 1,
+            "projection_schema_version": payload.get("schema_version"),
+            "host_id": "turn-final-fake-tendwire",
+            "mode": "bootstrap" if watermark is None else "changes",
+            "changes": changes,
+            "has_more": False,
+            "next_cursor": None,
+            "checkpoint": checkpoint,
+            "aggregate": {
+                "journal_rows_scanned": len(changes),
+                "projection_rows_read": len(rows),
+                "changes_returned": len(changes),
+                "duration_ms": 1,
+            },
+        }
+
     def pending(self):
         return {"ok": True, "pending_interactions": []}
 
@@ -2064,6 +2105,7 @@ def test_final_edits_exact_command_predecessor_working_card(
 def test_schema_incomplete_and_bad_page_refuse_before_any_telegram_activity(monkeypatch):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDRES_TENDWIRE_FORCE_FULL_RECONCILE", "1")
     telegram = DeletingTelegram()
     bad_schema = TurnFinalTendwire(_turn_row("turn-bad", "twrev1.bad", "answer"))
     bad_schema.turns = lambda: {"ok": True, "schema_version": 3, "turns": []}
@@ -2938,6 +2980,9 @@ def test_turn_final_rebind_during_ack_records_local_reconciliation(
     assert [sent[2]["thread_id"] for sent in telegram.sent] == ["77"]
 
     real_planner = source_sync.prepare_turn_delivery_parts
+    # A current delta event re-observes the acknowledged source and retries
+    # its pending local reconciliation on the next pass.
+    tendwire.row["updated_at"] = "2030-01-01T00:00:01Z"
     monkeypatch.setattr(
         source_sync,
         "prepare_turn_delivery_parts",

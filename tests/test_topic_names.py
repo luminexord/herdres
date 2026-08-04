@@ -110,8 +110,8 @@ def test_assign_keeps_matching_names_and_numbered_variants():
 
 
 def test_rename_candidates_old_name_stays_reserved():
-    # While a rename is pending, a NEW pane must not take the old name (it would collide into the
-    # old topic via _ensure_topic's reuse-by-name). It gets a numbered variant instead.
+    # While a rename is pending, a NEW pane must not claim the old topic's name. It gets a
+    # numbered variant instead.
     store = {"version": 2, "spaces": {}, "panes": {
         "worker:a": _wentry("a", topic_id="1", topic_name="doro"),
     }}

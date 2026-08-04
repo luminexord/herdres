@@ -30,11 +30,12 @@ def _worker(
     worker_id: str = "claude-live",
     *,
     fingerprint: str = "fp-live",
+    status: str = "working",
 ) -> dict:
     return {
         "id": worker_id,
         "name": "Claude",
-        "status": "working",
+        "status": status,
         "space_id": "workspace-1",
         "fingerprint": fingerprint,
         "last_seen_at": datetime.now(timezone.utc).isoformat(),
@@ -991,7 +992,11 @@ def test_unknown_distinct_live_topic_claims_fail_closed_across_passes(
         )
     runtime = SyncRuntime(
         FakeTendwire(
-            workers=[_worker("claude-live", fingerprint="fp-a")],
+            workers=[
+                _worker(
+                    "claude-live", fingerprint="fp-a", status="idle"
+                )
+            ],
             turns={"turns": [_final("claude-live")]},
             spaces=[],
         ),

@@ -5375,8 +5375,8 @@ def _assign_worker_topic_names(
         return cur == b or (cur.startswith(b + " ") and current[len(base) + 1 :].strip().isdigit())
 
     entries = state.source_worker_entries(store)
-    # EVERY existing topic name starts reserved (absent/closed workers' topics included — a new pane
-    # must never collide with them, or _ensure_topic's reuse-by-name would collapse into their topic).
+    # EVERY existing topic name starts reserved (absent/closed workers' topics included) so a new
+    # pane never proposes a name already owned by a different topic.
     reserved: set[str] = set()
     for entry in entries.values():
         if entry.get("topic_id") and entry.get("topic_name"):
@@ -5413,9 +5413,8 @@ def _assign_worker_topic_names(
         current = compact_ws(existing.get("topic_name"), 120)
         keep = _is_variant_of(current, state.topic_name_for_worker(worker))
         keeps[assignment_key] = keep
-        # NOTE: the old name stays RESERVED even when a rename is proposed — freeing it mid-pass
-        # would let a new pane take it and collide into this topic via _ensure_topic's reuse-by-name
-        # (two live panes sharing one topic). It frees naturally on the pass AFTER the rename lands.
+        # NOTE: the old name stays RESERVED even when a rename is proposed. It frees naturally on
+        # the pass AFTER the rename lands, preventing two live panes from claiming the same name.
     assigned: dict[str, str] = {}
     renames: dict[str, str] = {}
     # wid -> base for names the connector itself minted a " N" suffix onto this pass (name != base after
@@ -14596,30 +14595,24 @@ def _observe_sync_inputs(
     before the private projection can be adopted.
     """
 
-    has_delta = hasattr(runtime.tendwire, "turn_delta")
     if not state.lock_held():
         snapshot = runtime.tendwire.snapshot()
         if _herdr_backend_explicitly_unhealthy(snapshot):
             return {"unhealthy": True, "snapshot": snapshot}
-        observation = (
-            _observe_turn_delta(store, runtime, now=now) if has_delta else None
-        )
-        if observation is not None and observation["kind"] == "full":
+        observation = _observe_turn_delta(store, runtime, now=now)
+        if observation["kind"] == "full":
             turns_payload = runtime.tendwire.turns()
-        elif observation is not None and observation["kind"] == "delta":
+        elif observation["kind"] == "delta":
             turns_payload = {
                 "schema_version": TURN_SCHEMA_VERSION,
                 "turns": observation["upserts"],
             }
-        elif observation is not None:
+        else:
             turns_payload = {
                 "schema_version": TURN_SCHEMA_VERSION,
                 "turns": [],
             }
-        else:
-            turns_payload = runtime.tendwire.turns()
-        if isinstance(observation, dict):
-            observation["apply_basis"] = deepcopy(observation["delta"])
+        observation["apply_basis"] = deepcopy(observation["delta"])
         return {
             "snapshot": snapshot,
             "delta_observation": observation,
@@ -14629,10 +14622,9 @@ def _observe_sync_inputs(
 
     # Materialize default delta state before the phase-1 save so the equality
     # check below compares a durable, explicit cursor/projection basis.
-    if has_delta:
-        _delta_state(store, now=now)
+    _delta_state(store, now=now)
     state.save_state(store)
-    delta_basis = deepcopy(store.get(_DELTA_STATE_KEY)) if has_delta else None
+    delta_basis = deepcopy(store[_DELTA_STATE_KEY])
     observed_store = deepcopy(store)
     observed_runtime = SyncRuntime(
         runtime.tendwire,
@@ -14649,27 +14641,21 @@ def _observe_sync_inputs(
         if _herdr_backend_explicitly_unhealthy(snapshot):
             observed = {"unhealthy": True, "snapshot": snapshot}
         else:
-            observation = (
-                _observe_turn_delta(
-                    observed_store, observed_runtime, now=now
-                )
-                if has_delta
-                else None
+            observation = _observe_turn_delta(
+                observed_store, observed_runtime, now=now
             )
-            if observation is not None and observation["kind"] == "full":
+            if observation["kind"] == "full":
                 turns_payload = runtime.tendwire.turns()
-            elif observation is not None and observation["kind"] == "delta":
+            elif observation["kind"] == "delta":
                 turns_payload = {
                     "schema_version": TURN_SCHEMA_VERSION,
                     "turns": observation["upserts"],
                 }
-            elif observation is not None:
+            else:
                 turns_payload = {
                     "schema_version": TURN_SCHEMA_VERSION,
                     "turns": [],
                 }
-            else:
-                turns_payload = runtime.tendwire.turns()
             observed = {
                 "snapshot": snapshot,
                 "delta_observation": observation,
@@ -14680,20 +14666,17 @@ def _observe_sync_inputs(
     state.reload_state_in_place(store)
     if observed.get("unhealthy"):
         return observed
-    if has_delta:
-        if store.get(_DELTA_STATE_KEY) != delta_basis:
-            # Another observer advanced or re-bootstrapped the cursor while the
-            # RPC was in flight. Discard this page; applying it to the new basis
-            # would fork the retained projection.
-            return {"cursor_conflict": True}
-        observation = observed.get("delta_observation")
-        if isinstance(observation, dict):
-            store[_DELTA_STATE_KEY] = deepcopy(observation["delta"])
-            observation["delta"] = store[_DELTA_STATE_KEY]
-            # Later delivery/cleanup phases open more release windows.  Keep the
-            # exact adopted basis so the page can be revalidated immediately
-            # before its checkpoint is applied.
-            observation["apply_basis"] = deepcopy(observation["delta"])
+    if store.get(_DELTA_STATE_KEY) != delta_basis:
+        # Another observer advanced the cursor while the RPC was in flight.
+        # Discard this page; applying it to the new basis would fork the
+        # retained projection.
+        return {"cursor_conflict": True}
+    observation = observed["delta_observation"]
+    store[_DELTA_STATE_KEY] = deepcopy(observation["delta"])
+    observation["delta"] = store[_DELTA_STATE_KEY]
+    # Later delivery/cleanup phases open more release windows. Keep the exact
+    # adopted basis so the page can be revalidated before its checkpoint.
+    observation["apply_basis"] = deepcopy(observation["delta"])
     return observed
 
 

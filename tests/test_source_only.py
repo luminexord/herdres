@@ -1901,6 +1901,7 @@ class FakeTendwire:
                 "fingerprint": "space-fp-1",
             }
         ]
+        self.delta_calls = []
 
     def snapshot(self):
         return {
@@ -1911,6 +1912,104 @@ class FakeTendwire:
 
     def turns(self):
         return self._turns
+
+    @staticmethod
+    def _field_descriptor(value):
+        text = value if isinstance(value, str) else ""
+        return {
+            "availability": "complete" if value is not None else "absent",
+            "inline": value is not None,
+            "char_length": len(text),
+            "byte_length": len(text.encode("utf-8")),
+            "page_count": 1 if value is not None else 0,
+            "first_cursor": None,
+        }
+
+    def _delta_row(self, raw):
+        if not isinstance(raw, dict):
+            return raw
+        row = copy.deepcopy(raw)
+        worker = next(
+            (
+                candidate
+                for candidate in self._workers
+                if str(candidate.get("id") or "")
+                == str(row.get("worker_id") or "")
+            ),
+            None,
+        )
+        if isinstance(worker, dict):
+            row.setdefault("worker_fingerprint", worker.get("fingerprint"))
+            row.setdefault("space_id", worker.get("space_id"))
+            meta = worker.get("meta")
+            if isinstance(meta, dict):
+                if meta.get("stable_key") is not None:
+                    row.setdefault("stable_key", meta["stable_key"])
+                if meta.get("stable_key_version") is not None:
+                    row.setdefault(
+                        "stable_key_version", meta["stable_key_version"]
+                    )
+        if "content" not in row:
+            revision = hashlib.sha256(
+                json.dumps(row, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+            row["content"] = {
+                "schema_version": 1,
+                "content_revision": f"twrev1.fake_{revision}",
+                "known_incomplete": False,
+                "fields": {
+                    "user_text": self._field_descriptor(
+                        row.get("user_text")
+                    ),
+                    "assistant_final_text": self._field_descriptor(
+                        row.get("assistant_final_text")
+                    ),
+                },
+            }
+        return row
+
+    def turn_delta(self, *, cursor=None, watermark=None, limit=500):
+        self.delta_calls.append(
+            {"cursor": cursor, "watermark": watermark, "limit": limit}
+        )
+        assert cursor is None
+        assert limit > 0
+        rows = [self._delta_row(raw) for raw in self._turns.get("turns", [])]
+        revision = hashlib.sha256(
+            json.dumps(rows, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        checkpoint = f"twdelta1.fake_{revision}"
+        changes = []
+        if watermark != checkpoint:
+            for row in rows:
+                if not isinstance(row, dict):
+                    changes.append(row)
+                    continue
+                turn_id = str(row.get("id") or row.get("turn_id") or "")
+                changes.append(
+                    {
+                        "op": "upsert",
+                        "turn_id": turn_id,
+                        "changed_at": "2030-01-01T00:00:00Z",
+                        "turn": row,
+                    }
+                )
+        return {
+            "schema_version": 1,
+            "projection_schema_version": 2,
+            "host_id": "shared-fake-tendwire",
+            "mode": "bootstrap" if watermark is None else "changes",
+            "changes": changes,
+            "has_more": False,
+            "next_cursor": None,
+            "checkpoint": checkpoint,
+            "aggregate": {
+                "journal_rows_scanned": len(changes),
+                "projection_rows_read": len(rows),
+                "changes_returned": len(changes),
+                "duration_ms": 1,
+            },
+        }
 
     def pending(self):
         return self._pending
@@ -2081,6 +2180,18 @@ def _store():
         "panes": {},
         "spaces": {},
         "tendwired_bootstrap_complete": True,
+        "tendwire_delta_sync": {
+            "schema_version": 1,
+            "projection_schema_version": 2,
+            "status": "active",
+            "watermark": "twdelta1.test_baseline",
+            "pending_cursor": None,
+            "projection": {},
+            "bootstrap_state": None,
+            "failure_count": 0,
+            "watermark_updated_at": 4102444800,
+            "last_full_reconcile_at": 4102444800,
+        },
     }
 
 
@@ -3134,6 +3245,7 @@ def test_invalid_turn_schema_preflight_fails_before_all_mutation(
     monkeypatch, schema_version, received
 ):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_TENDWIRE_FORCE_FULL_RECONCILE", "1")
     store = _store()
     store["continuity_sentinel"] = {"topic_id": "77", "pin_id": "55"}
     before = json.loads(json.dumps(store))
@@ -3237,7 +3349,25 @@ def test_sync_backfills_existing_message_bindings(monkeypatch):
         topic_id="77",
     )
 
-    result = sync_once(store, SyncRuntime(FakeTendwire(), FakeTelegram(), with_outbox=False))
+    result = sync_once(
+        store,
+        SyncRuntime(
+            FakeTendwire(
+                turns={
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "worker_id": "worker-1",
+                            "assistant_final_text": "already delivered",
+                            "complete": True,
+                        }
+                    ]
+                }
+            ),
+            FakeTelegram(),
+            with_outbox=False,
+        ),
+    )
 
     assert result["message_bindings"] == 1
     binding = state.find_message_binding(store, "555", topic_id="77")

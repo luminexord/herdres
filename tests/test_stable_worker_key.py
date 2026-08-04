@@ -283,8 +283,10 @@ def test_malformed_or_unknown_pairs_are_quarantined_and_never_persisted(stable_k
 @pytest.mark.parametrize(
     "worker",
     [
-        _worker("claude-2"),
-        _worker("claude-2", "source-spoof", version=1),
+        _worker("claude-2", status="idle"),
+        _worker(
+            "claude-2", "source-spoof", version=1, status="idle"
+        ),
     ],
     ids=["missing", "malformed"],
 )
@@ -557,7 +559,10 @@ def test_fresh_duplicate_key_claimants_are_all_quarantined_without_routing_or_to
 ):
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", topic_mode)
     store = _store()
-    workers = [_worker("claude-2", KEY_A), _worker("claude-3", KEY_A)]
+    workers = [
+        _worker("claude-2", KEY_A, status="idle"),
+        _worker("claude-3", KEY_A, status="idle"),
+    ]
     turns = {"turns": [_final_turn("claude-2"), _final_turn("claude-3", turn_id="turn-2")]}
     first_telegram = FakeTelegram()
 
@@ -1628,7 +1633,19 @@ def test_terminal_snapshot_duplicates_are_order_and_repeat_idempotent_without_de
         )
         for status in statuses
     ]
-    turns = {"turns": [_final_turn("worker-1")]}
+    turns = {
+        "turns": [
+            {
+                "id": "turn-1",
+                "worker_id": "worker-1",
+                "worker_fingerprint": "fp-identical",
+                "assistant_stream_text": "Still working",
+                "complete": False,
+            }
+            if "working" in statuses
+            else _final_turn("worker-1")
+        ]
+    }
 
     def run(observations):
         store = _store()
@@ -1674,6 +1691,7 @@ def test_missing_and_malformed_same_id_rows_have_total_slot_order_on_repeat():
     missing = _worker(
         "worker-1",
         space="space-1",
+        status="idle",
         fingerprint="fp-identical",
     )
     malformed = _worker(
@@ -1681,6 +1699,7 @@ def test_missing_and_malformed_same_id_rows_have_total_slot_order_on_repeat():
         "malformed",
         version=1,
         space="space-1",
+        status="idle",
         fingerprint="fp-identical",
     )
 
@@ -1926,7 +1945,12 @@ def test_explicit_unhealthy_herdr_snapshot_preserves_authenticated_state_until_h
     recovered_entries = state.source_worker_entries(store)
     assert recovered["ok"] is True
     assert recovered["feed_sent"] == 0
-    assert (recovery_tendwire.snapshot_calls, recovery_tendwire.turn_calls, recovery_tendwire.pending_calls) == (1, 1, 1)
+    assert (
+        recovery_tendwire.snapshot_calls,
+        len(recovery_tendwire.delta_calls),
+        recovery_tendwire.turn_calls,
+        recovery_tendwire.pending_calls,
+    ) == (1, 1, 0, 1)
     assert len(recovered_entries) == 1
     assert next(iter(recovered_entries.values()))["topic_id"] == original_topic
     assert next(iter(recovered_entries.values()))["tendwire_worker_id"] == "claude-2-2"
@@ -1961,5 +1985,10 @@ def test_absent_malformed_or_non_herdr_backend_health_remains_compatible(backend
 
     assert result["ok"] is True
     assert result["created"] == 2
-    assert (tendwire.snapshot_calls, tendwire.turn_calls, tendwire.pending_calls) == (1, 1, 1)
+    assert (
+        tendwire.snapshot_calls,
+        len(tendwire.delta_calls),
+        tendwire.turn_calls,
+        tendwire.pending_calls,
+    ) == (1, 1, 0, 1)
     assert telegram.topics == ["telegram-bot"]

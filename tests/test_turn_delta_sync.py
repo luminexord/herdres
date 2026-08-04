@@ -13,11 +13,17 @@ from herdres_connector.source_sync import (
     SyncRuntime,
     sync_once,
 )
-from test_source_only import FakeTelegram, FakeTendwire, _store
+from test_source_only import FakeTelegram, FakeTendwire, _store as _source_store
 from test_turn_final_delivery import TurnFinalTendwire, _stable_key, _turn_row
 
 
 HOST = "host-public"
+
+
+def _store():
+    current = _source_store()
+    current.pop("tendwire_delta_sync", None)
+    return current
 
 
 def _page(
@@ -123,6 +129,29 @@ def test_delta_default_page_size_completes_supported_bootstrap_within_cursor_ttl
 ):
     monkeypatch.delenv("HERDRES_TENDWIRE_DELTA_LIMIT", raising=False)
     assert config.tendwire_delta_limit() == 500
+
+
+def test_sync_requires_turn_delta_and_never_falls_back_to_full_list():
+    class NoDeltaTendwire:
+        def __init__(self):
+            self.turn_calls = 0
+
+        def snapshot(self):
+            return {"ok": True, "workers": [], "spaces": []}
+
+        def turns(self):
+            self.turn_calls += 1
+            return {"ok": True, "schema_version": 2, "turns": []}
+
+    tendwire = NoDeltaTendwire()
+
+    with pytest.raises(AttributeError, match="turn_delta"):
+        sync_once(
+            _store(),
+            SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
+        )
+
+    assert tendwire.turn_calls == 0
 
 
 def test_unchanged_active_sync_uses_only_one_delta_page_and_no_provider_or_content():

@@ -1575,12 +1575,16 @@ def test_v3_submission_receipt_renders_working_and_links_delta(
     linked_turn["submission_state"] = "linked"
 
     class LinkedDelta(FakeTendwire):
-        def turn_delta(self, **_kwargs):
+        def turn_delta(self, **kwargs):
             return {
                 "schema_version": 1,
                 "projection_schema_version": 2,
                 "host_id": "host-public",
-                "mode": "bootstrap",
+                "mode": (
+                    "bootstrap"
+                    if kwargs.get("watermark") is None
+                    else "changes"
+                ),
                 "changes": [
                     {
                         "op": "upsert",

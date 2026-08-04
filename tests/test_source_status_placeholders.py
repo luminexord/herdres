@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from herdres_connector import state
 from herdres_connector.source_sync import SyncRuntime, sync_once
-from test_source_only import _source_worker
+from test_source_only import (
+    FakeTendwire as _SourceFakeTendwire,
+    _source_worker,
+)
 
 
-class FakeTendwire:
+class FakeTendwire(_SourceFakeTendwire):
     def __init__(self, turns=None, workers=None, spaces=None):
-        self._turns = dict(turns) if turns is not None else {"turns": []}
-        self._turns.setdefault("schema_version", 2)
         raw_workers = workers if workers is not None else [
             {
                 "id": "worker-live",
@@ -19,8 +20,7 @@ class FakeTendwire:
                 "meta": {"agent": "claude", "raw_status": "working"},
             }
         ]
-        self._workers = [_source_worker(worker) for worker in raw_workers]
-        self._spaces = spaces if spaces is not None else [
+        raw_spaces = spaces if spaces is not None else [
             {
                 "id": "space-workers",
                 "name": "Workers",
@@ -28,18 +28,11 @@ class FakeTendwire:
                 "fingerprint": "space-fp",
             }
         ]
-
-    def snapshot(self):
-        return {"ok": True, "workers": self._workers, "spaces": self._spaces}
-
-    def turns(self):
-        return self._turns
-
-    def pending(self):
-        return {"pending_interactions": []}
-
-    def connector_poll(self, **_kwargs):
-        return {"ok": True, "items": []}
+        super().__init__(
+            turns=turns,
+            workers=raw_workers,
+            spaces=raw_spaces,
+        )
 
 
 class FakeTelegram:
