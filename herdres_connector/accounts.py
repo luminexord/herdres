@@ -4,13 +4,12 @@ Reads plan metadata from the local CLI credential files (named fields only — N
 tokens themselves) and the REMAINING rate-limit headroom per window, rendered as e.g.
 
     🔑 Max 20x · 5h 76% left (1h10m) · wk 68% left (Sun)
-    🔑 ChatGPT Pro · 5h 86% left (2h05m) · wk 98% left (Fri)
+    🔑 ChatGPT Pro
 
-Sources:
-- Claude: the OAuth usage endpoint the in-app /usage screen uses (bearer = the access
-  token from ~/.claude/.credentials.json, read in-process and never rendered/logged).
-- Codex: the `rate_limits` events the codex CLI writes into its session JSONL files
-  (primary = 5h window, secondary = weekly) — local, no network.
+Quota source: the Claude OAuth usage endpoint the in-app /usage screen uses (bearer =
+the access token from ~/.claude/.credentials.json, read in-process and never
+rendered/logged). Codex identity metadata is read from its auth file, but Herdres does
+not read agent session logs.
 
 The snapshot is disk-cached with a coarse TTL: every value change re-edits every pinned
 board, so the TTL (config.usage_refresh_seconds) is the pin-edit rate limiter, and reset
@@ -19,9 +18,7 @@ countdowns are rounded to 5 minutes for the same reason.
 from __future__ import annotations
 
 import base64
-import glob
 import json
-import os
 import time
 import urllib.request
 from datetime import datetime
@@ -32,13 +29,10 @@ from . import config
 
 CLAUDE_CREDENTIALS_PATH = Path.home() / ".claude/.credentials.json"
 CODEX_AUTH_PATH = Path.home() / ".codex/auth.json"
-CODEX_SESSIONS_DIR = Path.home() / ".codex/sessions"
 USAGE_CACHE_PATH = Path.home() / ".local/share/herdres/usage_cache.json"
 
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 HTTP_TIMEOUT_SECONDS = 15
-_SESSION_TAIL_BYTES = 400_000
-_SESSION_FILES_TO_SCAN = 3
 
 # Process-local memo so one sync pass touching many topics reads/refreshes at most once,
 # even when the sources fail (a failed refresh would otherwise retry per topic).
@@ -172,73 +166,11 @@ def _claude_limits() -> dict[str, Any]:
     return limits
 
 
-def _last_rate_limits_line(path: Path) -> dict[str, Any]:
-    try:
-        with open(path, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - _SESSION_TAIL_BYTES))
-            tail = handle.read().decode("utf-8", "replace")
-    except Exception:
-        return {}
-    for line in reversed(tail.splitlines()):
-        if '"rate_limits"' not in line:
-            continue
-        try:
-            found = _dig_rate_limits(json.loads(line))
-        except Exception:
-            continue
-        if found:
-            return found
-    return {}
-
-
-def _dig_rate_limits(obj: Any) -> dict[str, Any]:
-    if isinstance(obj, dict):
-        limits = obj.get("rate_limits")
-        if isinstance(limits, dict):
-            return limits
-        for value in obj.values():
-            found = _dig_rate_limits(value)
-            if found:
-                return found
-    return {}
-
-
-def _codex_limits() -> dict[str, Any]:
-    """5h/weekly windows from the newest `rate_limits` event in the codex session logs
-    (primary = 5h, secondary = weekly). Local files only — no network."""
-    try:
-        files = sorted(
-            glob.glob(str(Path(CODEX_SESSIONS_DIR) / "**" / "*.jsonl"), recursive=True),
-            key=os.path.getmtime,
-        )
-    except Exception:
-        return {}
-    for path in reversed(files[-_SESSION_FILES_TO_SCAN:] if files else []):
-        raw = _last_rate_limits_line(Path(path))
-        if not raw:
-            continue
-        limits: dict[str, Any] = {}
-        for key, field in (("five_hour", "primary"), ("weekly", "secondary")):
-            window_raw = raw.get(field)
-            if isinstance(window_raw, dict):
-                window = _window(window_raw.get("used_percent"), window_raw.get("resets_at"))
-                if window:
-                    limits[key] = window
-        if limits:
-            return limits
-    return {}
-
-
-def _collect_usage(now: float) -> dict[str, Any]:
+def _collect_usage() -> dict[str, Any]:
     usage: dict[str, Any] = {}
     claude = _claude_limits()
     if claude:
         usage["claude"] = claude
-    codex = _codex_limits()
-    if codex:
-        usage["codex"] = codex
     return usage
 
 
@@ -261,7 +193,7 @@ def usage_snapshot(*, cache_path: Any = None, now: float | None = None, env: Any
     if isinstance(fetched, (int, float)) and current - fetched < ttl:
         _MEMO = cached
         return cached
-    fresh = _collect_usage(current)
+    fresh = _collect_usage()
     if not fresh and cached:
         snapshot = dict(cached)
         snapshot["fetched_at"] = current  # back off for a full TTL before retrying the sources
@@ -313,7 +245,11 @@ def account_line(kind: str, *, snapshot: dict[str, Any] | None = None, now: floa
         return ""
     current = time.time() if now is None else now
     snapshot = usage_snapshot(env=env) if snapshot is None else snapshot
-    limits = snapshot.get(kind) if isinstance(snapshot.get(kind), dict) else {}
+    limits = (
+        snapshot.get(kind)
+        if kind == "claude" and isinstance(snapshot.get(kind), dict)
+        else {}
+    )
     plan = _pretty_claude_plan(claude_identity()) if kind == "claude" else _pretty_codex_plan(codex_identity())
     parts = [plan] if plan else []
     for label, key in (("5h", "five_hour"), ("wk", "weekly"), ("opus wk", "weekly_opus")):

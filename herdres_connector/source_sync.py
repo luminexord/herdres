@@ -9986,23 +9986,6 @@ def _materialize_final_ready(
     return row, page_calls
 
 
-def _materialize_legacy_plan_source(
-    turns_payload: dict[str, Any],
-    revision: str,
-    runtime: SyncRuntime,
-) -> tuple[dict[str, Any] | None, int]:
-    matches = [
-        item
-        for item in _turns(turns_payload)
-        if _content_revision(item) == revision
-    ]
-    if len(matches) != 1:
-        return None, 0
-    item = matches[0]
-    page_calls = _materialize_turn_item(item, runtime)
-    return item, page_calls
-
-
 def _turn_item_by_revision(
     turns_payload: dict[str, Any], revision: str
 ) -> dict[str, Any] | None:
@@ -11648,7 +11631,6 @@ def _drain_turn_final(
     max_operations: int,
     turn_projection: Mapping[str, Any] | None = None,
     yield_barrier: Callable[[], None] | None = None,
-    legacy_turns_loader: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     result = {
         "enabled": runtime.with_outbox,
@@ -11686,7 +11668,6 @@ def _drain_turn_final(
     materialized_sources: dict[
         str, tuple[dict[str, Any], dict[str, Any]]
     ] = {}
-    legacy_turns_loaded = False
     lease_seconds = config.tendwire_turn_final_lease_seconds()
     for _iteration in range(max_operations + 100):
         # Terminal failures must only act on the lease from this iteration.
@@ -12006,35 +11987,6 @@ def _drain_turn_final(
                     and _content_revision(candidate) == revision
                 ]
                 item = matches[0] if len(matches) == 1 else None
-            if (
-                item is None
-                and not legacy_turns_loaded
-                and legacy_turns_loader is not None
-            ):
-                legacy_turns_loaded = True
-                relisted = legacy_turns_loader()
-                if relisted.get("ok") is False:
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "transient_delivery",
-                        result,
-                        delay_seconds=1,
-                    )
-                    break
-                try:
-                    turns_payload = _validate_turns_payload(relisted)
-                except _TurnContentError as exc:
-                    _fail_turn_final(
-                        runtime,
-                        ref,
-                        f"{exc.status}: {exc}",
-                        result,
-                    )
-                    break
-                item = _turn_item_by_revision(
-                    turns_payload, revision
-                )
             if item is None:
                 _fail_turn_final(
                     runtime,
@@ -15031,7 +14983,6 @@ def drain_outbound_once(
         chat_id=chat_id,
         max_operations=operation_limit,
         turn_projection=projection,
-        legacy_turns_loader=effective_runtime.tendwire.turns,
     )
     remaining = max(
         0,

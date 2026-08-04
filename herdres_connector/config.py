@@ -354,8 +354,8 @@ def pinned_status_enabled(env: Any | None = None) -> bool:
 def pinned_account_enabled(env: Any | None = None) -> bool:
     """Append a who-am-I/quota line to the pinned status boards: plan tier from the CLI
     credential files (named metadata fields only, never tokens) plus the remaining 5h and
-    weekly rate-limit headroom (Claude: the OAuth usage endpoint behind in-app /usage;
-    Codex: the rate_limits events in its local session logs). Default on; degrades to no
+    weekly rate-limit headroom (Claude: the OAuth usage endpoint behind in-app /usage).
+    Default on; degrades to no
     line when the sources are absent. HERDRES_PINNED_ACCOUNT=0 turns it off."""
     source = os.environ if env is None else env
     value = str(source.get("HERDRES_PINNED_ACCOUNT", "1") or "").strip().lower()
