@@ -402,6 +402,7 @@ ExecStart=/usr/bin/python3 -m tendwire.cli daemon
     expected = """[Service]
 # Preserve this comment and its spacing byte-for-byte.
 Environment=KEEP_ME=1\t
+Environment=TENDWIRE_HERDR_BACKEND=socket
 Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr
 ExecStart=/usr/bin/python3 -m tendwire.cli daemon
 """
@@ -421,6 +422,39 @@ ExecStart=/usr/bin/python3 -m tendwire.cli daemon
     second = _run_installer(repository, environment)
     _assert_success(second)
     assert unit.read_text(encoding="utf-8") == migrated
+
+
+def test_installer_adds_required_socket_backend_to_legacy_tendwired_unit(
+    tmp_path: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    unit = home / ".config/systemd/user/tendwired.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text(
+        """[Service]
+Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr_turn_adapter.py
+ExecStart=/usr/bin/python3 -m tendwire.cli daemon
+""",
+        encoding="utf-8",
+    )
+
+    result = _run_installer(repository, _installer_environment(home, None))
+
+    _assert_success(result)
+    migrated = unit.read_text(encoding="utf-8")
+    assert migrated.count("Environment=TENDWIRE_HERDR_BACKEND=socket\n") == 1
+    assert "herdr_turn_adapter.py" not in migrated
+    assert "Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr\n" in migrated
+
+
+def test_tendwired_service_template_enables_required_socket_backend() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    template = (
+        repository / "systemd/user/tendwired.service.example"
+    ).read_text(encoding="utf-8")
+
+    assert template.count("Environment=TENDWIRE_HERDR_BACKEND=socket\n") == 1
 
 
 def test_installer_retains_adapter_for_unrecognized_custom_unit(
