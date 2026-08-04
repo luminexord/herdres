@@ -905,7 +905,30 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             _reply_key, reply_entry = _worker_entry_from_reply(store, payload)
             if reply_entry is not None:
-                entry = reply_entry
+                target_bot_kind = str(
+                    payload.get("target_bot_kind") or ""
+                ).strip().lower()
+                reply_bot_kind = managed_bot_kind_for_entry(reply_entry)
+                if target_bot_kind and reply_bot_kind != target_bot_kind:
+                    _kind_key, kind_entry = _worker_entry_from_alias(
+                        store, target_bot_kind, entry
+                    )
+                    if kind_entry is None:
+                        if record is not None:
+                            return _local_ingress_outcome(
+                                store,
+                                record,
+                                reason="ambiguous reply author target",
+                                reply=SAFE_SEND_FAILURE_REPLY,
+                            )
+                        return {
+                            "handled": True,
+                            "reply": SAFE_SEND_FAILURE_REPLY,
+                            "status": "ambiguous_reply_author_target",
+                        }
+                    entry = kind_entry
+                else:
+                    entry = reply_entry
             elif payload.get("reply_to_message_id") and state.find_message_binding(
                 store,
                 payload.get("reply_to_message_id"),
