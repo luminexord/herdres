@@ -9,6 +9,10 @@ import pytest
 
 from herdres_connector import tendwire_client
 from herdres_connector import config
+from herdres_connector.source_sync import (
+    _TURN_CONTENT_OUTCOME_KEY,
+    _validate_turns_payload,
+)
 from herdres_connector.tendwire_client import TendwireClient
 
 
@@ -1136,6 +1140,95 @@ def test_turns_requests_and_requires_v2_content_schema(client_runner):
     assert missing_content["ok"] is False
     assert missing_content["status"] == "unsupported_content_schema"
     assert missing_content["supported_content_schema_version"] == 1
+
+
+@pytest.mark.parametrize(
+    ("private_structure", "private_sentinel"),
+    [
+        (
+            {"toolCall": {"rawInput": "private-root-sentinel"}},
+            "private-root-sentinel",
+        ),
+        (
+            {
+                "meta": {
+                    "upstream": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {
+                            "type": "text",
+                            "text": "private-nested-sentinel",
+                        },
+                    },
+                }
+            },
+            "private-nested-sentinel",
+        ),
+    ],
+)
+def test_full_turn_poll_preserves_private_acp_evidence_until_quarantine(
+    client_runner, private_structure, private_sentinel
+):
+    client, _calls, responses = client_runner
+    public_text = "public prompt"
+    row = {
+        "id": "turn-private-full",
+        "worker_id": "worker-public",
+        "complete": False,
+        "user_text": public_text,
+        "content": {
+            "schema_version": 1,
+            "content_revision": "twrev1.private-full",
+            "known_incomplete": False,
+            "fields": {
+                "user_text": {
+                    "availability": "complete",
+                    "inline": True,
+                    "char_length": len(public_text),
+                    "byte_length": len(public_text.encode("utf-8")),
+                    "page_count": 1,
+                    "first_cursor": None,
+                },
+                "assistant_final_text": {
+                    "availability": "absent",
+                    "inline": False,
+                    "char_length": 0,
+                    "byte_length": 0,
+                    "page_count": 0,
+                    "first_cursor": None,
+                },
+            },
+        },
+        **private_structure,
+    }
+    responses.append(
+        {
+            "body": {
+                "schema_version": 2,
+                "turns": [row],
+                "has_more": False,
+                "next_cursor": None,
+            }
+        }
+    )
+
+    polled = client.turns()
+    validated = _validate_turns_payload(polled)
+
+    # The client boundary must not erase the reason for quarantine, while the
+    # validated projection must retain no private ACP payload.
+    assert private_sentinel in json.dumps(polled, sort_keys=True)
+    assert validated["turns"] == [
+        {
+            "id": "turn-private-full",
+            "worker_id": "worker-public",
+            _TURN_CONTENT_OUTCOME_KEY: {
+                "turn_id": "turn-private-full",
+                "status": "private_agent_content",
+                "content_revision": "twrev1.private-full",
+            },
+        }
+    ]
+    assert private_sentinel not in json.dumps(validated, sort_keys=True)
 
 
 def test_turns_follows_bounded_list_cursors(client_runner):

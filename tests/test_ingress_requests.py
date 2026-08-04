@@ -1941,11 +1941,14 @@ def test_v3_stable_target_owner_is_fsynced_before_child_can_crash(
         def command_json(self, request_json):
             request = json.loads(request_json)
             assert request["target"] == {
+                "worker_id": entry["tendwire_worker_id"],
+                "worker_fingerprint": entry["tendwire_fingerprint"],
+            }
+            persisted = state.load_state()[ingress_requests.RECORDS_KEY][REQUEST_ID]
+            assert persisted["target_owner"] == {
                 "stable_key": expected_owner[0],
                 "stable_key_version": expected_owner[1],
             }
-            persisted = state.load_state()[ingress_requests.RECORDS_KEY][REQUEST_ID]
-            assert persisted["target_owner"] == request["target"]
             raise SimulatedCrash
 
     monkeypatch.setattr(herdres, "TendwireClient", CrashingClient)
@@ -1996,13 +1999,17 @@ def test_v3_space_stable_owner_survives_worker_route_churn_before_acceptance(
         "stable_key": space["active_worker_stable_key"],
         "stable_key_version": space["active_worker_stable_key_version"],
     }
+    expected_target = {
+        "worker_id": space["active_worker_id"],
+        "worker_fingerprint": space["active_worker_fingerprint"],
+    }
     state.save_state(store)
     submission_id = "twsub1." + "c" * 64
 
     class ChurningClient:
         def command_json(self, request_json):
             request = json.loads(request_json)
-            assert request["target"] == expected_owner
+            assert request["target"] == expected_target
             concurrent = state.load_state()
             record = concurrent[ingress_requests.RECORDS_KEY][REQUEST_ID]
             assert record["target_owner"] == expected_owner
@@ -2216,16 +2223,8 @@ def test_stale_refresh_uses_real_client_validation_and_persists_second_bytes(
     tmp_path, monkeypatch
 ) -> None:
     _setup_command_state(tmp_path, monkeypatch)
-    # Exercise the compatibility request shape explicitly. Current source
-    # entries prefer immutable stable-owner targets and never relax them.
-    monkeypatch.setattr(
-        herdres,
-        "_target_for_entry",
-        lambda _entry: {
-            "worker_id": "worker-1",
-            "worker_fingerprint": "fp-original",
-        },
-    )
+    # Exercise the production compatibility selector and its one permitted
+    # stale-fingerprint rewrite through the real child-response validator.
     child_starts: list[bytes] = []
     backend_mutations = 0
 

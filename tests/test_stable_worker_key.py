@@ -133,8 +133,8 @@ def _persisted_missing_version_worker(
     return key, entry
 
 
-def test_acp_frontend_fingerprint_churn_keeps_topic_and_stable_ingress_target():
-    """A visible pane frontend may rotate without changing the ACP owner."""
+def test_acp_frontend_fingerprint_churn_keeps_topic_and_compatible_ingress_target():
+    """A visible frontend may rotate while owner evidence stays separate."""
     store = _store()
     original_key, original, created = state.upsert_worker_entry(
         store,
@@ -171,9 +171,10 @@ def test_acp_frontend_fingerprint_churn_keeps_topic_and_stable_ingress_target():
     assert frontend is original
     assert frontend["topic_id"] == "14303"
     assert herdres._target_for_entry(frontend) == {
-        "stable_key": KEY_A,
-        "stable_key_version": 1,
+        "worker_id": "codex",
+        "worker_fingerprint": "fp-visible-frontend",
     }
+    assert herdres._stable_owner_for_entry(frontend) == (KEY_A, 1)
     binding = state.find_message_binding(store, "14310", topic_id="14303")
     assert binding is not None
     assert binding["worker_fingerprint"] == "fp-visible-frontend"
