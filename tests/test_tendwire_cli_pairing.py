@@ -80,57 +80,6 @@ def _run_paired_cli(
     return completed, body
 
 
-def test_nine_choice_single_adapter_shape_is_accepted_by_paired_tendwire(
-    tmp_path,
-):
-    source = _paired_tendwire_source()
-    env = _paired_env(tmp_path, source)
-    turn = {
-        "pending_decision": {
-            "decision_id": "toolu_nine",
-            "kind": "AskUserQuestion",
-            "prompt": "Choose one",
-            "mode": "buttons",
-            "multi_select": False,
-            "options": [
-                {"id": str(index), "label": f"Option {index}"}
-                for index in range(1, 10)
-            ]
-            + [
-                {
-                    "id": "custom",
-                    "label": "Write a different answer",
-                }
-            ],
-        }
-    }
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import json,sys;"
-                "from tendwire.backends.herdr_turns import "
-                "_pending_observation_from_turn;"
-                "o=_pending_observation_from_turn(json.load(sys.stdin));"
-                "print(json.dumps({'kind':o.kind,"
-                "'option_count':len(o.decision_options)}))"
-            ),
-        ],
-        input=json.dumps(turn, separators=(",", ":")).encode("utf-8"),
-        capture_output=True,
-        check=False,
-        env=env,
-        timeout=20,
-    )
-
-    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
-    assert json.loads(completed.stdout.decode("utf-8")) == {
-        "kind": "open_prompt",
-        "option_count": 9,
-    }
-
-
 def test_real_tendwire_cli_exit_code_matches_command_ok(tmp_path):
     source = _paired_tendwire_source()
     env = _paired_env(tmp_path, source)

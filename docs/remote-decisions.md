@@ -3,9 +3,8 @@
 Herdres can answer a bounded set of Claude prompts from an inline Telegram
 keyboard when `HERDRES_REMOTE_DECISIONS=1`.
 
-The flow is deliberately end to end: the Claude hook records a pending
-`AskUserQuestion` or `ExitPlanMode`; `herdr_turn_adapter.py` emits a
-`pending_decision`; Tendwire publishes the neutral form as
+The flow is deliberately end to end: ACP carries a pending `AskUserQuestion`
+or `ExitPlanMode` decision; Tendwire publishes the neutral form as
 `meta.decision`; Herdres joins it to one unambiguous worker topic and renders
 the inline keyboard; and a tap submits Tendwire's schema-v1
 `answer_decision` command. Tendwire owns the backend interaction and returns a

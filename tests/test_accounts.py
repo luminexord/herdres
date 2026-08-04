@@ -1,6 +1,6 @@
 """The pinned who-am-I/quota line: plan metadata comes from the CLI credential files
 (named fields only — tokens must never surface), remaining rate-limit headroom from the
-Claude OAuth usage endpoint / the codex session logs, behind a disk-cached TTL (the
+Claude OAuth usage endpoint, behind a disk-cached TTL (the
 pin-edit rate limiter), rendered as a compact footer on the pinned boards."""
 from __future__ import annotations
 
@@ -75,10 +75,10 @@ def test_pretty_plans():
 
 def test_usage_snapshot_ttl_memo_and_stale(monkeypatch, tmp_path):
     cache = tmp_path / "usage_cache.json"
-    calls: list[float] = []
+    calls: list[bool] = []
 
-    def fake_collect(now):
-        calls.append(now)
+    def fake_collect():
+        calls.append(True)
         return {"claude": {"today_cost": 10.0}}
 
     monkeypatch.setattr(accounts, "_collect_usage", fake_collect)
@@ -97,7 +97,7 @@ def test_usage_snapshot_ttl_memo_and_stale(monkeypatch, tmp_path):
     accounts.usage_snapshot(cache_path=cache, now=1400.0, env={})
     assert len(calls) == 2
     # a failed refresh serves the stale snapshot and backs off a full TTL before retrying
-    monkeypatch.setattr(accounts, "_collect_usage", lambda now: {})
+    monkeypatch.setattr(accounts, "_collect_usage", lambda: {})
     monkeypatch.setattr(accounts, "_MEMO", None)
     stale = accounts.usage_snapshot(cache_path=cache, now=2000.0, env={})
     assert stale["claude"]["today_cost"] == 10.0
@@ -130,8 +130,7 @@ def test_account_line_codex_format(monkeypatch, tmp_path):
         "id_token": _fake_jwt({"https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}})}}))
     monkeypatch.setattr(accounts, "CODEX_AUTH_PATH", auth)
     snapshot = {"codex": {"five_hour": {"used_percent": 14.0}, "weekly": {"used_percent": 2.0}}}
-    assert accounts.account_line("codex-1", snapshot=snapshot, now=0.0) == \
-        "🔑 ChatGPT Pro · 5h 86% left · wk 98% left"
+    assert accounts.account_line("codex-1", snapshot=snapshot, now=0.0) == "🔑 ChatGPT Pro"
 
 
 def test_account_line_degrades_gracefully(monkeypatch, tmp_path):
@@ -192,24 +191,6 @@ def test_claude_limits_without_token_makes_no_request(monkeypatch, tmp_path):
     monkeypatch.setattr(accounts, "_http_get_json",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call out without a token")))
     assert accounts._claude_limits() == {}
-
-
-def test_codex_limits_reads_session_tail(monkeypatch, tmp_path):
-    sessions = tmp_path / "sessions" / "2026" / "07"
-    sessions.mkdir(parents=True)
-    log = sessions / "rollout-x.jsonl"
-    stale = {"payload": {"rate_limits": {"primary": {"used_percent": 90.0}}}}
-    fresh = {"payload": {"rate_limits": {
-        "primary": {"used_percent": 14.0, "window_minutes": 300, "resets_at": 1_783_723_274},
-        "secondary": {"used_percent": 2.0, "window_minutes": 10080, "resets_at": 1_784_310_074},
-    }}}
-    log.write_text(json.dumps(stale) + "\n" + json.dumps({"other": 1}) + "\n" + json.dumps(fresh) + "\n")
-    monkeypatch.setattr(accounts, "CODEX_SESSIONS_DIR", tmp_path / "sessions")
-    limits = accounts._codex_limits()
-    assert limits["five_hour"] == {"used_percent": 14.0, "resets_at": 1_783_723_274.0}   # LAST event wins
-    assert limits["weekly"]["used_percent"] == 2.0
-    monkeypatch.setattr(accounts, "CODEX_SESSIONS_DIR", tmp_path / "missing")
-    assert accounts._codex_limits() == {}
 
 
 # --- pinned-board integration ---------------------------------------------------

@@ -5970,7 +5970,6 @@ def test_recovered_final_promotes_existing_working_card_once_without_replay(
     def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
         private_roots = {
             "herdr",
-            "herdr_turn_adapter",
             "herdr_socket",
             "herdr_cli",
             "herdr_events",

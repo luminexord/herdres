@@ -327,7 +327,7 @@ def _target_for_entry(entry: dict[str, Any]) -> dict[str, str | int]:
 
 
 # Choices whose selection needs the owner to then TYPE something (the picker's "write your own"
-# option): the turn adapter stamps these ids on AskUserQuestion's custom option and ExitPlanMode's
+# option): ACP decision events use these ids for AskUserQuestion's custom option and ExitPlanMode's
 # revise option. A bare number selecting one of these is refused so we never send a digit that leaves
 # the pane waiting for text the owner didn't provide.
 _FREETEXT_CHOICE_IDS = {"custom", "revise"}

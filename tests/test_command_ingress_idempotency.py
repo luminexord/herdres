@@ -384,6 +384,67 @@ def test_installer_comments_legacy_lane_rollback_with_consent_marker(
     assert env_path.read_text(encoding="utf-8") == migrated
 
 
+def test_installer_migrates_only_legacy_adapter_tendwired_unit(
+    tmp_path: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    unit = home / ".config/systemd/user/tendwired.service"
+    unit.parent.mkdir(parents=True)
+    original = """[Service]
+# Preserve this comment and its spacing byte-for-byte.
+Environment=KEEP_ME=1\t
+Environment=TENDWIRE_HERDR_BACKEND=socket
+Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr_turn_adapter.py
+Environment=HERDR_REAL_BIN=/home/smith/.local/bin/herdr
+ExecStart=/usr/bin/python3 -m tendwire.cli daemon
+"""
+    expected = """[Service]
+# Preserve this comment and its spacing byte-for-byte.
+Environment=KEEP_ME=1\t
+Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr
+ExecStart=/usr/bin/python3 -m tendwire.cli daemon
+"""
+    unit.write_text(original, encoding="utf-8")
+    unit.chmod(0o640)
+    environment = _installer_environment(home, None)
+
+    first = _run_installer(repository, environment)
+    _assert_success(first)
+    migrated = unit.read_text(encoding="utf-8")
+    assert (unit.parent / "tendwired.service.bak-herdres-acp").read_text(
+        encoding="utf-8"
+    ) == original
+    assert migrated == expected
+    assert stat.S_IMODE(unit.stat().st_mode) == 0o640
+
+    second = _run_installer(repository, environment)
+    _assert_success(second)
+    assert unit.read_text(encoding="utf-8") == migrated
+
+
+def test_installer_retains_adapter_for_unrecognized_custom_unit(
+    tmp_path: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    unit = home / ".config/systemd/user/tendwired.service"
+    adapter = home / ".local/bin/herdr_turn_adapter.py"
+    unit.parent.mkdir(parents=True)
+    adapter.parent.mkdir(parents=True)
+    unit.write_text(
+        'Environment="TENDWIRE_HERDR_BIN=%h/.local/bin/herdr_turn_adapter.py"\n',
+        encoding="utf-8",
+    )
+    adapter.write_text("legacy adapter", encoding="utf-8")
+
+    result = _run_installer(repository, _installer_environment(home, None))
+
+    assert result.returncode != 0
+    assert adapter.read_text(encoding="utf-8") == "legacy adapter"
+    assert b"migrate custom tendwired.service first" in result.stderr
+
+
 @pytest.mark.parametrize("use_home_expansion", [False, True])
 def test_installer_and_runtime_expand_same_absolute_custom_path_without_rotation(
     tmp_path: Path,

@@ -3,33 +3,82 @@ set -eu
 
 install -Dm755 herdres.py "$HOME/.local/bin/herdres"
 install -Dm755 herdres_gateway.py "$HOME/.local/bin/herdres-gateway"
-# Turn adapter: the tendwire daemon captures turn content by running `herdr pane turn`, which some
-# herdr builds lack. tendwired.service must set TENDWIRE_HERDR_BIN to this adapter (and
-# HERDR_REAL_BIN to the real herdr) or turn finals are never captured — the topic then shows
-# "Work is in progress" forever. See systemd/user/tendwired.service.example.
-install -Dm755 herdr_turn_adapter.py "$HOME/.local/bin/herdr_turn_adapter.py"
-# Pending-prompt hook: Claude Code fires PreToolUse the moment an AskUserQuestion/ExitPlanMode
-# prompt is shown (it is NOT in the session transcript until answered), so this passive recorder
-# is the only way the turn adapter can capture the question+choices for Telegram. Fails closed.
-install -Dm755 herdres_pending_hook.py "$HOME/.local/bin/herdres-pending-hook"
 find herdres_connector -type f -name '*.py' | while IFS= read -r f; do
     install -Dm644 "$f" "$HOME/.local/bin/$f"
 done
+
+# Migrate only the unit shape that invoked the retired transcript adapter. Preserve custom units,
+# back up before replacement, and complete this before removing the old executable below.
+TENDWIRED_UNIT="$HOME/.config/systemd/user/tendwired.service"
+if [ -f "$TENDWIRED_UNIT" ] && grep -Eq '^Environment=TENDWIRE_HERDR_BIN=.*/herdr_turn_adapter\.py$' "$TENDWIRED_UNIT"; then
+    command -v python3 >/dev/null 2>&1 || {
+        printf '%s\n' "Cannot migrate tendwired.service without python3; legacy adapter retained." >&2
+        exit 1
+    }
+    cp -a "$TENDWIRED_UNIT" "$TENDWIRED_UNIT.bak-herdres-acp"
+    python3 - "$TENDWIRED_UNIT" <<'UNITMIGRATE'
+import os
+import re
+import stat
+import sys
+import tempfile
+
+path = sys.argv[1]
+adapter = re.compile(r"^Environment=TENDWIRE_HERDR_BIN=.*/herdr_turn_adapter\.py$")
+real_bin = re.compile(r"^Environment=HERDR_REAL_BIN=.*$")
+with open(path, encoding="utf-8") as source:
+    lines = source.read().splitlines(keepends=True)
+rewritten = []
+replaced = False
+for line in lines:
+    body = line.rstrip("\r\n")
+    ending = line[len(body):]
+    if adapter.fullmatch(body):
+        rewritten.append("Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr" + (ending or "\n"))
+        replaced = True
+    elif not real_bin.fullmatch(body) and body != "Environment=TENDWIRE_HERDR_BACKEND=socket":
+        rewritten.append(line)
+if not replaced:
+    raise SystemExit("legacy adapter line disappeared during tendwired.service migration")
+metadata = os.stat(path, follow_symlinks=False)
+directory = os.path.dirname(path)
+descriptor, temporary = tempfile.mkstemp(prefix=".tendwired.service.", dir=directory)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+        target.writelines(rewritten)
+        target.flush()
+        os.fsync(target.fileno())
+    os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+print("Migrated tendwired.service from the transcript adapter to raw Herdr.")
+UNITMIGRATE
+fi
+if [ -f "$TENDWIRED_UNIT" ] && grep -q 'herdr_turn_adapter\.py' "$TENDWIRED_UNIT"; then
+    printf '%s\n' "Refusing to remove the legacy adapter: migrate custom tendwired.service first." >&2
+    exit 1
+fi
+
 rm -f \
     "$HOME/.local/bin/herdres_tendwire.py" \
     "$HOME/.local/bin/herdres_routing.py" \
     "$HOME/.local/bin/herdres_gateway.py" \
     "$HOME/.local/bin/herdres-decision-hook" \
+    "$HOME/.local/bin/herdres-pending-hook" \
+    "$HOME/.local/bin/herdr_turn_adapter.py" \
     "$HOME/.local/bin/herdres-speech" \
     "$HOME/.local/bin/herdr_telegram_topics_install_bridge.py" \
     "$HOME/.local/bin/herdres_connector/formatter.py" \
     "$HOME/.local/bin/herdres_connector/source_state.py"
 
-# The monolith wrote herdres-decision-hook entries into the REAL ~/.claude/settings.json. We just
-# removed the script (above); a dangling hook -> missing script blocks ALL Claude Code prompts, so
-# strip those entries too. Guarded + backed up + never fails the install (best-effort).
+# Remove registrations for retired Herdres hooks from the real Claude settings. A dangling hook can
+# block prompts, so this cleanup is guarded, backed up, and best-effort.
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
-if [ -f "$CLAUDE_SETTINGS" ] && grep -q "herdres-decision-hook" "$CLAUDE_SETTINGS" 2>/dev/null && command -v python3 >/dev/null 2>&1; then
+if [ -f "$CLAUDE_SETTINGS" ] && grep -Eq "herdres-(decision|pending)-hook" "$CLAUDE_SETTINGS" 2>/dev/null && command -v python3 >/dev/null 2>&1; then
     cp -a "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak-herdres-uninstall" 2>/dev/null || true
     python3 - "$CLAUDE_SETTINGS" <<'PY' || true
 import json, sys
@@ -47,7 +96,14 @@ for event, groups in list(hooks.items()):
     new_groups = []
     for g in groups:
         inner = g.get("hooks", []) if isinstance(g, dict) else []
-        kept = [h for h in inner if isinstance(h, dict) and "herdres-decision-hook" not in str(h.get("command", ""))]
+        kept = [
+            h for h in inner
+            if isinstance(h, dict)
+            and not any(
+                name in str(h.get("command", ""))
+                for name in ("herdres-decision-hook", "herdres-pending-hook")
+            )
+        ]
         if kept:
             g["hooks"] = kept
             new_groups.append(g)
@@ -57,47 +113,7 @@ for event, groups in list(hooks.items()):
         del hooks[event]
 json.dump(d, open(p, "w"), indent=2)
 PY
-    printf '%s\n' "Removed stale herdres-decision-hook entries from ~/.claude/settings.json."
-fi
-# Register the pending-prompt hook (PreToolUse/PostToolUse on AskUserQuestion|ExitPlanMode +
-# SessionEnd cleanup). Guarded + backed up + idempotent + best-effort: a broken settings.json is
-# left untouched, and the entries point at the file we JUST installed (no dangling-hook P0).
-if command -v python3 >/dev/null 2>&1; then
-    python3 - "$HOME/.claude/settings.json" "$HOME/.local/bin/herdres-pending-hook" <<'HOOKPY' || true
-import json, os, shutil, sys
-path, hook = sys.argv[1], sys.argv[2]
-if not os.path.exists(hook):
-    sys.exit(0)
-try:
-    data = json.load(open(path)) if os.path.exists(path) else {}
-except Exception:
-    sys.exit(0)  # unreadable settings: do not touch
-if not isinstance(data, dict):
-    sys.exit(0)
-command = f"python3 '{hook}'"
-if command in json.dumps(data):
-    sys.exit(0)  # already registered
-if os.path.exists(path):
-    try:
-        shutil.copy2(path, path + ".bak-herdres-hook")
-    except Exception:
-        sys.exit(0)
-hooks = data.setdefault("hooks", {})
-def add(event, matcher):
-    groups = hooks.setdefault(event, [])
-    entry = {"hooks": [{"type": "command", "command": command, "timeout": 10}]}
-    if matcher:
-        entry["matcher"] = matcher
-    groups.append(entry)
-add("PreToolUse", "AskUserQuestion|ExitPlanMode")
-add("PostToolUse", "AskUserQuestion|ExitPlanMode")
-add("SessionEnd", "")
-tmp = path + ".tmp"
-os.makedirs(os.path.dirname(path), exist_ok=True)
-json.dump(data, open(tmp, "w"), indent=2)
-os.replace(tmp, path)
-print("Registered herdres-pending-hook in ~/.claude/settings.json.")
-HOOKPY
+    printf '%s\n' "Removed stale Herdres hook entries from ~/.claude/settings.json."
 fi
 
 HERDRES_ENV_PATH="$HOME/.config/herdres/herdres.env"
