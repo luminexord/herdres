@@ -43,7 +43,7 @@ start the persistent Tendwire, Herdres, and gateway user services.
 Telegram topic input
   -> herdres-gateway
   -> herdres command
-  -> tendwire command --json
+  -> Tendwire command.submit over the protected Unix socket
 
 herdres sync
   -> tendwire snapshot/turn.delta/pending/connector
@@ -83,6 +83,7 @@ default as a safety net. Configure the page/repair behavior with:
 
 ```text
 HERDRES_TENDWIRE_TIMEOUT_SECONDS=60
+HERDRES_TENDWIRE_CONNECTOR_POLL_SECONDS=1
 HERDRES_TENDWIRE_DELTA_LIMIT=500
 HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION=2
 HERDRES_TENDWIRE_FULL_RECONCILE_SECONDS=3600
@@ -100,11 +101,11 @@ older Tendwire even when v3 was requested.
 
 Outbound delivery is not paced by the full source reconciliation. A durable v3
 submission receipt immediately renders its one working card, and
-`herdres sync --loop` runs a separate coalescing connector dispatcher. SQLite
-database/WAL commit notifications wake that dispatcher when Tendwire enqueues a
-turn-final job; a one-second fallback covers missed notifications and deferred
-jobs. The dispatcher uses only Tendwire's existing connector API and the same
-Telegram/state delivery machinery as the normal sync tail.
+`herdres sync --loop` runs a small connector-only poll loop independently of
+the full reconciliation. It polls once per second by default (configure
+`HERDRES_TENDWIRE_CONNECTOR_POLL_SECONDS`) and uses only Tendwire's public
+connector API plus the same Telegram/state delivery machinery as a one-shot
+sync. Herdres does not inspect Tendwire's database or watch SQLite/WAL files.
 
 ### Durable inbound lanes
 
@@ -155,7 +156,7 @@ Tendwire submission.
 
 Accepted sends do not post a redundant terminal success card by default: the
 working card already shows that the message is being handled. Set
-`HERDRES_INBOUND_SUCCESS_ACK=1` to restore the legacy byte-identical replies
+`HERDRES_INBOUND_SUCCESS_ACK=1` to restore the same fixed replies
 (`Sent to Tendwire worker.` and
 `Submitted to busy Tendwire worker.`). This gateway-only flag is read for each
 inbound call and never suppresses the instant queued acknowledgement or any
@@ -200,15 +201,16 @@ suppress commands by comparing their content.
 
 The gateway derives the opaque ID before private route resolution. In legacy
 mode it creates the durable schema-v2 lifecycle shell before routing,
-transcription, or child creation; lane mode first commits the update and cursor
-to the separate spool and creates the same unchanged state record during lane
-dispatch. In either mode `created_at`, `deadline_at`, and `retain_until` are
-fixed from the Telegram first-seen instant. Before Tendwire can observe a command, Herdres
-canonicalizes the exact schema-v1 public request, stores that JSON string, and
-fsyncs the temporary state file, atomic replacement, and parent directory. The
-Tendwire child receives those stored UTF-8 bytes verbatim; an ID-only
-redelivery probe consults the record before current topic, route,
-transcription, or worker-state lookup. The only permitted byte change is one
+transcription, or AF_UNIX submission; lane mode first commits the update and
+cursor to the separate spool and creates the same unchanged state record during
+lane dispatch. In either mode `created_at`, `deadline_at`, and `retain_until`
+are fixed from the Telegram first-seen instant. Before Tendwire can observe a
+command, Herdres canonicalizes the exact schema-v1 public request, stores that
+JSON string, and fsyncs the temporary state file, atomic replacement, and parent
+directory. The AF_UNIX client parses only those stored UTF-8 bytes and submits
+the resulting exact public object in one correlated daemon request; an ID-only
+redelivery probe consults the record before current topic, route, transcription,
+or worker-state lookup. The only permitted byte change is one
 `stale_target` response with disposition `no_receipt`: when the recorded target
 contains `worker_fingerprint`, Herdres removes only that field, durably stores
 the second exact byte string, and retries once under the same request ID.
@@ -234,10 +236,10 @@ cover Herdres's full range; Tendwire also enforces a `691200`-second receipt-age
 floor and an age strictly greater than its own retry horizon.
 
 Terminal accepted/rejected results and every quarantine store one exact,
-sanitized child outcome. Tendwire rejection, terminal uncertainty, deadline
+sanitized ingress outcome. Tendwire rejection, terminal uncertainty, deadline
 expiry, and unsafe/corrupt command evidence use the fixed public reply
 `Could not send safely. Refresh status and choose the target again.` and the
-child `checkpoint: "advance"`. The gateway sends that reply, advances and
+outcome `checkpoint: "advance"`. The gateway sends that reply, advances and
 saves the stable polling offset, and continues with later Telegram updates.
 Redelivery or restart returns the cached outcome before private routing and
 without constructing a Tendwire client. This bounded terminalization is
@@ -253,9 +255,9 @@ correlation and is never a command wire selector. Tendwire's general request-ID
 grammar is `[A-Za-z0-9._-]{1,128}`; Herdres emits and locally requires its
 narrower canonical 48-character `hri1_…` form. Raw Telegram receiver, update,
 chat, topic, message, reply, and user IDs, bot tokens, private routes, and
-backend targets never cross. The child environment preserves public Tendwire
-overrides but strips Telegram variables and private ingress, gateway,
-managed-bot, state, request-key, and binary-selector settings.
+backend targets never cross. No CLI environment or process output crosses this
+boundary; the client communicates only with the configured private AF_UNIX
+daemon endpoint.
 
 For a non-dry-run ingress send, Herdres accepts only an exact schema-v2 Tendwire
 response with the ten fields `schema_version`, `action`, `request_id`, `ok`,
@@ -282,15 +284,17 @@ whole disposition tuple:
 - `no_receipt` permits the same rejection-status set except
   `duplicate_request`.
 
-The process exit is part of the envelope: exit `0` must pair with `ok: true`
-and exit `1` with `ok: false`. Exit `2`, a mismatched pair, timeout,
-invalid UTF-8/JSON, wrong shape/correlation, or other unproven post-start loss
-becomes private process ambiguity. Herdres does not forge a schema-v2
-disposition from it or expose process markers, stdout, or stderr; it keeps the
-durable record retryable with no reply and retains the gateway checkpoint until
-the fixed deadline. A definite spawn failure follows the same bounded retry
-path. At the deadline, or for an authoritative `terminal_uncertain`,
-quarantine caches the fixed safe outcome and advances the queue.
+The client pins the owner-private socket path, verifies the connected peer,
+sends one bounded newline-framed JSON request, and accepts only one correlated
+daemon envelope. A failure before connection/send is definite. Timeout, EOF,
+invalid UTF-8/JSON, wrong shape/correlation, or another unproven post-send loss
+is transport ambiguity; a valid correlated outer daemon error remains typed
+and distinct from a malformed inner method result. Herdres does not forge a
+schema-v2 disposition from ambiguous transport evidence: it keeps the durable
+record retryable with no reply and retains the gateway checkpoint until the
+fixed deadline. At the deadline, or for an authoritative
+`terminal_uncertain`, quarantine caches the fixed safe outcome and advances the
+queue.
 
 A `SIGKILL` during `command_json` is intentionally recovered by replay, not by
 a local `submitting` marker: Herdres cannot prove whether the remote mutation
@@ -351,7 +355,7 @@ installed, running, or available. The root contains canonical content
 descriptors and the public identity pair, never a private checkpoint, Telegram
 routing, credentials, or message state.
 
-After leasing a `final_ready` root and materializing its exact canonical
+After leasing a `final_ready` root and materializing its canonical
 content, Herdres derives ordered multipart presentation ranges. Prepare
 begin/part/commit sends only neutral field/start/end spans, never turn text;
 the leased `source_ref` is bound on begin and commit, while part requests carry
@@ -483,12 +487,13 @@ replacement generation:
 ```sh
 herdres tendwire recover-turn-final \
   --plan-token twplan1.<failed-plan> \
-  --request-id operator-2026.07.11:1
+  --request-id operator-2026.07.11-1
 ```
 
 The plan token must be a bounded public `twplan1.` coordinate. The request ID
-must contain 1–128 ASCII characters from `[A-Za-z0-9._:-]`; it is the durable
-idempotency and audit key. Before the Tendwire RPC, Herdres requires exactly one
+must contain 1–128 ASCII characters from `[A-Za-z0-9._-]` and must not contain
+reserved public-boundary vocabulary; it is the durable idempotency and audit
+key. Before the Tendwire RPC, Herdres requires exactly one
 pending failed plan on one uniquely routable, nonquarantined worker, valid
 revision/part/job coordinates, enough receipt capacity for both generations,
 and old receipts consisting only of one contiguous `acknowledged` prefix
@@ -707,7 +712,7 @@ This branch runs two user services (plus the Tendwire daemon):
 
 - `herdres.service` — the source sync loop (`herdres sync --loop`). It reads
   Tendwire snapshots/turns/pending and drives Telegram topics, messages, and
-  pinned status. Its wakeable outbound dispatcher drains working/final cards
+  pinned status. Its bounded connector poll loop drains working/final cards
   independently of long reconciliation passes. This replaces the old
   `herdres.timer`; there is no timer unit on this branch.
 - `herdres-gateway.service` — inbound Telegram polling; forwards topic input to
@@ -717,8 +722,8 @@ This branch runs two user services (plus the Tendwire daemon):
 
 ## Send transport
 
-Herdres submits every outbound instruction through Tendwire's public command
-path (`command.submit`, invoked as `tendwire command --json`). Herdres never
+Herdres submits every outbound instruction through Tendwire's public
+`command.submit` method over the protected local daemon socket. Herdres never
 sees or handles `pane_id`, `terminal_id`, or `send_keys` — those never appear in
 public or source-mode state. Tendwire owns the private send target and may, for
 delivery reliability, drive a private Herdr pane transport internally; that is a

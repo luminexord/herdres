@@ -1,10 +1,7 @@
-# Current Herdres connector RPC contract
+# Current Herdres connector socket contract
 
-This Wave 0 document freezes the connector seam that exists before the Wave 3
-socket-client rewrite. It describes the wire-level Tendwire daemon RPC at
-Tendwire commit `91891bfb4aa44a03bea37571911b5c83e0ec977d` and the operations
-the Herdres client actually issues at Herdres commit
-`ff000d6c19ba8c24cf21aff301cbba883cc39f07`.
+This document describes the direct wire-level Tendwire daemon RPC used by the
+Herdres socket client and the connector operations it issues.
 
 The primary evidence is:
 
@@ -19,12 +16,11 @@ The primary evidence is:
   implementation delegated to by `daemon_api.py`, including strict prepare
   shapes at lines 235-403, poll results at 406-467, mutation fields at
   480-581, and verb dispatch at 660-680.
-- `/home/smith/tendwire/src/tendwire/cli.py`: the temporary subprocess
-  adapter's flag-to-RPC normalization at lines 1510-1563.
+- `tests/test_tendwire_socket_pairing.py`: the executable pairing gate using a
+  real `UnixSocketJSONServer`, `ConnectorOutboxAPI`, and SQLite store.
 
-Herdres currently invokes a Tendwire CLI subprocess, with
-`TENDWIRE_SOCKET_PATH` forced so the CLI attempts the long-running daemon.
-Waves 3-4 may remove that subprocess hop, but must preserve the contract below.
+Herdres connects directly to the protected Tendwire Unix socket. It has no CLI
+or subprocess fallback.
 
 ## Wire envelope
 
@@ -63,9 +59,8 @@ The optional safe request `id` is echoed as `id`. A dispatch/protocol failure is
 
 Connector business failures are different: dispatch succeeded, so outer `ok`
 remains `true`, while `result.ok` is `false` and `result.status`/`result.error`
-describe the connector failure. The existing CLI unwraps `result` before
-Herdres sees it. A direct socket client must therefore validate the outer
-envelope, unwrap exactly once, and then preserve the inner business result.
+describe the connector failure. The Herdres client validates the outer
+envelope, unwraps exactly once, and validates the inner business result.
 The daemon sanitizes the connector result and explicitly restores valid opaque
 plan tokens after sanitization.
 
@@ -169,7 +164,7 @@ Commit:
 
 The Herdres client requires a `twplan1.` token with a non-empty ASCII
 alphanumeric/`_`/`-` body and a 1-128 character public-safe request id using
-ASCII alphanumerics plus `.`, `_`, `:`, or `-`.
+ASCII alphanumerics plus `.`, `_`, or `-`.
 
 ### `connector.poll`
 
@@ -217,12 +212,8 @@ The public Herdres attention helper calls its local argument `error`, while the
 turn-final helper calls it `reason`; the daemon RPC field is `reason`. Herdres
 sanitizes the text to at most 240 characters before invocation.
 
-At this freeze point the attention helper serializes that value as the CLI flag
-`--error`, but Tendwire's subprocess adapter accepts `--reason`. Consequently,
-an attention failure does not currently reach `connector.fail` through this
-subprocess path. This is a baseline transport mismatch, not an alternate RPC
-shape: a direct socket client must send `params.reason` while retaining the
-Herdres helper's public `error` argument if callers still need it.
+The attention helper retains its public `error` argument for callers and sends
+that sanitized value as `params.reason` on the socket.
 
 ### `connector.defer`
 
@@ -294,14 +285,14 @@ applicable. Herdres makes control-flow decisions from `ok` and `status`; refs
 and tokens remain opaque. A connector rejection uses the same inner shape with
 `ok: false` and an `error` object containing at least `code` and `message`.
 
-## Compatibility rule for Waves 3-4
+## Compatibility rule
 
-A replacement direct socket client is compatible only if it:
+The direct socket client remains compatible only if it:
 
 1. sends the five `connector.*` verbs and queue names above;
 2. preserves the exact prepare action objects and lease mutation fields;
 3. distinguishes outer RPC failure from inner connector failure;
 4. requires connector schema 1 for the turn-final path;
-5. keeps opaque refs, revision tokens, and plan tokens byte-for-byte; and
+5. keeps opaque ref, revision-token, and plan-token string values unchanged; and
 6. does not add a subprocess fallback, SQLite/WAL access, or invented
    `turn_final_*` socket methods.

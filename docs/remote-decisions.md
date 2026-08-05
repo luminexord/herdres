@@ -33,9 +33,9 @@ stale option references are not forwarded.
 
 Herdres accepts only the exact schema-v2 `answer_decision` response envelope,
 including the correlated request ID and decision reference. A missing field,
-extra field, wrong result shape, mismatched CLI exit code, or other malformed
-response becomes `request_state_uncertain` rather than being treated as an
-answer.
+extra field, wrong result shape, socket framing/correlation fault, or other
+malformed response becomes `request_state_uncertain` rather than being treated
+as an answer.
 
 When Tendwire reports `answer_in_progress`, another request currently owns the
 answer claim. Herdres keeps both the decision record and keyboard, performs no

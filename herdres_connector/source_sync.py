@@ -1994,7 +1994,7 @@ def _resolve_stable_worker_generations(
             else:
                 # A replacement snapshot row without a turn is not evidence
                 # of ownership. Hide it from source upsert and preserve the
-                # incumbent route byte-for-byte.
+                # incumbent route unchanged.
                 excluded_worker_refs.update(id(worker) for worker in generations)
             continue
         if reason == "freshest_turn_activity":
@@ -3190,7 +3190,7 @@ def _hold_incomplete_pending_plan(
             "ok": False,
             "partial": bool(accepted_ids),
             "message_ids": accepted_ids,
-            # A stopped creator/dead-lettered child is a definite missing
+            # A stopped creator/dead-lettered connector job is a definite missing
             # suffix. Accepted prefix ids remain exact provider facts, while
             # only the missing suffix is eligible for explicit recovery.
             "terminal_outcome": "not_delivered",
@@ -5148,7 +5148,7 @@ def _account_usage_snapshot_offlock(
         return accounts.usage_snapshot()
     # The OAuth usage endpoint has a 15-second timeout.  Persist the complete
     # pre-refresh state, release the flock for cache/network collection, then
-    # adopt any lane-child commit before pinned rendering resumes.
+    # adopt any concurrent ingress-lane commit before pinned rendering resumes.
     state.save_state(store)
     try:
         with state.released_lock():
@@ -5660,6 +5660,7 @@ def _sync_sources(
     runtime: SyncRuntime,
     *,
     chat_id: str,
+    yield_barrier: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     counts = {"created": 0, "updated": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
     counts["updated"] += _recover_accepted_created_topics(
@@ -5760,6 +5761,8 @@ def _sync_sources(
     workers_by_space: dict[str, list[dict[str, Any]]] = {}
     observed_worker_entry_keys: set[str] = set()
     for worker in _ordered_workers(workers):
+        if yield_barrier is not None:
+            yield_barrier()
         space_id = compact_ws(worker.get("space_id"), 160)
         existing_key = worker_entry_reservations.get(id(worker))
         before = dict(state.source_worker_entries(store).get(existing_key) or {}) if existing_key is not None else {}
@@ -5878,6 +5881,9 @@ def _sync_sources(
             counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["panes"] += 1
 
+    if workers and yield_barrier is not None:
+        yield_barrier()
+
     # Visibility is a current-snapshot fact. Historical state survives for
     # lifecycle/reply ownership, but it must never inflate the live-unbound
     # board or doctor alarm.
@@ -5913,6 +5919,8 @@ def _sync_sources(
         return counts
 
     for space_id, space in spaces.items():
+        if yield_barrier is not None:
+            yield_barrier()
         if not _space_is_open(space):
             continue
         selectable = [worker for worker in workers_by_space.get(space_id, []) if _worker_is_open(worker)]
@@ -5972,6 +5980,8 @@ def _sync_sources(
         counts["updated"] += int(not created and before != entry)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["spaces"] += 1
+    if spaces and yield_barrier is not None:
+        yield_barrier()
     for key in list(state.source_space_entries(store)):
         if key not in seen_space_keys:
             stale_entry = state.source_space_entries(store)[key]
@@ -8227,7 +8237,7 @@ def _stage_final_plan(
         raise _TurnContentError(
             "invalid_prepare_response", "prepare begin returned invalid state"
         )
-    # Stamp the parent before creating children.  If child creation stops, the
+    # Stamp the plan before creating part jobs. If part creation stops, the
     # ordinary pass barrier persists a named, ageing plan instead of leaving a
     # route-local pin with no clock.  Re-observing the same token never resets
     # the clock.
@@ -8246,9 +8256,9 @@ def _stage_final_plan(
             else 0
         ),
     )
-    # The parent checkpoint is the durable resume contract for every child
+    # The plan checkpoint is the durable resume contract for every part job
     # and commit call below.  Persist the protocol version with that parent,
-    # not only after a successful commit: if the process or transport stops
+    # not only after a successful commit: if the request or transport stops
     # after prepare-part, the retry must reopen the same plan version/token.
     # Falling back to the legacy version here creates a second empty plan and
     # permanently rejects the source final.
@@ -13018,7 +13028,7 @@ def _drain_turn_final(
                             revision=failed_revision,
                             part_count=failed_part_count,
                             error=(
-                                "multipart child dead-lettered before its "
+                                "multipart job dead-lettered before its "
                                 "parent plan completed"
                             ),
                         )
@@ -14317,12 +14327,12 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     )
     if yield_barrier is not None:
         # Ingress deliberately needs two consecutive state-lock acquisitions:
-        # the gateway first fsyncs its immutable request shell, then the command
-        # child acquires the lock to attach canonical bytes and submit them.
+        # the gateway first fsyncs its immutable request shell, then the AF_UNIX
+        # submitter acquires the lock to attach canonical bytes and submit them.
         # The off-lock observation window can admit the first acquisition, but
         # without this handoff sync immediately reacquires the flock and enters
-        # the comparatively heavy reconciliation phase before the child exists.
-        # Yield once more after observation so the already-waiting child wins a
+        # the comparatively heavy reconciliation phase before the request starts.
+        # Yield once more after observation so the waiting submitter wins a
         # lock window instead of holding every later item in its strict FIFO
         # lane behind a full sync pass.
         with state.lock_phase("sync.post_observe_handoff"):
@@ -14345,7 +14355,12 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     )
     with state.lock_phase("sync.sources"):
         source_counts = _sync_sources(
-            store, snapshot, turns_payload, runtime, chat_id=chat_id
+            store,
+            snapshot,
+            turns_payload,
+            runtime,
+            chat_id=chat_id,
+            yield_barrier=yield_barrier,
         )
     worker_rebinds = 0
     for resolution in generation_resolutions:

@@ -12,6 +12,7 @@ import argparse
 import copy
 import json
 import sys
+import threading
 import time
 from typing import Any, Callable
 
@@ -23,7 +24,6 @@ from herdres_connector.managed_bots import (
     managed_bot_kind_for_username,
 )
 from herdres_connector.safe import compact_ws, public_prune, sanitize_text, short_hash
-from herdres_connector.outbound_dispatcher import OutboundDispatcher
 from herdres_connector.source_sync import (
     SyncRuntime,
     deliver_submission_working_card,
@@ -35,6 +35,7 @@ from herdres_connector.tendwire_client import (
     TendwireClient,
     command_process_ambiguous,
     command_process_not_started,
+    valid_recovery_request_id,
 )
 
 VERSION = "0.7.0rc4-tendwired-source-only"
@@ -469,8 +470,8 @@ def _submit_ingress_command_record(
             state.save_state(store)
             return outcome
 
-        # Construct the child only after deadline/cache preflight. command_json
-        # sends these exact UTF-8 bytes rather than reserializing the request.
+        # Construct the AF_UNIX client only after deadline/cache preflight.
+        # command_json parses only the exact durably stored UTF-8 request.
         _ingress_timing_log(
             "tendwire_submit_sent",
             request_id,
@@ -649,7 +650,7 @@ def _submit_ingress_command_record(
         ):
             # The only legal byte rewrite is a one-time removal of the stale
             # worker fingerprint. Recheck the immutable deadline before both
-            # the durable rewrite and the second child start.
+            # the durable rewrite and the second socket request.
             retry_at = time.time()
             if retry_at >= record["deadline_at"]:
                 outcome = ingress_requests.quarantine_request(
@@ -737,7 +738,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             prepared = prepared or shell_created
             if changed or prepared:
                 # First-seen lifecycle bounds are durable before routing,
-                # speech preparation, or child-process construction for legacy
+                # speech preparation, or AF_UNIX request construction for legacy
                 # direct callers. Lane mode already has those exact bytes and
                 # bounds in the durable spool, so it folds this shell write into
                 # the canonical request commit below.
@@ -984,8 +985,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             state.save_state(store)
             return outcome
         if attached:
-            # Exact canonical bytes are fsynced before Tendwire can observe the
-            # request, and every retry reads only this stored string.
+            # Canonical JSON is fsynced before Tendwire can observe the request,
+            # and every retry reads only this stored string.
             state.save_state(store)
         _ingress_timing_log(
             "canonical_commit",
@@ -1007,7 +1008,7 @@ def callback_reply(_payload: dict[str, Any]) -> dict[str, Any]:
     return {"handled": True, "reply": "This source-only Herdres branch does not use Telegram callbacks."}
 
 
-def _sync_pass() -> dict[str, Any]:
+def _sync_pass(*, with_outbox: bool = True) -> dict[str, Any]:
     with state.state_lock(phase="sync_pass.load"):
         with state.lock_phase("sync_pass.load"):
             store = state.load_state()
@@ -1023,7 +1024,7 @@ def _sync_pass() -> dict[str, Any]:
                 store,
                 _runtime(
                     dry_run=False,
-                    with_outbox=True,
+                    with_outbox=with_outbox,
                     checkpoint=checkpoint,
                 ),
             )
@@ -1034,7 +1035,7 @@ def _sync_pass() -> dict[str, Any]:
 
 
 def _outbound_pass() -> dict[str, Any]:
-    """Drain connector work independently of the full sync-pass duration."""
+    """Drain connector work without snapshot, turn, pending, or pane scans."""
 
     with state.state_lock(phase="outbound_pass.load"):
         with state.lock_phase("outbound_pass.load"):
@@ -1042,9 +1043,7 @@ def _outbound_pass() -> dict[str, Any]:
 
         def checkpoint() -> None:
             if not state.lock_held():
-                raise RuntimeError(
-                    "outbound checkpoint requires the held state lock"
-                )
+                raise RuntimeError("outbound checkpoint requires the held state lock")
             with state.lock_phase("outbound.checkpoint"):
                 state.save_state(store)
 
@@ -1064,6 +1063,27 @@ def _outbound_pass() -> dict[str, Any]:
     return result
 
 
+def _connector_poll_loop(stop: threading.Event) -> None:
+    cadence = config.tendwire_connector_poll_seconds()
+    while not stop.is_set():
+        started = time.monotonic()
+        try:
+            _outbound_pass()
+        except Exception as exc:  # noqa: BLE001 - retain the bounded poll loop
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status": "outbound_pass_failed",
+                        "error": sanitize_text(str(exc), 300),
+                    }
+                ),
+                flush=True,
+            )
+        remaining = cadence - (time.monotonic() - started)
+        stop.wait(max(0.0, remaining))
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
     config.load_env_file()
     config.require_source_mode()
@@ -1072,40 +1092,36 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return _json(_sync_pass())
     import time as _time
 
-    def outbound_error(exc: Exception) -> None:
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "status": "outbound_pass_failed",
-                    "error": sanitize_text(str(exc), 300),
-                }
-            ),
-            flush=True,
-        )
-
-    dispatcher = OutboundDispatcher(
-        _outbound_pass,
-        database_path=config.tendwire_db_path(),
-        on_error=outbound_error,
+    stop = threading.Event()
+    poller = threading.Thread(
+        target=_connector_poll_loop,
+        args=(stop,),
+        name="herdres-connector-poll",
+        daemon=True,
     )
-    dispatcher.start()
+    poller.start()
     try:
         while True:
             started = _time.monotonic()
             try:
-                result = _sync_pass()
+                result = _sync_pass(with_outbox=False)
                 if result.get("ok") is not True:
-                    # The long-running service is the active probe: emit its
-                    # structured health result to the journal every pass so a
-                    # terminal fold failure does not depend on a human running
-                    # `herdres doctor` first.
                     print(json.dumps(result), flush=True)
-            except Exception as exc:  # noqa: BLE001 - keep the loop alive across transient failures
-                print(json.dumps({"ok": False, "status": "sync_pass_failed", "error": sanitize_text(str(exc), 300)}), flush=True)
+            except Exception as exc:  # noqa: BLE001 - survive transient failures
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "status": "sync_pass_failed",
+                            "error": sanitize_text(str(exc), 300),
+                        }
+                    ),
+                    flush=True,
+                )
             _time.sleep(max(0.5, interval - (_time.monotonic() - started)))
     finally:
-        dispatcher.stop()
+        stop.set()
+        poller.join(timeout=max(1.0, config.tendwire_connector_poll_seconds() + 0.5))
 
 
 def cmd_command(_args: argparse.Namespace) -> int:
@@ -1226,14 +1242,7 @@ def _valid_recovery_plan_token(value: Any) -> bool:
 
 
 def _valid_recovery_request_id(value: Any) -> bool:
-    return bool(
-        isinstance(value, str)
-        and 1 <= len(value) <= 128
-        and all(
-            char.isascii() and (char.isalnum() or char in "._:-")
-            for char in value
-        )
-    )
+    return valid_recovery_request_id(value)
 
 
 def _recovery_audits(store: dict[str, Any]) -> dict[str, Any]:

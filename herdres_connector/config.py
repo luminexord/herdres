@@ -11,7 +11,6 @@ from typing import Any
 HOME = Path.home()
 DEFAULT_STATE_PATH = HOME / ".local/share/herdres/state.json"
 DEFAULT_PROCESSED_PATH = HOME / ".local/share/herdres/gateway_processed_messages.json"
-DEFAULT_TENDWIRE_DB_PATH = HOME / ".local/share/tendwire/tendwire.db"
 DEFAULT_TENDWIRE_SOCKET_PATH = HOME / ".local/share/tendwire/tendwire.sock"
 DEFAULT_REQUEST_ID_KEY_PATH = HOME / ".local/share/herdres/request-id.key"
 DEFAULT_INBOUND_SPOOL_PATH = HOME / ".local/share/herdres/inbound_spool.db"
@@ -48,13 +47,8 @@ def processed_path(env: Any | None = None) -> Path:
     return Path(source.get("HERDR_TELEGRAM_TOPICS_GATEWAY_PROCESSED", DEFAULT_PROCESSED_PATH)).expanduser()
 
 
-def tendwire_db_path(env: Any | None = None) -> Path:
-    source = os.environ if env is None else env
-    return Path(source.get("HERDRES_TENDWIRE_DB_PATH", source.get("TENDWIRE_DB_PATH", DEFAULT_TENDWIRE_DB_PATH))).expanduser()
-
-
 def tendwire_socket_path(env: Any | None = None) -> Path:
-    """Return the authoritative Tendwire daemon socket for child CLI calls."""
+    """Return the authoritative Tendwire daemon socket."""
 
     source = os.environ if env is None else env
     return Path(
@@ -72,6 +66,19 @@ def tendwire_timeout_seconds(env: Any | None = None) -> float:
     except (TypeError, ValueError):
         return 60.0
     return min(300.0, max(1.0, value))
+
+
+def tendwire_connector_poll_seconds(env: Any | None = None) -> float:
+    """Bound the connector-only polling cadence independently of reconciliation."""
+
+    source = os.environ if env is None else env
+    try:
+        value = float(
+            str(source.get("HERDRES_TENDWIRE_CONNECTOR_POLL_SECONDS", "1") or "1")
+        )
+    except (TypeError, ValueError):
+        return 1.0
+    return min(60.0, max(0.1, value))
 
 
 def tendwire_delta_limit(env: Any | None = None) -> int:
@@ -207,7 +214,7 @@ def command_response_schema_version(env: Any | None = None) -> int:
     """Return the explicitly negotiated Tendwire command envelope version.
 
     Version 2 remains the default so an installed pre-v3 Tendwire keeps seeing
-    byte-for-byte compatible command requests.  Operators can opt in to v3
+    field-compatible command requests. Operators can opt in to v3
     submission receipts without changing the request schema itself.
     """
 
@@ -434,7 +441,7 @@ def topic_icon_error_retry_seconds(env: Any | None = None) -> int:
 def offlock_interpane_yield_enabled(env: Any | None = None) -> bool:
     """Whether sync_once briefly releases the state lock between delivered turns so a queued inbound
     command can interleave instead of stalling behind the whole delivery loop's Telegram sends (the
-    source-mode jam, #122). Read at call time, not import-time, so the plugin/subprocess paths (no
+    source-mode jam, #122). Read at call time, not import-time, so plugin/direct-call paths (no
     systemd EnvironmentFile) still honour it."""
     source = os.environ if env is None else env
     value = str(source.get("HERDRES_OFFLOCK_INTERPANE_YIELD", "1") or "").strip().lower()

@@ -2,7 +2,7 @@
 
 The helpers in this module are deliberately transport-agnostic.  Callers must
 hold the connector state lock and durably save the returned mutations before
-starting a child process or advancing an ingress checkpoint.
+starting the AF_UNIX request or advancing an ingress checkpoint.
 """
 
 from __future__ import annotations
@@ -208,12 +208,12 @@ class IngressResult(dict[str, Any]):
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> IngressResult:
-        """Wrap one already-validated child mapping at a public boundary."""
+        """Wrap one already-validated ingress mapping at a public boundary."""
 
         return cls(copy.deepcopy(value))
 
     def to_wire_dict(self) -> dict[str, Any]:
-        """Return plain JSON data explicitly for a process boundary."""
+        """Return plain JSON data explicitly for the gateway boundary."""
 
         return copy.deepcopy(dict(self))
 
@@ -262,7 +262,7 @@ def child_result(
     reply: str = "",
     handled: bool = True,
 ) -> IngressResult:
-    """Build the exact child envelope consumed by the Telegram gateway."""
+    """Build the exact ingress envelope consumed by the Telegram gateway."""
 
     request_id = validate_request_id(request_id)
     if type(handled) is not bool:
@@ -283,7 +283,7 @@ def child_result(
             or request_phase not in {"ready", "retryable", "retry_authorized"}
             or terminal_outcome is not None
         ):
-            raise ValueError("invalid retry child outcome")
+            raise ValueError("invalid retry ingress outcome")
         reply = ""
     elif checkpoint == "advance":
         if (
@@ -873,7 +873,7 @@ def preflight_request(
     retry_horizon: float,
     retention: float,
 ) -> tuple[dict[str, Any], IngressResult | None, bool]:
-    """Resolve cache/deadline before route reconstruction or child creation."""
+    """Resolve cache/deadline before route reconstruction or AF_UNIX submission."""
 
     record, changed = ensure_request_shell(
         store,

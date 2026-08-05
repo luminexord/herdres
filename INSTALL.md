@@ -4,7 +4,7 @@
 
 Herdres does not function on its own. It has no observation, worker identity,
 turn/pending, command routing, or backend-health logic of its own — every one of
-those comes from Tendwire over the `tendwire` CLI/daemon. Install Tendwire first:
+those comes from Tendwire over its local daemon socket. Install Tendwire first:
 
 ```sh
 git clone https://github.com/plotarmordev/tendwire.git ~/tendwire
@@ -15,15 +15,16 @@ tendwire doctor --json
 ```
 
 See [Tendwire's own INSTALL.md](https://github.com/plotarmordev/tendwire/blob/main/INSTALL.md)
-for the `tendwired.service` daemon setup. Herdres finds Tendwire via the
-`tendwire` binary on `PATH`, or falls back to `TENDWIRE_SOURCE_DIR`
-(default `~/tendwire/src`) and runs it as `python -m tendwire.cli`.
+for the `tendwired.service` daemon setup. Herdres connects only to
+`HERDRES_TENDWIRE_SOCKET_PATH` (default
+`~/.local/share/tendwire/tendwire.sock`). It never runs Tendwire as a child
+process or opens Tendwire's SQLite store.
 
 This is a paired command protocol, not a best-effort JSON integration. Herdres
 sends schema-v1 requests and requires an exact, correlated schema-v2 response.
-For a non-dry-run command, Tendwire CLI exit `0` must carry `ok: true`; exit
-`1` must carry `ok: false`. Exit `2`, malformed output, or any exit/body
-mismatch is private unproven process ambiguity and is not converted into a
+For a non-dry-run command, the daemon must return the exact correlated command
+envelope. A timeout, disconnect, malformed response, or correlation mismatch
+after request transmission is unproven ambiguity and is not converted into a
 forged disposition.
 
 ## Continuity data and upgrades
@@ -100,8 +101,9 @@ An ordinary service restart must retain the private Herdres state file,
 Herdres request-ID key, stable polling-offset files, and Tendwire database
 unchanged. Before private route reconstruction, Herdres returns any cached
 terminal or quarantined child outcome for a redelivered request ID. A retained
-retryable record replays only its stored exact UTF-8 request bytes; token,
-routing, transcription, or worker-state churn cannot rebuild or replace them.
+retryable record reconstructs only its stored canonical request object and
+text; token, routing, transcription, or worker-state churn cannot rebuild or
+replace them.
 The sole exception is the one persisted removal of `worker_fingerprint` after
 `stale_target` with disposition `no_receipt`. Terminal and quarantine cache
 survives restart and route loss, bypasses Tendwire client construction, sends
@@ -191,7 +193,7 @@ HERDRES_INBOUND_LANE_DEPTH=32
 HERDRES_INBOUND_LANE_BACKOFF_SECONDS=2
 HERDRES_INBOUND_HOLD_SECONDS=15
 HERDRES_INBOUND_LANE_STALL_SECONDS=5
-TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.db
+HERDRES_TENDWIRE_SOCKET_PATH=~/.local/share/tendwire/tendwire.sock
 HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS=60
 ```
 

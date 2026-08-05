@@ -17,14 +17,13 @@ python3 scripts/herdr_smoke.py --fixture-dir tests/fixtures/herdr/live_smoke/ok
 python3 -m build
 python3 scripts/release_artifacts.py artifacts dist
 
-# Herdres checkout; bind pairing explicitly to avoid a skipped test
-HERDRES_PAIRED_TENDWIRE_SOURCE_DIR=/absolute/tendwire/src \
-  python3 -m pytest -q
+# Herdres checkout
+python3 -m pytest -q
 python3 -m compileall -q herdres.py herdres_gateway.py herdres_connector tests
 ```
 
-The paired run must execute rather than skip `tests/test_tendwire_cli_pairing.py`
-and must retain `direct_herdr_calls=0`, exact turn/pending/command schemas,
+The recorded paired socket probe must use a temporary Tendwire daemon and
+retain `direct_herdr_calls=0`, exact turn/pending/command schemas,
 stable-owner migration, neutral outbox behavior, and the two forced no-op sync
 proof. Record both commits and the Tendwire wheel/sdist digests.
 
@@ -75,6 +74,7 @@ consumer/reconciliation contract together as one compatible release pair:
 
 ```sh
 # From the Tendwire checkout:
+TENDWIRE_CHECKOUT="$(pwd -P)"
 python -m pytest -q \
   tests/test_worker_stable_key.py \
   tests/test_commands.py \
@@ -86,23 +86,27 @@ python -m pytest -q \
   tests/test_store.py
 
 # From the Herdres checkout:
-python -m pytest -q \
+TENDWIRE_SOURCE="$(cd -- "${TENDWIRE_CHECKOUT:?set TENDWIRE_CHECKOUT to the clean Tendwire checkout}" && pwd -P)/src"
+test -f "$TENDWIRE_SOURCE/tendwire/daemon_api.py"
+HERDRES_PAIRED_TENDWIRE_SOURCE_DIR="$TENDWIRE_SOURCE" python -m pytest -q \
   tests/test_source_only.py \
   tests/test_command_ingress_idempotency.py \
   tests/test_stable_worker_key.py \
   tests/test_tendwire_client.py \
+  tests/test_tendwire_socket_pairing.py \
   tests/test_turn_final_delivery.py \
+  tests/test_outbound_latency.py \
   tests/test_offlock_delivery.py
 HERDRES_TENDWIRE_MODE=source ./herdres.py tendwire source-smoke --with-outbox
 ```
 
-The exact Herdres `tests/test_command_ingress_idempotency.py`,
-`tests/test_tendwire_client.py`, and `tests/test_turn_final_delivery.py` suites
-in this block are the hermetic Goal 11 ingress/client and Goal 10 final-delivery
-gates. The listed Tendwire command, connector, and store tests are the paired
-producer gate. Every listed test must pass before any stateful sync. The
-repeated `source-smoke --with-outbox` remains only the shallow preflight
-described above.
+The Herdres ingress/client/final-delivery suites in this block are hermetic
+contract gates. `tests/test_tendwire_socket_pairing.py` is the executable real
+server/API/SQLite pair: it proves poll, provider binding, ACK, empty repoll, and
+ACK-response loss followed by authoritative empty repoll. The listed Tendwire
+command, connector, and store tests are the producer gate. Every listed test
+must pass before any stateful sync. The repeated `source-smoke --with-outbox`
+remains only the shallow preflight described above.
 
 The paired gate must establish all of the following:
 
@@ -122,21 +126,21 @@ The paired gate must establish all of the following:
 - Manager and managed-bot polling cursors are keyed to stable receiving-bot
   kinds, not token-derived runtime keys, so token rotation preserves polling
   position.
-- On first sight of an update, before routing or child creation, Herdres
+- On first sight of an update, before routing or AF_UNIX submission, Herdres
   persists immutable `created_at`, `deadline_at`, and `retain_until` bounds.
   It then persists canonical schema-v1 request JSON before command start.
-  Every retry sends those exact UTF-8 bytes. The sole rewrite is one
+  Every retry reconstructs the same request object and text. The sole rewrite is one
   `stale_target` + `no_receipt` removal of `worker_fingerprint`, durably stored
   before the same-ID retry.
-- The paired CLI returns the exact ten-field schema-v2 response. Herdres checks
+- The paired socket endpoint returns the exact ten-field schema-v2 response. Herdres checks
   action/request/dry-run correlation, public pruning, and each complete
   disposition tuple: accepted/`terminal_accepted`, pending/`in_progress`,
   request-state-uncertain/`terminal_uncertain`, and the allowed rejection
   statuses paired with either `terminal_rejected` or `no_receipt`.
-- CLI exit `0` pairs only with `ok: true`, and exit `1` only with `ok: false`.
-  Exit `2`, malformed/non-UTF-8 output, timeout, wrong schema/shape/correlation,
-  or any exit/body mismatch remains private process ambiguity. No schema-v2
-  disposition or private process/stdout/stderr detail is forged from it.
+- Pre-send socket failures are definite; timeout, EOF, malformed/non-UTF-8
+  output, or wrong schema/shape/correlation after request start remains
+  transport ambiguity. No schema-v2 disposition or private implementation
+  detail is forged from it.
 - Disposition, never status alone, controls lifecycle. In particular,
   `backend_unavailable` + `no_receipt` retains the checkpoint for retry, while
   `backend_unavailable` + `terminal_rejected` caches failure and advances.
@@ -144,13 +148,13 @@ The paired gate must establish all of the following:
   (`86400` default/fallback), does not slide with `updated_at`, retry,
   redelivery, or configuration changes, and expires at equality. Before client
   creation and after a retryable response, deadline expiry quarantines instead
-  of starting another child.
+  of starting another socket request.
 - `retain_until` is first-seen plus the horizon and `86400`: `172800` default,
   `86460` minimum, `691200` maximum. It is immutable and pruning is strictly
   after it. The paired Tendwire retry horizon is at least the Herdres horizon,
   and Tendwire receipt age is at least the Herdres retention bound. Tendwire's
   `604800`/`2592000`/`4096` defaults satisfy the pair.
-- `terminal_accepted` and `terminal_rejected` cache an exact sanitized child
+- `terminal_accepted` and `terminal_rejected` cache an exact sanitized ingress
   outcome. `terminal_uncertain`, deadline expiry, and unsafe/corrupt evidence
   are quarantined (locally dead-lettered) with the fixed reply `Could not send
   safely. Refresh status and choose the target again.` and checkpoint
@@ -160,10 +164,9 @@ The paired gate must establish all of the following:
 - Only the exact allowlisted public command object reaches Tendwire; its
   request ID satisfies `[A-Za-z0-9._-]{1,128}` and Herdres uses the narrower
   `hri1_…` form. No raw Telegram receiver/update/chat/topic/message/reply/user
-  ID, bot token, or private/backend route crosses. The Tendwire child
-  environment retains public overrides while stripping Telegram and private
-  ingress, gateway, managed-bot, state, request-key, and binary-selector
-  variables.
+  ID, bot token, or private/backend route crosses. No CLI environment or
+  process output crosses this boundary; the client uses only the configured
+  owner-private AF_UNIX daemon endpoint.
 - The Herdres state, Herdres request-ID key, Tendwire database, and Tendwire
   installation key/marker/sentinel are backed up quiescently and restored as
   one set. A replaced Herdres key changes every derived ID and is not recovery.
@@ -286,11 +289,12 @@ issues an explicit command for that failed generation:
 ```sh
 herdres tendwire recover-turn-final \
   --plan-token twplan1.<failed-plan> \
-  --request-id operator-2026.07.11:1
+  --request-id operator-2026.07.11-1
 ```
 
-The request ID is 1–128 ASCII `[A-Za-z0-9._:-]` characters and is both the
-idempotency key and audit key. Local preflight must stop before RPC with:
+The request ID is 1–128 ASCII `[A-Za-z0-9._-]` characters, excludes reserved
+public-boundary vocabulary, and is both the idempotency key and audit key.
+Local preflight must stop before RPC with:
 
 - `invalid_recovery_request` for a malformed/bounded-coordinate failure;
 - `recovery_request_conflict` when the request ID is bound elsewhere;
@@ -315,7 +319,7 @@ generation. Herdres adds that audit's retained-failure count to the current
 failed tail and binds the inherited identity and cumulative count into
 preflight revalidation. Audits needed by pending replacements are protected
 from bounded-detail eviction; an all-protected audit table fails before RPC
-rather than stranding a later generation. The old receipts remain byte-for-byte
+rather than stranding a later generation. The old receipt values remain
 unchanged. Herdres clones the contiguous acknowledged prefix, retargets only
 its bindings,
 records the request-keyed audit, validates the suffix's predecessor against the

@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import copy
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -1944,9 +1943,12 @@ def test_exact_bytes_recover_accepted_response_loss_with_one_backend_send(
     backend_receipts: set[str] = set()
     backend_sends = 0
 
-    def run(argv, *, input, **_kwargs):
+    def request(_self, method, params, **_kwargs):
         nonlocal backend_sends
-        request_bytes = bytes(input)
+        assert method == "command.submit"
+        request_bytes = json.dumps(
+            params, separators=(",", ":"), ensure_ascii=False
+        ).encode()
         child_starts.append(request_bytes)
         saved = state.load_state()
         assert (
@@ -1960,16 +1962,18 @@ def test_exact_bytes_recover_accepted_response_loss_with_one_backend_send(
         if request_id not in backend_receipts:
             backend_receipts.add(request_id)
             backend_sends += 1
-            return subprocess.CompletedProcess(argv, 0, b"not-json", b"private stderr")
-        response = _accepted_command_response(request)
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            json.dumps(response, separators=(",", ":")).encode(),
-            b"",
-        )
+            return tendwire_client.TendwireClient._transport_error(
+                "daemon_protocol_error",
+                "response lost",
+                started=True,
+            )
+        return _accepted_command_response(request)
 
-    monkeypatch.setattr(tendwire_client.subprocess, "run", run)
+    monkeypatch.setattr(
+        tendwire_client.TendwireClient,
+        "_request",
+        request,
+    )
     first = herdres.command_reply(_payload())
     assert first == _child(REQUEST_ID, checkpoint="retry", disposition=None)
 
@@ -2003,28 +2007,27 @@ def test_v3_ack_loss_replays_submission_once_without_duplicate_working(
     backend_sends = 0
     child_starts = 0
 
-    def run(argv, *, input, **_kwargs):
+    def request(_self, method, params, **_kwargs):
         nonlocal backend_sends, child_starts
+        assert method == "command.submit"
         child_starts += 1
-        request = json.loads(bytes(input))
-        request_id = request["request_id"]
+        request_id = params["request_id"]
         if request_id not in backend_receipts:
             backend_receipts.add(request_id)
             backend_sends += 1
-            return subprocess.CompletedProcess(argv, 0, b"lost-ack", b"")
-        response = _accepted_command_response(request)
+            return tendwire_client.TendwireClient._transport_error(
+                "daemon_protocol_error",
+                "response lost",
+                started=True,
+            )
+        response = _accepted_command_response(params)
         response["schema_version"] = 3
         response["result"].update(
             {"submission_id": submission_id, "turn_id": None}
         )
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            json.dumps(response, separators=(",", ":")).encode(),
-            b"",
-        )
+        return response
 
-    monkeypatch.setattr(tendwire_client.subprocess, "run", run)
+    monkeypatch.setattr(tendwire_client.TendwireClient, "_request", request)
     first = herdres.command_reply(_payload())
     second = herdres.command_reply(_payload())
     assert first["checkpoint"] == "retry"
@@ -2066,31 +2069,21 @@ def test_stale_refresh_uses_real_client_validation_and_persists_second_bytes(
     child_starts: list[bytes] = []
     backend_mutations = 0
 
-    def run(argv, *, input, **_kwargs):
+    def request(_self, method, params, **_kwargs):
         nonlocal backend_mutations
-        request_bytes = bytes(input)
+        assert method == "command.submit"
+        request_bytes = json.dumps(
+            params, separators=(",", ":"), ensure_ascii=False
+        ).encode()
         child_starts.append(request_bytes)
-        request = json.loads(request_bytes)
         if len(child_starts) == 1:
-            response = _failed_command_response(
-                request, status="stale_target", disposition="no_receipt"
-            )
-            return subprocess.CompletedProcess(
-                argv,
-                1,
-                json.dumps(response, separators=(",", ":")).encode(),
-                b"",
+            return _failed_command_response(
+                params, status="stale_target", disposition="no_receipt"
             )
         backend_mutations += 1
-        response = _accepted_command_response(request)
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            json.dumps(response, separators=(",", ":")).encode(),
-            b"",
-        )
+        return _accepted_command_response(params)
 
-    monkeypatch.setattr(tendwire_client.subprocess, "run", run)
+    monkeypatch.setattr(tendwire_client.TendwireClient, "_request", request)
     result = herdres.command_reply(_payload())
     assert result["transport_disposition"] == "written_to_pty"
     assert len(child_starts) == 2

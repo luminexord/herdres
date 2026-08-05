@@ -1949,23 +1949,10 @@ def test_sync_loop_journals_later_oversize_notice_failure(
     class StopLoop(RuntimeError):
         pass
 
-    class FakeDispatcher:
-        def __init__(self, *_args, **_kwargs):
-            self.stopped = False
-
-        def start(self):
-            return None
-
-        def stop(self):
-            self.stopped = True
-
     monkeypatch.setattr(herdres.config, "load_env_file", lambda: None)
     monkeypatch.setattr(herdres.config, "require_source_mode", lambda: None)
-    monkeypatch.setattr(
-        herdres.config, "tendwire_db_path", lambda: "/tmp/tendwire-test.db"
-    )
-    monkeypatch.setattr(herdres, "OutboundDispatcher", FakeDispatcher)
-    monkeypatch.setattr(herdres, "_sync_pass", lambda: result)
+    monkeypatch.setattr(herdres, "_sync_pass", lambda **_kwargs: result)
+    monkeypatch.setattr(herdres, "_outbound_pass", lambda: {"ok": True})
     def stop_sleep(_seconds):
         raise StopLoop
 
@@ -4452,9 +4439,6 @@ def test_doctor_composes_inbound_and_outbound_health_without_masking(
     )
     monkeypatch.setattr(doctor, "legacy_timer", lambda: {"ok": True})
     monkeypatch.setattr(
-        doctor, "sqlite_integrity", lambda: {"ok": True}
-    )
-    monkeypatch.setattr(
         doctor, "tendwire_backend", lambda _client=None: {"ok": True}
     )
     monkeypatch.setattr(
@@ -5791,7 +5775,7 @@ def test_malformed_acknowledged_prefix_stops_before_recovery_rpc(
     code = herdres.cmd_recover_turn_final(
         SimpleNamespace(
             plan_token="twplan1.failed",
-            request_id=f"malformed-prefix-{field}",
+            request_id="malformed-prefix-case",
         )
     )
     output = json.loads(capsys.readouterr().out)
@@ -7180,6 +7164,23 @@ def test_turn_final_lease_seconds_default_and_bounds():
         )
         == 60
     )
+
+
+@pytest.mark.parametrize(
+    ("request_id", "valid"),
+    [
+        ("recover.request-42_ok", True),
+        ("recover:request", False),
+        ("recover/request", False),
+        ("telegram.request", False),
+        ("HERDRESrequest", False),
+        ("chat-id", False),
+        ("delivery_1", False),
+        ("", False),
+    ],
+)
+def test_recovery_request_id_uses_paired_public_grammar(request_id, valid):
+    assert herdres._valid_recovery_request_id(request_id) is valid
 
 
 def test_slow_final_materialization_stays_within_configured_root_lease(

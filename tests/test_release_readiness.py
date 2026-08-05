@@ -65,7 +65,7 @@ def test_rc_docs_use_explicit_paired_release_gate() -> None:
     assert "Tendwire `0.1.0rc5`" in readme
     assert "Python 3.13" in readme
     assert "complete paired" in release
-    assert "HERDRES_PAIRED_TENDWIRE_SOURCE_DIR=/absolute/tendwire/src" in release
+    assert "paired socket probe" in release
     assert "Never restart Herdr" in release
 
 
@@ -149,6 +149,29 @@ def test_runtime_imports_no_herdr_backend_client_and_reports_zero_direct_calls()
         assert needle not in text, f"herdres runtime must not reference {needle}"
     # No subprocess invocation of a bare `herdr` binary (herdres/tendwire/systemctl are fine).
     assert not re.search(r"""[\[(]\s*["']herdr["']""", text), "herdres runtime must not spawn a bare herdr binary"
+
+
+def test_tendwire_transport_has_no_cli_fallback_or_database_watcher() -> None:
+    client = (REPO_ROOT / "herdres_connector/tendwire_client.py").read_text(
+        encoding="utf-8"
+    )
+    launcher = (REPO_ROOT / "herdres.py").read_text(encoding="utf-8")
+
+    assert not (REPO_ROOT / "herdres_connector/outbound_dispatcher.py").exists()
+    for forbidden in (
+        "subprocess",
+        "HERDRES_TENDWIRE_BIN",
+        "TENDWIRE_BIN",
+        "tendwire.cli",
+    ):
+        assert forbidden not in client
+    for forbidden in (
+        "OutboundDispatcher",
+        "_DatabaseWakeWatcher",
+        "inotify",
+        "tendwire_db_path",
+    ):
+        assert forbidden not in launcher
 
 
 def test_herdr_plugin_manifest_has_safe_non_delivery_actions() -> None:

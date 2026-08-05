@@ -633,7 +633,6 @@ def test_doctor_consumer_propagates_terminal_fold_health(monkeypatch):
     binding["fold_error"] = "recipient rejected fold"
     monkeypatch.setattr(doctor, "source_services", lambda: {"ok": True})
     monkeypatch.setattr(doctor, "legacy_timer", lambda: {"ok": True})
-    monkeypatch.setattr(doctor, "sqlite_integrity", lambda: {"ok": True})
     monkeypatch.setattr(
         doctor, "tendwire_backend", lambda _client=None: {"ok": True}
     )
