@@ -223,8 +223,8 @@ def _reply_bot_kind_from_binding(store: dict[str, Any], reply_to: dict[str, Any]
 def _explicit_target_bot_kind_for_message(store: dict[str, Any], message: dict[str, Any], text: str, thread_id: str) -> str:
     reply_to = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
     return (
-        _reply_bot_kind_from_binding(store, reply_to, thread_id)
-        or _reply_bot_kind_from_username(store, reply_to)
+        _reply_bot_kind_from_username(store, reply_to)
+        or _reply_bot_kind_from_binding(store, reply_to, thread_id)
         or _mentioned_managed_bot_kind(store, text)
     )
 

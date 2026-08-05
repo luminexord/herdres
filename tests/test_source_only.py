@@ -4942,6 +4942,88 @@ def test_command_reply_to_agent_message_targets_original_worker(tmp_path, monkey
     assert request["instruction"] == {"text": "reply to claude"}
 
 
+def test_command_reply_author_bot_overrides_corrupt_reply_binding(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json")
+    )
+    store = _store()
+    _codex_key, codex, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-codex",
+                "name": "codex",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-codex",
+            }
+        ),
+    )
+    _kimi_key, kimi, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-kimi",
+                "name": "kimi",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-kimi",
+            }
+        ),
+    )
+    _space_key, space, _created = state.upsert_space_entry(
+        store,
+        {
+            "id": "space-1",
+            "name": "Project",
+            "status": "active",
+            "fingerprint": "space-fp",
+        },
+        topic_id="77",
+    )
+    assert state.cache_space_active_worker(space, codex)
+    state.bind_message_to_worker(
+        store,
+        "555",
+        kimi,
+        topic_id="77",
+        kind="final",
+        turn_id="turn-corrupt",
+        bot_kind="kimi",
+    )
+    state.save_state(store)
+    fake = FakeTendwire()
+
+    class ClientFactory:
+        def __call__(self):
+            return fake
+
+    monkeypatch.setattr(herdres, "TendwireClient", ClientFactory())
+    result = herdres.command_reply(
+        {
+            "chat_id": "-100",
+            "topic_id": "77",
+            "message_id": "999",
+            "request_id": REQUEST_ID,
+            "reply_to_message_id": "555",
+            "target_bot_kind": "codex",
+            "text": "/send reply to Coda",
+        }
+    )
+
+    assert result == _gateway_child(
+        REQUEST_ID,
+        disposition="terminal_accepted",
+        reply="Sent to Tendwire worker.",
+    )
+    assert fake.commands[0]["target"] == _worker_target(
+        "worker-codex", "fp-codex"
+    )
+    assert fake.commands[0]["instruction"] == {"text": "reply to Coda"}
+
+
 def test_command_reply_at_alias_targets_worker_in_space(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
     store = _store()
@@ -5932,6 +6014,82 @@ def test_gateway_manager_skips_reply_owned_by_child_bot(monkeypatch):
     )
 
     assert payload is None
+
+
+def test_gateway_reply_author_overrides_corrupt_binding_bot_kind(monkeypatch):
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_MANAGED_BOTS", "1")
+    store = _store()
+    store["telegram"]["managed_bots"] = {
+        "codex": {
+            "enabled": True,
+            "token": "codex-token",
+            "username": "coda_bot",
+        },
+        "kimi": {
+            "enabled": True,
+            "token": "kimi-token",
+            "username": "kimi_bot",
+        },
+    }
+    _worker_key, kimi, _created = state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": "worker-kimi",
+                "name": "kimi",
+                "status": "idle",
+                "space_id": "space-1",
+                "fingerprint": "fp-kimi",
+            }
+        ),
+    )
+    state.upsert_space_entry(
+        store,
+        {
+            "id": "space-1",
+            "name": "Project",
+            "status": "active",
+            "fingerprint": "space-fp",
+        },
+        topic_id="77",
+    )
+    state.bind_message_to_worker(
+        store,
+        "555",
+        kimi,
+        topic_id="77",
+        kind="final",
+        turn_id="turn-corrupt",
+        bot_kind="kimi",
+    )
+    message = {
+        "chat": {"id": "-100", "is_forum": True},
+        "message_thread_id": 77,
+        "message_id": 10,
+        "reply_to_message": {
+            "message_id": 555,
+            "from": {"username": "coda_bot", "is_bot": True},
+        },
+        "from": {"id": "1", "is_bot": False},
+        "text": "reply to Coda",
+    }
+    bot_keys = {
+        kind: key for key, kind, _token in managed_bot_tokens(store["telegram"])
+    }
+
+    codex_payload = herdres_gateway._payload_for_message(
+        message, store, bot_key=bot_keys["codex"]
+    )
+
+    assert codex_payload is not None
+    assert codex_payload["target_bot_kind"] == "codex"
+    assert (
+        herdres_gateway._payload_for_message(
+            message, store, bot_key=bot_keys["kimi"]
+        )
+        is None
+    )
+    assert herdres_gateway._payload_for_message(message, store) is None
 
 
 def test_runtime_has_no_direct_herdr_pane_api_names():
