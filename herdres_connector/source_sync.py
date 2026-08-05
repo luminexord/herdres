@@ -11,8 +11,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from . import accounts, config, decisions, ingress_requests, speech, state
-from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token, managed_bot_token_for_entry
+from . import accounts, config, decisions, speech, state
+from .managed_bots import MANAGER_BOT_KIND, managed_bot_kind_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import (
     PresentationContentError,
@@ -2428,11 +2428,25 @@ def _set_pending_turn_plan(
 def _delivery_bot(
     store: dict[str, Any], entry: dict[str, Any]
 ) -> tuple[str | None, str]:
+    kind = managed_bot_kind_for_entry(entry)
+    if not kind or entry.get("managed_voice_active") is False:
+        return None, MANAGER_BOT_KIND
+    token = _legacy_presenter_bot_token(store, kind)
+    return (token, kind) if token else (None, MANAGER_BOT_KIND)
+
+
+def _legacy_presenter_bot_token(store: dict[str, Any], bot_kind: str) -> str:
+    """Read a managed delivery token only for the temporary old presenter."""
+
+    if not config.managed_bots_enabled():
+        return ""
     telegram = _telegram_state(store)
-    return (
-        managed_bot_token_for_entry(telegram, entry),
-        desired_message_bot_kind(telegram, entry),
-    )
+    bots = telegram.get("managed_bots")
+    record = bots.get(bot_kind) if isinstance(bots, dict) else None
+    if isinstance(record, dict) and record.get("enabled") is False:
+        return ""
+    configured = config.managed_bot_token(bot_kind)
+    return configured or (str(record.get("token") or "").strip() if isinstance(record, dict) else "")
 
 
 def _record_delivery_error(
@@ -3273,30 +3287,6 @@ def _clear_stream_delivery_state(entry: dict[str, Any], turn_id: str) -> None:
     if entry.get("last_stream_turn_id") != turn_id:
         return
     _clear_stream_delivery_keys(entry)
-
-
-def _complete_submission_receipt(
-    store: dict[str, Any],
-    submission_id: str,
-    *,
-    now: float | None = None,
-) -> bool:
-    if not submission_id:
-        return False
-    completed_at = time.time() if now is None else now
-    for record in ingress_requests.retained_submission_records(
-        store, now=completed_at
-    ):
-        if record.get("submission_id") != submission_id:
-            continue
-        return ingress_requests.attach_submission_receipt(
-            record,
-            submission_id,
-            "complete",
-            record.get("turn_id"),
-            now=completed_at,
-        )
-    return False
 
 
 _FOLD_ATTEMPT_CAP = state.RESPONSE_FOLD_ATTEMPT_CAP
@@ -6206,308 +6196,6 @@ def _deliver_working(
     return False
 
 
-def _submission_owner_entry(
-    store: dict[str, Any], record: dict[str, Any]
-) -> dict[str, Any] | None:
-    owner = record.get("target_owner")
-    if not isinstance(owner, dict):
-        return None
-    stable_key = owner.get("stable_key")
-    if not isinstance(stable_key, str):
-        return None
-    _entry_key, entry = state.find_worker_entry_by_stable_key(store, stable_key)
-    if (
-        entry is None
-        or state.entry_stable_identity(entry)
-        != (stable_key, owner.get("stable_key_version"))
-    ):
-        return None
-    return entry
-
-
-def _associate_submission_working(
-    store: dict[str, Any], record: dict[str, Any], entry: dict[str, Any]
-) -> bool:
-    submission_id = str(record.get("submission_id") or "")
-    turn_id = str(record.get("turn_id") or "")
-    if (
-        not submission_id
-        or not turn_id
-        or entry.get("last_stream_submission_id") != submission_id
-    ):
-        return False
-    changed = _entry_put(entry, "last_stream_turn_id", turn_id)
-    message_id = str(entry.get("last_stream_message_id") or "")
-    binding = state.find_message_binding(store, message_id)
-    if isinstance(binding, dict) and binding.get("submission_id") == submission_id:
-        if binding.get("turn_id") != turn_id:
-            binding["turn_id"] = turn_id
-            changed = True
-    return changed
-
-
-def _submission_instruction(record: dict[str, Any]) -> str:
-    request_json = record.get("request_json")
-    if not isinstance(request_json, str):
-        return ""
-    try:
-        request = json.loads(request_json)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return ""
-    instruction = request.get("instruction") if isinstance(request, dict) else None
-    return (
-        str(instruction.get("text") or "")
-        if isinstance(instruction, dict)
-        else ""
-    )
-
-
-def _apply_submission_links(
-    store: dict[str, Any], turns: list[dict[str, Any]], *, now: float
-) -> int:
-    changed = 0
-    for item in turns:
-        submission_id = item.get(_SUBMISSION_ID_KEY)
-        if not isinstance(submission_id, str):
-            continue
-        record, record_changed = ingress_requests.link_submission(
-            store,
-            submission_id,
-            _turn_id(item),
-            now=now,
-            submission_state=str(item.get(_SUBMISSION_STATE_KEY) or "linked"),
-        )
-        changed += int(record_changed)
-        if record is None:
-            continue
-        entry = _submission_owner_entry(store, record)
-        if entry is not None:
-            changed += int(_associate_submission_working(store, record, entry))
-    return changed
-
-
-def _sync_submission_working_cards(
-    store: dict[str, Any],
-    turns: list[dict[str, Any]],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    now: float,
-    yield_barrier: Callable[[], None] | None = None,
-) -> dict[str, int]:
-    """Render v3 receipts while leaving the legacy predicted-turn path inert."""
-
-    counts = {
-        "sent": 0,
-        "updated": 0,
-        "physical_writes": 0,
-        "work_pending": 0,
-    }
-    budget = _delivery_write_budget(runtime)
-    budget_start = budget.spent
-    complete_turn_ids = {
-        _turn_id(item) for item in turns if _turn_has_complete_final(item)
-    }
-    records = ingress_requests.retained_submission_records(store, now=now)
-    newest_by_owner: dict[str, dict[str, Any]] = {}
-    for record in records:
-        owner = record.get("target_owner")
-        stable_key = (
-            str(owner.get("stable_key") or "")
-            if isinstance(owner, dict)
-            else ""
-        )
-        current = newest_by_owner.get(stable_key)
-        if stable_key and (
-            current is None
-            or (
-                float(record.get("submitted_at") or 0),
-                str(record.get("submission_id") or ""),
-            )
-            > (
-                float(current.get("submitted_at") or 0),
-                str(current.get("submission_id") or ""),
-            )
-        ):
-            newest_by_owner[stable_key] = record
-    records = list(newest_by_owner.values())
-    records.sort(
-        key=lambda record: (
-            float(record.get("submitted_at") or 0),
-            str(record.get("submission_id") or ""),
-        )
-    )
-    for record in records:
-        request_id = str(record.get("request_id") or "")
-        if yield_barrier is not None:
-            yield_barrier()
-            record = next(
-                (
-                    candidate
-                    for candidate in ingress_requests.retained_submission_records(
-                        store, now=now
-                    )
-                    if candidate.get("request_id") == request_id
-                ),
-                None,
-            )
-            if record is None:
-                continue
-        writes_before = budget.spent
-        delivered = _deliver_submission_working_record(
-            store,
-            record,
-            runtime,
-            chat_id=chat_id,
-            now=now,
-            complete_turn_ids=complete_turn_ids,
-        )
-        counts["sent"] += delivered["sent"]
-        counts["updated"] += delivered["updated"]
-        writes_used = budget.spent - writes_before
-        counts["physical_writes"] = budget.spent - budget_start
-        if writes_used and not delivered["sent"]:
-            counts["work_pending"] += 1
-    return counts
-
-
-def _deliver_submission_working_record(
-    store: dict[str, Any],
-    record: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    now: float,
-    complete_turn_ids: set[str] | None = None,
-) -> dict[str, int]:
-    """Deliver the working card for one durable Tendwire v3 receipt."""
-
-    counts = {"sent": 0, "updated": 0}
-    submission_id = str(record.get("submission_id") or "")
-    turn_id = str(record.get("turn_id") or "")
-    if not submission_id:
-        return counts
-    entry = _submission_owner_entry(store, record)
-    if entry is None:
-        return counts
-    counts["updated"] += int(
-        _associate_submission_working(store, record, entry)
-    )
-    if record.get("submission_state") == "complete" or (
-        turn_id
-        and complete_turn_ids is not None
-        and turn_id in complete_turn_ids
-    ):
-        if record.get("submission_state") != "complete":
-            before = dict(record)
-            ingress_requests.attach_submission_receipt(
-                record,
-                submission_id,
-                "complete",
-                turn_id,
-                now=now,
-            )
-            counts["updated"] += int(record != before)
-        return counts
-    existing_message_id = str(
-        entry.get("last_stream_message_id") or ""
-    )
-    if (
-        entry.get("last_stream_submission_id") == submission_id
-        and existing_message_id
-        and existing_message_id != "0"
-    ):
-        binding = state.find_message_binding(store, existing_message_id)
-        if isinstance(binding, dict):
-            if binding.get("submission_id") != submission_id:
-                binding["submission_id"] = submission_id
-                counts["updated"] += 1
-            if turn_id and binding.get("turn_id") != turn_id:
-                binding["turn_id"] = turn_id
-                counts["updated"] += 1
-        return counts
-    stream_identity = turn_id or submission_id
-    item = {
-        "id": stream_identity,
-        "worker_id": str(
-            entry.get("tendwire_worker_id") or entry.get("worker_id") or ""
-        ),
-        "space_id": str(
-            entry.get("tendwire_space_id") or entry.get("space_id") or ""
-        ),
-        "complete": False,
-        "user_text": _submission_instruction(record),
-        _SUBMISSION_ID_KEY: submission_id,
-    }
-    before = dict(entry)
-    delivered = _deliver_working(
-        store,
-        item,
-        entry,
-        runtime,
-        chat_id=chat_id,
-    )
-    if delivered or entry.get("last_stream_turn_id") == stream_identity:
-        if entry.get("last_stream_submission_id") != submission_id:
-            entry["last_stream_submission_id"] = submission_id
-        message_id = str(entry.get("last_stream_message_id") or "")
-        binding = state.find_message_binding(store, message_id)
-        if isinstance(binding, dict):
-            binding["submission_id"] = submission_id
-    counts["sent"] += int(delivered)
-    counts["updated"] += int(not delivered and entry != before)
-    return counts
-
-
-def deliver_submission_working_card(
-    store: dict[str, Any],
-    request_id: str,
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    now: float | None = None,
-) -> dict[str, Any]:
-    """Deliver one receipt-derived card at the durable acceptance boundary."""
-
-    observed_at = time.time() if now is None else float(now)
-    record = next(
-        (
-            candidate
-            for candidate in ingress_requests.retained_submission_records(
-                store, now=observed_at
-            )
-            if candidate.get("request_id") == request_id
-        ),
-        None,
-    )
-    if record is None:
-        return {
-            "ok": True,
-            "request_id": request_id,
-            "sent": 0,
-            "updated": 0,
-            "status": "receipt_not_found",
-        }
-    effective_runtime = _offlock_runtime(store, runtime)
-    counts = _deliver_submission_working_record(
-        store,
-        record,
-        effective_runtime,
-        chat_id=chat_id,
-        now=observed_at,
-    )
-    changed = bool(counts["sent"] or counts["updated"])
-    if changed and runtime.checkpoint is not None:
-        runtime.checkpoint()
-    return {
-        "ok": True,
-        "request_id": request_id,
-        **counts,
-        "changed": changed,
-        "status": "delivered" if counts["sent"] else "unchanged",
-    }
-
-
 def _refind_entry(store: dict[str, Any], entry_key: str | None) -> dict[str, Any] | None:
     if not entry_key:
         return None
@@ -8076,7 +7764,7 @@ def _exact_job_binding(
 def _owning_bot_token(store: dict[str, Any], bot_kind: str) -> str | None:
     if not bot_kind or bot_kind == MANAGER_BOT_KIND:
         return None
-    token = managed_bot_token(_telegram_state(store), bot_kind)
+    token = _legacy_presenter_bot_token(store, bot_kind)
     if not token:
         raise _TurnContentError(
             "missing_message_owner_token",
@@ -8229,7 +7917,6 @@ def _complete_turn_plan_from_bindings(
     _clear_pending_turn_plan(store, entry)
     if stream_submission_id:
         _clear_stream_delivery_keys(entry)
-        _complete_submission_receipt(store, stream_submission_id)
     else:
         _clear_stream_delivery_state(entry, _turn_id(item))
     _record_delivery_success(entry, bot_kind)
@@ -10304,14 +9991,6 @@ def _follow_removed_turn_successor(
 def _clear_projection_stale_cards(store: dict[str, Any], projection: dict[str, Any]) -> int:
     cleared = 0
     known = set(projection)
-    raw_records = store.get(ingress_requests.RECORDS_KEY)
-    active_submissions = {
-        str(record.get("submission_id"))
-        for record in (raw_records.values() if isinstance(raw_records, dict) else [])
-        if isinstance(record, dict)
-        and isinstance(record.get("submission_id"), str)
-        and record.get("submission_state") != "complete"
-    }
     candidates: set[str] = set()
     for bucket_name in ("panes", "spaces"):
         bucket = store.get(bucket_name)
@@ -10322,12 +10001,6 @@ def _clear_projection_stale_cards(store: dict[str, Any], projection: dict[str, A
                 continue
             for key in ("last_stream_turn_id", "last_turn_id"):
                 value = entry.get(key)
-                if (
-                    key == "last_stream_turn_id"
-                    and entry.get("last_stream_submission_id")
-                    in active_submissions
-                ):
-                    continue
                 if isinstance(value, str) and value and value not in known:
                     candidates.add(value)
     for turn_id in candidates:
@@ -10822,18 +10495,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         # page watermark/checkpoint is not written into an orphaned sub-dict.
         delta = _delta_state(store, now=observed_at)
         delta_observation["delta"] = delta
-    with state.lock_phase("sync.submissions"):
-        submission_link_updates = _apply_submission_links(
-            store, _turns(turns_payload), now=observed_at
-        )
-        submission_counts = _sync_submission_working_cards(
-            store,
-            _turns(turns_payload),
-            runtime,
-            chat_id=chat_id,
-            now=observed_at,
-            yield_barrier=yield_barrier,
-        )
     with state.lock_phase("sync.routing"):
         routing_repaired = _repair_space_mode_routing_state(store)
         message_bindings = _backfill_message_bindings(store)
@@ -10946,9 +10607,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         or routing_repaired
         or turn_counts["sent"]
         or turn_counts["updated"]
-        or submission_counts["sent"]
-        or submission_counts["updated"]
-        or submission_link_updates
         or topic_cleanup.get("changed")
         or message_bindings
         or decision_result.get("changed")
@@ -11073,13 +10731,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     response_fold_health = state.response_fold_health(store)
     completed_deliveries = (
         int(turn_counts["sent"])
-        + int(submission_counts["sent"])
         + int(turn_final_result.get("delivered") or 0)
         + int(outbox_result.get("delivered") or 0)
     )
     pending_delivery_work = (
         int(turn_counts.get("work_pending") or 0)
-        + int(submission_counts.get("work_pending") or 0)
         + int(turn_final_result.get("failed") or 0)
         + int(turn_final_result.get("deferred") or 0)
         + int(outbox_result.get("failed") or 0)
@@ -11121,10 +10777,10 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "icon_updated": source_counts["icon_updated"],
         "worker_rebinds": worker_rebinds,
         "pinned_status_updated": int(pinned_changed) + topic_pinned_updated,
-        "feed_sent": turn_counts["feed_sent"] + submission_counts["sent"],
-        "sent": turn_counts["sent"] + submission_counts["sent"],
+        "feed_sent": turn_counts["feed_sent"],
+        "sent": turn_counts["sent"],
         "routing_repaired": routing_repaired,
-        "turn_updates": turn_counts["updated"] + submission_counts["updated"],
+        "turn_updates": turn_counts["updated"],
         "response_folds": {
             "attempted": int(
                 turn_counts.get("response_fold_attempted") or 0
@@ -11134,7 +10790,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 turn_counts.get("response_fold_failed") or 0
             ),
         },
-        "submission_working": submission_counts,
         **(
             {"tendwire_delta_sync": _delta_health(delta, now=observed_at)}
             if delta is not None

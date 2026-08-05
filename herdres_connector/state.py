@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+# H8-SLOC-BEGIN state-imports
+import base64
+import hashlib
+import hmac
+import stat
+from contextlib import ExitStack
+from dataclasses import dataclass
+from enum import Enum
+from typing import ContextManager
+# H8-SLOC-END state-imports
 import fcntl
 import json
 import os
@@ -39,6 +49,222 @@ PANE_UUID_VERSION = 1
 PANE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+
+# H8-SLOC-BEGIN state-contracts
+_PROVIDER_GUARD_DOMAIN = b"herdres-provider-owner-v1\0"
+_ROUTE_GENERATION_RE = re.compile(r"^twroute1\.[A-Za-z0-9_-]{43}$", re.ASCII)
+_PROVIDER_GUARD_DIR = ".provider-mutation-locks"
+_PROVIDER_GUARD_PREFIX = "pg1."
+
+
+def _bounded_text(value: Any, *, field: str, maximum: int = 512) -> str:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum:
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class StateToken:
+    value: str
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.value, field="state token", maximum=128)
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalOwner:
+    bot_identity: str
+    chat_id: str
+    topic_id: str
+
+    def __post_init__(self) -> None:
+        for value, field in ((self.bot_identity, "provider bot identity"),
+                             (self.chat_id, "provider chat id"), (self.topic_id, "provider topic id")):
+            _bounded_text(value, field=field, maximum=256)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderMutationGuard:
+    owner: PhysicalOwner
+    lock_identity: str
+
+
+class SecretStr:
+    __slots__ = ("__value",)
+
+    def __init__(self, value: str) -> None:
+        self.__value = _bounded_text(
+            value, field="receiver token", maximum=4096
+        )
+
+    def __repr__(self) -> str:
+        return "SecretStr('[REDACTED]')"
+
+    def __str__(self) -> str:
+        return "[REDACTED]"
+
+    def _reject_serialization(self, *_args: Any) -> Any:
+        raise TypeError("SecretStr cannot be serialized")
+
+    __reduce__ = __reduce_ex__ = __deepcopy__ = _reject_serialization
+
+    def reveal_for_telegram_client(self) -> str:
+        return self.__value
+
+
+@dataclass(frozen=True, slots=True)
+class IngressReceiver:
+    receiver_id: str
+    bot_kind: str
+    username: str
+    token: SecretStr
+
+
+@dataclass(frozen=True, slots=True)
+class IngressPolicy:
+    chat_id: str
+    general_topic_id: str
+    owner_user_ids: frozenset[str]
+    managed_usernames: tuple[tuple[str, str], ...]
+    state_token: StateToken
+
+
+class RouteStatus(str, Enum):
+    RESOLVED = "resolved"
+    MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
+    QUARANTINED = "quarantined"
+    RETIRED = "retired"
+    STALE = "stale"
+    BINDING_AMBIGUOUS = "binding_ambiguous"
+    AUTHOR_AMBIGUOUS = "author_ambiguous"
+
+
+@dataclass(frozen=True, slots=True)
+class StableOwner:
+    stable_key: str
+    stable_key_version: int
+    route_generation: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IngressRouteQuery:
+    chat_id: str
+    topic_id: str
+    receiver_bot_kind: str
+    explicit_alias: str
+    explicit_bot_kind: str
+    state_token: StateToken
+
+
+@dataclass(frozen=True, slots=True)
+class IngressReplyQuery:
+    chat_id: str
+    topic_id: str
+    reply_message_id: str
+    observed_author_bot_kind: str
+    explicit_alias: str
+    explicit_bot_kind: str
+    state_token: StateToken
+
+
+@dataclass(frozen=True, slots=True)
+class IngressRouteResult:
+    status: RouteStatus
+    state_token: StateToken
+    chat_id: str
+    topic_id: str
+    worker_id: str
+    worker_fingerprint: str | None
+    owner: StableOwner | None
+    space_id: str
+    bot_kind: str
+    reply_binding_id: str | None
+    binding_was_present: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionIngressQuery:
+    chat_id: str
+    topic_id: str
+    callback_ref: str | None
+    state_token: StateToken
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionOption:
+    option_ref: str
+    label: str
+
+
+class DecisionStatus(str, Enum):
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
+    QUARANTINED = "quarantined"
+    STALE = "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionIngressResult:
+    status: DecisionStatus
+    state_token: StateToken
+    decision_ref: str
+    revision_digest: str
+    mode: str
+    worker_id: str
+    owner: StableOwner | None
+    message_binding_id: str
+    chat_id: str
+    topic_id: str
+    message_id: str
+    option_refs: tuple[str, ...]
+    options: tuple[DecisionOption, ...]
+    selected_refs: tuple[str, ...]
+    await_freeform: bool
+    render_fingerprint: str
+    physical_owner: PhysicalOwner
+
+
+class DecisionMutationKind(str, Enum):
+    ARM_FREEFORM = "ARM_FREEFORM"
+    TOGGLE_OPTION = "TOGGLE_OPTION"
+    RECORD_LOCAL_MARKUP = "RECORD_LOCAL_MARKUP"
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionMutation:
+    request_id: str
+    kind: DecisionMutationKind
+    decision_ref: str
+    revision_digest: str
+    option_ref: str | None
+    desired_selected_refs: tuple[str, ...]
+    desired_markup_fingerprint: str
+    expected_state_token: StateToken
+
+
+class DecisionMutationStatus(str, Enum):
+    APPLIED = "applied"
+    ALREADY_APPLIED = "already_applied"
+    STALE = "stale"
+    CONFLICT = "conflict"
+    EXPIRED = "expired"
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionMutationResult:
+    status: DecisionMutationStatus
+    state_token: StateToken
+    decision_ref: str
+    selected_refs: tuple[str, ...]
+    await_freeform: bool
+    message_binding_id: str
+    message_id: str
+    desired_markup_fingerprint: str
+# H8-SLOC-END state-contracts
 
 
 def load_state(path: Path | None = None) -> dict[str, Any]:
@@ -341,6 +567,121 @@ def state_lock(path: Path | None = None, *, phase: str = "state"):
                 fcntl.flock(handle, fcntl.LOCK_UN)
             finally:
                 _record_lock_released(handle.fileno())
+
+
+# H8-SLOC-BEGIN state-provider-guard
+def _opaque_digest(domain: bytes, value: Any, *, key: bytes | None = None) -> str:
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    digest = hmac.digest(key, domain + encoded, "sha256") if key else hashlib.sha256(domain + encoded).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _state_token(data: Mapping[str, Any], state_file: Path) -> StateToken:
+    try:
+        metadata = os.lstat(state_file)
+        identity: tuple[int, int] | None = (metadata.st_dev, metadata.st_ino)
+    except FileNotFoundError:
+        identity = None
+    return StateToken("st1." + _opaque_digest(
+        b"herdres-state-token-v1\0", {"file_identity": identity, "state": data}))
+
+
+def _load_schema2_locked(state_file: Path) -> tuple[dict[str, Any], StateToken]:
+    data = load_state(state_file)
+    if type(data.get("version")) is not int or data.get("version") != 2:
+        raise RuntimeError("Herdres typed state requires schema 2")
+    return data, _state_token(data, state_file)
+
+
+def _open_guard_node(
+    path: str | Path, *, dir_fd: int | None = None, directory: bool,
+) -> int:
+    fd: int | None = None
+    label = "namespace" if directory else "file"
+    try:
+        before = os.stat(path, dir_fd=dir_fd, follow_symlinks=False) if directory else None
+        flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        if directory:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | flags,
+                         dir_fd=dir_fd)
+        else:
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | flags,
+                             0o600, dir_fd=dir_fd)
+                os.fchmod(fd, 0o600)
+            except FileExistsError:
+                fd = os.open(path, os.O_RDWR | flags, dir_fd=dir_fd)
+        metadata = os.fstat(fd)
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+        raise RuntimeError(f"unsafe provider mutation guard {label}") from exc
+    race = directory and before is not None and (
+        metadata.st_dev != before.st_dev or metadata.st_ino != before.st_ino)
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    safe = (kind(metadata.st_mode) and metadata.st_uid == os.geteuid()
+            and stat.S_IMODE(metadata.st_mode) == (0o700 if directory else 0o600)
+            and (directory or metadata.st_nlink == 1))
+    if not safe or race:
+        os.close(fd)
+        raise RuntimeError(f"unsafe provider mutation guard {label}")
+    return fd
+
+
+@contextmanager
+def provider_mutation_guard(
+    state_path: Path,
+    owner: PhysicalOwner,
+    deadline_monotonic: float,
+) -> ContextManager[ProviderMutationGuard]:
+    """Serialize one physical Telegram owner without exposing its coordinates."""
+
+    if not isinstance(state_path, Path) or not state_path.is_absolute():
+        raise RuntimeError("unsafe provider mutation guard state path")
+    if not isinstance(owner, PhysicalOwner):
+        raise TypeError("provider mutation owner must be PhysicalOwner")
+    if type(deadline_monotonic) not in (int, float) or deadline_monotonic <= time.monotonic():
+        raise TimeoutError("provider mutation guard deadline reached")
+    if lock_actually_held():
+        raise RuntimeError("provider mutation guard cannot wait under state lock")
+
+    from .ingress_identity import load_request_id_key
+
+    identity = {"bot_identity": owner.bot_identity, "chat_id": owner.chat_id,
+                "topic_id": owner.topic_id}
+    lock_identity = _PROVIDER_GUARD_PREFIX + _opaque_digest(
+        _PROVIDER_GUARD_DOMAIN, identity, key=load_request_id_key())
+    try:
+        with ExitStack() as cleanup:
+            parent_fd = _open_guard_node(state_path.parent, directory=True)
+            cleanup.callback(os.close, parent_fd)
+            try:
+                os.mkdir(_PROVIDER_GUARD_DIR, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            guard_fd = _open_guard_node(_PROVIDER_GUARD_DIR, dir_fd=parent_fd,
+                                        directory=True)
+            cleanup.callback(os.close, guard_fd)
+            lock_fd = _open_guard_node(lock_identity, dir_fd=guard_fd,
+                                       directory=False)
+            cleanup.callback(os.close, lock_fd)
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline_monotonic:
+                        raise TimeoutError("provider mutation guard deadline reached")
+                    remaining = max(0.0, deadline_monotonic - time.monotonic())
+                    time.sleep(min(0.01, remaining))
+            cleanup.callback(fcntl.flock, lock_fd, fcntl.LOCK_UN)
+            yield ProviderMutationGuard(owner=owner, lock_identity=lock_identity)
+    except (RuntimeError, TimeoutError):
+        raise
+    except OSError as exc:
+        raise RuntimeError("unsafe provider mutation guard") from exc
+# H8-SLOC-END state-provider-guard
 
 
 def source_worker_entries(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -3363,6 +3704,14 @@ def bind_message_to_worker(
     if pane_uuid:
         binding["pane_uuid"] = pane_uuid
         binding["pane_uuid_version"] = PANE_UUID_VERSION
+    # H8-SLOC-BEGIN state-binding-route-generation
+    route_generation = entry.get("route_generation")
+    if (
+        isinstance(route_generation, str)
+        and _ROUTE_GENERATION_RE.fullmatch(route_generation) is not None
+    ):
+        binding["route_generation"] = route_generation
+    # H8-SLOC-END state-binding-route-generation
     if entry_is_quarantined(entry):
         binding["routing_quarantined"] = True
     bindings[message] = binding
@@ -3381,3 +3730,329 @@ def find_message_binding(data: dict[str, Any], message_id: str | int | None, *, 
     if topic_id and str(binding.get("topic_id") or "") and str(binding.get("topic_id")) != str(topic_id):
         return None
     return binding
+
+
+# H8-SLOC-BEGIN state-routing
+def _entry_route(
+    entry: Mapping[str, Any],
+) -> tuple[str, str | None, StableOwner | None, str, str]:
+    from .managed_bots import managed_bot_kind_for_entry
+
+    identity = entry_stable_identity(dict(entry))
+    generation = entry.get("route_generation")
+    if generation is not None and (
+        not isinstance(generation, str) or not _ROUTE_GENERATION_RE.fullmatch(generation)
+    ):
+        identity = None
+    owner = StableOwner(*identity, generation) if identity else None
+    worker_id = str(entry.get("tendwire_worker_id") or entry.get("active_worker_id") or entry.get("worker_id") or "")
+    fingerprint = str(entry.get("tendwire_fingerprint") or entry.get("active_worker_fingerprint") or "") or None
+    space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+    return worker_id, fingerprint, owner, space_id, managed_bot_kind_for_entry(dict(entry)) or "manager"
+
+
+def _route_result(
+    query: IngressRouteQuery | IngressReplyQuery, token: StateToken,
+    status: RouteStatus, reason: str, *, entry: Mapping[str, Any] | None = None,
+    binding: bool = False,
+) -> IngressRouteResult:
+    fields = _entry_route(entry or {}) if entry else ("", None, None, "", "")
+    return IngressRouteResult(status, token, query.chat_id, query.topic_id, *fields,
+                              getattr(query, "reply_message_id", None) if binding else None,
+                              binding, reason)
+
+
+def _route_matches(
+    data: dict[str, Any], query: IngressRouteQuery, *, space_id: str = "",
+    inactive: bool = False,
+) -> list[tuple[str, dict[str, Any]]]:
+    alias, kind = _alias_token(query.explicit_alias), str(query.explicit_bot_kind or "").strip().lower()
+    matches: list[tuple[str, dict[str, Any]]] = []
+    for key, entry in source_worker_entries(data).items():
+        blocked = entry_is_quarantined(entry) or entry_is_retired(entry)
+        if inactive != blocked or (inactive and _entry_route(entry)[2] is None):
+            continue
+        if not inactive and not worker_entry_is_uniquely_routable(data, key, entry):
+            continue
+        if query.topic_id not in worker_entry_allowed_topic_ids(data, entry) or (space_id and _entry_route(entry)[3] != space_id):
+            continue
+        aliases = {_alias_token(value) for value in (entry.get("worker_name"), entry.get("agent"), entry.get("topic_name"), entry.get("tendwire_worker_id"), entry.get("worker_id")) if value}
+        if (alias and alias not in aliases) or (not alias and kind and _entry_route(entry)[4] != kind):
+            continue
+        matches.append((key, entry))
+    return matches
+
+
+def _bound_entry(
+    data: dict[str, Any], binding: Mapping[str, Any]
+) -> tuple[str | None, dict[str, Any] | None]:
+    rows = source_worker_entries(data)
+    source = message_binding_source_identity(dict(binding))
+    stable = message_binding_stable_identity(dict(binding))
+    pane_uuid = message_binding_pane_uuid(dict(binding))
+    if source:
+        keys = _all_worker_entry_keys_by_stable_key(data, source[0])
+    elif "tendwire_stable_key" in binding or "tendwire_stable_key_version" in binding:
+        keys = []
+    elif pane_uuid:
+        keys = [key for key, row in rows.items() if entry_pane_uuid(row) == pane_uuid]
+    elif "pane_uuid" in binding or "pane_uuid_version" in binding:
+        keys = []
+    elif stable:
+        keys = _all_worker_entry_keys_by_stable_key(data, stable[0])
+    elif "stable_key" in binding or "stable_key_version" in binding:
+        keys = []
+    else:
+        keys = _all_worker_entry_keys_by_worker(data, str(binding.get("worker_id") or ""))
+    return (keys[0], rows.get(keys[0])) if len(keys) == 1 else (None, None)
+
+
+def _binding_evidence_matches(
+    data: dict[str, Any], binding: Mapping[str, Any], entry: Mapping[str, Any]
+) -> bool:
+    worker_id, fingerprint, owner, space_id, _kind = _entry_route(entry)
+    bound_generation = binding.get("route_generation")
+    return bool(
+        str(binding.get("topic_id") or "") in worker_entry_allowed_topic_ids(data, dict(entry))
+        and (not binding.get("worker_id") or str(binding.get("worker_id")) == worker_id)
+        and (not binding.get("worker_fingerprint") or str(binding.get("worker_fingerprint")) == fingerprint)
+        and (not binding.get("space_id") or str(binding.get("space_id")) == space_id)
+        and ("route_generation" not in binding or isinstance(bound_generation, str)
+             and _ROUTE_GENERATION_RE.fullmatch(bound_generation) is not None
+             and owner is not None and owner.route_generation == bound_generation)
+    )
+
+
+def read_ingress_policy(state_path: Path) -> IngressPolicy:
+    from .managed_bots import normalize_username
+
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_ingress_policy"):
+        data, token = _load_schema2_locked(state_file)
+    telegram = data.get("telegram") if isinstance(data.get("telegram"), dict) else {}
+    owners = telegram.get("owner_user_ids", [])
+    owners = owners if isinstance(owners, list) else []
+    managed = telegram.get("managed_bots")
+    usernames = [
+        (normalize_username(raw.get("username")), str(kind).strip().lower())
+        for kind, raw in (managed.items() if isinstance(managed, dict) else ())
+        if isinstance(raw, dict) and raw.get("enabled") is not False
+        and normalize_username(raw.get("username"))
+    ]
+    return IngressPolicy(
+        chat_id=config.telegram_chat_id(data),
+        general_topic_id=config.general_thread_id(data),
+        owner_user_ids=frozenset(str(value) for value in owners),
+        managed_usernames=tuple(sorted(set(usernames))),
+        state_token=token,
+    )
+
+
+def read_ingress_receivers(state_path: Path) -> tuple[IngressReceiver, ...]:
+    from .managed_bots import MANAGED_BOT_KINDS
+
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_ingress_receivers"):
+        data, _token = _load_schema2_locked(state_file)
+    telegram = data.get("telegram") if isinstance(data.get("telegram"), dict) else {}
+    managed = telegram.get("managed_bots")
+    managed = managed if isinstance(managed, dict) else {}
+    receivers: list[IngressReceiver] = []
+    for kind in ("manager", *sorted(MANAGED_BOT_KINDS)):
+        raw = telegram if kind == "manager" else managed.get(kind, {})
+        if not isinstance(raw, dict) or raw.get("enabled") is False:
+            continue
+        token = (config.telegram_token() if kind == "manager" else
+                 config.managed_bot_token(kind) or str(raw.get("token") or "").strip())
+        if not token:
+            continue
+        username = raw.get("username") or (raw.get("bot_username") if kind == "manager" else "")
+        receivers.append(
+            IngressReceiver("manager" if kind == "manager" else f"managed-{kind}",
+                            kind, str(username or "").strip().lstrip("@").lower(),
+                            SecretStr(token))
+        )
+    return tuple(receivers)
+
+
+def _resolve_ingress_route_locked(
+    data: dict[str, Any], token: StateToken, query: IngressRouteQuery
+) -> IngressRouteResult:
+    if query.state_token != token:
+        return _route_result(query, token, RouteStatus.STALE, "stale_state")
+    if query.chat_id != config.telegram_chat_id(data):
+        return _route_result(query, token, RouteStatus.MISSING, "chat_mismatch")
+    matches = _route_matches(data, query)
+    if len(matches) == 1:
+        reason = "explicit_alias" if query.explicit_alias else "explicit_bot_kind" if query.explicit_bot_kind else "topic_route"
+        return _route_result(query, token, RouteStatus.RESOLVED, reason, entry=matches[0][1])
+    if len(matches) > 1:
+        return _route_result(query, token, RouteStatus.AMBIGUOUS, "route_ambiguous")
+    inactive = _route_matches(data, query, inactive=True)
+    if len(inactive) == 1:
+        entry = inactive[0][1]
+        status = RouteStatus.QUARANTINED if entry_is_quarantined(entry) else RouteStatus.RETIRED
+        return _route_result(query, token, status, "route_" + status.value, entry=entry)
+    status = RouteStatus.AMBIGUOUS if inactive else RouteStatus.MISSING
+    return _route_result(query, token, status, "route_ambiguous" if inactive else "route_missing")
+
+
+def resolve_ingress_route(
+    state_path: Path, query: IngressRouteQuery
+) -> IngressRouteResult:
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_ingress_route"):
+        data, token = _load_schema2_locked(state_file)
+        return _resolve_ingress_route_locked(data, token, query)
+
+
+def resolve_ingress_reply(
+    state_path: Path, query: IngressReplyQuery
+) -> IngressRouteResult:
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_ingress_reply"):
+        data, token = _load_schema2_locked(state_file)
+        if query.state_token != token:
+            return _route_result(query, token, RouteStatus.STALE, "stale_state")
+        if query.chat_id != config.telegram_chat_id(data):
+            return _route_result(query, token, RouteStatus.MISSING, "chat_mismatch")
+        if query.explicit_alias:
+            route = IngressRouteQuery(query.chat_id, query.topic_id, "", query.explicit_alias, "", token)
+            return _resolve_ingress_route_locked(data, token, route)
+        binding_id = str(query.reply_message_id or "").strip()
+        bindings = message_bindings(data)
+        binding_was_present = bool(binding_id) and binding_id in bindings
+        binding = find_message_binding(data, query.reply_message_id, topic_id=query.topic_id)
+        if binding_was_present and binding is None:
+            return _route_result(query, token, RouteStatus.BINDING_AMBIGUOUS, "binding_topic_mismatch_or_malformed", binding=True)
+        if binding is not None:
+            if "routing_quarantined" in binding:
+                return _route_result(query, token, RouteStatus.BINDING_AMBIGUOUS, "reply_binding_quarantined", binding=True)
+            key, entry = _bound_entry(data, binding)
+            if entry is not None and not _binding_evidence_matches(data, binding, entry):
+                return _route_result(query, token, RouteStatus.BINDING_AMBIGUOUS, "reply_binding_evidence_mismatch", binding=True)
+            observed = str(query.observed_author_bot_kind or "").strip().lower()
+            binding_kind = str(binding.get("bot_kind") or "").strip().lower()
+            resolved_kind = _entry_route(entry)[4] if entry is not None else binding_kind
+            if observed and resolved_kind != observed:
+                author_query = IngressRouteQuery(query.chat_id, query.topic_id, "", "", observed, token)
+                author_matches = _route_matches(data, author_query, space_id=_entry_route(entry)[3] if entry else str(binding.get("space_id") or ""))
+                if len(author_matches) != 1:
+                    return _route_result(query, token, RouteStatus.AUTHOR_AMBIGUOUS, "ambiguous_reply_author_target", binding=True)
+                key, entry = author_matches[0]
+            if entry is not None and key is not None and worker_entry_is_uniquely_routable(data, key, entry):
+                return _route_result(query, token, RouteStatus.RESOLVED, "reply_binding", entry=entry, binding=True)
+            if entry is not None and (entry_is_quarantined(entry) or entry_is_retired(entry)):
+                status = RouteStatus.QUARANTINED if entry_is_quarantined(entry) else RouteStatus.RETIRED
+                return _route_result(query, token, status, "reply_binding_" + status.value, entry=entry, binding=True)
+            return _route_result(query, token, RouteStatus.BINDING_AMBIGUOUS, "ambiguous_reply_target", binding=True)
+        route = IngressRouteQuery(query.chat_id, query.topic_id, "", query.explicit_alias,
+                                  query.observed_author_bot_kind or query.explicit_bot_kind, token)
+        return _resolve_ingress_route_locked(data, token, route)
+# H8-SLOC-END state-routing
+
+
+# H8-SLOC-BEGIN state-decisions
+def _decision_result(
+    status: DecisionStatus, token: StateToken, chat_id: str, topic_id: str,
+    projected: Mapping[str, Any] | None = None, owner: StableOwner | None = None,
+) -> DecisionIngressResult:
+    row = projected or {}
+    options = tuple(DecisionOption(*pair) for pair in row.get("options", ()))
+    return DecisionIngressResult(
+        status, token, str(row.get("decision_ref") or ""), str(row.get("revision") or ""),
+        str(row.get("mode") or ""), str(row.get("worker_id") or ""), owner,
+        str(row.get("binding_id") or ""), chat_id, topic_id, str(row.get("message_id") or ""),
+        tuple(row.get("refs", ())), options, tuple(row.get("selected", ())),
+        row.get("await_freeform") is True, str(row.get("render_fingerprint") or ""),
+        PhysicalOwner(str(row.get("bot_identity") or "manager"), chat_id or "unknown", topic_id or "unknown"),
+    )
+
+
+def read_decision_ingress(
+    state_path: Path, query: DecisionIngressQuery
+) -> DecisionIngressResult:
+    from . import decisions
+
+    if query.callback_ref is not None and (not isinstance(query.callback_ref, str) or not query.callback_ref):
+        raise ValueError("decision callback ref must be nonempty or null")
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_decision_read"):
+        data, token = _load_schema2_locked(state_file)
+        status = DecisionStatus.STALE if query.state_token != token else DecisionStatus.MISSING
+        if status is DecisionStatus.STALE or query.chat_id != config.telegram_chat_id(data):
+            return _decision_result(status, token, query.chat_id, query.topic_id)
+        record = decisions.active_decision(data, query.topic_id)
+        if record is None:
+            return _decision_result(DecisionStatus.MISSING, token, query.chat_id, query.topic_id)
+        decision_ref = str(record.get("decision_id") or record.get("decision_ref") or "")
+        if query.callback_ref is not None and not hmac.compare_digest(decisions._ref56(decision_ref), query.callback_ref):
+            return _decision_result(DecisionStatus.EXPIRED, token, query.chat_id, query.topic_id)
+        projected = decisions._project_ingress_record(record)
+        if projected is None:
+            return _decision_result(DecisionStatus.QUARANTINED, token, query.chat_id, query.topic_id)
+        _key, entry = find_worker_entry_by_id(data, projected["worker_id"])
+        owner = _entry_route(entry or {})[2]
+        status = (DecisionStatus.ACTIVE if entry is not None and owner is not None
+                  and not entry_is_quarantined(entry) else DecisionStatus.QUARANTINED)
+        return _decision_result(status, token, query.chat_id, query.topic_id, projected, owner)
+
+
+def _mutation_result(
+    status: DecisionMutationStatus, token: StateToken,
+    projected: Mapping[str, Any] | None = None,
+) -> DecisionMutationResult:
+    row = projected or {}
+    return DecisionMutationResult(
+        status=status, state_token=token, decision_ref=str(row.get("decision_ref") or ""),
+        selected_refs=tuple(row.get("selected", ())), await_freeform=row.get("await_freeform") is True,
+        message_binding_id=str(row.get("binding_id") or ""), message_id=str(row.get("message_id") or ""),
+        desired_markup_fingerprint=str(row.get("desired_markup_fingerprint") or ""),
+    )
+
+
+def apply_decision_ingress(
+    state_path: Path, mutation: DecisionMutation
+) -> DecisionMutationResult:
+    from . import decisions
+    from .ingress_identity import validate_request_id
+
+    if not isinstance(mutation, DecisionMutation):
+        raise TypeError("decision mutation must be DecisionMutation")
+    validate_request_id(mutation.request_id)
+    if not isinstance(mutation.kind, DecisionMutationKind):
+        raise ValueError("invalid decision mutation kind")
+    _bounded_text(mutation.decision_ref, field="decision ref")
+    _bounded_text(mutation.revision_digest, field="decision revision")
+    if mutation.option_ref is not None:
+        _bounded_text(mutation.option_ref, field="decision option ref")
+    if len(mutation.desired_selected_refs) > 64:
+        raise ValueError("too many desired decision selections")
+    for desired_ref in mutation.desired_selected_refs:
+        _bounded_text(desired_ref, field="desired decision option ref")
+    if mutation.desired_markup_fingerprint:
+        _bounded_text(
+            mutation.desired_markup_fingerprint,
+            field="desired markup fingerprint",
+        )
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_decision_mutation"):
+        data, token = _load_schema2_locked(state_file)
+        if mutation.expected_state_token != token:
+            return _mutation_result(DecisionMutationStatus.STALE, token)
+        matches = [
+            record
+            for record in decisions._active_records(data, create=False).values()
+            if str(record.get("decision_id") or record.get("decision_ref") or "")
+            == mutation.decision_ref
+        ]
+        if len(matches) != 1:
+            status = DecisionMutationStatus.EXPIRED if not matches else DecisionMutationStatus.CONFLICT
+            return _mutation_result(status, token)
+        record = matches[0]
+        status = decisions._reduce_ingress_mutation(record, mutation)
+        if status is DecisionMutationStatus.APPLIED:
+            save_state(data, state_file)
+            token = _state_token(data, state_file)
+        return _mutation_result(status, token, decisions._project_ingress_record(record))
+# H8-SLOC-END state-decisions

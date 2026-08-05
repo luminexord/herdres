@@ -296,6 +296,16 @@ def test_key_loader_rejects_symlink(tmp_path: Path) -> None:
         load_request_id_key(linked_key)
 
 
+def test_key_loader_rejects_hard_link(tmp_path: Path) -> None:
+    key_path = tmp_path / "request-id.key"
+    linked_key = tmp_path / "linked.key"
+    _write_key(key_path)
+    os.link(key_path, linked_key)
+
+    with pytest.raises(RuntimeError, match="missing or unsafe"):
+        load_request_id_key(key_path)
+
+
 def test_key_loader_detects_atomic_path_replacement_without_a_sleep(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

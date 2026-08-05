@@ -2,19 +2,33 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
+import time
+from dataclasses import replace
 from types import SimpleNamespace
 
-import herdres
-import herdres_gateway
+import pytest
+
 from herdres_connector import decisions, source_sync, state, tendwire_client
 from herdres_connector.ingress_identity import (
     derive_telegram_request_id,
     validate_request_id,
 )
-from herdres_connector.telegram_delivery import TelegramClient
+from herdres_connector.telegram_delivery import TelegramClient, TelegramError
 
 
 REQUEST_KEY = bytes(range(32))
+
+
+@pytest.fixture(autouse=True)
+def _provider_guard_identity(tmp_path, monkeypatch):
+    key_path = tmp_path / "request-id.key"
+    key_path.write_bytes(REQUEST_KEY)
+    key_path.chmod(0o600)
+    monkeypatch.setenv("HERDRES_REQUEST_ID_KEY_PATH", str(key_path))
+    monkeypatch.setenv(
+        "HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json")
+    )
 
 
 def _request_id(update_id: int = 100, message_id: int = 9001) -> str:
@@ -314,6 +328,159 @@ def _button(record: dict, token: str) -> str:
     raise AssertionError(f"button not found: {token}")
 
 
+def test_typed_schema2_policy_route_and_secret_boundary(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "typed-state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "manager-secret")
+    state.save_state(_store(), state_path)
+
+    policy = state.read_ingress_policy(state_path)
+    route = state.resolve_ingress_route(
+        state_path,
+        state.IngressRouteQuery(
+            chat_id="-100",
+            topic_id="77",
+            receiver_bot_kind="manager",
+            explicit_alias="",
+            explicit_bot_kind="",
+            state_token=policy.state_token,
+        ),
+    )
+    receivers = state.read_ingress_receivers(state_path)
+
+    assert route.status is state.RouteStatus.RESOLVED
+    assert route.worker_id == "worker-1"
+    assert route.owner is not None
+    assert route.owner.stable_key_version == 1
+    assert receivers[0].receiver_id == "manager"
+    assert str(receivers[0].token) == "[REDACTED]"
+    assert "manager-secret" not in repr(receivers[0].token)
+    assert receivers[0].token.reveal_for_telegram_client() == "manager-secret"
+    with pytest.raises(TypeError):
+        pickle.dumps(receivers[0].token)
+
+
+def test_typed_decision_mutation_is_composite_idempotent_and_digest_fenced(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "typed-decision-state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    store = _store()
+    record = _post(store, FakeTelegram(), _pending(kind="multi"))
+    state.save_state(store, state_path)
+    token = state.read_ingress_policy(state_path).state_token
+    snapshot = state.read_decision_ingress(
+        state_path,
+        state.DecisionIngressQuery(
+            chat_id="-100",
+            topic_id="77",
+            callback_ref=decisions._ref56(record["decision_id"]),
+            state_token=token,
+        ),
+    )
+    assert snapshot.status is state.DecisionStatus.ACTIVE
+    assert snapshot.options == (
+        state.DecisionOption(option_ref="1", label="Use the safe path"),
+        state.DecisionOption(option_ref="2", label="Use the fast path"),
+    )
+    markup, markup_fingerprint = decisions.render_ingress_markup(
+        snapshot, ("1",)
+    )
+    assert markup["inline_keyboard"][0][0]["text"] == "✅ Use the safe path"
+    assert markup["inline_keyboard"][1][0]["text"] == "▫️ Use the fast path"
+    mutation = state.DecisionMutation(
+        request_id=_request_id(update_id=501, message_id=9501),
+        kind=state.DecisionMutationKind.TOGGLE_OPTION,
+        decision_ref=snapshot.decision_ref,
+        revision_digest=snapshot.revision_digest,
+        option_ref="1",
+        desired_selected_refs=("1",),
+        desired_markup_fingerprint=markup_fingerprint,
+        expected_state_token=snapshot.state_token,
+    )
+
+    applied = state.apply_decision_ingress(state_path, mutation)
+    replayed = state.apply_decision_ingress(
+        state_path, replace(mutation, expected_state_token=applied.state_token)
+    )
+    conflicted = state.apply_decision_ingress(
+        state_path,
+        replace(
+            mutation,
+            desired_markup_fingerprint="different-markup",
+            expected_state_token=replayed.state_token,
+        ),
+    )
+
+    assert applied.status is state.DecisionMutationStatus.APPLIED
+    assert applied.selected_refs == ("1",)
+    assert replayed.status is state.DecisionMutationStatus.ALREADY_APPLIED
+    assert conflicted.status is state.DecisionMutationStatus.CONFLICT
+
+
+def test_typed_decision_topic_lookup_supports_armed_freeform(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "typed-freeform-state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    store = _store()
+    _post(store, FakeTelegram(), _pending(kind="single"))
+    state.save_state(store, state_path)
+    token = state.read_ingress_policy(state_path).state_token
+    snapshot = state.read_decision_ingress(
+        state_path,
+        state.DecisionIngressQuery(
+            chat_id="-100",
+            topic_id="77",
+            callback_ref=None,
+            state_token=token,
+        ),
+    )
+
+    armed = state.apply_decision_ingress(
+        state_path,
+        state.DecisionMutation(
+            request_id=_request_id(update_id=502, message_id=9502),
+            kind=state.DecisionMutationKind.ARM_FREEFORM,
+            decision_ref=snapshot.decision_ref,
+            revision_digest=snapshot.revision_digest,
+            option_ref=None,
+            desired_selected_refs=snapshot.selected_refs,
+            desired_markup_fingerprint="",
+            expected_state_token=snapshot.state_token,
+        ),
+    )
+
+    assert snapshot.status is state.DecisionStatus.ACTIVE
+    assert armed.status is state.DecisionMutationStatus.APPLIED
+    assert armed.await_freeform is True
+    with pytest.raises(ValueError):
+        state.read_decision_ingress(
+            state_path,
+            state.DecisionIngressQuery(
+                chat_id="-100",
+                topic_id="77",
+                callback_ref="",
+                state_token=armed.state_token,
+            ),
+        )
+
+
+def test_provider_guard_uses_opaque_stable_identity(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "guard-state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    owner = state.PhysicalOwner("manager", "-100", "77")
+
+    with state.provider_mutation_guard(
+        state_path, owner, time.monotonic() + 1.0
+    ) as first:
+        assert first.owner == owner
+        assert first.lock_identity.startswith("pg1.")
+        assert len(first.lock_identity) == 47
+        assert "-100" not in first.lock_identity
+        assert "77" not in first.lock_identity
+
+
 def test_resolve_decisions_joins_worker_and_fails_closed() -> None:
     store = _store()
     payload = _pending()
@@ -523,78 +690,6 @@ def test_decision_not_pending_retracts_with_honest_note() -> None:
     assert "✅ Answered." not in telegram.edited[-1]["html"]
 
 
-def test_write_in_arm_then_plain_text_submits_as_decision(
-    tmp_path, monkeypatch
-) -> None:
-    store = _store()
-    telegram = FakeTelegram()
-    record = _post(store, telegram, _pending())
-    armed = decisions.handle_callback(
-        store,
-        callback_data=_button(record, "custom"),
-        topic_id="77",
-        chat_id="-100",
-        request_id=_request_id(),
-        telegram=telegram,
-        tendwire=FakeTendwire(),
-    )
-    assert armed["status"] == "await_freeform"
-    assert record["await_freeform"] is True
-
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
-    state.save_state(store)
-    tendwire = FakeTendwire()
-    monkeypatch.setattr(herdres, "TendwireClient", lambda: tendwire)
-    monkeypatch.setattr(herdres, "TelegramClient", lambda **_kwargs: telegram)
-
-    result = herdres.command_reply(
-        {
-            "request_id": _request_id(update_id=101, message_id=9002),
-            "topic_id": "77",
-            "message_id": "9002",
-            "text": "Use the compatibility implementation",
-        }
-    )
-
-    assert result["handled"] is True
-    assert tendwire.commands[0]["action"] == "answer_decision"
-    assert tendwire.commands[0]["params"]["selection"] == {
-        "text": "Use the compatibility implementation"
-    }
-    assert state.load_state()["decisions"]["active"] == {}
-
-
-def test_send_command_falls_through_even_when_write_in_is_armed(
-    tmp_path, monkeypatch
-) -> None:
-    store = _store()
-    telegram = FakeTelegram()
-    record = _post(store, telegram, _pending())
-    record["await_freeform"] = True
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
-    state.save_state(store)
-    tendwire = FakeTendwire()
-    monkeypatch.setattr(herdres, "TendwireClient", lambda: tendwire)
-
-    result = herdres.command_reply(
-        {
-            "request_id": _request_id(update_id=102, message_id=9003),
-            "topic_id": "77",
-            "message_id": "9003",
-            "text": "/send deploy the compatibility implementation",
-        }
-    )
-
-    assert result["handled"] is True
-    assert tendwire.commands[0]["action"] == "send_instruction"
-    assert tendwire.commands[0]["instruction"]["text"] == (
-        "deploy the compatibility implementation"
-    )
-    assert state.load_state()["decisions"]["active"]["77"][
-        "await_freeform"
-    ] is True
-
-
 def test_remote_decisions_flag_off_is_fully_inert(monkeypatch) -> None:
     monkeypatch.setenv("HERDRES_REMOTE_DECISIONS", "0")
     store = _store()
@@ -623,81 +718,6 @@ def test_remote_decisions_flag_off_is_fully_inert(monkeypatch) -> None:
     assert decisions.config.remote_decisions_enabled({"HERDRES_REMOTE_DECISIONS": ""}) is True
 
 
-def test_gateway_routes_owner_callback_and_answers_query(
-    tmp_path, monkeypatch
-) -> None:
-    store = _store()
-    telegram = FakeTelegram()
-    record = _post(store, telegram, _pending())
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
-    state.save_state(store)
-    tendwire = FakeTendwire()
-    monkeypatch.setattr(herdres_gateway, "TelegramClient", lambda **_kwargs: telegram)
-    monkeypatch.setattr(herdres_gateway, "TendwireClient", lambda: tendwire)
-
-    checkpoint = herdres_gateway.handle_update(
-        {
-            "update_id": 103,
-            "callback_query": {
-                "id": "callback-1",
-                "from": {"id": 7, "is_bot": False},
-                "data": _button(record, "1"),
-                "message": {
-                    "message_id": int(record["message_id"]),
-                    "message_thread_id": 77,
-                    "chat": {"id": -100, "is_forum": True},
-                },
-            },
-        },
-        "fake-token",
-        receiver_id="manager",
-        request_id_key=REQUEST_KEY,
-    )
-
-    assert checkpoint == herdres_gateway.CHECKPOINT_ADVANCE
-    assert validate_request_id(tendwire.commands[0]["request_id"])
-    assert state.load_state()["decisions"]["active"] == {}
-    assert telegram.callback_answers[-1]["callback_query_id"] == "callback-1"
-    assert telegram.callback_answers[-1]["text"] == "Answered."
-
-
-def test_gateway_rejects_non_owner_callback_but_still_answers(
-    tmp_path, monkeypatch
-) -> None:
-    store = _store()
-    telegram = FakeTelegram()
-    record = _post(store, telegram, _pending())
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(tmp_path / "state.json"))
-    state.save_state(store)
-    tendwire = FakeTendwire()
-    monkeypatch.setattr(herdres_gateway, "TelegramClient", lambda **_kwargs: telegram)
-    monkeypatch.setattr(herdres_gateway, "TendwireClient", lambda: tendwire)
-
-    checkpoint = herdres_gateway.handle_update(
-        {
-            "update_id": 104,
-            "callback_query": {
-                "id": "callback-denied",
-                "from": {"id": 8, "is_bot": False},
-                "data": _button(record, "1"),
-                "message": {
-                    "message_id": int(record["message_id"]),
-                    "message_thread_id": 77,
-                    "chat": {"id": -100, "is_forum": True},
-                },
-            },
-        },
-        "fake-token",
-        receiver_id="manager",
-        request_id_key=REQUEST_KEY,
-    )
-
-    assert checkpoint == herdres_gateway.CHECKPOINT_ADVANCE
-    assert tendwire.commands == []
-    assert "not allowed" in telegram.callback_answers[-1]["text"]
-    assert "77" in state.load_state()["decisions"]["active"]
-
-
 def test_decision_sync_failure_is_exception_isolated(monkeypatch) -> None:
     monkeypatch.setattr(
         source_sync.decisions,
@@ -714,7 +734,7 @@ def test_decision_sync_failure_is_exception_isolated(monkeypatch) -> None:
     assert result["changed"] is False
 
 
-def test_production_guarded_runtime_posts_callbacks_and_retracts(
+def test_production_guarded_runtime_posts_and_retracts(
     tmp_path, monkeypatch
 ) -> None:
     state_path = tmp_path / "state.json"
@@ -737,20 +757,6 @@ def test_production_guarded_runtime_posts_callbacks_and_retracts(
         posted = source_sync._deliver_decisions(
             current, _pending(kind="multi"), runtime, chat_id="-100"
         )
-        record = decisions.active_decision(current, "77")
-        assert record is not None
-        toggled = decisions.handle_callback(
-            current,
-            callback_data=_button(record, "1"),
-            topic_id="77",
-            chat_id="-100",
-            request_id=_request_id(),
-            telegram=runtime.telegram,
-            tendwire=runtime.tendwire,
-            provider_executor=source_sync._decision_provider_executor(
-                current, runtime
-            ),
-        )
         retracted = source_sync._deliver_decisions(
             current,
             {"pending_interactions": []},
@@ -758,34 +764,12 @@ def test_production_guarded_runtime_posts_callbacks_and_retracts(
             chat_id="-100",
         )
 
-        reposted = source_sync._deliver_decisions(
-            current, _pending(), runtime, chat_id="-100"
-        )
-        record = decisions.active_decision(current, "77")
-        assert record is not None
-        submitted = decisions.handle_callback(
-            current,
-            callback_data=_button(record, "2"),
-            topic_id="77",
-            chat_id="-100",
-            request_id=_request_id(update_id=105, message_id=9005),
-            telegram=runtime.telegram,
-            tendwire=runtime.tendwire,
-            provider_executor=source_sync._decision_provider_executor(
-                current, runtime
-            ),
-        )
-
     assert posted["posted"] == 1
-    assert toggled["status"] == "toggled"
     assert retracted["retracted"] == 1
-    assert reposted["posted"] == 1
-    assert submitted["status"] == "accepted"
     assert decisions.active_decision(current, "77") is None
-    assert len(telegram.sent) == 2
-    assert len(tendwire.commands) == 1
-    assert len(telegram.markup_edits) == 3
-    assert len(telegram.edited) == 2
+    assert len(telegram.sent) == 1
+    assert len(telegram.markup_edits) == 1
+    assert len(telegram.edited) == 1
 
 
 def _guarded_runtime(current, telegram, tendwire=None):
@@ -862,115 +846,6 @@ def test_guarded_decision_retract_rebind_finishes_exact_old_card(
     assert current["decisions"]["active"] == {}
     assert telegram.markup_edits[-1]["message_id"] == "101"
     assert telegram.edited[-1]["message_id"] == "101"
-
-
-def test_guarded_decision_toggle_rebind_does_not_write_rebound_owner(
-    tmp_path, monkeypatch
-) -> None:
-    state_path = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
-    state.save_state(_store(), state_path)
-    telegram = RebindingTelegram(state_path, on="never")
-
-    with state.state_lock(state_path):
-        current = state.load_state(state_path)
-        runtime = _guarded_runtime(current, telegram)
-        source_sync._deliver_decisions(
-            current, _pending(kind="multi"), runtime, chat_id="-100"
-        )
-        record = decisions.active_decision(current, "77")
-        assert record is not None
-        telegram.on = "markup"
-        result = decisions.handle_callback(
-            current,
-            callback_data=_button(record, "1"),
-            topic_id="77",
-            chat_id="-100",
-            request_id=_request_id(),
-            telegram=runtime.telegram,
-            tendwire=runtime.tendwire,
-            provider_executor=source_sync._decision_provider_executor(
-                current, runtime
-            ),
-        )
-        reconciled = source_sync._deliver_decisions(
-            current, _pending(kind="multi"), runtime, chat_id="-100"
-        )
-
-    assert result["status"] == "telegram_edit_failed"
-    assert result["changed"] is True
-    assert current["panes"]["worker-entry"]["topic_id"] == "88"
-    assert reconciled["posted"] == 1
-    assert telegram.deleted == [
-        {"chat_id": "-100", "message_id": "101"}
-    ]
-    assert [row["kwargs"]["thread_id"] for row in telegram.sent] == [
-        "77",
-        "88",
-    ]
-    assert decisions.active_decision(current, "77") is None
-    live = decisions.active_decision(current, "88")
-    assert live is not None and live["message_id"] == "102"
-
-
-def test_guarded_callback_failure_rebind_retires_exact_notice_once(
-    tmp_path, monkeypatch
-) -> None:
-    state_path = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
-    state.save_state(_store(), state_path)
-    telegram = RebindingTelegram(state_path, on="never")
-    tendwire = FakeTendwire(
-        {"ok": False, "status": "answer_failed"}
-    )
-
-    with state.state_lock(state_path):
-        current = state.load_state(state_path)
-        runtime = _guarded_runtime(current, telegram, tendwire)
-        source_sync._deliver_decisions(
-            current, _pending(), runtime, chat_id="-100"
-        )
-        record = decisions.active_decision(current, "77")
-        assert record is not None
-        telegram.on = "send"
-        result = decisions.handle_callback(
-            current,
-            callback_data=_button(record, "2"),
-            topic_id="77",
-            chat_id="-100",
-            request_id=_request_id(update_id=108, message_id=9008),
-            telegram=runtime.telegram,
-            tendwire=runtime.tendwire,
-            provider_executor=source_sync._decision_provider_executor(
-                current, runtime
-            ),
-        )
-        artifacts = current["decisions"]["accepted_artifacts"]
-        assert len(artifacts) == 1
-        assert [
-            (
-                row["kind"],
-                row["topic_id"],
-                row["message_id"],
-            )
-            for row in artifacts.values()
-        ] == [("decision_notice", "77", "102")]
-
-        reconciled = source_sync._deliver_decisions(
-            current, _pending(), runtime, chat_id="-100"
-        )
-
-    assert result["status"] == "answer_failed"
-    assert reconciled["artifact_reconciled"] == 1
-    assert telegram.deleted == [
-        {"chat_id": "-100", "message_id": "102"}
-    ]
-    assert sum(
-        "Could not answer that prompt" in row["html"]
-        for row in telegram.sent
-    ) == 1
-    assert current["decisions"]["accepted_artifacts"] == {}
-    assert current.get("decisions", {}).get("failure_notices", []) == []
 
 
 def test_guarded_decision_submit_rebind_tracks_acceptance_once(
@@ -1165,3 +1040,22 @@ def test_send_message_attaches_markup_only_to_final_split_and_helpers_use_api() 
             "text": "Updated",
         },
     )
+
+
+@pytest.mark.parametrize("ambiguous_acceptance", [False, True])
+def test_markup_edit_preserves_telegram_ambiguity_marker(
+    ambiguous_acceptance: bool,
+) -> None:
+    class FailingTelegram(TelegramClient):
+        def api(self, method, payload):
+            raise TelegramError(
+                "transport failed",
+                ambiguous_acceptance=ambiguous_acceptance,
+            )
+
+    result = FailingTelegram(token="fake").edit_message_reply_markup(
+        "-100", "9", {"inline_keyboard": []}
+    )
+
+    assert result["ok"] is False
+    assert result["ambiguous_acceptance"] is ambiguous_acceptance

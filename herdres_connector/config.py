@@ -194,23 +194,6 @@ def command_request_retention_seconds(env: Any | None = None) -> int:
     return command_retry_horizon_seconds(env) + 86_400
 
 
-def command_response_schema_version(env: Any | None = None) -> int:
-    """Return the explicitly negotiated Tendwire command envelope version.
-
-    Version 2 remains the default so an installed pre-v3 Tendwire keeps seeing
-    field-compatible command requests. Operators can opt in to v3
-    submission receipts without changing the request schema itself.
-    """
-
-    source = os.environ if env is None else env
-    raw = source.get("HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION", "2")
-    try:
-        value = int(str(raw or "2"))
-    except (TypeError, ValueError):
-        return 2
-    return value if value in {2, 3} else 2
-
-
 def inbound_spool_path(env: Any | None = None) -> Path:
     source = os.environ if env is None else env
     return Path(
@@ -225,50 +208,6 @@ def inbound_dispatch_workers(env: Any | None = None) -> int:
     except (TypeError, ValueError):
         return 8
     return min(64, max(1, value))
-
-
-def inbound_lane_depth(env: Any | None = None) -> int:
-    source = os.environ if env is None else env
-    try:
-        value = int(str(source.get("HERDRES_INBOUND_LANE_DEPTH", "32") or "32"))
-    except (TypeError, ValueError):
-        return 32
-    return min(4096, max(1, value))
-
-
-def inbound_lane_backoff_seconds(env: Any | None = None) -> float:
-    source = os.environ if env is None else env
-    try:
-        value = float(
-            str(source.get("HERDRES_INBOUND_LANE_BACKOFF_SECONDS", "2") or "2")
-        )
-    except (TypeError, ValueError):
-        return 2.0
-    return min(300.0, max(0.01, value))
-
-
-def inbound_hold_seconds(env: Any | None = None) -> float:
-    """Maximum time an ambiguous delivery may hold strict lane FIFO."""
-
-    source = os.environ if env is None else env
-    try:
-        value = float(str(source.get("HERDRES_INBOUND_HOLD_SECONDS", "15") or "15"))
-    except (TypeError, ValueError):
-        return 15.0
-    return min(60.0, max(1.0, value))
-
-
-def inbound_lane_stall_seconds(env: Any | None = None) -> float:
-    """Age at which a non-draining pending lane fails the health probe."""
-
-    source = os.environ if env is None else env
-    try:
-        value = float(
-            str(source.get("HERDRES_INBOUND_LANE_STALL_SECONDS", "5") or "5")
-        )
-    except (TypeError, ValueError):
-        return 5.0
-    return min(60.0, max(1.0, value))
 
 
 def gateway_timing_logs_enabled(env: Any | None = None) -> bool:

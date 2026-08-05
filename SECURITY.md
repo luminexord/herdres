@@ -24,86 +24,66 @@ only to the configured owner-private AF_UNIX daemon endpoint, so no inherited
 Telegram credentials, private connector paths, child environment, or process
 output crosses the boundary.
 
-## Inbound command request identity
+## Inbound queue, identity, and provider serialization
 
-`install-user.sh` creates a dedicated private 32-byte raw HMAC key at
-`HERDRES_REQUEST_ID_KEY_PATH`. Unset or empty selects
-`~/.local/share/herdres/request-id.key`; every configured value is expanded for
-`~` and must then be a nonempty absolute path. The owner-owned parent directory
-is mode `0700`; the owner-owned regular key file is mode `0600`. Existing valid
-material is preserved. Symlinks, unsafe ownership or permissions, malformed
-length, missing material, and replacement during validation fail closed.
-Runtime loads the key but never creates, repairs, or rotates it. Never put raw
-key bytes in environment variables, examples, logs, tickets, or source.
+Independent H8 has one durable ingress store:
+`~/.local/share/herdres/inbound_spool.db`. The writer pins an absolute
+owner-private parent, uses no-follow directory-relative opens, verifies stable
+device/inode identity, and requires the database, writer lock, WAL, and SHM to
+be EUID-owned regular single-link mode-`0600` files. The parent and physical
+provider-lock directory are mode `0700`. Wrong schema, ownership, permissions,
+type, link count, symlink, replacement, partial sidecars, or failed integrity
+checks fail closed; runtime never chmod-repairs or silently recreates an unsafe
+existing store.
 
-The canonical public form is `hri1_` followed by the 43-character unpadded
-URL-safe base64 encoding of an HMAC-SHA256 digest. Its versioned MAC scope is
-exactly the stable receiving-bot identity and Telegram `update_id`, `chat_id`,
-and `message_id`. It excludes bot tokens, text, topic/reply metadata, Telegram
-user identity, and resolved Tendwire target. Managed-bot polling cursors use
-the same stable bot kind rather than a token-derived runtime key. Token rotation
-therefore preserves both polling position and request identity without
-disclosing raw coordinates to Tendwire. The ID is an idempotency coordinate,
-not an authentication credential; Tendwire does not receive the key and cannot
-recompute it.
+The queue is schema 1 with one exclusive writer, WAL, `synchronous=FULL`,
+`trusted_schema=OFF`, bounded busy time, fixed depth/lease/deadline/retention
+limits, and atomic receiver-cursor acceptance. A separate observer is
+query-only and exposes aggregate health/status only. There is no lane spool,
+JSON ingress ledger in state, second database, child process, CLI fallback, or
+receipt-derived presentation shortcut.
 
-Every distinct Telegram update receives a distinct ID, even if two messages
-have identical text. Herdres performs no content-based command suppression.
-The gateway derives the ID and durably creates fixed first-seen lifecycle
-bounds before private routing, transcription, or child creation. It checks a
-retained terminal/quarantine cache before those operations. Before the first
-Tendwire call it stores canonical schema-v1 request JSON and fsyncs the
-temporary file, atomic replacement, and parent directory; retries pass the
-stored UTF-8 bytes verbatim.
+`install-user.sh` creates one private 32-byte HMAC key at
+`HERDRES_REQUEST_ID_KEY_PATH` (default
+`~/.local/share/herdres/request-id.key`). Runtime accepts only an EUID-owned
+regular single-link mode-`0600` file of exactly 32 bytes under a private parent,
+pins its inode during reading, and never creates, repairs, rotates, serializes,
+or logs it. The canonical public ID is `hri1_` plus the 43-character unpadded
+base64url HMAC-SHA256 digest over receiver identity and Telegram
+update/chat/message coordinates. Tokens, text, sender, reply metadata, and
+resolved route are excluded.
 
-The only authorized byte rewrite is one `stale_target` response carrying
-disposition `no_receipt`: Herdres may remove only `worker_fingerprint`, must
-persist the resulting exact bytes, and reuses the same request ID. No other
-status, route change, transcription, or worker observation may rebuild the
-request.
+Ingress reads legacy schema-2 state only through frozen typed operations.
+Callers receive opaque `StateToken` values, bounded public route/decision data,
+and slotted `SecretStr` receiver credentials that reject display, pickling, and
+dataclass serialization. Each secret is revealed only directly into one
+`TelegramClient`; it never enters the queue, another dataclass, an exception,
+status, or log.
 
-Herdres treats the correlated Tendwire AF_UNIX response as the only command
-authority. It requires the exact negotiated schema-v2 or schema-v3 field set,
-validates public pruning and the complete
-disposition/`ok`/`status`/result/error tuple. Status alone is not authority:
-`backend_unavailable` plus `no_receipt` is retryable, whereas
-`backend_unavailable` plus `terminal_rejected` is terminal. A pre-send socket
-failure is definite; timeout, EOF, malformed or non-UTF-8 data, or a wrong
-field/correlation/tuple after request start supplies no proven response and is
-transport ambiguity. Herdres forges no disposition and retries only the
-already durable request within its fixed deadline.
+Decision edits and deletes are serialized per exact `PhysicalOwner` by the
+shared `provider_mutation_guard`. Its sibling lock filename is `pg1.<43>`, the
+unpadded base64url HMAC-SHA256 of the three owner fields under the request-ID
+key and a separate domain. No chat/topic/account coordinate appears in the
+namespace. Waiting has a monotonic deadline and never holds the state flock or
+a queue transaction. Typed mutations use composite
+`(request_id, DecisionMutationKind)` idempotency plus a canonical mutation
+digest, so selection and provider-markup checkpoints replay independently and
+conflicting bytes fail closed.
 
-`HERDRES_COMMAND_RETRY_HORIZON_SECONDS` defaults/falls back to `86400` seconds
-and clamps to `60` through `604800`. The stored deadline is first-seen plus
-that value; `updated_at`, redelivery, retry, and configuration changes never
-slide it, and equality expires. Local retention is also first-seen based:
-horizon plus a `86400`-second margin (`172800` default, `86460` minimum,
-`691200` maximum). A valid record is pruned only when `now > retain_until`.
-Pair Tendwire retry age at or above the Herdres horizon and Tendwire receipt
-age at or above the Herdres retention bound; Tendwire's defaults are `604800`
-and `2592000`, with a newest-`4096` inactive-receipt floor.
+Before AF_UNIX mutation the queue durably checkpoints the exact canonical
+command or local action. `TendwireClient.command_json()` is the only command
+transport; no subprocess or database watcher exists. Definitely-not-started
+work may retry the same bytes. Started ambiguity cannot be converted into a new
+send or live-route substitute; it follows the bounded retry/quarantine rule for
+that exact operation. Only public allowlisted command fields cross to Tendwire.
+Raw Telegram coordinates, credentials, provider bindings, queue rows, private
+routes, and process output do not.
 
-An authoritative `terminal_uncertain`, deadline expiry, or corrupt/conflicting
-receipt evidence is quarantined (locally dead-lettered) rather than retried
-forever. Terminal rejection and quarantine cache the fixed sanitized reply
-`Could not send safely. Refresh status and choose the target again.` in an
-`advance` terminal outcome. The gateway sends the reply, advances the stable
-polling offset, and permits later updates; restart/redelivery reuses the cache
-without a Tendwire call. This local ingress quarantine is distinct from
-Tendwire's final-delivery dead-letter queue.
-
-Only schema/action, opaque request ID, `dry_run`, a public target, and
-instruction text can cross to Tendwire. Tendwire's public request-ID grammar is
-`[A-Za-z0-9._-]{1,128}` while Herdres generates its narrower canonical
-`hri1_…` value. Raw Telegram receiver, update, chat, topic, message, reply, or
-user IDs, bot tokens, and private routes/backend targets cannot cross.
-
-Back up and restore the request-ID key together with private Herdres state and
-the Tendwire database/continuity key set while writers are quiesced. Preserve
-mode `0600` on restore. Replacing this key changes every request ID and can
-bypass continuity for a redelivered mutation; key regeneration is not a
-recovery operation.
-
+Back up and restore the queue DB/WAL/SHM, request-ID key, private Herdres state,
+and Tendwire database/continuity family together while all writers are stopped.
+Key regeneration is not recovery: it changes request and provider-lock
+identities. The old presenter remains until paired H7/H6 and shares the same
+physical-owner guard, but never opens the H8 queue.
 ## Final delivery ambiguity
 
 Dead-letter inspection is bounded and public-safe, and retry selects one exact

@@ -42,8 +42,8 @@ start the persistent Tendwire, Herdres, and gateway user services.
 ```text
 Telegram topic input
   -> herdres-gateway
-  -> herdres command
-  -> Tendwire command.submit over the protected Unix socket
+  -> one durable in-process ingress queue
+  -> Tendwire command JSON over the protected AF_UNIX socket
 
 herdres sync
   -> tendwire snapshot/turn.delta/pending/connector
@@ -85,7 +85,6 @@ default as a safety net. Configure the page/repair behavior with:
 HERDRES_TENDWIRE_TIMEOUT_SECONDS=60
 HERDRES_TENDWIRE_CONNECTOR_POLL_SECONDS=1
 HERDRES_TENDWIRE_DELTA_LIMIT=500
-HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION=2
 HERDRES_TENDWIRE_FULL_RECONCILE_SECONDS=3600
 HERDRES_TENDWIRE_FORCE_FULL_RECONCILE=0
 ```
@@ -94,224 +93,78 @@ Zero, negative, or invalid reconciliation intervals use the hourly default so
 the retained projection stays bounded. Set the force flag for an explicit
 reconciliation pass.
 
-Command envelopes remain on schema v2 by default for installed-contract
-compatibility. Set `HERDRES_TENDWIRE_COMMAND_RESPONSE_SCHEMA_VERSION=3` to opt
-in to deterministic submission receipts. Herdres accepts a v2 response from an
-older Tendwire even when v3 was requested.
+Outbound presentation is not paced by the full source reconciliation.
+`herdres sync --loop` retains its connector-only presenter poll until the paired
+H7/H6 replacement. Independent H8 ingress never calls that presenter path and
+does not synthesize a working card from a command receipt. Neither path inspects
+Tendwire's database or watches its SQLite/WAL files.
 
-Outbound delivery is not paced by the full source reconciliation. A durable v3
-submission receipt immediately renders its one working card, and
-`herdres sync --loop` runs a small connector-only poll loop independently of
-the full reconciliation. It polls once per second by default (configure
-`HERDRES_TENDWIRE_CONNECTOR_POLL_SECONDS`) and uses only Tendwire's public
-connector API plus the same Telegram/state delivery machinery as a one-shot
-sync. Herdres does not inspect Tendwire's database or watch SQLite/WAL files.
+### Durable inbound queue
 
-### Durable inbound lanes
+Independent H8 ingress runs entirely inside `herdres-gateway.service`. The
+96-line `herdres_gateway.py` wrapper loads typed receiver credentials, opens one
+`IngressQueue` writer, and starts in-process poller and dispatcher threads. It
+does not invoke `herdres.py`, a command child, a subprocess, a CLI fallback, or
+the retained presenter.
 
-The per-topic ingress scheduler stores accepted updates in
-`~/.local/share/herdres/inbound_spool.db` (override with
-`HERDRES_INBOUND_SPOOL_PATH`) using SQLite WAL and `synchronous=FULL`. The lane
-item and stable receiving-bot cursor commit in one transaction.
+Accepted updates and stable receiver cursors commit atomically to the sole
+private queue at `~/.local/share/herdres/inbound_spool.db` (override with
+`HERDRES_INBOUND_SPOOL_PATH`). The schema-1 SQLite database uses WAL,
+`synchronous=FULL`, one exclusive writer, fixed depth/lease/deadline/retention
+bounds, strict FIFO per ordering key, and up to
+`HERDRES_INBOUND_DISPATCH_WORKERS` concurrent dispatchers (default `8`). There
+is no lane database, JSON request ledger in `state.json`, second queue, or
+receipt-derived working-card shortcut.
 
-Message lanes are keyed by receiving-bot kind and Telegram topic. A topic uses
-that key immediately even before its state entry resolves, so resolution cannot
-reorder its first messages. General-topic chatter, owner slash commands, and
-callback queries use three separate receiver-wide lanes; owner commands retain
-their own FIFO without queueing behind conversation. Each lane is strict FIFO
-with at most one leased head, while up to
-`HERDRES_INBOUND_DISPATCH_WORKERS` lanes run concurrently (default `8`). A
-retry delays only its lane using exponential backoff based on
-`HERDRES_INBOUND_LANE_BACKOFF_SECONDS` (default `2`, capped at five minutes).
-An accepted-but-unverified delivery holds that strict FIFO for at most
-`HERDRES_INBOUND_HOLD_SECONDS` (default `15`), then becomes terminal without
-redispatch; later messages are never leased before that transition. The
-dispatcher caps its sleep at the hold expiry, so this bound does not grow with
-the retry backoff. `herdres doctor` fails with the structured
-`inbound_lane_stalled` signal when a lane has pending work but no claimable head
-continuously for `HERDRES_INBOUND_LANE_STALL_SECONDS` (default `5`). The clock
-starts at the current obstructing head's state transition, so old followers
-behind a freshly claimed head do not produce a false alarm.
-On the first boot after adding that clock, legacy blocked and retry-pending rows
-use their latest transition timestamp. A retry-pending head is excluded from
-stall evaluation until its backoff is due. A legacy processing timestamp is
-unknowable because its latest write may only be a lease heartbeat, so its clock
-remains null: doctor fails with `inbound_lane_obstruction_unknown`, names the
-lane, and reports no duration. Gateway startup reclaims inherited processing
-leases and supplies the first real transition timestamp. Retry obstruction has
-its own durable clock, set by the first retry and preserved across later
-backoffs. A retry shorter than the stall threshold remains healthy; at the
-threshold doctor fails with `inbound_lane_retry_obstructed`. Thus every
-non-claimable lane is visible within five seconds by default, without calling a
-legitimate short retry stalled. The nullable columns also remain writable by
-the prior release during rollback.
-The dispatcher renews a claimed lease across the full pipeline, including
-unbounded voice pretranscription, command execution, and terminal receipt commit.
-Expired leases are reclaimed after a crash and replay the same request ID;
-terminal ingress records complete without a second Tendwire submission.
-Owner-visible terminal acknowledgements are claimed once and sent by ordered
-per-lane background shards only after the command result is durable. A slow
-Telegram `sendMessage` therefore cannot hold a lane head or delay the next
-Tendwire submission.
+The queue checkpoints one canonical command or local-decision action before
+external mutation. Commands use `TendwireClient.command_json()` directly over
+the pinned owner-private AF_UNIX socket. A definite not-started result may retry
+the same stored bytes; post-start ambiguity, corrupt evidence, owner drift, or
+deadline expiry fails closed or follows the bounded convergence rule for the
+known target. Terminal and quarantine outcomes are durable, and notices are
+claimed separately so a slow Telegram send does not hold the ordering head.
 
-Accepted sends do not post a redundant terminal success card by default: the
-working card already shows that the message is being handled. Set
-`HERDRES_INBOUND_SUCCESS_ACK=1` to restore the same fixed replies
-(`Sent to Tendwire worker.` and
-`Submitted to busy Tendwire worker.`). This gateway-only flag is read for each
-inbound call and never suppresses the instant queued acknowledgement or any
-failure, quarantine, rate-limit, re-key, or uncertain reply. Operations CLI
-results are unchanged.
+Ingress never receives the schema-2 state root. It uses the typed policy,
+receiver, route, reply, and decision operations in `state.py`, comparing opaque
+`StateToken` values only for equality. Receiver tokens remain inside slotted
+`SecretStr` values and are revealed only into their one `TelegramClient`.
+Decision message edit/delete operations share the request-key-derived
+`pg1.<43>` physical-owner guard with the retained presenter; guard files expose
+no provider coordinates and waiting never holds the state flock or queue
+transaction.
 
-`HERDRES_INBOUND_LANE_DEPTH` bounds each lane at `32` open items by default.
-When a lane is full, the gateway does not spool that update: it advances the
-durable cursor and posts one throttled owner-visible notice in the affected
-topic. Wrong-chat, non-owner, bot-authored, empty, and other-token updates are
-also dropped and advanced before spooling. Dispatch releases the global
-`state.json` flock around the idempotent Tendwire request and reloads state after
-reacquiring it, so unrelated lane dispatchers do not serialize on the backend
-call. `HERDRES_GATEWAY_TIMING_LOGS=1` (the default) emits structured breadcrumbs
-for getUpdates return, durable enqueue, claim, canonical commit, Tendwire submit,
-receipt storage, and asynchronous acknowledgement; set it to `0` to quiet them.
+The old source presenter remains in `herdres.service` until the paired H7/H6
+replacement. It continues ordinary observational working/final presentation,
+but it does not open the inbound queue and no longer consumes ingress JSON or
+submission receipts to synthesize a working card. Voice/media ingress is not
+part of H8. This documents the independent implementation state only; it is not
+a claim that deployment, cutover, or the later H7/H6 release is complete.
 
 ### Inbound command identity and redelivery
 
-`install-user.sh` initializes one private 32-byte request-ID key at the path
-selected by `HERDRES_REQUEST_ID_KEY_PATH`. Unset or empty selects
-`~/.local/share/herdres/request-id.key`; a configured value is expanded for
-`~` and must then be a nonempty absolute path. The installer creates or
-tightens the owner-owned parent directory to mode `0700`, creates the
-owner-owned regular key file atomically with mode `0600`, and preserves an
-existing valid key instead of rotating it. The gateway only loads this
-installed file; a missing, malformed, symlinked, incorrectly owned or
-permissioned, or concurrently replaced key fails startup closed. Never put
-the raw key in an environment file, command line, log, ticket, or repository.
+`install-user.sh` initializes one private 32-byte request-ID key at
+`HERDRES_REQUEST_ID_KEY_PATH` (default
+`~/.local/share/herdres/request-id.key`). The parent is owner-owned mode `0700`
+and the regular single-link key is mode `0600`; unsafe, missing, malformed, or
+replaced material fails startup closed. Runtime never creates, repairs, rotates,
+logs, or serializes the key.
 
-For each received Telegram message, Herdres emits a canonical `hri1_` request
-ID containing an unpadded URL-safe base64 HMAC-SHA256 digest. The MAC is scoped
-only to the stable receiving-bot identity plus Telegram `update_id`, `chat_id`,
-and `message_id`, under a versioned Herdres domain. Bot tokens, message text,
-topic/reply metadata, and the resolved Tendwire target are not inputs. Manager
-and managed-bot polling offsets are likewise keyed by the stable receiving-bot
-kind, not token-derived runtime keys; a current legacy token-keyed managed-bot
-offset is migrated to that stable path. Token rotation therefore preserves both
-the polling position and the opaque request ID. Every distinct update receives
-a different ID even when its content is identical, and Herdres does not
-suppress commands by comparing their content.
+Each Telegram update receives a canonical `hri1_` plus 43-character unpadded
+base64url HMAC-SHA256 ID over receiver identity and update/chat/message
+coordinates. Tokens, text, user identity, reply metadata, and resolved routes
+are excluded. The queue stores canonical request bytes and the composite local
+decision identity before mutation. Duplicate bytes converge; a conflicting
+digest quarantines. The sole fenced command rewrite removes
+`worker_fingerprint` once only for a pre-route-generation `stale_target` with
+`no_receipt` while stable owner and worker ID remain identical.
 
-The gateway derives the opaque ID before private route resolution. In legacy
-mode it creates the durable schema-v2 lifecycle shell before routing,
-transcription, or AF_UNIX submission; lane mode first commits the update and
-cursor to the separate spool and creates the same unchanged state record during
-lane dispatch. In either mode `created_at`, `deadline_at`, and `retain_until`
-are fixed from the Telegram first-seen instant. Before Tendwire can observe a
-command, Herdres canonicalizes the exact schema-v1 public request, stores that
-JSON string, and fsyncs the temporary state file, atomic replacement, and parent
-directory. The AF_UNIX client parses only those stored UTF-8 bytes and submits
-the resulting exact public object in one correlated daemon request; an ID-only
-redelivery probe consults the record before current topic, route, transcription,
-or worker-state lookup. The only permitted byte change is one
-`stale_target` response with disposition `no_receipt`: when the recorded target
-contains `worker_fingerprint`, Herdres removes only that field, durably stores
-the second exact byte string, and retries once under the same request ID.
-
-`HERDRES_COMMAND_RETRY_HORIZON_SECONDS` fixes `deadline_at` to first-seen time
-plus the effective horizon. Unset, empty, or invalid values use `86400`
-seconds; configured values clamp to `60` through `604800`. Neither redelivery,
-retry, `updated_at`, a terminal transition, nor a later configuration change
-moves that deadline. Equality is expired: before creating another client, and
-again after every retryable result, `now >= deadline_at` quarantines
-(dead-letters) the local ingress record.
-
-`retain_until` is independently fixed at first-seen time plus the effective
-horizon and a `86400`-second safety margin: `172800` by default, `86460` at
-the minimum, and `691200` at the maximum. Valid records are pruned only when
-`now > retain_until`; equality remains cached. `updated_at`, `terminal_at`,
-and `quarantined_at` describe transitions but never slide retention. Pair the
-services so `TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS` is at least the Herdres
-horizon and `TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS` is at least the
-Herdres first-seen retention bound. Tendwire's defaults (`604800` retry,
-`2592000` receipt age, and newest `4096` bounded inactive receipts per host)
-cover Herdres's full range; Tendwire also enforces a `691200`-second receipt-age
-floor and an age strictly greater than its own retry horizon.
-
-Terminal accepted/rejected results and every quarantine store one exact,
-sanitized ingress outcome. Tendwire rejection, terminal uncertainty, deadline
-expiry, and unsafe/corrupt command evidence use the fixed public reply
-`Could not send safely. Refresh status and choose the target again.` and the
-outcome `checkpoint: "advance"`. The gateway sends that reply, advances and
-saves the stable polling offset, and continues with later Telegram updates.
-Redelivery or restart returns the cached outcome before private routing and
-without constructing a Tendwire client. This bounded terminalization is
-separate from Tendwire's connector-final dead-letter queue.
-
-Herdres sends an exact schema-v1 `send_instruction` object containing only
-`schema_version`, `action`, `request_id`, `dry_run`, `target`, and
-`instruction`; `dry_run` is false, `instruction` contains only nonempty
-`text`, and `target` is exactly one of `{worker_id}`,
-`{worker_id, worker_fingerprint}`, or `{space_id}`, with nonempty string
-values. Stable owner identity is persisted separately for v3 submission
-correlation and is never a command wire selector. Tendwire's general request-ID
-grammar is `[A-Za-z0-9._-]{1,128}`; Herdres emits and locally requires its
-narrower canonical 48-character `hri1_…` form. Raw Telegram receiver, update,
-chat, topic, message, reply, and user IDs, bot tokens, private routes, and
-backend targets never cross. No CLI environment or process output crosses this
-boundary; the client communicates only with the configured private AF_UNIX
-daemon endpoint.
-
-For a non-dry-run ingress send, Herdres accepts only an exact schema-v2 Tendwire
-response with the ten fields `schema_version`, `action`, `request_id`, `ok`,
-`dry_run`, `status`, `disposition`, `result`, `error`, and `warnings`; action,
-request ID, and `dry_run: false` must correlate, warnings must be strings, and
-the complete value must survive public pruning unchanged. It then validates the
-whole disposition tuple:
-
-- `terminal_accepted` requires `ok: true`, status `accepted`, a null error, and
-  a result containing `target`, `delivery_state`, `transport_state`,
-  `target_state_at_send`, and `observed_turn_state`, plus an optional nonempty
-  public `turn_id`. The
-  target contains only the correlated `worker_id`, delivery and transport are
-  `submitted`, target state is nonempty, and observed turn state is
-  `pending_observation`, `observed`, or `complete`.
-- Every nonaccepted tuple requires `ok: false` and an error whose code equals
-  status and whose message is nonempty.
-- `in_progress` permits only status `pending`.
-- `terminal_uncertain` permits only status `request_state_uncertain`.
-- `terminal_rejected` permits `rejected`, `not_found`, `ambiguous_target`,
-  `stale_target`, `backend_unavailable`, `backend_unsupported`,
-  `ambiguous_backend_target`, `backend_failed`, `duplicate_request`, or
-  `invalid_request`.
-- `no_receipt` permits the same rejection-status set except
-  `duplicate_request`.
-
-The client pins the owner-private socket path, verifies the connected peer,
-sends one bounded newline-framed JSON request, and accepts only one correlated
-daemon envelope. A failure before connection/send is definite. Timeout, EOF,
-invalid UTF-8/JSON, wrong shape/correlation, or another unproven post-send loss
-is transport ambiguity; a valid correlated outer daemon error remains typed
-and distinct from a malformed inner method result. Herdres does not forge a
-schema-v2 disposition from ambiguous transport evidence: it keeps the durable
-record retryable with no reply and retains the gateway checkpoint until the
-fixed deadline. At the deadline, or for an authoritative
-`terminal_uncertain`, quarantine caches the fixed safe outcome and advances the
-queue.
-
-A `SIGKILL` during `command_json` is intentionally recovered by replay, not by
-a local `submitting` marker: Herdres cannot prove whether the remote mutation
-happened. The retry uses the same request ID and the exact fsynced request bytes,
-and Tendwire's durable request receipt deduplicates those bytes before applying
-the mutation. This Tendwire receipt is the double-submit protection for the
-mid-RPC crash window.
-
-`status` alone never decides retry or finality. In particular,
-`backend_unavailable` with `no_receipt` retries with no reply, while the same
-status with `terminal_rejected` caches the fixed failure and advances.
-`stale_target` refreshes a fingerprint only when paired with `no_receipt`;
-otherwise its disposition is authoritative. Back up and restore the request-ID
-key with private Herdres state and the Tendwire continuity set; replacing the
-key changes every derived ID and can turn a redelivery into a different
-mutation.
-
+Only the allowlisted public command object crosses to Tendwire. Accepted sends
+must satisfy the pinned schema-3 success contract; bounded compatible failures
+retain their exact allowed schema-2/3 disposition matrix. Decision answers use
+their exact schema-2 contract. Raw Telegram/provider coordinates, credentials,
+private routes, queue rows, and process output never cross the AF_UNIX boundary.
+Back up the queue DB/WAL/SHM, request-ID key, private Herdres state, and Tendwire
+continuity set together while all writers are stopped.
 ### Turn content and paging contract
 
 Production source sync negotiates Tendwire's top-level `turn.list` schema as the
@@ -568,24 +421,11 @@ HERDRES_MANAGED_BOT_CODEX_TOKEN=...
 HERDRES_MANAGED_BOT_CLAUDE_TOKEN=...
 ```
 
-When enabled, Herdres polls configured child bots as well as the manager bot.
-Use `/voice per_agent` or `/voice shared` inside a space topic to switch that
-space. Unconfigured agent kinds fall back to the manager bot. Do not commit real
-bot tokens or local bot names.
-
-Telegram voice notes are separate from bot identity. Inbound audio transcription
-is local and opt-in:
-
-```sh
-python3 -m venv ~/.local/share/herdres/speech-venv
-uv pip install --python ~/.local/share/herdres/speech-venv/bin/python sherpa-onnx numpy
-~/.local/share/herdres/speech-venv/bin/python ~/.local/bin/herdres speech install
-HERDR_TELEGRAM_TOPICS_SPEECH_INPUT=1
-```
-
-The gateway downloads a voice note with the bot token that received it, deletes
-the temporary audio after transcription, and sends only the transcript through
-Tendwire.
+When enabled, H8 polls configured child bots as well as the manager bot.
+Unconfigured agent kinds fall back to the manager bot. Do not commit real bot
+tokens or local bot names. Voice/audio/media-only ingress and the old `/voice`
+gateway command are not supported by H8. The outbound speech module remains
+only because the old presenter still imports it; paired H7/H6 owns its removal.
 
 ## Install
 
@@ -607,8 +447,8 @@ This branch runs two user services (plus the Tendwire daemon):
   pinned status. Its bounded connector poll loop drains working/final cards
   independently of long reconciliation passes. This replaces the old
   `herdres.timer`; there is no timer unit on this branch.
-- `herdres-gateway.service` — inbound Telegram polling; forwards topic input to
-  `herdres command` → `tendwire command`.
+- `herdres-gateway.service` — inbound Telegram polling, durable queue dispatch,
+  and direct Tendwire AF_UNIX command submission in one process.
 - `tendwired.service` — the Tendwire daemon (installed from the Tendwire repo);
   Herdres depends on it but does not manage it.
 

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
 import hashlib
 import json
 import time
-from types import SimpleNamespace
 
-import herdres
 import pytest
 from herdres_connector import config, doctor, source_sync, state
+from herdres_connector.ingress_queue import IngressQueue
 from herdres_connector.rich_delivery import (
     RICH_SPLIT_CHUNK_CHARS,
     TURN_DELIVERY_PLAIN_SOURCE_CHARS,
@@ -1304,7 +1304,9 @@ def test_short_inline_ready_delivery_fetches_exact_fields_then_two_syncs_noop(mo
     assert entry["last_clean_plan_token"] == "twplan1.plan1"
 
 
-def test_paged_20k_final_edits_working_then_sends_ordered_bound_parts(monkeypatch):
+def test_paged_20k_final_edits_working_then_sends_ordered_bound_parts(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
     store = _store()
     telegram = DeletingTelegram()
@@ -1331,9 +1333,38 @@ def test_paged_20k_final_edits_working_then_sends_ordered_bound_parts(monkeypatc
     ids = entry["last_clean_message_ids"]
     assert len(ids) > 2
     assert ids[0] == working_id
-    assert [state.find_message_binding(store, message_id)["part_ordinal"] for message_id in ids] == list(range(len(ids)))
-    for message_id in ids:
-        assert herdres._worker_entry_from_reply(store, {"reply_to_message_id": message_id, "topic_id": "77"})[1] is not None
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(state_path))
+    state.save_state(store, state_path)
+    token = state.read_ingress_policy(state_path).state_token
+    for ordinal, message_id in enumerate(ids):
+        binding = state.find_message_binding(store, message_id)
+        assert binding is not None
+        assert binding["turn_id"] == "turn-long"
+        assert binding["content_revision"] == "twrev1.long"
+        assert binding["plan_token"] == "twplan1.plan1"
+        assert binding["part_ordinal"] == ordinal
+        assert binding["part_count"] == len(ids)
+        assert binding["tendwire_job_key"].endswith(f":{ordinal:06d}")
+
+        route = state.resolve_ingress_reply(
+            state_path,
+            state.IngressReplyQuery(
+                chat_id="-100",
+                topic_id="77",
+                reply_message_id=message_id,
+                observed_author_bot_kind="",
+                explicit_alias="",
+                explicit_bot_kind="",
+                state_token=token,
+            ),
+        )
+        assert route.status is state.RouteStatus.RESOLVED
+        assert route.worker_id == "worker-1"
+        assert route.owner is not None
+        assert route.owner.stable_key == row["stable_key"]
+        assert route.reply_binding_id == message_id
+        assert route.binding_was_present is True
 
 
 def test_final_edits_exact_command_predecessor_working_card(
@@ -2802,57 +2833,63 @@ def test_quiet_outbound_pass_remains_healthy(monkeypatch):
 
 
 
-@pytest.mark.parametrize(
-    (
-        "stalled",
-        "unknown",
-        "retry_obstructed",
-        "expected_status",
-    ),
-    [
-        (1, 1, 1, "stalled"),
-        (0, 1, 1, "obstruction_unknown"),
-        (0, 0, 1, "retry_obstructed"),
-        (0, 0, 0, "healthy"),
-    ],
-)
-def test_outbound_health_composition_preserves_inbound_precedence(
-    monkeypatch,
+def test_inbound_queue_observer_health_and_status_compose_with_outbound_health(
     tmp_path,
-    stalled,
-    unknown,
-    retry_obstructed,
-    expected_status,
 ):
     db_path = tmp_path / "inbound.sqlite3"
-    db_path.touch()
-    snapshot = SimpleNamespace(
-        stalled_lane_count=stalled,
-        unknown_obstruction_lane_count=unknown,
-        retry_obstructed_lane_count=retry_obstructed,
-        pending_count=3,
-        claimable_lane_count=0,
-        blocked_count=3,
-        first_unknown_obstruction_lane="lane-unknown",
-        oldest_retry_obstructed_seconds=12.0,
-        first_retry_obstructed_lane="lane-retry",
-        oldest_stalled_seconds=20.0,
-        first_stalled_lane="lane-stalled",
-    )
 
-    class FakeIngressLaneSpool:
-        def __init__(self, _path):
-            pass
+    def request_id(index: int) -> str:
+        digest = hashlib.sha256(str(index).encode()).digest()
+        return "hri1_" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
-        def dispatch_snapshot(self, **_kwargs):
-            return snapshot
+    def accept(queue: IngressQueue, index: int) -> None:
+        queue.accept_update(
+            {
+                "receiver_id": "manager",
+                "update_id": index,
+                "request_id": request_id(index),
+                "ordering_key": "topic:77",
+                "kind": "decision" if index % 2 else "message",
+                "input": {"chat_id": "-100", "message_id": str(index)},
+                "first_seen_at": 10.0,
+                "deadline_at": 100.0,
+                "retain_until": 200.0,
+                "depth_limit": 1,
+            }
+        )
 
-    monkeypatch.setattr(doctor, "IngressLaneSpool", FakeIngressLaneSpool)
+    with IngressQueue.open_writer(db_path) as queue:
+        healthy = doctor.inbound_queue(db_path, now=20.0)
+        assert healthy["ok"] is True
+        assert healthy["status"] == "healthy"
+        assert healthy["health"] == {
+            "pending": 0,
+            "processing": 0,
+            "retry": 0,
+            "terminal": 0,
+            "quarantine": 0,
+            "pending_notices": 0,
+            "claimed_notices": 0,
+            "expired_leases": 0,
+            "overdue_open": 0,
+        }
+        assert healthy["statuses"] == []
 
-    result = doctor.inbound_lanes(db_path)
+        accept(queue, 1)
+        accept(queue, 2)
+        attention = doctor.inbound_queue(db_path, now=20.0)
 
-    assert result["status"] == expected_status
-    assert result["ok"] is (expected_status == "healthy")
+    assert attention["ok"] is False
+    assert attention["status"] == "attention_required"
+    assert attention["signal"] == "inbound_queue_attention_required"
+    assert attention["attention_required"] == 1
+    assert attention["health"]["pending"] == 1
+    assert attention["health"]["quarantine"] == 1
+    assert attention["health"]["pending_notices"] == 1
+    assert {
+        (row["state"], row["kind"], row["count"])
+        for row in attention["statuses"]
+    } == {("pending", "decision", 1), ("quarantine", "message", 1)}
 
 
 

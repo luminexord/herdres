@@ -1,8 +1,7 @@
-"""Off-lock inter-work delivery for source mode (issue #122).
+"""Off-lock presenter delivery for source mode (issue #122).
 
-sync_once holds state.state_lock() across the whole source-mode delivery loop, so queued inbound
-commands (which also take state_lock()) stall behind its Telegram sends. released_lock() drops the held
-lock for a bounded window between delivered turns and re-acquires it. These tests pin the mechanism
+Provider operations run outside the state flock and reload durable presenter state afterward.
+These tests pin the mechanism
 (state_lock exposes/restores the held fd, released_lock is a no-op when no lock is held, the fd is
 thread-local, drop-then-reacquire, re-acquire-failure propagates), the two runtime flag readers, the
 commit-before-yield / reload-after no-clobber invariant, and the _cleanup_topics per-pass delete cap.
@@ -10,8 +9,6 @@ commit-before-yield / reload-after no-clobber invariant, and the _cleanup_topics
 from __future__ import annotations
 
 import fcntl
-import json
-import math
 from types import SimpleNamespace
 import threading
 import time
@@ -31,10 +28,8 @@ from herdres_connector.source_sync import (
 from herdres_connector.telegram_delivery import drain_outbox, topic_icon_id
 
 from test_source_only import (
-    REQUEST_ID,
     FakeTelegram,
     FakeTendwire,
-    _accepted_command_response,
     _source_worker,
     _store,
 )
@@ -68,8 +63,7 @@ def _reset_lock_state():
 
 
 def _competitor_can_acquire(lock_path) -> bool:
-    """A fresh, independent fd tries a non-blocking acquire on the state lock file — the flock a
-    queued inbound command would attempt. Succeeds only when the holder has released the lock."""
+    """Return whether an independent state writer can acquire the released flock."""
     with open(lock_path, "a+", encoding="utf-8") as fh:
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -305,32 +299,6 @@ def test_slow_provider_call_does_not_hold_state_lock(tmp_path, monkeypatch):
     assert store["concurrent_command"] is True
 
 
-def test_nested_offlock_client_does_not_rollback_lane_child_commit(
-    tmp_path, monkeypatch
-):
-    """Regression for cleanup/speak phases that already own a release window."""
-
-    _reset_lock_state()
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    state.save_state(_store(), statepath)
-
-    class Provider:
-        def configured(self):
-            return {"ok": True}
-
-    with state.state_lock(path=statepath):
-        current = state.load_state(statepath)
-        client = _OfflockClient(Provider(), current)
-        with state.released_lock():
-            child = state.load_state(statepath)
-            child["child_commit_survived"] = True
-            state.save_state(child, statepath)
-            assert client.configured()["ok"] is True
-        state.reload_state_in_place(current, statepath)
-
-    assert current["child_commit_survived"] is True
-    assert state.load_state(statepath)["child_commit_survived"] is True
 
 
 def test_guarded_outbox_checkpoints_before_ack_and_replay_only_acks(
@@ -1048,120 +1016,8 @@ def test_raising_offlock_provider_reloads_before_caller_continues(
     assert persisted["caller_continued"] is True
 
 
-def test_blocked_sync_observation_does_not_delay_command_submission(
-    tmp_path, monkeypatch
-):
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
-    worker = _source_worker(
-        {
-            "id": "worker-1",
-            "name": "Alpha",
-            "status": "idle",
-            "space_id": "space-1",
-            "fingerprint": "fp-1",
-        }
-    )
-    store = _store()
-    state.upsert_worker_entry(store, worker, topic_id="77")
-    state.save_state(store, statepath)
-    entered = threading.Event()
-    release = threading.Event()
-    submitted: list[str] = []
-
-    class SlowSyncTendwire(FakeTendwire):
-        def snapshot(self):
-            entered.set()
-            assert release.wait(6)
-            return super().snapshot()
-
-    class CommandTendwire:
-        def command_json(self, request_json):
-            submitted.append(request_json)
-            return _accepted_command_response(json.loads(request_json))
-
-    slow = SlowSyncTendwire(workers=[worker])
-    monkeypatch.setattr(
-        herdres,
-        "_runtime",
-        lambda **_kwargs: SyncRuntime(
-            slow, FakeTelegram(), with_outbox=False
-        ),
-    )
-    monkeypatch.setattr(herdres, "TendwireClient", CommandTendwire)
-    result: dict[str, object] = {}
-
-    thread = threading.Thread(target=lambda: result.update(herdres._sync_pass()))
-    thread.start()
-    assert entered.wait(1)
-    started = time.monotonic()
-    reply = herdres.command_reply(
-        {
-            "request_id": REQUEST_ID,
-            "topic_id": "77",
-            "message_id": "9001",
-            "text": "submit while sync RPC is blocked",
-        }
-    )
-    elapsed = time.monotonic() - started
-    release.set()
-    thread.join(6)
-
-    assert reply["checkpoint"] == "hold"
-    assert reply["transport_disposition"] == "written_to_pty"
-    assert reply["request_phase"] == "accepted_unverified"
-    assert reply["terminal_outcome"] == "delivery_unknown"
-    assert reply["reply"] == ""
-    assert len(submitted) == 1
-    assert elapsed < 5.0
-    assert not thread.is_alive()
-    assert result["ok"] is True
 
 
-def test_sync_yields_again_before_heavy_source_reconciliation(
-    tmp_path, monkeypatch
-):
-    """The command child gets a lock window after gateway preflight."""
-
-    _reset_lock_state()
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    state.save_state(_store(), statepath)
-    release_windows = 0
-    real_released_lock = state.released_lock
-    real_sync_sources = source_sync._sync_sources
-
-    class ObservedRelease:
-        def __enter__(self):
-            nonlocal release_windows
-            release_windows += 1
-            self._window = real_released_lock()
-            return self._window.__enter__()
-
-        def __exit__(self, *args):
-            return self._window.__exit__(*args)
-
-    def observed_sync_sources(*args, **kwargs):
-        # One window belongs to provider observation. The second is the
-        # explicit post-observation handoff for the gateway command child.
-        assert release_windows >= 2
-        return real_sync_sources(*args, **kwargs)
-
-    monkeypatch.setattr(state, "released_lock", ObservedRelease)
-    monkeypatch.setattr(source_sync, "_sync_sources", observed_sync_sources)
-    with state.state_lock(path=statepath):
-        current = state.load_state(statepath)
-        result = sync_once(
-            current,
-            SyncRuntime(FakeTendwire(), FakeTelegram(), with_outbox=False),
-        )
-
-    assert result["ok"] is True
-    assert release_windows >= 2
 
 
 # --- config flags ------------------------------------------------------------
@@ -1211,129 +1067,6 @@ def test_flock_hold_instrumentation_reports_phase_and_timestamps(
     assert "released_at=" in warning
 
 
-def test_full_busy_pass_flock_p99_and_concurrent_canonical_commit_budget(
-    tmp_path, monkeypatch
-):
-    """Production composition: slow account refresh is off-lock for a lane child."""
-
-    _reset_lock_state()
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDRES_PINNED_STATUS", "1")
-    monkeypatch.setenv("HERDRES_PINNED_ACCOUNT", "1")
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    workers = [
-        _source_worker(
-            {
-                "id": f"worker-{index}",
-                "name": f"Worker {index}",
-                "status": "idle",
-                "space_id": "space-1",
-                "fingerprint": f"fp-{index}",
-                "meta": {"agent": "codex"},
-            }
-        )
-        for index in range(12)
-    ]
-    turns = {
-        "turns": [
-            {
-                "id": f"turn-{index}",
-                "worker_id": worker["id"],
-                "worker_fingerprint": worker["fingerprint"],
-                "assistant_final_text": f"Final {index}",
-                "complete": True,
-            }
-            for index, worker in enumerate(workers)
-        ]
-    }
-    store = _store()
-    for index, worker in enumerate(workers):
-        state.upsert_worker_entry(
-            store, worker, topic_id=str(700 + index)
-        )
-    state.save_state(store, statepath)
-
-    account_refresh_entered = threading.Event()
-    release_account_refresh = threading.Event()
-
-    def slow_account_refresh():
-        account_refresh_entered.set()
-        assert release_account_refresh.wait(5)
-        return {"fetched_at": time.time()}
-
-    monkeypatch.setattr(
-        source_sync.accounts, "usage_snapshot", slow_account_refresh
-    )
-    tendwire = FakeTendwire(
-        turns=turns,
-        pending={"pending_interactions": []},
-        workers=workers,
-        spaces=[],
-    )
-    tendwire.turn_final_poll = lambda **_kwargs: {"ok": True, "items": []}
-    telegram = FakeTelegram()
-
-    def runtime_factory(**kwargs):
-        return SyncRuntime(
-            tendwire,
-            telegram,
-            with_outbox=bool(kwargs.get("with_outbox", True)),
-            checkpoint=kwargs.get("checkpoint"),
-        )
-
-    class CommandTendwire:
-        def command_json(self, request_json):
-            return _accepted_command_response(json.loads(request_json))
-
-    monkeypatch.setattr(herdres, "_runtime", runtime_factory)
-    monkeypatch.setattr(herdres, "TendwireClient", CommandTendwire)
-    holds = []
-    sync_result: dict[str, object] = {}
-    sync_error: list[BaseException] = []
-
-    def run_sync():
-        try:
-            sync_result.update(herdres._sync_pass())
-        except BaseException as exc:  # pragma: no cover - surfaced below
-            sync_error.append(exc)
-
-    with state.observe_lock_holds(holds.append):
-        sync_thread = threading.Thread(target=run_sync)
-        sync_thread.start()
-        assert account_refresh_entered.wait(2)
-        started = time.monotonic()
-        reply = herdres.command_reply(
-            {
-                "request_id": REQUEST_ID,
-                "topic_id": "700",
-                "message_id": "9001",
-                "text": "commit while a full pass refreshes account usage",
-            }
-        )
-        canonical_commit_seconds = time.monotonic() - started
-        release_account_refresh.set()
-        sync_thread.join(8)
-
-    assert not sync_error
-    assert not sync_thread.is_alive()
-    assert sync_result["ok"] is True
-    assert reply["transport_disposition"] == "written_to_pty"
-    assert reply["terminal_outcome"] == "delivery_unknown"
-    assert canonical_commit_seconds < 3.0
-    assert holds
-    hold_seconds = sorted(float(hold["hold_seconds"]) for hold in holds)
-    p99 = hold_seconds[math.ceil(0.99 * len(hold_seconds)) - 1]
-    assert p99 < 2.0
-    assert any(
-        hold["phase"] == "sync.pinned.account_usage" for hold in holds
-    )
-    persisted = state.load_state(statepath)
-    request = persisted["tendwire_ingress_command_requests"][REQUEST_ID]
-    assert isinstance(request.get("request_json"), str)
 
 
 def test_cleanup_topics_delete_cap(tmp_path, monkeypatch):
@@ -1467,11 +1200,6 @@ def test_continuation_bindings_share_worker_topic_and_delivery_identity(monkeypa
     assert {binding["content_revision"] for binding in bindings} == {_REV_A}
     assert {binding["plan_token"] for binding in bindings} == {_PLAN_A}
     assert [binding["part_ordinal"] for binding in bindings] == [0, 1]
-    for message_id in ("901", "902"):
-        assert herdres._worker_entry_from_reply(
-            store,
-            {"reply_to_message_id": message_id, "topic_id": "77"},
-        ) == (worker_key, worker)
 
 
 def test_old_binding_callers_keep_exact_legacy_shape():

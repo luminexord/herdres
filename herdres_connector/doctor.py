@@ -5,10 +5,12 @@ from __future__ import annotations
 import sqlite3
 import subprocess
 import time
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from . import config, state
-from .ingress_lanes import IngressLaneSpool
+from .ingress_queue import IngressQueue
 from .safe import sanitize_text
 from .tendwire_client import TendwireClient
 
@@ -101,70 +103,41 @@ def tendwire_delta_feed() -> dict[str, Any]:
     return result
 
 
-def inbound_lanes(
+def inbound_queue(
     path: Path | None = None,
     *,
     now: float | None = None,
-    stall_after_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Expose a structured failure signal for a non-draining ingress lane."""
+    """Expose aggregate queue health while the gateway writer is live."""
 
     db_path = path or config.inbound_spool_path()
     if not db_path.exists():
         return {"ok": True, "status": "bootstrapping"}
-    threshold = (
-        config.inbound_lane_stall_seconds()
-        if stall_after_seconds is None
-        else max(0.0, float(stall_after_seconds))
-    )
     try:
-        snapshot = IngressLaneSpool(db_path).dispatch_snapshot(
-            now=now,
-            stall_after_seconds=threshold,
-        )
-    except (OSError, sqlite3.Error) as exc:
+        observed_at = time.time() if now is None else float(now)
+        with IngressQueue.observe(db_path) as observer:
+            snapshot = observer.health_snapshot(observed_at)
+            statuses = observer.status_rows(observed_at)
+    except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
         return {
             "ok": False,
             "status": "error",
-            "signal": "inbound_lane_probe_failed",
+            "signal": "inbound_queue_probe_failed",
             "error": sanitize_text(str(exc), 200),
         }
-    stalled = snapshot.stalled_lane_count > 0
-    unknown = snapshot.unknown_obstruction_lane_count > 0
-    retry_obstructed = snapshot.retry_obstructed_lane_count > 0
-    if stalled:
-        status = "stalled"
-        signal = "inbound_lane_stalled"
-    elif unknown:
-        status = "obstruction_unknown"
-        signal = "inbound_lane_obstruction_unknown"
-    elif retry_obstructed:
-        status = "retry_obstructed"
-        signal = "inbound_lane_retry_obstructed"
-    else:
-        status = "healthy"
-        signal = ""
+    attention = (
+        snapshot.quarantine
+        + snapshot.claimed_notices
+        + snapshot.expired_leases
+        + snapshot.overdue_open
+    )
     return {
-        "ok": not (stalled or unknown or retry_obstructed),
-        "status": status,
-        "signal": signal,
-        "threshold_seconds": threshold,
-        "pending": snapshot.pending_count,
-        "claimable": snapshot.claimable_lane_count,
-        "blocked": snapshot.blocked_count,
-        "unknown_obstructions": snapshot.unknown_obstruction_lane_count,
-        "first_unknown_obstruction_lane": (
-            snapshot.first_unknown_obstruction_lane
-        ),
-        "unknown_obstruction_duration_seconds": None,
-        "retry_obstructed_lanes": snapshot.retry_obstructed_lane_count,
-        "first_retry_obstructed_lane": snapshot.first_retry_obstructed_lane,
-        "oldest_retry_obstructed_seconds": (
-            snapshot.oldest_retry_obstructed_seconds
-        ),
-        "stalled_lanes": snapshot.stalled_lane_count,
-        "oldest_stalled_seconds": snapshot.oldest_stalled_seconds,
-        "first_stalled_lane": snapshot.first_stalled_lane,
+        "ok": attention == 0,
+        "status": "healthy" if attention == 0 else "attention_required",
+        "signal": "" if attention == 0 else "inbound_queue_attention_required",
+        "attention_required": attention,
+        "health": asdict(snapshot),
+        "statuses": [asdict(row) for row in statuses],
     }
 
 
@@ -234,7 +207,7 @@ def run_doctor(client: TendwireClient | None = None) -> dict[str, Any]:
         "legacy_topic_timer": legacy_timer(),
         "tendwire_backend": tendwire_backend(client),
         "tendwire_delta_feed": tendwire_delta_feed(),
-        "inbound_lanes": inbound_lanes(),
+        "inbound_queue": inbound_queue(),
         "outbound_unbound_live_panes": outbound_unbound_live_panes(),
         "outbound_response_folds": outbound_response_folds(),
     }

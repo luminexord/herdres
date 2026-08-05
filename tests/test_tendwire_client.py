@@ -18,18 +18,16 @@ from herdres_connector.tendwire_client import TendwireClient
 REQUEST_ID = "hri1_SIodGeqCeIvApzpEvIaEM-L07UzUMgUFyeltRQxPpqU"
 
 
-def _command_request(*, v3: bool = False) -> dict[str, Any]:
-    request = {
+def _command_request() -> dict[str, Any]:
+    return {
         "schema_version": 1,
         "action": "send_instruction",
         "request_id": REQUEST_ID,
         "dry_run": False,
         "target": {"worker_id": "worker-public", "worker_fingerprint": "fingerprint-public"},
         "instruction": {"text": "perform the public instruction"},
+        "response_schema_version": 3,
     }
-    if v3:
-        request["response_schema_version"] = 3
-    return request
 
 
 def _accepted(request: dict[str, Any], *, schema: int = 2) -> dict[str, Any]:
@@ -211,12 +209,28 @@ def test_protocol_prune_is_bounded_and_preserves_exact_protocol_text_and_tokens(
 
 
 def test_command_uses_one_daemon_rpc_and_accepts_exact_v3_response(tmp_path: Path) -> None:
-    request = _command_request(v3=True)
+    request = _command_request()
     with _daemon(tmp_path, [_return(_accepted(request, schema=3))]) as (client, calls):
-        result = client.command(request)
+        result = client.command_json(
+            json.dumps(request, ensure_ascii=False, separators=(",", ":"))
+        )
     assert result["ok"] is True
     assert result["result"]["submission_id"] == "twsub1.public"
     assert [(call["method"], call["params"]) for call in calls] == [("command.submit", request)]
+
+
+def test_send_requires_pinned_v3_request_and_rejects_v2_success(tmp_path: Path) -> None:
+    missing_version = _command_request()
+    missing_version.pop("response_schema_version")
+    client = TendwireClient(socket_path=tmp_path / "never.sock")
+    assert client.command(missing_version)["status"] == "invalid_request"
+
+    request = _command_request()
+    with _daemon(tmp_path, [_return(_accepted(request, schema=2))]) as (live, calls):
+        result = live.command(request)
+    assert result["status"] == "request_state_uncertain"
+    assert tendwire_client.command_process_ambiguous(result)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -231,7 +245,7 @@ def test_command_uses_one_daemon_rpc_and_accepts_exact_v3_response(tmp_path: Pat
     ],
 )
 def test_command_response_validation_fails_closed(tmp_path: Path, mutate) -> None:
-    request = _command_request(v3=True)
+    request = _command_request()
     body = _accepted(request, schema=3)
     mutate(body)
     with _daemon(tmp_path, [_return(body)]) as (client, _calls):
@@ -260,6 +274,15 @@ def test_command_failure_tuple_matrix_is_preserved(
     assert len(calls) == 1
 
 
+def test_send_failure_retains_schema_three_compatibility(tmp_path: Path) -> None:
+    request = _command_request()
+    response = _command_failure(request, "rejected", "terminal_rejected")
+    response["schema_version"] = 3
+    with _daemon(tmp_path, [_return(response)]) as (client, _calls):
+        result = client.command(request)
+    assert (result["schema_version"], result["status"]) == (3, "rejected")
+
+
 @pytest.mark.parametrize(
     ("status", "disposition"),
     [
@@ -283,6 +306,13 @@ def test_decision_response_tuple_matrix(
     assert result["status"] == status
     assert result["disposition"] == disposition
     assert calls[0]["method"] == "command.submit"
+
+
+def test_decision_rejects_empty_option_selection_without_rpc(tmp_path: Path) -> None:
+    request = _decision_request()
+    request["params"]["selection"] = {"option_refs": []}
+    result = TendwireClient(socket_path=tmp_path / "never.sock").command(request)
+    assert result["status"] == "invalid_request"
 
 
 def test_command_pre_send_failure_is_definite_but_post_send_eof_is_uncertain(tmp_path: Path) -> None:

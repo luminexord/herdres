@@ -577,7 +577,12 @@ class TelegramClient:
             error = sanitize_text(str(exc), 300)
             if "message is not modified" in error.lower():
                 return {"ok": True, "message_id": str(message_id), "kind": "unchanged"}
-            return {"ok": False, "message_id": str(message_id), "error": error}
+            return {
+                "ok": False,
+                "message_id": str(message_id),
+                "error": error,
+                "ambiguous_acceptance": bool(exc.ambiguous_acceptance),
+            }
 
     def answer_callback_query(
         self,

@@ -6,6 +6,11 @@ This candidate supports Python 3.13 and pairs with Tendwire `0.1.0rc5` or a
 reviewed descendant preserving its public contract. Run the complete paired
 gate from clean checkouts before tagging or deployment.
 
+Independent H8 is an implementation/review state, not evidence that a cutover
+or deployment has occurred and not authorization to perform one. It retains the
+old presenter in `herdres.service`; the later state/presenter replacement must
+ship only as its separately approved paired H7/H6 release.
+
 Before tagging or deployment, run the complete local pair from clean checkouts:
 
 ```sh
@@ -89,6 +94,7 @@ python -m pytest -q \
 TENDWIRE_SOURCE="$(cd -- "${TENDWIRE_CHECKOUT:?set TENDWIRE_CHECKOUT to the clean Tendwire checkout}" && pwd -P)/src"
 test -f "$TENDWIRE_SOURCE/tendwire/daemon_api.py"
 HERDRES_PAIRED_TENDWIRE_SOURCE_DIR="$TENDWIRE_SOURCE" python -m pytest -q \
+  tests/test_ingress.py \
   tests/test_source_only.py \
   tests/test_command_ingress_idempotency.py \
   tests/test_stable_worker_key.py \
@@ -96,7 +102,8 @@ HERDRES_PAIRED_TENDWIRE_SOURCE_DIR="$TENDWIRE_SOURCE" python -m pytest -q \
   tests/test_tendwire_socket_pairing.py \
   tests/test_turn_final_delivery.py \
   tests/test_outbound_latency.py \
-  tests/test_offlock_delivery.py
+  tests/test_offlock_delivery.py \
+  tests/test_release_readiness.py
 HERDRES_TENDWIRE_MODE=source ./herdres.py tendwire source-smoke --with-outbox
 ```
 
@@ -110,66 +117,42 @@ remains only the shallow preflight described above.
 
 The paired gate must establish all of the following:
 
-- Unset or empty `HERDRES_REQUEST_ID_KEY_PATH` selects
-  `~/.local/share/herdres/request-id.key`; a configured value expands `~` and
-  must then be a nonempty absolute path. `install-user.sh` initializes exactly
-  one persistent private raw 32-byte key there, with an owner-owned `0700`
-  parent directory and owner-owned regular `0600` file. Reinstall preserves
-  valid material; runtime refuses missing, malformed, symlinked, unsafe, or
-  replaced material and never creates or repairs it.
-- `hri1_` IDs are canonical unpadded URL-safe HMAC-SHA256 digests scoped only
-  to stable receiving-bot identity plus Telegram update/chat/message
-  coordinates. Tokens, text, topic/reply/user identity, and resolved targets
-  are excluded. Same-update redelivery and managed-bot token rotation retain
-  the same ID; every distinct update has a different ID even for identical
-  text. Identical content does not merge distinct commands.
-- Manager and managed-bot polling cursors are keyed to stable receiving-bot
-  kinds, not token-derived runtime keys, so token rotation preserves polling
-  position.
-- On first sight of an update, before routing or AF_UNIX submission, Herdres
-  persists immutable `created_at`, `deadline_at`, and `retain_until` bounds.
-  It then persists canonical schema-v1 request JSON before command start.
-  Every retry reconstructs the same request object and text. The sole rewrite is one
-  `stale_target` + `no_receipt` removal of `worker_fingerprint`, durably stored
-  before the same-ID retry.
-- The paired socket endpoint returns the exact ten-field schema-v2 response. Herdres checks
-  action/request/dry-run correlation, public pruning, and each complete
-  disposition tuple: accepted/`terminal_accepted`, pending/`in_progress`,
-  request-state-uncertain/`terminal_uncertain`, and the allowed rejection
-  statuses paired with either `terminal_rejected` or `no_receipt`.
-- Pre-send socket failures are definite; timeout, EOF, malformed/non-UTF-8
-  output, or wrong schema/shape/correlation after request start remains
-  transport ambiguity. No schema-v2 disposition or private implementation
-  detail is forged from it.
-- Disposition, never status alone, controls lifecycle. In particular,
-  `backend_unavailable` + `no_receipt` retains the checkpoint for retry, while
-  `backend_unavailable` + `terminal_rejected` caches failure and advances.
-- The retry deadline is first-seen plus the effective `60..604800` horizon
-  (`86400` default/fallback), does not slide with `updated_at`, retry,
-  redelivery, or configuration changes, and expires at equality. Before client
-  creation and after a retryable response, deadline expiry quarantines instead
-  of starting another socket request.
-- `retain_until` is first-seen plus the horizon and `86400`: `172800` default,
-  `86460` minimum, `691200` maximum. It is immutable and pruning is strictly
-  after it. The paired Tendwire retry horizon is at least the Herdres horizon,
-  and Tendwire receipt age is at least the Herdres retention bound. Tendwire's
-  `604800`/`2592000`/`4096` defaults satisfy the pair.
-- `terminal_accepted` and `terminal_rejected` cache an exact sanitized ingress
-  outcome. `terminal_uncertain`, deadline expiry, and unsafe/corrupt evidence
-  are quarantined (locally dead-lettered) with the fixed reply `Could not send
-  safely. Refresh status and choose the target again.` and checkpoint
-  `advance`. The gateway replies, saves the advanced offset, and processes
-  later updates. Restart/redelivery returns terminal or quarantine cache before
-  route resolution and never constructs another Tendwire client.
-- Only the exact allowlisted public command object reaches Tendwire; its
-  request ID satisfies `[A-Za-z0-9._-]{1,128}` and Herdres uses the narrower
-  `hri1_…` form. No raw Telegram receiver/update/chat/topic/message/reply/user
-  ID, bot token, or private/backend route crosses. No CLI environment or
-  process output crosses this boundary; the client uses only the configured
-  owner-private AF_UNIX daemon endpoint.
-- The Herdres state, Herdres request-ID key, Tendwire database, and Tendwire
-  installation key/marker/sentinel are backed up quiescently and restored as
-  one set. A replaced Herdres key changes every derived ID and is not recovery.
+- `herdres_gateway.py` remains executable and is 70--100 physical lines. It
+  loads environment/source mode, the safe request-ID key, typed receivers, one
+  `IngressQueue.open_writer`, fixed ingress defaults plus configured dispatcher
+  count, bounded signal stop handling, and `run_gateway` only. It contains no
+  business logic, state-root access, SQL, subprocess, speech, or presenter
+  import.
+- Exactly one schema-1 ingress queue exists at
+  `HERDRES_INBOUND_SPOOL_PATH`. DB/WAL/SHM and writer lock satisfy the pinned
+  parent, EUID ownership, regular/single-link, `0600`, inode, integrity, WAL,
+  and `synchronous=FULL` checks. The old lane/request modules and JSON ingress
+  state key are absent; doctor uses the read-only aggregate observer.
+- Queue acceptance atomically stores each stable receiver cursor and request.
+  Ordering-key FIFO, fixed depth, claim/renew/expiry, exact operation bytes,
+  notice claims, quarantine, pruning, and restart convergence pass
+  `tests/test_ingress.py`. Only `HERDRES_INBOUND_DISPATCH_WORKERS` configures
+  concurrency; removed lane/hold/stall/response-version flags do not return.
+- `hri1_` identities use the installed private 32-byte key and exact receiver
+  plus Telegram update/chat/message coordinates. The key and every database
+  namespace fail closed on unsafe type, owner, mode, link, symlink, or inode
+  replacement. Receiver secrets remain redacted typed values and are revealed
+  only into one Telegram client.
+- Ingress calls only the frozen typed state operations; it never obtains the
+  state root or uses generic load/save/lock helpers. Local decisions use
+  composite request/kind idempotency and exact mutation digests. All local and
+  retained-presenter decision markup/edit/delete calls share the request-key
+  HMAC-derived `pg1.<43>` physical-owner guard without waiting under state or
+  queue locks.
+- Commands use `TendwireClient.command_json()` directly over the owner-private
+  AF_UNIX socket. No child, CLI/database fallback, second queue, or
+  receipt-derived working-card shortcut exists. Accepted sends use the pinned
+  v3 success contract; decisions and bounded failure matrices retain their
+  specified compatibility.
+- The old observational presenter remains in `herdres.service` until paired
+  H7/H6. It never opens the H8 queue. Passing this independent H8 gate records
+  review evidence only and does not assert deployment/cutover completion or
+  authorize deployment.
 
 - Tendwire retains a 32-byte installation key, matching digest marker, and
   one-byte nonsecret ASCII `1` initialization sentinel with the required

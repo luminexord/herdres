@@ -1,145 +1,106 @@
-"""Managed bot voice selection for source-mode Telegram delivery.
-
-This is the source-only extraction of the old Herdres managed-bot routing
-helpers: resolve a worker/entry to a generic bot kind, then pick the operator's
-private token from env or state. Public code never contains user bot names.
-"""
+"""Pure managed-receiver kind and username normalization."""
 
 from __future__ import annotations
 
-import hashlib
 import re
-from typing import Any
-
-from . import config
+# H8-SLOC-BEGIN managed-typing-imports
+from collections.abc import Iterable, Mapping
+from typing import Protocol, TypeVar
+# H8-SLOC-END managed-typing-imports
 
 
 MANAGER_BOT_KIND = "manager"
+_MANAGED_KIND_ORDER = ("codex", "claude", "glm", "kimi", "omp", "devin")
+MANAGED_BOT_KINDS = frozenset(_MANAGED_KIND_ORDER)
+_ENTRY_KIND_FIELDS = (
+    "agent",
+    "worker_name",
+    "active_worker_name",
+    "topic_name",
+    "space_topic_name",
+    "tendwire_worker_id",
+    "worker_id",
+)
 
-MANAGED_BOT_SPECS: dict[str, dict[str, Any]] = {
-    "codex": {"aliases": ("codex",)},
-    "claude": {"aliases": ("claude",)},
-    "glm": {"aliases": ("glm",)},
-    "kimi": {"aliases": ("kimi",)},
-    "omp": {"aliases": ("omp",)},
-    "devin": {"aliases": ("devin",)},
-}
+
+# H8-SLOC-BEGIN managed-input-protocols
+class ReceiverInput(Protocol):
+    receiver_id: str
+    bot_kind: str
+    username: str
 
 
-def managed_bot_specs() -> dict[str, dict[str, Any]]:
-    return MANAGED_BOT_SPECS
+class PolicyInput(Protocol):
+    managed_usernames: tuple[tuple[str, str], ...]
+
+
+ReceiverT = TypeVar("ReceiverT", bound=ReceiverInput)
+# H8-SLOC-END managed-input-protocols
+
+
+def normalize_bot_kind(value: object, *, allow_manager: bool = True) -> str:
+    """Return one canonical configured kind, or an empty string."""
+
+    kind = str(value or "").strip().lower()
+    allowed = MANAGED_BOT_KINDS | ({MANAGER_BOT_KIND} if allow_manager else set())
+    return kind if kind in allowed else ""
+
+
+def normalize_username(value: object) -> str:
+    username = str(value or "").strip().lstrip("@").lower()
+    return username if username and "@" not in username and not username.isspace() else ""
 
 
 def managed_bot_kind_for_agent(value: str | None) -> str:
-    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
-    words = set(text.split())
-    for kind, spec in managed_bot_specs().items():
-        aliases = {str(alias).lower() for alias in spec.get("aliases") or ()}
-        if kind in words or aliases.intersection(words):
-            return kind
-        if any(alias and alias in text for alias in aliases):
-            return kind
-    return ""
+    words = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split()
+    return next((kind for kind in _MANAGED_KIND_ORDER if kind in words), "")
 
 
-def managed_bot_kind_for_entry(entry: dict[str, Any] | None) -> str:
-    if not isinstance(entry, dict):
+def managed_bot_kind_for_entry(entry: Mapping[str, object] | None) -> str:
+    if not isinstance(entry, Mapping):
         return ""
-    explicit = str(entry.get("bot_kind") or "").strip().lower()
-    if explicit in managed_bot_specs():
+    explicit = normalize_bot_kind(entry.get("bot_kind"), allow_manager=False)
+    if explicit:
         return explicit
-    for key in (
-        "agent",
-        "worker_name",
-        "active_worker_name",
-        "topic_name",
-        "space_topic_name",
-        "tendwire_worker_id",
-        "worker_id",
-    ):
-        kind = managed_bot_kind_for_agent(str(entry.get(key) or ""))
+    for field in _ENTRY_KIND_FIELDS:
+        kind = managed_bot_kind_for_agent(str(entry.get(field) or ""))
         if kind:
             return kind
     return ""
 
 
-def managed_bot_record(telegram: dict[str, Any] | None, kind: str) -> dict[str, Any] | None:
-    telegram_data = telegram if isinstance(telegram, dict) else {}
-    bots = telegram_data.get("managed_bots") if isinstance(telegram_data.get("managed_bots"), dict) else {}
-    record = bots.get(kind) if isinstance(bots, dict) else None
-    return record if isinstance(record, dict) else None
-
-
-def managed_bot_token(telegram: dict[str, Any] | None, kind: str) -> str:
-    clean = str(kind or "").strip().lower()
-    if clean not in managed_bot_specs():
+def managed_bot_kind_for_username(policy: PolicyInput, username: str) -> str:
+    wanted = normalize_username(username)
+    if not wanted:
         return ""
-    record = managed_bot_record(telegram, clean) or {}
-    if record.get("enabled") is False:
-        return ""
-    return config.managed_bot_token(clean) or str(record.get("token") or "").strip()
-
-
-def managed_bot_key(kind: str, token: str) -> str:
-    clean = str(kind or "").strip().lower()
-    digest = hashlib.sha1(str(token or "").encode("utf-8")).hexdigest()[:12]
-    return f"managed-{clean}-{digest}"
-
-
-def managed_bot_kind_for_key(key: str | None) -> str:
-    match = re.match(r"^managed-([a-z0-9_]+)-", str(key or ""))
-    if not match:
-        return ""
-    kind = match.group(1)
-    return kind if kind in managed_bot_specs() else ""
-
-
-def managed_bot_tokens(telegram: dict[str, Any] | None) -> list[tuple[str, str, str]]:
-    if not config.managed_bots_enabled():
-        return []
-    records: list[tuple[str, str, str]] = []
-    for kind in managed_bot_specs():
-        token = managed_bot_token(telegram, kind)
-        if token:
-            records.append((managed_bot_key(kind, token), kind, token))
-    return records
-
-
-def managed_bot_kind_for_username(telegram: dict[str, Any] | None, username: str) -> str:
-    clean_username = str(username or "").strip().lstrip("@").lower()
-    if not clean_username:
-        return ""
-    telegram_data = telegram if isinstance(telegram, dict) else {}
-    bots = telegram_data.get("managed_bots") if isinstance(telegram_data.get("managed_bots"), dict) else {}
-    bot_items = bots.items() if isinstance(bots, dict) else ()
-    for kind, record in bot_items:
-        if kind not in managed_bot_specs() or not isinstance(record, dict):
-            continue
-        configured = str(record.get("username") or "").strip().lstrip("@").lower()
-        if configured and clean_username == configured:
-            return str(kind)
+    for configured, raw_kind in policy.managed_usernames:
+        kind = normalize_bot_kind(raw_kind, allow_manager=False)
+        if kind and normalize_username(configured) == wanted:
+            return kind
     return ""
 
 
-def managed_bot_token_for_entry(
-    telegram: dict[str, Any] | None,
-    entry: dict[str, Any] | None,
-) -> str | None:
-    if not config.managed_bots_enabled():
-        return None
-    kind = managed_bot_kind_for_entry(entry)
-    if not kind:
-        return None
-    if entry is not None and entry.get("managed_voice_active") is False:
-        return None
-    token = managed_bot_token(telegram, kind)
-    return token or None
+# H8-SLOC-BEGIN managed-receiver-lookups
+def receiver_for_id(
+    receivers: Iterable[ReceiverT], receiver_id: str
+) -> ReceiverT | None:
+    wanted = str(receiver_id or "").strip()
+    matches = [receiver for receiver in receivers if receiver.receiver_id == wanted]
+    return matches[0] if len(matches) == 1 else None
 
 
-def desired_message_bot_kind(telegram: dict[str, Any] | None, entry: dict[str, Any] | None) -> str:
-    token = managed_bot_token_for_entry(telegram, entry)
-    if token:
-        kind = managed_bot_kind_for_entry(entry)
-        if kind:
-            return kind
-    return MANAGER_BOT_KIND
+def receiver_for_kind(
+    receivers: Iterable[ReceiverT], bot_kind: str
+) -> ReceiverT | None:
+    wanted = normalize_bot_kind(bot_kind)
+    matches = [
+        receiver
+        for receiver in receivers
+        if normalize_bot_kind(receiver.bot_kind) == wanted
+    ]
+    return matches[0] if wanted and len(matches) == 1 else None
+
+
+def receiver_kind(receiver: ReceiverInput | None) -> str:
+    return normalize_bot_kind(receiver.bot_kind if receiver is not None else "")
+# H8-SLOC-END managed-receiver-lookups

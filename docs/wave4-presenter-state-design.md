@@ -277,11 +277,15 @@ The exact decision types are:
 DecisionIngressQuery:
     chat_id: str
     topic_id: str
-    callback_ref: str
+    callback_ref: str | None      # nonempty exact callback; null active-by-topic
     state_token: StateToken
 
 DecisionStatus enum:
     ACTIVE, EXPIRED, MISSING, AMBIGUOUS, QUARANTINED, STALE
+
+DecisionOption:
+    option_ref: str
+    label: str                   # bounded public Telegram label
 
 DecisionIngressResult:
     status: DecisionStatus
@@ -296,6 +300,7 @@ DecisionIngressResult:
     topic_id: str
     message_id: str
     option_refs: tuple[str, ...]
+    options: tuple[DecisionOption, ...]  # same refs/order as option_refs
     selected_refs: tuple[str, ...]
     await_freeform: bool
     render_fingerprint: str
@@ -327,6 +332,16 @@ DecisionMutationResult:
     message_id: str
     desired_markup_fingerprint: str
 ```
+
+`decisions.render_ingress_markup(snapshot, desired_selected_refs)` is the one
+public pure H8 renderer. It accepts only a typed active `DecisionIngressResult`,
+returns the exact bounded Telegram markup object and fingerprint, and performs
+no state/provider I/O. H8 checkpoints those exact bytes before mutation.
+
+For `DecisionIngressQuery`, null `callback_ref` resolves exactly one active
+decision in the exact chat/topic and is used only by an armed free-form message.
+A nonempty value performs exact callback lookup. Empty strings and multiple
+active topic decisions fail closed; neither form falls through to raw state.
 
 `state_token` is an opaque H7 snapshot/CAS token returned only by
 the typed reads/mutations. H8 persists and compares it only as an opaque value;

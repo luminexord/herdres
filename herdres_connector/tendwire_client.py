@@ -41,8 +41,11 @@ DAEMON_MAX_FRAME_BYTES = 1024 * 1024
 
 _COMMAND_FIELDS = {
     "send_instruction": (
-        {"schema_version", "action", "request_id", "dry_run", "target", "instruction"},
-        {"response_schema_version"},
+        {
+            "schema_version", "action", "request_id", "dry_run", "target",
+            "instruction", "response_schema_version",
+        },
+        set(),
     ),
     "answer_decision": (
         {"schema_version", "action", "request_id", "dry_run", "target", "params"},
@@ -180,7 +183,8 @@ def _exact_command_request(value: Any) -> dict[str, Any] | None:
         instruction = value.get("instruction")
         valid = set(target) in allowed_targets and _keys(instruction, {"text"})
         valid = valid and isinstance(instruction["text"], str) and bool(instruction["text"])
-        valid = valid and value.get("response_schema_version", 3) == 3
+        valid = valid and type(value.get("response_schema_version")) is int
+        valid = valid and value["response_schema_version"] == 3
         return value if valid else None
     if set(target) != {"worker_id"} or not _keys(
         value.get("params"), {"decision_ref", "selection"}
@@ -193,7 +197,7 @@ def _exact_command_request(value: Any) -> dict[str, Any] | None:
     if set(selection) == {"text"}:
         return value if _text(selection["text"]) else None
     refs = selection.get("option_refs")
-    valid = set(selection) == {"option_refs"} and isinstance(refs, list)
+    valid = set(selection) == {"option_refs"} and isinstance(refs, list) and bool(refs)
     valid = (
         valid
         and all(_text(item) for item in refs)
@@ -264,8 +268,7 @@ def _validated_command_response(
     response: Any,
     request: dict[str, Any],
 ) -> dict[str, Any] | None:
-    schemas = {2, 3} if request.get("response_schema_version") == 3 else {2}
-    if not _valid_response_shell(response, request, schemas):
+    if not _valid_response_shell(response, request, {2, 3}):
         return None
     status, disposition = response["status"], response["disposition"]
     if response["ok"] is True:
@@ -273,6 +276,7 @@ def _validated_command_response(
             (
                 status == "accepted",
                 disposition == "terminal_accepted",
+                response["schema_version"] == 3,
                 response.get("error") is None,
                 _valid_send_result(
                     response.get("result"), request, response["schema_version"]

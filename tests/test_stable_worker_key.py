@@ -6,7 +6,6 @@ import json
 
 import pytest
 
-import herdres
 from herdres_connector import state
 from herdres_connector.source_sync import SyncRuntime, _worker_entry_for_turn, sync_once
 
@@ -140,7 +139,32 @@ def _persisted_missing_version_worker(
     return key, entry
 
 
-def test_acp_frontend_fingerprint_churn_keeps_topic_and_compatible_ingress_target():
+def _typed_state(store, tmp_path):
+    tmp_path.chmod(0o700)
+    path = tmp_path / "typed-state.json"
+    state.save_state(store, path)
+    path.chmod(0o600)
+    return path, state.read_ingress_policy(path)
+
+
+def _typed_topic_route(store, tmp_path, topic_id, *, alias="", bot_kind=""):
+    path, policy = _typed_state(store, tmp_path)
+    return state.resolve_ingress_route(path, state.IngressRouteQuery(
+        chat_id=policy.chat_id, topic_id=str(topic_id), receiver_bot_kind="manager",
+        explicit_alias=alias, explicit_bot_kind=bot_kind, state_token=policy.state_token,
+    ))
+
+
+def _typed_reply_route(store, tmp_path, message_id, topic_id, *, author_kind=""):
+    path, policy = _typed_state(store, tmp_path)
+    return state.resolve_ingress_reply(path, state.IngressReplyQuery(
+        chat_id=policy.chat_id, topic_id=str(topic_id), reply_message_id=str(message_id),
+        observed_author_bot_kind=author_kind, explicit_alias="", explicit_bot_kind="",
+        state_token=policy.state_token,
+    ))
+
+
+def test_acp_frontend_fingerprint_churn_keeps_topic_and_compatible_ingress_target(tmp_path):
     """A visible frontend may rotate while owner evidence stays separate."""
     store = _store()
     original_key, original, created = state.upsert_worker_entry(
@@ -177,11 +201,12 @@ def test_acp_frontend_fingerprint_churn_keeps_topic_and_compatible_ingress_targe
     assert frontend_key == original_key
     assert frontend is original
     assert frontend["topic_id"] == "14303"
-    assert herdres._target_for_entry(frontend) == {
-        "worker_id": "codex",
-        "worker_fingerprint": "fp-visible-frontend",
-    }
-    assert herdres._stable_owner_for_entry(frontend) == (KEY_A, 1)
+    route = _typed_topic_route(store, tmp_path, "14303")
+    assert route.status is state.RouteStatus.RESOLVED
+    assert (route.worker_id, route.worker_fingerprint) == (
+        "codex", "fp-visible-frontend"
+    )
+    assert route.owner == state.StableOwner(KEY_A, 1, None)
     binding = state.find_message_binding(store, "14310", topic_id="14303")
     assert binding is not None
     assert binding["worker_fingerprint"] == "fp-visible-frontend"
@@ -191,19 +216,18 @@ def test_acp_frontend_fingerprint_churn_keeps_topic_and_compatible_ingress_targe
     )
 
 
-def test_ingress_target_uses_fingerprint_only_without_exact_stable_owner():
-    entry = {
-        "tendwire_worker_id": "codex",
-        "tendwire_fingerprint": "fp-legacy",
-        "tendwire_stable_key": KEY_A,
-        "tendwire_stable_key_version": "1",
-    }
+def test_ingress_route_fails_closed_without_exact_stable_owner(tmp_path):
+    store = _store()
+    _key, entry, _created = state.upsert_worker_entry(
+        store, _worker("codex", KEY_A, fingerprint="fp-legacy"), topic_id="14303"
+    )
+    entry["tendwire_stable_key_version"] = "1"
 
     assert state.entry_stable_identity(entry) is None
-    assert herdres._target_for_entry(entry) == {
-        "worker_id": "codex",
-        "worker_fingerprint": "fp-legacy",
-    }
+    route = _typed_topic_route(store, tmp_path, "14303")
+    assert route.status is state.RouteStatus.MISSING
+    assert route.owner is None
+    assert not route.worker_id and not route.worker_fingerprint
 
 
 def _final_turn(worker_id, *, turn_id="turn-1", text="Full final answer"):
@@ -515,7 +539,7 @@ def test_unsupported_persisted_identity_is_quarantined_not_adopted():
     assert current["tendwire_stable_key"] == KEY_A
 
 
-def test_restart_repoints_all_constrained_historical_bindings_and_replies():
+def test_restart_repoints_all_constrained_historical_bindings_and_replies(tmp_path):
     store = _store()
     key, entry, _created = state.upsert_worker_entry(
         store,
@@ -544,12 +568,13 @@ def test_restart_repoints_all_constrained_historical_bindings_and_replies():
         assert binding["worker_fingerprint"] == "fp-new"
         assert binding["stable_key"] == KEY_A
         assert binding["stable_key_version"] == 1
-        reply_key, reply_entry = herdres._worker_entry_from_reply(
-            store,
-            {"reply_to_message_id": message_id, "topic_id": "26"},
+        route = _typed_reply_route(store, tmp_path, message_id, "26")
+        assert route.status is state.RouteStatus.RESOLVED
+        assert (route.worker_id, route.worker_fingerprint) == (
+            "claude-2-2", "fp-new"
         )
-        assert reply_key == key
-        assert reply_entry is rebound
+        assert route.owner == state.StableOwner(KEY_A, 1, None)
+        assert route.binding_was_present is True
     assert store["telegram_message_bindings"]["999"]["worker_id"] == "claude-2"
 
 
@@ -631,7 +656,7 @@ def test_persisted_duplicate_stable_key_consolidates_to_oldest_topic():
 
 
 
-def test_closed_key_reuse_never_adopts_or_routes_the_closed_entry():
+def test_closed_key_reuse_never_adopts_or_routes_the_closed_entry(tmp_path):
     store = _store()
     old_key, old, _created = state.upsert_worker_entry(
         store,
@@ -651,10 +676,10 @@ def test_closed_key_reuse_never_adopts_or_routes_the_closed_entry():
     assert old["topic_id"] == "26"
     assert state.entry_is_quarantined(old) is True
     assert state.find_entry_by_thread(store, "26") == (None, None)
-    assert herdres._worker_entry_from_reply(
-        store,
-        {"reply_to_message_id": "500", "topic_id": "26"},
-    ) == (None, None)
+    route = _typed_reply_route(store, tmp_path, "500", "26")
+    assert route.status is state.RouteStatus.BINDING_AMBIGUOUS
+    assert route.binding_was_present is True
+    assert route.owner is None and not route.worker_id
 
 
 def test_sync_planner_never_reopens_closed_same_id_stable_owner():
@@ -706,7 +731,7 @@ def test_sync_planner_never_reopens_closed_same_id_stable_owner():
         _worker("claude-2", "source-spoof", version=1, fingerprint="fp-new"),
     ],
 )
-def test_rotation_loss_or_invalid_replacement_quarantines_old_binding(incoming):
+def test_rotation_loss_or_invalid_replacement_quarantines_old_binding(incoming, tmp_path):
     store = _store()
     old_key, old, _created = state.upsert_worker_entry(
         store,
@@ -727,10 +752,10 @@ def test_rotation_loss_or_invalid_replacement_quarantines_old_binding(incoming):
     assert state.entry_is_quarantined(old) is True
     assert state.find_worker_entry_by_id(store, "claude-2") == (None, None)
     assert store["telegram_message_bindings"]["500"]["routing_quarantined"] is True
-    assert herdres._worker_entry_from_reply(
-        store,
-        {"reply_to_message_id": "500", "topic_id": "26"},
-    ) == (None, None)
+    route = _typed_reply_route(store, tmp_path, "500", "26")
+    assert route.status is state.RouteStatus.BINDING_AMBIGUOUS
+    assert route.binding_was_present is True
+    assert route.owner is None and not route.worker_id
 
 
 @pytest.mark.parametrize(
@@ -824,7 +849,7 @@ def test_rotation_with_majority_physical_identity_migrates_the_old_topic():
     assert telegram.topics == []
 
 
-def test_stable_bearing_reply_binding_resolves_stable_first_and_fails_closed():
+def test_stable_bearing_reply_binding_resolves_stable_first_and_fails_closed(tmp_path):
     store = _store()
     _key_a, entry_a, _created = state.upsert_worker_entry(
         store, _worker("claude-2", KEY_B), topic_id="26"
@@ -839,16 +864,34 @@ def test_stable_bearing_reply_binding_resolves_stable_first_and_fails_closed():
 
     assert state.find_worker_entry_by_id(store, "claude-2") == (None, None)
     assert state.find_entry_key_by_stable_key(store, KEY_A) is None
-    assert herdres._worker_entry_from_reply(
-        store,
-        {"reply_to_message_id": "500", "topic_id": "26"},
-    ) == (None, None)
+    route = _typed_reply_route(store, tmp_path, "500", "26")
+    assert route.status is state.RouteStatus.BINDING_AMBIGUOUS
+    assert route.binding_was_present is True
+    assert route.owner is None and not route.worker_id
 
     store["telegram_message_bindings"]["500"]["stable_key_version"] = "1"
-    assert herdres._worker_entry_from_reply(
-        store,
-        {"reply_to_message_id": "500", "topic_id": "26"},
-    ) == (None, None)
+    malformed = _typed_reply_route(store, tmp_path, "500", "26")
+    assert malformed.status is state.RouteStatus.BINDING_AMBIGUOUS
+    assert malformed.binding_was_present is True
+    assert malformed.owner is None and not malformed.worker_id
+
+
+@pytest.mark.parametrize("malformed_binding", [None, "corrupt", [], 7])
+def test_present_malformed_reply_binding_never_falls_through_to_topic_route(
+    malformed_binding, tmp_path
+):
+    store = _store()
+    state.upsert_worker_entry(
+        store, _worker("claude-2", KEY_A), topic_id="26"
+    )
+    store["telegram_message_bindings"] = {"500": malformed_binding}
+
+    route = _typed_reply_route(store, tmp_path, "500", "26")
+
+    assert route.status is state.RouteStatus.BINDING_AMBIGUOUS
+    assert route.reason == "binding_topic_mismatch_or_malformed"
+    assert route.binding_was_present is True
+    assert route.owner is None and not route.worker_id
 
 
 def test_new_message_bindings_carry_only_validated_v1_identity():
@@ -886,7 +929,7 @@ def test_any_present_entry_quarantine_marker_fails_closed(marker):
 
 
 @pytest.mark.parametrize("marker", [1, "true", False])
-def test_any_present_binding_quarantine_marker_fails_closed(marker):
+def test_any_present_binding_quarantine_marker_fails_closed(marker, tmp_path):
     store = _store()
     _key, entry, _created = state.upsert_worker_entry(
         store, _worker("claude-2", KEY_A), topic_id="26"
@@ -894,10 +937,10 @@ def test_any_present_binding_quarantine_marker_fails_closed(marker):
     state.bind_message_to_worker(store, "500", entry, topic_id="26", kind="final")
     store["telegram_message_bindings"]["500"]["routing_quarantined"] = marker
 
-    assert herdres._worker_entry_from_reply(
-        store,
-        {"reply_to_message_id": "500", "topic_id": "26"},
-    ) == (None, None)
+    route = _typed_reply_route(store, tmp_path, "500", "26")
+    assert route.status is state.RouteStatus.BINDING_AMBIGUOUS
+    assert route.binding_was_present is True
+    assert route.owner is None and not route.worker_id
 
 
 @pytest.mark.parametrize(
@@ -909,7 +952,9 @@ def test_any_present_binding_quarantine_marker_fails_closed(marker):
         (None, 1),
     ],
 )
-def test_malformed_stored_identity_is_unroutable_everywhere(stored_key, stored_version):
+def test_malformed_stored_identity_is_unroutable_everywhere(
+    stored_key, stored_version, tmp_path
+):
     store = _store()
     _key, entry, _created = state.upsert_worker_entry(
         store, _worker("claude-2", KEY_C), topic_id="26"
@@ -927,10 +972,10 @@ def test_malformed_stored_identity_is_unroutable_everywhere(stored_key, stored_v
     assert state.find_entry_by_thread(store, "26") == (None, None)
     assert _worker_entry_for_turn(store, "claude-2", "w1") == (None, None)
     assert state.find_worker_entry_by_alias(store, "claude-2", space_id="w1") == (None, None)
-    assert herdres._worker_entry_from_reply(
-        store,
-        {"reply_to_message_id": "500", "topic_id": "26"},
-    ) == (None, None)
+    route = _typed_reply_route(store, tmp_path, "500", "26")
+    assert route.status is state.RouteStatus.BINDING_AMBIGUOUS
+    assert route.binding_was_present is True
+    assert route.owner is None and not route.worker_id
 
 
 def test_absent_and_noncurrent_persisted_identities_are_unroutable():
@@ -1750,7 +1795,7 @@ def test_missing_and_malformed_same_id_rows_have_total_slot_order_on_repeat():
 
 @pytest.mark.parametrize("topic_mode", ["worker", "space"])
 def test_absent_current_owners_of_preflight_blocked_key_are_quarantined_before_reconciliation(
-    monkeypatch, topic_mode
+    monkeypatch, topic_mode, tmp_path
 ):
     monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", topic_mode)
     store = _store()
@@ -1816,10 +1861,10 @@ def test_absent_current_owners_of_preflight_blocked_key_are_quarantined_before_r
             for binding in state.message_bindings(store).values()
         )
         for message_id, topic_id in (("500", "26"), ("501", "28")):
-            assert herdres._worker_entry_from_reply(
-                store,
-                {"reply_to_message_id": message_id, "topic_id": topic_id},
-            ) == (None, None)
+            route = _typed_reply_route(store, tmp_path, message_id, topic_id)
+            assert route.status is state.RouteStatus.BINDING_AMBIGUOUS
+            assert route.binding_was_present is True
+            assert route.owner is None and not route.worker_id
         assert state.find_worker_entry_by_stable_key(store, KEY_A) == (None, None)
         assert state.find_entry_by_thread(store, "26") == (None, None)
         assert state.find_entry_by_thread(store, "28") == (None, None)
