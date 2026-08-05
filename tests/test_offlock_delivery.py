@@ -1,8 +1,7 @@
-"""Off-lock inter-work delivery for source mode (issue #122).
+"""Off-lock presenter delivery for source mode (issue #122).
 
-sync_once holds state.state_lock() across the whole source-mode delivery loop, so queued inbound
-commands (which also take state_lock()) stall behind its Telegram sends. released_lock() drops the held
-lock for a bounded window between delivered turns and re-acquires it. These tests pin the mechanism
+Provider operations run outside the state flock and reload durable presenter state afterward.
+These tests pin the mechanism
 (state_lock exposes/restores the held fd, released_lock is a no-op when no lock is held, the fd is
 thread-local, drop-then-reacquire, re-acquire-failure propagates), the two runtime flag readers, the
 commit-before-yield / reload-after no-clobber invariant, and the _cleanup_topics per-pass delete cap.
@@ -10,8 +9,6 @@ commit-before-yield / reload-after no-clobber invariant, and the _cleanup_topics
 from __future__ import annotations
 
 import fcntl
-import json
-import math
 from types import SimpleNamespace
 import threading
 import time
@@ -31,13 +28,33 @@ from herdres_connector.source_sync import (
 from herdres_connector.telegram_delivery import drain_outbox, topic_icon_id
 
 from test_source_only import (
-    REQUEST_ID,
     FakeTelegram,
     FakeTendwire,
-    _accepted_command_response,
     _source_worker,
     _store,
 )
+from test_turn_final_delivery import (
+    DeletingTelegram,
+    TurnFinalTendwire,
+    _runtime as _turn_runtime,
+    _turn_row,
+)
+
+
+_PENDING_FINAL_FIELDS = {
+    "pending_turn_id",
+    "pending_content_revision",
+    "pending_plan_token",
+    "pending_turn_part_count",
+    "pending_turn_job_count",
+    "pending_turn_started_at",
+    "pending_turn_user_hash",
+    "pending_stream_submission_id",
+    "pending_plan_generation",
+    "pending_presentation_version",
+    "pending_final_identity",
+    "pending_working_predecessor_turn_id",
+}
 
 
 def _reset_lock_state():
@@ -46,8 +63,7 @@ def _reset_lock_state():
 
 
 def _competitor_can_acquire(lock_path) -> bool:
-    """A fresh, independent fd tries a non-blocking acquire on the state lock file — the flock a
-    queued inbound command would attempt. Succeeds only when the holder has released the lock."""
+    """Return whether an independent state writer can acquire the released flock."""
     with open(lock_path, "a+", encoding="utf-8") as fh:
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -55,6 +71,75 @@ def _competitor_can_acquire(lock_path) -> bool:
             return False
         fcntl.flock(fh, fcntl.LOCK_UN)
         return True
+
+
+def _fsynced_turn_pass(
+    statepath,
+    tendwire,
+    telegram,
+    *,
+    max_sends: int,
+    after_provider_accept=None,
+):
+    with state.state_lock(path=statepath):
+        store = state.load_state(statepath)
+
+        def checkpoint() -> None:
+            assert state.lock_actually_held()
+            state.save_state(store, statepath)
+
+        result = sync_once(
+            store,
+            _turn_runtime(
+                tendwire,
+                telegram,
+                max_sends=max_sends,
+                checkpoint=checkpoint,
+                after_provider_accept=(
+                    None
+                    if after_provider_accept is None
+                    else lambda: after_provider_accept(store)
+                ),
+            ),
+        )
+        if result.get("changed"):
+            state.save_state(store, statepath)
+    return result, state.load_state(statepath)
+
+
+def _seed_fsynced_turn_state(statepath, row) -> None:
+    store = _store()
+    state.upsert_worker_entry(
+        store,
+        _source_worker(
+            {
+                "id": row["worker_id"],
+                "name": "Alpha",
+                "status": "idle",
+                "space_id": row.get("space_id") or "space-1",
+                "fingerprint": row["worker_fingerprint"],
+                "meta": {
+                    "agent": "codex",
+                    "stable_key": row["stable_key"],
+                    "stable_key_version": row["stable_key_version"],
+                },
+            }
+        ),
+        topic_id="77",
+    )
+    state.save_state(store, statepath)
+
+
+def _final_bindings(store, turn_id: str):
+    return sorted(
+        (
+            (message_id, binding)
+            for message_id, binding in state.message_bindings(store).items()
+            if binding.get("kind") == "final"
+            and binding.get("turn_id") == turn_id
+        ),
+        key=lambda item: item[1]["part_ordinal"],
+    )
 
 
 # --- machinery ---------------------------------------------------------------
@@ -214,32 +299,6 @@ def test_slow_provider_call_does_not_hold_state_lock(tmp_path, monkeypatch):
     assert store["concurrent_command"] is True
 
 
-def test_nested_offlock_client_does_not_rollback_lane_child_commit(
-    tmp_path, monkeypatch
-):
-    """Regression for cleanup/speak phases that already own a release window."""
-
-    _reset_lock_state()
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    state.save_state(_store(), statepath)
-
-    class Provider:
-        def configured(self):
-            return {"ok": True}
-
-    with state.state_lock(path=statepath):
-        current = state.load_state(statepath)
-        client = _OfflockClient(Provider(), current)
-        with state.released_lock():
-            child = state.load_state(statepath)
-            child["child_commit_survived"] = True
-            state.save_state(child, statepath)
-            assert client.configured()["ok"] is True
-        state.reload_state_in_place(current, statepath)
-
-    assert current["child_commit_survived"] is True
-    assert state.load_state(statepath)["child_commit_survived"] is True
 
 
 def test_guarded_outbox_checkpoints_before_ack_and_replay_only_acks(
@@ -341,6 +400,189 @@ def test_guarded_outbox_checkpoints_before_ack_and_replay_only_acks(
             "delivered_identities"
         ]
     ) == 1
+
+
+def test_fsynced_committed_ack_loss_restart_keeps_completed_identity(
+    tmp_path, monkeypatch
+) -> None:
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    row = _turn_row(
+        "turn-fsynced-committed-loss",
+        "twrev1.fsynced_committed_loss",
+        "accepted exactly once",
+    )
+    _seed_fsynced_turn_state(statepath, row)
+    tendwire = TurnFinalTendwire(row)
+    tendwire.ack_committed_response_lost_once = True
+    telegram = DeletingTelegram()
+
+    first, persisted = _fsynced_turn_pass(
+        statepath, tendwire, telegram, max_sends=1
+    )
+
+    assert first["tendwire_turn_final"]["operations"] == 1
+    assert first["tendwire_turn_final"]["acked"] == 0
+    assert first["tendwire_turn_final"]["status"] == "timeout"
+    bindings = _final_bindings(persisted, row["id"])
+    assert len(bindings) == 1
+    message_ids = [message_id for message_id, _binding in bindings]
+    assert len(telegram.sent) == 1
+    assert telegram.edited == []
+    assert telegram.deleted_messages == []
+    assert [sent[3] for sent in telegram.sent] == message_ids
+    entry = next(iter(state.source_worker_entries(persisted).values()))
+    assert entry["last_clean_message_ids"] == message_ids
+    assert entry["last_clean_content_revision"] == row["content"][
+        "content_revision"
+    ]
+    assert entry["last_clean_plan_token"] == "twplan1.plan1"
+    assert _PENDING_FINAL_FIELDS.isdisjoint(entry)
+    identity = (
+        f"final:{row['id']}:"
+        f"{row['content']['content_revision']}"
+    )
+    delivered = state.delivered_turns(persisted)[identity]
+    assert delivered["message_ids"] == message_ids
+    assert delivered["content_revision"] == row["content"][
+        "content_revision"
+    ]
+    writes = len(telegram.sent) + len(telegram.edited)
+
+    restarted, restarted_store = _fsynced_turn_pass(
+        statepath, tendwire, telegram, max_sends=1
+    )
+
+    assert restarted["tendwire_turn_final"]["polled"] == 0
+    assert restarted["tendwire_turn_final"]["operations"] == 0
+    assert len(telegram.sent) + len(telegram.edited) == writes == 1
+    restarted_entry = next(
+        iter(state.source_worker_entries(restarted_store).values())
+    )
+    assert restarted_entry["last_clean_message_ids"] == message_ids
+    assert _PENDING_FINAL_FIELDS.isdisjoint(restarted_entry)
+
+
+def test_fsynced_upsert_defers_when_reloaded_owner_is_absent(
+    tmp_path, monkeypatch
+) -> None:
+    statepath = tmp_path / "state.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    row = _turn_row(
+        "turn-owner-removed-offlock",
+        "twrev1.owner_removed_offlock",
+        "accepted after owner removal",
+    )
+    _seed_fsynced_turn_state(statepath, row)
+    tendwire = TurnFinalTendwire(row)
+
+    telegram = DeletingTelegram()
+
+    def remove_owner_after_binding(store) -> None:
+        concurrent = state.load_state(statepath)
+        concurrent["panes"] = {}
+        state.save_state(concurrent, statepath)
+        state.reload_state_in_place(store, statepath)
+
+    result, persisted = _fsynced_turn_pass(
+        statepath,
+        tendwire,
+        telegram,
+        max_sends=1,
+        after_provider_accept=remove_owner_after_binding,
+    )
+
+    assert len(telegram.sent) == 1
+    assert tendwire.ack_calls == []
+    assert len(tendwire.defer_calls) == 1
+    assert tendwire.defer_calls[0][1] == "transient_delivery"
+    assert result["tendwire_turn_final"]["acked"] == 0
+    assert result["tendwire_turn_final"]["deferred"] == 1
+    assert state.source_worker_entries(persisted) == {}
+
+
+@pytest.mark.parametrize(
+    "ack_loss_flag",
+    ["ack_loss_once", "ack_committed_response_lost_once"],
+)
+def test_fsynced_multipart_ack_loss_restart_writes_each_ordinal_once(
+    tmp_path, monkeypatch, ack_loss_flag
+) -> None:
+    statepath = tmp_path / f"{ack_loss_flag}.json"
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
+    text = ("ordered fsynced multipart answer\n\n" * 900) + "FINAL_TAIL"
+    row = _turn_row(
+        f"turn-fsynced-{ack_loss_flag}",
+        f"twrev1.fsynced_{ack_loss_flag}",
+        text,
+    )
+    _seed_fsynced_turn_state(statepath, row)
+    tendwire = TurnFinalTendwire(row)
+    setattr(tendwire, ack_loss_flag, True)
+    telegram = DeletingTelegram()
+
+    first, prefix_store = _fsynced_turn_pass(
+        statepath, tendwire, telegram, max_sends=1
+    )
+
+    part_count = int(tendwire._plans["twplan1.plan1"]["part_count"])
+    assert part_count > 1
+    assert first["tendwire_turn_final"]["operations"] == 1
+    assert first["tendwire_turn_final"]["acked"] == 0
+    assert len(_final_bindings(prefix_store, row["id"])) == 1
+    assert len(telegram.sent) == 1
+
+    resumed, converged = _fsynced_turn_pass(
+        statepath, tendwire, telegram, max_sends=part_count + 1
+    )
+
+    bindings = _final_bindings(converged, row["id"])
+    message_ids = [message_id for message_id, _binding in bindings]
+    assert [binding["part_ordinal"] for _message_id, binding in bindings] == list(
+        range(part_count)
+    )
+    assert [sent[3] for sent in telegram.sent] == message_ids
+    assert len(telegram.sent) == part_count
+    assert len(set(message_ids)) == part_count
+    assert telegram.edited == []
+    assert telegram.deleted_messages == []
+    entry = next(iter(state.source_worker_entries(converged).values()))
+    assert entry["last_clean_message_ids"] == message_ids
+    assert entry["last_clean_content_revision"] == row["content"][
+        "content_revision"
+    ]
+    assert entry["last_clean_plan_token"] == "twplan1.plan1"
+    assert _PENDING_FINAL_FIELDS.isdisjoint(entry)
+    identity = (
+        f"final:{row['id']}:"
+        f"{row['content']['content_revision']}"
+    )
+    assert state.delivered_turns(converged)[identity][
+        "message_ids"
+    ] == message_ids
+    assert resumed["tendwire_turn_final"]["operations"] == part_count - 1
+
+    restarted, restarted_store = _fsynced_turn_pass(
+        statepath, tendwire, telegram, max_sends=part_count + 1
+    )
+
+    assert restarted["tendwire_turn_final"]["polled"] == 0
+    assert restarted["tendwire_turn_final"]["operations"] == 0
+    assert len(telegram.sent) == part_count
+    restarted_entry = next(
+        iter(state.source_worker_entries(restarted_store).values())
+    )
+    assert restarted_entry["last_clean_message_ids"] == message_ids
+    assert _PENDING_FINAL_FIELDS.isdisjoint(restarted_entry)
 
 
 def test_guarded_topic_icon_catalog_persists_and_is_reused(
@@ -774,121 +1016,8 @@ def test_raising_offlock_provider_reloads_before_caller_continues(
     assert persisted["caller_continued"] is True
 
 
-def test_blocked_sync_observation_does_not_delay_command_submission(
-    tmp_path, monkeypatch
-):
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
-    monkeypatch.setenv("HERDRES_INBOUND_LANES", "1")
-    worker = _source_worker(
-        {
-            "id": "worker-1",
-            "name": "Alpha",
-            "status": "idle",
-            "space_id": "space-1",
-            "fingerprint": "fp-1",
-        }
-    )
-    store = _store()
-    state.upsert_worker_entry(store, worker, topic_id="77")
-    state.save_state(store, statepath)
-    entered = threading.Event()
-    release = threading.Event()
-    submitted: list[str] = []
-
-    class SlowSyncTendwire(FakeTendwire):
-        def snapshot(self):
-            entered.set()
-            assert release.wait(6)
-            return super().snapshot()
-
-    class CommandTendwire:
-        def command_json(self, request_json):
-            submitted.append(request_json)
-            return _accepted_command_response(json.loads(request_json))
-
-    slow = SlowSyncTendwire(workers=[worker])
-    monkeypatch.setattr(
-        herdres,
-        "_runtime",
-        lambda **_kwargs: SyncRuntime(
-            slow, FakeTelegram(), with_outbox=False
-        ),
-    )
-    monkeypatch.setattr(herdres, "TendwireClient", CommandTendwire)
-    result: dict[str, object] = {}
-
-    thread = threading.Thread(target=lambda: result.update(herdres._sync_pass()))
-    thread.start()
-    assert entered.wait(1)
-    started = time.monotonic()
-    reply = herdres.command_reply(
-        {
-            "request_id": REQUEST_ID,
-            "topic_id": "77",
-            "message_id": "9001",
-            "text": "submit while sync RPC is blocked",
-        }
-    )
-    elapsed = time.monotonic() - started
-    release.set()
-    thread.join(6)
-
-    assert reply["checkpoint"] == "hold"
-    assert reply["transport_disposition"] == "written_to_pty"
-    assert reply["request_phase"] == "accepted_unverified"
-    assert reply["terminal_outcome"] == "delivery_unknown"
-    assert reply["reply"] == ""
-    assert len(submitted) == 1
-    assert elapsed < 5.0
-    assert not thread.is_alive()
-    assert result["ok"] is True
 
 
-def test_sync_yields_again_before_heavy_source_reconciliation(
-    tmp_path, monkeypatch
-):
-    """The command child gets a lock window after gateway preflight."""
-
-    _reset_lock_state()
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    state.save_state(_store(), statepath)
-    release_windows = 0
-    real_released_lock = state.released_lock
-    real_sync_sources = source_sync._sync_sources
-
-    class ObservedRelease:
-        def __enter__(self):
-            nonlocal release_windows
-            release_windows += 1
-            self._window = real_released_lock()
-            return self._window.__enter__()
-
-        def __exit__(self, *args):
-            return self._window.__exit__(*args)
-
-    def observed_sync_sources(*args, **kwargs):
-        # One window belongs to provider observation. The second is the
-        # explicit post-observation handoff for the gateway command child.
-        assert release_windows >= 2
-        return real_sync_sources(*args, **kwargs)
-
-    monkeypatch.setattr(state, "released_lock", ObservedRelease)
-    monkeypatch.setattr(source_sync, "_sync_sources", observed_sync_sources)
-    with state.state_lock(path=statepath):
-        current = state.load_state(statepath)
-        result = sync_once(
-            current,
-            SyncRuntime(FakeTendwire(), FakeTelegram(), with_outbox=False),
-        )
-
-    assert result["ok"] is True
-    assert release_windows >= 2
 
 
 # --- config flags ------------------------------------------------------------
@@ -906,123 +1035,12 @@ def test_source_orphan_delete_cap():
 
 # --- yield behaviour in sync_once -------------------------------------------
 
-def _two_final_turns_tendwire():
-    return FakeTendwire(
-        turns={"turns": [
-            {"id": "turn-a", "worker_id": "worker-a", "worker_fingerprint": "fp-a",
-             "assistant_final_text": "Final A", "complete": True},
-            {"id": "turn-b", "worker_id": "worker-b", "worker_fingerprint": "fp-b",
-             "assistant_final_text": "Final B", "complete": True},
-        ]},
-        workers=[
-            {"id": "worker-a", "name": "a", "status": "idle", "space_id": "space-1",
-             "fingerprint": "fp-a", "meta": {"agent": "codex"}},
-            {"id": "worker-b", "name": "b", "status": "idle", "space_id": "space-1",
-             "fingerprint": "fp-b", "meta": {"agent": "claude"}},
-        ],
-    )
 
 
-def test_yield_no_clobber_competitor_write_survives(tmp_path, monkeypatch):
-    # commit-before-yield + reload-after: during the released window a competitor loads state.json,
-    # modifies it, and saves; sync_once reloads after the yield, so the competitor's write survives
-    # rather than being clobbered by a stale in-memory save.
-    _reset_lock_state()
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-
-    class _CompetitorWindow:
-        """Stand in for released_lock(): a queued command grabs the freed lock, load-modify-saves."""
-        def __enter__(self):
-            disk = json.loads(statepath.read_text(encoding="utf-8"))
-            disk["competitor_sentinel"] = "written-during-yield"
-            statepath.write_text(json.dumps(disk), encoding="utf-8")
-            return self
-        def __exit__(self, *_a):
-            return False
-
-    monkeypatch.setattr(state, "released_lock", lambda: _CompetitorWindow())
-
-    store = _store()
-    telegram = FakeTelegram()
-    with state.state_lock(path=statepath):
-        result = sync_once(store, SyncRuntime(_two_final_turns_tendwire(), telegram, with_outbox=False))
-
-    assert result["sent"] == 2                                       # both turns delivered
-    assert store.get("competitor_sentinel") == "written-during-yield"  # reload picked up the write
 
 
-def test_yield_preserves_both_deliveries(tmp_path, monkeypatch):
-    # With the real released_lock, the mid-loop save/reload must not lose either worker's delivery
-    # record (the RC-edition of the detached-reference bug).
-    _reset_lock_state()
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    store = _store()
-    telegram = FakeTelegram()
-    with state.state_lock(path=statepath):
-        result = sync_once(store, SyncRuntime(_two_final_turns_tendwire(), telegram, with_outbox=False))
-    assert result["sent"] == 2
-    workers = state.source_worker_entries(store)
-    delivered = [w for w in workers.values() if w.get("last_clean_message_id") or w.get("final_message_ids")]
-    assert len(delivered) == 2   # both survived the mid-loop reload
 
 
-def test_real_sync_delivery_releases_lock_within_budget(tmp_path, monkeypatch):
-    """The production sync_once wrapping is what keeps Telegram delivery off-lock."""
-
-    _reset_lock_state()
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    state.save_state(_store(), statepath)
-    delivery_entered = threading.Event()
-    release_delivery = threading.Event()
-    competitor_acquired = threading.Event()
-    sync_finished = threading.Event()
-
-    class SlowDeliveryTelegram(FakeTelegram):
-        def send_message(self, chat_id, html, **kwargs):
-            delivery_entered.set()
-            assert release_delivery.wait(3)
-            return super().send_message(chat_id, html, **kwargs)
-
-    def run_sync():
-        with state.state_lock(path=statepath):
-            current = state.load_state(statepath)
-            result = sync_once(
-                current,
-                SyncRuntime(
-                    _two_final_turns_tendwire(),
-                    SlowDeliveryTelegram(),
-                    with_outbox=False,
-                ),
-            )
-            assert result["sent"] == 2
-            state.save_state(current, statepath)
-        sync_finished.set()
-
-    def compete():
-        with state.state_lock(path=statepath):
-            competitor_acquired.set()
-
-    sync_thread = threading.Thread(target=run_sync)
-    sync_thread.start()
-    assert delivery_entered.wait(1)
-    competitor_thread = threading.Thread(target=compete)
-    competitor_thread.start()
-    try:
-        assert competitor_acquired.wait(0.75)
-    finally:
-        release_delivery.set()
-    sync_thread.join(4)
-    competitor_thread.join(4)
-
-    assert sync_finished.is_set()
 
 
 def test_flock_hold_instrumentation_reports_phase_and_timestamps(
@@ -1049,129 +1067,6 @@ def test_flock_hold_instrumentation_reports_phase_and_timestamps(
     assert "released_at=" in warning
 
 
-def test_full_busy_pass_flock_p99_and_concurrent_canonical_commit_budget(
-    tmp_path, monkeypatch
-):
-    """Production composition: slow account refresh is off-lock for a lane child."""
-
-    _reset_lock_state()
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
-    monkeypatch.setenv("HERDRES_SOURCE_TOPIC_MODE", "worker")
-    monkeypatch.setenv("HERDRES_PINNED_STATUS", "1")
-    monkeypatch.setenv("HERDRES_PINNED_ACCOUNT", "1")
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "0")
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "0")
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    workers = [
-        _source_worker(
-            {
-                "id": f"worker-{index}",
-                "name": f"Worker {index}",
-                "status": "idle",
-                "space_id": "space-1",
-                "fingerprint": f"fp-{index}",
-                "meta": {"agent": "codex"},
-            }
-        )
-        for index in range(12)
-    ]
-    turns = {
-        "turns": [
-            {
-                "id": f"turn-{index}",
-                "worker_id": worker["id"],
-                "worker_fingerprint": worker["fingerprint"],
-                "assistant_final_text": f"Final {index}",
-                "complete": True,
-            }
-            for index, worker in enumerate(workers)
-        ]
-    }
-    store = _store()
-    for index, worker in enumerate(workers):
-        state.upsert_worker_entry(
-            store, worker, topic_id=str(700 + index)
-        )
-    state.save_state(store, statepath)
-
-    account_refresh_entered = threading.Event()
-    release_account_refresh = threading.Event()
-
-    def slow_account_refresh():
-        account_refresh_entered.set()
-        assert release_account_refresh.wait(5)
-        return {"fetched_at": time.time()}
-
-    monkeypatch.setattr(
-        source_sync.accounts, "usage_snapshot", slow_account_refresh
-    )
-    tendwire = FakeTendwire(
-        turns=turns,
-        pending={"pending_interactions": []},
-        workers=workers,
-        spaces=[],
-    )
-    tendwire.turn_final_poll = lambda **_kwargs: {"ok": True, "items": []}
-    telegram = FakeTelegram()
-
-    def runtime_factory(**kwargs):
-        return SyncRuntime(
-            tendwire,
-            telegram,
-            with_outbox=bool(kwargs.get("with_outbox", True)),
-            checkpoint=kwargs.get("checkpoint"),
-        )
-
-    class CommandTendwire:
-        def command_json(self, request_json):
-            return _accepted_command_response(json.loads(request_json))
-
-    monkeypatch.setattr(herdres, "_runtime", runtime_factory)
-    monkeypatch.setattr(herdres, "TendwireClient", CommandTendwire)
-    holds = []
-    sync_result: dict[str, object] = {}
-    sync_error: list[BaseException] = []
-
-    def run_sync():
-        try:
-            sync_result.update(herdres._sync_pass())
-        except BaseException as exc:  # pragma: no cover - surfaced below
-            sync_error.append(exc)
-
-    with state.observe_lock_holds(holds.append):
-        sync_thread = threading.Thread(target=run_sync)
-        sync_thread.start()
-        assert account_refresh_entered.wait(2)
-        started = time.monotonic()
-        reply = herdres.command_reply(
-            {
-                "request_id": REQUEST_ID,
-                "topic_id": "700",
-                "message_id": "9001",
-                "text": "commit while a full pass refreshes account usage",
-            }
-        )
-        canonical_commit_seconds = time.monotonic() - started
-        release_account_refresh.set()
-        sync_thread.join(8)
-
-    assert not sync_error
-    assert not sync_thread.is_alive()
-    assert sync_result["ok"] is True
-    assert reply["transport_disposition"] == "written_to_pty"
-    assert reply["terminal_outcome"] == "delivery_unknown"
-    assert canonical_commit_seconds < 3.0
-    assert holds
-    hold_seconds = sorted(float(hold["hold_seconds"]) for hold in holds)
-    p99 = hold_seconds[math.ceil(0.99 * len(hold_seconds)) - 1]
-    assert p99 < 2.0
-    assert any(
-        hold["phase"] == "sync.pinned.account_usage" for hold in holds
-    )
-    persisted = state.load_state(statepath)
-    request = persisted["tendwire_ingress_command_requests"][REQUEST_ID]
-    assert isinstance(request.get("request_json"), str)
 
 
 def test_cleanup_topics_delete_cap(tmp_path, monkeypatch):
@@ -1235,188 +1130,14 @@ def _turn_job_key(plan_token: str, sequence_index: int) -> str:
     return f"turn-final:{plan_token}:{sequence_index:08d}"
 
 
-def _reserve_job(
-    store,
-    *,
-    plan_token=_PLAN_A,
-    content_revision=_REV_A,
-    sequence_index=0,
-    part_ordinal=0,
-    part_count=2,
-    operation="upsert",
-    prior_message_id="",
-):
-    return state.reserve_tendwire_turn_job(
-        store,
-        _turn_job_key(plan_token, sequence_index),
-        plan_token=plan_token,
-        content_revision=content_revision,
-        operation=operation,
-        sequence_index=sequence_index,
-        part_ordinal=part_ordinal,
-        part_count=part_count,
-        prior_message_id=prior_message_id,
-    )
 
 
-def _checkpointed_success(store, *, plan_token, content_revision, sequence_index):
-    receipt = _reserve_job(
-        store,
-        plan_token=plan_token,
-        content_revision=content_revision,
-        sequence_index=sequence_index,
-        part_ordinal=0,
-        part_count=1,
-    )
-    job_key = _turn_job_key(plan_token, sequence_index)
-    state.update_tendwire_turn_job(
-        store,
-        job_key,
-        substate="telegram_applied",
-        telegram_message_id=str(700 + sequence_index),
-        bot_kind="codex",
-    )
-    state.update_tendwire_turn_job(
-        store,
-        job_key,
-        substate="acknowledged",
-    )
-    return receipt
 
 
-def test_stable_job_key_resume_ignores_new_lease_ref_and_preserves_success(tmp_path):
-    store = _store()
-    job_key = _turn_job_key(_PLAN_A, 0)
-    original = _reserve_job(store)
-    state.update_tendwire_turn_job(
-        store,
-        job_key,
-        substate="telegram_applied",
-        telegram_message_id="901",
-        bot_kind="codex",
-    )
-    statepath = tmp_path / "state.json"
-    state.save_state(store, statepath)
-
-    restarted = state.load_state(statepath)
-    resumed = _reserve_job(restarted)
-    assert resumed is state.find_tendwire_turn_job(restarted, job_key)
-    assert resumed["substate"] == "telegram_applied"
-    assert resumed["telegram_message_id"] == "901"
-    assert len(state.tendwire_turn_jobs(restarted)) == 1
-    assert "lease_ref" not in resumed and "ref" not in resumed
-    with pytest.raises(ValueError):
-        state.find_tendwire_turn_job(restarted, "twref1.new-attempt")
-
-    # A retry carrying any new lease ref consults only the stable key. Since Telegram success
-    # survived restart, it may advance directly to acknowledged without another send intent.
-    state.update_tendwire_turn_job(
-        restarted,
-        job_key,
-        substate="acknowledged",
-    )
-    assert original["plan_token"] == resumed["plan_token"]
-    assert resumed["substate"] == "acknowledged"
 
 
-def test_job_substates_are_strict_and_checkpoint_old_slot_retirement():
-    store = _store()
-    job_key = _turn_job_key(_PLAN_A, 0)
-    receipt = _reserve_job(store, prior_message_id="501")
-    assert receipt["substate"] == "reserved"
-    state.update_tendwire_turn_job(
-        store,
-        job_key,
-        substate="telegram_applied",
-        telegram_message_id="901",
-        bot_kind="codex",
-    )
-    telegram_checkpoint = receipt["checkpoint_sequence"]
-    state.update_tendwire_turn_job(
-        store,
-        job_key,
-        substate="old_slot_retired",
-    )
-    assert receipt["substate"] == "old_slot_retired"
-    assert receipt["checkpoint_sequence"] > telegram_checkpoint
-    state.update_tendwire_turn_job(store, job_key, substate="acknowledged")
-    with pytest.raises(ValueError, match="invalid tendwire job transition"):
-        state.update_tendwire_turn_job(store, job_key, substate="reserved")
-
-    failed_key = _turn_job_key(_PLAN_B, 1)
-    failed = _reserve_job(
-        store,
-        plan_token=_PLAN_B,
-        content_revision=_REV_B,
-        sequence_index=1,
-        part_ordinal=0,
-        part_count=1,
-    )
-    state.update_tendwire_turn_job(store, failed_key, substate="failed")
-    assert failed["substate"] == "failed"
-    with pytest.raises(ValueError, match="invalid tendwire job transition"):
-        state.update_tendwire_turn_job(
-            store,
-            failed_key,
-            substate="telegram_applied",
-            telegram_message_id="999",
-        )
-    with pytest.raises(ValueError, match="conflicting tendwire job reservation"):
-        state.reserve_tendwire_turn_job(
-            store,
-            failed_key,
-            plan_token=_PLAN_B,
-            content_revision=_REV_B,
-            operation="retire",
-            sequence_index=1,
-            part_ordinal=1,
-            part_count=1,
-        )
 
 
-def test_sync_pass_checkpoint_persists_successful_prefix_before_ack(
-    tmp_path, monkeypatch
-):
-    _reset_lock_state()
-    statepath = tmp_path / "state.json"
-    monkeypatch.setenv("HERDR_TELEGRAM_TOPICS_STATE", str(statepath))
-    store = _store()
-    first_key = _turn_job_key(_PLAN_A, 0)
-    second_key = _turn_job_key(_PLAN_A, 1)
-    _reserve_job(store, sequence_index=0, part_ordinal=0)
-    _reserve_job(store, sequence_index=1, part_ordinal=1)
-    state.save_state(store, statepath)
-    events = []
-
-    def runtime_factory(**kwargs):
-        return SimpleNamespace(checkpoint=kwargs["checkpoint"])
-
-    def interrupted_sync(current, runtime):
-        state.update_tendwire_turn_job(
-            current,
-            first_key,
-            substate="telegram_applied",
-            telegram_message_id="801",
-            bot_kind="codex",
-        )
-        runtime.checkpoint()
-        events.append("checkpoint")
-        on_disk = state.load_state(statepath)
-        assert on_disk["tendwire_turn_jobs"][first_key]["substate"] == "telegram_applied"
-        assert on_disk["tendwire_turn_jobs"][second_key]["substate"] == "reserved"
-        events.append("ack_attempt")
-        raise RuntimeError("simulated Tendwire ACK outage")
-
-    monkeypatch.setattr(herdres, "_runtime", runtime_factory)
-    monkeypatch.setattr(herdres, "sync_once", interrupted_sync)
-    with pytest.raises(RuntimeError, match="ACK outage"):
-        herdres._sync_pass()
-
-    assert events == ["checkpoint", "ack_attempt"]
-    restarted = state.load_state(statepath)
-    assert restarted["tendwire_turn_jobs"][first_key]["substate"] == "telegram_applied"
-    assert restarted["tendwire_turn_jobs"][first_key]["telegram_message_id"] == "801"
-    assert restarted["tendwire_turn_jobs"][second_key]["substate"] == "reserved"
 
 
 def test_runtime_exposes_optional_checkpoint_without_breaking_old_construction(
@@ -1479,11 +1200,6 @@ def test_continuation_bindings_share_worker_topic_and_delivery_identity(monkeypa
     assert {binding["content_revision"] for binding in bindings} == {_REV_A}
     assert {binding["plan_token"] for binding in bindings} == {_PLAN_A}
     assert [binding["part_ordinal"] for binding in bindings] == [0, 1]
-    for message_id in ("901", "902"):
-        assert herdres._worker_entry_from_reply(
-            store,
-            {"reply_to_message_id": message_id, "topic_id": "77"},
-        ) == (worker_key, worker)
 
 
 def test_old_binding_callers_keep_exact_legacy_shape():
@@ -1522,117 +1238,3 @@ def test_old_binding_callers_keep_exact_legacy_shape():
         "stable_key": worker["tendwire_stable_key"],
         "stable_key_version": 1,
     }
-
-
-def test_job_cleanup_removes_only_unreferenced_terminal_receipts():
-    store = _store()
-    _key, worker, _created = state.upsert_worker_entry(
-        store,
-        _source_worker(
-            {
-                "id": "worker-1",
-                "name": "Alpha",
-                "status": "idle",
-                "space_id": "space-1",
-                "fingerprint": "fp-1",
-            }
-        ),
-        topic_id="77",
-    )
-    old = _checkpointed_success(
-        store,
-        plan_token=_PLAN_A,
-        content_revision=_REV_A,
-        sequence_index=0,
-    )
-    bound = _checkpointed_success(
-        store,
-        plan_token=_PLAN_B,
-        content_revision=_REV_B,
-        sequence_index=1,
-    )
-    entry_referenced = _checkpointed_success(
-        store,
-        plan_token=_PLAN_C,
-        content_revision=_REV_C,
-        sequence_index=2,
-    )
-    pending = _reserve_job(
-        store,
-        plan_token=_PLAN_D,
-        content_revision=_REV_D,
-        sequence_index=3,
-        part_ordinal=0,
-        part_count=1,
-    )
-    bound_key = _turn_job_key(_PLAN_B, 1)
-    state.bind_message_to_worker(
-        store,
-        bound["telegram_message_id"],
-        worker,
-        topic_id="77",
-        kind="final",
-        turn_id="turn-bound",
-        bot_kind="codex",
-        content_revision=_REV_B,
-        plan_token=_PLAN_B,
-        part_ordinal=0,
-        part_count=1,
-        tendwire_job_key=bound_key,
-    )
-    worker["last_clean_plan_token"] = _PLAN_C
-    worker["last_clean_content_revision"] = _REV_C
-
-    removed = state.cleanup_tendwire_turn_jobs(store, max_records=1)
-    jobs = state.tendwire_turn_jobs(store)
-    assert removed == 1
-    assert _turn_job_key(_PLAN_A, 0) not in jobs
-    assert jobs[bound_key] is bound
-    assert jobs[_turn_job_key(_PLAN_C, 2)] is entry_referenced
-    assert jobs[_turn_job_key(_PLAN_D, 3)] is pending
-    assert pending["substate"] == "reserved"
-    assert not any(
-        forbidden in receipt
-        for receipt in jobs.values()
-        for forbidden in ("text", "html", "payload", "lease_ref", "ref")
-    )
-
-
-def test_receipt_capacity_covers_maximum_old_and_replacement_plans():
-    store = _store()
-    old_plan = "twplan1.capacity_old"
-    old_revision = "twrev1.capacity_old"
-    new_plan = "twplan1.capacity_new"
-    new_revision = "twrev1.capacity_new"
-    maximum_parts = 10_000
-
-    for ordinal in range(maximum_parts):
-        _reserve_job(
-            store,
-            plan_token=old_plan,
-            content_revision=old_revision,
-            sequence_index=ordinal,
-            part_ordinal=ordinal,
-            part_count=maximum_parts,
-        )
-    _reserve_job(
-        store,
-        plan_token=new_plan,
-        content_revision=new_revision,
-        sequence_index=0,
-        part_ordinal=0,
-        part_count=1,
-    )
-    for sequence in range(1, maximum_parts):
-        _reserve_job(
-            store,
-            plan_token=new_plan,
-            content_revision=new_revision,
-            sequence_index=sequence,
-            part_ordinal=maximum_parts - sequence,
-            part_count=1,
-            operation="retire",
-        )
-
-    assert len(state.tendwire_turn_jobs(store)) == maximum_parts * 2
-    assert state.TENDWIRE_TURN_JOB_LIMIT >= maximum_parts * 2 + 1

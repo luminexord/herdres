@@ -19,7 +19,16 @@ from .tendwire_client import TendwireClient
 
 
 class TelegramError(RuntimeError):
-    pass
+    """Telegram failure with optional post-submit acceptance uncertainty."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        ambiguous_acceptance: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.ambiguous_acceptance = bool(ambiguous_acceptance)
 
 
 class RateLimited(TelegramError):
@@ -150,13 +159,22 @@ class TelegramClient:
                     sanitize_text(data.get("description") or detail, 300),
                     method=method,
                 ) from exc
-            raise TelegramError(sanitize_text(data.get("description") or detail or str(exc), 300)) from exc
+            raise TelegramError(
+                sanitize_text(data.get("description") or detail or str(exc), 300),
+                ambiguous_acceptance=exc.code >= 500,
+            ) from exc
         except Exception as exc:  # noqa: BLE001
-            raise TelegramError(sanitize_text(str(exc), 300)) from exc
+            raise TelegramError(
+                sanitize_text(str(exc), 300),
+                ambiguous_acceptance=True,
+            ) from exc
         try:
             data = json.loads(body)
         except json.JSONDecodeError as exc:
-            raise TelegramError("Telegram returned non-json response") from exc
+            raise TelegramError(
+                "Telegram returned non-json response",
+                ambiguous_acceptance=True,
+            ) from exc
         if not data.get("ok"):
             params = (
                 data.get("parameters")
@@ -173,7 +191,17 @@ class TelegramClient:
                     ),
                     method=method,
                 )
-            raise TelegramError(sanitize_text(data.get("description") or "Telegram API error", 300))
+            raw_error_code = data.get("error_code")
+            error_code = (
+                raw_error_code
+                if isinstance(raw_error_code, int)
+                and not isinstance(raw_error_code, bool)
+                else 0
+            )
+            raise TelegramError(
+                sanitize_text(data.get("description") or "Telegram API error", 300),
+                ambiguous_acceptance=error_code >= 500,
+            )
         return data
 
     def _html_variants(self, html_text: str) -> list[tuple[str, str]]:
@@ -549,7 +577,12 @@ class TelegramClient:
             error = sanitize_text(str(exc), 300)
             if "message is not modified" in error.lower():
                 return {"ok": True, "message_id": str(message_id), "kind": "unchanged"}
-            return {"ok": False, "message_id": str(message_id), "error": error}
+            return {
+                "ok": False,
+                "message_id": str(message_id),
+                "error": error,
+                "ambiguous_acceptance": bool(exc.ambiguous_acceptance),
+            }
 
     def answer_callback_query(
         self,
@@ -594,7 +627,13 @@ class TelegramClient:
         except RateLimited as exc:
             return _rate_limited_result(exc, method="createForumTopic")
         except TelegramError as exc:
-            return {"ok": False, "error": sanitize_text(str(exc), 300)}
+            return {
+                "ok": False,
+                "error": sanitize_text(str(exc), 300),
+                "ambiguous_acceptance": bool(
+                    getattr(exc, "ambiguous_acceptance", False)
+                ),
+            }
 
     def rename_topic(self, chat_id: str, thread_id: str, name: str) -> dict[str, Any]:
         try:
@@ -899,6 +938,19 @@ def drain_outbox(
                     continue
             result["acked"] += 1
             result["changed"] = True
+            continue
+        event_type = str(payload.get("event_type") or "")
+        if event_type not in {"attention_created", "attention_escalated"}:
+            # The generic connector queue is not permission to render a new
+            # payload family. In particular, never turn a future ACP
+            # tool/plan/control event into a misleading generic notification.
+            # ``connector.fail`` deliberately consumes the queue's bounded
+            # attempt budget and eventually dead-letters a poison/future item;
+            # ACK would falsely record an unsupported item as delivered.
+            result["failed"] += 1
+            result["changed"] = True
+            if ref and not dry_run:
+                tendwire.connector_fail(ref, "unsupported connector event type")
             continue
         html = render_attention_notice(payload)
         thread_id = config.general_thread_id(store)

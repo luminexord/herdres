@@ -3,9 +3,8 @@
 Herdres can answer a bounded set of Claude prompts from an inline Telegram
 keyboard when `HERDRES_REMOTE_DECISIONS=1`.
 
-The flow is deliberately end to end: the Claude hook records a pending
-`AskUserQuestion` or `ExitPlanMode`; `herdr_turn_adapter.py` emits a
-`pending_decision`; Tendwire publishes the neutral form as
+The flow is deliberately end to end: ACP carries a pending `AskUserQuestion`
+or `ExitPlanMode` decision; Tendwire publishes the neutral form as
 `meta.decision`; Herdres joins it to one unambiguous worker topic and renders
 the inline keyboard; and a tap submits Tendwire's schema-v1
 `answer_decision` command. Tendwire owns the backend interaction and returns a
@@ -34,9 +33,9 @@ stale option references are not forwarded.
 
 Herdres accepts only the exact schema-v2 `answer_decision` response envelope,
 including the correlated request ID and decision reference. A missing field,
-extra field, wrong result shape, mismatched CLI exit code, or other malformed
-response becomes `request_state_uncertain` rather than being treated as an
-answer.
+extra field, wrong result shape, socket framing/correlation fault, or other
+malformed response becomes `request_state_uncertain` rather than being treated
+as an answer.
 
 When Tendwire reports `answer_in_progress`, another request currently owns the
 answer claim. Herdres keeps both the decision record and keyboard, performs no

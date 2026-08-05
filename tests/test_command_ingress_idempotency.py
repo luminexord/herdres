@@ -296,6 +296,16 @@ def test_key_loader_rejects_symlink(tmp_path: Path) -> None:
         load_request_id_key(linked_key)
 
 
+def test_key_loader_rejects_hard_link(tmp_path: Path) -> None:
+    key_path = tmp_path / "request-id.key"
+    linked_key = tmp_path / "linked.key"
+    _write_key(key_path)
+    os.link(key_path, linked_key)
+
+    with pytest.raises(RuntimeError, match="missing or unsafe"):
+        load_request_id_key(key_path)
+
+
 def test_key_loader_detects_atomic_path_replacement_without_a_sleep(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -355,33 +365,65 @@ def test_installer_and_runtime_use_same_default_and_preserve_private_key(
     _assert_key_not_disclosed(second, original)
 
 
-def test_installer_comments_legacy_lane_rollback_with_consent_marker(
+def test_installer_migrates_only_legacy_adapter_tendwired_unit(
     tmp_path: Path,
 ) -> None:
     repository = Path(__file__).resolve().parents[1]
     home = tmp_path / "home"
-    env_path = home / ".config/herdres/herdres.env"
-    env_path.parent.mkdir(parents=True)
-    env_path.write_text(
-        "TELEGRAM_BOT_TOKEN=private\nHERDRES_INBOUND_LANES=0\n",
-        encoding="utf-8",
-    )
-    env_path.chmod(0o600)
+    unit = home / ".config/systemd/user/tendwired.service"
+    unit.parent.mkdir(parents=True)
+    original = """[Service]
+# Preserve this comment and its spacing byte-for-byte.
+Environment=KEEP_ME=1\t
+Environment=TENDWIRE_HERDR_BACKEND=socket
+Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr_turn_adapter.py
+Environment=HERDR_REAL_BIN=/home/smith/.local/bin/herdr
+ExecStart=/usr/bin/python3 -m tendwire.cli daemon
+"""
+    expected = """[Service]
+# Preserve this comment and its spacing byte-for-byte.
+Environment=KEEP_ME=1\t
+Environment=TENDWIRE_HERDR_BIN=%h/.local/bin/herdr
+ExecStart=/usr/bin/python3 -m tendwire.cli daemon
+"""
+    unit.write_text(original, encoding="utf-8")
+    unit.chmod(0o640)
     environment = _installer_environment(home, None)
 
     first = _run_installer(repository, environment)
     _assert_success(first)
-    migrated = env_path.read_text(encoding="utf-8")
-    assert (
-        "approved by running install-user.sh" in migrated
-    )
-    assert "\n# HERDRES_INBOUND_LANES=0\n" in migrated
-    assert "\nHERDRES_INBOUND_LANES=0\n" not in migrated
-    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+    migrated = unit.read_text(encoding="utf-8")
+    assert (unit.parent / "tendwired.service.bak-herdres-acp").read_text(
+        encoding="utf-8"
+    ) == original
+    assert migrated == expected
+    assert stat.S_IMODE(unit.stat().st_mode) == 0o640
 
     second = _run_installer(repository, environment)
     _assert_success(second)
-    assert env_path.read_text(encoding="utf-8") == migrated
+    assert unit.read_text(encoding="utf-8") == migrated
+
+
+def test_installer_retains_adapter_for_unrecognized_custom_unit(
+    tmp_path: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    unit = home / ".config/systemd/user/tendwired.service"
+    adapter = home / ".local/bin/herdr_turn_adapter.py"
+    unit.parent.mkdir(parents=True)
+    adapter.parent.mkdir(parents=True)
+    unit.write_text(
+        'Environment="TENDWIRE_HERDR_BIN=%h/.local/bin/herdr_turn_adapter.py"\n',
+        encoding="utf-8",
+    )
+    adapter.write_text("legacy adapter", encoding="utf-8")
+
+    result = _run_installer(repository, _installer_environment(home, None))
+
+    assert result.returncode != 0
+    assert adapter.read_text(encoding="utf-8") == "legacy adapter"
+    assert b"migrate custom tendwired.service first" in result.stderr
 
 
 @pytest.mark.parametrize("use_home_expansion", [False, True])

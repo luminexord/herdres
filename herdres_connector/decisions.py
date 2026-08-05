@@ -8,6 +8,13 @@ requiring the owner to finish the prompt at the desk.
 
 from __future__ import annotations
 
+# H8-SLOC-BEGIN decisions-imports
+import base64
+import fcntl
+import json
+import time
+from contextlib import contextmanager
+# H8-SLOC-END decisions-imports
 import hashlib
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping
@@ -29,6 +36,17 @@ ANSWER_IN_PROGRESS_REPLY = (
     "That prompt is being answered right now — try again in a moment."
 )
 ACCEPTED_ARTIFACT_LIMIT = 64
+# H8-SLOC-BEGIN decisions-constants
+INGRESS_MARKUP_LIMIT_BYTES = 32 * 1024
+PROVIDER_GUARD_TIMEOUT_SECONDS = 30.0
+_GUARDED_TELEGRAM_CAPABILITIES = frozenset(
+    {
+        "telegram.edit_message",
+        "telegram.edit_message_reply_markup",
+        "telegram.delete_message",
+    }
+)
+# H8-SLOC-END decisions-constants
 
 
 @dataclass(frozen=True)
@@ -41,6 +59,9 @@ class ProviderOperation:
     worker_id: str
     topic_id: str
     decision_id: str
+    # H8-SLOC-BEGIN decisions-operation-field
+    decision_state_fingerprint: str
+    # H8-SLOC-END decisions-operation-field
     message_id: str = ""
     scope: str = "entry"
     artifact_kind: str = ""
@@ -58,6 +79,74 @@ class ProviderExecution:
 
 
 ProviderExecutor = Callable[[ProviderOperation], ProviderExecution]
+
+
+# H8-SLOC-BEGIN decisions-presenter-guard
+@contextmanager
+def _legacy_provider_mutation_guard(
+    owner: state.PhysicalOwner, deadline: float,
+):
+    held_fd = state._held_lock_fd()
+    if held_fd is None or not state.lock_actually_held():
+        with state.provider_mutation_guard(config.state_path(), owner, deadline) as guard:
+            yield guard
+        return
+    fcntl.flock(held_fd, fcntl.LOCK_UN)
+    state._record_lock_released(held_fd)
+    state._LOCK_STATE.release_depth = 1
+    restored = False
+    try:
+        with state.provider_mutation_guard(config.state_path(), owner, deadline) as guard:
+            fcntl.flock(held_fd, fcntl.LOCK_EX)
+            state._record_lock_acquired(held_fd)
+            state._LOCK_STATE.release_depth = 0
+            try:
+                yield guard
+            finally:
+                fcntl.flock(held_fd, fcntl.LOCK_UN)
+                state._record_lock_released(held_fd)
+                state._LOCK_STATE.release_depth = 1
+        fcntl.flock(held_fd, fcntl.LOCK_EX)
+        state._record_lock_acquired(held_fd)
+        state._LOCK_STATE.release_depth = 0
+        restored = True
+    finally:
+        if not restored:
+            fcntl.flock(held_fd, fcntl.LOCK_EX)
+            state._record_lock_acquired(held_fd)
+            state._LOCK_STATE.release_depth = 0
+
+
+def _decision_state_fingerprint(record: Mapping[str, Any]) -> str:
+    values = {
+        "decision_id": str(record.get("decision_id") or record.get("decision_ref") or ""),
+        "revision_digest": str(record.get("revision_digest") or record.get("content_hash") or ""),
+        "message_binding_id": str(record.get("message_binding_id") or record.get("message_id") or ""),
+        "message_id": str(record.get("message_id") or ""),
+        "selected": [str(value) for value in record.get("selected", []) if isinstance(value, str)],
+        "await_freeform": record.get("await_freeform") is True,
+        "desired_markup_fingerprint": str(record.get("desired_markup_fingerprint") or ""),
+        "applied_markup_fingerprint": str(record.get("applied_markup_fingerprint") or ""),
+    }
+    return short_hash(values, 32)
+
+
+def _guarded_decision_target_is_current(
+    store: dict[str, Any], operation: ProviderOperation
+) -> bool:
+    current = active_decision(store, operation.topic_id)
+    if current is not None:
+        identity = str(current.get("decision_id") or current.get("decision_ref") or "")
+        if identity == operation.decision_id and str(current.get("message_id") or "") == operation.message_id:
+            return _decision_state_fingerprint(current) == operation.decision_state_fingerprint
+    for raw in _accepted_artifacts(store, create=False).values():
+        if isinstance(raw, dict) and (
+            str(raw.get("decision_id") or ""), str(raw.get("topic_id") or ""),
+            str(raw.get("message_id") or ""),
+        ) == (operation.decision_id, operation.topic_id, operation.message_id):
+            return True
+    return False
+# H8-SLOC-END decisions-presenter-guard
 
 
 def _operation(
@@ -83,6 +172,9 @@ def _operation(
         worker_id=str(record.get("worker_id") or ""),
         topic_id=str(topic_id or ""),
         decision_id=str(record.get("decision_id") or ""),
+        # H8-SLOC-BEGIN decisions-operation-capture
+        decision_state_fingerprint=_decision_state_fingerprint(record),
+        # H8-SLOC-END decisions-operation-capture
         message_id=str(message_id or ""),
         scope=str(scope or "entry"),
         artifact_kind=str(artifact_kind or ""),
@@ -139,12 +231,48 @@ def _execute(
     telegram: TelegramClient | None = None,
     tendwire: TendwireClient | None = None,
     provider_executor: ProviderExecutor | None = None,
+    # H8-SLOC-BEGIN decisions-execute-signature
+    state_store: dict[str, Any] | None = None,
+    # H8-SLOC-END decisions-execute-signature
 ) -> ProviderExecution:
-    if provider_executor is not None:
-        return provider_executor(operation)
-    return _execute_direct(
-        operation, telegram=telegram, tendwire=tendwire
+    # H8-SLOC-BEGIN decisions-execute-guard
+    def invoke() -> ProviderExecution:
+        if provider_executor is not None:
+            return provider_executor(operation)
+        return _execute_direct(
+            operation, telegram=telegram, tendwire=tendwire
+        )
+
+    if operation.capability not in _GUARDED_TELEGRAM_CAPABILITIES:
+        return invoke()
+    if not operation.args:
+        raise ValueError("guarded Telegram mutation lacks chat identity")
+    owner = state.PhysicalOwner(
+        bot_identity="manager",
+        chat_id=str(operation.args[0]),
+        topic_id=operation.topic_id,
     )
+    deadline = time.monotonic() + PROVIDER_GUARD_TIMEOUT_SECONDS
+    if state_store is not None and state.lock_actually_held():
+        # The retained presenter owns a mutable schema-2 projection.  Its
+        # accepted-artifact and active-control changes must be durable before
+        # releasing the state flock to wait for the physical-owner guard.
+        state.save_state(state_store)
+    with _legacy_provider_mutation_guard(owner, deadline):
+        if state_store is not None and state.lock_actually_held():
+            state.reload_state_in_place(state_store)
+            if not _guarded_decision_target_is_current(state_store, operation):
+                return ProviderExecution(
+                    {"ok": False, "status": "owner_changed"}, "abandon"
+                )
+        if provider_executor is None and state.lock_actually_held():
+            with state.released_lock():
+                execution = invoke()
+            if state_store is not None:
+                state.reload_state_in_place(state_store)
+            return execution
+        return invoke()
+    # H8-SLOC-END decisions-execute-guard
 
 
 def _ref56(decision_id: str) -> str:
@@ -459,7 +587,143 @@ def inline_keyboard(record: dict[str, Any]) -> dict[str, list[list[dict[str, str
     return {"inline_keyboard": rows}
 
 
+# H8-SLOC-BEGIN decisions-renderer
+def render_ingress_markup(
+    snapshot: state.DecisionIngressResult,
+    desired_selected_refs: tuple[str, ...],
+) -> tuple[dict[str, Any], str]:
+    """Render the exact bounded markup used by a typed local decision action."""
+
+    if not isinstance(snapshot, state.DecisionIngressResult):
+        raise TypeError("decision ingress markup requires a typed snapshot")
+    if not isinstance(desired_selected_refs, tuple):
+        raise TypeError("desired selected refs must be a tuple")
+    if snapshot.status is not state.DecisionStatus.ACTIVE or snapshot.mode not in SUPPORTED_KINDS:
+        raise ValueError("decision ingress markup requires an active supported decision")
+    if any(not isinstance(option, state.DecisionOption) for option in snapshot.options):
+        raise ValueError("invalid decision ingress option")
+    record = {
+        "decision_id": snapshot.decision_ref,
+        "kind": snapshot.mode,
+        "options": [
+            {"ref": option.option_ref, "label": option.label}
+            for option in snapshot.options
+        ],
+        "selected": list(desired_selected_refs),
+    }
+    projected = _project_ingress_record(record)
+    if projected is None or projected["refs"] != snapshot.option_refs:
+        raise ValueError("invalid decision ingress options or selections")
+    markup = inline_keyboard(record)
+    encoded = json.dumps(
+        markup,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(encoded) > INGRESS_MARKUP_LIMIT_BYTES:
+        raise ValueError("decision ingress markup is too large")
+    return markup, short_hash(markup, 32)
+# H8-SLOC-END decisions-renderer
+
+
+# H8-SLOC-BEGIN decisions-state-adapter
+def _project_ingress_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    decision_ref = str(record.get("decision_id") or record.get("decision_ref") or "")
+    raw_options = record.get("options")
+    raw_selected = record.get("selected")
+    if not decision_ref or not isinstance(raw_options, list) or len(raw_options) > 64:
+        return None
+    options: list[tuple[str, str]] = []
+    for raw in raw_options:
+        if not isinstance(raw, dict):
+            return None
+        ref, label = raw.get("ref"), raw.get("label")
+        if (not isinstance(ref, str) or not ref or len(ref.encode("utf-8")) > 512
+                or ref in {item[0] for item in options} or not isinstance(label, str)
+                or compact_ws(label, 80) != label or _callback_data(decision_ref, ref) is None):
+            return None
+        options.append((ref, label))
+    refs = tuple(ref for ref, _label in options)
+    if not isinstance(raw_selected, list) or len(raw_selected) > 64 or any(not isinstance(ref, str) for ref in raw_selected):
+        return None
+    selected = tuple(raw_selected)
+    if len(set(selected)) != len(selected) or selected != tuple(ref for ref in refs if ref in set(selected)):
+        return None
+    message_id = str(record.get("message_id") or "")
+    return {
+        "decision_ref": decision_ref,
+        "revision": str(record.get("revision_digest") or record.get("content_hash") or ""),
+        "mode": str(record.get("kind") or record.get("mode") or ""),
+        "worker_id": str(record.get("worker_id") or ""),
+        "message_id": message_id,
+        "binding_id": str(record.get("message_binding_id") or message_id),
+        "options": tuple(options), "refs": refs, "selected": selected,
+        "await_freeform": record.get("await_freeform") is True,
+        "render_fingerprint": str(record.get("render_fingerprint") or record.get("content_hash") or ""),
+        "desired_markup_fingerprint": str(record.get("desired_markup_fingerprint") or ""),
+        "bot_identity": str(record.get("provider_bot_identity") or record.get("bot_identity") or record.get("bot_kind") or "manager"),
+    }
+
+
+def _ingress_mutation_digest(mutation: state.DecisionMutation) -> str:
+    body = {"request_id": mutation.request_id, "kind": mutation.kind.value,
+            "decision_ref": mutation.decision_ref, "revision_digest": mutation.revision_digest,
+            "option_ref": mutation.option_ref, "desired_selected_refs": list(mutation.desired_selected_refs),
+            "desired_markup_fingerprint": mutation.desired_markup_fingerprint}
+    encoded = json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    digest = hashlib.sha256(b"herdres-decision-mutation-v1\0" + encoded).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _reduce_ingress_mutation(
+    record: dict[str, Any], mutation: state.DecisionMutation,
+) -> state.DecisionMutationStatus:
+    projected = _project_ingress_record(record)
+    if projected is None or projected["revision"] != mutation.revision_digest:
+        return state.DecisionMutationStatus.CONFLICT
+    digest = _ingress_mutation_digest(mutation)
+    applied = record.setdefault("applied_ingress_identities", [])
+    if not isinstance(applied, list):
+        raise RuntimeError("decision ingress identity store is corrupt")
+    for raw in applied:
+        if not isinstance(raw, dict):
+            raise RuntimeError("decision ingress identity store is corrupt")
+        if raw.get("request_id") == mutation.request_id and raw.get("kind") == mutation.kind.value:
+            return (state.DecisionMutationStatus.ALREADY_APPLIED
+                    if raw.get("mutation_digest") == digest else state.DecisionMutationStatus.CONFLICT)
+    if len(applied) >= 256:
+        return state.DecisionMutationStatus.CONFLICT
+    refs, current, desired = projected["refs"], projected["selected"], mutation.desired_selected_refs
+    if len(set(desired)) != len(desired) or desired != tuple(ref for ref in refs if ref in set(desired)):
+        return state.DecisionMutationStatus.CONFLICT
+    mode, option, markup = projected["mode"], mutation.option_ref, mutation.desired_markup_fingerprint
+    if mutation.kind is state.DecisionMutationKind.ARM_FREEFORM:
+        valid = mode == "single" and option is None and desired == current and not markup
+        if valid:
+            record["await_freeform"] = True
+    elif mutation.kind is state.DecisionMutationKind.TOGGLE_OPTION:
+        toggled = set(current)
+        toggled.discard(option) if option in toggled else toggled.add(option)
+        valid = mode == "multi" and option in refs and bool(markup) and desired == tuple(ref for ref in refs if ref in toggled)
+        if valid:
+            record["selected"], record["desired_markup_fingerprint"] = list(desired), markup
+    else:
+        valid = option in refs and bool(markup) and desired == current and markup == str(record.get("desired_markup_fingerprint") or "")
+        if valid:
+            record["applied_markup_fingerprint"] = markup
+    if not valid:
+        return state.DecisionMutationStatus.CONFLICT
+    applied.append({"request_id": mutation.request_id, "kind": mutation.kind.value, "mutation_digest": digest})
+    return state.DecisionMutationStatus.APPLIED
+# H8-SLOC-END decisions-state-adapter
+
+
 def _retract(
+    # H8-SLOC-BEGIN decisions-retract-store
+    store: dict[str, Any],
+    # H8-SLOC-END decisions-retract-store
     telegram: TelegramClient,
     chat_id: str,
     topic_id: str,
@@ -485,6 +749,9 @@ def _retract(
         ),
         telegram=telegram,
         provider_executor=provider_executor,
+        # H8-SLOC-BEGIN decisions-retract-markup-guard
+        state_store=store,
+        # H8-SLOC-END decisions-retract-markup-guard
     )
     if markup.result.get("ok") is not True:
         return False
@@ -504,6 +771,9 @@ def _retract(
         ),
         telegram=telegram,
         provider_executor=provider_executor,
+        # H8-SLOC-BEGIN decisions-retract-edit-guard
+        state_store=store,
+        # H8-SLOC-END decisions-retract-edit-guard
     )
     return bool(edited.result.get("ok") is True)
 
@@ -551,6 +821,9 @@ def _drain_accepted_artifacts(
                 ),
                 telegram=telegram,
                 provider_executor=provider_executor,
+                # H8-SLOC-BEGIN decisions-artifact-delete-guard
+                state_store=store,
+                # H8-SLOC-END decisions-artifact-delete-guard
             )
             if (
                 execution.result.get("ok") is not True
@@ -567,6 +840,9 @@ def _drain_accepted_artifacts(
         if kind == "decision_submission":
             active = active_decision(store, topic_id)
             if active is not None and not _retract(
+                # H8-SLOC-BEGIN decisions-artifact-retract-store
+                store,
+                # H8-SLOC-END decisions-artifact-retract-store
                 telegram,
                 chat_id,
                 topic_id,
@@ -672,6 +948,9 @@ def sync_decisions(
             else "✅ Answered."
         )
         if not _retract(
+            # H8-SLOC-BEGIN decisions-sync-retract-store
+            store,
+            # H8-SLOC-END decisions-sync-retract-store
             telegram,
             chat_id,
             topic_id,
@@ -688,6 +967,9 @@ def sync_decisions(
     for topic_id, candidate in desired.items():
         record = {
             "decision_id": candidate["decision_id"],
+            # H8-SLOC-BEGIN decisions-record-fields
+            "revision_digest": candidate["content_hash"],
+            # H8-SLOC-END decisions-record-fields
             "worker_id": candidate["worker_id"],
             "entry_key": candidate["entry_key"],
             "kind": candidate["kind"],
@@ -697,7 +979,16 @@ def sync_decisions(
             "selected": [],
             "await_freeform": False,
             "content_hash": candidate["content_hash"],
+            # H8-SLOC-BEGIN decisions-record-mutation-fields
+            "render_fingerprint": candidate["content_hash"],
+            "desired_markup_fingerprint": "",
+            "applied_markup_fingerprint": "",
+            "applied_ingress_identities": [],
+            # H8-SLOC-END decisions-record-mutation-fields
         }
+        # H8-SLOC-BEGIN decisions-record-markup-fingerprint
+        record["desired_markup_fingerprint"] = short_hash(inline_keyboard(record), 32)
+        # H8-SLOC-END decisions-record-markup-fingerprint
         execution = _execute(
             _operation(
                 "telegram.send_message",
@@ -724,6 +1015,12 @@ def sync_decisions(
         record["message_id"] = str(
             sent.get("reply_markup_message_id") or sent.get("message_id") or ""
         )
+        # H8-SLOC-BEGIN decisions-record-binding-fields
+        record["message_binding_id"] = record["message_id"]
+        record["applied_markup_fingerprint"] = record[
+            "desired_markup_fingerprint"
+        ]
+        # H8-SLOC-END decisions-record-binding-fields
         if execution.provenance:
             record["provider_provenance"] = dict(execution.provenance)
         active = _active_records(store, create=True)
@@ -878,6 +1175,9 @@ def _submit(
     active = _active_records(store, create=True)
     if result.get("ok") is True and result.get("status") == "accepted":
         if not _retract(
+            # H8-SLOC-BEGIN decisions-submit-accepted-store
+            store,
+            # H8-SLOC-END decisions-submit-accepted-store
             telegram,
             chat_id,
             topic_id,
@@ -924,6 +1224,9 @@ def _submit(
     if status == "decision_not_pending":
         note = "⚠️ That prompt is no longer pending (answered at the desk?)"
         if not _retract(
+            # H8-SLOC-BEGIN decisions-submit-expired-store
+            store,
+            # H8-SLOC-END decisions-submit-expired-store
             telegram,
             chat_id,
             topic_id,
@@ -1036,6 +1339,9 @@ def handle_callback(
             toast = "Choice selected."
         preview = dict(record)
         preview["selected"] = selected
+        # H8-SLOC-BEGIN decisions-callback-markup-fingerprint
+        desired_markup_fingerprint = short_hash(inline_keyboard(preview), 32)
+        # H8-SLOC-END decisions-callback-markup-fingerprint
         toggle_operation = _operation(
             "telegram.edit_message_reply_markup",
             reason=(
@@ -1055,6 +1361,9 @@ def handle_callback(
             toggle_operation,
             telegram=telegram,
             provider_executor=provider_executor,
+            # H8-SLOC-BEGIN decisions-callback-provider-guard
+            state_store=store,
+            # H8-SLOC-END decisions-callback-provider-guard
         )
         edited = execution.result
         if execution.disposition != "apply":
@@ -1115,6 +1424,10 @@ def handle_callback(
                 "status": "expired",
             }
         current["selected"] = selected
+        # H8-SLOC-BEGIN decisions-callback-checkpoint
+        current["desired_markup_fingerprint"] = desired_markup_fingerprint
+        current["applied_markup_fingerprint"] = desired_markup_fingerprint
+        # H8-SLOC-END decisions-callback-checkpoint
         return {
             "handled": True,
             "changed": True,

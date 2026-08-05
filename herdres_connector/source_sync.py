@@ -11,8 +11,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from . import accounts, config, decisions, ingress_requests, speech, state
-from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token, managed_bot_token_for_entry
+from . import accounts, config, decisions, speech, state
+from .managed_bots import MANAGER_BOT_KIND, managed_bot_kind_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import (
     PresentationContentError,
@@ -23,18 +23,24 @@ from .rich_delivery import (
     TURN_DELIVERY_MAX_PARTS,
     edit_feed_item,
     edit_turn_delivery_part,
-    feed_item_requires_send_split,
     prepare_turn_delivery_parts,
-    render_feed_item_html,
     send_feed_item,
     send_turn_delivery_part,
-    split_legacy_message_ids,
     turn_item_from_source,
 )
-from .safe import compact_ws, html_escape, short_hash
+from .safe import (
+    PRIVATE_AGENT_CONTAINER_FIELD_NAMES,
+    PRIVATE_AGENT_FIELD_NAMES,
+    PRIVATE_STRUCTURE_MAX_DEPTH,
+    PRIVATE_STRUCTURE_MAX_ITEMS,
+    compact_ws,
+    html_escape,
+    mapping_has_private_agent_discriminator,
+    normalized_public_key,
+    short_hash,
+)
 from .telegram_delivery import (
     DELIVERY_FORMAT_STATE_UPDATE_KEY,
-    MESSAGE_TEXT_LIMIT,
     TOPIC_ICON_COLORS,
     RateLimited,
     TelegramClient,
@@ -48,7 +54,7 @@ from .telegram_delivery import (
 from .tendwire_client import TendwireClient, TendwireError
 
 RENDER_VERSION = "telegram-rich-v28-primary-dual-bound"
-PRESENTATION_VERSION = "turn-present-v29"
+PRESENTATION_VERSION = "turn-present-v31"
 TURN_SCHEMA_VERSION = 2
 TURN_CONTENT_SCHEMA_VERSION = 1
 _SUBMISSION_ID_KEY = "_herdres_submission_id"
@@ -64,13 +70,40 @@ _TOPIC_CLEANUP_MIN_RETRY_SECONDS = 60.0
 _TOPIC_CLEANUP_PERMANENT_ERROR_KINDS = frozenset(
     {"bad_request", "bot_access", "capability"}
 )
-_ACCEPTED_NOTIFICATION_LIMIT = 64
-_OVERSIZE_NOTICE_ATTEMPT_CAP = 3
 _DELIVERY_FORMAT_FALLBACK_LIMIT = 64
 _BINDING_STATE_BOUND = "bound"
 _BINDING_STATE_PENDING_CREATE = "pending_create"
 _BINDING_STATE_NO_IDENTITY = "no_stable_identity"
 _BINDING_STATE_ABSENT = "absent_from_snapshot"
+
+# These fields belong to ACP's private structured-event side. Herdres consumes
+# only Tendwire's neutral turn projection; tool/plan/permission/control details
+# require a separately versioned public contract before they can be presented.
+# Checking structural keys and exact ACP discriminator values keeps ordinary
+# assistant messages free to discuss tools or plans without being mistaken for
+# protocol payloads.
+_PRIVATE_AGENT_ROOT_FIELD_NAMES = frozenset(
+    {
+        "availablecommands",
+        "configoption",
+        "configoptions",
+        "control",
+        "controlevent",
+        "currentmode",
+        "extension",
+        "extensions",
+        "permission",
+        "permissionrequest",
+        "plan",
+        "reasoning",
+        "thought",
+        "thoughts",
+        "toolcall",
+        "toolcalls",
+        "toolcallupdate",
+        "toolcallupdates",
+    }
+)
 
 
 @dataclass
@@ -103,6 +136,52 @@ class _TurnContentError(RuntimeError):
         self.status = status
         self.conflict = conflict
         self.part_count = part_count
+
+
+def _contains_private_agent_turn_fields(value: Any) -> bool:
+    """Return whether a neutral turn illegally embeds private ACP structure.
+
+    Public ``meta`` is intentionally extensible, so generic words such as
+    ``plan`` or ``control`` are rejected only as illegal root turn fields.
+    Nested detection is limited to unmistakably private keys and exact ACP
+    envelope shapes. Bounds and cycle detection make malformed input fail
+    closed without risking recursion failure.
+    """
+
+    stack: list[tuple[Any, int, bool]] = [(value, 0, True)]
+    seen: set[int] = set()
+    items = 0
+    while stack:
+        current, depth, is_root = stack.pop()
+        items += 1
+        if items > PRIVATE_STRUCTURE_MAX_ITEMS or depth > PRIVATE_STRUCTURE_MAX_DEPTH:
+            return True
+        if isinstance(current, Mapping):
+            identity = id(current)
+            if identity in seen:
+                return True
+            seen.add(identity)
+            plain = dict(current)
+            if mapping_has_private_agent_discriminator(plain):
+                return True
+            for raw_key, item in current.items():
+                key = str(raw_key)
+                normalized = normalized_public_key(key)
+                if (
+                    key.lower() == "_meta"
+                    or normalized in PRIVATE_AGENT_CONTAINER_FIELD_NAMES
+                    or normalized in PRIVATE_AGENT_FIELD_NAMES
+                    or is_root and normalized in _PRIVATE_AGENT_ROOT_FIELD_NAMES
+                ):
+                    return True
+                stack.append((item, depth + 1, False))
+        elif isinstance(current, (list, tuple)):
+            identity = id(current)
+            if identity in seen:
+                return True
+            seen.add(identity)
+            stack.extend((item, depth + 1, False) for item in current)
+    return False
 
 
 @dataclass
@@ -217,7 +296,6 @@ _DIRECT_PROVIDER_CAPABILITIES = {
         "connector_prepare_begin",
         "connector_prepare_commit",
         "connector_prepare_part",
-        "connector_prepare_recover",
         "turn_final_ack",
         "turn_final_defer",
         "turn_final_fail",
@@ -732,6 +810,14 @@ def _operation_binding_entry(
         "tendwire_worker_id": operation.owner_generation[3],
         "tendwire_fingerprint": operation.owner_generation[4],
         "tendwire_space_id": operation.owner_generation[5],
+        # Include the local binding aliases as well.  Most callers pass this
+        # snapshot through state.bind_message_to_worker(), but post-ACK
+        # reconciliation applies it directly to an existing binding.  Keeping
+        # both views aligned prevents a reply from following a stale pane
+        # owner in a shared space topic.
+        "worker_id": operation.owner_generation[3],
+        "worker_fingerprint": operation.owner_generation[4],
+        "space_id": operation.owner_generation[5],
     }
     if operation.pane_uuid:
         entry["pane_uuid"] = operation.pane_uuid
@@ -739,6 +825,8 @@ def _operation_binding_entry(
     if operation.stable_key:
         entry["tendwire_stable_key"] = operation.stable_key
         entry["tendwire_stable_key_version"] = operation.stable_key_version
+        entry["stable_key"] = operation.stable_key
+        entry["stable_key_version"] = operation.stable_key_version
     return entry
 
 
@@ -1900,7 +1988,7 @@ def _resolve_stable_worker_generations(
             else:
                 # A replacement snapshot row without a turn is not evidence
                 # of ownership. Hide it from source upsert and preserve the
-                # incumbent route byte-for-byte.
+                # incumbent route unchanged.
                 excluded_worker_refs.update(id(worker) for worker in generations)
             continue
         if reason == "freshest_turn_activity":
@@ -2117,19 +2205,6 @@ def _telegram_state(store: dict[str, Any]) -> dict[str, Any]:
     return telegram
 
 
-def _accepted_notification_messages(
-    store: dict[str, Any], *, create: bool
-) -> dict[str, dict[str, Any]]:
-    telegram = _telegram_state(store)
-    records = telegram.get("accepted_notification_messages")
-    if not isinstance(records, dict):
-        if not create:
-            return {}
-        records = {}
-        telegram["accepted_notification_messages"] = records
-    return records
-
-
 def _accepted_created_topics(
     store: dict[str, Any], *, create: bool
 ) -> dict[str, dict[str, Any]]:
@@ -2143,36 +2218,87 @@ def _accepted_created_topics(
     return records
 
 
+def _ambiguous_created_topic_for_entry(
+    store: dict[str, Any], entry: dict[str, Any]
+) -> dict[str, Any] | None:
+    entry_key, entry_type = _entry_operation_key(store, entry)
+    identity = state.entry_stable_identity(entry)
+    space_id = _entry_space_id(entry)
+    for record in _accepted_created_topics(
+        store, create=False
+    ).values():
+        if (
+            not isinstance(record, dict)
+            or record.get("kind") != "ambiguous_created_topic"
+        ):
+            continue
+        owner = record.get("owner")
+        if not isinstance(owner, dict) or owner.get("entry_type") != entry_type:
+            continue
+        if entry_type == "worker" and identity is not None:
+            if (
+                owner.get("stable_key"),
+                owner.get("stable_key_version"),
+            ) == identity:
+                return record
+        elif entry_type == "space" and space_id:
+            if str(owner.get("space_id") or "") == space_id:
+                return record
+        elif entry_key and owner.get("entry_key") == entry_key:
+            return record
+    return None
+
+
+def _stamp_ambiguous_topic_create(
+    entry: dict[str, Any], record: Mapping[str, Any]
+) -> None:
+    entry["binding_state"] = "quarantined:ambiguous_topic_create"
+    entry["ambiguous_topic_create_name"] = compact_ws(
+        record.get("topic_name"), 120
+    )
+    entry["ambiguous_topic_create_at_unix"] = float(
+        record.get("observed_at_unix") or time.time()
+    )
+    entry["last_topic_error"] = compact_ws(record.get("error"), 240)
+    entry.pop("binding_topic_id", None)
+
+
 def _checkpoint_accepted_created_topic(
     store: dict[str, Any],
-    runtime: SyncRuntime,
     operation: _OfflockEntryOperation,
     result: Any,
     *,
     topic_name: str,
 ) -> str:
-    """Journal a non-idempotent accepted topic before owner disposition."""
+    """Record a non-idempotent accepted topic before content delivery."""
 
-    if not isinstance(result, Mapping) or result.get("ok") is not True:
+    if not isinstance(result, Mapping):
         return ""
     topic_id = str(result.get("topic_id") or "")
-    if not topic_id:
+    if result.get("ok") is True and topic_id:
+        record = {
+            "kind": "created_topic",
+            "topic_id": topic_id,
+            "topic_name": compact_ws(topic_name, 120),
+            "owner": _operation_provenance(operation),
+        }
+    elif result.get("ambiguous_acceptance"):
+        record = {
+            "kind": "ambiguous_created_topic",
+            "topic_name": compact_ws(topic_name, 120),
+            "error": compact_ws(result.get("error"), 240),
+            "observed_at_unix": time.time(),
+            "owner": _operation_provenance(operation),
+        }
+        current = _resolve_operation_entry(store, operation)
+        if current is not None and not current.get("topic_id"):
+            _stamp_ambiguous_topic_create(current, record)
+    else:
         return ""
-    record = {
-        "kind": "created_topic",
-        "topic_id": topic_id,
-        "topic_name": compact_ws(topic_name, 120),
-        "owner": _operation_provenance(operation),
-    }
     receipt_id = short_hash(record, 32)
     _accepted_created_topics(store, create=True).setdefault(
         receipt_id, record
     )
-    if state.lock_actually_held():
-        state.append_accepted_notification_receipt(
-            receipt_id, record, data=store
-        )
-        _after_provider_accept(runtime)
     return receipt_id
 
 
@@ -2185,10 +2311,19 @@ def _complete_accepted_created_topic(
         )
 
 
+def _checkpoint_topic_lifecycle(
+    store: dict[str, Any], runtime: SyncRuntime
+) -> None:
+    if runtime.checkpoint is not None:
+        runtime.checkpoint()
+    elif state.lock_actually_held():
+        state.save_state(store)
+
+
 def _recover_accepted_created_topics(
     store: dict[str, Any], runtime: SyncRuntime
 ) -> int:
-    """Adopt or quarantine topic creates recovered from the sidecar."""
+    """Adopt or quarantine topic creates from the lifecycle mirror."""
 
     recovered = 0
     records = list(
@@ -2212,7 +2347,21 @@ def _recover_accepted_created_topics(
             else _OfflockEntryResolution(_OFFLOCK_ABANDON)
         )
         entry = resolution.entry
-        if (
+        if record.get("kind") == "ambiguous_created_topic":
+            current = (
+                _resolve_operation_entry(store, operation)
+                if operation is not None
+                else None
+            )
+            if current is None or current.get("topic_id"):
+                continue
+            _stamp_ambiguous_topic_create(current, record)
+            # This receipt is the independent create guard. Mutable routing
+            # state may later overwrite binding_state, so retain the durable
+            # owner/name record until an explicit audited adopt/reset clears
+            # the ambiguity.
+            continue
+        elif (
             topic_id
             and resolution.disposition == _OFFLOCK_APPLY
             and entry is not None
@@ -2246,652 +2395,6 @@ def _recover_accepted_created_topics(
     return recovered
 
 
-def _notification_acceptance_capacity_available(
-    store: dict[str, Any],
-) -> bool:
-    return len(
-        _accepted_notification_messages(store, create=False)
-    ) < _ACCEPTED_NOTIFICATION_LIMIT
-
-
-def _notification_kind_pending(
-    store: dict[str, Any], kind: str
-) -> bool:
-    return any(
-        isinstance(record, dict) and record.get("kind") == kind
-        for record in _accepted_notification_messages(
-            store, create=False
-        ).values()
-    )
-
-
-def _checkpoint_accepted_notification(
-    store: dict[str, Any],
-    runtime: SyncRuntime,
-    operation: _OfflockEntryOperation,
-    result: Any,
-    *,
-    chat_id: str,
-    kind: str,
-    bot_kind: str = MANAGER_BOT_KIND,
-) -> str:
-    """Durably record an accepted exact message before disposition is known.
-
-    The provider acceptance fact crosses a small fsynced sidecar boundary
-    here.  The next canonical full-state barrier absorbs and clears that
-    journal, avoiding another whole-ledger save per notification without
-    reopening the acceptance crash window.
-    """
-
-    if not isinstance(result, Mapping) or result.get("ok") is not True:
-        return ""
-    message_id = str(result.get("message_id") or "")
-    if not message_id or message_id == "0":
-        return ""
-    receipt_id = short_hash(
-        {
-            "kind": kind,
-            "chat_id": chat_id,
-            "topic_id": operation.route_topic_id,
-            "message_id": message_id,
-            "provenance": _operation_provenance(operation),
-        },
-        32,
-    )
-    records = _accepted_notification_messages(store, create=True)
-    # Capacity gates starting new sends. An already-accepted provider fact is
-    # always admitted, even if a concurrent writer filled the nominal bound.
-    record = {
-        "kind": kind,
-        "chat_id": chat_id,
-        "topic_id": operation.route_topic_id,
-        "message_id": message_id,
-        "bot_kind": bot_kind,
-        "provenance": _operation_provenance(operation),
-    }
-    records.setdefault(receipt_id, record)
-    # Source-mode production calls run under the state flock. Unit-level
-    # in-memory helpers deliberately have no durable state path to journal.
-    if state.lock_actually_held():
-        state.append_accepted_notification_receipt(
-            receipt_id, record, data=store
-        )
-        _after_provider_accept(runtime)
-    return receipt_id
-
-
-def _complete_accepted_notification(
-    store: dict[str, Any], receipt_id: str
-) -> None:
-    if receipt_id:
-        _accepted_notification_messages(
-            store, create=False
-        ).pop(receipt_id, None)
-
-
-def _oversize_notice_kind(turn_id: str, content_hash: str) -> str:
-    return "oversize_notice:" + short_hash(
-        {"turn_id": turn_id, "content_hash": content_hash}, 20
-    )
-
-
-def _oversize_hold_for_notice_kind(
-    store: dict[str, Any], kind: str
-) -> dict[str, Any] | None:
-    if not kind.startswith("oversize_notice:"):
-        return None
-    matches = [
-        record
-        for record in state.active_partial_final_deliveries(store)
-        if record.get("request_phase") == "oversize_presentation"
-        and _oversize_notice_kind(
-            str(record.get("turn_id") or ""),
-            str(record.get("content_hash") or ""),
-        )
-        == kind
-    ]
-    return matches[0] if len(matches) == 1 else None
-
-
-def _adopt_checkpointed_oversize_notice(
-    store: dict[str, Any],
-    receipt_id: str,
-    raw: dict[str, Any],
-    *,
-    chat_id: str,
-) -> bool:
-    """Adopt one accepted oversize notice without another provider send.
-
-    A matching receipt is an acceptance witness even when its current route
-    cannot be proven. Exact route/provenance matches become ``accepted``;
-    uncertain matches become terminal ``delivery_unknown``. Neither outcome
-    deletes or re-sends the owner-visible notification.
-    """
-
-    kind = str(raw.get("kind") or "")
-    record = _oversize_hold_for_notice_kind(store, kind)
-    if record is None:
-        return False
-    message_id = str(raw.get("message_id") or "")
-    topic_id = str(raw.get("topic_id") or "")
-    bot_kind = str(raw.get("bot_kind") or MANAGER_BOT_KIND)
-    provenance = raw.get("provenance")
-    operation: _OfflockEntryOperation | None = None
-    resolution = _OfflockEntryResolution(_OFFLOCK_ABANDON)
-    if isinstance(provenance, dict):
-        try:
-            operation = _operation_from_provenance(provenance)
-            if (
-                operation.entry_type not in {"worker", "space", "global"}
-                or len(operation.owner_generation) < 6
-            ):
-                operation = None
-            else:
-                resolution = _compare_and_apply_entry_operation(
-                    store, operation
-                )
-        except (TypeError, ValueError):
-            operation = None
-    current_topic_id = str(record.get("current_topic_id") or "")
-    current_bot_kind = str(record.get("current_bot_kind") or "")
-    exact = bool(
-        message_id
-        and message_id != "0"
-        and str(raw.get("chat_id") or "") == str(chat_id)
-        and topic_id
-        and topic_id == current_topic_id
-        and (not current_bot_kind or bot_kind == current_bot_kind)
-        and operation is not None
-        and operation.route_topic_id == topic_id
-        and resolution.disposition == _OFFLOCK_APPLY
-        and resolution.entry is not None
-    )
-    raw_attempt_count = record.get("oversize_notice_attempt_count")
-    attempt_count = (
-        raw_attempt_count
-        if isinstance(raw_attempt_count, int)
-        and not isinstance(raw_attempt_count, bool)
-        and raw_attempt_count >= 0
-        else 0
-    )
-    record["oversize_notice_attempt_count"] = max(1, attempt_count)
-    record["oversize_notice_attempt_cap"] = _OVERSIZE_NOTICE_ATTEMPT_CAP
-    raw_physical_writes = record.get("oversize_notice_physical_writes")
-    physical_writes = (
-        raw_physical_writes
-        if isinstance(raw_physical_writes, int)
-        and not isinstance(raw_physical_writes, bool)
-        and raw_physical_writes >= 0
-        else 0
-    )
-    record["oversize_notice_physical_writes"] = max(1, physical_writes)
-    record["oversize_notice_terminal"] = True
-    if message_id and message_id != "0":
-        record["oversize_notice_message_id"] = message_id
-    if exact:
-        record["oversize_notice_status"] = "accepted"
-        record.pop("oversize_notice_error", None)
-    else:
-        record["oversize_notice_status"] = "delivery_unknown"
-        record["oversize_notice_error"] = (
-            "checkpointed provider acceptance could not be matched to the "
-            "current notice route; no automatic resend was attempted"
-        )
-
-    binding_entry = (
-        resolution.entry
-        if exact
-        else _operation_binding_entry(operation)
-        if operation is not None
-        else None
-    )
-    if (
-        binding_entry is not None
-        and message_id
-        and message_id != "0"
-        and topic_id
-    ):
-        state.bind_message_to_worker(
-            store,
-            message_id,
-            binding_entry,
-            topic_id=topic_id,
-            kind="oversize_notice",
-            turn_id=str(record.get("turn_id") or ""),
-            bot_kind=bot_kind,
-        )
-    if exact and resolution.entry is not None:
-        resolution.entry["partial_final_delivery"] = record
-    _complete_accepted_notification(store, receipt_id)
-    return True
-
-
-def _drain_accepted_notifications(
-    store: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-) -> tuple[int, int]:
-    """Adopt valid oversize notices; retire other stale accepted cards."""
-
-    completed = 0
-    pending = 0
-    for receipt_id, raw in list(
-        _accepted_notification_messages(
-            store, create=False
-        ).items()
-    ):
-        if not isinstance(raw, dict):
-            _complete_accepted_notification(store, receipt_id)
-            completed += 1
-            continue
-        if _adopt_checkpointed_oversize_notice(
-            store, receipt_id, raw, chat_id=chat_id
-        ):
-            completed += 1
-            if runtime.checkpoint is not None:
-                runtime.checkpoint()
-            continue
-        message_id = str(raw.get("message_id") or "")
-        if not message_id:
-            _complete_accepted_notification(store, receipt_id)
-            completed += 1
-            continue
-        try:
-            owner_token = _owning_bot_token(
-                store,
-                str(raw.get("bot_kind") or MANAGER_BOT_KIND),
-            )
-            deleted = _execute_exact_provider_operation(
-                runtime.telegram,
-                store=store,
-                mutation=_provider_mutation(
-                    "telegram.delete_message",
-                    reason=(
-                        "telegram.delete_message: retire accepted stale "
-                        "notification"
-                    ),
-                    args=(chat_id, message_id),
-                    api_token=owner_token,
-                ),
-            )
-        except Exception:
-            pending += 1
-            continue
-        if (
-            deleted.get("ok") is not True
-            and classify_telegram_error(deleted.get("error"))
-            != "not_found"
-        ):
-            pending += 1
-            continue
-        _retire_local_message(store, None, message_id)
-        _complete_accepted_notification(store, receipt_id)
-        completed += 1
-        if runtime.checkpoint is not None:
-            runtime.checkpoint()
-    return completed, pending
-
-
-def _delivery_bot(store: dict[str, Any], entry: dict[str, Any]) -> tuple[str | None, str]:
-    telegram = _telegram_state(store)
-    token = managed_bot_token_for_entry(telegram, entry)
-    return token, desired_message_bot_kind(telegram, entry)
-
-
-def _record_delivery_error(entry: dict[str, Any], result: dict[str, Any], bot_kind: str) -> None:
-    error = compact_ws(result.get("error") or result.get("kind") or "Telegram delivery failed", 240)
-    entry["last_delivery_error"] = error
-    if bot_kind != MANAGER_BOT_KIND:
-        entry["last_managed_bot_kind"] = bot_kind
-        entry["last_managed_bot_error"] = error
-
-
-def _record_partial_final_delivery(
-    store: dict[str, Any],
-    entry: dict[str, Any],
-    result: dict[str, Any],
-    *,
-    turn_id: str,
-    content_hash: str,
-    topic_id: str,
-    bot_kind: str,
-) -> None:
-    """Persist a real accepted prefix without claiming logical completion."""
-
-    prior = state.find_partial_final_delivery(
-        store, turn_id, content_hash
-    )
-    same_content_prior = isinstance(prior, dict)
-    message_ids = (
-        list(prior.get("message_ids") or [])
-        if same_content_prior
-        and prior.get("status") == "retry_authorized"
-        else []
-    )
-    for message_id in split_legacy_message_ids(result):
-        if message_id not in message_ids:
-            message_ids.append(message_id)
-    canonical_message_id = message_ids[0] if message_ids else ""
-    outcome = str(result.get("terminal_outcome") or "delivery_unknown")
-    error = compact_ws(
-        result.get("error")
-        or f"multipart final incomplete: {outcome}",
-        240,
-    )
-    now = time.time()
-    created_at = (
-        float(prior["created_at"])
-        if same_content_prior
-        and isinstance(prior.get("created_at"), (int, float))
-        and not isinstance(prior.get("created_at"), bool)
-        else now
-    )
-    record = {
-        "schema_version": state.PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION,
-        "turn_id": turn_id,
-        "content_hash": content_hash,
-        "status": "held",
-        "transport_disposition": "accepted_prefix",
-        "request_phase": "partial_final_delivery",
-        "terminal_outcome": outcome,
-        "delivery_complete": False,
-        "message_ids": list(message_ids),
-        "canonical_message_id": canonical_message_id,
-        "failed_part_index": int(
-            result.get("failed_part_index") or 0
-        ),
-        "operator_attention_required": True,
-        "automatic_replay_authorized": False,
-        "recovery_action": (
-            "accept-partial"
-            if outcome == "delivery_unknown"
-            else "retry-missing"
-        ),
-        "created_at": created_at,
-        "updated_at": now,
-        "escalates_at": (
-            created_at + config.partial_final_escalation_seconds()
-        ),
-        "original_worker_id": str(
-            (prior or {}).get("original_worker_id")
-            or entry.get("tendwire_worker_id")
-            or entry.get("active_worker_id")
-            or ""
-        ),
-        "original_topic_id": str(
-            (prior or {}).get("original_topic_id") or topic_id
-        ),
-        "original_bot_kind": str(
-            (prior or {}).get("original_bot_kind") or bot_kind
-        ),
-        "current_worker_id": str(
-            entry.get("tendwire_worker_id")
-            or entry.get("active_worker_id")
-            or ""
-        ),
-        "current_topic_id": str(
-            entry.get("topic_id") or topic_id
-        ),
-        "current_bot_kind": bot_kind,
-        "error": error,
-    }
-    state.partial_final_deliveries(store, create=True)[
-        state.partial_final_delivery_key(turn_id, content_hash)
-    ] = record
-    # Re-run normalization after insertion so the resolved-witness bound is
-    # enforced immediately. Unresolved records are never eviction candidates.
-    state.partial_final_deliveries(store)
-    entry["partial_final_delivery"] = record
-    _record_delivery_error(entry, {"error": error}, bot_kind)
-    for message_id in message_ids:
-        binding = state.find_message_binding(store, message_id)
-        if binding is None:
-            state.bind_message_to_worker(
-                store,
-                message_id,
-                entry,
-                topic_id=topic_id,
-                kind="final",
-                turn_id=turn_id,
-                bot_kind=bot_kind,
-            )
-            binding = state.find_message_binding(store, message_id)
-        if binding is not None:
-            binding["message_ids"] = list(message_ids)
-            binding["canonical_message_id"] = canonical_message_id
-            binding["partial_final_delivery"] = dict(record)
-
-
-def _record_oversize_final_delivery(
-    store: dict[str, Any],
-    entry: dict[str, Any],
-    *,
-    turn_id: str,
-    content_hash: str,
-) -> None:
-    """Make an exact-but-unpresentable final explicit without sending a prefix."""
-
-    topic_id = str(entry.get("topic_id") or "")
-    bot_kind = desired_message_bot_kind(_telegram_state(store), entry)
-    _record_partial_final_delivery(
-        store,
-        entry,
-        {
-            "ok": False,
-            "partial": False,
-            "message_ids": [],
-            "terminal_outcome": "not_delivered",
-            "failed_part_index": 0,
-            "error": (
-                "turn exceeds the hard Telegram presentation-part limit"
-            ),
-        },
-        turn_id=turn_id,
-        content_hash=content_hash,
-        topic_id=topic_id,
-        bot_kind=bot_kind,
-    )
-    record = state.find_partial_final_delivery(
-        store, turn_id, content_hash
-    )
-    assert record is not None
-    record["request_phase"] = "oversize_presentation"
-    record["transport_disposition"] = "not_delivered"
-    record["recovery_action"] = (
-        "retrieve-canonical-source-or-supersede-with-shorter-answer"
-    )
-    entry["partial_final_delivery"] = record
-
-
-def _notify_oversize_final(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    turn_id: str,
-    content_hash: str,
-    part_count: int | None,
-) -> int:
-    """Make an exact oversize hold visible without duplicate retries.
-
-    The notice is deliberately not the answer and does not authorize replay.
-    The exact answer remains in Tendwire under the named turn/revision while
-    the partial-final record keeps the logical delivery incomplete. Definite
-    rejections retry for three passes; ambiguous delivery is terminal because
-    retrying a possibly accepted owner-visible send would duplicate it.
-    """
-
-    record = state.find_partial_final_delivery(store, turn_id, content_hash)
-    topic_id = str(entry.get("topic_id") or "")
-    raw_attempt_count = (
-        record.get("oversize_notice_attempt_count")
-        if isinstance(record, dict)
-        else None
-    )
-    attempt_count = (
-        int(raw_attempt_count)
-        if isinstance(raw_attempt_count, int)
-        and not isinstance(raw_attempt_count, bool)
-        and raw_attempt_count >= 0
-        else 0
-    )
-    notice_kind = _oversize_notice_kind(turn_id, content_hash)
-    if (
-        runtime.dry_run
-        or not isinstance(record, dict)
-        or not chat_id
-        or not topic_id
-        or record.get("oversize_notice_status") == "accepted"
-        or record.get("oversize_notice_terminal") is True
-        or attempt_count >= _OVERSIZE_NOTICE_ATTEMPT_CAP
-        or _delivery_write_budget(runtime).remaining <= 0
-        or not _notification_acceptance_capacity_available(store)
-        or _notification_kind_pending(store, notice_kind)
-    ):
-        return 0
-    if not record.get("answer_sha256"):
-        answer = str(item.get("assistant_final_text") or "")
-        answer_bytes = answer.encode("utf-8")
-        record["answer_char_length"] = len(answer)
-        record["answer_byte_length"] = len(answer_bytes)
-        record["answer_sha256"] = hashlib.sha256(answer_bytes).hexdigest()
-    required = (
-        part_count
-        if isinstance(part_count, int) and not isinstance(part_count, bool)
-        else int(record.get("required_part_count") or 0)
-    )
-    record["required_part_count"] = required
-    record["oversize_notice_attempt_cap"] = _OVERSIZE_NOTICE_ATTEMPT_CAP
-    record["content_locator"] = {
-        "source": "tendwire_turn",
-        "turn_id": turn_id,
-        "content_revision": content_hash,
-        "field": "assistant_final_text",
-    }
-    answer_chars = int(record.get("answer_char_length") or 0)
-    answer_bytes = int(record.get("answer_byte_length") or 0)
-    digest = str(record.get("answer_sha256") or "")
-    revision_label = content_hash or "unknown revision"
-    html = (
-        "<b>Answer held: exceeds Telegram card limit</b>\n"
-        f"Turn <code>{html_escape(turn_id, 200)}</code> contains "
-        f"{answer_chars:,} characters / {answer_bytes:,} UTF-8 bytes "
-        f"and needs {required or 'more than'} cards "
-        f"(limit {TURN_DELIVERY_MAX_PARTS}).\n"
-        f"Digest: <code>sha256:{digest}</code>\n"
-        "No answer content was truncated or marked delivered. The exact "
-        "canonical answer remains in authenticated Tendwire source at "
-        f"turn <code>{html_escape(turn_id, 200)}</code>, revision "
-        f"<code>{html_escape(revision_label, 200)}</code>. Reply in this "
-        "topic asking the pane to resend it in at most "
-        f"{TURN_DELIVERY_MAX_PARTS} cards; an operator can retrieve the "
-        "exact source by that turn/revision identity."
-    )
-    operation = _capture_entry_operation(
-        store,
-        entry,
-        topic_id=topic_id,
-    )
-    accepted_receipt_id = ""
-
-    def checkpoint_oversize_notice(
-        result: Any, captured: _OfflockEntryOperation
-    ) -> None:
-        nonlocal accepted_receipt_id
-        accepted_receipt_id = _checkpoint_accepted_notification(
-            store,
-            runtime,
-            captured,
-            result,
-            chat_id=chat_id,
-            kind=notice_kind,
-            bot_kind=desired_message_bot_kind(
-                _telegram_state(store), entry
-            ),
-        )
-
-    execution = _execute_accounted_delivery_write(
-        store,
-        runtime,
-        operation,
-        _provider_mutation(
-            "telegram.send_message",
-            reason="telegram.send_message: expose oversize final hold",
-            args=(chat_id, html),
-            kwargs={
-                "thread_id": topic_id,
-                "notify": True,
-                # One provider attempt is essential: a lost response after
-                # acceptance must never fall through to the plain variant.
-                "max_physical_writes": 1,
-                "ambiguous_errors_are_unknown": True,
-            },
-        ),
-        acceptance_checkpoint=checkpoint_oversize_notice,
-    )
-    sent = execution.result
-    writes = _telegram_physical_writes(sent)
-    message_ids = split_legacy_message_ids(sent) if sent.get("ok") else []
-    current_record = state.find_partial_final_delivery(
-        store, turn_id, content_hash
-    )
-    if not isinstance(current_record, dict):
-        return writes
-    current_record["oversize_notice_attempt_count"] = (
-        attempt_count + (1 if writes else 0)
-    )
-    current_record["oversize_notice_attempt_cap"] = (
-        _OVERSIZE_NOTICE_ATTEMPT_CAP
-    )
-    current_record["oversize_notice_physical_writes"] = writes
-    if message_ids:
-        current_record["oversize_notice_status"] = "accepted"
-        current_record["oversize_notice_terminal"] = True
-        current_record["oversize_notice_message_id"] = message_ids[0]
-        binding_entry = (
-            execution.resolution.entry
-            if execution.resolution.disposition == _OFFLOCK_APPLY
-            else _operation_binding_entry(operation)
-        )
-        assert binding_entry is not None
-        state.bind_message_to_worker(
-            store,
-            message_ids[0],
-            binding_entry,
-            topic_id=topic_id,
-            kind="oversize_notice",
-            turn_id=turn_id,
-            bot_kind=desired_message_bot_kind(
-                _telegram_state(store), entry
-            ),
-        )
-        _complete_accepted_notification(store, accepted_receipt_id)
-    else:
-        delivery_unknown = sent.get("delivery_unknown") is True
-        exhausted = (
-            current_record["oversize_notice_attempt_count"]
-            >= _OVERSIZE_NOTICE_ATTEMPT_CAP
-        )
-        current_record["oversize_notice_status"] = (
-            "delivery_unknown"
-            if delivery_unknown
-            else "terminal_failed"
-            if exhausted
-            else "failed"
-        )
-        current_record["oversize_notice_terminal"] = bool(
-            delivery_unknown or exhausted
-        )
-        current_record["oversize_notice_error"] = str(
-            sent.get("error") or "oversize notice was not accepted"
-        )
-    entry["partial_final_delivery"] = current_record
-    return writes
-
-
 def _set_pending_turn_plan(
     entry: dict[str, Any],
     *,
@@ -2922,289 +2425,43 @@ def _set_pending_turn_plan(
         )
 
 
-def _pending_turn_plan_age(
-    entry: dict[str, Any], *, now: float | None = None
-) -> float:
-    started_at = entry.get("pending_turn_started_at")
-    if not isinstance(started_at, (int, float)) or isinstance(
-        started_at, bool
-    ):
-        return 0.0
-    return max(
-        0.0,
-        (time.time() if now is None else float(now))
-        - float(started_at),
-    )
+def _delivery_bot(
+    store: dict[str, Any], entry: dict[str, Any]
+) -> tuple[str | None, str]:
+    kind = managed_bot_kind_for_entry(entry)
+    if not kind or entry.get("managed_voice_active") is False:
+        return None, MANAGER_BOT_KIND
+    token = _legacy_presenter_bot_token(store, kind)
+    return (token, kind) if token else (None, MANAGER_BOT_KIND)
 
 
-def _hold_incomplete_pending_plan(
-    store: dict[str, Any],
-    entry: dict[str, Any],
-    *,
-    turn_id: str,
-    plan_token: str,
-    revision: str,
-    part_count: int,
-    created_job_count: int | None = None,
-    error: str,
-) -> bool:
-    """Move a non-completable parent plan to a visible, replay-blocking hold."""
+def _legacy_presenter_bot_token(store: dict[str, Any], bot_kind: str) -> str:
+    """Read a managed delivery token only for the temporary old presenter."""
 
-    existing = state.find_partial_final_delivery(store, turn_id, revision)
-    if isinstance(existing, dict):
-        return False
-    receipts = [
-        receipt
-        for receipt in state.tendwire_turn_jobs(store).values()
-        if isinstance(receipt, dict)
-        and receipt.get("plan_token") == plan_token
-        and receipt.get("content_revision") == revision
-    ]
-    bound = sorted(
-        (
-            (int(binding.get("part_ordinal")), message_id)
-            for message_id, binding in _final_delivery_bindings(
-                store, turn_id
-            )
-            if (
-                binding.get("plan_token") == plan_token
-                or binding.get("content_revision") == revision
-            )
-            and isinstance(binding.get("part_ordinal"), int)
-        ),
-        key=lambda row: row[0],
-    )
-    accepted_ids = [message_id for _ordinal, message_id in bound]
-    for receipt in receipts:
-        message_id = str(receipt.get("telegram_message_id") or "")
-        if message_id and message_id != "0" and message_id not in accepted_ids:
-            accepted_ids.append(message_id)
-    # Created ordinals are durable facts carried by immutable job receipts or
-    # accepted-message bindings.  Never synthesize them from a scalar count:
-    # a sparse 0,2 creation must not be rewritten as the fictional 0,1.
-    known_ordinals = {
-        int(receipt["part_ordinal"])
-        for receipt in receipts
-        if isinstance(receipt.get("part_ordinal"), int)
-        and 0 <= int(receipt["part_ordinal"]) < part_count
-    }
-    known_ordinals.update(
-        ordinal
-        for ordinal, _message_id in bound
-        if 0 <= ordinal < part_count
-    )
-    reported_created_count = (
-        min(max(0, created_job_count), part_count)
-        if isinstance(created_job_count, int)
-        and not isinstance(created_job_count, bool)
-        else None
-    )
-    missing = [
-        ordinal for ordinal in range(part_count) if ordinal not in known_ordinals
-    ]
-    failed_receipts = [
-        receipt
-        for receipt in receipts
-        if receipt.get("substate") == "failed"
-        and isinstance(receipt.get("part_ordinal"), int)
-    ]
-    failed_index = (
-        min(int(receipt["part_ordinal"]) for receipt in failed_receipts)
-        if failed_receipts
-        else (missing[0] if missing else len(known_ordinals))
-    )
-    _record_partial_final_delivery(
-        store,
-        entry,
-        {
-            "ok": False,
-            "partial": bool(accepted_ids),
-            "message_ids": accepted_ids,
-            # A stopped creator/dead-lettered child is a definite missing
-            # suffix. Accepted prefix ids remain exact provider facts, while
-            # only the missing suffix is eligible for explicit recovery.
-            "terminal_outcome": "not_delivered",
-            "failed_part_index": failed_index,
-            "error": error,
-        },
-        turn_id=turn_id,
-        content_hash=revision,
-        topic_id=str(entry.get("topic_id") or ""),
-        bot_kind=desired_message_bot_kind(
-            _telegram_state(store), entry
-        ),
-    )
-    record = state.find_partial_final_delivery(store, turn_id, revision)
-    assert record is not None
-    record["request_phase"] = "pending_plan_incomplete"
-    record["plan_token"] = plan_token
-    record["declared_part_count"] = int(part_count)
-    record["created_part_ordinals"] = sorted(known_ordinals)
-    record["reported_created_job_count"] = reported_created_count
-    record["unwitnessed_created_job_count"] = (
-        max(0, reported_created_count - len(known_ordinals))
-        if reported_created_count is not None
-        else None
-    )
-    record["missing_part_ordinals"] = missing
-    record["bounded_exit_seconds"] = (
-        config.partial_final_escalation_seconds()
-    )
-    if not accepted_ids:
-        record["transport_disposition"] = "not_delivered"
-    entry["partial_final_delivery"] = record
-    return True
+    if not config.managed_bots_enabled():
+        return ""
+    telegram = _telegram_state(store)
+    bots = telegram.get("managed_bots")
+    record = bots.get(bot_kind) if isinstance(bots, dict) else None
+    if isinstance(record, dict) and record.get("enabled") is False:
+        return ""
+    configured = config.managed_bot_token(bot_kind)
+    return configured or (str(record.get("token") or "").strip() if isinstance(record, dict) else "")
 
 
-def _partial_final_delivery_record(
-    store: dict[str, Any],
-    *,
-    turn_id: str,
-    content_hash: str,
-) -> dict[str, Any] | None:
-    """Adopt every route-local record, then return this content's witness."""
-
-    records = state.partial_final_deliveries(store)
-    candidates = [
-        partial
-        for container in (
-            *state.source_worker_entries(store).values(),
-            *state.message_bindings(store).values(),
-        )
-        if isinstance(container, dict)
-        and isinstance(
-            partial := container.get("partial_final_delivery"), dict
-        )
-        and partial.get("turn_id") == turn_id
-        and partial.get("delivery_complete") is False
-    ]
-    if candidates and not isinstance(
-        store.get("telegram_partial_final_deliveries"), dict
-    ):
-        records = state.partial_final_deliveries(store, create=True)
-    for candidate in candidates:
-        candidate_content_hash = compact_ws(
-            candidate.get("content_hash"), 200
-        )
-        if not candidate_content_hash:
-            continue
-        key = state.partial_final_delivery_key(
-            turn_id, candidate_content_hash
-        )
-        if isinstance(records.get(key), dict):
-            continue
-        adopted = dict(candidate)
-        now = time.time()
-        adopted["schema_version"] = (
-            state.PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION
-        )
-        adopted["status"] = str(adopted.get("status") or "held")
-        adopted["created_at"] = float(
-            adopted.get("created_at")
-            if isinstance(adopted.get("created_at"), (int, float))
-            and not isinstance(adopted.get("created_at"), bool)
-            else now
-        )
-        adopted["updated_at"] = now
-        adopted["escalates_at"] = (
-            adopted["created_at"]
-            + config.partial_final_escalation_seconds()
-        )
-        adopted["recovery_action"] = (
-            "accept-partial"
-            if adopted.get("terminal_outcome") == "delivery_unknown"
-            else "retry-missing"
-        )
-        records[key] = adopted
-    return state.find_partial_final_delivery(
-        store, turn_id, content_hash
-    )
-
-
-def _reconcile_partial_final_hold(
-    store: dict[str, Any],
-    entry: dict[str, Any],
-    record: dict[str, Any],
-    *,
-    requested_content_hash: str,
+def _record_delivery_error(
+    entry: dict[str, Any], result: dict[str, Any], bot_kind: str
 ) -> None:
-    """Make a route-independent hold visible on the current route snapshot."""
-
-    record["current_worker_id"] = str(
-        entry.get("tendwire_worker_id")
-        or entry.get("active_worker_id")
-        or ""
-    )
-    record["current_topic_id"] = str(entry.get("topic_id") or "")
-    record["current_bot_kind"] = desired_message_bot_kind(
-        _telegram_state(store), entry
-    )
-    if record.get("content_hash") != requested_content_hash:
-        record["blocked_revision_content_hash"] = requested_content_hash
-        record["blocked_revision_at"] = time.time()
-        record["error"] = (
-            "revised final blocked until the accepted-prefix hold is resolved"
-        )
-    entry["partial_final_delivery"] = dict(record)
-    entry["last_delivery_error"] = compact_ws(
-        record.get("error")
-        or "multipart final requires operator reconciliation",
+    error = compact_ws(
+        result.get("error")
+        or result.get("kind")
+        or "Telegram delivery failed",
         240,
     )
-
-
-def _partial_final_hold_escalated(
-    record: dict[str, Any],
-    *,
-    now: float,
-) -> bool:
-    created_at = record.get("created_at")
-    if not isinstance(created_at, (int, float)) or isinstance(
-        created_at, bool
-    ):
-        return False
-    return (
-        float(now) - float(created_at)
-        >= config.partial_final_escalation_seconds()
-    )
-
-
-def _superseding_final_feed_item(
-    feed_item: dict[str, Any],
-) -> dict[str, Any]:
-    """Make the automatic post-bound supersession visible to the recipient."""
-
-    revised = dict(feed_item)
-    notice = (
-        "⚠️ Supersedes an incomplete earlier version whose delivery "
-        "still requires operator resolution."
-    )
-    response = str(revised.get("assistant_final_text") or "").strip()
-    revised["assistant_final_text"] = (
-        f"{notice}\n\n{response}" if response else notice
-    )
-    return revised
-
-
-def _record_partial_final_supersession(
-    records: list[dict[str, Any]],
-    *,
-    content_hash: str,
-    message_ids: list[str],
-) -> None:
-    """Record a delivered revision without resolving its predecessor holds."""
-
-    now = time.time()
-    for record in records:
-        record["superseded_by_content_hash"] = content_hash
-        record["superseded_at"] = now
-        record["supersession"] = "newer_revision_delivered"
-        record["supersession_message_ids"] = list(message_ids)
-        record["recovery_action"] = (
-            "accept-partial"
-            if record.get("terminal_outcome") == "delivery_unknown"
-            else "retry-missing"
-        )
+    entry["last_delivery_error"] = error
+    if bot_kind != MANAGER_BOT_KIND:
+        entry["last_managed_bot_kind"] = bot_kind
+        entry["last_managed_bot_error"] = error
 
 
 def _repair_provider_gone_topic(
@@ -3392,7 +2649,26 @@ def _turn_local_outcome(
     return outcome
 
 
+def _quarantined_turn_row(
+    item: dict[str, Any], status: str
+) -> dict[str, Any]:
+    """Retain public routing identity, never the rejected private structure."""
+
+    quarantined = {
+        key: item[key]
+        for key in ("id", "turn_id", "worker_id", "space_id")
+        if isinstance(item.get(key), str) and item[key]
+    }
+    quarantined[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(item, status)
+    return quarantined
+
+
 def _validate_turn_row(raw: dict[str, Any]) -> dict[str, Any]:
+    if _contains_private_agent_turn_fields(raw):
+        raise _TurnContentError(
+            "private_agent_content",
+            "neutral Tendwire turn contains private structured agent data",
+        )
     item = dict(raw)
     content = item.get("content")
     content_schema = (
@@ -3445,10 +2721,6 @@ def _validate_turn_row(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _validate_turns_payload(payload: dict[str, Any]) -> dict[str, Any]:
     schema = payload.get("schema_version")
-    if type(schema) is int and schema == 1:
-        # Direct-call Goal 01B compatibility. The production TendwireClient
-        # negotiates schema v2 and refuses daemon/CLI v1 responses.
-        return payload
     if type(schema) is not int or schema != TURN_SCHEMA_VERSION:
         raise _TurnContentError(
             "upgrade_required", "Tendwire turn schema v2 is required"
@@ -3475,10 +2747,15 @@ def _validate_turns_payload(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             validated_rows.append(_validate_turn_row(raw))
         except _TurnContentError as exc:
-            item = dict(raw)
-            item[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
-                item, exc.status
+            item = (
+                _quarantined_turn_row(raw, exc.status)
+                if exc.status == "private_agent_content"
+                else dict(raw)
             )
+            if _TURN_CONTENT_OUTCOME_KEY not in item:
+                item[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
+                    item, exc.status
+                )
             validated_rows.append(item)
     validated = dict(payload)
     validated["turns"] = validated_rows
@@ -3540,14 +2817,9 @@ def _materialize_turn_field(
             or page.get("field") != field
             or page.get("availability") != "complete"
         ):
-            conflict = page.get("content_revision") not in (
-                None,
-                content_revision,
-            )
             raise _TurnContentError(
                 "invalid_content_page",
                 f"{field} page identity mismatch",
-                conflict=conflict,
             )
         index = _strict_nonnegative_int(
             page.get("index"), "page.index", status="invalid_content_page"
@@ -3642,8 +2914,9 @@ def _materialize_turn_item(
         )
     content = item.get("content")
     if not isinstance(content, dict):
-        # Legacy direct-call fixtures carry their canonical inline values.
-        return 0
+        raise _TurnContentError(
+            "unsupported_content_schema", "turn content schema v1 is required"
+        )
     fields = content["fields"]
     revision = str(content["content_revision"])
     materialized = dict(item)
@@ -3921,14 +3194,12 @@ def _turn_feed_item(
     return turn_item_from_source(presentation, entry)
 
 
-def _changed_final_should_send_new_message(item: dict[str, Any], entry: dict[str, Any]) -> bool:
-    user_hash = _turn_user_hash(item)
-    if not user_hash:
-        return False
-    if entry.get("last_turn_id") != _turn_id(item):
-        return False
-    previous = str(entry.get("last_clean_user_hash") or "")
-    return bool(previous and previous != user_hash)
+def _canonical_final_feed_item(
+    item: dict[str, Any], entry: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a lossless feed item for a Tendwire canonical final plan."""
+
+    return turn_item_from_source(item, entry)
 
 
 def _working_delivery_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -3982,18 +3253,6 @@ def _final_delivery_bindings(
     ]
 
 
-def _final_turn_delivered(store: dict[str, Any], turn_id: str) -> bool:
-    if not turn_id:
-        return False
-    prefix = f"final:{turn_id}:"
-    for identity, record in state.delivered_turns(store).items():
-        if str(identity).startswith(prefix):
-            return True
-        if isinstance(record, dict) and str(record.get("turn_id") or "") == turn_id:
-            return True
-    return False
-
-
 def _clear_open_turn_final_delivery_state(store: dict[str, Any], entry: dict[str, Any], turn_id: str) -> bool:
     """Remove stale final-delivery markers for a turn Tendwire still reports open.
 
@@ -4024,316 +3283,10 @@ def _clear_open_turn_final_delivery_state(store: dict[str, Any], entry: dict[str
     return changed
 
 
-def _repair_delivered_final_entry(store: dict[str, Any], item: dict[str, Any], entry: dict[str, Any], content_hash: str) -> bool:
-    turn_id = _turn_id(item)
-    topic_id = str(entry.get("topic_id") or "")
-    final_bindings = _final_delivery_bindings(
-        store, turn_id, topic_id=topic_id
-    )
-    if not final_bindings:
-        return False
-    message_ids = [
-        message_id
-        for message_id, _binding in final_bindings
-        if message_id
-    ]
-    bot_kind = str(final_bindings[-1][1].get("bot_kind") or "")
-    return _set_final_delivery(
-        entry,
-        turn_id=turn_id,
-        content_hash=content_hash,
-        user_hash=_turn_user_hash(item),
-        message_ids=message_ids,
-        bot_kind=bot_kind or None,
-    )
-
-
 def _clear_stream_delivery_state(entry: dict[str, Any], turn_id: str) -> None:
     if entry.get("last_stream_turn_id") != turn_id:
         return
     _clear_stream_delivery_keys(entry)
-
-
-def _complete_submission_receipt(
-    store: dict[str, Any],
-    submission_id: str,
-    *,
-    now: float | None = None,
-) -> bool:
-    if not submission_id:
-        return False
-    completed_at = time.time() if now is None else now
-    for record in ingress_requests.retained_submission_records(
-        store, now=completed_at
-    ):
-        if record.get("submission_id") != submission_id:
-            continue
-        return ingress_requests.attach_submission_receipt(
-            record,
-            submission_id,
-            "complete",
-            record.get("turn_id"),
-            now=completed_at,
-        )
-    return False
-
-
-def _record_final_delivery_success(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    *,
-    thread_id: str,
-    message_ids: list[str],
-    content_hash: str,
-    identity: str,
-    bot_kind: str,
-) -> None:
-    turn_id = _turn_id(item)
-    submission_id = str(entry.get("last_stream_submission_id") or "")
-    canonical_message_id = message_ids[0] if message_ids else ""
-    for message_id in message_ids:
-        state.bind_message_to_worker(
-            store,
-            message_id,
-            entry,
-            topic_id=thread_id,
-            kind="final",
-            turn_id=turn_id,
-            bot_kind=bot_kind,
-        )
-        binding = state.find_message_binding(store, message_id)
-        if binding is not None:
-            binding["message_ids"] = list(message_ids)
-            binding["canonical_message_id"] = canonical_message_id
-    state.mark_delivered(
-        store,
-        identity,
-        {
-            "worker_id": entry.get("tendwire_worker_id"),
-            "turn_id": turn_id,
-            "message_ids": list(message_ids),
-            "canonical_message_id": canonical_message_id,
-        },
-    )
-    _set_final_delivery(
-        entry,
-        turn_id=turn_id,
-        content_hash=content_hash,
-        user_hash=_turn_user_hash(item),
-        message_ids=message_ids,
-        bot_kind=bot_kind,
-        render_version=RENDER_VERSION,
-    )
-    _record_delivery_success(entry, bot_kind)
-    if submission_id:
-        _clear_stream_delivery_keys(entry)
-    else:
-        _clear_stream_delivery_state(entry, turn_id)
-    if submission_id:
-        _complete_submission_receipt(store, submission_id)
-    entry.pop("tendwire_rebind_catchup_pending", None)
-
-
-def _promote_working_to_final(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    thread_id: str,
-    content_hash: str,
-    identity: str,
-) -> bool:
-    turn_id = _turn_id(item)
-    stream_message_id = str(entry.get("last_stream_message_id") or "")
-    submission_id = _stream_submission_id(item, entry)
-    same_card = entry.get("last_stream_turn_id") == turn_id or bool(
-        submission_id
-        and entry.get("last_stream_submission_id") == submission_id
-    )
-    if not stream_message_id or not same_card:
-        return False
-    telegram = _telegram_state(store)
-    api_token, bot_kind = _delivery_bot(store, entry)
-    stored_bot_kind = str(entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND)
-    if stored_bot_kind != bot_kind:
-        return False
-    feed_item = _turn_feed_item(item, entry)
-    # Telegram legacy edits cannot split. If the final view is too large for a
-    # single safe edit, use the send path instead so long responses are split.
-    if len(render_feed_item_html(feed_item)) > MESSAGE_TEXT_LIMIT or feed_item_requires_send_split(feed_item):
-        return False
-    operation = _capture_entry_operation(
-        store,
-        entry,
-        topic_id=thread_id,
-        message_id=stream_message_id,
-        observe=("last_stream_message_id",),
-    )
-    execution = _execute_accounted_delivery_write(
-        store,
-        runtime,
-        operation,
-        _provider_mutation(
-            "telegram.edit_feed_item",
-            reason=(
-                "telegram.edit_feed_item: promote working card to final"
-            ),
-            args=(chat_id, stream_message_id, feed_item),
-            kwargs={
-                "telegram": telegram,
-                "api_token": api_token,
-                "max_physical_writes": _delivery_write_budget(
-                    runtime
-                ).remaining,
-            },
-        ),
-    )
-    sent, resolution = execution.result, execution.resolution
-    if not sent.get("ok") or resolution.disposition != _OFFLOCK_APPLY:
-        return False
-    entry = resolution.entry
-    assert entry is not None
-    edited_message_id = str(sent.get("message_id") or "").strip()
-    message_id = edited_message_id if edited_message_id and edited_message_id != "0" else stream_message_id
-    _record_final_delivery_success(
-        store,
-        item,
-        entry,
-        thread_id=thread_id,
-        message_ids=[message_id],
-        content_hash=content_hash,
-        identity=identity,
-        bot_kind=bot_kind,
-    )
-    return True
-
-
-def _replace_changed_final(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    thread_id: str,
-    content_hash: str,
-    identity: str,
-) -> bool:
-    bindings = _final_delivery_bindings(
-        store, _turn_id(item), topic_id=thread_id
-    )
-    if not bindings:
-        return False
-    api_token, bot_kind = _delivery_bot(store, entry)
-    if any(
-        str(binding.get("bot_kind") or "")
-        not in {"", bot_kind}
-        for _message_id, binding in bindings
-    ):
-        return False
-    feed_item = _turn_feed_item(item, entry)
-    try:
-        plans = _prepare_final_delivery_parts(feed_item)
-    except _TurnContentError:
-        return False
-    ordered = sorted(
-        bindings,
-        key=lambda pair: (
-            pair[1].get("part_ordinal")
-            if isinstance(pair[1].get("part_ordinal"), int)
-            else len(bindings),
-            pair[0],
-        ),
-    )
-    if len(ordered) != len(plans):
-        return False
-    message_ids: list[str] = []
-    current_entry = entry
-    for fallback_ordinal, (message_id, binding) in enumerate(ordered):
-        if _delivery_write_budget(runtime).remaining == 0:
-            return False
-        ordinal = binding.get("part_ordinal")
-        if not isinstance(ordinal, int):
-            ordinal = fallback_ordinal
-        if not 0 <= ordinal < len(plans):
-            return False
-        operation = _capture_entry_operation(
-            store,
-            current_entry,
-            topic_id=thread_id,
-            message_id=message_id,
-        )
-        execution = _execute_accounted_delivery_write(
-            store,
-            runtime,
-            operation,
-            _provider_mutation(
-                "telegram.edit_turn_delivery_part",
-                reason=(
-                    "telegram.edit_turn_delivery_part: replace "
-                    "changed final part"
-                ),
-                args=(
-                    chat_id,
-                    message_id,
-                    feed_item,
-                    plans[ordinal],
-                ),
-                kwargs={
-                    "telegram": _telegram_state(store),
-                    "api_token": api_token,
-                    "max_physical_writes": _delivery_write_budget(
-                        runtime
-                    ).remaining,
-                },
-            ),
-        )
-        sent, resolution = execution.result, execution.resolution
-        if (
-            not sent.get("ok")
-            or resolution.disposition != _OFFLOCK_APPLY
-        ):
-            return False
-        current_entry = resolution.entry
-        assert current_entry is not None
-        edited_message_id = str(
-            sent.get("message_id") or ""
-        ).strip()
-        message_ids.append(
-            edited_message_id
-            if edited_message_id and edited_message_id != "0"
-            else message_id
-        )
-    _record_final_delivery_success(
-        store,
-        item,
-        current_entry,
-        thread_id=thread_id,
-        message_ids=message_ids,
-        content_hash=content_hash,
-        identity=identity,
-        bot_kind=bot_kind,
-    )
-    return True
-
-
-def _suppress_historical_final(store: dict[str, Any], item: dict[str, Any], content_hash: str) -> bool:
-    turn_id = _turn_id(item)
-    if not turn_id or _final_turn_delivered(store, turn_id):
-        return False
-    return state.mark_delivered(
-        store,
-        f"final:{turn_id}:{content_hash}",
-        {
-            "worker_id": compact_ws(item.get("worker_id"), 160),
-            "turn_id": turn_id,
-            "suppressed": "historical_same_worker_turn",
-        },
-    )
-
 
 
 _FOLD_ATTEMPT_CAP = state.RESPONSE_FOLD_ATTEMPT_CAP
@@ -4621,6 +3574,16 @@ def _ensure_topic(
         entry["binding_state"] = _BINDING_STATE_BOUND
         entry["binding_topic_id"] = str(entry["topic_id"])
         return False, False
+    ambiguous_record = _ambiguous_created_topic_for_entry(store, entry)
+    if ambiguous_record is not None:
+        _stamp_ambiguous_topic_create(entry, ambiguous_record)
+    if entry.get("binding_state") == "quarantined:ambiguous_topic_create":
+        # createForumTopic has no idempotency key. A transport failure after
+        # submission may still have created the topic, so blindly retrying can
+        # mint an untracked duplicate on every sync pass. Keep this owner
+        # quarantined until an operator inventories/adopts or resets topics.
+        entry.pop("binding_topic_id", None)
+        return False, False
     if str(entry.get("entry_type") or "") == "worker":
         identity = state.entry_stable_identity(entry)
         if identity is not None and any(
@@ -4638,13 +3601,6 @@ def _ensure_topic(
             # duplicate minting a second topic.
             entry["binding_state"] = "quarantined:stable_identity_collision"
             return False, False
-    reused = state.find_legacy_topic_id_by_name(store, entry.get("topic_name") or "")
-    if reused:
-        entry["topic_id"] = reused
-        entry["binding_state"] = _BINDING_STATE_BOUND
-        entry["binding_topic_id"] = str(reused)
-        _complete_topic_recovery(entry, reused)
-        return False, False
     if runtime.dry_run:
         entry["binding_state"] = _BINDING_STATE_PENDING_CREATE
         entry.pop("binding_topic_id", None)
@@ -4667,11 +3623,12 @@ def _ensure_topic(
         nonlocal accepted_receipt_id
         accepted_receipt_id = _checkpoint_accepted_created_topic(
             store,
-            runtime,
             captured,
             result,
             topic_name=str(topic_name),
         )
+        if accepted_receipt_id:
+            _checkpoint_topic_lifecycle(store, runtime)
 
     execution = _execute_entry_operation(
         store,
@@ -4701,11 +3658,7 @@ def _ensure_topic(
             _complete_accepted_created_topic(
                 store, accepted_receipt_id
             )
-            if (
-                not state.lock_actually_held()
-                and runtime.checkpoint is not None
-            ):
-                runtime.checkpoint()
+            _checkpoint_topic_lifecycle(store, runtime)
         return False, bool(created.get("ok") and created_topic_id)
     entry = resolution.entry
     assert entry is not None
@@ -4717,18 +3670,23 @@ def _ensure_topic(
         _complete_accepted_created_topic(
             store, accepted_receipt_id
         )
-        # Topic creation has no provider idempotency key. Its compact receipt
-        # was fsynced at provider acceptance, so the next ordinary state
-        # barrier can absorb this binding without an extra full-ledger save.
-        # Direct, unlocked helper callers have no sidecar durability context,
-        # so retain their explicit checkpoint contract.
-        if (
-            not state.lock_actually_held()
-            and runtime.checkpoint is not None
-        ):
-            runtime.checkpoint()
+        # Topic creation has no provider idempotency key. Persist the compact
+        # lifecycle receipt at acceptance, then atomically absorb the final
+        # binding into the ordinary state file before returning.
+        _checkpoint_topic_lifecycle(store, runtime)
         return True, True
     entry["last_topic_error"] = compact_ws(created.get("error"), 240)
+    if created.get("ambiguous_acceptance"):
+        _stamp_ambiguous_topic_create(
+            entry,
+            {
+                "topic_name": topic_name,
+                "error": created.get("error"),
+                "observed_at_unix": time.time(),
+            },
+        )
+        entry.pop("binding_topic_id", None)
+        return False, False
     entry["binding_state"] = (
         "create_error:"
         + (entry["last_topic_error"] or "unknown_create_error")
@@ -4866,21 +3824,6 @@ def _sync_topic_icon(store: dict[str, Any], entry: dict[str, Any], runtime: Sync
     return False
 
 
-def _legacy_pinned_message_id_for_topic(store: dict[str, Any], topic_id: str) -> str:
-    if not topic_id:
-        return ""
-    spaces = store.get("spaces") if isinstance(store.get("spaces"), dict) else {}
-    for entry in spaces.values():
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("topic_id") or "") != topic_id:
-            continue
-        message_id = str(entry.get("pinned_status_message_id") or "")
-        if message_id:
-            return message_id
-    return ""
-
-
 def _record_topic_pinned_status(entry: dict[str, Any], *, message_id: str, content_hash: str, pinned: bool = False) -> None:
     entry["pinned_status_message_id"] = str(message_id)
     entry["pinned_status_hash"] = content_hash
@@ -4967,7 +3910,7 @@ def _account_usage_snapshot_offlock(
         return accounts.usage_snapshot()
     # The OAuth usage endpoint has a 15-second timeout.  Persist the complete
     # pre-refresh state, release the flock for cache/network collection, then
-    # adopt any lane-child commit before pinned rendering resumes.
+    # adopt any concurrent ingress-lane commit before pinned rendering resumes.
     state.save_state(store)
     try:
         with state.released_lock():
@@ -4997,14 +3940,13 @@ def _sync_topic_pinned(
     if account_html:
         html = f"{html}\n{account_html}"
     content_hash = short_hash(html, 20)
-    message_id = str(entry.get("pinned_status_message_id") or "") or _legacy_pinned_message_id_for_topic(store, thread_id)
+    message_id = str(entry.get("pinned_status_message_id") or "")
     if message_id and entry.get("pinned_status_hash") == content_hash and entry.get("pinned_status_pinned"):
         return False
     if runtime.dry_run:
         _record_topic_pinned_status(entry, message_id=message_id or "0", content_hash=content_hash, pinned=True)
         return True
     sent: dict[str, Any]
-    accepted_receipt_id = ""
     if message_id:
         edit_operation = _capture_entry_operation(
             store,
@@ -5039,27 +3981,9 @@ def _sync_topic_pinned(
             entry["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
             return False
     if not message_id:
-        if (
-            not _notification_acceptance_capacity_available(store)
-            or _notification_kind_pending(store, "topic_pinned")
-        ):
-            return False
         send_operation = _capture_entry_operation(
             store, entry, topic_id=thread_id
         )
-
-        def checkpoint_topic_pin(
-            result: Any, operation: _OfflockEntryOperation
-        ) -> None:
-            nonlocal accepted_receipt_id
-            accepted_receipt_id = _checkpoint_accepted_notification(
-                store,
-                runtime,
-                operation,
-                result,
-                chat_id=chat_id,
-                kind="topic_pinned",
-            )
 
         execution = _execute_entry_operation(
             store,
@@ -5071,7 +3995,6 @@ def _sync_topic_pinned(
                 args=(chat_id, html),
                 kwargs={"thread_id": thread_id, "notify": False},
             ),
-            acceptance_checkpoint=checkpoint_topic_pin,
         )
         sent, send_resolution = execution.result, execution.resolution
         if not sent.get("ok") and _topic_missing(sent.get("error")):
@@ -5121,7 +4044,6 @@ def _sync_topic_pinned(
     assert entry is not None
     pinned = bool(pin_result.get("ok"))
     _record_topic_pinned_status(entry, message_id=message_id, content_hash=content_hash, pinned=pinned)
-    _complete_accepted_notification(store, accepted_receipt_id)
     if not pinned:
         entry["pinned_status_pin_error"] = compact_ws(pin_result.get("error"), 240)
     else:
@@ -5169,17 +4091,15 @@ def _assign_worker_topic_names(
     """Map each not-yet-topiced worker id -> a unique topic name (cwd basename, numbered on collision).
     Names already bound to a created topic are reserved and never renumbered, so numbers stay stable as
     panes come and go. Ordered by the shared canonical observation key for deterministic numbering."""
-    # Reserved names are compared case-INSENSITIVELY to match _ensure_topic's reuse lookup
-    # (find_legacy_topic_id_by_name uses .casefold()); otherwise "Foo"/"foo" would look distinct here
-    # yet still collapse into one topic there.
+    # Telegram topic names are case-insensitive, so reserve them the same way.
     def _is_variant_of(current: str, base: str) -> bool:
         # "gitmoot" and "gitmoot 3" are both variants of base "gitmoot" — keep them (stable numbering).
         cur, b = current.casefold(), base.casefold()
         return cur == b or (cur.startswith(b + " ") and current[len(base) + 1 :].strip().isdigit())
 
     entries = state.source_worker_entries(store)
-    # EVERY existing topic name starts reserved (absent/closed workers' topics included — a new pane
-    # must never collide with them, or _ensure_topic's reuse-by-name would collapse into their topic).
+    # EVERY existing topic name starts reserved (absent/closed workers' topics included) so a new
+    # pane never proposes a name already owned by a different topic.
     reserved: set[str] = set()
     for entry in entries.values():
         if entry.get("topic_id") and entry.get("topic_name"):
@@ -5216,9 +4136,8 @@ def _assign_worker_topic_names(
         current = compact_ws(existing.get("topic_name"), 120)
         keep = _is_variant_of(current, state.topic_name_for_worker(worker))
         keeps[assignment_key] = keep
-        # NOTE: the old name stays RESERVED even when a rename is proposed — freeing it mid-pass
-        # would let a new pane take it and collide into this topic via _ensure_topic's reuse-by-name
-        # (two live panes sharing one topic). It frees naturally on the pass AFTER the rename lands.
+        # NOTE: the old name stays RESERVED even when a rename is proposed. It frees naturally on
+        # the pass AFTER the rename lands, preventing two live panes from claiming the same name.
     assigned: dict[str, str] = {}
     renames: dict[str, str] = {}
     # wid -> base for names the connector itself minted a " N" suffix onto this pass (name != base after
@@ -5327,13 +4246,6 @@ def _sync_retired_worker_topics(
         if entry.get("retired_topic_notice_pending"):
             if runtime.dry_run:
                 continue
-            if (
-                not _notification_acceptance_capacity_available(store)
-                or _notification_kind_pending(
-                    store, "retired_topic_notice"
-                )
-            ):
-                continue
             survivor_topic_id = str(entry.get("consolidated_into_topic_id") or "")
             target = (
                 f" (topic {html_escape(survivor_topic_id)})"
@@ -5346,23 +4258,6 @@ def _sync_retired_worker_topics(
                 topic_id=topic_id,
                 observe=("retired_topic_notice_pending",),
             )
-            accepted_receipt_id = ""
-
-            def checkpoint_retired_notice(
-                result: Any, operation: _OfflockEntryOperation
-            ) -> None:
-                nonlocal accepted_receipt_id
-                accepted_receipt_id = (
-                    _checkpoint_accepted_notification(
-                        store,
-                        runtime,
-                        operation,
-                        result,
-                        chat_id=chat_id,
-                        kind="retired_topic_notice",
-                    )
-                )
-
             execution = _execute_entry_operation(
                 store,
                 runtime.telegram,
@@ -5380,7 +4275,6 @@ def _sync_retired_worker_topics(
                     ),
                     kwargs={"thread_id": topic_id, "notify": False},
                 ),
-                acceptance_checkpoint=checkpoint_retired_notice,
             )
             sent, notice_resolution = execution.result, execution.resolution
             if _topic_missing(sent.get("error")):
@@ -5403,9 +4297,6 @@ def _sync_retired_worker_topics(
                 entry.pop("retired_topic_notice_error", None)
                 entry["retired_topic_notice_message_id"] = str(
                     sent.get("message_id") or ""
-                )
-                _complete_accepted_notification(
-                    store, accepted_receipt_id
                 )
                 changed += 1
                 if runtime.checkpoint is not None:
@@ -5482,6 +4373,7 @@ def _sync_sources(
     runtime: SyncRuntime,
     *,
     chat_id: str,
+    yield_barrier: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     counts = {"created": 0, "updated": 0, "panes": 0, "spaces": 0, "icon_updated": 0}
     counts["updated"] += _recover_accepted_created_topics(
@@ -5582,6 +4474,8 @@ def _sync_sources(
     workers_by_space: dict[str, list[dict[str, Any]]] = {}
     observed_worker_entry_keys: set[str] = set()
     for worker in _ordered_workers(workers):
+        if yield_barrier is not None:
+            yield_barrier()
         space_id = compact_ws(worker.get("space_id"), 160)
         existing_key = worker_entry_reservations.get(id(worker))
         before = dict(state.source_worker_entries(store).get(existing_key) or {}) if existing_key is not None else {}
@@ -5613,7 +4507,7 @@ def _sync_sources(
         if entry.get("topic_id"):
             entry["binding_state"] = _BINDING_STATE_BOUND
             entry["binding_topic_id"] = str(entry["topic_id"])
-        else:
+        elif entry.get("binding_state") != "quarantined:ambiguous_topic_create":
             entry["binding_state"] = _BINDING_STATE_PENDING_CREATE
             entry.pop("binding_topic_id", None)
         # Apply the cwd-based, disambiguated name before the topic is created (once it has a topic_id
@@ -5700,6 +4594,9 @@ def _sync_sources(
             counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["panes"] += 1
 
+    if workers and yield_barrier is not None:
+        yield_barrier()
+
     # Visibility is a current-snapshot fact. Historical state survives for
     # lifecycle/reply ownership, but it must never inflate the live-unbound
     # board or doctor alarm.
@@ -5735,6 +4632,8 @@ def _sync_sources(
         return counts
 
     for space_id, space in spaces.items():
+        if yield_barrier is not None:
+            yield_barrier()
         if not _space_is_open(space):
             continue
         selectable = [worker for worker in workers_by_space.get(space_id, []) if _worker_is_open(worker)]
@@ -5794,6 +4693,8 @@ def _sync_sources(
         counts["updated"] += int(not created and before != entry)
         counts["icon_updated"] += int(_sync_topic_icon(store, entry, runtime, chat_id=chat_id))
         counts["spaces"] += 1
+    if spaces and yield_barrier is not None:
+        yield_barrier()
     for key in list(state.source_space_entries(store)):
         if key not in seen_space_keys:
             stale_entry = state.source_space_entries(store)[key]
@@ -6203,21 +5104,34 @@ def _cleanup_topics(
                 name=delete_topic_name,
                 reason="done_council_space_topic",
             )
-        if not runtime.dry_run:
-            if should_delete:
-                finalize_deleted_space_worker_aliases(
-                    cleared_worker_keys, "done_council_space_topic"
-                )
-            if not should_delete or delete_resolution.disposition == _OFFLOCK_APPLY:
-                current_entry = (
-                    delete_resolution.entry if should_delete else entry
-                )
+        if not runtime.dry_run and should_delete:
+            finalize_deleted_space_worker_aliases(
+                cleared_worker_keys, "done_council_space_topic"
+            )
+            if delete_resolution.disposition == _OFFLOCK_APPLY:
+                current_entry = delete_resolution.entry
                 assert current_entry is not None
                 current_key, _kind = _entry_operation_key(
                     store, current_entry
                 )
                 pop_space(current_key)
                 result["pruned"] += 1
+        elif not runtime.dry_run:
+            # Snapshot absence is not proof that a long-lived space/topic was
+            # deleted. Retain its identity and topic binding so a transient
+            # source blip cannot orphan the live Telegram topic and remint a
+            # duplicate when the same space returns.
+            before_retained = (
+                entry.get("binding_state"),
+                entry.get("binding_topic_id"),
+            )
+            entry["binding_state"] = _BINDING_STATE_ABSENT
+            entry.pop("binding_topic_id", None)
+            result["changed"] = result["changed"] or before_retained != (
+                entry.get("binding_state"),
+                entry.get("binding_topic_id"),
+            )
+            continue
         result["changed"] = True
     return result
 
@@ -7114,7 +6028,15 @@ def _deliver_working(
         message_id=str(entry.get("last_stream_message_id") or "")
         if edit_attempted
         else "",
-        observe=("last_stream_message_id",) if edit_attempted else (),
+        observe=(
+            ("last_stream_message_id",)
+            if edit_attempted
+            else (
+                "last_stream_message_id",
+                "last_stream_turn_id",
+                "last_stream_submission_id",
+            )
+        ),
     )
     if edit_attempted:
         execution = _execute_accounted_delivery_write(
@@ -7175,10 +6097,19 @@ def _deliver_working(
         entry = resolution.entry
         assert entry is not None
         _clear_stream_delivery_keys(entry)
-        if _delivery_write_budget(runtime).remaining == 0:
+        if (
+            _delivery_write_budget(runtime).remaining == 0
+        ):
             return False
         operation = _capture_entry_operation(
-            store, entry, topic_id=thread_id
+            store,
+            entry,
+            topic_id=thread_id,
+            observe=(
+                "last_stream_message_id",
+                "last_stream_turn_id",
+                "last_stream_submission_id",
+            ),
         )
         execution = _execute_accounted_delivery_write(
             store,
@@ -7231,6 +6162,8 @@ def _deliver_working(
                     bot_kind=bot_kind,
                     submission_id=submission_id,
                 )
+            # Preserve the exact provider id as presentation-retirement state;
+            # never turn an accepted stale write into an untracked resend.
             return False
         entry = resolution.entry
         assert entry is not None
@@ -7261,308 +6194,6 @@ def _deliver_working(
     assert entry is not None
     _record_delivery_error(entry, sent, bot_kind)
     return False
-
-
-def _submission_owner_entry(
-    store: dict[str, Any], record: dict[str, Any]
-) -> dict[str, Any] | None:
-    owner = record.get("target_owner")
-    if not isinstance(owner, dict):
-        return None
-    stable_key = owner.get("stable_key")
-    if not isinstance(stable_key, str):
-        return None
-    _entry_key, entry = state.find_worker_entry_by_stable_key(store, stable_key)
-    if (
-        entry is None
-        or state.entry_stable_identity(entry)
-        != (stable_key, owner.get("stable_key_version"))
-    ):
-        return None
-    return entry
-
-
-def _associate_submission_working(
-    store: dict[str, Any], record: dict[str, Any], entry: dict[str, Any]
-) -> bool:
-    submission_id = str(record.get("submission_id") or "")
-    turn_id = str(record.get("turn_id") or "")
-    if (
-        not submission_id
-        or not turn_id
-        or entry.get("last_stream_submission_id") != submission_id
-    ):
-        return False
-    changed = _entry_put(entry, "last_stream_turn_id", turn_id)
-    message_id = str(entry.get("last_stream_message_id") or "")
-    binding = state.find_message_binding(store, message_id)
-    if isinstance(binding, dict) and binding.get("submission_id") == submission_id:
-        if binding.get("turn_id") != turn_id:
-            binding["turn_id"] = turn_id
-            changed = True
-    return changed
-
-
-def _submission_instruction(record: dict[str, Any]) -> str:
-    request_json = record.get("request_json")
-    if not isinstance(request_json, str):
-        return ""
-    try:
-        request = json.loads(request_json)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return ""
-    instruction = request.get("instruction") if isinstance(request, dict) else None
-    return (
-        str(instruction.get("text") or "")
-        if isinstance(instruction, dict)
-        else ""
-    )
-
-
-def _apply_submission_links(
-    store: dict[str, Any], turns: list[dict[str, Any]], *, now: float
-) -> int:
-    changed = 0
-    for item in turns:
-        submission_id = item.get(_SUBMISSION_ID_KEY)
-        if not isinstance(submission_id, str):
-            continue
-        record, record_changed = ingress_requests.link_submission(
-            store,
-            submission_id,
-            _turn_id(item),
-            now=now,
-            submission_state=str(item.get(_SUBMISSION_STATE_KEY) or "linked"),
-        )
-        changed += int(record_changed)
-        if record is None:
-            continue
-        entry = _submission_owner_entry(store, record)
-        if entry is not None:
-            changed += int(_associate_submission_working(store, record, entry))
-    return changed
-
-
-def _sync_submission_working_cards(
-    store: dict[str, Any],
-    turns: list[dict[str, Any]],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    now: float,
-    yield_barrier: Callable[[], None] | None = None,
-) -> dict[str, int]:
-    """Render v3 receipts while leaving the legacy predicted-turn path inert."""
-
-    counts = {
-        "sent": 0,
-        "updated": 0,
-        "physical_writes": 0,
-        "work_pending": 0,
-    }
-    budget = _delivery_write_budget(runtime)
-    budget_start = budget.spent
-    complete_turn_ids = {
-        _turn_id(item) for item in turns if _turn_has_complete_final(item)
-    }
-    records = ingress_requests.retained_submission_records(store, now=now)
-    newest_by_owner: dict[str, dict[str, Any]] = {}
-    for record in records:
-        owner = record.get("target_owner")
-        stable_key = (
-            str(owner.get("stable_key") or "")
-            if isinstance(owner, dict)
-            else ""
-        )
-        current = newest_by_owner.get(stable_key)
-        if stable_key and (
-            current is None
-            or (
-                float(record.get("submitted_at") or 0),
-                str(record.get("submission_id") or ""),
-            )
-            > (
-                float(current.get("submitted_at") or 0),
-                str(current.get("submission_id") or ""),
-            )
-        ):
-            newest_by_owner[stable_key] = record
-    records = list(newest_by_owner.values())
-    records.sort(
-        key=lambda record: (
-            float(record.get("submitted_at") or 0),
-            str(record.get("submission_id") or ""),
-        )
-    )
-    for record in records:
-        request_id = str(record.get("request_id") or "")
-        if yield_barrier is not None:
-            yield_barrier()
-            record = next(
-                (
-                    candidate
-                    for candidate in ingress_requests.retained_submission_records(
-                        store, now=now
-                    )
-                    if candidate.get("request_id") == request_id
-                ),
-                None,
-            )
-            if record is None:
-                continue
-        writes_before = budget.spent
-        delivered = _deliver_submission_working_record(
-            store,
-            record,
-            runtime,
-            chat_id=chat_id,
-            now=now,
-            complete_turn_ids=complete_turn_ids,
-        )
-        counts["sent"] += delivered["sent"]
-        counts["updated"] += delivered["updated"]
-        writes_used = budget.spent - writes_before
-        counts["physical_writes"] = budget.spent - budget_start
-        if writes_used and not delivered["sent"]:
-            counts["work_pending"] += 1
-    return counts
-
-
-def _deliver_submission_working_record(
-    store: dict[str, Any],
-    record: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    now: float,
-    complete_turn_ids: set[str] | None = None,
-) -> dict[str, int]:
-    """Deliver the working card for one durable Tendwire v3 receipt."""
-
-    counts = {"sent": 0, "updated": 0}
-    submission_id = str(record.get("submission_id") or "")
-    turn_id = str(record.get("turn_id") or "")
-    if not submission_id:
-        return counts
-    entry = _submission_owner_entry(store, record)
-    if entry is None:
-        return counts
-    counts["updated"] += int(
-        _associate_submission_working(store, record, entry)
-    )
-    if record.get("submission_state") == "complete" or (
-        turn_id
-        and complete_turn_ids is not None
-        and turn_id in complete_turn_ids
-    ):
-        if record.get("submission_state") != "complete":
-            before = dict(record)
-            ingress_requests.attach_submission_receipt(
-                record,
-                submission_id,
-                "complete",
-                turn_id,
-                now=now,
-            )
-            counts["updated"] += int(record != before)
-        return counts
-    existing_message_id = str(
-        entry.get("last_stream_message_id") or ""
-    )
-    if (
-        entry.get("last_stream_submission_id") == submission_id
-        and existing_message_id
-        and existing_message_id != "0"
-    ):
-        binding = state.find_message_binding(store, existing_message_id)
-        if isinstance(binding, dict):
-            if binding.get("submission_id") != submission_id:
-                binding["submission_id"] = submission_id
-                counts["updated"] += 1
-            if turn_id and binding.get("turn_id") != turn_id:
-                binding["turn_id"] = turn_id
-                counts["updated"] += 1
-        return counts
-    stream_identity = turn_id or submission_id
-    item = {
-        "id": stream_identity,
-        "worker_id": str(
-            entry.get("tendwire_worker_id") or entry.get("worker_id") or ""
-        ),
-        "space_id": str(
-            entry.get("tendwire_space_id") or entry.get("space_id") or ""
-        ),
-        "complete": False,
-        "user_text": _submission_instruction(record),
-        _SUBMISSION_ID_KEY: submission_id,
-    }
-    before = dict(entry)
-    delivered = _deliver_working(
-        store,
-        item,
-        entry,
-        runtime,
-        chat_id=chat_id,
-    )
-    if delivered or entry.get("last_stream_turn_id") == stream_identity:
-        if entry.get("last_stream_submission_id") != submission_id:
-            entry["last_stream_submission_id"] = submission_id
-        message_id = str(entry.get("last_stream_message_id") or "")
-        binding = state.find_message_binding(store, message_id)
-        if isinstance(binding, dict):
-            binding["submission_id"] = submission_id
-    counts["sent"] += int(delivered)
-    counts["updated"] += int(not delivered and entry != before)
-    return counts
-
-
-def deliver_submission_working_card(
-    store: dict[str, Any],
-    request_id: str,
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-    now: float | None = None,
-) -> dict[str, Any]:
-    """Deliver one receipt-derived card at the durable acceptance boundary."""
-
-    observed_at = time.time() if now is None else float(now)
-    record = next(
-        (
-            candidate
-            for candidate in ingress_requests.retained_submission_records(
-                store, now=observed_at
-            )
-            if candidate.get("request_id") == request_id
-        ),
-        None,
-    )
-    if record is None:
-        return {
-            "ok": True,
-            "request_id": request_id,
-            "sent": 0,
-            "updated": 0,
-            "status": "receipt_not_found",
-        }
-    effective_runtime = _offlock_runtime(store, runtime)
-    counts = _deliver_submission_working_record(
-        store,
-        record,
-        effective_runtime,
-        chat_id=chat_id,
-        now=observed_at,
-    )
-    changed = bool(counts["sent"] or counts["updated"])
-    if changed and runtime.checkpoint is not None:
-        runtime.checkpoint()
-    return {
-        "ok": True,
-        "request_id": request_id,
-        **counts,
-        "changed": changed,
-        "status": "delivered" if counts["sent"] else "unchanged",
-    }
 
 
 def _refind_entry(store: dict[str, Any], entry_key: str | None) -> dict[str, Any] | None:
@@ -7688,44 +6319,15 @@ def _stage_final_plan(
     revision = _content_revision(item)
     if not revision:
         return False, 0, entry
-    exact_hold = state.find_partial_final_delivery(
-        store, _turn_id(item), revision
-    )
-    if (
-        isinstance(exact_hold, dict)
-        and exact_hold.get("request_phase") == "oversize_presentation"
-    ):
-        _notify_oversize_final(
-            store,
-            _turn_feed_item(item, entry),
-            entry,
-            runtime,
-            chat_id=config.telegram_chat_id(store),
-            turn_id=_turn_id(item),
-            content_hash=revision,
-            part_count=exact_hold.get("required_part_count"),
-        )
-    if (
-        isinstance(exact_hold, dict)
-        and exact_hold.get("operator_attention_required") is True
-        and not (
-            exact_hold.get("status") == "retry_authorized"
-            and entry.get("pending_content_revision") == revision
-            and isinstance(entry.get("pending_plan_generation"), int)
-            and not isinstance(entry.get("pending_plan_generation"), bool)
-            and int(entry["pending_plan_generation"]) > 1
-        )
-    ):
-        raise _TurnContentError(
-            "invalid_pending_plan",
-            "final revision is held after an incomplete multipart plan",
-        )
 
-    def _prepare_begin_kwargs(part_count: int) -> dict[str, Any]:
+    def _prepare_begin_kwargs(
+        part_count: int,
+        presentation_version: str = PRESENTATION_VERSION,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "turn_id": _turn_id(item),
             "content_revision": revision,
-            "presentation_version": PRESENTATION_VERSION,
+            "presentation_version": presentation_version,
             "part_count": part_count,
         }
         if source_ref is not None:
@@ -7760,6 +6362,14 @@ def _stage_final_plan(
             raise _TurnContentError(
                 "invalid_pending_plan", "pending plan has invalid part count"
             )
+        pending_presentation_version = entry.get(
+            "pending_presentation_version"
+        )
+        if pending_presentation_version != PRESENTATION_VERSION:
+            raise _TurnContentError(
+                "invalid_pending_plan",
+                "pending plan has an unsupported presentation version",
+            )
         operation = _capture_entry_operation(
             store,
             entry,
@@ -7775,7 +6385,10 @@ def _stage_final_plan(
                 reason=(
                     "tendwire.connector_prepare_begin: reconcile pending plan"
                 ),
-                kwargs=_prepare_begin_kwargs(pending_count),
+                kwargs=_prepare_begin_kwargs(
+                    pending_count,
+                    pending_presentation_version,
+                ),
             ),
         )
         observed, resolution = execution.result, execution.resolution
@@ -7827,68 +6440,28 @@ def _stage_final_plan(
                     conflict=str(observed.get("status") or "")
                     in {"revision_conflict", "stale_revision", "stale_ref"},
                 )
-        if observed.get("state") == "completed":
-            receipts = [
-                (job_key, receipt)
-                for job_key, receipt in state.tendwire_turn_jobs(store).items()
-                if isinstance(receipt, dict)
-                and receipt.get("plan_token") == pending_token
-            ]
-            for job_key, receipt in receipts:
-                if receipt.get("substate") in {
-                    "telegram_applied",
-                    "old_slot_retired",
-                }:
-                    state.update_tendwire_turn_job(
-                        store, job_key, substate="acknowledged"
-                    )
-                elif receipt.get("substate") != "acknowledged":
-                    raise _TurnContentError(
-                        "invalid_pending_plan",
-                        "completed plan lacks a durable Telegram outcome",
-                    )
-            if _maybe_complete_turn_plan(
-                store,
-                item,
-                entry,
-                plan_token=pending_token,
-                revision=revision,
-            ):
-                _checkpoint_turn_job(runtime)
-            elif _observe_jammed_pending_plan(
-                store,
-                entry,
-                turn_id=_turn_id(item),
-                plan_token=pending_token,
-                revision=revision,
-                part_count=pending_count,
-            ):
-                _checkpoint_turn_job(runtime)
+        if observed.get("state") == "completed" and _complete_turn_plan_from_bindings(
+            store,
+            item,
+            entry,
+            plan_token=pending_token,
+            revision=revision,
+            part_count=pending_count,
+        ):
+            _checkpoint_turn_job(runtime)
         return False, 0, entry
 
     page_calls = _materialize_turn_item(item, runtime)
-    feed_item = _turn_feed_item(item, entry)
-    try:
-        parts = _prepare_final_delivery_parts(feed_item)
-    except _TurnContentError as exc:
-        if exc.status == "oversize_presentation":
-            _record_oversize_final_delivery(
-                store,
-                entry,
-                turn_id=_turn_id(item),
-                content_hash=revision,
-            )
-            _notify_oversize_final(
-                store,
-                feed_item,
-                entry,
-                runtime,
-                chat_id=config.telegram_chat_id(store),
-                turn_id=_turn_id(item),
-                content_hash=revision,
-                part_count=exc.part_count,
-            )
-        raise
+    # Final plans are a lossless projection of Tendwire's canonical revision.
+    # Repeated-prompt suppression is a working-card display policy; applying it
+    # here drops a required user_text span and makes Tendwire reject the plan as
+    # incomplete before any Telegram job can be created.
+    feed_item = _canonical_final_feed_item(item, entry)
+    parts = _prepare_final_delivery_parts(
+        feed_item,
+        rich_transport=config.rich_messages_enabled(),
+    )
+    _validate_final_plan_exact_coverage(item, parts)
     if not parts:
         raise _TurnContentError(
             "invalid_presentation_plan",
@@ -7906,6 +6479,7 @@ def _stage_final_plan(
         )
         entry["pending_turn_user_hash"] = _turn_user_hash(item)
         entry["pending_plan_generation"] = 1
+        entry["pending_presentation_version"] = PRESENTATION_VERSION
         entry.pop("pending_stream_submission_id", None)
         if entry.get("last_stream_submission_id"):
             entry["pending_stream_submission_id"] = str(
@@ -7962,7 +6536,7 @@ def _stage_final_plan(
         raise _TurnContentError(
             "invalid_prepare_response", "prepare begin returned invalid state"
         )
-    # Stamp the parent before creating children.  If child creation stops, the
+    # Stamp the plan before creating part jobs. If part creation stops, the
     # ordinary pass barrier persists a named, ageing plan instead of leaving a
     # route-local pin with no clock.  Re-observing the same token never resets
     # the clock.
@@ -7981,6 +6555,13 @@ def _stage_final_plan(
             else 0
         ),
     )
+    # The plan checkpoint is the durable resume contract for every part job
+    # and commit call below.  Persist the protocol version with that parent,
+    # not only after a successful commit: if the request or transport stops
+    # after prepare-part, the retry must reopen the same plan version/token.
+    # Falling back to the legacy version here creates a second empty plan and
+    # permanently rejects the source final.
+    entry["pending_presentation_version"] = PRESENTATION_VERSION
     final_identity = item.get(_TURN_FINAL_IDENTITY_KEY)
     if isinstance(final_identity, str) and final_identity:
         entry["pending_final_identity"] = final_identity
@@ -8127,6 +6708,7 @@ def _stage_final_plan(
     )
     entry["pending_turn_user_hash"] = _turn_user_hash(item)
     entry["pending_plan_generation"] = generation
+    entry["pending_presentation_version"] = PRESENTATION_VERSION
     entry.pop("pending_stream_submission_id", None)
     if entry.get("last_stream_submission_id"):
         entry["pending_stream_submission_id"] = str(
@@ -8140,6 +6722,8 @@ def _stage_final_plan(
 
 def _prepare_final_delivery_parts(
     feed_item: dict[str, Any],
+    *,
+    rich_transport: bool = False,
 ) -> list[dict[str, Any]]:
     """Turn expected content limits into a per-item outcome.
 
@@ -8151,7 +6735,7 @@ def _prepare_final_delivery_parts(
     try:
         parts = prepare_turn_delivery_parts(
             feed_item,
-            rich_transport=False,
+            rich_transport=rich_transport,
         )
         # Keep canonical planning reconstructable at every size.  The cap is a
         # delivery policy: reject the whole logical send into an observable
@@ -8170,6 +6754,64 @@ def _prepare_final_delivery_parts(
             "invalid_presentation_plan",
             str(exc),
         ) from exc
+
+
+def _validate_final_plan_exact_coverage(
+    item: dict[str, Any], parts: list[dict[str, Any]]
+) -> None:
+    """Reject lossy local plans before creating a durable Tendwire plan."""
+
+    content = item.get("content")
+    fields = content.get("fields") if isinstance(content, dict) else None
+    if not isinstance(fields, dict):
+        raise _TurnContentError(
+            "invalid_presentation_plan",
+            "completed turn has no canonical field descriptors",
+        )
+    spans_by_field: dict[str, list[tuple[int, int]]] = {}
+    for part in parts:
+        for span in part.get("spans") or []:
+            field = str(span.get("field") or "")
+            start = span.get("start_char")
+            end = span.get("end_char")
+            if (
+                field not in {"user_text", "assistant_final_text"}
+                or isinstance(start, bool)
+                or not isinstance(start, int)
+                or isinstance(end, bool)
+                or not isinstance(end, int)
+            ):
+                raise _TurnContentError(
+                    "invalid_presentation_plan",
+                    "final presentation contains an invalid content span",
+                )
+            spans_by_field.setdefault(field, []).append((start, end))
+    for field in ("user_text", "assistant_final_text"):
+        descriptor = fields.get(field)
+        if not isinstance(descriptor, dict):
+            raise _TurnContentError(
+                "invalid_presentation_plan",
+                f"completed turn is missing {field} descriptor",
+            )
+        expected = (
+            int(descriptor.get("char_length") or 0)
+            if descriptor.get("availability") == "complete"
+            else 0
+        )
+        spans = spans_by_field.get(field, [])
+        cursor = 0
+        for start, end in spans:
+            if start != cursor or end <= start or end > expected:
+                raise _TurnContentError(
+                    "invalid_presentation_plan",
+                    f"final presentation does not exactly cover {field}",
+                )
+            cursor = end
+        if cursor != expected:
+            raise _TurnContentError(
+                "invalid_presentation_plan",
+                f"final presentation does not exactly cover {field}",
+            )
 
 
 def _notify_unbound_final(
@@ -8202,7 +6844,6 @@ def _notify_unbound_final(
         or entry.get("binding_state") == _BINDING_STATE_BOUND
         or not notice_eligible
         or _delivery_write_budget(runtime).remaining <= 0
-        or not _notification_acceptance_capacity_available(store)
     ):
         return 0
     now = time.time()
@@ -8216,15 +6857,6 @@ def _notify_unbound_final(
         return 0
     worker_id = _entry_worker_id(entry) or "unknown pane"
     turn_id = _turn_id(item)
-    notice_kind = "unbound_final:" + short_hash(
-        {
-            "worker_id": worker_id,
-            "pane_uuid": state.entry_pane_uuid(entry),
-        },
-        20,
-    )
-    if _notification_kind_pending(store, notice_kind):
-        return 0
     html = (
         "<b>Live pane has no Telegram topic</b>\n"
         f"{html_escape(worker_id, 160)} has a completed turn waiting "
@@ -8298,357 +6930,6 @@ def _unbound_live_entry_for_item(
         and _entry_worker_id(entry) == worker_id
     ]
     return matches[0] if worker_id and len(matches) == 1 else None
-
-
-def _deliver_final(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    chat_id: str,
-) -> bool:
-    thread_id = str(entry.get("topic_id") or "")
-    if not thread_id:
-        _notify_unbound_final(
-            store, item, entry, runtime, chat_id=chat_id
-        )
-        return False
-    turn_id = _turn_id(item)
-    content_hash = _turn_content_hash(item, "final")
-    identity = f"final:{turn_id}:{content_hash}"
-    exact_record = _partial_final_delivery_record(
-        store, turn_id=turn_id, content_hash=content_hash
-    )
-    if (
-        isinstance(exact_record, dict)
-        and exact_record.get("status") == "resolved"
-    ):
-        # A resolved record is a permanent replay witness. It is retained even
-        # after the route-local alert is cleared so the same content identity
-        # can never be re-fired by a later owner generation.
-        return False
-    retry_missing = bool(
-        isinstance(exact_record, dict)
-        and exact_record.get("status") == "retry_authorized"
-        and exact_record.get("terminal_outcome") == "not_delivered"
-        and exact_record.get("resolution_action") == "retry-missing"
-    )
-    active_records = state.active_partial_final_deliveries_for_turn(
-        store, turn_id
-    )
-    if isinstance(exact_record, dict) and not retry_missing:
-        if exact_record.get("request_phase") == "oversize_presentation":
-            _notify_oversize_final(
-                store,
-                _turn_feed_item(item, entry),
-                entry,
-                runtime,
-                chat_id=chat_id,
-                turn_id=turn_id,
-                content_hash=content_hash,
-                part_count=exact_record.get("required_part_count"),
-            )
-        _reconcile_partial_final_hold(
-            store,
-            entry,
-            exact_record,
-            requested_content_hash=content_hash,
-        )
-        return False
-    revision_blockers = [
-        record
-        for record in active_records
-        if record.get("content_hash") != content_hash
-        and record.get("superseded_by_content_hash") != content_hash
-    ]
-    if retry_missing:
-        revision_blockers = []
-    if revision_blockers and not all(
-        _partial_final_hold_escalated(record, now=time.time())
-        for record in revision_blockers
-    ):
-        _reconcile_partial_final_hold(
-            store,
-            entry,
-            min(
-                revision_blockers,
-                key=lambda record: float(record.get("created_at") or 0),
-            ),
-            requested_content_hash=content_hash,
-        )
-        return False
-    presentation_item = (
-        _superseding_final_feed_item(item)
-        if revision_blockers
-        else item
-    )
-    visible_here = bool(
-        _final_delivery_bindings(store, turn_id, topic_id=thread_id)
-    )
-    exact_final_visible_here = bool(
-        visible_here
-        and entry.get("last_turn_id") == turn_id
-        and entry.get("last_clean_hash") == content_hash
-    )
-    placeholder_here = bool(
-        entry.get("last_turn_id") == turn_id
-        and entry.get("last_clean_hash") == content_hash
-        and entry.get("last_clean_message_ids") == ["0"]
-    )
-    if identity in state.delivered_turns(store) and (
-        exact_final_visible_here or placeholder_here
-    ):
-        _repair_delivered_final_entry(store, item, entry, content_hash)
-        entry.pop("tendwire_rebind_catchup_pending", None)
-        return False
-    feed_item = _turn_feed_item(presentation_item, entry)
-    try:
-        _prepare_final_delivery_parts(feed_item)
-    except _TurnContentError as exc:
-        if exc.status == "oversize_presentation":
-            _record_oversize_final_delivery(
-                store,
-                entry,
-                turn_id=turn_id,
-                content_hash=content_hash,
-            )
-            _notify_oversize_final(
-                store,
-                feed_item,
-                entry,
-                runtime,
-                chat_id=chat_id,
-                turn_id=turn_id,
-                content_hash=content_hash,
-                part_count=exc.part_count,
-            )
-            return False
-        raise
-    if runtime.dry_run:
-        state.mark_delivered(store, identity, {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id})
-        _set_final_delivery(
-            entry,
-            turn_id=turn_id,
-            content_hash=content_hash,
-            user_hash=_turn_user_hash(item),
-            render_version=RENDER_VERSION,
-            placeholder=True,
-        )
-        entry.pop("tendwire_rebind_catchup_pending", None)
-        return True
-    send_changed_as_new = _changed_final_should_send_new_message(item, entry)
-    if _final_turn_delivered(store, turn_id) and visible_here:
-        replaced = bool(
-            not send_changed_as_new
-            and entry.get("last_clean_hash") == content_hash
-            and _replace_changed_final(
-                store,
-                presentation_item,
-                entry,
-                runtime,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                content_hash=content_hash,
-                identity=identity,
-            )
-        )
-        if replaced:
-            if revision_blockers:
-                _record_partial_final_supersession(
-                    revision_blockers,
-                    content_hash=content_hash,
-                    message_ids=list(
-                        entry.get("last_clean_message_ids") or []
-                    ),
-                )
-            return True
-        if not send_changed_as_new:
-            _repair_delivered_final_entry(store, item, entry, content_hash)
-            return False
-    replaced = bool(
-        not send_changed_as_new
-        and _replace_changed_final(
-            store,
-            presentation_item,
-            entry,
-            runtime,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            content_hash=content_hash,
-            identity=identity,
-        )
-    )
-    if replaced:
-        if revision_blockers:
-            _record_partial_final_supersession(
-                revision_blockers,
-                content_hash=content_hash,
-                message_ids=list(
-                    entry.get("last_clean_message_ids") or []
-                ),
-            )
-        return True
-    if _delivery_write_budget(runtime).remaining == 0:
-        return False
-    promoted = _promote_working_to_final(
-        store,
-        presentation_item,
-        entry,
-        runtime,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        content_hash=content_hash,
-        identity=identity,
-    )
-    if promoted:
-        if revision_blockers:
-            _record_partial_final_supersession(
-                revision_blockers,
-                content_hash=content_hash,
-                message_ids=list(
-                    entry.get("last_clean_message_ids") or []
-                ),
-            )
-        return True
-    if _delivery_write_budget(runtime).remaining == 0:
-        return False
-    if not state.partial_final_delivery_has_unresolved_capacity(store):
-        # Do not start a provider write when an incomplete outcome could not
-        # be recorded without discarding another unresolved obligation.
-        return False
-    telegram = _telegram_state(store)
-    api_token, bot_kind = _delivery_bot(store, entry)
-    operation = _capture_entry_operation(
-        store, entry, topic_id=thread_id
-    )
-    start_part_index = (
-        int(exact_record.get("failed_part_index") or 0)
-        if retry_missing and isinstance(exact_record, dict)
-        else 0
-    )
-    execution = _execute_accounted_delivery_write(
-        store,
-        runtime,
-        operation,
-        _provider_mutation(
-            "telegram.send_feed_item",
-            reason="telegram.send_feed_item: deliver legacy final",
-            args=(chat_id, feed_item),
-            kwargs={
-                "telegram": telegram,
-                "thread_id": thread_id,
-                "notify": False,
-                "api_token": api_token,
-                "start_part_index": start_part_index,
-                "max_physical_writes": _delivery_write_budget(
-                    runtime
-                ).remaining,
-            },
-        ),
-    )
-    sent, resolution = execution.result, execution.resolution
-    message_ids = split_legacy_message_ids(sent)
-    if not sent.get("ok"):
-        if (
-            (sent.get("partial") is True and message_ids)
-            or retry_missing
-        ):
-            partial_entry = (
-                resolution.entry
-                if resolution.disposition == _OFFLOCK_APPLY
-                else _operation_binding_entry(operation)
-            )
-            assert partial_entry is not None
-            _record_partial_final_delivery(
-                store,
-                partial_entry,
-                sent,
-                turn_id=turn_id,
-                content_hash=content_hash,
-                topic_id=thread_id,
-                bot_kind=bot_kind,
-            )
-        elif _topic_missing(sent.get("error")):
-            _repair_provider_gone_topic(
-                store,
-                resolution.entry
-                if resolution.disposition == _OFFLOCK_APPLY
-                else None,
-                sent,
-                topic_id=thread_id,
-            )
-        elif resolution.disposition == _OFFLOCK_APPLY:
-            assert resolution.entry is not None
-            _record_delivery_error(resolution.entry, sent, bot_kind)
-        return False
-    if resolution.disposition != _OFFLOCK_APPLY:
-        binding_entry = _operation_binding_entry(operation)
-        for message_id in message_ids:
-            state.bind_message_to_worker(
-                store,
-                message_id,
-                binding_entry,
-                topic_id=thread_id,
-                kind="final",
-                turn_id=turn_id,
-                bot_kind=bot_kind,
-            )
-        if retry_missing and isinstance(exact_record, dict):
-            combined_ids = list(exact_record.get("message_ids") or [])
-            for message_id in message_ids:
-                if message_id not in combined_ids:
-                    combined_ids.append(message_id)
-            state.complete_partial_final_retry(
-                store,
-                turn_id=turn_id,
-                content_hash=content_hash,
-                message_ids=combined_ids,
-                now=time.time(),
-            )
-        if revision_blockers:
-            _record_partial_final_supersession(
-                revision_blockers,
-                content_hash=content_hash,
-                message_ids=message_ids,
-            )
-        # The accepted text remains an exact, tracked provider fact. Let the
-        # optional voice follow-up use its captured thread; routing/delivery
-        # completion itself remains deferred to the current route.
-        return True
-    entry = resolution.entry
-    assert entry is not None
-    if retry_missing and isinstance(exact_record, dict):
-        combined_ids = list(exact_record.get("message_ids") or [])
-        for message_id in message_ids:
-            if message_id not in combined_ids:
-                combined_ids.append(message_id)
-        message_ids = combined_ids
-    _record_final_delivery_success(
-        store,
-        item,
-        entry,
-        thread_id=thread_id,
-        message_ids=message_ids,
-        content_hash=content_hash,
-        identity=identity,
-        bot_kind=bot_kind,
-    )
-    if retry_missing:
-        state.complete_partial_final_retry(
-            store,
-            turn_id=turn_id,
-            content_hash=content_hash,
-            message_ids=message_ids,
-            now=time.time(),
-        )
-    if revision_blockers:
-        _record_partial_final_supersession(
-            revision_blockers,
-            content_hash=content_hash,
-            message_ids=message_ids,
-        )
-    return True
 
 
 def _deliver_pending(
@@ -8732,74 +7013,6 @@ def _deliver_pending(
     return False
 
 
-def _bootstrap_existing_turns(
-    store: dict[str, Any],
-    turns_payload: dict[str, Any],
-    pending_payload: dict[str, Any],
-    *,
-    skip_v2_finals: bool = False,
-    complete: bool = True,
-) -> int:
-    """Record current Tendwire rows as seen on first deployment.
-
-    The pre-slim source ledger used different identities. Without this bootstrap,
-    the first source-only sync can repost historical rows. This migration is
-    intentionally one-way and Telegram-silent.
-    """
-    if store.get("tendwired_bootstrap_complete"):
-        return 0
-    skipped = 0
-    for item in _turns(turns_payload):
-        if _turn_has_content_outcome(item):
-            continue
-        _key, entry = _entry_for_turn(store, item)
-        if entry is None:
-            continue
-        turn_id = _turn_id(item)
-        if not turn_id:
-            continue
-        if _turn_has_complete_final(item):
-            if skip_v2_finals and _content_revision(item):
-                continue
-            revision = _content_revision(item)
-            content_hash = revision or _turn_content_hash(item, "final")
-            identity = f"final:{turn_id}:{content_hash}"
-            record = {"worker_id": entry.get("tendwire_worker_id"), "turn_id": turn_id}
-            if revision:
-                record["content_revision"] = revision
-                entry["last_clean_content_revision"] = revision
-            state.mark_delivered(store, identity, record)
-            _set_final_delivery(entry, turn_id=turn_id, content_hash=content_hash, placeholder=True)
-            skipped += 1
-            continue
-        if item.get("assistant_stream_text"):
-            _set_stream_delivery(entry, turn_id=turn_id, content_hash=_turn_content_hash(item, "working"), placeholder=True)
-            skipped += 1
-    for item in _pending(pending_payload):
-        _key, entry = _entry_for_turn(store, item)
-        if entry is None:
-            continue
-        pending_id = compact_ws(item.get("id") or item.get("pending_id") or item.get("turn_id"), 200)
-        if not pending_id:
-            continue
-        content_hash = short_hash({"pending": pending_id, "text": item.get("prompt_text") or item.get("text")}, 20)
-        state.mark_delivered(
-            store,
-            f"pending:{pending_id}:{content_hash}",
-            {"worker_id": entry.get("tendwire_worker_id"), "pending_id": pending_id},
-        )
-        skipped += 1
-    previous_seen = store.get("tendwired_bootstrap_seen")
-    store["tendwired_bootstrap_seen"] = (
-        int(previous_seen)
-        if isinstance(previous_seen, int) and not isinstance(previous_seen, bool)
-        else 0
-    ) + skipped
-    if complete:
-        store["tendwired_bootstrap_complete"] = True
-    return skipped
-
-
 def _sync_turns(
     store: dict[str, Any],
     turns_payload: dict[str, Any],
@@ -8810,7 +7023,6 @@ def _sync_turns(
     chat_id: str,
     live_worker_ids: set[str] | None = None,
     yield_barrier: Any | None = None,
-    list_finals_are_authoritative: bool = True,
     checkpoint_after_delivery: bool = False,
     retained_projection: dict[str, Any] | None = None,
 ) -> dict[str, int]:
@@ -8858,7 +7070,6 @@ def _sync_turns(
             )
         ]
     latest_content_turn_by_worker: dict[str, str] = {}
-    latest_completed_turn_by_worker: dict[str, str] = {}
     placeholder_turn_ids_by_worker: dict[str, set[str]] = {}
     # Pass 1: real content only (user prompt, stream, or a completed final).
     # Tendwire store output is already ordered by per-worker observed recency.
@@ -8876,10 +7087,6 @@ def _sync_turns(
         if not _turn_has_real_content(item):
             continue
         latest_content_turn_by_worker.setdefault(worker_key, _turn_id(item))
-        if _turn_has_complete_final(item):
-            latest_completed_turn_by_worker.setdefault(
-                worker_key, _turn_id(item)
-            )
     # Pass 2: synthetic "Work is in progress." placeholders only fill workers
     # with no real turn at all — a placeholder must never outrank a real turn.
     for item in turns:
@@ -8916,7 +7123,6 @@ def _sync_turns(
             delivery_turns = (
                 delivery_turns[split_at:] + delivery_turns[:split_at]
             )
-    seen_final_workers: set[str] = set()
     seen_working_workers: set[str] = set()
     fold_state: dict[str, int] = {
         "issued": 0,
@@ -8960,103 +7166,15 @@ def _sync_turns(
         latest_turn_id = latest_content_turn_by_worker.get(worker_key)
         complete = _turn_has_complete_final(item)
         if complete:
-            if entry.get("tendwire_rebind_catchup_pending"):
-                latest_turn_id = latest_completed_turn_by_worker.get(
-                    worker_key
-                )
             if latest_turn_id and _turn_id(item) != latest_turn_id:
-                delivered = False
-                content_hash = _content_revision(item) or _turn_content_hash(item, "final")
-                counts["updated"] += int(_suppress_historical_final(store, item, content_hash))
                 writes_before = budget.spent
                 counts["updated"] += int(_fold_superseded_final(store, item, entry, runtime, chat_id=chat_id, fold_state=fold_state))
                 if budget.spent > writes_before:
                     counts["physical_writes"] = budget.spent - budget_start
                 continue
-            if not list_finals_are_authoritative and _content_revision(item):
-                continue
-            if worker_key in seen_final_workers:
-                continue
-            seen_final_workers.add(worker_key)
             if _content_revision(item):
-                try:
-                    _staged, page_calls, entry = _stage_final_plan(
-                        store, item, entry, runtime
-                    )
-                    counts["content_pages"] += page_calls
-                except _TurnContentError as exc:
-                    if exc.conflict and relist_on_conflict:
-                        raise
-                    item[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
-                        item, exc.status
-                    )
-                    continue
-                delivered = False
-            else:
-                delivery_thread_id = str(
-                    entry.get("topic_id") or ""
-                )
-                prior_final_message_ids = {
-                    message_id
-                    for message_id, _binding in (
-                        _final_delivery_bindings(
-                            store,
-                            _turn_id(item),
-                            topic_id=delivery_thread_id,
-                        )
-                    )
-                }
-                writes_before = budget.spent
-                delivered = (
-                    _deliver_final(
-                        store,
-                        item,
-                        entry,
-                        runtime,
-                        chat_id=chat_id,
-                    )
-                    if budget.remaining
-                    else False
-                )
-                writes_used = budget.spent - writes_before
-                if writes_used:
-                    counts["physical_writes"] = budget.spent - budget_start
-                if not delivered and (writes_used or not budget.remaining):
-                    counts["work_pending"] += 1
-                    counts["failed_writes"] += int(bool(writes_used))
-                    if writes_used:
-                        fairness_cursor_candidate = _turn_id(item)
-                if delivered:
-                    # Legacy inline direct-call compatibility; v2 finals are spoken only after the
-                    # complete ordered plan is acknowledged.
-                    delivery_bindings = _final_delivery_bindings(
-                        store,
-                        _turn_id(item),
-                        topic_id=delivery_thread_id,
-                    )
-                    new_delivery_bindings = [
-                        binding
-                        for binding in delivery_bindings
-                        if binding[0]
-                        not in prior_final_message_ids
-                    ]
-                    reply_binding = (
-                        new_delivery_bindings[0]
-                        if new_delivery_bindings
-                        else delivery_bindings[-1]
-                        if delivery_bindings
-                        else None
-                    )
-                    entry = _speak_reply(
-                        store, item, entry, entry_key, runtime,
-                        chat_id=chat_id,
-                        thread_id=delivery_thread_id,
-                        reply_to=(
-                            reply_binding[0]
-                            if reply_binding is not None
-                            else None
-                        ),
-                    )
+                continue
+            continue
         elif item.get("assistant_stream_text") or _turn_is_working_placeholder(item, entry):
             if latest_turn_id and _turn_id(item) != latest_turn_id:
                 continue
@@ -9593,32 +7711,6 @@ def _clear_final_source_owner(
         store.pop(_TURN_FINAL_SOURCE_OWNERS_KEY, None)
 
 
-def _materialize_final_ready(
-    payload: dict[str, Any],
-    runtime: SyncRuntime,
-) -> tuple[dict[str, Any], int]:
-    row = _final_ready_row(payload)
-    page_calls = _materialize_turn_item(row, runtime)
-    return row, page_calls
-
-
-def _materialize_legacy_plan_source(
-    turns_payload: dict[str, Any],
-    revision: str,
-    runtime: SyncRuntime,
-) -> tuple[dict[str, Any] | None, int]:
-    matches = [
-        item
-        for item in _turns(turns_payload)
-        if _content_revision(item) == revision
-    ]
-    if len(matches) != 1:
-        return None, 0
-    item = matches[0]
-    page_calls = _materialize_turn_item(item, runtime)
-    return item, page_calls
-
-
 def _turn_item_by_revision(
     turns_payload: dict[str, Any], revision: str
 ) -> dict[str, Any] | None:
@@ -9631,43 +7723,52 @@ def _slot_binding(
     *,
     turn_id: str,
     ordinal: int,
-    plan_token: str = "",
+    plan_token: str,
 ) -> tuple[str, dict[str, Any]] | tuple[None, None]:
-    candidates: list[tuple[str, dict[str, Any]]] = []
-    for message_id, binding in _final_delivery_bindings(store, turn_id):
-        binding_ordinal = binding.get("part_ordinal")
-        if binding_ordinal is None:
-            ids = [
-                str(value)
-                for value in (binding.get("message_ids") or [])
-                if str(value or "")
-            ]
-            if ids:
-                binding_ordinal = ids.index(message_id) if message_id in ids else None
-        if binding_ordinal is None:
-            entry_ids = [
-                str(value)
-                for entry in state.source_entries(store).values()
-                if entry.get("last_turn_id") == turn_id
-                for value in (entry.get("last_clean_message_ids") or [])
-            ]
-            binding_ordinal = entry_ids.index(message_id) if message_id in entry_ids else 0
-        if binding_ordinal != ordinal:
-            continue
-        if plan_token and binding.get("plan_token") not in (None, "", plan_token):
-            continue
-        candidates.append((message_id, binding))
-    return candidates[-1] if candidates else (None, None)
+    matches = [
+        (message_id, binding)
+        for message_id, binding in _final_delivery_bindings(store, turn_id)
+        if binding.get("plan_token") == plan_token
+        and binding.get("part_ordinal") == ordinal
+    ]
+    return matches[0] if len(matches) == 1 else (None, None)
+
+
+def _exact_job_binding(
+    store: dict[str, Any],
+    *,
+    job_key: str,
+    turn_id: str,
+    revision: str,
+    plan_token: str,
+    ordinal: int,
+    part_count: int,
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    matches = [
+        (message_id, binding)
+        for message_id, binding in _final_delivery_bindings(store, turn_id)
+        if binding.get("tendwire_job_key") == job_key
+        and binding.get("content_revision") == revision
+        and binding.get("plan_token") == plan_token
+        and binding.get("part_ordinal") == ordinal
+        and binding.get("part_count") == part_count
+    ]
+    if len(matches) > 1:
+        raise _TurnContentError(
+            "invalid_turn_final_job",
+            "multiple Telegram messages claim the same final-delivery job",
+        )
+    return matches[0] if matches else (None, None)
 
 
 def _owning_bot_token(store: dict[str, Any], bot_kind: str) -> str | None:
     if not bot_kind or bot_kind == MANAGER_BOT_KIND:
         return None
-    token = managed_bot_token(_telegram_state(store), bot_kind)
+    token = _legacy_presenter_bot_token(store, bot_kind)
     if not token:
         raise _TurnContentError(
             "missing_message_owner_token",
-            f"cannot retire a message owned by unavailable bot kind {bot_kind}",
+            f"cannot mutate a message owned by unavailable bot kind {bot_kind}",
         )
     return token
 
@@ -9677,8 +7778,6 @@ def _retire_local_message(
     entry: dict[str, Any] | None,
     message_id: str,
 ) -> None:
-    """Apply the exact provider fact independently of entry disposition."""
-
     state.message_bindings(store).pop(str(message_id), None)
     candidates = (
         [entry]
@@ -9703,42 +7802,139 @@ def _current_upsert_candidate(
     turn_id = _turn_id(item)
     if ordinal == 0:
         working_id = str(entry.get("last_stream_message_id") or "")
-        predecessor_turn_id = str(
+        predecessor = str(
             item.get(_TURN_FINAL_WORKING_PREDECESSOR_KEY)
             or entry.get("pending_working_predecessor_turn_id")
             or ""
         )
-        stream_turn_id = str(
-            entry.get("last_stream_turn_id") or ""
-        )
-        if working_id and (
-            stream_turn_id == turn_id
-            or (
-                predecessor_turn_id
-                and stream_turn_id == predecessor_turn_id
-            )
-        ):
+        stream_turn = str(entry.get("last_stream_turn_id") or "")
+        if working_id and stream_turn in {turn_id, predecessor}:
             binding = state.find_message_binding(store, working_id)
             return (
                 working_id,
-                str((binding or {}).get("bot_kind") or entry.get("last_stream_bot_kind") or MANAGER_BOT_KIND),
+                str(
+                    (binding or {}).get("bot_kind")
+                    or entry.get("last_stream_bot_kind")
+                    or MANAGER_BOT_KIND
+                ),
                 str((binding or {}).get("topic_id") or entry.get("topic_id") or ""),
                 "working",
             )
-    message_id, binding = _slot_binding(
-        store,
-        turn_id=turn_id,
-        ordinal=ordinal,
-        plan_token=replaces_plan_token,
-    )
-    if message_id and binding:
-        return (
-            message_id,
-            str(binding.get("bot_kind") or entry.get("last_clean_bot_kind") or MANAGER_BOT_KIND),
-            str(binding.get("topic_id") or ""),
-            "final",
+    if replaces_plan_token:
+        message_id, binding = _slot_binding(
+            store,
+            turn_id=turn_id,
+            ordinal=ordinal,
+            plan_token=replaces_plan_token,
         )
+        if message_id and binding:
+            return (
+                message_id,
+                str(binding.get("bot_kind") or MANAGER_BOT_KIND),
+                str(binding.get("topic_id") or ""),
+                "final",
+            )
     return "", "", "", ""
+
+
+def _clear_pending_turn_plan(
+    store: dict[str, Any], entry: dict[str, Any]
+) -> None:
+    _clear_final_source_owner(store, entry.get("pending_final_identity"))
+    for field in (
+        "pending_turn_id",
+        "pending_content_revision",
+        "pending_plan_token",
+        "pending_turn_part_count",
+        "pending_turn_job_count",
+        "pending_turn_started_at",
+        "pending_turn_user_hash",
+        "pending_stream_submission_id",
+        "pending_plan_generation",
+        "pending_presentation_version",
+        "pending_final_identity",
+        "pending_working_predecessor_turn_id",
+    ):
+        entry.pop(field, None)
+
+
+def _complete_turn_plan_from_bindings(
+    store: dict[str, Any],
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    plan_token: str,
+    revision: str,
+    part_count: int,
+) -> bool:
+    selected: list[tuple[str, dict[str, Any]]] = []
+    for ordinal in range(part_count):
+        matches = [
+            (message_id, binding)
+            for message_id, binding in _final_delivery_bindings(
+                store, _turn_id(item)
+            )
+            if binding.get("plan_token") == plan_token
+            and binding.get("content_revision") == revision
+            and binding.get("part_ordinal") == ordinal
+            and binding.get("part_count") == part_count
+        ]
+        if len(matches) != 1:
+            return False
+        selected.append(matches[0])
+    message_ids = [message_id for message_id, _binding in selected]
+    canonical_message_id = message_ids[0]
+    for _message_id, binding in selected:
+        binding["message_ids"] = list(message_ids)
+        binding["canonical_message_id"] = canonical_message_id
+    bot_kind = str(selected[0][1].get("bot_kind") or MANAGER_BOT_KIND)
+    state.mark_delivered(
+        store,
+        f"final:{_turn_id(item)}:{revision}",
+        {
+            "worker_id": entry.get("tendwire_worker_id"),
+            "turn_id": _turn_id(item),
+            "content_revision": revision,
+            "message_ids": list(message_ids),
+            "canonical_message_id": canonical_message_id,
+        },
+    )
+    stream_submission_id = str(
+        entry.get("pending_stream_submission_id") or ""
+    )
+    _set_final_delivery(
+        entry,
+        turn_id=_turn_id(item),
+        content_hash=revision,
+        user_hash=str(entry.get("pending_turn_user_hash") or "")
+        or _turn_user_hash(item),
+        message_ids=message_ids,
+        bot_kind=bot_kind,
+        render_version=RENDER_VERSION,
+    )
+    entry["last_clean_content_revision"] = revision
+    entry["last_clean_plan_token"] = plan_token
+    _clear_pending_turn_plan(store, entry)
+    if stream_submission_id:
+        _clear_stream_delivery_keys(entry)
+    else:
+        _clear_stream_delivery_state(entry, _turn_id(item))
+    _record_delivery_success(entry, bot_kind)
+    return True
+
+
+def _clear_abandoned_plan_handle(entry: dict[str, Any]) -> None:
+    for field in (
+        "abandoned_plan_token",
+        "abandoned_content_revision",
+        "abandoned_turn_id",
+        "abandoned_turn_part_count",
+        "abandoned_turn_job_count",
+        "abandoned_plan_generation",
+        "abandoned_replaces_failed_plan_token",
+    ):
+        entry.pop(field, None)
+
 
 
 def _validate_turn_final_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -9867,666 +8063,6 @@ def _validate_turn_final_item(item: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _maybe_complete_turn_plan(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    *,
-    plan_token: str,
-    revision: str,
-) -> bool:
-    if (
-        entry.get("pending_plan_token") != plan_token
-        or entry.get("pending_content_revision") != revision
-    ):
-        return False
-    stream_submission_id = str(
-        entry.get("pending_stream_submission_id") or ""
-    )
-    expected_jobs = entry.get("pending_turn_job_count")
-    if (
-        isinstance(expected_jobs, bool)
-        or not isinstance(expected_jobs, int)
-        or expected_jobs <= 0
-    ):
-        return False
-    receipts = [
-        receipt
-        for receipt in state.tendwire_turn_jobs(store).values()
-        if isinstance(receipt, dict)
-        and receipt.get("plan_token") == plan_token
-    ]
-    if len(receipts) < expected_jobs or any(
-        receipt.get("substate") != "acknowledged"
-        or isinstance(receipt.get("post_ack_reconcile"), dict)
-        for receipt in receipts
-    ):
-        return False
-    part_count = entry.get("pending_turn_part_count")
-    if (
-        isinstance(part_count, bool)
-        or not isinstance(part_count, int)
-        or part_count <= 0
-    ):
-        return False
-    selected_bindings: dict[int, tuple[str, dict[str, Any]]] = {}
-    for message_id, binding in _final_delivery_bindings(
-        store, _turn_id(item)
-    ):
-        binding_plan = str(binding.get("plan_token") or "")
-        binding_revision = str(
-            binding.get("content_revision") or ""
-        )
-        if binding_plan != plan_token and binding_revision != revision:
-            continue
-        ordinal = binding.get("part_ordinal")
-        if not isinstance(ordinal, int) or not 0 <= ordinal < part_count:
-            continue
-        existing = selected_bindings.get(ordinal)
-        if existing is None or binding_plan == plan_token:
-            selected_bindings[ordinal] = (message_id, binding)
-    bindings = [
-        (ordinal, *selected_bindings[ordinal])
-        for ordinal in sorted(selected_bindings)
-    ]
-    if [
-        ordinal for ordinal, _message_id, _binding in bindings
-    ] != list(range(part_count)):
-        return False
-    message_ids = [
-        message_id for _ordinal, message_id, _binding in bindings
-    ]
-    canonical_message_id = message_ids[0]
-    for _ordinal, _message_id, binding in bindings:
-        binding["message_ids"] = list(message_ids)
-        binding["canonical_message_id"] = canonical_message_id
-    bot_kind = str(
-        bindings[0][2].get("bot_kind") or MANAGER_BOT_KIND
-    )
-    identity = f"final:{_turn_id(item)}:{revision}"
-    state.mark_delivered(
-        store,
-        identity,
-        {
-            "worker_id": entry.get("tendwire_worker_id"),
-            "turn_id": _turn_id(item),
-            "content_revision": revision,
-            "message_ids": list(message_ids),
-            "canonical_message_id": canonical_message_id,
-        },
-    )
-    partial = state.find_partial_final_delivery(
-        store, _turn_id(item), revision
-    )
-    if (
-        isinstance(partial, dict)
-        and partial.get("request_phase") == "pending_plan_incomplete"
-        and partial.get("status") == "retry_authorized"
-    ):
-        state.complete_partial_final_retry(
-            store,
-            turn_id=_turn_id(item),
-            content_hash=revision,
-            message_ids=list(message_ids),
-            now=time.time(),
-        )
-    _set_final_delivery(
-        entry,
-        turn_id=_turn_id(item),
-        content_hash=revision,
-        user_hash=str(entry.get("pending_turn_user_hash") or "")
-        or _turn_user_hash(item),
-        message_ids=message_ids,
-        bot_kind=bot_kind,
-        render_version=RENDER_VERSION,
-    )
-    entry["last_clean_content_revision"] = revision
-    entry["last_clean_plan_token"] = plan_token
-    final_identity = (
-        entry.get("pending_final_identity")
-        or item.get(_TURN_FINAL_IDENTITY_KEY)
-    )
-    _clear_final_source_owner(store, final_identity)
-    for field in (
-        "pending_turn_id",
-        "pending_content_revision",
-        "pending_plan_token",
-        "pending_turn_part_count",
-        "pending_turn_job_count",
-        "pending_turn_started_at",
-        "pending_turn_user_hash",
-        "pending_stream_submission_id",
-        "pending_plan_generation",
-        "pending_acknowledged_prefix_count",
-        "replaces_failed_plan_token",
-        "pending_final_identity",
-        "pending_working_predecessor_turn_id",
-        "pending_turn_suppressed",
-        "abandoned_plan_token",
-        "abandoned_content_revision",
-    ):
-        entry.pop(field, None)
-    if stream_submission_id:
-        _clear_stream_delivery_keys(entry)
-        _complete_submission_receipt(
-            store, stream_submission_id
-        )
-    else:
-        _clear_stream_delivery_state(entry, _turn_id(item))
-    _record_delivery_success(entry, bot_kind)
-    entry.pop("tendwire_rebind_catchup_pending", None)
-    return True
-
-
-def _observe_jammed_pending_plan(
-    store: dict[str, Any],
-    entry: dict[str, Any],
-    *,
-    turn_id: str,
-    plan_token: str,
-    revision: str,
-    part_count: int,
-) -> bool:
-    """Hold a completed plan whose acknowledged parts lost route bindings.
-
-    The hold is immediate and doctor-visible.  After the existing partial-final
-    escalation bound, only the broken plan handle is abandoned so later
-    revisions can use the topic; the delivery-unknown witness remains until an
-    operator resolves it.
-    """
-
-    receipts = [
-        receipt
-        for receipt in state.tendwire_turn_jobs(store).values()
-        if isinstance(receipt, dict)
-        and receipt.get("plan_token") == plan_token
-    ]
-    expected_jobs = entry.get("pending_turn_job_count")
-    if (
-        isinstance(expected_jobs, bool)
-        or not isinstance(expected_jobs, int)
-        or expected_jobs <= 0
-        or len(receipts) < expected_jobs
-        or any(
-            receipt.get("substate") != "acknowledged"
-            or isinstance(receipt.get("post_ack_reconcile"), dict)
-            for receipt in receipts
-        )
-    ):
-        return False
-    bound_ordinals = {
-        binding.get("part_ordinal")
-        for _message_id, binding in _final_delivery_bindings(
-            store, turn_id
-        )
-        if (
-            binding.get("plan_token") == plan_token
-            or binding.get("content_revision") == revision
-        )
-        and isinstance(binding.get("part_ordinal"), int)
-    }
-    missing = [
-        ordinal
-        for ordinal in range(part_count)
-        if ordinal not in bound_ordinals
-    ]
-    if not missing:
-        return False
-    record = state.find_partial_final_delivery(
-        store, turn_id, revision
-    )
-    changed = False
-    if not isinstance(record, dict):
-        existing_bindings = sorted(
-            (
-                (
-                    int(binding.get("part_ordinal")),
-                    message_id,
-                    binding,
-                )
-                for message_id, binding in _final_delivery_bindings(
-                    store, turn_id
-                )
-                if (
-                    binding.get("plan_token") == plan_token
-                    or binding.get("content_revision") == revision
-                )
-                and isinstance(binding.get("part_ordinal"), int)
-            ),
-            key=lambda row: row[0],
-        )
-        existing_ids = [row[1] for row in existing_bindings]
-        missing_binding_ids: list[str] = []
-        for receipt in receipts:
-            message_id = str(
-                receipt.get("telegram_message_id") or ""
-            )
-            if (
-                message_id
-                and message_id != "0"
-                and message_id not in existing_ids
-                and message_id not in missing_binding_ids
-            ):
-                missing_binding_ids.append(message_id)
-        _record_partial_final_delivery(
-            store,
-            entry,
-            {
-                "ok": False,
-                "partial": bool(
-                    existing_ids or missing_binding_ids
-                ),
-                "message_ids": missing_binding_ids,
-                "terminal_outcome": "delivery_unknown",
-                "failed_part_index": missing[0],
-                "error": (
-                    "completed multipart plan lost one or more "
-                    "acknowledged message bindings"
-                ),
-            },
-            turn_id=turn_id,
-            content_hash=revision,
-            topic_id=str(entry.get("topic_id") or ""),
-            bot_kind=str(
-                next(
-                    (
-                        receipt.get("bot_kind")
-                        for receipt in receipts
-                        if receipt.get("bot_kind")
-                    ),
-                    MANAGER_BOT_KIND,
-                )
-            ),
-        )
-        record = state.find_partial_final_delivery(
-            store, turn_id, revision
-        )
-        assert record is not None
-        all_message_ids = existing_ids + missing_binding_ids
-        record["message_ids"] = all_message_ids
-        record["canonical_message_id"] = (
-            all_message_ids[0] if all_message_ids else ""
-        )
-        record["request_phase"] = "pending_plan_binding_gap"
-        record["plan_token"] = plan_token
-        record["missing_part_ordinals"] = list(missing)
-        record["bounded_exit_seconds"] = (
-            config.partial_final_escalation_seconds()
-        )
-        for _ordinal, _message_id, binding in existing_bindings:
-            binding["message_ids"] = list(all_message_ids)
-            binding["canonical_message_id"] = record[
-                "canonical_message_id"
-            ]
-            binding["partial_final_delivery"] = dict(record)
-        entry["partial_final_delivery"] = record
-        changed = True
-    created_at = record.get("created_at")
-    age = (
-        time.time() - float(created_at)
-        if isinstance(created_at, (int, float))
-        and not isinstance(created_at, bool)
-        else 0.0
-    )
-    if (
-        age >= config.partial_final_escalation_seconds()
-        and entry.get("pending_plan_token") == plan_token
-        and _abandon_pending_turn_plan(
-            store,
-            entry,
-            plan_token=plan_token,
-            revision=revision,
-        )
-    ):
-        record["bounded_exit_at"] = time.time()
-        record["bounded_exit"] = "broken_plan_abandoned"
-        entry["partial_final_delivery"] = record
-        changed = True
-    return changed
-
-
-def _abandon_pending_turn_plan(
-    store: dict[str, Any],
-    entry: dict[str, Any],
-    *,
-    plan_token: str,
-    revision: str,
-) -> bool:
-    """Release a terminal plan without losing its explicit-recovery handle."""
-    if (
-        entry.get("pending_plan_token") != plan_token
-        or entry.get("pending_content_revision") != revision
-    ):
-        return False
-    _clear_final_source_owner(
-        store, entry.get("pending_final_identity")
-    )
-    entry["abandoned_plan_token"] = plan_token
-    entry["abandoned_content_revision"] = revision
-    entry["abandoned_turn_id"] = entry.get("pending_turn_id")
-    entry["abandoned_turn_part_count"] = entry.get(
-        "pending_turn_part_count"
-    )
-    entry["abandoned_turn_job_count"] = entry.get(
-        "pending_turn_job_count"
-    )
-    entry["abandoned_plan_generation"] = entry.get(
-        "pending_plan_generation", 1
-    )
-    entry["abandoned_replaces_failed_plan_token"] = entry.get(
-        "replaces_failed_plan_token"
-    )
-    for field in (
-        "pending_turn_id",
-        "pending_content_revision",
-        "pending_plan_token",
-        "pending_turn_part_count",
-        "pending_turn_job_count",
-        "pending_turn_started_at",
-        "pending_turn_user_hash",
-        "pending_stream_submission_id",
-        "pending_plan_generation",
-        "pending_acknowledged_prefix_count",
-        "replaces_failed_plan_token",
-        "pending_final_identity",
-        "pending_working_predecessor_turn_id",
-        "pending_turn_suppressed",
-    ):
-        entry.pop(field, None)
-    return True
-
-
-def _clear_abandoned_plan_handle(entry: dict[str, Any]) -> None:
-    for field in (
-        "abandoned_plan_token",
-        "abandoned_content_revision",
-        "abandoned_turn_id",
-        "abandoned_turn_part_count",
-        "abandoned_turn_job_count",
-        "abandoned_plan_generation",
-        "abandoned_replaces_failed_plan_token",
-    ):
-        entry.pop(field, None)
-
-
-def _pending_final_source_owner_is_valid(
-    store: dict[str, Any], entry: dict[str, Any]
-) -> bool:
-    """Fail closed before reconciling a plan rooted in a durable source."""
-
-    final_identity = entry.get("pending_final_identity")
-    if not isinstance(final_identity, str) or not final_identity:
-        return True
-    owner = _canonical_final_source_owner(
-        _turn_final_source_owners(store).get(final_identity)
-    )
-    identity = state.entry_stable_identity(entry)
-    return bool(
-        owner is not None
-        and identity is not None
-        and owner["turn_id"] == entry.get("pending_turn_id")
-        and owner["content_revision"]
-        == entry.get("pending_content_revision")
-        and owner["stable_key"] == identity[0]
-        and owner["stable_key_version"] == identity[1]
-    )
-
-
-def _reconcile_completed_turn_plans(
-    store: dict[str, Any],
-    runtime: SyncRuntime,
-    *,
-    pending_entry: dict[str, Any] | None = None,
-) -> int:
-    if not runtime.with_outbox or runtime.dry_run:
-        return 0
-    reconciled = 0
-    entries = (
-        (pending_entry,)
-        if pending_entry is not None
-        else state.source_worker_entries(store).values()
-    )
-    for entry in entries:
-        plan_token = entry.get("pending_plan_token")
-        revision = entry.get("pending_content_revision")
-        turn_id = entry.get("pending_turn_id")
-        part_count = entry.get("pending_turn_part_count")
-        if (
-            not isinstance(plan_token, str)
-            or not plan_token.startswith("twplan1.")
-            or not isinstance(revision, str)
-            or not revision.startswith("twrev1.")
-            or not isinstance(turn_id, str)
-            or not turn_id
-            or isinstance(part_count, bool)
-            or not isinstance(part_count, int)
-            or part_count <= 0
-        ):
-            continue
-        _set_pending_turn_plan(
-            entry,
-            turn_id=turn_id,
-            revision=revision,
-            plan_token=plan_token,
-            part_count=part_count,
-            job_count=(
-                int(entry.get("pending_turn_job_count"))
-                if isinstance(entry.get("pending_turn_job_count"), int)
-                and not isinstance(entry.get("pending_turn_job_count"), bool)
-                else 0
-            ),
-        )
-        if not _pending_final_source_owner_is_valid(store, entry):
-            continue
-        operation = _capture_entry_operation(
-            store,
-            entry,
-            plan_token=plan_token,
-            revision=revision,
-        )
-        execution = _execute_entry_operation(
-            store,
-            runtime.tendwire,
-            operation,
-            _provider_mutation(
-                "tendwire.connector_prepare_commit",
-                reason=(
-                    "tendwire.connector_prepare_commit: reconcile completed plan"
-                ),
-                kwargs={"plan_token": plan_token},
-            ),
-        )
-        observed, resolution = execution.result, execution.resolution
-        if resolution.disposition != _OFFLOCK_APPLY:
-            continue
-        entry = resolution.entry
-        assert entry is not None
-        observed_token = observed.get("plan_token")
-        plan_not_found = (
-            observed.get("ok") is False
-            and observed.get("status") == "plan_not_found"
-            and (observed_token is None or observed_token == plan_token)
-        )
-        superseded = (
-            observed.get("ok") is True
-            and observed_token == plan_token
-            and observed.get("state") == "superseded"
-        )
-        failed = (
-            observed.get("ok") is True
-            and observed_token == plan_token
-            and observed.get("state") in {"failed", "dead_letter"}
-        )
-        dead_receipt = any(
-            isinstance(receipt, dict)
-            and receipt.get("plan_token") == plan_token
-            and receipt.get("content_revision") == revision
-            and receipt.get("substate") == "failed"
-            for receipt in state.tendwire_turn_jobs(store).values()
-        )
-        if failed or dead_receipt:
-            created_job_count = observed.get("job_count")
-            held = _hold_incomplete_pending_plan(
-                store,
-                entry,
-                turn_id=turn_id,
-                plan_token=plan_token,
-                revision=revision,
-                part_count=part_count,
-                created_job_count=(
-                    created_job_count
-                    if isinstance(created_job_count, int)
-                    and not isinstance(created_job_count, bool)
-                    else None
-                ),
-                error=(
-                    "multipart parent reached a terminal state before all "
-                    "declared parts completed"
-                ),
-            )
-            abandoned = _abandon_pending_turn_plan(
-                store,
-                entry,
-                plan_token=plan_token,
-                revision=revision,
-            )
-            if held or abandoned:
-                reconciled += 1
-                _checkpoint_turn_job(runtime)
-            continue
-        if plan_not_found or superseded:
-            _clear_final_source_owner(
-                store, entry.get("pending_final_identity")
-            )
-            for field in (
-                "pending_turn_id",
-                "pending_content_revision",
-                "pending_plan_token",
-                "pending_turn_part_count",
-                "pending_turn_job_count",
-                "pending_turn_started_at",
-                "pending_turn_user_hash",
-                "pending_stream_submission_id",
-                "pending_plan_generation",
-                "pending_acknowledged_prefix_count",
-                "replaces_failed_plan_token",
-                "pending_final_identity",
-                "pending_working_predecessor_turn_id",
-                "pending_turn_suppressed",
-                "abandoned_plan_token",
-                "abandoned_content_revision",
-            ):
-                entry.pop(field, None)
-            reconciled += 1
-            _checkpoint_turn_job(runtime)
-            continue
-        if (
-            observed.get("ok") is not True
-            or observed_token != plan_token
-            or observed.get("state") != "completed"
-        ):
-            if (
-                observed.get("ok") is True
-                and observed_token == plan_token
-                and _pending_turn_plan_age(entry)
-                >= config.partial_final_escalation_seconds()
-            ):
-                created_job_count = observed.get("job_count")
-                held = _hold_incomplete_pending_plan(
-                    store,
-                    entry,
-                    turn_id=turn_id,
-                    plan_token=plan_token,
-                    revision=revision,
-                    part_count=part_count,
-                    created_job_count=(
-                        created_job_count
-                        if isinstance(created_job_count, int)
-                        and not isinstance(created_job_count, bool)
-                        else None
-                    ),
-                    error=(
-                        "multipart parent exceeded its bounded active window "
-                        "before all declared parts completed"
-                    ),
-                )
-                abandoned = _abandon_pending_turn_plan(
-                    store,
-                    entry,
-                    plan_token=plan_token,
-                    revision=revision,
-                )
-                if held or abandoned:
-                    reconciled += 1
-                    _checkpoint_turn_job(runtime)
-            continue
-        job_count = observed.get("job_count")
-        if (
-            isinstance(job_count, bool)
-            or not isinstance(job_count, int)
-            or job_count <= 0
-        ):
-            continue
-        entry["pending_turn_job_count"] = job_count
-        advanced = False
-        for job_key, receipt in list(
-            state.tendwire_turn_jobs(store).items()
-        ):
-            if (
-                isinstance(receipt, dict)
-                and receipt.get("plan_token") == plan_token
-                and receipt.get("substate")
-                in {
-                    "telegram_applied",
-                    "old_slot_retired",
-                    "suppressed",
-                }
-            ):
-                state.update_tendwire_turn_job(
-                    store, job_key, substate="acknowledged"
-                )
-                state.clear_tendwire_turn_job_post_ack_reconcile(
-                    store, job_key
-                )
-                advanced = True
-        item = {
-            "id": turn_id,
-            "worker_id": _entry_worker_id(entry),
-            "space_id": _entry_space_id(entry),
-        }
-        completed = (
-            _complete_suppressed_turn_plan(
-                store,
-                item,
-                entry,
-                plan_token=plan_token,
-                revision=revision,
-            )
-            if _suppressed_turn_plan(entry, plan_token, revision)
-            else _maybe_complete_turn_plan(
-                store,
-                item,
-                entry,
-                plan_token=plan_token,
-                revision=revision,
-            )
-        )
-        if completed:
-            reconciled += 1
-            advanced = True
-        elif _observe_jammed_pending_plan(
-            store,
-            entry,
-            turn_id=turn_id,
-            plan_token=plan_token,
-            revision=revision,
-            part_count=part_count,
-        ):
-            reconciled += 1
-            advanced = True
-        if advanced:
-            _checkpoint_turn_job(runtime)
-    return reconciled
 
 
 _TURN_FINAL_FAILURE_REASON_CODES = frozenset(
@@ -10545,6 +8081,7 @@ _TURN_FINAL_FAILURE_REASON_CODES = frozenset(
         "invalid_recovery_predecessor_receipt",
         "invalid_turn_final_job",
         "missing_message_owner_token",
+        "plan_incomplete",
         "prepare_failed",
         "presentation_plan_mismatch",
         "receipt_reservation_failed",
@@ -10669,30 +8206,15 @@ def _defer_turn_final(
     ref: str,
     reason: str,
     result: dict[str, Any],
-    store: dict[str, Any] | None = None,
-    job_key: str = "",
     *,
     delay_seconds: int,
 ) -> None:
-    if store is not None and job_key:
-        receipt = state.find_tendwire_turn_job(store, job_key)
-        if (
-            receipt is not None
-            and receipt.get("substate") == "reserved"
-        ):
-            state.update_tendwire_turn_job(
-                store,
-                job_key,
-                substate="retryable",
-            )
-            _checkpoint_turn_job(runtime)
-    reason_code = _turn_final_reason_code(reason, deferred=True)
     response = _execute_exact_provider_operation(
         runtime.tendwire,
         mutation=_provider_mutation(
             "tendwire.turn_final_defer",
             reason="tendwire.turn_final_defer: defer exact leased final",
-            args=(ref, reason_code),
+            args=(ref, _turn_final_reason_code(reason, deferred=True)),
             kwargs={"delay_seconds": max(1, int(delay_seconds))},
         ),
     )
@@ -10704,479 +8226,870 @@ def _defer_turn_final(
         )
 
 
-def _turns_by_id_for_catchup(
-    turns_payload: dict[str, Any],
-    turn_projection: Mapping[str, Any] | None,
-) -> dict[str, dict[str, Any]]:
-    rows: dict[str, dict[str, Any]] = {}
-    candidates = list(_turns(turns_payload))
-    if isinstance(turn_projection, Mapping):
-        candidates.extend(
-            item
-            for item in turn_projection.values()
-            if isinstance(item, dict)
-        )
-    for item in candidates:
-        turn_id = _turn_id(item)
-        if not turn_id or _turn_has_content_outcome(item):
-            continue
-        current = rows.get(turn_id)
-        if current is None or _turn_recency(item) > _turn_recency(current):
-            rows[turn_id] = item
-    return rows
-
-
-def _ensure_rebind_catchup_bound(
-    entry: dict[str, Any],
-    turns_payload: dict[str, Any],
-    turn_projection: Mapping[str, Any] | None,
-) -> tuple[dict[str, str] | None, dict[str, dict[str, Any]]]:
-    rows = _turns_by_id_for_catchup(turns_payload, turn_projection)
-    existing = entry.get("tendwire_rebind_catchup_bound")
-    if isinstance(existing, dict):
-        turn_id = str(existing.get("turn_id") or "")
-        updated_at = str(existing.get("updated_at") or "")
-        if turn_id and updated_at:
-            return {
-                "turn_id": turn_id,
-                "updated_at": updated_at,
-            }, rows
-    pending = entry.get("tendwire_rebind_catchup_pending")
-    identity = state.entry_stable_identity(entry)
-    if not isinstance(pending, dict) or identity is None:
-        return None, rows
-    completed = [
-        item
-        for item in rows.values()
-        if _turn_stable_identity(item) == identity
-        and _turn_has_complete_final(item)
-        and _turn_recency(item)
-    ]
-    if not completed:
-        return None, rows
-    newest_at = max(_turn_recency(item) for item in completed)
-    newest = [
-        item for item in completed if _turn_recency(item) == newest_at
-    ]
-    last_turn_id = str(entry.get("last_turn_id") or "")
-    chosen = next(
-        (item for item in newest if _turn_id(item) == last_turn_id),
-        newest[0] if len(newest) == 1 else None,
-    )
-    if chosen is None:
-        return None, rows
-    bound = {
-        "turn_id": _turn_id(chosen),
-        "updated_at": _turn_recency(chosen),
-    }
-    entry["tendwire_rebind_catchup_bound"] = dict(bound)
-    return bound, rows
-
-
-def _suppress_rebind_catchup_root(
-    entry: dict[str, Any],
+def _turn_final_item_source(
     payload: dict[str, Any],
     turns_payload: dict[str, Any],
     turn_projection: Mapping[str, Any] | None,
-) -> bool:
-    bound, rows = _ensure_rebind_catchup_bound(
-        entry, turns_payload, turn_projection
-    )
-    if bound is None:
-        return False
-    item = rows.get(str(payload.get("turn_id") or ""))
-    if item is None or _turn_stable_identity(item) != state.entry_stable_identity(
-        entry
-    ):
-        return False
-    updated_at = _turn_recency(item)
-    if not updated_at:
-        return False
-    if updated_at > bound["updated_at"]:
-        entry.pop("tendwire_rebind_catchup_bound", None)
-        entry.pop("tendwire_rebind_catchup_pending", None)
-        return False
-    return (
-        _turn_id(item) != bound["turn_id"]
-        and updated_at <= bound["updated_at"]
-    )
-
-
-def _suppressed_turn_plan(
-    entry: dict[str, Any], plan_token: str, revision: str
-) -> bool:
-    marker = entry.get("pending_turn_suppressed")
-    return bool(
-        isinstance(marker, dict)
-        and marker.get("plan_token") == plan_token
-        and marker.get("content_revision") == revision
-    )
-
-
-def _complete_suppressed_turn_plan(
-    store: dict[str, Any],
-    item: dict[str, Any],
-    entry: dict[str, Any],
-    *,
-    plan_token: str,
-    revision: str,
-) -> bool:
-    if not _suppressed_turn_plan(entry, plan_token, revision):
-        return False
-    expected_jobs = entry.get("pending_turn_job_count")
-    receipts = [
-        receipt
-        for receipt in state.tendwire_turn_jobs(store).values()
-        if isinstance(receipt, dict)
-        and receipt.get("plan_token") == plan_token
-    ]
-    if (
-        isinstance(expected_jobs, bool)
-        or not isinstance(expected_jobs, int)
-        or expected_jobs <= 0
-        or len(receipts) < expected_jobs
-        or any(
-            receipt.get("substate") != "acknowledged"
-            or isinstance(receipt.get("post_ack_reconcile"), dict)
-            for receipt in receipts
+) -> dict[str, Any]:
+    source = payload.get("turn")
+    if isinstance(source, dict):
+        return _final_ready_row(source)
+    revision = str(payload["content_revision"])
+    item = _turn_item_by_revision(turns_payload, revision)
+    if item is None and isinstance(turn_projection, Mapping):
+        matches = [
+            candidate
+            for candidate in turn_projection.values()
+            if isinstance(candidate, dict)
+            and _content_revision(candidate) == revision
+        ]
+        item = matches[0] if len(matches) == 1 else None
+    if item is None:
+        raise _TurnContentError(
+            "stale_or_unavailable_content_revision",
+            "turn-final source revision is unavailable",
         )
-    ):
+    return item
+
+
+def _ack_turn_final(
+    runtime: SyncRuntime,
+    ref: str,
+    job_key: str,
+    result: dict[str, Any],
+) -> bool:
+    ack = _execute_exact_provider_operation(
+        runtime.tendwire,
+        mutation=_provider_mutation(
+            "tendwire.turn_final_ack",
+            reason="tendwire.turn_final_ack: acknowledge applied final",
+            args=(ref, {"outcome": "applied", "job_key": job_key}),
+        ),
+    )
+    if ack.get("ok") is False:
+        result["status"] = str(
+            ack.get("status") or "turn_final_ack_failed"
+        )
+        result["changed"] = True
         return False
-    state.mark_delivered(
-        store,
-        f"final:{_turn_id(item)}:{revision}",
-        {
-            "worker_id": entry.get("tendwire_worker_id"),
-            "turn_id": _turn_id(item),
-            "content_revision": revision,
-            "suppressed": True,
-        },
-    )
-    _clear_final_source_owner(
-        store, entry.get("pending_final_identity")
-    )
-    for field in (
-        "pending_turn_id",
-        "pending_content_revision",
-        "pending_plan_token",
-        "pending_turn_part_count",
-        "pending_turn_job_count",
-        "pending_turn_started_at",
-        "pending_turn_user_hash",
-        "pending_stream_submission_id",
-        "pending_plan_generation",
-        "pending_acknowledged_prefix_count",
-        "replaces_failed_plan_token",
-        "pending_final_identity",
-        "pending_working_predecessor_turn_id",
-        "pending_turn_suppressed",
-        "abandoned_plan_token",
-        "abandoned_content_revision",
-    ):
-        entry.pop(field, None)
+    result["delivered"] += 1
+    result["acked"] += 1
+    result["changed"] = True
     return True
 
 
-def _turn_final_ack_obligation(
+def _delete_final_message(
     store: dict[str, Any],
-    job_key: str,
-    operation: _OfflockEntryOperation,
-    *,
-    kind: str,
-    turn_id: str,
-    plan_token: str,
-    revision: str,
-    ordinal: int,
-    part_count: int,
-) -> dict[str, Any]:
-    receipt = state.find_tendwire_turn_job(store, job_key) or {}
-    message_id = str(receipt.get("telegram_message_id") or "")
-    binding = state.find_message_binding(store, message_id)
-    return {
-        "status": "ack_inflight",
-        "kind": kind,
-        "owner": _operation_provenance(operation),
-        "turn_id": turn_id,
-        "plan_token": plan_token,
-        "content_revision": revision,
-        "part_ordinal": ordinal,
-        "part_count": part_count,
-        "current_message_id": message_id,
-        "current_topic_id": str(
-            (binding or {}).get("topic_id")
-            or operation.route_topic_id
-            or ""
-        ),
-        "bot_kind": str(
-            (binding or {}).get("bot_kind")
-            or receipt.get("bot_kind")
-            or MANAGER_BOT_KIND
-        ),
-        "stale_copies": [],
-    }
-
-
-def _drain_post_ack_reconciliations(
-    store: dict[str, Any],
-    turns_payload: dict[str, Any],
     runtime: SyncRuntime,
     *,
     chat_id: str,
-    max_operations: int,
+    message_id: str,
+    bot_kind: str,
+) -> dict[str, Any]:
+    token = _owning_bot_token(store, bot_kind)
+    return _execute_exact_provider_operation(
+        runtime.telegram,
+        store=store,
+        mutation=_provider_mutation(
+            "telegram.delete_turn_delivery_message",
+            reason="telegram.delete_turn_delivery_message: retire final slot",
+            args=(chat_id, message_id),
+            kwargs={"api_token": token},
+        ),
+    )
+
+
+def _retire_bound_predecessor(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    binding: dict[str, Any],
     result: dict[str, Any],
-) -> None:
-    """Drain acknowledged work locally; Tendwire must never be polled again."""
-
-    for job_key, receipt in list(state.tendwire_turn_jobs(store).items()):
-        obligation = (
-            receipt.get("post_ack_reconcile")
-            if isinstance(receipt, dict)
-            else None
+    *,
+    chat_id: str,
+    ref: str,
+    max_operations: int,
+) -> bool:
+    message_id = str(binding.get("superseded_message_id") or "")
+    if not message_id:
+        return True
+    if result["operations"] >= max_operations:
+        _defer_turn_final(
+            runtime,
+            ref,
+            "delivery_budget_exhausted",
+            result,
+            delay_seconds=1,
         )
-        if not isinstance(obligation, dict):
-            continue
-        if obligation.get("status") == "ack_inflight":
-            # A crash may have happened on either side of ACK. The normal
-            # observation path will settle this ambiguous receipt.
-            continue
-        owner = obligation.get("owner")
-        if not isinstance(owner, dict):
-            continue
-        captured = _operation_from_provenance(owner)
-        entry = _resolve_operation_entry(store, captured)
-        if entry is None or state.entry_is_retired(entry):
-            state.clear_tendwire_turn_job_post_ack_reconcile(store, job_key)
-            result["changed"] = True
-            _checkpoint_turn_job(runtime)
-            continue
-        plan_token = str(obligation.get("plan_token") or "")
-        revision = str(obligation.get("content_revision") or "")
-        item = _turn_item_by_revision(turns_payload, revision)
-        if obligation.get("kind") == "suppressed":
-            state.clear_tendwire_turn_job_post_ack_reconcile(
-                store, job_key
-            )
-            if item is not None:
-                _complete_suppressed_turn_plan(
-                    store,
-                    item,
-                    entry,
-                    plan_token=plan_token,
-                    revision=revision,
-                )
-            result["changed"] = True
-            _checkpoint_turn_job(runtime)
-            continue
-
-        stale = obligation.get("stale_copies")
-        if not isinstance(stale, list):
-            stale = []
-            obligation["stale_copies"] = stale
-        while stale and result["operations"] < max_operations:
-            copy = stale[0]
-            if not isinstance(copy, dict):
-                stale.pop(0)
-                continue
-            message_id = str(copy.get("message_id") or "")
-            bot_kind = str(copy.get("bot_kind") or MANAGER_BOT_KIND)
-            try:
-                token = _owning_bot_token(store, bot_kind)
-                retired = _execute_exact_provider_operation(
-                    runtime.telegram,
-                    store=store,
-                    mutation=_provider_mutation(
-                        "telegram.delete_turn_delivery_message",
-                        reason=(
-                            "telegram.delete_turn_delivery_message: post-ACK "
-                            "retire stale copy"
-                        ),
-                        args=(chat_id, message_id),
-                        kwargs={"api_token": token},
-                    ),
-                )
-                result["operations"] += 1
-            except RateLimited:
-                return
-            except Exception:
-                return
-            if not retired.get("ok") and _telegram_result_is_transient(retired):
-                return
-            if not retired.get("ok"):
-                return
-            _retire_local_message(store, None, message_id)
-            stale.pop(0)
-            result["changed"] = True
-            _checkpoint_turn_job(runtime)
-        if stale or result["operations"] >= max_operations:
-            return
-
-        current_topic = str(entry.get("topic_id") or "")
-        applied_topic = str(obligation.get("current_topic_id") or "")
-        current_message_id = str(
-            obligation.get("current_message_id") or ""
+        return False
+    bot_kind = str(
+        binding.get("superseded_bot_kind") or MANAGER_BOT_KIND
+    )
+    try:
+        deleted = _delete_final_message(
+            store,
+            runtime,
+            chat_id=chat_id,
+            message_id=message_id,
+            bot_kind=bot_kind,
         )
-        if not current_topic:
-            continue
-        if current_topic != applied_topic:
-            if item is None:
-                continue
-            _materialize_turn_item(item, runtime)
-            feed_item = _turn_feed_item(item, entry)
-            try:
-                plans = _prepare_final_delivery_parts(feed_item)
-            except _TurnContentError as exc:
-                # This message has already been acknowledged upstream.  Keep
-                # the durable local reconciliation obligation in place and
-                # isolate the bad item from the rest of the sync pass.
-                state.record_tendwire_turn_job_post_ack_error(
-                    store,
-                    job_key,
-                    status=exc.status,
-                    error=str(exc),
-                )
-                result["status"] = exc.status
-                result["failed"] += 1
-                result["changed"] = True
-                continue
-            ordinal = int(obligation.get("part_ordinal") or 0)
-            if not 0 <= ordinal < len(plans):
-                continue
-            token, bot_kind = _delivery_bot(store, entry)
-            operation = _capture_entry_operation(
-                store,
-                entry,
-                topic_id=current_topic,
-                plan_token=plan_token,
-                revision=revision,
+        result["operations"] += 1
+    except RateLimited as exc:
+        _defer_turn_final(
+            runtime,
+            ref,
+            "rate_limited",
+            result,
+            delay_seconds=exc.retry_after,
+        )
+        return False
+    except Exception:
+        _defer_turn_final(
+            runtime,
+            ref,
+            "transient_delivery",
+            result,
+            delay_seconds=1,
+        )
+        return False
+    if not deleted.get("ok"):
+        if _telegram_result_is_transient(deleted):
+            _defer_turn_final(
+                runtime,
+                ref,
+                "transient_delivery",
+                result,
+                delay_seconds=_telegram_result_retry_after(deleted),
             )
-            execution = _execute_entry_operation(
-                store,
-                runtime.telegram,
-                operation,
-                _provider_mutation(
-                    "telegram.send_turn_delivery_part",
-                    reason=(
-                        "telegram.send_turn_delivery_part: post-ACK reconcile route"
-                    ),
-                    args=(chat_id, feed_item, plans[ordinal]),
-                    kwargs={
-                        "telegram": _telegram_state(store),
-                        "thread_id": current_topic,
-                        "notify": False,
-                        "api_token": token,
-                        "max_physical_writes": (
-                            max_operations - result["operations"]
-                        ),
-                    },
+        else:
+            _fail_turn_final(
+                runtime,
+                ref,
+                str(deleted.get("error") or "delivery_rejected"),
+                result,
+            )
+        return False
+    _retire_local_message(store, None, message_id)
+    binding.pop("superseded_message_id", None)
+    binding.pop("superseded_bot_kind", None)
+    _checkpoint_turn_job(runtime)
+    return True
+
+
+def _retire_quarantined_job_binding(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    message_id: str,
+    binding: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    chat_id: str,
+    ref: str,
+    max_operations: int,
+) -> bool:
+    if result["operations"] >= max_operations:
+        _defer_turn_final(
+            runtime,
+            ref,
+            "operation_budget_exhausted",
+            result,
+            delay_seconds=1,
+        )
+        return False
+    try:
+        deleted = _delete_final_message(
+            store,
+            runtime,
+            chat_id=chat_id,
+            message_id=message_id,
+            bot_kind=str(
+                binding.get("bot_kind") or MANAGER_BOT_KIND
+            ),
+        )
+        result["operations"] += 1
+    except RateLimited as exc:
+        _defer_turn_final(
+            runtime,
+            ref,
+            "rate_limited",
+            result,
+            delay_seconds=exc.retry_after,
+        )
+        return False
+    except TelegramError:
+        _defer_turn_final(
+            runtime,
+            ref,
+            "transient_delivery",
+            result,
+            delay_seconds=1,
+        )
+        return False
+    if not deleted.get("ok") and not _message_missing(
+        deleted.get("error")
+    ):
+        if _telegram_result_is_transient(deleted):
+            _defer_turn_final(
+                runtime,
+                ref,
+                "transient_delivery",
+                result,
+                delay_seconds=_telegram_result_retry_after(deleted),
+            )
+        else:
+            _fail_turn_final(
+                runtime,
+                ref,
+                str(deleted.get("error") or "delivery_rejected"),
+                result,
+            )
+        return False
+    _retire_local_message(store, None, message_id)
+    _checkpoint_turn_job(runtime)
+    _defer_turn_final(
+        runtime,
+        ref,
+        "transient_delivery",
+        result,
+        delay_seconds=1,
+    )
+    return False
+
+
+def _apply_retire_job(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    item: dict[str, Any],
+    payload: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    chat_id: str,
+    ref: str,
+) -> bool:
+    ordinal = int(payload["part_ordinal"])
+    message_id, binding = _slot_binding(
+        store,
+        turn_id=_turn_id(item),
+        ordinal=ordinal,
+        plan_token=str(payload.get("replaces_plan_token") or ""),
+    )
+    if not message_id:
+        return True
+    try:
+        deleted = _delete_final_message(
+            store,
+            runtime,
+            chat_id=chat_id,
+            message_id=message_id,
+            bot_kind=str(
+                (binding or {}).get("bot_kind") or MANAGER_BOT_KIND
+            ),
+        )
+        result["operations"] += 1
+    except RateLimited as exc:
+        _defer_turn_final(
+            runtime,
+            ref,
+            "rate_limited",
+            result,
+            delay_seconds=exc.retry_after,
+        )
+        return False
+    except Exception:
+        _defer_turn_final(
+            runtime,
+            ref,
+            "transient_delivery",
+            result,
+            delay_seconds=1,
+        )
+        return False
+    if not deleted.get("ok"):
+        if _telegram_result_is_transient(deleted):
+            _defer_turn_final(
+                runtime,
+                ref,
+                "transient_delivery",
+                result,
+                delay_seconds=_telegram_result_retry_after(deleted),
+            )
+        else:
+            _fail_turn_final(
+                runtime,
+                ref,
+                str(deleted.get("error") or "delivery_rejected"),
+                result,
+            )
+        return False
+    _retire_local_message(store, None, message_id)
+    _checkpoint_turn_job(runtime)
+    _after_provider_accept(runtime)
+    return True
+
+
+def _send_or_edit_final_part(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    source_item: dict[str, Any],
+    feed_item: dict[str, Any],
+    entry: dict[str, Any],
+    payload: dict[str, Any],
+    plan: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    chat_id: str,
+    max_operations: int,
+) -> tuple[
+    dict[str, Any],
+    _OfflockEntryOperation,
+    _OfflockEntryResolution,
+    str,
+    str,
+    str,
+]:
+    ordinal = int(payload["part_ordinal"])
+    candidate_id, candidate_bot, candidate_topic, _kind = (
+        _current_upsert_candidate(
+            store,
+            source_item,
+            entry,
+            ordinal=ordinal,
+            replaces_plan_token=str(
+                payload.get("replaces_plan_token") or ""
+            ),
+        )
+    )
+    desired_token, desired_bot = _delivery_bot(store, entry)
+    route_topic = str(entry.get("topic_id") or "")
+    compatible = bool(
+        candidate_id
+        and candidate_bot == desired_bot
+        and candidate_topic == route_topic
+    )
+    operation = _capture_entry_operation(
+        store,
+        entry,
+        topic_id=route_topic,
+        message_id=candidate_id if compatible else "",
+        plan_token=str(payload["plan_token"]),
+        revision=str(payload["content_revision"]),
+    )
+    kwargs: dict[str, Any] = {
+        "telegram": _telegram_state(store),
+        "api_token": desired_token,
+        "max_physical_writes": max(
+            1, max_operations - result["operations"]
+        ),
+    }
+    if not compatible:
+        kwargs.update({"thread_id": route_topic, "notify": False})
+    if compatible:
+        execution = _execute_entry_operation(
+            store,
+            runtime.telegram,
+            operation,
+            _provider_mutation(
+                "telegram.edit_turn_delivery_part",
+                reason=(
+                    "telegram.edit_turn_delivery_part: apply final-delivery job"
                 ),
-            )
-            sent = execution.result
-            result["operations"] += _telegram_physical_writes(sent)
-            if not sent.get("ok"):
-                return
-            new_message_id = str(sent.get("message_id") or "")
-            if not new_message_id:
-                return
-            state.bind_message_to_worker(
-                store,
-                new_message_id,
-                _operation_binding_entry(operation),
-                topic_id=current_topic,
-                kind="final",
-                turn_id=str(obligation.get("turn_id") or ""),
-                bot_kind=bot_kind,
-                content_revision=revision,
-                plan_token=plan_token,
-                part_ordinal=ordinal,
-                part_count=int(obligation.get("part_count") or len(plans)),
-                tendwire_job_key=job_key,
-                delivery_format=str(sent.get("format") or ""),
-            )
-            if current_message_id:
-                stale.append(
-                    {
-                        "message_id": current_message_id,
-                        "topic_id": applied_topic,
-                        "bot_kind": str(
-                            obligation.get("bot_kind")
-                            or MANAGER_BOT_KIND
-                        ),
-                    }
-                )
-            obligation["current_message_id"] = new_message_id
-            obligation["current_topic_id"] = current_topic
-            obligation["bot_kind"] = bot_kind
-            result["changed"] = True
-            _checkpoint_turn_job(runtime)
-            if execution.resolution.disposition != _OFFLOCK_APPLY:
-                continue
-            entry = execution.resolution.entry
-            assert entry is not None
-            # Retire the old exact copy in this pass when budget permits.
-            if stale and result["operations"] < max_operations:
-                copy = stale[0]
-                old_message_id = str(copy.get("message_id") or "")
-                old_bot = str(copy.get("bot_kind") or MANAGER_BOT_KIND)
-                try:
-                    old_token = _owning_bot_token(store, old_bot)
-                    retired = _execute_exact_provider_operation(
-                        runtime.telegram,
-                        store=store,
-                        mutation=_provider_mutation(
-                            "telegram.delete_turn_delivery_message",
-                            reason=(
-                                "telegram.delete_turn_delivery_message: "
-                                "post-ACK retire superseded copy"
-                            ),
-                            args=(chat_id, old_message_id),
-                            kwargs={"api_token": old_token},
-                        ),
-                    )
-                    result["operations"] += 1
-                except Exception:
-                    return
-                if not retired.get("ok"):
-                    return
-                _retire_local_message(store, None, old_message_id)
-                stale.pop(0)
-                _checkpoint_turn_job(runtime)
-            if stale:
-                return
-            if (
-                _compare_and_apply_entry_operation(
-                    store, operation
-                ).disposition
-                != _OFFLOCK_APPLY
-            ):
-                continue
-        message_id = str(obligation.get("current_message_id") or "")
-        binding = state.find_message_binding(store, message_id)
-        if binding is not None:
-            binding.update(
-                {
-                    key: value
-                    for key, value in _operation_binding_entry(
-                        _capture_entry_operation(
-                            store, entry, topic_id=current_topic
-                        )
-                    ).items()
-                    if key != "topic_id"
-                }
-            )
-        state.clear_tendwire_turn_job_post_ack_reconcile(store, job_key)
-        if item is not None:
-            _maybe_complete_turn_plan(
-                store,
-                item,
-                entry,
-                plan_token=plan_token,
-                revision=revision,
-            )
-        result["changed"] = True
-        result["post_ack_reconciled"] = (
-            int(result.get("post_ack_reconciled") or 0) + 1
+                args=(chat_id, candidate_id, feed_item, plan),
+                kwargs=kwargs,
+            ),
         )
+    else:
+        execution = _execute_entry_operation(
+            store,
+            runtime.telegram,
+            operation,
+            _provider_mutation(
+                "telegram.send_turn_delivery_part",
+                reason=(
+                    "telegram.send_turn_delivery_part: apply final-delivery job"
+                ),
+                args=(chat_id, feed_item, plan),
+                kwargs=kwargs,
+            ),
+        )
+    applied = execution.result
+    result["operations"] += _telegram_physical_writes(applied)
+    return (
+        applied,
+        operation,
+        execution.resolution,
+        candidate_id,
+        candidate_bot,
+        desired_bot,
+    )
+
+
+def _canonical_turn_final_part(
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    payload: dict[str, Any],
+    runtime: SyncRuntime,
+    result: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    result["content_pages"] += _materialize_turn_item(item, runtime)
+    feed_item = _canonical_final_feed_item(item, entry)
+    plans = _prepare_final_delivery_parts(
+        feed_item,
+        rich_transport=config.rich_messages_enabled(),
+    )
+    ordinal = int(payload["part_ordinal"])
+    if (
+        ordinal >= len(plans)
+        or int(payload["part_count"]) != len(plans)
+        or payload.get("spans") != plans[ordinal].get("spans")
+    ):
+        raise _TurnContentError(
+            "presentation_plan_mismatch",
+            "turn-final job does not match canonical presentation",
+        )
+    return feed_item, plans[ordinal]
+
+
+def _handle_failed_upsert_result(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    applied: dict[str, Any],
+    operation: _OfflockEntryOperation,
+    result: dict[str, Any],
+    *,
+    candidate_id: str,
+    ref: str,
+) -> None:
+    kind = str(applied.get("kind") or "")
+    if candidate_id and (
+        kind == "not_found" or _message_missing(applied.get("error"))
+    ):
+        _retire_local_message(store, None, candidate_id)
         _checkpoint_turn_job(runtime)
+        _defer_turn_final(
+            runtime,
+            ref,
+            "transient_delivery",
+            result,
+            delay_seconds=1,
+        )
+    elif kind == "topic_not_found" or _topic_missing(
+        applied.get("error")
+    ):
+        state.tombstone_dead_topic(store, operation.route_topic_id)
+        _checkpoint_turn_job(runtime)
+        _defer_turn_final(
+            runtime,
+            ref,
+            "transient_delivery",
+            result,
+            delay_seconds=1,
+        )
+    elif _telegram_result_is_transient(applied):
+        _defer_turn_final(
+            runtime,
+            ref,
+            "rate_limited"
+            if applied.get("rate_limited")
+            else "transient_delivery",
+            result,
+            delay_seconds=_telegram_result_retry_after(applied),
+        )
+    else:
+        _fail_turn_final(
+            runtime,
+            ref,
+            str(applied.get("error") or "delivery_rejected"),
+            result,
+        )
+
+
+def _persist_exact_job_binding(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    item: dict[str, Any],
+    operation: _OfflockEntryOperation,
+    resolution: _OfflockEntryResolution,
+    applied: dict[str, Any],
+    *,
+    message_id: str,
+    candidate_id: str,
+    candidate_bot: str,
+    desired_bot: str,
+    revision: str,
+    plan_token: str,
+    ordinal: int,
+    part_count: int,
+    job_key: str,
+) -> dict[str, Any] | None:
+    state.bind_message_to_worker(
+        store,
+        message_id,
+        _operation_binding_entry(operation),
+        topic_id=operation.route_topic_id,
+        kind="final",
+        turn_id=_turn_id(item),
+        bot_kind=desired_bot,
+        content_revision=revision,
+        plan_token=plan_token,
+        part_ordinal=ordinal,
+        part_count=part_count,
+        tendwire_job_key=job_key,
+        delivery_format=str(applied.get("format") or ""),
+    )
+    binding = state.find_message_binding(store, message_id)
+    if binding is not None and resolution.disposition != _OFFLOCK_APPLY:
+        binding["routing_quarantined"] = True
+        binding["routing_quarantine_reason"] = (
+            "owner_changed_during_delivery"
+        )
+    if binding is not None and candidate_id and candidate_id != message_id:
+        binding["superseded_message_id"] = candidate_id
+        binding["superseded_bot_kind"] = (
+            candidate_bot or MANAGER_BOT_KIND
+        )
+    _checkpoint_turn_job(runtime)
+    _after_provider_accept(runtime)
+    return binding
+
+
+def _apply_upsert_job(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    item: dict[str, Any],
+    entry: dict[str, Any],
+    payload: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    chat_id: str,
+    job_key: str,
+    ref: str,
+    max_operations: int,
+) -> bool:
+    plan_token = str(payload["plan_token"])
+    revision = str(payload["content_revision"])
+    ordinal = int(payload["part_ordinal"])
+    part_count = int(payload["part_count"])
+    message_id, binding = _exact_job_binding(
+        store,
+        job_key=job_key,
+        turn_id=_turn_id(item),
+        revision=revision,
+        plan_token=plan_token,
+        ordinal=ordinal,
+        part_count=part_count,
+    )
+    if message_id and binding:
+        if binding.get("routing_quarantined") is True:
+            return _retire_quarantined_job_binding(
+                store,
+                runtime,
+                message_id,
+                binding,
+                result,
+                chat_id=chat_id,
+                ref=ref,
+                max_operations=max_operations,
+            )
+        return _retire_bound_predecessor(
+            store,
+            runtime,
+            binding,
+            result,
+            chat_id=chat_id,
+            ref=ref,
+            max_operations=max_operations,
+        )
+    feed_item, plan = _canonical_turn_final_part(
+        item, entry, payload, runtime, result
+    )
+    (
+        applied,
+        operation,
+        resolution,
+        candidate_id,
+        candidate_bot,
+        desired_bot,
+    ) = (
+        _send_or_edit_final_part(
+            store,
+            runtime,
+            item,
+            feed_item,
+            entry,
+            payload,
+            plan,
+            result,
+            chat_id=chat_id,
+            max_operations=max_operations,
+        )
+    )
+    if not applied.get("ok"):
+        _handle_failed_upsert_result(
+            store,
+            runtime,
+            applied,
+            operation,
+            result,
+            candidate_id=candidate_id,
+            ref=ref,
+        )
+        return False
+    message_id = str(applied.get("message_id") or candidate_id or "")
+    if not message_id or message_id == "0":
+        _fail_turn_final(
+            runtime,
+            ref,
+            "delivery_uncertain",
+            result,
+            uncertain=True,
+        )
+        return False
+    binding = _persist_exact_job_binding(
+        store,
+        runtime,
+        item,
+        operation,
+        resolution,
+        applied,
+        message_id=message_id,
+        candidate_id=candidate_id,
+        candidate_bot=candidate_bot,
+        desired_bot=desired_bot,
+        revision=revision,
+        plan_token=plan_token,
+        ordinal=ordinal,
+        part_count=part_count,
+        job_key=job_key,
+    )
+    if binding is not None and binding.get("routing_quarantined") is True:
+        return _retire_quarantined_job_binding(
+            store,
+            runtime,
+            message_id,
+            binding,
+            result,
+            chat_id=chat_id,
+            ref=ref,
+            max_operations=max_operations,
+        )
+    return bool(
+        binding is None
+        or _retire_bound_predecessor(
+            store,
+            runtime,
+            binding,
+            result,
+            chat_id=chat_id,
+            ref=ref,
+            max_operations=max_operations,
+        )
+    )
+
+
+def _stage_final_root(
+    store: dict[str, Any],
+    runtime: SyncRuntime,
+    payload: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    ref: str,
+) -> dict[str, Any] | None:
+    item = _final_ready_row(payload)
+    entry_key, entry = _resolve_final_source_entry(store, payload)
+    if entry is None or not str(entry.get("topic_id") or ""):
+        return None
+    owner_matches, owner_bound = _bind_or_verify_final_source_owner(
+        store, payload, entry_key, entry, allow_bind=True
+    )
+    if not owner_matches:
+        return None
+    if owner_bound:
+        _checkpoint_turn_job(runtime)
+    page_calls = _materialize_turn_item(item, runtime)
+    result["content_pages"] += page_calls
+    staged, staged_pages, entry = _stage_final_plan(
+        store,
+        item,
+        entry,
+        runtime,
+        source_ref=ref,
+    )
+    predecessor = str(
+        payload.get("working_predecessor_turn_id") or ""
+    )
+    if predecessor:
+        entry["pending_working_predecessor_turn_id"] = predecessor
+    result["content_pages"] += staged_pages
+    result["staged"] += int(staged)
+    result["changed"] = True
+    _checkpoint_turn_job(runtime)
+    return item
+
+
+def _poll_turn_final(
+    runtime: SyncRuntime, *, lease_seconds: int
+) -> dict[str, Any]:
+    return _execute_exact_provider_operation(
+        runtime.tendwire,
+        mutation=_provider_mutation(
+            "tendwire.turn_final_poll",
+            reason="tendwire.turn_final_poll: acquire final lease",
+            kwargs={"limit": 1, "lease_seconds": lease_seconds},
+        ),
+    )
+
+
+def _prepare_turn_final_job(
+    store: dict[str, Any],
+    turns_payload: dict[str, Any],
+    runtime: SyncRuntime,
+    payload: dict[str, Any],
+    result: dict[str, Any],
+    materialized_sources: dict[str, dict[str, Any]],
+    *,
+    ref: str,
+    turn_projection: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], str, str, int] | None:
+    revision = str(payload["content_revision"])
+    item = materialized_sources.get(revision) or _turn_final_item_source(
+        payload, turns_payload, turn_projection
+    )
+    entry_key, entry = _resolve_final_source_entry(
+        store,
+        payload.get("turn")
+        if isinstance(payload.get("turn"), dict)
+        else item,
+    )
+    if entry is None or not str(entry.get("topic_id") or ""):
+        _defer_turn_final(
+            runtime,
+            ref,
+            "transient_delivery",
+            result,
+            delay_seconds=1,
+        )
+        return None
+    source = payload.get("turn")
+    if isinstance(source, dict):
+        owner_matches, owner_bound = _bind_or_verify_final_source_owner(
+            store, source, entry_key, entry, allow_bind=True
+        )
+        if not owner_matches:
+            _defer_turn_final(
+                runtime,
+                ref,
+                "transient_delivery",
+                result,
+                delay_seconds=1,
+            )
+            return None
+        if owner_bound:
+            _checkpoint_turn_job(runtime)
+    plan_token = str(payload["plan_token"])
+    part_count = int(payload["part_count"])
+    _set_pending_turn_plan(
+        entry,
+        turn_id=_turn_id(item),
+        revision=revision,
+        plan_token=plan_token,
+        part_count=part_count,
+        job_count=max(part_count, int(payload["sequence_index"]) + 1),
+    )
+    entry["pending_presentation_version"] = PRESENTATION_VERSION
+    return item, entry, plan_token, revision, part_count
+
+
+def _apply_turn_final_lease(
+    store: dict[str, Any],
+    turns_payload: dict[str, Any],
+    runtime: SyncRuntime,
+    lease: dict[str, Any],
+    result: dict[str, Any],
+    materialized_sources: dict[str, dict[str, Any]],
+    *,
+    chat_id: str,
+    max_operations: int,
+    turn_projection: Mapping[str, Any] | None,
+) -> bool:
+    ref = str(lease.get("ref") or "")
+    payload = _validate_turn_final_item(lease)
+    if payload["operation"] == "materialize":
+        staged_item = _stage_final_root(
+            store, runtime, payload, result, ref=ref
+        )
+        if staged_item is None:
+            _defer_turn_final(
+                runtime,
+                ref,
+                "transient_delivery",
+                result,
+                delay_seconds=1,
+            )
+            return False
+        materialized_sources[str(payload["content_revision"])] = staged_item
+        return True
+    prepared = _prepare_turn_final_job(
+        store,
+        turns_payload,
+        runtime,
+        payload,
+        result,
+        materialized_sources,
+        ref=ref,
+        turn_projection=turn_projection,
+    )
+    if prepared is None:
+        return False
+    item, entry, plan_token, revision, part_count = prepared
+    if payload["operation"] == "retire":
+        applied = _apply_retire_job(
+            store,
+            runtime,
+            item,
+            payload,
+            result,
+            chat_id=chat_id,
+            ref=ref,
+        )
+    else:
+        applied = _apply_upsert_job(
+            store,
+            runtime,
+            item,
+            entry,
+            payload,
+            result,
+            chat_id=chat_id,
+            job_key=str(lease["key"]),
+            ref=ref,
+            max_operations=max_operations,
+        )
+    if not applied:
+        return False
+    if payload["operation"] == "upsert":
+        _entry_key, authoritative_entry = _resolve_final_source_entry(
+            store, item
+        )
+        if authoritative_entry is None:
+            _defer_turn_final(
+                runtime,
+                ref,
+                "transient_delivery",
+                result,
+                delay_seconds=1,
+            )
+            return False
+        if _complete_turn_plan_from_bindings(
+            store,
+            item,
+            authoritative_entry,
+            plan_token=plan_token,
+            revision=revision,
+            part_count=part_count,
+        ):
+            _checkpoint_turn_job(runtime)
+    return _ack_turn_final(
+        runtime, ref, str(lease["key"]), result
+    )
 
 
 def _drain_turn_final(
@@ -11188,7 +9101,6 @@ def _drain_turn_final(
     max_operations: int,
     turn_projection: Mapping[str, Any] | None = None,
     yield_barrier: Callable[[], None] | None = None,
-    legacy_turns_loader: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     result = {
         "enabled": runtime.with_outbox,
@@ -11203,54 +9115,16 @@ def _drain_turn_final(
         "content_pages": 0,
         "changed": False,
     }
-    failed_job_key = ""
-    failed_plan_token = ""
-    failed_revision = ""
-    if (
-        not runtime.with_outbox
-        or max_operations <= 0
-        or runtime.dry_run
-    ):
+    if not runtime.with_outbox or max_operations <= 0 or runtime.dry_run:
         return result
-    _drain_post_ack_reconciliations(
-        store,
-        turns_payload,
-        runtime,
-        chat_id=chat_id,
-        max_operations=max_operations,
-        result=result,
-    )
-    if result["operations"] >= max_operations:
-        return result
-    materialized_sources: dict[
-        str, tuple[dict[str, Any], dict[str, Any]]
-    ] = {}
-    legacy_turns_loaded = False
     lease_seconds = config.tendwire_turn_final_lease_seconds()
+    materialized_sources: dict[str, dict[str, Any]] = {}
     for _iteration in range(max_operations + 100):
-        # Terminal failures must only act on the lease from this iteration.
-        # A materialize failure has no plan job and therefore must not reuse
-        # the identity of a successfully delivered job from an earlier pass.
-        failed_job_key = ""
-        failed_plan_token = ""
-        failed_revision = ""
         if result["operations"] >= max_operations:
             break
         if yield_barrier is not None:
             yield_barrier()
-        poll = _execute_exact_provider_operation(
-            runtime.tendwire,
-            mutation=_provider_mutation(
-                "tendwire.turn_final_poll",
-                reason=(
-                    "tendwire.turn_final_poll: acquire exact final-delivery lease"
-                ),
-                kwargs={
-                    "limit": 1,
-                    "lease_seconds": lease_seconds,
-                },
-            ),
-        )
+        poll = _poll_turn_final(runtime, lease_seconds=lease_seconds)
         if poll.get("ok") is False:
             result["status"] = str(
                 poll.get("status") or "turn_final_poll_failed"
@@ -11258,9 +9132,9 @@ def _drain_turn_final(
             result["changed"] = True
             break
         jobs = [
-            job
-            for job in poll.get("items", [])
-            if isinstance(job, dict)
+            item
+            for item in poll.get("items", [])
+            if isinstance(item, dict)
         ]
         if not jobs:
             break
@@ -11268,644 +9142,28 @@ def _drain_turn_final(
         lease = jobs[0]
         ref = str(lease.get("ref") or "")
         try:
-            payload = _validate_turn_final_item(lease)
-        except _TurnContentError as exc:
-            _fail_turn_final(
-                runtime, ref, f"{exc.status}: {exc}", result
-            )
-            break
-
-        if payload["operation"] == "materialize":
-            try:
-                item = _final_ready_row(payload)
-            except _TurnContentError as exc:
-                _fail_turn_final(
-                    runtime, ref, f"{exc.status}: {exc}", result
-                )
-                break
-            _entry_key, entry = _resolve_final_source_entry(
-                store, payload
-            )
-            if entry is None or not str(entry.get("topic_id") or ""):
-                notice_entry = entry or _unbound_live_entry_for_item(
-                    store, item
-                )
-                if notice_entry is not None:
-                    result["operations"] += _notify_unbound_final(
-                        store,
-                        item,
-                        notice_entry,
-                        runtime,
-                        chat_id=chat_id,
-                    )
-                owner_matches = False
-                owner_bound = False
-                suppress_historical = False
-            else:
-                owner_matches, owner_bound = (
-                    _bind_or_verify_final_source_owner(
-                        store,
-                        payload,
-                        _entry_key,
-                        entry,
-                        allow_bind=True,
-                    )
-                )
-                suppress_historical = _suppress_rebind_catchup_root(
-                    entry,
-                    payload,
-                    turns_payload,
-                    turn_projection,
-                )
-            if not owner_matches:
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "transient_delivery",
-                    result,
-                    delay_seconds=1,
-                )
-                break
-            if owner_bound:
-                _checkpoint_turn_job(runtime)
-            pending_plan = str(
-                entry.get("pending_plan_token") or ""
-            )
-            pending_revision = str(
-                entry.get("pending_content_revision") or ""
-            )
-            if (
-                pending_plan
-                and pending_revision
-                not in {"", payload["content_revision"]}
+            if not _apply_turn_final_lease(
+                store,
+                turns_payload,
+                runtime,
+                lease,
+                result,
+                materialized_sources,
+                chat_id=chat_id,
+                max_operations=max_operations,
+                turn_projection=turn_projection,
             ):
-                _reconcile_completed_turn_plans(
-                    store,
-                    runtime,
-                    pending_entry=entry,
-                )
-                pending_plan = str(
-                    entry.get("pending_plan_token") or ""
-                )
-                pending_revision = str(
-                    entry.get("pending_content_revision") or ""
-                )
-            if (
-                pending_plan
-                and pending_revision
-                not in {"", payload["content_revision"]}
-            ):
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "predecessor_pending",
-                    result,
-                    delay_seconds=1,
-                )
                 break
-            try:
-                item, page_calls = _materialize_final_ready(
-                    payload, runtime
-                )
-            except _TurnContentError as exc:
-                _fail_turn_final(
-                    runtime, ref, f"{exc.status}: {exc}", result
-                )
-                break
-            except Exception:
-                # No provider operation has started. Release the source root
-                # instead of leaving a silent loop failure leased until expiry.
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "transient_delivery",
-                    result,
-                    delay_seconds=1,
-                )
-                break
-            result["content_pages"] += page_calls
-            source_identity = str(payload["final_identity"])
-            cached_source = materialized_sources.get(
-                source_identity
-            )
-            if (
-                cached_source is not None
-                and cached_source[0] != payload
-            ):
-                _fail_turn_final(
-                    runtime,
-                    ref,
-                    "invalid_turn_final_job",
-                    result,
-                )
-                break
-            try:
-                staged, staged_pages, entry = _stage_final_plan(
-                    store,
-                    item,
-                    entry,
-                    runtime,
-                    source_ref=ref,
-                )
-            except _TurnContentError as exc:
-                _fail_turn_final(
-                    runtime, ref, f"{exc.status}: {exc}", result
-                )
-                break
-            except TendwireError:
-                # The provider boundary names transport/process failures.
-                # Programming exceptions from local planning are deliberately
-                # not caught here and reach loop-level failure reporting.
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "transient_delivery",
-                    result,
-                    delay_seconds=1,
-                )
-                break
-            result["content_pages"] += staged_pages
-            predecessor_turn_id = str(
-                payload.get("working_predecessor_turn_id") or ""
-            )
-            if predecessor_turn_id:
-                entry["pending_working_predecessor_turn_id"] = (
-                    predecessor_turn_id
-                )
-            if suppress_historical:
-                entry["pending_turn_suppressed"] = {
-                    "plan_token": str(
-                        entry.get("pending_plan_token") or ""
-                    ),
-                    "turn_id": _turn_id(item),
-                    "content_revision": _content_revision(item),
-                    "reason": "rebind_catchup_older_than_bound",
-                }
-            materialized_sources[source_identity] = (
-                payload,
-                item,
-            )
-            result["staged"] += int(staged)
-            result["changed"] = True
-            _checkpoint_turn_job(runtime)
-            continue
-
-        revision = str(payload["content_revision"])
-        plan_token = str(payload["plan_token"])
-        job_key = str(lease["key"])
-        failed_job_key = job_key
-        failed_plan_token = plan_token
-        failed_revision = revision
-        operation = str(payload["operation"])
-        sequence = int(payload["sequence_index"])
-        ordinal = int(payload["part_ordinal"])
-        part_count = int(payload["part_count"])
-        replaces = str(payload.get("replaces_plan_token") or "")
-        existing_receipt = state.find_tendwire_turn_job(
-            store, job_key
-        )
-        durable_outcome = (
-            str((existing_receipt or {}).get("substate") or "")
-            in {
-                "telegram_applied",
-                "old_slot_retired",
-                "suppressed",
-                "acknowledged",
-            }
-        )
-
-        source = payload.get("turn")
-        source_identity = ""
-        item: dict[str, Any] | None
-        if isinstance(source, dict):
-            source_identity = str(source["final_identity"])
-            cached_source = materialized_sources.get(
-                source_identity
-            )
-            if (
-                cached_source is not None
-                and cached_source[0] != source
-            ):
-                _fail_turn_final(
-                    runtime,
-                    ref,
-                    "invalid_turn_final_job",
-                    result,
-                )
-                break
-            if cached_source is not None:
-                item = cached_source[1]
-            else:
-                try:
-                    item = _final_ready_row(source)
-                except _TurnContentError as exc:
-                    _fail_turn_final(
-                        runtime,
-                        ref,
-                        f"{exc.status}: {exc}",
-                        result,
-                    )
-                    break
-                materialized_sources[source_identity] = (
-                    source,
-                    item,
-                )
-        else:
-            item = _turn_item_by_revision(
-                turns_payload, revision
-            )
-            if item is None and isinstance(turn_projection, Mapping):
-                matches = [
-                    candidate
-                    for candidate in turn_projection.values()
-                    if isinstance(candidate, dict)
-                    and _content_revision(candidate) == revision
-                ]
-                item = matches[0] if len(matches) == 1 else None
-            if (
-                item is None
-                and not legacy_turns_loaded
-                and legacy_turns_loader is not None
-            ):
-                legacy_turns_loaded = True
-                relisted = legacy_turns_loader()
-                if relisted.get("ok") is False:
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "transient_delivery",
-                        result,
-                        delay_seconds=1,
-                    )
-                    break
-                try:
-                    turns_payload = _validate_turns_payload(relisted)
-                except _TurnContentError as exc:
-                    _fail_turn_final(
-                        runtime,
-                        ref,
-                        f"{exc.status}: {exc}",
-                        result,
-                    )
-                    break
-                item = _turn_item_by_revision(
-                    turns_payload, revision
-                )
-            if item is None:
-                _fail_turn_final(
-                    runtime,
-                    ref,
-                    "stale_or_unavailable_content_revision",
-                    result,
-                )
-                break
-
-        _entry_key, entry = _resolve_final_source_entry(
-            store, source if isinstance(source, dict) else item
-        )
-        pending_token = str(
-            (entry or {}).get("pending_plan_token") or ""
-        )
-        owner_matches = (
-            entry is not None
-            and bool(str(entry.get("topic_id") or ""))
-        )
-        owner_bound = False
-        if owner_matches and isinstance(source, dict):
-            owner_matches, owner_bound = (
-                _bind_or_verify_final_source_owner(
-                    store,
-                    source,
-                    _entry_key,
-                    entry,
-                    allow_bind=pending_token
-                    in {"", plan_token},
-                )
-            )
-        if not owner_matches:
+        except RateLimited as exc:
             _defer_turn_final(
                 runtime,
                 ref,
-                "transient_delivery",
+                "rate_limited",
                 result,
-                delay_seconds=1,
+                delay_seconds=exc.retry_after,
             )
             break
-        if owner_bound:
-            _checkpoint_turn_job(runtime)
-        if pending_token not in {"", plan_token}:
-            _fail_turn_final(
-                runtime,
-                ref,
-                "stale_or_unroutable_turn_plan",
-                result,
-            )
-            break
-        if (
-            entry.get("abandoned_plan_token") == plan_token
-            and entry.get("abandoned_content_revision") == revision
-        ):
-            _fail_turn_final(
-                runtime,
-                ref,
-                "invalid_pending_plan",
-                result,
-            )
-            break
-        _clear_abandoned_plan_handle(entry)
-        if source_identity:
-            entry["pending_final_identity"] = source_identity
-        prior_expected = entry.get("pending_turn_job_count")
-        _set_pending_turn_plan(
-            entry,
-            turn_id=_turn_id(item),
-            revision=revision,
-            plan_token=plan_token,
-            part_count=part_count,
-            job_count=max(
-                int(prior_expected)
-                if isinstance(prior_expected, int)
-                and not isinstance(prior_expected, bool)
-                else 0,
-                sequence + 1,
-                part_count,
-            ),
-        )
-        if not entry.get("pending_turn_user_hash"):
-            entry["pending_turn_user_hash"] = _turn_user_hash(item)
-        if (
-            not entry.get("pending_stream_submission_id")
-            and entry.get("last_stream_submission_id")
-        ):
-            entry["pending_stream_submission_id"] = str(
-                entry["last_stream_submission_id"]
-            )
-        if "pending_plan_generation" not in entry:
-            entry["pending_plan_generation"] = 1
-
-        advanced_prior = False
-        for prior_key, prior_receipt in list(
-            state.tendwire_turn_jobs(store).items()
-        ):
-            if (
-                isinstance(prior_receipt, dict)
-                and prior_receipt.get("plan_token") == plan_token
-                and isinstance(
-                    prior_receipt.get("sequence_index"), int
-                )
-                and prior_receipt["sequence_index"] < sequence
-                and prior_receipt.get("substate")
-                in {"telegram_applied", "old_slot_retired"}
-            ):
-                state.update_tendwire_turn_job(
-                    store,
-                    prior_key,
-                    substate="acknowledged",
-                )
-                advanced_prior = True
-        if advanced_prior:
-            _checkpoint_turn_job(runtime)
-
-        predecessor_job_key = payload.get(
-            "predecessor_job_key"
-        )
-        if predecessor_job_key is not None:
-            try:
-                predecessor_receipt = (
-                    state.find_tendwire_turn_job(
-                        store, predecessor_job_key
-                    )
-                )
-            except ValueError:
-                predecessor_receipt = None
-            if (
-                predecessor_receipt is None
-                or predecessor_receipt.get("substate")
-                != "acknowledged"
-                or predecessor_receipt.get("content_revision")
-                != revision
-                or predecessor_receipt.get("sequence_index")
-                != int(
-                    entry.get(
-                        "pending_acknowledged_prefix_count"
-                    )
-                    or 0
-                )
-                - 1
-                or predecessor_receipt.get("plan_token")
-                != entry.get("replaces_failed_plan_token")
-            ):
-                _fail_turn_final(
-                    runtime,
-                    ref,
-                    "invalid_recovery_predecessor_receipt",
-                    result,
-                )
-                break
-
-        feed_item: dict[str, Any] | None = None
-        plans: list[dict[str, Any]] = []
-        if operation == "upsert" and not durable_outcome:
-            try:
-                page_calls = _materialize_turn_item(
-                    item, runtime
-                )
-            except _TurnContentError as exc:
-                _fail_turn_final(
-                    runtime,
-                    ref,
-                    f"{exc.status}: {exc}",
-                    result,
-                )
-                break
-            result["content_pages"] += page_calls
-            feed_item = _turn_feed_item(item, entry)
-            try:
-                plans = _prepare_final_delivery_parts(feed_item)
-            except _TurnContentError as exc:
-                _fail_turn_final(
-                    runtime,
-                    ref,
-                    f"{exc.status}: {exc}",
-                    result,
-                )
-                break
-            if (
-                ordinal >= len(plans)
-                or part_count != len(plans)
-                or payload.get("spans")
-                != plans[ordinal].get("spans")
-            ):
-                _fail_turn_final(
-                    runtime,
-                    ref,
-                    "presentation_plan_mismatch",
-                    result,
-                )
-                break
-
-        if operation == "upsert":
-            (
-                candidate_id,
-                candidate_bot,
-                candidate_topic,
-                candidate_kind,
-            ) = _current_upsert_candidate(
-                store,
-                item,
-                entry,
-                ordinal=ordinal,
-                replaces_plan_token=replaces,
-            )
-        else:
-            candidate_id, binding = _slot_binding(
-                store,
-                turn_id=_turn_id(item),
-                ordinal=ordinal,
-                plan_token=replaces,
-            )
-            candidate_bot = str(
-                (binding or {}).get("bot_kind")
-                or MANAGER_BOT_KIND
-            )
-            candidate_topic = str(
-                (binding or {}).get("topic_id") or ""
-            )
-            candidate_kind = "final"
-        desired_token, desired_bot = _delivery_bot(store, entry)
-        compatible = bool(
-            candidate_id
-            and candidate_bot == desired_bot
-            and candidate_topic
-            == str(entry.get("topic_id") or "")
-        )
-        prior_for_reservation = (
-            candidate_id if operation == "retire" else ""
-        )
-        try:
-            receipt = state.reserve_tendwire_turn_job(
-                store,
-                job_key,
-                plan_token=plan_token,
-                content_revision=revision,
-                operation=operation,
-                sequence_index=sequence,
-                part_ordinal=ordinal,
-                part_count=part_count,
-                prior_message_id=prior_for_reservation,
-                bot_kind=desired_bot
-                if operation == "upsert"
-                else candidate_bot,
-            )
-            if existing_receipt is None:
-                _checkpoint_turn_job(runtime)
-        except (RuntimeError, ValueError) as exc:
-            _fail_turn_final(
-                runtime,
-                ref,
-                f"receipt_reservation_failed: {exc}",
-                result,
-            )
-            break
-        substate = str(receipt.get("substate") or "")
-        if substate == "retryable":
-            if not state.tendwire_turn_job_has_stale_copy_capacity(
-                receipt
-            ):
-                stale = state.tendwire_turn_job_stale_copies(receipt)[0]
-                if result["operations"] >= max_operations:
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "operation_budget_exhausted",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=1,
-                    )
-                    break
-                try:
-                    owner_token = _owning_bot_token(
-                        store, stale["bot_kind"]
-                    )
-                    retired = _execute_exact_provider_operation(
-                        runtime.telegram,
-                        store=store,
-                        mutation=_provider_mutation(
-                            "telegram.delete_turn_delivery_message",
-                            reason=(
-                                "telegram.delete_turn_delivery_message: "
-                                "stale-copy backpressure retirement"
-                            ),
-                            args=(chat_id, stale["message_id"]),
-                            kwargs={"api_token": owner_token},
-                        ),
-                    )
-                    result["operations"] += 1
-                except RateLimited as exc:
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "rate_limited",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=exc.retry_after,
-                    )
-                    break
-                except Exception:
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "transient_delivery",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=1,
-                    )
-                    break
-                if not retired.get("ok"):
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        str(
-                            retired.get("error")
-                            or "stale copy retire failed"
-                        ),
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=1,
-                    )
-                    break
-                _retire_local_message(
-                    store, None, stale["message_id"]
-                )
-                state.retire_tendwire_turn_job_stale_copy(
-                    store,
-                    job_key,
-                    message_id=stale["message_id"],
-                    topic_id=stale["topic_id"],
-                    bot_kind=stale["bot_kind"],
-                )
-                _checkpoint_turn_job(runtime)
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "stale_copy_backpressure",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=1,
-                )
-                break
-            state.update_tendwire_turn_job(
-                store, job_key, substate="reserved"
-            )
-            _checkpoint_turn_job(runtime)
-            substate = "reserved"
-            existing_receipt = None
-        if substate == "reserved" and existing_receipt is not None:
+        except TelegramError:
             _fail_turn_final(
                 runtime,
                 ref,
@@ -11914,1269 +9172,33 @@ def _drain_turn_final(
                 uncertain=True,
             )
             break
-        if substate == "failed":
-            _fail_turn_final(
-                runtime,
-                ref,
-                "delivery_rejected",
-                result,
-            )
-            result["_terminal_failure"] = True
-            break
-
-        if _suppressed_turn_plan(entry, plan_token, revision):
-            if substate not in {"suppressed", "acknowledged"}:
-                state.update_tendwire_turn_job(
-                    store, job_key, substate="suppressed"
-                )
-                _checkpoint_turn_job(runtime)
-                substate = "suppressed"
-            suppressed_ack_operation = _capture_entry_operation(
-                store,
-                entry,
-                topic_id=str(entry.get("topic_id") or ""),
-                plan_token=plan_token,
-                revision=revision,
-            )
-            if (
-                _compare_and_apply_entry_operation(
-                    store, suppressed_ack_operation
-                ).disposition
-                != _OFFLOCK_APPLY
-            ):
+        except _TurnContentError as exc:
+            if exc.conflict:
                 _defer_turn_final(
                     runtime,
                     ref,
                     "transient_delivery",
                     result,
-                    store,
-                    job_key,
                     delay_seconds=1,
                 )
-                break
-            ack_obligation = _turn_final_ack_obligation(
-                store,
-                job_key,
-                suppressed_ack_operation,
-                kind="suppressed",
-                turn_id=_turn_id(item),
-                plan_token=plan_token,
-                revision=revision,
-                ordinal=ordinal,
-                part_count=part_count,
-            )
-            state.record_tendwire_turn_job_post_ack_reconcile(
-                store,
-                job_key,
-                ack_obligation,
-                acknowledged=False,
-            )
-            _checkpoint_turn_job(runtime)
-            execution = _execute_entry_operation(
-                store,
-                runtime.tendwire,
-                suppressed_ack_operation,
-                _provider_mutation(
-                    "tendwire.turn_final_ack",
-                    reason=(
-                        "tendwire.turn_final_ack: acknowledge suppressed plan"
-                    ),
-                    args=(
-                        ref,
-                        {
-                            "outcome": "applied",
-                            "job_key": job_key,
-                        },
-                    ),
-                ),
-            )
-            ack = execution.result
-            suppressed_ack_resolution = execution.resolution
-            if (
-                suppressed_ack_resolution.disposition
-                != _OFFLOCK_APPLY
-            ):
-                if ack.get("ok") is not False:
-                    ack_obligation["status"] = "reconcile"
-                    state.record_tendwire_turn_job_post_ack_reconcile(
-                        store, job_key, ack_obligation
-                    )
-                    _checkpoint_turn_job(runtime)
-                    result["delivered"] += 1
-                    result["acked"] += 1
-                    result["changed"] = True
-                    continue
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "transient_delivery",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=1,
-                )
-                break
-            entry = suppressed_ack_resolution.entry
-            assert entry is not None
-            if ack.get("ok") is False:
-                observe_operation = _capture_entry_operation(
-                    store,
-                    entry,
-                    topic_id=str(entry.get("topic_id") or ""),
-                    plan_token=plan_token,
-                    revision=revision,
-                )
-                execution = _execute_entry_operation(
-                    store,
-                    runtime.tendwire,
-                    observe_operation,
-                    _provider_mutation(
-                        "tendwire.connector_prepare_commit",
-                        reason=(
-                            "tendwire.connector_prepare_commit: observe "
-                            "suppressed ACK conflict"
-                        ),
-                        kwargs={"plan_token": plan_token},
-                    ),
-                )
-                observed = execution.result
-                observe_resolution = execution.resolution
-                if observe_resolution.disposition != _OFFLOCK_APPLY:
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "transient_delivery",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=1,
-                    )
-                    break
-                entry = observe_resolution.entry
-                assert entry is not None
-                advanced = False
-                if (
-                    observed.get("ok") is True
-                    and observed.get("plan_token") == plan_token
-                    and observed.get("state") == "completed"
-                ):
-                    for receipt_key, observed_receipt in list(
-                        state.tendwire_turn_jobs(store).items()
-                    ):
-                        if (
-                            isinstance(observed_receipt, dict)
-                            and observed_receipt.get("plan_token")
-                            == plan_token
-                            and observed_receipt.get("substate")
-                            in {
-                                "suppressed",
-                                "telegram_applied",
-                                "old_slot_retired",
-                            }
-                        ):
-                            state.update_tendwire_turn_job(
-                                store,
-                                receipt_key,
-                                substate="acknowledged",
-                            )
-                            state.clear_tendwire_turn_job_post_ack_reconcile(
-                                store, receipt_key
-                            )
-                            advanced = True
-                    advanced = (
-                        _complete_suppressed_turn_plan(
-                            store,
-                            item,
-                            entry,
-                            plan_token=plan_token,
-                            revision=revision,
-                        )
-                        or advanced
-                    )
-                if advanced:
-                    _checkpoint_turn_job(runtime)
-                result["status"] = str(
-                    ack.get("status") or "turn_final_ack_failed"
-                )
-                result["changed"] = True
-                break
-            if substate != "acknowledged":
-                state.update_tendwire_turn_job(
-                    store, job_key, substate="acknowledged"
-                )
-            state.clear_tendwire_turn_job_post_ack_reconcile(
-                store, job_key
-            )
-            _checkpoint_turn_job(runtime)
-            result["delivered"] += 1
-            result["acked"] += 1
-            result["changed"] = True
-            if _complete_suppressed_turn_plan(
-                store,
-                item,
-                entry,
-                plan_token=plan_token,
-                revision=revision,
-            ):
-                _checkpoint_turn_job(runtime)
-            continue
-
-        if substate in {
-            "telegram_applied",
-            "old_slot_retired",
-            "acknowledged",
-        }:
-            pass
-        elif operation == "retire":
-            if not candidate_id:
-                state.update_tendwire_turn_job(
-                    store,
-                    job_key,
-                    substate="telegram_applied",
-                    prior_message_id="already-missing",
-                    bot_kind=candidate_bot
-                    or MANAGER_BOT_KIND,
-                )
-                _checkpoint_turn_job(runtime)
-                substate = "telegram_applied"
             else:
-                retire_operation = _capture_entry_operation(
-                    store,
-                    entry,
-                    topic_id=str(entry.get("topic_id") or ""),
-                    message_id=candidate_id,
-                    plan_token=plan_token,
-                    revision=revision,
-                )
-                try:
-                    owner_token = _owning_bot_token(
-                        store, candidate_bot
-                    )
-                    result["operations"] += 1
-                    execution = _execute_entry_operation(
-                        store,
-                        runtime.telegram,
-                        retire_operation,
-                        _provider_mutation(
-                            "telegram.delete_turn_delivery_message",
-                            reason=(
-                                "telegram.delete_turn_delivery_message: "
-                                "retire planned final slot"
-                            ),
-                            args=(chat_id, candidate_id),
-                            kwargs={"api_token": owner_token},
-                        ),
-                    )
-                except RateLimited as exc:
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "rate_limited",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=exc.retry_after,
-                    )
-                    break
-                except _TurnContentError as exc:
-                    _fail_turn_final(
-                        runtime,
-                        ref,
-                        f"{exc.status}: {exc}",
-                        result,
-                    )
-                    break
-                except Exception:
-                    _fail_turn_final(
-                        runtime,
-                        ref,
-                        "delivery_uncertain",
-                        result,
-                        uncertain=True,
-                    )
-                    break
-                deleted = execution.result
-                retire_resolution = execution.resolution
-                if not deleted.get("ok"):
-                    if _telegram_result_is_transient(deleted):
-                        _defer_turn_final(
-                            runtime,
-                            ref,
-                            str(
-                                deleted.get("error")
-                                or "transient delivery"
-                            ),
-                            result,
-                            store,
-                            job_key,
-                            delay_seconds=_telegram_result_retry_after(
-                                deleted
-                            ),
-                        )
-                    else:
-                        _fail_turn_final(
-                            runtime,
-                            ref,
-                            str(
-                                deleted.get("error")
-                                or "retire failed"
-                            ),
-                            result,
-                        )
-                    break
-                _retire_local_message(store, None, candidate_id)
-                state.update_tendwire_turn_job(
-                    store,
-                    job_key,
-                    substate="telegram_applied",
-                    prior_message_id=candidate_id,
-                    bot_kind=candidate_bot
-                    or MANAGER_BOT_KIND,
-                )
-                _checkpoint_turn_job(runtime)
-                _after_provider_accept(runtime)
-                substate = "telegram_applied"
-        else:
-            assert feed_item is not None and plans
-            attempted_topic_id = str(entry.get("topic_id") or "")
-            if not attempted_topic_id:
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "transient_delivery",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=1,
-                )
-                break
-            delivery_operation = _capture_entry_operation(
-                store,
-                entry,
-                topic_id=attempted_topic_id,
-                message_id=candidate_id if compatible else "",
-                plan_token=plan_token,
-                revision=revision,
-            )
-            try:
-                result["operations"] += 1
-                if compatible:
-                    execution = _execute_entry_operation(
-                        store,
-                        runtime.telegram,
-                        delivery_operation,
-                        _provider_mutation(
-                            "telegram.edit_turn_delivery_part",
-                            reason=(
-                                "telegram.edit_turn_delivery_part: apply compatible final"
-                            ),
-                            args=(
-                                chat_id,
-                                candidate_id,
-                                feed_item,
-                                plans[ordinal],
-                            ),
-                            kwargs={
-                                "telegram": _telegram_state(store),
-                                "api_token": desired_token,
-                                "max_physical_writes": (
-                                    max_operations
-                                    - result["operations"]
-                                    + 1
-                                ),
-                            },
-                        ),
-                    )
-                else:
-                    execution = _execute_entry_operation(
-                        store,
-                        runtime.telegram,
-                        delivery_operation,
-                        _provider_mutation(
-                            "telegram.send_turn_delivery_part",
-                            reason=(
-                                "telegram.send_turn_delivery_part: apply new final"
-                            ),
-                            args=(chat_id, feed_item, plans[ordinal]),
-                            kwargs={
-                                "telegram": _telegram_state(store),
-                                "thread_id": attempted_topic_id,
-                                "notify": False,
-                                "api_token": desired_token,
-                                "max_physical_writes": (
-                                    max_operations
-                                    - result["operations"]
-                                    + 1
-                                ),
-                            },
-                        ),
-                    )
-            except RateLimited as exc:
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "rate_limited",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=exc.retry_after,
-                )
-                break
-            except Exception:
                 _fail_turn_final(
-                    runtime,
-                    ref,
-                    "delivery_uncertain",
-                    result,
-                    uncertain=True,
+                    runtime, ref, f"{exc.status}: {exc}", result
                 )
-                break
-            applied = execution.result
-            result["operations"] += max(
-                0, _telegram_physical_writes(applied) - 1
-            )
-            delivery_resolution = execution.resolution
-            if not applied.get("ok"):
-                kind = str(applied.get("kind") or "")
-                if kind == "operation_budget_exhausted":
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "operation_budget_exhausted",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=1,
-                    )
-                    break
-                if _telegram_result_is_transient(applied):
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        str(
-                            applied.get("error")
-                            or "transient delivery"
-                        ),
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=_telegram_result_retry_after(
-                            applied
-                        ),
-                    )
-                    break
-                retry_as_send = (
-                    compatible
-                    and kind in {"not_found", "topic_not_found"}
-                )
-                if retry_as_send and kind == "not_found":
-                    _retire_local_message(store, None, candidate_id)
-                    candidate_id = ""
-                    compatible = False
-                    _checkpoint_turn_job(runtime)
-                if (
-                    retry_as_send
-                    and delivery_resolution.disposition
-                    != _OFFLOCK_APPLY
-                ):
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "transient_delivery",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=1,
-                    )
-                    break
-                if (
-                    retry_as_send
-                    and result["operations"] >= max_operations
-                ):
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "operation_budget_exhausted",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=1,
-                    )
-                    break
-                if retry_as_send:
-                    entry = delivery_resolution.entry
-                    assert entry is not None
-                    attempted_topic_id = str(entry.get("topic_id") or "")
-                    if not attempted_topic_id:
-                        _defer_turn_final(
-                            runtime,
-                            ref,
-                            "transient_delivery",
-                            result,
-                            store,
-                            job_key,
-                            delay_seconds=1,
-                        )
-                        break
-                    delivery_operation = _capture_entry_operation(
-                        store,
-                        entry,
-                        topic_id=attempted_topic_id,
-                        plan_token=plan_token,
-                        revision=revision,
-                    )
-                    try:
-                        result["operations"] += 1
-                        execution = _execute_entry_operation(
-                            store,
-                            runtime.telegram,
-                            delivery_operation,
-                            _provider_mutation(
-                                "telegram.send_turn_delivery_part",
-                                reason=(
-                                    "telegram.send_turn_delivery_part: replace missing final"
-                                ),
-                                args=(chat_id, feed_item, plans[ordinal]),
-                                kwargs={
-                                    "telegram": _telegram_state(store),
-                                    "thread_id": attempted_topic_id,
-                                    "notify": False,
-                                    "api_token": desired_token,
-                                    "max_physical_writes": (
-                                        max_operations
-                                        - result["operations"]
-                                        + 1
-                                    ),
-                                },
-                            ),
-                        )
-                        compatible = False
-                    except RateLimited as exc:
-                        _defer_turn_final(
-                            runtime,
-                            ref,
-                            "rate_limited",
-                            result,
-                            store,
-                            job_key,
-                            delay_seconds=exc.retry_after,
-                        )
-                        break
-                    except Exception:
-                        _fail_turn_final(
-                            runtime,
-                            ref,
-                            "delivery_uncertain",
-                            result,
-                            uncertain=True,
-                        )
-                        break
-                    applied = execution.result
-                    result["operations"] += max(
-                        0, _telegram_physical_writes(applied) - 1
-                    )
-                    delivery_resolution = execution.resolution
-                if not applied.get("ok"):
-                    if _repair_provider_gone_topic(
-                        store,
-                        delivery_resolution.entry
-                        if delivery_resolution.disposition
-                        == _OFFLOCK_APPLY
-                        else None,
-                        applied,
-                        topic_id=attempted_topic_id,
-                    ):
-                        _defer_turn_final(
-                            runtime,
-                            ref,
-                            "transient_delivery",
-                            result,
-                            store,
-                            job_key,
-                            delay_seconds=1,
-                        )
-                        break
-                    if _telegram_result_is_transient(applied):
-                        _defer_turn_final(
-                            runtime,
-                            ref,
-                            str(
-                                applied.get("error")
-                                or "transient delivery"
-                            ),
-                            result,
-                            store,
-                            job_key,
-                            delay_seconds=_telegram_result_retry_after(
-                                applied
-                            ),
-                        )
-                    else:
-                        _fail_turn_final(
-                            runtime,
-                            ref,
-                            str(
-                                applied.get("error")
-                                or "delivery rejected"
-                            ),
-                            result,
-                        )
-                    break
-            message_id = str(
-                applied.get("message_id")
-                or candidate_id
-                or ""
-            )
-            if not message_id or message_id == "0":
-                _fail_turn_final(
-                    runtime,
-                    ref,
-                    "delivery_uncertain",
-                    result,
-                    uncertain=True,
-                )
-                break
-            prior_id = (
-                candidate_id
-                if candidate_id
-                and not compatible
-                and candidate_id != message_id
-                else None
-            )
-            state.bind_message_to_worker(
-                store,
-                message_id,
-                _operation_binding_entry(delivery_operation),
-                topic_id=attempted_topic_id,
-                kind="final",
-                turn_id=_turn_id(item),
-                bot_kind=desired_bot,
-                content_revision=revision,
-                plan_token=plan_token,
-                part_ordinal=ordinal,
-                part_count=part_count,
-                tendwire_job_key=job_key,
-                delivery_format=str(applied.get("format") or ""),
-            )
-            if delivery_resolution.disposition != _OFFLOCK_APPLY:
-                state.reconcile_tendwire_turn_job_route(
-                    store,
-                    job_key,
-                    message_id=message_id,
-                    topic_id=attempted_topic_id,
-                    bot_kind=desired_bot,
-                )
-                _checkpoint_turn_job(runtime)
-                _after_provider_accept(runtime)
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "transient_delivery",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=1,
-                )
-                break
-            entry = delivery_resolution.entry
-            assert entry is not None
-            if prior_id and any(
-                stale["message_id"] == prior_id
-                for stale in state.tendwire_turn_job_stale_copies(
-                    state.find_tendwire_turn_job(store, job_key)
-                )
-            ):
-                prior_id = None
-            state.update_tendwire_turn_job(
-                store,
-                job_key,
-                substate="telegram_applied",
-                telegram_message_id=message_id,
-                prior_message_id=prior_id,
-                bot_kind=desired_bot,
-            )
-            if (
-                candidate_kind == "working"
-                and message_id == candidate_id
-            ):
-                _clear_entry_message_reference(
-                    entry, candidate_id, "working"
-                )
-            _checkpoint_turn_job(runtime)
-            _after_provider_accept(runtime)
-            substate = "telegram_applied"
-
-        receipt = state.find_tendwire_turn_job(store, job_key)
-        if (
-            operation == "upsert"
-            and substate == "telegram_applied"
-            and receipt is not None
-        ):
-            prior_id = str(
-                receipt.get("prior_message_id") or ""
-            )
-            message_id = str(
-                receipt.get("telegram_message_id") or ""
-            )
-            if prior_id and prior_id != message_id:
-                if result["operations"] >= max_operations:
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "operation_budget_exhausted",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=1,
-                    )
-                    break
-                prior_binding = state.find_message_binding(
-                    store, prior_id
-                )
-                prior_bot = str(
-                    (prior_binding or {}).get("bot_kind")
-                    or candidate_bot
-                    or MANAGER_BOT_KIND
-                )
-                retire_operation = _capture_entry_operation(
-                    store,
-                    entry,
-                    topic_id=str(entry.get("topic_id") or ""),
-                    message_id=prior_id,
-                    plan_token=plan_token,
-                    revision=revision,
-                )
-                try:
-                    owner_token = _owning_bot_token(
-                        store, prior_bot
-                    )
-                    result["operations"] += 1
-                    execution = _execute_entry_operation(
-                        store,
-                        runtime.telegram,
-                        retire_operation,
-                        _provider_mutation(
-                            "telegram.delete_turn_delivery_message",
-                            reason=(
-                                "telegram.delete_turn_delivery_message: "
-                                "retire replaced final slot"
-                            ),
-                            args=(chat_id, prior_id),
-                            kwargs={"api_token": owner_token},
-                        ),
-                    )
-                except RateLimited as exc:
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "rate_limited",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=exc.retry_after,
-                    )
-                    break
-                except _TurnContentError as exc:
-                    _fail_turn_final(
-                        runtime,
-                        ref,
-                        f"{exc.status}: {exc}",
-                        result,
-                    )
-                    break
-                except Exception:
-                    _fail_turn_final(
-                        runtime,
-                        ref,
-                        "delivery_uncertain",
-                        result,
-                        uncertain=True,
-                    )
-                    break
-                retired = execution.result
-                retire_resolution = execution.resolution
-                if not retired.get("ok"):
-                    if _telegram_result_is_transient(retired):
-                        _defer_turn_final(
-                            runtime,
-                            ref,
-                            str(
-                                retired.get("error")
-                                or "transient delivery"
-                            ),
-                            result,
-                            store,
-                            job_key,
-                            delay_seconds=_telegram_result_retry_after(
-                                retired
-                            ),
-                        )
-                    else:
-                        _fail_turn_final(
-                            runtime,
-                            ref,
-                            str(
-                                retired.get("error")
-                                or "old slot retire failed"
-                            ),
-                            result,
-                        )
-                    break
-                _retire_local_message(store, None, prior_id)
-                if retire_resolution.disposition != _OFFLOCK_APPLY:
-                    current_binding = state.find_message_binding(
-                        store, message_id
-                    )
-                    current_topic = str(
-                        (current_binding or {}).get("topic_id") or ""
-                    )
-                    current_bot = str(
-                        (current_binding or {}).get("bot_kind")
-                        or receipt.get("bot_kind")
-                        or desired_bot
-                    )
-                    if message_id and current_topic:
-                        state.reconcile_tendwire_turn_job_route(
-                            store,
-                            job_key,
-                            message_id=message_id,
-                            topic_id=current_topic,
-                            bot_kind=current_bot,
-                        )
-                        _checkpoint_turn_job(runtime)
-                    else:
-                        _checkpoint_turn_job(runtime)
-                    _after_provider_accept(runtime)
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        "transient_delivery",
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=1,
-                    )
-                    break
-                entry = retire_resolution.entry
-                assert entry is not None
-                state.update_tendwire_turn_job(
-                    store,
-                    job_key,
-                    substate="old_slot_retired",
-                )
-                _checkpoint_turn_job(runtime)
-                _after_provider_accept(runtime)
-                substate = "old_slot_retired"
-
-        stale_cleanup_deferred = False
-        while operation == "upsert":
-            receipt = state.find_tendwire_turn_job(store, job_key)
-            stale_copies = state.tendwire_turn_job_stale_copies(receipt)
-            if not stale_copies:
-                break
-            stale = stale_copies[0]
-            if result["operations"] >= max_operations:
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "operation_budget_exhausted",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=1,
-                )
-                stale_cleanup_deferred = True
-                break
-            stale_operation = _capture_entry_operation(
-                store,
-                entry,
-                topic_id=str(entry.get("topic_id") or ""),
-                message_id=stale["message_id"],
-                plan_token=plan_token,
-                revision=revision,
-            )
-            try:
-                owner_token = _owning_bot_token(
-                    store, stale["bot_kind"]
-                )
-                result["operations"] += 1
-                execution = _execute_entry_operation(
-                    store,
-                    runtime.telegram,
-                    stale_operation,
-                    _provider_mutation(
-                        "telegram.delete_turn_delivery_message",
-                        reason=(
-                            "telegram.delete_turn_delivery_message: "
-                            "retire tracked stale final copy"
-                        ),
-                        args=(chat_id, stale["message_id"]),
-                        kwargs={"api_token": owner_token},
-                    ),
-                )
-            except RateLimited as exc:
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "rate_limited",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=exc.retry_after,
-                )
-                stale_cleanup_deferred = True
-                break
-            except (_TurnContentError, Exception):
-                _fail_turn_final(
-                    runtime,
-                    ref,
-                    "delivery_uncertain",
-                    result,
-                    uncertain=True,
-                )
-                stale_cleanup_deferred = True
-                break
-            retired = execution.result
-            stale_resolution = execution.resolution
-            if not retired.get("ok"):
-                if _telegram_result_is_transient(retired):
-                    _defer_turn_final(
-                        runtime,
-                        ref,
-                        str(retired.get("error") or "transient delivery"),
-                        result,
-                        store,
-                        job_key,
-                        delay_seconds=_telegram_result_retry_after(
-                            retired
-                        ),
-                    )
-                else:
-                    _fail_turn_final(
-                        runtime,
-                        ref,
-                        str(retired.get("error") or "stale copy retire failed"),
-                        result,
-                    )
-                stale_cleanup_deferred = True
-                break
-            _retire_local_message(store, None, stale["message_id"])
-            state.retire_tendwire_turn_job_stale_copy(
-                store,
-                job_key,
-                message_id=stale["message_id"],
-                topic_id=stale["topic_id"],
-                bot_kind=stale["bot_kind"],
-            )
-            _checkpoint_turn_job(runtime)
-            if stale_resolution.disposition != _OFFLOCK_APPLY:
-                receipt = state.find_tendwire_turn_job(store, job_key)
-                current_message_id = str(
-                    (receipt or {}).get("telegram_message_id") or ""
-                )
-                current_binding = state.find_message_binding(
-                    store, current_message_id
-                )
-                current_topic = str(
-                    (current_binding or {}).get("topic_id") or ""
-                )
-                current_bot = str(
-                    (current_binding or {}).get("bot_kind")
-                    or (receipt or {}).get("bot_kind")
-                    or desired_bot
-                )
-                if current_message_id and current_topic:
-                    state.reconcile_tendwire_turn_job_route(
-                        store,
-                        job_key,
-                        message_id=current_message_id,
-                        topic_id=current_topic,
-                        bot_kind=current_bot,
-                    )
-                    _checkpoint_turn_job(runtime)
-                _after_provider_accept(runtime)
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "transient_delivery",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=1,
-                )
-                stale_cleanup_deferred = True
-                break
-            entry = stale_resolution.entry
-            assert entry is not None
-            _after_provider_accept(runtime)
-        if stale_cleanup_deferred:
             break
-
-        # ACK is allowed only for the same durable owner/route/plan that the
-        # provider operation used, after every accepted stale copy is gone.
-        pre_ack_operation = _capture_entry_operation(
-            store,
-            entry,
-            topic_id=str(entry.get("topic_id") or ""),
-            plan_token=plan_token,
-            revision=revision,
-        )
-        if (
-            _compare_and_apply_entry_operation(
-                store, pre_ack_operation
-            ).disposition
-            != _OFFLOCK_APPLY
-            or state.tendwire_turn_job_stale_copies(
-                state.find_tendwire_turn_job(store, job_key)
-            )
-        ):
+        except TendwireError:
             _defer_turn_final(
                 runtime,
                 ref,
                 "transient_delivery",
                 result,
-                store,
-                job_key,
                 delay_seconds=1,
             )
             break
-        ack_obligation = _turn_final_ack_obligation(
-            store,
-            job_key,
-            pre_ack_operation,
-            kind="upsert",
-            turn_id=_turn_id(item),
-            plan_token=plan_token,
-            revision=revision,
-            ordinal=ordinal,
-            part_count=part_count,
-        )
-        state.record_tendwire_turn_job_post_ack_reconcile(
-            store,
-            job_key,
-            ack_obligation,
-            acknowledged=False,
-        )
-        _checkpoint_turn_job(runtime)
-        execution = _execute_entry_operation(
-            store,
-            runtime.tendwire,
-            pre_ack_operation,
-            _provider_mutation(
-                "tendwire.turn_final_ack",
-                reason="tendwire.turn_final_ack: acknowledge applied final",
-                args=(
-                    ref,
-                    {"outcome": "applied", "job_key": job_key},
-                ),
-            ),
-        )
-        ack, ack_resolution = execution.result, execution.resolution
-        if ack_resolution.disposition != _OFFLOCK_APPLY:
-            if ack.get("ok") is not False:
-                ack_obligation["status"] = "reconcile"
-                state.record_tendwire_turn_job_post_ack_reconcile(
-                    store, job_key, ack_obligation
-                )
-                _checkpoint_turn_job(runtime)
-                result["delivered"] += 1
-                result["acked"] += 1
-                result["changed"] = True
-                continue
-            _defer_turn_final(
-                runtime,
-                ref,
-                "transient_delivery",
-                result,
-                store,
-                job_key,
-                delay_seconds=1,
-            )
-            break
-        entry = ack_resolution.entry
-        assert entry is not None
-        if ack.get("ok") is False:
-            observe_operation = _capture_entry_operation(
-                store,
-                entry,
-                topic_id=str(entry.get("topic_id") or ""),
-                plan_token=plan_token,
-                revision=revision,
-            )
-            execution = _execute_entry_operation(
-                store,
-                runtime.tendwire,
-                observe_operation,
-                _provider_mutation(
-                    "tendwire.connector_prepare_commit",
-                    reason=(
-                        "tendwire.connector_prepare_commit: observe applied ACK conflict"
-                    ),
-                    kwargs={"plan_token": plan_token},
-                ),
-            )
-            observed = execution.result
-            observe_resolution = execution.resolution
-            if observe_resolution.disposition != _OFFLOCK_APPLY:
-                _defer_turn_final(
-                    runtime,
-                    ref,
-                    "transient_delivery",
-                    result,
-                    store,
-                    job_key,
-                    delay_seconds=1,
-                )
-                break
-            entry = observe_resolution.entry
-            assert entry is not None
-            advanced = False
-            if (
-                observed.get("ok") is True
-                and observed.get("plan_token") == plan_token
-                and observed.get("state") == "completed"
-            ):
-                observed_count = observed.get("job_count")
-                if (
-                    isinstance(observed_count, int)
-                    and not isinstance(observed_count, bool)
-                    and observed_count > 0
-                    and entry.get("pending_plan_token")
-                    == plan_token
-                    and entry.get("pending_content_revision")
-                    == revision
-                ):
-                    entry[
-                        "pending_turn_job_count"
-                    ] = observed_count
-                for receipt_key, observed_receipt in list(
-                    state.tendwire_turn_jobs(store).items()
-                ):
-                    if (
-                        isinstance(observed_receipt, dict)
-                        and observed_receipt.get("plan_token")
-                        == plan_token
-                        and observed_receipt.get("substate")
-                        in {
-                            "telegram_applied",
-                            "old_slot_retired",
-                        }
-                    ):
-                        state.update_tendwire_turn_job(
-                            store,
-                            receipt_key,
-                            substate="acknowledged",
-                        )
-                        state.clear_tendwire_turn_job_post_ack_reconcile(
-                            store, receipt_key
-                        )
-                        advanced = True
-                if _maybe_complete_turn_plan(
-                    store,
-                    item,
-                    entry,
-                    plan_token=plan_token,
-                    revision=revision,
-                ):
-                    advanced = True
-            if advanced:
-                _checkpoint_turn_job(runtime)
-            result["status"] = str(
-                ack.get("status") or "turn_final_ack_failed"
-            )
-            result["changed"] = True
-            break
-        if substate != "acknowledged":
-            state.update_tendwire_turn_job(
-                store, job_key, substate="acknowledged"
-            )
-        state.clear_tendwire_turn_job_post_ack_reconcile(
-            store, job_key
-        )
-        _checkpoint_turn_job(runtime)
-        result["delivered"] += 1
-        result["acked"] += 1
-        result["changed"] = True
-        if _maybe_complete_turn_plan(
-            store,
-            item,
-            entry,
-            plan_token=plan_token,
-            revision=revision,
-        ):
-            _checkpoint_turn_job(runtime)
-
-    terminal_failure = bool(result.pop("_terminal_failure", False))
-    if terminal_failure and failed_job_key:
-        failed_receipt = state.find_tendwire_turn_job(
-            store, failed_job_key
-        )
-        terminal_changed = False
-        if (
-            failed_receipt is not None
-            and failed_receipt.get("substate")
-            in {
-                "reserved",
-                "retryable",
-                "telegram_applied",
-                "old_slot_retired",
-                "suppressed",
-            }
-        ):
-            state.update_tendwire_turn_job(
-                store,
-                failed_job_key,
-                substate="failed",
-            )
-            terminal_changed = True
-        for pending_entry in state.source_worker_entries(
-            store
-        ).values():
-            if (
-                pending_entry.get("pending_plan_token")
-                == failed_plan_token
-                and pending_entry.get("pending_content_revision")
-                == failed_revision
-            ):
-                failed_part_count = pending_entry.get(
-                    "pending_turn_part_count"
-                )
-                failed_turn_id = str(
-                    pending_entry.get("pending_turn_id") or ""
-                )
-                if (
-                    failed_turn_id
-                    and isinstance(failed_part_count, int)
-                    and not isinstance(failed_part_count, bool)
-                    and failed_part_count > 0
-                ):
-                    terminal_changed = (
-                        _hold_incomplete_pending_plan(
-                            store,
-                            pending_entry,
-                            turn_id=failed_turn_id,
-                            plan_token=failed_plan_token,
-                            revision=failed_revision,
-                            part_count=failed_part_count,
-                            error=(
-                                "multipart child dead-lettered before its "
-                                "parent plan completed"
-                            ),
-                        )
-                        or terminal_changed
-                    )
-            terminal_changed = (
-                _abandon_pending_turn_plan(
-                    store,
-                    pending_entry,
-                    plan_token=failed_plan_token,
-                    revision=failed_revision,
-                )
-                or terminal_changed
-            )
-        if terminal_changed:
-            _checkpoint_turn_job(runtime)
+        except Exception:
+            raise
     return result
+
 
 
 def _sync_pinned(
@@ -13220,39 +9242,12 @@ def _sync_pinned(
         telegram.setdefault("pinned_status_message_id", "0")
         return True
     general_thread_id = str(config.general_thread_id(store))
-    accepted_receipt_id = ""
-
     def send_to_general_thread() -> tuple[
         dict[str, Any], _OfflockEntryResolution
     ]:
-        nonlocal accepted_receipt_id
-        if (
-            not _notification_acceptance_capacity_available(store)
-            or _notification_kind_pending(store, "global_pinned")
-        ):
-            return (
-                {
-                    "ok": False,
-                    "status": "accepted_artifact_backpressure",
-                },
-                _OfflockEntryResolution(_OFFLOCK_RECONCILE),
-            )
         operation = _capture_global_operation(
             store, topic_id=general_thread_id
         )
-
-        def checkpoint_global_pin(
-            result: Any, captured: _OfflockEntryOperation
-        ) -> None:
-            nonlocal accepted_receipt_id
-            accepted_receipt_id = _checkpoint_accepted_notification(
-                store,
-                runtime,
-                captured,
-                result,
-                chat_id=chat_id,
-                kind="global_pinned",
-            )
 
         execution = _execute_entry_operation(
             store,
@@ -13269,7 +9264,6 @@ def _sync_pinned(
                     "notify": False,
                 },
             ),
-            acceptance_checkpoint=checkpoint_global_pin,
         )
         result, resolution = execution.result, execution.resolution
         if not result.get("ok") and _topic_missing(
@@ -13296,7 +9290,6 @@ def _sync_pinned(
                     args=(chat_id, html),
                     kwargs={"notify": False},
                 ),
-                acceptance_checkpoint=checkpoint_global_pin,
             )
             result, resolution = execution.result, execution.resolution
         return result, resolution
@@ -13360,9 +9353,6 @@ def _sync_pinned(
         if sent.get("message_id"):
             telegram["pinned_status_message_id"] = str(sent["message_id"])
         telegram.pop("pinned_status_last_error", None)
-        _complete_accepted_notification(
-            store, accepted_receipt_id
-        )
         return True
     telegram["pinned_status_last_error"] = compact_ws(sent.get("error"), 240)
     return False
@@ -13376,12 +9366,35 @@ def _sync_topic_pinned_statuses(
     yield_barrier: Callable[[], None] | None = None,
     account_usage: dict[str, Any] | None = None,
 ) -> int:
+    def owns_topic_pin(entry: dict[str, Any]) -> bool:
+        is_space = str(entry.get("entry_type") or "") == "space"
+        if config.source_topic_mode() == "space":
+            return (
+                is_space
+                and bool(entry.get("topic_id"))
+                and not entry.get("stale_space_topic")
+            )
+        return (
+            not is_space
+            and bool(entry.get("topic_id"))
+            and (
+                entry.get("live_in_snapshot") is True
+                or (
+                    "live_in_snapshot" not in entry
+                    and _entry_open_for_pin(entry)
+                )
+            )
+        )
+
     updated = 0
     for entry_key in list(state.source_entries(store)):
+        entry = state.source_entries(store).get(entry_key)
+        if entry is None or not owns_topic_pin(entry):
+            continue
         if yield_barrier is not None:
             yield_barrier()
         entry = state.source_entries(store).get(entry_key)
-        if entry is None:
+        if entry is None or not owns_topic_pin(entry):
             continue
         updated += int(
             _sync_topic_pinned(
@@ -13589,14 +9602,11 @@ def _tendwire_non_success(runtime: SyncRuntime, status: str) -> dict[str, Any]:
     }
 
 
-_TURN_SCHEMA_VERSION = 1
-
-
 def _unsupported_turn_schema_version(
     runtime: SyncRuntime, received: Any
 ) -> dict[str, Any]:
     result = _tendwire_non_success(runtime, "unsupported_turn_schema_version")
-    result["required_turn_schema_version"] = _TURN_SCHEMA_VERSION
+    result["required_turn_schema_version"] = TURN_SCHEMA_VERSION
     if isinstance(received, str):
         safe_received: Any = compact_ws(received, 80)
     elif received is None or isinstance(received, (bool, int, float)):
@@ -13625,22 +9635,6 @@ def _herdr_backend_explicitly_unhealthy(snapshot: dict[str, Any]) -> bool:
 _DELTA_STATE_KEY = "tendwire_delta_sync"
 _DELTA_SCHEMA_VERSION = 1
 _DELTA_PROJECTION_SCHEMA_VERSION = 2
-_DELTA_TRANSPORT_STATUS = "transport_ambiguous"
-_DELTA_TRANSIENT_FAILURE_THRESHOLD = 4
-_DELTA_FALLBACK_BASE_SECONDS = 60
-_DELTA_FALLBACK_MAX_SECONDS = 3600
-_DELTA_WATERMARK_RECOVERY = frozenset(
-    {"invalid_watermark", "expired_watermark"}
-)
-_DELTA_TERMINAL_FALLBACK = frozenset(
-    {
-        "bootstrap_too_large",
-        "cross_host_watermark",
-        "incompatible_schema",
-        "invalid_cursor",
-        "expired_cursor",
-    }
-)
 
 
 def _new_delta_state(*, reason: str, now: float) -> dict[str, Any]:
@@ -13673,15 +9667,18 @@ def _delta_state(store: dict[str, Any], *, now: float) -> dict[str, Any]:
         or current.get("projection_schema_version")
         != _DELTA_PROJECTION_SCHEMA_VERSION
         or not isinstance(current.get("projection"), dict)
+        or current.get("status") not in {"active", "bootstrapping"}
     ):
-        current = _new_delta_state(reason="invalid_local_state", now=now)
-        store[_DELTA_STATE_KEY] = current
+        raise _TurnContentError(
+            "invalid_delta_state",
+            "persisted turn-delta state is not supported",
+        )
     return current
 
 
 def _delta_health(delta: dict[str, Any] | None, *, now: float | None = None) -> dict[str, Any]:
     if not isinstance(delta, dict):
-        return {"state": "fallback", "watermark_age_seconds": None, "last_batch": {}}
+        return {"state": "bootstrapping", "watermark_age_seconds": None, "last_batch": {}}
     clock = time.time() if now is None else now
     updated_at = delta.get("watermark_updated_at")
     age: int | None = None
@@ -13707,7 +9704,7 @@ def _delta_health(delta: dict[str, Any] | None, *, now: float | None = None) -> 
     state_name = str(delta.get("status") or "bootstrapping")
     result: dict[str, Any] = {
         "state": state_name
-        if state_name in {"active", "fallback", "bootstrapping"}
+        if state_name in {"active", "bootstrapping"}
         else "bootstrapping",
         "watermark_age_seconds": age,
         "last_batch": batch,
@@ -13811,10 +9808,27 @@ def _validate_delta_page(
             try:
                 turn = _validate_turn_row(raw_turn)
             except _TurnContentError as exc:
-                turn = dict(raw_turn)
-                turn[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
-                    turn, exc.status
+                turn = (
+                    _quarantined_turn_row(raw_turn, exc.status)
+                    if exc.status == "private_agent_content"
+                    else dict(raw_turn)
                 )
+                if _TURN_CONTENT_OUTCOME_KEY not in turn:
+                    turn[_TURN_CONTENT_OUTCOME_KEY] = _turn_local_outcome(
+                        turn, exc.status
+                    )
+                if (
+                    exc.status == "private_agent_content"
+                    and _turn_id(turn) != change_turn_id
+                ):
+                    # Privacy quarantine changes presentation, not journal
+                    # identity. It must not advance the checkpoint under a
+                    # different turn key. Content-schema isolation remains
+                    # row-local below this boundary.
+                    raise _TurnContentError(
+                        "delta_protocol_ambiguous",
+                        "Tendwire turn.delta projection identity mismatched",
+                    )
             else:
                 if _turn_id(turn) != change_turn_id:
                     raise _TurnContentError(
@@ -13977,14 +9991,6 @@ def _follow_removed_turn_successor(
 def _clear_projection_stale_cards(store: dict[str, Any], projection: dict[str, Any]) -> int:
     cleared = 0
     known = set(projection)
-    raw_records = store.get(ingress_requests.RECORDS_KEY)
-    active_submissions = {
-        str(record.get("submission_id"))
-        for record in (raw_records.values() if isinstance(raw_records, dict) else [])
-        if isinstance(record, dict)
-        and isinstance(record.get("submission_id"), str)
-        and record.get("submission_state") != "complete"
-    }
     candidates: set[str] = set()
     for bucket_name in ("panes", "spaces"):
         bucket = store.get(bucket_name)
@@ -13995,12 +10001,6 @@ def _clear_projection_stale_cards(store: dict[str, Any], projection: dict[str, A
                 continue
             for key in ("last_stream_turn_id", "last_turn_id"):
                 value = entry.get(key)
-                if (
-                    key == "last_stream_turn_id"
-                    and entry.get("last_stream_submission_id")
-                    in active_submissions
-                ):
-                    continue
                 if isinstance(value, str) and value and value not in known:
                     candidates.add(value)
     for turn_id in candidates:
@@ -14008,138 +10008,19 @@ def _clear_projection_stale_cards(store: dict[str, Any], projection: dict[str, A
     return cleared
 
 
-def _set_delta_fallback(
-    delta: dict[str, Any],
-    reason: str,
-    *,
-    terminal: bool,
-    now: float,
-) -> None:
-    delta["status"] = "fallback"
-    delta["pending_cursor"] = None
-    delta["bootstrap_state"] = None
-    delta["health_flag"] = f"turn_delta_{compact_ws(reason, 48)}"
-    delta["fallback_kind"] = "terminal" if terminal else "transient"
-    delta["fallback_reason"] = compact_ws(reason, 48)
-    if terminal:
-        delta.pop("fallback_attempt", None)
-        delta.pop("fallback_retry_at", None)
-        delta.pop("fallback_probe", None)
-        return
-    previous_attempt = delta.get("fallback_attempt")
-    attempt = (
-        previous_attempt + 1
-        if isinstance(previous_attempt, int)
-        and not isinstance(previous_attempt, bool)
-        and previous_attempt >= 0
-        else 1
-    )
-    delay = min(
-        _DELTA_FALLBACK_BASE_SECONDS
-        * (2 ** min(attempt - 1, 16)),
-        _DELTA_FALLBACK_MAX_SECONDS,
-    )
-    delta["fallback_attempt"] = attempt
-    delta["fallback_retry_at"] = now + delay
-    delta.pop("fallback_probe", None)
-
-
-def _normalize_delta_fallback(delta: dict[str, Any], *, now: float) -> str:
-    kind = delta.get("fallback_kind")
-    if kind in {"terminal", "transient"}:
-        return str(kind)
-    health_flag = compact_ws(delta.get("health_flag"), 80)
-    reason = (
-        health_flag.removeprefix("turn_delta_")
-        if health_flag.startswith("turn_delta_")
-        else "legacy_fallback"
-    )
-    terminal = reason in {
-        "unsupported",
-        *_DELTA_TERMINAL_FALLBACK,
-    }
-    delta["fallback_kind"] = "terminal" if terminal else "transient"
-    delta["fallback_reason"] = reason
-    if not terminal:
-        # Older versions made transient fallback permanent. Probe once
-        # immediately after upgrade, then use the normal persisted backoff.
-        delta["fallback_attempt"] = 0
-        delta["fallback_retry_at"] = now
-    return str(delta["fallback_kind"])
-
-
-def _begin_delta_fallback_probe(delta: dict[str, Any], *, now: float) -> None:
-    watermark = delta.get("watermark")
-    if isinstance(watermark, str) and watermark:
-        delta["status"] = "active"
-        delta["pending_cursor"] = None
-    else:
-        _begin_delta_rebootstrap(
-            delta,
-            reason="transient_fallback_recovery",
-            now=now,
-        )
-    delta["fallback_probe"] = True
-
-
-def _record_delta_transient_failure(
+def _record_delta_failure(
     delta: dict[str, Any], *, status: str, now: float
-) -> bool:
+) -> None:
     delta["last_error_at"] = now
-    failure_count = int(delta.get("failure_count") or 0) + 1
-    delta["failure_count"] = failure_count
+    delta["failure_count"] = int(delta.get("failure_count") or 0) + 1
     safe_status = compact_ws(status, 48)
     delta["health_flag"] = f"turn_delta_{safe_status}"
-    if delta.get("fallback_probe") or (
-        failure_count >= _DELTA_TRANSIENT_FAILURE_THRESHOLD
-    ):
-        _set_delta_fallback(
-            delta,
-            f"repeated_{safe_status}",
-            terminal=False,
-            now=now,
-        )
-        return True
-    return False
 
 
-def _clear_delta_fallback_recovery(delta: dict[str, Any]) -> None:
+def _clear_delta_failure(delta: dict[str, Any]) -> None:
     delta["failure_count"] = 0
-    for key in (
-        "fallback_kind",
-        "fallback_reason",
-        "fallback_attempt",
-        "fallback_retry_at",
-        "fallback_probe",
-        "last_error_at",
-        "health_flag",
-    ):
+    for key in ("last_error_at", "health_flag"):
         delta.pop(key, None)
-
-
-def _begin_delta_rebootstrap(delta: dict[str, Any], *, reason: str, now: float) -> None:
-    previous = delta.get("bootstrap_state")
-    attempt = (
-        int(previous.get("attempt") or 0) + 1
-        if isinstance(previous, dict)
-        else 1
-    )
-    delta.update(
-        {
-            "status": "bootstrapping",
-            "watermark": None,
-            "pending_cursor": None,
-            "projection": {},
-            "bootstrap_state": {
-                "reason": reason,
-                "attempt": attempt,
-                "pages_applied": 0,
-                "started_at": now,
-            },
-            "failure_count": 0,
-            "health_flag": f"turn_delta_{reason}",
-        }
-    )
 
 
 def _observe_turn_delta(
@@ -14154,16 +10035,6 @@ def _observe_turn_delta(
         return result
 
     delta = _delta_state(store, now=now)
-    if delta.get("status") == "fallback":
-        fallback_kind = _normalize_delta_fallback(delta, now=now)
-        retry_at = delta.get("fallback_retry_at")
-        if fallback_kind == "terminal" or (
-            isinstance(retry_at, (int, float))
-            and not isinstance(retry_at, bool)
-            and now < float(retry_at)
-        ):
-            return {"kind": "full", "delta": delta, "reason": "fallback"}
-        _begin_delta_fallback_probe(delta, now=now)
     if _delta_full_reconcile_due(delta, now=now):
         return {"kind": "full", "delta": delta, "reason": "reconcile"}
     cursor = delta.get("pending_cursor")
@@ -14179,73 +10050,40 @@ def _observe_turn_delta(
     )
     if page.get("ok") is False:
         status = _delta_error_code(page) or "delta_failed"
-        delta["last_error_at"] = now
-        if status == "unsupported_method":
-            _set_delta_fallback(
-                delta, "unsupported", terminal=True, now=now
-            )
-            return transition(
-                {"kind": "full", "delta": delta, "reason": "unsupported"}
-            )
-        if status == _DELTA_TRANSPORT_STATUS:
-            fell_back = _record_delta_transient_failure(
-                delta, status=status, now=now
-            )
-            return transition(
-                {
-                    "kind": "full" if fell_back else "empty",
-                    "delta": delta,
-                    "reason": status,
-                }
-            )
-        if status in _DELTA_WATERMARK_RECOVERY and cursor is None and watermark is not None:
-            _begin_delta_rebootstrap(delta, reason=status, now=now)
-            return transition(
-                {"kind": "empty", "delta": delta, "reason": status}
-            )
-        if status in _DELTA_TERMINAL_FALLBACK or (
-            status in _DELTA_WATERMARK_RECOVERY
-            and delta.get("status") == "bootstrapping"
-        ):
-            _set_delta_fallback(
-                delta, status, terminal=True, now=now
-            )
-            return transition(
-                {"kind": "full", "delta": delta, "reason": status}
-            )
-        fell_back = _record_delta_transient_failure(
-            delta, status=status, now=now
-        )
+        _record_delta_failure(delta, status=status, now=now)
         return transition(
             {
-                "kind": "full" if fell_back else "empty",
+                "kind": "error",
                 "delta": delta,
                 "reason": status,
+                "status": f"turn_delta_{compact_ws(status, 48)}",
             }
         )
     try:
         upserts, removals, aggregate = _validate_delta_page(page)
     except _TurnContentError:
-        fell_back = _record_delta_transient_failure(
+        _record_delta_failure(
             delta, status="delta_protocol_ambiguous", now=now
         )
         return transition(
             {
-                "kind": "full" if fell_back else "empty",
+                "kind": "error",
                 "delta": delta,
                 "reason": "delta_protocol_ambiguous",
+                "status": "turn_delta_delta_protocol_ambiguous",
             }
         )
     expected_mode = "bootstrap" if watermark is None and delta.get("status") == "bootstrapping" else "changes"
     if page.get("mode") != expected_mode:
-        fell_back = _record_delta_transient_failure(
+        _record_delta_failure(
             delta, status="delta_protocol_ambiguous", now=now
         )
         return transition(
             {
-                "kind": "full" if fell_back else "empty",
+                "kind": "error",
                 "delta": delta,
                 "reason": "delta_protocol_ambiguous",
+                "status": "turn_delta_delta_protocol_ambiguous",
             }
         )
     if (
@@ -14266,7 +10104,7 @@ def _observe_turn_delta(
     for removal in removals:
         turn_id = str(removal["turn_id"])
         projection.pop(turn_id, None)
-    _clear_delta_fallback_recovery(delta)
+    _clear_delta_failure(delta)
     delta["last_batch"] = {
         "mode": str(page["mode"]),
         **aggregate,
@@ -14361,30 +10199,24 @@ def _observe_sync_inputs(
     before the private projection can be adopted.
     """
 
-    has_delta = hasattr(runtime.tendwire, "turn_delta")
     if not state.lock_held():
         snapshot = runtime.tendwire.snapshot()
         if _herdr_backend_explicitly_unhealthy(snapshot):
             return {"unhealthy": True, "snapshot": snapshot}
-        observation = (
-            _observe_turn_delta(store, runtime, now=now) if has_delta else None
-        )
-        if observation is not None and observation["kind"] == "full":
+        observation = _observe_turn_delta(store, runtime, now=now)
+        if observation["kind"] == "full":
             turns_payload = runtime.tendwire.turns()
-        elif observation is not None and observation["kind"] == "delta":
+        elif observation["kind"] == "delta":
             turns_payload = {
                 "schema_version": TURN_SCHEMA_VERSION,
                 "turns": observation["upserts"],
             }
-        elif observation is not None:
+        else:
             turns_payload = {
                 "schema_version": TURN_SCHEMA_VERSION,
                 "turns": [],
             }
-        else:
-            turns_payload = runtime.tendwire.turns()
-        if isinstance(observation, dict):
-            observation["apply_basis"] = deepcopy(observation["delta"])
+        observation["apply_basis"] = deepcopy(observation["delta"])
         return {
             "snapshot": snapshot,
             "delta_observation": observation,
@@ -14394,10 +10226,9 @@ def _observe_sync_inputs(
 
     # Materialize default delta state before the phase-1 save so the equality
     # check below compares a durable, explicit cursor/projection basis.
-    if has_delta:
-        _delta_state(store, now=now)
+    _delta_state(store, now=now)
     state.save_state(store)
-    delta_basis = deepcopy(store.get(_DELTA_STATE_KEY)) if has_delta else None
+    delta_basis = deepcopy(store[_DELTA_STATE_KEY])
     observed_store = deepcopy(store)
     observed_runtime = SyncRuntime(
         runtime.tendwire,
@@ -14414,27 +10245,21 @@ def _observe_sync_inputs(
         if _herdr_backend_explicitly_unhealthy(snapshot):
             observed = {"unhealthy": True, "snapshot": snapshot}
         else:
-            observation = (
-                _observe_turn_delta(
-                    observed_store, observed_runtime, now=now
-                )
-                if has_delta
-                else None
+            observation = _observe_turn_delta(
+                observed_store, observed_runtime, now=now
             )
-            if observation is not None and observation["kind"] == "full":
+            if observation["kind"] == "full":
                 turns_payload = runtime.tendwire.turns()
-            elif observation is not None and observation["kind"] == "delta":
+            elif observation["kind"] == "delta":
                 turns_payload = {
                     "schema_version": TURN_SCHEMA_VERSION,
                     "turns": observation["upserts"],
                 }
-            elif observation is not None:
+            else:
                 turns_payload = {
                     "schema_version": TURN_SCHEMA_VERSION,
                     "turns": [],
                 }
-            else:
-                turns_payload = runtime.tendwire.turns()
             observed = {
                 "snapshot": snapshot,
                 "delta_observation": observation,
@@ -14445,20 +10270,17 @@ def _observe_sync_inputs(
     state.reload_state_in_place(store)
     if observed.get("unhealthy"):
         return observed
-    if has_delta:
-        if store.get(_DELTA_STATE_KEY) != delta_basis:
-            # Another observer advanced or re-bootstrapped the cursor while the
-            # RPC was in flight. Discard this page; applying it to the new basis
-            # would fork the retained projection.
-            return {"cursor_conflict": True}
-        observation = observed.get("delta_observation")
-        if isinstance(observation, dict):
-            store[_DELTA_STATE_KEY] = deepcopy(observation["delta"])
-            observation["delta"] = store[_DELTA_STATE_KEY]
-            # Later delivery/cleanup phases open more release windows.  Keep the
-            # exact adopted basis so the page can be revalidated immediately
-            # before its checkpoint is applied.
-            observation["apply_basis"] = deepcopy(observation["delta"])
+    if store.get(_DELTA_STATE_KEY) != delta_basis:
+        # Another observer advanced the cursor while the RPC was in flight.
+        # Discard this page; applying it to the new basis would fork the
+        # retained projection.
+        return {"cursor_conflict": True}
+    observation = observed["delta_observation"]
+    store[_DELTA_STATE_KEY] = deepcopy(observation["delta"])
+    observation["delta"] = store[_DELTA_STATE_KEY]
+    # Later delivery/cleanup phases open more release windows. Keep the exact
+    # adopted basis so the page can be revalidated before its checkpoint.
+    observation["apply_basis"] = deepcopy(observation["delta"])
     return observed
 
 
@@ -14500,7 +10322,6 @@ def drain_outbound_once(
         chat_id=chat_id,
         max_operations=operation_limit,
         turn_projection=projection,
-        legacy_turns_loader=effective_runtime.tendwire.turns,
     )
     remaining = max(
         0,
@@ -14548,8 +10369,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     )
     backpressure_sequence = _telegram_backpressure_sequence(store)
     observed_at = time.time()
-    with state.lock_phase("sync.observe"):
-        observed = _observe_sync_inputs(store, runtime, now=observed_at)
+    try:
+        with state.lock_phase("sync.observe"):
+            observed = _observe_sync_inputs(store, runtime, now=observed_at)
+    except _TurnContentError as exc:
+        return _tendwire_non_success(runtime, exc.status)
     if observed.get("unhealthy"):
         return _tendwire_non_success(runtime, "tendwire_herdr_unhealthy")
     if observed.get("cursor_conflict"):
@@ -14560,6 +10384,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     observed_snapshot_workers: list[dict[str, Any]] = []
     if delta_observation is not None:
         delta = delta_observation["delta"]
+        if delta_observation.get("kind") == "error":
+            return _tendwire_non_success(
+                runtime,
+                str(delta_observation.get("status") or "turn_delta_failed"),
+            )
     turns_payload = observed["turns"]
     pending_payload = observed["pending"]
     for name, payload in (("snapshot", snapshot), ("turns", turns_payload), ("pending", pending_payload)):
@@ -14568,10 +10397,9 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     turn_schema = turns_payload.get("schema_version")
     if (
         type(turn_schema) is not int
-        or turn_schema not in {_TURN_SCHEMA_VERSION, TURN_SCHEMA_VERSION}
+        or turn_schema != TURN_SCHEMA_VERSION
     ):
         return _unsupported_turn_schema_version(runtime, turn_schema)
-    list_finals_are_authoritative = turn_schema != TURN_SCHEMA_VERSION
     chat_id = config.telegram_chat_id(store)
     with state.lock_phase("sync.validate"):
         try:
@@ -14581,15 +10409,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             # are converted to bounded row-local outcomes by validation.
             return _tendwire_non_success(runtime, exc.status)
     runtime = _offlock_runtime(store, runtime)
-    with state.lock_phase("sync.accepted_notifications"):
-        (
-            accepted_notifications_retired,
-            _accepted_notifications_pending,
-        ) = _drain_accepted_notifications(
-            store,
-            runtime,
-            chat_id=chat_id,
-        )
 
     def _yield_between_turns() -> None:
         if not state.lock_held():
@@ -14606,12 +10425,12 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     )
     if yield_barrier is not None:
         # Ingress deliberately needs two consecutive state-lock acquisitions:
-        # the gateway first fsyncs its immutable request shell, then the command
-        # child acquires the lock to attach canonical bytes and submit them.
+        # the gateway first fsyncs its immutable request shell, then the AF_UNIX
+        # submitter acquires the lock to attach canonical bytes and submit them.
         # The off-lock observation window can admit the first acquisition, but
         # without this handoff sync immediately reacquires the flock and enters
-        # the comparatively heavy reconciliation phase before the child exists.
-        # Yield once more after observation so the already-waiting child wins a
+        # the comparatively heavy reconciliation phase before the request starts.
+        # Yield once more after observation so the waiting submitter wins a
         # lock window instead of holding every later item in its strict FIFO
         # lane behind a full sync pass.
         with state.lock_phase("sync.post_observe_handoff"):
@@ -14628,13 +10447,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             turns_payload,
             observed_at=observed_at,
         )
-    changed = bool(
-        generation_resolution_changed
-        or accepted_notifications_retired
-    )
+    changed = bool(generation_resolution_changed)
     with state.lock_phase("sync.sources"):
         source_counts = _sync_sources(
-            store, snapshot, turns_payload, runtime, chat_id=chat_id
+            store,
+            snapshot,
+            turns_payload,
+            runtime,
+            chat_id=chat_id,
+            yield_barrier=yield_barrier,
         )
     worker_rebinds = 0
     for resolution in generation_resolutions:
@@ -14659,7 +10480,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 to_worker_id=to_worker_id,
                 reason=resolution["reason"],
                 observed_at=observed_at,
-                evidence_turn_id=resolution["evidence_turn_id"],
             )
         )
     with state.lock_phase("sync.lifecycle_cleanup"):
@@ -14675,52 +10495,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         # page watermark/checkpoint is not written into an orphaned sub-dict.
         delta = _delta_state(store, now=observed_at)
         delta_observation["delta"] = delta
-    with state.lock_phase("sync.submissions"):
-        submission_link_updates = _apply_submission_links(
-            store, _turns(turns_payload), now=observed_at
-        )
-        submission_counts = _sync_submission_working_cards(
-            store,
-            _turns(turns_payload),
-            runtime,
-            chat_id=chat_id,
-            now=observed_at,
-            yield_barrier=yield_barrier,
-        )
     with state.lock_phase("sync.routing"):
         routing_repaired = _repair_space_mode_routing_state(store)
         message_bindings = _backfill_message_bindings(store)
-    bootstrap_complete = True
-    if delta_observation is not None:
-        bootstrap_complete = (
-            delta_observation.get("kind") in {"full", "noop"}
-            or (
-                delta_observation.get("kind") == "delta"
-                and (
-                    delta_observation.get("page", {}).get("mode") == "changes"
-                    or delta_observation.get("page", {}).get("has_more") is False
-                )
-            )
-        )
-    with state.lock_phase("sync.bootstrap"):
-        bootstrapped = _bootstrap_existing_turns(
-            store,
-            turns_payload,
-            pending_payload,
-            skip_v2_finals=not list_finals_are_authoritative,
-            complete=bootstrap_complete,
-        )
     live_worker_ids = {
         compact_ws(worker.get("id"), 160)
         for worker in observed_snapshot_workers
         if _worker_is_open(worker)
     }
     live_worker_ids.discard("")
-    with state.lock_phase("sync.turn_plan_reconcile"):
-        reconciled_turn_plans = _reconcile_completed_turn_plans(
-            store, runtime
-        )
-
     try:
         feed_turns_payload = (
             {"schema_version": TURN_SCHEMA_VERSION, "turns": []}
@@ -14729,44 +10512,29 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             and delta_observation.get("page", {}).get("mode") == "bootstrap"
             else turns_payload
         )
-        if bootstrapped:
-            turn_counts = {
-                "feed_sent": 0,
-                "sent": 0,
-                "updated": 0,
-                "content_pages": 0,
-                "physical_writes": 0,
-                "work_pending": 0,
-                "failed_writes": 0,
-                "response_fold_attempted": 0,
-                "response_folded": 0,
-                "response_fold_failed": 0,
-            }
-        else:
-            with state.lock_phase("sync.turns"):
-                turn_counts = _sync_turns(
-                    store,
-                    feed_turns_payload,
-                    pending_payload,
-                    runtime,
-                    chat_id=chat_id,
-                    live_worker_ids=live_worker_ids,
-                    yield_barrier=yield_barrier,
-                    list_finals_are_authoritative=list_finals_are_authoritative,
-                    checkpoint_after_delivery=(
-                        delta_observation is not None
-                        and delta_observation.get("kind") == "delta"
-                        and delta_observation.get("page", {}).get("mode")
-                        == "changes"
-                    ),
-                    retained_projection=(
-                        delta.get("projection")
-                        if delta_observation is not None
-                        and delta_observation.get("kind") == "delta"
-                        and isinstance(delta, dict)
-                        else None
-                    ),
-                )
+        with state.lock_phase("sync.turns"):
+            turn_counts = _sync_turns(
+                store,
+                feed_turns_payload,
+                pending_payload,
+                runtime,
+                chat_id=chat_id,
+                live_worker_ids=live_worker_ids,
+                yield_barrier=yield_barrier,
+                checkpoint_after_delivery=(
+                    delta_observation is not None
+                    and delta_observation.get("kind") == "delta"
+                    and delta_observation.get("page", {}).get("mode")
+                    == "changes"
+                ),
+                retained_projection=(
+                    delta.get("projection")
+                    if delta_observation is not None
+                    and delta_observation.get("kind") == "delta"
+                    and isinstance(delta, dict)
+                    else None
+                ),
+            )
     except _TurnContentError as exc:
         if not exc.conflict:
             return _tendwire_non_success(runtime, exc.status)
@@ -14777,10 +10545,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
             )
         try:
             turns_payload = _validate_turns_payload(relisted)
-            relisted_schema = turns_payload.get("schema_version")
-            relisted_finals_are_authoritative = (
-                relisted_schema != TURN_SCHEMA_VERSION
-            )
             with state.lock_phase("sync.turns_relist"):
                 turn_counts = _sync_turns(
                     store,
@@ -14791,7 +10555,6 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                     live_worker_ids=live_worker_ids,
                     relist_on_conflict=False,
                     yield_barrier=yield_barrier,
-                    list_finals_are_authoritative=relisted_finals_are_authoritative,
                     checkpoint_after_delivery=(
                         delta_observation is not None
                         and delta_observation.get("kind") == "delta"
@@ -14844,13 +10607,8 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         or routing_repaired
         or turn_counts["sent"]
         or turn_counts["updated"]
-        or submission_counts["sent"]
-        or submission_counts["updated"]
-        or submission_link_updates
-        or bootstrapped
         or topic_cleanup.get("changed")
         or message_bindings
-        or reconciled_turn_plans
         or decision_result.get("changed")
     )
     if config.pinned_status_enabled():
@@ -14970,21 +10728,14 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         store, backpressure_sequence
     )
     changed = changed or bool(telegram_backpressure["count"])
-    partial_final_health = state.partial_final_delivery_health(
-        store,
-        now=time.time(),
-        escalation_seconds=config.partial_final_escalation_seconds(),
-    )
     response_fold_health = state.response_fold_health(store)
     completed_deliveries = (
         int(turn_counts["sent"])
-        + int(submission_counts["sent"])
         + int(turn_final_result.get("delivered") or 0)
         + int(outbox_result.get("delivered") or 0)
     )
     pending_delivery_work = (
         int(turn_counts.get("work_pending") or 0)
-        + int(submission_counts.get("work_pending") or 0)
         + int(turn_final_result.get("failed") or 0)
         + int(turn_final_result.get("deferred") or 0)
         + int(outbox_result.get("failed") or 0)
@@ -15004,23 +10755,15 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "completed_count": completed_deliveries,
         "physical_writes": _delivery_write_budget(runtime).spent,
     }
-    overall_ok = bool(
-        partial_final_health["ok"]
-        and not delivery_stalled
-        and response_fold_health["ok"]
-    )
+    overall_ok = bool(not delivery_stalled and response_fold_health["ok"])
     return {
         "ok": overall_ok,
         **(
             {
                 "status": (
-                    partial_final_health["status"]
-                    if partial_final_health["ok"] is not True
-                    else (
-                        outbound_delivery_health["status"]
-                        if delivery_stalled
-                        else response_fold_health["status"]
-                    )
+                    outbound_delivery_health["status"]
+                    if delivery_stalled
+                    else response_fold_health["status"]
                 )
             }
             if not overall_ok
@@ -15034,10 +10777,10 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "icon_updated": source_counts["icon_updated"],
         "worker_rebinds": worker_rebinds,
         "pinned_status_updated": int(pinned_changed) + topic_pinned_updated,
-        "feed_sent": turn_counts["feed_sent"] + submission_counts["sent"],
-        "sent": turn_counts["sent"] + submission_counts["sent"],
+        "feed_sent": turn_counts["feed_sent"],
+        "sent": turn_counts["sent"],
         "routing_repaired": routing_repaired,
-        "turn_updates": turn_counts["updated"] + submission_counts["updated"],
+        "turn_updates": turn_counts["updated"],
         "response_folds": {
             "attempted": int(
                 turn_counts.get("response_fold_attempted") or 0
@@ -15047,13 +10790,11 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
                 turn_counts.get("response_fold_failed") or 0
             ),
         },
-        "submission_working": submission_counts,
         **(
             {"tendwire_delta_sync": _delta_health(delta, now=observed_at)}
             if delta is not None
             else {}
         ),
-        "bootstrap_seen": bootstrapped,
         "message_bindings": message_bindings,
         "topic_cleanup": topic_cleanup,
         "content_pages": int(turn_counts["content_pages"])
@@ -15064,6 +10805,5 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
         "tendwire_outbox": outbox_result,
         "telegram_backpressure": telegram_backpressure,
         "outbound_delivery": outbound_delivery_health,
-        "outbound_partial_finals": partial_final_health,
         "outbound_response_folds": response_fold_health,
     }

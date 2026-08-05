@@ -13,11 +13,17 @@ from herdres_connector.source_sync import (
     SyncRuntime,
     sync_once,
 )
-from test_source_only import FakeTelegram, FakeTendwire, _store
+from test_source_only import FakeTelegram, FakeTendwire, _store as _source_store
 from test_turn_final_delivery import TurnFinalTendwire, _stable_key, _turn_row
 
 
 HOST = "host-public"
+
+
+def _store():
+    current = _source_store()
+    current.pop("tendwire_delta_sync", None)
+    return current
 
 
 def _page(
@@ -123,6 +129,29 @@ def test_delta_default_page_size_completes_supported_bootstrap_within_cursor_ttl
 ):
     monkeypatch.delenv("HERDRES_TENDWIRE_DELTA_LIMIT", raising=False)
     assert config.tendwire_delta_limit() == 500
+
+
+def test_sync_requires_turn_delta_and_never_falls_back_to_full_list():
+    class NoDeltaTendwire:
+        def __init__(self):
+            self.turn_calls = 0
+
+        def snapshot(self):
+            return {"ok": True, "workers": [], "spaces": []}
+
+        def turns(self):
+            self.turn_calls += 1
+            return {"ok": True, "schema_version": 2, "turns": []}
+
+    tendwire = NoDeltaTendwire()
+
+    with pytest.raises(AttributeError, match="turn_delta"):
+        sync_once(
+            _store(),
+            SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
+        )
+
+    assert tendwire.turn_calls == 0
 
 
 def test_unchanged_active_sync_uses_only_one_delta_page_and_no_provider_or_content():
@@ -524,80 +553,7 @@ def test_batch_watermark_advances_only_on_final_applied_page():
     assert second["status"] == "active"
 
 
-def test_multi_page_bootstrap_marks_every_page_before_redelivery_guard_completes(
-    monkeypatch,
-):
-    first_row = _turn_row(
-        "turn-bootstrap-first",
-        "twrev1.bootstrap_first",
-        None,
-        user="first historical prompt",
-    )
-    first_row["assistant_stream_text"] = "first historical progress"
-    second_row = _turn_row(
-        "turn-bootstrap-second",
-        "twrev1.bootstrap_second",
-        None,
-        user="second historical prompt",
-    )
-    second_row.update(
-        {
-            "worker_id": "worker-2",
-            "worker_fingerprint": "fp-2",
-            "stable_key": _stable_key("worker-2", "fp-2"),
-            "assistant_stream_text": "second historical progress",
-        }
-    )
-    workers = [
-        {
-            "id": "worker-1",
-            "name": "Alpha",
-            "status": "working",
-            "space_id": "space-1",
-            "fingerprint": "fp-1",
-        },
-        {
-            "id": "worker-2",
-            "name": "Beta",
-            "status": "working",
-            "space_id": "space-1",
-            "fingerprint": "fp-2",
-        },
-    ]
-    tendwire = DeltaTendwire(
-        [
-            _page(
-                [_upsert(first_row)],
-                more=True,
-                cursor="twdeltac1.bootstrap_next",
-                checkpoint=None,
-            ),
-            _page([_upsert(second_row)], checkpoint="twdelta1.bootstrap_done"),
-        ],
-        turns={"schema_version": 1, "turns": [second_row, first_row]},
-        workers=workers,
-    )
-    store = _store()
-    store.pop("tendwired_bootstrap_complete")
-    telegram = FakeTelegram()
-    runtime = SyncRuntime(tendwire, telegram, with_outbox=False)
-
-    sync_once(store, runtime)
-    assert "tendwired_bootstrap_complete" not in store
-    assert store["tendwired_bootstrap_seen"] == 1
-
-    sync_once(store, runtime)
-    assert store["tendwired_bootstrap_complete"] is True
-    assert store["tendwired_bootstrap_seen"] == 2
-
-    monkeypatch.setenv("HERDRES_TENDWIRE_FORCE_FULL_RECONCILE", "1")
-    sync_once(store, runtime)
-
-    assert tendwire.turn_calls == 1
-    assert telegram.sent == []
-
-
-def test_transport_ambiguity_never_bootstraps_or_traverses():
+def test_transport_ambiguity_fails_without_bootstrap_or_full_list():
     tendwire = DeltaTendwire(
         [{"ok": False, "status": "transport_ambiguous"}]
     )
@@ -609,41 +565,283 @@ def test_transport_ambiguity_never_bootstraps_or_traverses():
         SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
     )
 
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert result["status"] == "turn_delta_transport_ambiguous"
     assert len(tendwire.delta_calls) == 1
     assert tendwire.turn_calls == 0
     assert store["tendwire_delta_sync"]["watermark"] == "twdelta1.current"
     assert store["tendwire_delta_sync"]["status"] == "active"
-    assert result["tendwire_delta_sync"]["health_flag"] == "turn_delta_transport_ambiguous"
+    assert store["tendwire_delta_sync"]["health_flag"] == "turn_delta_transport_ambiguous"
 
 
-def test_delta_page_isolates_revisionless_legacy_row_without_dropping_valid_rows():
+@pytest.mark.parametrize(
+    "status",
+    [
+        "unsupported_method",
+        "invalid_watermark",
+        "expired_watermark",
+        "bootstrap_too_large",
+        "invalid_cursor",
+    ],
+)
+def test_delta_errors_fail_without_fallback_or_rebootstrap(status):
+    tendwire = DeltaTendwire(
+        [{"ok": False, "status": status}],
+        turns={"schema_version": 2, "turns": []},
+    )
+    store = _store()
+    store["tendwire_delta_sync"] = _active_delta()
+
+    result = sync_once(
+        store,
+        SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == f"turn_delta_{status}"
+    assert tendwire.turn_calls == 0
+    delta = store["tendwire_delta_sync"]
+    assert delta["status"] == "active"
+    assert delta["watermark"] == "twdelta1.current"
+    assert not any(key.startswith("fallback_") for key in delta)
+
+
+def test_delta_page_isolates_revisionless_row_without_dropping_valid_rows():
     valid = _turn_row(
         "turn-valid", "twrev1.valid", None, user="current prompt"
     )
-    legacy = _turn_row(
-        "turn-legacy", "twrev1.legacy", None, user="legacy prompt"
+    invalid = _turn_row(
+        "turn-invalid", "twrev1.invalid", None, user="invalid prompt"
     )
-    legacy["content"]["content_revision"] = None
+    invalid["content"]["content_revision"] = None
 
     upserts, removals, _aggregate = _validate_delta_page(
         _page(
-            [_upsert(valid), _upsert(legacy)],
+            [_upsert(valid), _upsert(invalid)],
             mode="changes",
-            checkpoint="twdelta1.legacy_tolerated",
+            checkpoint="twdelta1.invalid_isolated",
         )
     )
 
     assert removals == []
     assert [row["id"] for row in upserts] == [
         "turn-valid",
-        "turn-legacy",
+        "turn-invalid",
     ]
     assert _TURN_CONTENT_OUTCOME_KEY not in upserts[0]
     assert upserts[1][_TURN_CONTENT_OUTCOME_KEY] == {
-        "turn_id": "turn-legacy",
+        "turn_id": "turn-invalid",
         "status": "invalid_content_schema",
     }
+
+
+@pytest.mark.parametrize(
+    "private_field,private_value",
+    [
+        ("_meta", {"adapter/private": "session-private"}),
+        ("sessionId", "private-session-id"),
+        ("toolCallId", "private-tool-id"),
+        ("thought", "raw chain of thought"),
+        ("toolCall", {"rawInput": "secret command"}),
+        ("tool_call_update", {"rawOutput": "secret output"}),
+        ("plan", [{"content": "private plan", "status": "pending"}]),
+        ("permission_request", {"options": ["allow_always"]}),
+        ("control", {"currentMode": "private-mode"}),
+    ],
+)
+def test_delta_quarantines_private_structured_agent_fields(
+    private_field, private_value
+):
+    row = _turn_row(
+        "turn-private", "twrev1.private", None, user="public prompt"
+    )
+    row[private_field] = private_value
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(row)],
+            mode="changes",
+            checkpoint="twdelta1.private-quarantined",
+        )
+    )
+
+    assert removals == []
+    assert upserts == [
+        {
+            "id": "turn-private",
+            "worker_id": row["worker_id"],
+            _TURN_CONTENT_OUTCOME_KEY: {
+                "turn_id": "turn-private",
+                "status": "private_agent_content",
+                "content_revision": "twrev1.private",
+            },
+        }
+    ]
+    encoded = repr(upserts)
+    assert repr(private_value) not in encoded
+
+
+def test_delta_accepts_agent_message_text_that_discusses_tools_and_plans():
+    row = _turn_row(
+        "turn-message",
+        "twrev1.message",
+        None,
+        user="Explain the plan and tool call.",
+    )
+    row["assistant_stream_text"] = (
+        "The plan is safe to discuss as ordinary assistant message text."
+    )
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(row)],
+            mode="changes",
+            checkpoint="twdelta1.message",
+        )
+    )
+
+    assert removals == []
+    assert upserts == [row]
+    assert _TURN_CONTENT_OUTCOME_KEY not in upserts[0]
+
+
+@pytest.mark.parametrize(
+    "agent_event",
+    [
+        {
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {
+                "type": "text",
+                "text": "private reasoning in a sibling field",
+            },
+        },
+        {
+            "sessionUpdate": "agent_thought",
+            "content": {
+                "type": "text",
+                "text": "private ACP v2 reasoning update",
+            },
+        },
+        {
+            "sessionUpdate": "agent_thought_chunk",
+            "session_update": "benign-looking-collision",
+            "content": {
+                "type": "text",
+                "text": "private reasoning behind an alias collision",
+            },
+        },
+        {
+            "kind": "plan",
+            "visibility": "private",
+            "payload": {"steps": ["private step"]},
+        },
+        {
+            "kind": "agent_message",
+            "visibility": "private",
+            "payload": {"text": "private copy of an otherwise public kind"},
+        },
+    ],
+)
+def test_delta_quarantines_structurally_discriminated_acp_event(agent_event):
+    row = _turn_row(
+        "turn-private-structure",
+        "twrev1.private-structure",
+        None,
+        user="public prompt",
+    )
+    row.setdefault("meta", {})["upstream_projection"] = agent_event
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(row)],
+            mode="changes",
+            checkpoint="twdelta1.private-structure",
+        )
+    )
+
+    assert removals == []
+    assert len(upserts) == 1
+    assert upserts[0][_TURN_CONTENT_OUTCOME_KEY]["status"] == (
+        "private_agent_content"
+    )
+    assert repr(agent_event) not in repr(upserts)
+
+
+def test_delta_preserves_ordinary_public_meta_with_protocol_like_words():
+    row = _turn_row(
+        "turn-public-meta", "twrev1.public-meta", None, user="public prompt"
+    )
+    row.setdefault("meta", {}).update(
+        {
+            "plan": "Migration roadmap",
+            "control": "Control group",
+            "permission": "Document ACL label",
+            "extensions": [".py"],
+            "current_mode": "dark",
+            "reasoning": "Deductive",
+            "thought": "Product-design note",
+            "planning": {
+                "kind": "plan",
+                "payload": {"description": "Public roadmap metadata"},
+            },
+        }
+    )
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(row)],
+            mode="changes",
+            checkpoint="twdelta1.public-meta",
+        )
+    )
+
+    assert removals == []
+    assert upserts == [row]
+    assert _TURN_CONTENT_OUTCOME_KEY not in upserts[0]
+
+
+def test_delta_private_scan_fails_closed_on_excessive_depth_without_recursion():
+    nested = {}
+    for _index in range(200):
+        nested = {"child": nested}
+    row = _turn_row(
+        "turn-overdeep", "twrev1.overdeep", None, user="public prompt"
+    )
+    row.setdefault("meta", {})["nested"] = nested
+
+    upserts, removals, _aggregate = _validate_delta_page(
+        _page(
+            [_upsert(row)],
+            mode="changes",
+            checkpoint="twdelta1.overdeep",
+        )
+    )
+
+    assert removals == []
+    assert len(upserts) == 1
+    assert upserts[0][_TURN_CONTENT_OUTCOME_KEY]["status"] == (
+        "private_agent_content"
+    )
+
+
+def test_delta_private_quarantine_cannot_advance_mismatched_turn_identity():
+    row = _turn_row(
+        "turn-row", "twrev1.private-mismatch", None, user="public prompt"
+    )
+    row["toolCall"] = {"rawInput": "private command"}
+    change = _upsert(row)
+    change["turn_id"] = "turn-wrapper"
+
+    with pytest.raises(_TurnContentError) as excinfo:
+        _validate_delta_page(
+            _page(
+                [change],
+                mode="changes",
+                checkpoint="twdelta1.private-mismatch",
+            )
+        )
+
+    assert excinfo.value.status == "delta_protocol_ambiguous"
 
 
 @pytest.mark.parametrize(
@@ -706,217 +904,6 @@ def test_delta_page_isolates_invalid_row_before_checking_its_identity():
             },
         }
     ]
-
-
-def test_invalid_watermark_starts_one_bootstrap_and_ambiguity_resumes_its_cursor():
-    row = _turn_row("turn-bootstrap", "twrev1.bootstrap", None, user="prompt")
-    tendwire = DeltaTendwire(
-        [
-            {"ok": False, "status": "invalid_watermark"},
-            _page(
-                [_upsert(row)],
-                mode="bootstrap",
-                more=True,
-                cursor="twdeltac1.resume",
-                checkpoint=None,
-            ),
-            {"ok": False, "status": "transport_ambiguous"},
-        ],
-        workers=[],
-        spaces=[],
-    )
-    store = _store()
-    store["tendwire_delta_sync"] = _active_delta()
-    runtime = SyncRuntime(tendwire, FakeTelegram(), with_outbox=False)
-
-    sync_once(store, runtime)
-    assert len(tendwire.delta_calls) == 1
-    assert tendwire.turn_calls == 0
-    assert store["tendwire_delta_sync"]["status"] == "bootstrapping"
-    assert store["tendwire_delta_sync"]["watermark"] is None
-
-    sync_once(store, runtime)
-    assert len(tendwire.delta_calls) == 2
-    assert tendwire.delta_calls[1]["watermark"] is None
-
-    sync_once(store, runtime)
-    assert len(tendwire.delta_calls) == 3
-    assert tendwire.delta_calls[2]["cursor"] == "twdeltac1.resume"
-    assert store["tendwire_delta_sync"]["pending_cursor"] == "twdeltac1.resume"
-    assert store["tendwire_delta_sync"]["status"] == "bootstrapping"
-    assert tendwire.turn_calls == 0
-
-
-def test_explicit_unsupported_is_the_only_immediate_full_poll_fallback():
-    tendwire = DeltaTendwire(
-        [{"ok": False, "status": "unsupported_method"}],
-        turns={"schema_version": 2, "turns": []},
-    )
-    store = _store()
-
-    result = sync_once(
-        store,
-        SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
-    )
-
-    assert result["ok"] is True
-    assert len(tendwire.delta_calls) == 1
-    assert tendwire.turn_calls == 1
-    assert store["tendwire_delta_sync"]["status"] == "fallback"
-    assert store["tendwire_delta_sync"]["fallback_kind"] == "terminal"
-    assert result["tendwire_delta_sync"]["health_flag"] == "turn_delta_unsupported"
-
-    repeated = sync_once(
-        store,
-        SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
-    )
-    assert repeated["ok"] is True
-    assert len(tendwire.delta_calls) == 1
-    assert tendwire.turn_calls == 2
-
-
-def test_transient_delta_fallback_recovers_with_persisted_exponential_backoff(
-    monkeypatch,
-):
-    clock = [1000.0]
-    monkeypatch.setattr(source_sync.time, "time", lambda: clock[0])
-    tendwire = DeltaTendwire(
-        [
-            {"ok": False, "status": "nonzero_exit"},
-            {"ok": False, "status": "nonzero_exit"},
-            {"ok": False, "status": "nonzero_exit"},
-            {"ok": False, "status": "nonzero_exit"},
-            {"ok": False, "status": "nonzero_exit"},
-            _page([], mode="changes", checkpoint="twdelta1.current"),
-        ],
-        turns={"schema_version": 2, "turns": []},
-    )
-    store = _store()
-    store["tendwire_delta_sync"] = _active_delta()
-    runtime = SyncRuntime(tendwire, FakeTelegram(), with_outbox=False)
-
-    for _attempt in range(3):
-        result = sync_once(store, runtime)
-        assert result["ok"] is True
-        assert store["tendwire_delta_sync"]["status"] == "active"
-        assert tendwire.turn_calls == 0
-
-    fourth = sync_once(store, runtime)
-    delta = store["tendwire_delta_sync"]
-    assert fourth["ok"] is True
-    assert delta["status"] == "fallback"
-    assert delta["fallback_kind"] == "transient"
-    assert delta["fallback_attempt"] == 1
-    assert delta["fallback_retry_at"] == 1060.0
-    assert tendwire.turn_calls == 1
-
-    clock[0] = 1059.0
-    sync_once(store, runtime)
-    assert len(tendwire.delta_calls) == 4
-    assert tendwire.turn_calls == 2
-
-    clock[0] = 1060.0
-    sync_once(store, runtime)
-    delta = store["tendwire_delta_sync"]
-    assert len(tendwire.delta_calls) == 5
-    assert delta["status"] == "fallback"
-    assert delta["fallback_attempt"] == 2
-    assert delta["fallback_retry_at"] == 1180.0
-    assert tendwire.turn_calls == 3
-
-    clock[0] = 1179.0
-    sync_once(store, runtime)
-    assert len(tendwire.delta_calls) == 5
-    assert tendwire.turn_calls == 4
-
-    clock[0] = 1180.0
-    recovered = sync_once(store, runtime)
-    delta = store["tendwire_delta_sync"]
-    assert recovered["ok"] is True
-    assert len(tendwire.delta_calls) == 6
-    assert tendwire.turn_calls == 4
-    assert delta["status"] == "active"
-    assert delta["failure_count"] == 0
-    assert not any(key.startswith("fallback_") for key in delta)
-    assert "health_flag" not in delta
-
-
-def test_legacy_transient_fallback_is_probed_immediately_after_upgrade(
-    monkeypatch,
-):
-    clock = [2000.0]
-    monkeypatch.setattr(source_sync.time, "time", lambda: clock[0])
-    tendwire = DeltaTendwire(
-        [_page([], mode="changes", checkpoint="twdelta1.current")]
-    )
-    store = _store()
-    delta = _active_delta()
-    delta.update(
-        {
-            "status": "fallback",
-            "failure_count": 2,
-            "health_flag": "turn_delta_repeated_nonzero_exit",
-        }
-    )
-    store["tendwire_delta_sync"] = delta
-
-    result = sync_once(
-        store, SyncRuntime(tendwire, FakeTelegram(), with_outbox=False)
-    )
-
-    assert result["ok"] is True
-    assert len(tendwire.delta_calls) == 1
-    assert tendwire.turn_calls == 0
-    assert store["tendwire_delta_sync"]["status"] == "active"
-    assert not any(
-        key.startswith("fallback_")
-        for key in store["tendwire_delta_sync"]
-    )
-
-
-def test_transport_ambiguity_uses_the_same_four_failure_recovery_lane(
-    monkeypatch,
-):
-    clock = [3000.0]
-    monkeypatch.setattr(source_sync.time, "time", lambda: clock[0])
-    tendwire = DeltaTendwire(
-        [
-            {"ok": False, "status": "transport_ambiguous"}
-            for _attempt in range(4)
-        ],
-        turns={"schema_version": 2, "turns": []},
-    )
-    store = _store()
-    store["tendwire_delta_sync"] = _active_delta()
-    runtime = SyncRuntime(tendwire, FakeTelegram(), with_outbox=False)
-
-    for _attempt in range(4):
-        sync_once(store, runtime)
-
-    delta = store["tendwire_delta_sync"]
-    assert len(tendwire.delta_calls) == 4
-    assert tendwire.turn_calls == 1
-    assert delta["status"] == "fallback"
-    assert delta["fallback_kind"] == "transient"
-    assert delta["fallback_retry_at"] == 3060.0
-
-
-def test_bootstrap_too_large_degrades_to_full_poll_with_health_flag():
-    tendwire = DeltaTendwire(
-        [{"ok": False, "status": "bootstrap_too_large"}],
-        turns={"schema_version": 2, "turns": []},
-    )
-    store = _store()
-
-    result = sync_once(
-        store,
-        SyncRuntime(tendwire, FakeTelegram(), with_outbox=False),
-    )
-
-    assert result["ok"] is True
-    assert tendwire.turn_calls == 1
-    assert store["tendwire_delta_sync"]["status"] == "fallback"
-    assert result["tendwire_delta_sync"]["health_flag"] == "turn_delta_bootstrap_too_large"
 
 
 def test_explicit_full_reconcile_uses_bounded_full_lane_without_delta(monkeypatch):
@@ -1100,21 +1087,13 @@ def test_changes_page_crash_replay_uses_durable_card_identity_without_resend():
     )
     telegram = FakeTelegram()
     base = _store()
-    sync_once(
-        base,
-        SyncRuntime(
-            DeltaTendwire(
-                [_page([], mode="changes", checkpoint="twdelta1.warm")]
-            ),
-            telegram,
-            with_outbox=False,
-        ),
-    )
     base["tendwire_delta_sync"] = _active_delta()
     persisted = deepcopy(base)
     first_store = deepcopy(base)
 
     def crash_after_delivery_checkpoint():
+        if not telegram.sent:
+            return
         persisted.clear()
         persisted.update(deepcopy(first_store))
         assert (

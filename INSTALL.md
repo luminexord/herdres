@@ -4,7 +4,7 @@
 
 Herdres does not function on its own. It has no observation, worker identity,
 turn/pending, command routing, or backend-health logic of its own — every one of
-those comes from Tendwire over the `tendwire` CLI/daemon. Install Tendwire first:
+those comes from Tendwire over its local daemon socket. Install Tendwire first:
 
 ```sh
 git clone https://github.com/plotarmordev/tendwire.git ~/tendwire
@@ -15,15 +15,16 @@ tendwire doctor --json
 ```
 
 See [Tendwire's own INSTALL.md](https://github.com/plotarmordev/tendwire/blob/main/INSTALL.md)
-for the `tendwired.service` daemon setup. Herdres finds Tendwire via the
-`tendwire` binary on `PATH`, or falls back to `TENDWIRE_SOURCE_DIR`
-(default `~/tendwire/src`) and runs it as `python -m tendwire.cli`.
+for the `tendwired.service` daemon setup. Herdres connects only to
+`HERDRES_TENDWIRE_SOCKET_PATH` (default
+`~/.local/share/tendwire/tendwire.sock`). It never runs Tendwire as a child
+process or opens Tendwire's SQLite store.
 
 This is a paired command protocol, not a best-effort JSON integration. Herdres
 sends schema-v1 requests and requires an exact, correlated schema-v2 response.
-For a non-dry-run command, Tendwire CLI exit `0` must carry `ok: true`; exit
-`1` must carry `ok: false`. Exit `2`, malformed output, or any exit/body
-mismatch is private unproven process ambiguity and is not converted into a
+For a non-dry-run command, the daemon must return the exact correlated command
+envelope. A timeout, disconnect, malformed response, or correlation mismatch
+after request transmission is unproven ambiguity and is not converted into a
 forged disposition.
 
 ## Continuity data and upgrades
@@ -52,20 +53,18 @@ do not replace the state file with an editor write while services are running.
 
 The key makes Telegram ingress request IDs stable across gateway restart,
 Telegram redelivery, and managed-bot token rotation. Manager and managed-bot
-polling offsets are keyed by stable receiving-bot kind rather than bot token;
-the current legacy token-keyed managed-bot offset is migrated to that stable
-path, so rotation does not reset its polling position. Back up the key with
+polling cursors are keyed by stable receiving-bot kind rather than bot token,
+so rotation does not reset polling position. Back up the key with
 Herdres state and restore the same file with mode `0600` before restarting the
 gateway. Deleting, regenerating, or changing the key path without restoring
 the original key changes every derived request ID and can make an already-seen
 Telegram update appear to be a new mutation.
 
-When `HERDRES_INBOUND_LANES=1`, the authoritative receiving-bot cursors and
-pending updates live in the separate SQLite WAL selected by
+The authoritative receiving-bot cursors and pending updates live in the
+separate SQLite WAL selected by
 `HERDRES_INBOUND_SPOOL_PATH` (default
-`~/.local/share/herdres/inbound_spool.db`). The legacy offset files are only
-atomic, fsynced rollback mirrors. Stop the gateway before backing up or
-restoring the spool so SQLite can checkpoint its WAL consistently.
+`~/.local/share/herdres/inbound_spool.db`). Stop the gateway before backing up
+or restoring the spool so SQLite can checkpoint its WAL consistently.
 
 ### Tendwire worker continuity key
 
@@ -82,8 +81,8 @@ Treat these six items as one operational backup and restore unit:
 1. the Herdres state selected by `HERDR_TELEGRAM_TOPICS_STATE` (default
    `~/.local/share/herdres/state.json`), which contains private Telegram
    topic/message IDs, bot credentials and routing/ownership, ingress command
-   request records, final bindings, and stable-job delivery
-   checkpoints/receipts;
+   request records, exact final bindings, delivered identities, and the compact
+   accepted-topic receipt;
 2. the Herdres request-ID key selected by `HERDRES_REQUEST_ID_KEY_PATH`;
 3. the Tendwire database selected by `TENDWIRE_DB_PATH`;
 4. Tendwire's `installation.key`;
@@ -101,28 +100,27 @@ mismatched, malformed, or unsafe state fails closed.
 An ordinary service restart must retain the private Herdres state file,
 Herdres request-ID key, stable polling-offset files, and Tendwire database
 unchanged. Before private route reconstruction, Herdres returns any cached
-terminal or quarantined child outcome for a redelivered request ID. A retained
-retryable record replays only its stored exact UTF-8 request bytes; token,
-routing, transcription, or worker-state churn cannot rebuild or replace them.
+terminal or quarantined outcome for a redelivered request ID. A retained
+retryable record reconstructs only its stored canonical request object and
+text; token, routing, transcription, or worker-state churn cannot rebuild or
+replace them.
 The sole exception is the one persisted removal of `worker_fingerprint` after
 `stale_target` with disposition `no_receipt`. Terminal and quarantine cache
 survives restart and route loss, bypasses Tendwire client construction, sends
 the same sanitized reply, and advances the polling offset.
 
-Herdres also resumes stable-job checkpoints under fresh transient lease refs,
-ACKs already-applied work without repeating the Telegram operation, and
-reconciles a completed pending plan when the final ACK response or
-completed-plan observation was lost. A pending plan confirmed as `superseded`
-or `plan_not_found` is cleared before its newer durable root is handled; every
-other unresolved state continues to block the newer root. Do not clear or edit
-either state store, polling offsets, or replace either key as part of a restart.
+Tendwire alone resumes durable final jobs and recovery under fresh transient
+lease refs. Herdres re-polls that outbox and uses its fsynced exact Telegram
+bindings and delivered identities to ACK already-applied work without repeating
+the provider operation. Do not clear or edit either state store, polling
+offsets, or replace either key as part of a restart.
 
 An ordinary upgrade must retain this state set. Persisted Herdres workers with
 absent identity or a legacy 24-character lowercase hexadecimal identity are not
 independently routable. They are eligible only for one-time migration when a
 compatible current observation supplies an exact valid-v1 identity for the same
 unambiguous, live worker. The migration retains the existing Telegram topic,
-message bindings, and delivery ledgers, does not replay delivered turns, and
+message bindings, and delivered identities, does not replay delivered turns, and
 does not change `HERDRES_SOURCE_TOPIC_MODE` or any Telegram topic deletion
 policy.
 
@@ -158,10 +156,10 @@ queries Herdr.
 Tendwire store schema v14 final-ready materialization roots use exact payload
 `schema_version: 2` and repeat that same public opaque `stable_key` plus exact
 integer `stable_key_version: 1` to bind retained work to worker continuity.
-Herdres never treats these public coordinates as private checkpoint data, and a
-schema-v1 root cannot be routed by reusable worker or space IDs alone. No
-Telegram routing, credentials, message state, or private checkpoint belongs in
-the root.
+Herdres never treats these public coordinates as an exact Telegram binding or
+delivered identity, and a schema-v1 root cannot be routed by reusable worker or
+space IDs alone. No Telegram routing, credentials, message state, exact binding,
+or delivered identity belongs in the root.
 
 ## Herdres itself
 
@@ -188,23 +186,10 @@ HERDRES_TELEGRAM_CHAT_ID=...
 HERDR_TELEGRAM_TOPICS_STATE=~/.local/share/herdres/state.json
 HERDRES_REQUEST_ID_KEY_PATH=~/.local/share/herdres/request-id.key
 HERDRES_COMMAND_RETRY_HORIZON_SECONDS=86400
-HERDRES_INBOUND_LANES=1
 HERDRES_INBOUND_DISPATCH_WORKERS=8
-HERDRES_INBOUND_LANE_DEPTH=32
-HERDRES_INBOUND_LANE_BACKOFF_SECONDS=2
-HERDRES_INBOUND_HOLD_SECONDS=15
-HERDRES_INBOUND_LANE_STALL_SECONDS=5
-TENDWIRE_DB_PATH=~/.local/share/tendwire/tendwire.db
+HERDRES_TENDWIRE_SOCKET_PATH=~/.local/share/tendwire/tendwire.sock
 HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS=60
 ```
-
-Upgrade migration: lane execution and acknowledgement live in
-`herdres-gateway.service`, so both shipped Herdres units set
-`HERDRES_INBOUND_LANES=1`. An active `HERDRES_INBOUND_LANES=0` left in
-`~/.config/herdres/herdres.env` by older installation guidance overrides those
-unit defaults. Re-running `./install-user.sh` treats running the installer as
-consent to comment out only that legacy rollback line; it preserves the line
-under an explanatory marker so you can deliberately uncomment it to roll back.
 
 `HERDRES_COMMAND_RETRY_HORIZON_SECONDS` fixes the retry deadline from the
 record's first-seen time; it does not configure a sliding idle timeout. Unset,
@@ -244,11 +229,12 @@ request receipt for the configured horizon and suppress the repeated mutation;
 do not replace this paired receipt continuity with a local `submitting` marker.
 
 The final-root lease covers canonical paging, range-only presentation-plan
-begin/part/commit staging, and ACK. It uses 900 seconds when unset, empty, or
+begin/part/commit staging, and ACK. It uses 60 seconds when unset, empty, or
 invalid and clamps configured values to 60 through 3600 seconds. Keep it long
 enough for the largest expected completed response. Tendwire owns durable
-final-ready roots, jobs, leases, ACK/dead-letter state, and retention; Herdres
-owns private Telegram provider state and stable-job checkpoints.
+final-ready roots, jobs, outbox recovery, leases, ACK/dead-letter state, and
+retention. Herdres owns private provider state, exact Telegram bindings,
+delivered identities, and the compact accepted-topic receipt.
 
 Start only the source connector services:
 

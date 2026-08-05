@@ -261,6 +261,56 @@ def test_same_busy_pane_keeps_uuid_and_topic_across_five_serial_key_drifts():
     assert repeated.closed_topics == []
 
 
+def test_durable_reconciliation_preserves_other_worker_binding_on_shared_topic():
+    store = _store()
+    codex = _worker(
+        "codex",
+        _key("a"),
+        label="codex-pane",
+        agent="codex",
+        cwd="/srv/project/codex",
+        title="codex",
+        space="shared-space",
+        fingerprint="fp-codex",
+    )
+    kimi = _worker(
+        "kimi",
+        _key("b"),
+        label="kimi-pane",
+        agent="kimi",
+        cwd="/srv/project/kimi",
+        title="kimi",
+        space="shared-space",
+        fingerprint="fp-kimi",
+    )
+    _persist(store, codex, "77")
+    _persist(store, kimi, "77")
+    state.reconcile_durable_pane_identities(store, [codex, kimi])
+    codex_key, codex_entry = state.find_worker_entry_by_stable_key(
+        store, state.worker_stable_key(codex)
+    )
+    kimi_key, kimi_entry = state.find_worker_entry_by_stable_key(
+        store, state.worker_stable_key(kimi)
+    )
+    assert codex_key is not None and codex_entry is not None
+    assert kimi_key is not None and kimi_entry is not None
+    state.bind_message_to_worker(
+        store, "700", codex_entry, topic_id="77", kind="final", bot_kind="codex"
+    )
+    state.bind_message_to_worker(
+        store, "701", kimi_entry, topic_id="77", kind="final", bot_kind="kimi"
+    )
+
+    state.reconcile_durable_pane_identities(store, [codex, kimi])
+
+    codex_binding = state.message_bindings(store)["700"]
+    kimi_binding = state.message_bindings(store)["701"]
+    assert codex_binding["stable_key"] == state.worker_stable_key(codex)
+    assert codex_binding["worker_id"] == "codex"
+    assert kimi_binding["stable_key"] == state.worker_stable_key(kimi)
+    assert kimi_binding["worker_id"] == "kimi"
+
+
 @pytest.fixture
 def session_key_drift_live_shape() -> tuple[dict, list[dict], dict[str, str]]:
     """Sanitized 2026-07-22 shape: released old owners plus new keys."""

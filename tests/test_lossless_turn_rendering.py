@@ -241,20 +241,18 @@ def test_one_part_executor_uses_rich_primary_or_one_plain_override():
         assert result["canonical_message_id"] == result["message_id"]
 
 
-def test_rich_capability_does_not_weaken_canonical_plain_part_bound():
+def test_rich_capability_uses_native_capacity_without_losing_content():
     item = {
         "kind": "turn",
         "user_text": "u" * 18_000,
         "assistant_final_text": "f" * 15_799,
     }
 
-    # Rich planning is retained only as an explicit #207 surface. Production
-    # defaults to the identical plain profile used by the sole sender.
     rich_parts = prepare_turn_delivery_parts(item, rich_transport=True)
     plain_parts = prepare_turn_delivery_parts(item, rich_transport=False)
 
-    assert rich_parts == plain_parts
-    assert len(rich_parts) > 2
+    assert len(rich_parts) < len(plain_parts)
+    assert len(rich_parts) == 2
     assert _reconstruct(item, rich_parts, "user_text") == item["user_text"]
     assert (
         _reconstruct(item, rich_parts, "assistant_final_text")
@@ -276,6 +274,32 @@ def test_rich_capability_does_not_weaken_canonical_plain_part_bound():
     )
 
 
+def test_rich_plan_keeps_twenty_thousand_character_final_in_one_card():
+    item = {
+        "kind": "turn",
+        "user_text": "continue",
+        "assistant_final_text": "x" * 20_000,
+    }
+
+    parts = prepare_turn_delivery_parts(item, rich_transport=True)
+    client = RecordingTelegram()
+    result = send_turn_delivery_part(
+        client,
+        "-100",
+        item,
+        parts[0],
+        telegram={"rich_messages": {"supported": "yes"}},
+        thread_id="7",
+    )
+
+    assert len(parts) == 1
+    assert result["ok"] is True
+    assert result["format"] == "rich"
+    assert [method for method, _payload in client.calls] == [
+        "sendRichMessage"
+    ]
+
+
 def test_production_planner_ignores_dormant_rich_capability_profile():
     text = "\n\n".join("x" for _ in range(1800))
     assert len(text) == 5_398
@@ -293,7 +317,7 @@ def test_production_planner_ignores_dormant_rich_capability_profile():
 
     assert production == plain
     assert len(production) == 2
-    assert len(isolated_rich) == 7
+    assert len(isolated_rich) == 8
 
 
 def test_plain_canonical_plan_keeps_content_lossless():

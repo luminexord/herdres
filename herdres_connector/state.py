@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+# H8-SLOC-BEGIN state-imports
+import base64
+import hashlib
+import hmac
+import stat
+from contextlib import ExitStack
+from dataclasses import dataclass
+from enum import Enum
+from typing import ContextManager
+# H8-SLOC-END state-imports
 import fcntl
 import json
 import os
@@ -22,25 +32,8 @@ from .rendering import normalized_status
 from .safe import compact_ws, short_hash
 
 DELIVERED_TURN_LEDGER_LIMIT = 10000
-PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION = 3
-PARTIAL_FINAL_DELIVERY_LIMIT = 512
-PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT = 64
 RESPONSE_FOLD_ATTEMPT_CAP = 3
-TENDWIRE_TURN_JOB_LIMIT = 20001
-TENDWIRE_TURN_JOB_STALE_COPY_LIMIT = 8
 ORPHANED_CREATED_TOPIC_LIMIT = 200
-TENDWIRE_TURN_JOB_SUBSTATES = frozenset(
-    {
-        "reserved",
-        "retryable",
-        "telegram_applied",
-        "old_slot_retired",
-        "suppressed",
-        "acknowledged",
-        "failed",
-    }
-)
-_TENDWIRE_TURN_JOB_TERMINAL_SUBSTATES = frozenset({"acknowledged", "failed"})
 _TENDWIRE_OPAQUE_TOKEN_RE = re.compile(r"^tw(?:plan|rev)1\.[A-Za-z0-9_-]{1,256}$")
 _TENDWIRE_TURN_JOB_KEY_RE = re.compile(
     r"^turn-final:(twplan1\.[A-Za-z0-9_-]{1,256}):([0-9]+)$"
@@ -56,199 +49,222 @@ PANE_UUID_VERSION = 1
 PANE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
-ACCEPTED_NOTIFICATION_JOURNAL_APPLIED_LIMIT = 200
-_ACCEPTED_JOURNAL_PENDING_KEY = "_herdres_accepted_journal_pending"
+
+# H8-SLOC-BEGIN state-contracts
+_PROVIDER_GUARD_DOMAIN = b"herdres-provider-owner-v1\0"
+_ROUTE_GENERATION_RE = re.compile(r"^twroute1\.[A-Za-z0-9_-]{43}$", re.ASCII)
+_PROVIDER_GUARD_DIR = ".provider-mutation-locks"
+_PROVIDER_GUARD_PREFIX = "pg1."
 
 
-def accepted_notification_journal_path(path: Path | None = None) -> Path:
-    state_file = path or config.state_path()
-    return state_file.with_suffix(
-        state_file.suffix + ".accepted-notifications"
-    )
+def _bounded_text(value: Any, *, field: str, maximum: int = 512) -> str:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum:
+        raise ValueError(f"invalid {field}")
+    return value
 
 
-def _load_accepted_notification_journal(
-    path: Path | None = None,
-) -> dict[str, dict[str, Any]]:
-    journal_file = accepted_notification_journal_path(path)
-    if not journal_file.exists():
-        return {}
-    try:
-        payload = json.loads(journal_file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise RuntimeError(
-            "Herdres accepted-notification journal is corrupt"
-        ) from exc
-    if not isinstance(payload, dict) or payload.get("version") != 1:
-        raise RuntimeError(
-            "Herdres accepted-notification journal is corrupt"
+@dataclass(frozen=True, slots=True)
+class StateToken:
+    value: str
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.value, field="state token", maximum=128)
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalOwner:
+    bot_identity: str
+    chat_id: str
+    topic_id: str
+
+    def __post_init__(self) -> None:
+        for value, field in ((self.bot_identity, "provider bot identity"),
+                             (self.chat_id, "provider chat id"), (self.topic_id, "provider topic id")):
+            _bounded_text(value, field=field, maximum=256)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderMutationGuard:
+    owner: PhysicalOwner
+    lock_identity: str
+
+
+class SecretStr:
+    __slots__ = ("__value",)
+
+    def __init__(self, value: str) -> None:
+        self.__value = _bounded_text(
+            value, field="receiver token", maximum=4096
         )
-    receipts = payload.get("receipts")
-    if not isinstance(receipts, dict):
-        raise RuntimeError(
-            "Herdres accepted-notification journal is corrupt"
-        )
-    if not all(
-        isinstance(receipt_id, str) and isinstance(record, dict)
-        for receipt_id, record in receipts.items()
-    ):
-        raise RuntimeError(
-            "Herdres accepted-notification journal is corrupt"
-        )
-    return receipts
+
+    def __repr__(self) -> str:
+        return "SecretStr('[REDACTED]')"
+
+    def __str__(self) -> str:
+        return "[REDACTED]"
+
+    def _reject_serialization(self, *_args: Any) -> Any:
+        raise TypeError("SecretStr cannot be serialized")
+
+    __reduce__ = __reduce_ex__ = __deepcopy__ = _reject_serialization
+
+    def reveal_for_telegram_client(self) -> str:
+        return self.__value
 
 
-def _fsync_directory(path: Path) -> None:
-    directory_fd = os.open(
-        path,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_CLOEXEC", 0),
-    )
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+@dataclass(frozen=True, slots=True)
+class IngressReceiver:
+    receiver_id: str
+    bot_kind: str
+    username: str
+    token: SecretStr
 
 
-def append_accepted_notification_receipt(
-    receipt_id: str,
-    record: Mapping[str, Any],
-    *,
-    data: dict[str, Any] | None = None,
-    path: Path | None = None,
-) -> None:
-    """Durably append one small provider-acceptance fact.
-
-    The journal is intentionally separate from the large state ledger.  The
-    provider has already accepted the message, so this few-hundred-byte fsync
-    must complete before the acceptance callback returns.  The next canonical
-    state save absorbs the fact and removes the sidecar.
-    """
-
-    if not receipt_id or not isinstance(record, Mapping):
-        return
-    state_file = path or config.state_path()
-    journal_file = accepted_notification_journal_path(state_file)
-    journal_file.parent.mkdir(parents=True, exist_ok=True)
-    receipts = _load_accepted_notification_journal(state_file)
-    if data is not None:
-        telegram = (
-            data.get("telegram")
-            if isinstance(data.get("telegram"), dict)
-            else {}
-        )
-        applied = telegram.get("accepted_notification_journal_applied")
-        applied_ids = {
-            str(item)
-            for item in (applied if isinstance(applied, list) else [])
-            if item
-        }
-        receipts = {
-            key: value
-            for key, value in receipts.items()
-            if key not in applied_ids
-        }
-    receipts.setdefault(receipt_id, deepcopy(dict(record)))
-    if data is not None:
-        pending = data.get(_ACCEPTED_JOURNAL_PENDING_KEY)
-        pending_ids = {
-            str(item)
-            for item in (pending if isinstance(pending, list) else [])
-            if item
-        }
-        pending_ids.update(receipts)
-        data[_ACCEPTED_JOURNAL_PENDING_KEY] = sorted(pending_ids)
-    tmp = journal_file.with_suffix(journal_file.suffix + ".tmp")
-    payload = (
-        json.dumps(
-            {"version": 1, "receipts": receipts},
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        + "\n"
-    )
-    try:
-        with tmp.open("w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, journal_file)
-        _fsync_directory(journal_file.parent)
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+@dataclass(frozen=True, slots=True)
+class IngressPolicy:
+    chat_id: str
+    general_topic_id: str
+    owner_user_ids: frozenset[str]
+    managed_usernames: tuple[tuple[str, str], ...]
+    state_token: StateToken
 
 
-def _merge_accepted_notification_journal(
-    data: dict[str, Any], path: Path | None = None
-) -> None:
-    receipts = _load_accepted_notification_journal(path)
-    if not receipts:
-        return
-    data[_ACCEPTED_JOURNAL_PENDING_KEY] = sorted(receipts)
-    telegram = data.setdefault("telegram", {})
-    if not isinstance(telegram, dict):
-        telegram = {}
-        data["telegram"] = telegram
-    records = telegram.setdefault("accepted_notification_messages", {})
-    if not isinstance(records, dict):
-        records = {}
-        telegram["accepted_notification_messages"] = records
-    applied = telegram.get("accepted_notification_journal_applied")
-    applied_ids = {
-        str(item)
-        for item in (applied if isinstance(applied, list) else [])
-        if item
-    }
-    for receipt_id, record in receipts.items():
-        if receipt_id in applied_ids:
-            continue
-        if record.get("kind") == "created_topic":
-            created = telegram.setdefault("accepted_created_topics", {})
-            if not isinstance(created, dict):
-                created = {}
-                telegram["accepted_created_topics"] = created
-            created.setdefault(receipt_id, deepcopy(record))
-        else:
-            records.setdefault(receipt_id, deepcopy(record))
+class RouteStatus(str, Enum):
+    RESOLVED = "resolved"
+    MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
+    QUARANTINED = "quarantined"
+    RETIRED = "retired"
+    STALE = "stale"
+    BINDING_AMBIGUOUS = "binding_ambiguous"
+    AUTHOR_AMBIGUOUS = "author_ambiguous"
 
 
-def _mark_accepted_notification_journal_applied(
-    data: dict[str, Any], receipt_ids: list[str]
-) -> bool:
-    if not receipt_ids:
-        return False
-    telegram = data.setdefault("telegram", {})
-    if not isinstance(telegram, dict):
-        telegram = {}
-        data["telegram"] = telegram
-    applied = telegram.get("accepted_notification_journal_applied")
-    applied_ids = [
-        str(item)
-        for item in (applied if isinstance(applied, list) else [])
-        if item
-    ]
-    for receipt_id in receipt_ids:
-        if receipt_id not in applied_ids:
-            applied_ids.append(receipt_id)
-    telegram["accepted_notification_journal_applied"] = applied_ids[
-        -ACCEPTED_NOTIFICATION_JOURNAL_APPLIED_LIMIT:
-    ]
-    return True
+@dataclass(frozen=True, slots=True)
+class StableOwner:
+    stable_key: str
+    stable_key_version: int
+    route_generation: str | None
 
 
-def _clear_accepted_notification_journal(
-    path: Path | None = None,
-) -> None:
-    journal_file = accepted_notification_journal_path(path)
-    if not journal_file.exists():
-        return
-    journal_file.unlink()
-    _fsync_directory(journal_file.parent)
+@dataclass(frozen=True, slots=True)
+class IngressRouteQuery:
+    chat_id: str
+    topic_id: str
+    receiver_bot_kind: str
+    explicit_alias: str
+    explicit_bot_kind: str
+    state_token: StateToken
+
+
+@dataclass(frozen=True, slots=True)
+class IngressReplyQuery:
+    chat_id: str
+    topic_id: str
+    reply_message_id: str
+    observed_author_bot_kind: str
+    explicit_alias: str
+    explicit_bot_kind: str
+    state_token: StateToken
+
+
+@dataclass(frozen=True, slots=True)
+class IngressRouteResult:
+    status: RouteStatus
+    state_token: StateToken
+    chat_id: str
+    topic_id: str
+    worker_id: str
+    worker_fingerprint: str | None
+    owner: StableOwner | None
+    space_id: str
+    bot_kind: str
+    reply_binding_id: str | None
+    binding_was_present: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionIngressQuery:
+    chat_id: str
+    topic_id: str
+    callback_ref: str | None
+    state_token: StateToken
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionOption:
+    option_ref: str
+    label: str
+
+
+class DecisionStatus(str, Enum):
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
+    QUARANTINED = "quarantined"
+    STALE = "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionIngressResult:
+    status: DecisionStatus
+    state_token: StateToken
+    decision_ref: str
+    revision_digest: str
+    mode: str
+    worker_id: str
+    owner: StableOwner | None
+    message_binding_id: str
+    chat_id: str
+    topic_id: str
+    message_id: str
+    option_refs: tuple[str, ...]
+    options: tuple[DecisionOption, ...]
+    selected_refs: tuple[str, ...]
+    await_freeform: bool
+    render_fingerprint: str
+    physical_owner: PhysicalOwner
+
+
+class DecisionMutationKind(str, Enum):
+    ARM_FREEFORM = "ARM_FREEFORM"
+    TOGGLE_OPTION = "TOGGLE_OPTION"
+    RECORD_LOCAL_MARKUP = "RECORD_LOCAL_MARKUP"
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionMutation:
+    request_id: str
+    kind: DecisionMutationKind
+    decision_ref: str
+    revision_digest: str
+    option_ref: str | None
+    desired_selected_refs: tuple[str, ...]
+    desired_markup_fingerprint: str
+    expected_state_token: StateToken
+
+
+class DecisionMutationStatus(str, Enum):
+    APPLIED = "applied"
+    ALREADY_APPLIED = "already_applied"
+    STALE = "stale"
+    CONFLICT = "conflict"
+    EXPIRED = "expired"
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionMutationResult:
+    status: DecisionMutationStatus
+    state_token: StateToken
+    decision_ref: str
+    selected_refs: tuple[str, ...]
+    await_freeform: bool
+    message_binding_id: str
+    message_id: str
+    desired_markup_fingerprint: str
+# H8-SLOC-END state-contracts
 
 
 def load_state(path: Path | None = None) -> dict[str, Any]:
@@ -273,7 +289,6 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
     data.setdefault("telegram", {})
     data.setdefault("panes", {})
     data.setdefault("spaces", {})
-    _merge_accepted_notification_journal(data, state_file)
     return data
 
 
@@ -281,22 +296,6 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
     state_file = path or config.state_path()
     state_file.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_file.with_suffix(state_file.suffix + ".tmp")
-    raw_pending = data.pop(_ACCEPTED_JOURNAL_PENDING_KEY, [])
-    pending_receipt_ids = [
-        str(item)
-        for item in (
-            raw_pending if isinstance(raw_pending, list) else []
-        )
-        if item
-    ]
-    journal_pending = _mark_accepted_notification_journal_applied(
-        data, pending_receipt_ids
-    )
-    journal_cleared = False
-    # This file is an internal durability boundary, not a hand-edited config.
-    # Compact separators cut serialization and fsync bytes on the live state
-    # ledger; inbound commands cross this boundary before and after Tendwire,
-    # so pretty-print whitespace was directly extending every lane service.
     payload = (
         json.dumps(
             data,
@@ -312,23 +311,22 @@ def save_state(data: dict[str, Any], path: Path | None = None) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, state_file)
-        # Every canonical state replace is a durability boundary. Commit the
-        # directory entry before any accepted-provider receipt can disappear.
-        _fsync_directory(state_file.parent)
-        if journal_pending:
-            # Receipt absorption has two ordered directory barriers: the
-            # canonical state rename above, then the sidecar unlink here.
-            _clear_accepted_notification_journal(state_file)
-            journal_cleared = True
+        directory_fd = os.open(
+            state_file.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
-        if pending_receipt_ids and not journal_cleared:
-            data[_ACCEPTED_JOURNAL_PENDING_KEY] = (
-                pending_receipt_ids
-            )
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
 
 
 def _replace_in_place(current: Any, fresh: Any) -> Any:
@@ -378,8 +376,8 @@ def reload_state_in_place(data: dict[str, Any], path: Path | None = None) -> Non
 # yield between items. The held fd + release depth are THREAD-LOCAL: fcntl.flock is per open-file
 # description, so an in-process caller with two concurrent state_lock() holders (e.g. an embedded
 # runner) would let one thread's released_lock() unlock another thread's fd; per-thread state keeps
-# each holder dropping only its OWN fd. (Prod routes inbound commands through subprocesses, one holder
-# per process, where this is equivalent to a module global.)
+# each holder dropping only its own fd. Production AF_UNIX request and connector workers can therefore
+# contend in either threads or separate processes without sharing descriptor ownership.
 _LOCK_STATE = threading.local()
 _LOCK_HOLD_WARN_SECONDS = 2.0
 _LOCK_HOLD_OBSERVERS: list[Any] = []
@@ -571,6 +569,121 @@ def state_lock(path: Path | None = None, *, phase: str = "state"):
                 _record_lock_released(handle.fileno())
 
 
+# H8-SLOC-BEGIN state-provider-guard
+def _opaque_digest(domain: bytes, value: Any, *, key: bytes | None = None) -> str:
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    digest = hmac.digest(key, domain + encoded, "sha256") if key else hashlib.sha256(domain + encoded).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _state_token(data: Mapping[str, Any], state_file: Path) -> StateToken:
+    try:
+        metadata = os.lstat(state_file)
+        identity: tuple[int, int] | None = (metadata.st_dev, metadata.st_ino)
+    except FileNotFoundError:
+        identity = None
+    return StateToken("st1." + _opaque_digest(
+        b"herdres-state-token-v1\0", {"file_identity": identity, "state": data}))
+
+
+def _load_schema2_locked(state_file: Path) -> tuple[dict[str, Any], StateToken]:
+    data = load_state(state_file)
+    if type(data.get("version")) is not int or data.get("version") != 2:
+        raise RuntimeError("Herdres typed state requires schema 2")
+    return data, _state_token(data, state_file)
+
+
+def _open_guard_node(
+    path: str | Path, *, dir_fd: int | None = None, directory: bool,
+) -> int:
+    fd: int | None = None
+    label = "namespace" if directory else "file"
+    try:
+        before = os.stat(path, dir_fd=dir_fd, follow_symlinks=False) if directory else None
+        flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        if directory:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | flags,
+                         dir_fd=dir_fd)
+        else:
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | flags,
+                             0o600, dir_fd=dir_fd)
+                os.fchmod(fd, 0o600)
+            except FileExistsError:
+                fd = os.open(path, os.O_RDWR | flags, dir_fd=dir_fd)
+        metadata = os.fstat(fd)
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+        raise RuntimeError(f"unsafe provider mutation guard {label}") from exc
+    race = directory and before is not None and (
+        metadata.st_dev != before.st_dev or metadata.st_ino != before.st_ino)
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    safe = (kind(metadata.st_mode) and metadata.st_uid == os.geteuid()
+            and stat.S_IMODE(metadata.st_mode) == (0o700 if directory else 0o600)
+            and (directory or metadata.st_nlink == 1))
+    if not safe or race:
+        os.close(fd)
+        raise RuntimeError(f"unsafe provider mutation guard {label}")
+    return fd
+
+
+@contextmanager
+def provider_mutation_guard(
+    state_path: Path,
+    owner: PhysicalOwner,
+    deadline_monotonic: float,
+) -> ContextManager[ProviderMutationGuard]:
+    """Serialize one physical Telegram owner without exposing its coordinates."""
+
+    if not isinstance(state_path, Path) or not state_path.is_absolute():
+        raise RuntimeError("unsafe provider mutation guard state path")
+    if not isinstance(owner, PhysicalOwner):
+        raise TypeError("provider mutation owner must be PhysicalOwner")
+    if type(deadline_monotonic) not in (int, float) or deadline_monotonic <= time.monotonic():
+        raise TimeoutError("provider mutation guard deadline reached")
+    if lock_actually_held():
+        raise RuntimeError("provider mutation guard cannot wait under state lock")
+
+    from .ingress_identity import load_request_id_key
+
+    identity = {"bot_identity": owner.bot_identity, "chat_id": owner.chat_id,
+                "topic_id": owner.topic_id}
+    lock_identity = _PROVIDER_GUARD_PREFIX + _opaque_digest(
+        _PROVIDER_GUARD_DOMAIN, identity, key=load_request_id_key())
+    try:
+        with ExitStack() as cleanup:
+            parent_fd = _open_guard_node(state_path.parent, directory=True)
+            cleanup.callback(os.close, parent_fd)
+            try:
+                os.mkdir(_PROVIDER_GUARD_DIR, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            guard_fd = _open_guard_node(_PROVIDER_GUARD_DIR, dir_fd=parent_fd,
+                                        directory=True)
+            cleanup.callback(os.close, guard_fd)
+            lock_fd = _open_guard_node(lock_identity, dir_fd=guard_fd,
+                                       directory=False)
+            cleanup.callback(os.close, lock_fd)
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline_monotonic:
+                        raise TimeoutError("provider mutation guard deadline reached")
+                    remaining = max(0.0, deadline_monotonic - time.monotonic())
+                    time.sleep(min(0.01, remaining))
+            cleanup.callback(fcntl.flock, lock_fd, fcntl.LOCK_UN)
+            yield ProviderMutationGuard(owner=owner, lock_identity=lock_identity)
+    except (RuntimeError, TimeoutError):
+        raise
+    except OSError as exc:
+        raise RuntimeError("unsafe provider mutation guard") from exc
+# H8-SLOC-END state-provider-guard
+
+
 def source_worker_entries(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
     panes = data.get("panes") if isinstance(data.get("panes"), dict) else {}
     return {
@@ -742,6 +855,25 @@ def entry_continuity_identity(entry: dict[str, Any]) -> tuple[str, int] | None:
 def message_binding_stable_identity(binding: dict[str, Any]) -> tuple[str, int] | None:
     stable_key = binding.get("stable_key")
     version = binding.get("stable_key_version")
+    if not valid_stable_worker_key_pair(stable_key, version):
+        return None
+    return stable_key, STABLE_WORKER_KEY_VERSION
+
+
+def message_binding_source_identity(
+    binding: dict[str, Any],
+) -> tuple[str, int] | None:
+    """Return the exact Tendwire source identity recorded during final ACK.
+
+    Space topics deliberately host more than one worker.  The ordinary
+    ``stable_key`` fields describe the local presentation binding and can be
+    rewritten while a durable pane identity is consolidated.  Modern final
+    delivery reconciliation additionally records the immutable ACP/Tendwire
+    source in ``tendwire_stable_key``; reply routing must prefer that owner.
+    """
+
+    stable_key = binding.get("tendwire_stable_key")
+    version = binding.get("tendwire_stable_key_version")
     if not valid_stable_worker_key_pair(stable_key, version):
         return None
     return stable_key, STABLE_WORKER_KEY_VERSION
@@ -1332,6 +1464,7 @@ def _retarget_durable_bindings(
     data: dict[str, Any],
     entry: dict[str, Any],
     *,
+    previous_owners: tuple[dict[str, Any], ...],
     related_topic_ids: set[str],
     surviving_topic_id: str,
 ) -> None:
@@ -1344,6 +1477,47 @@ def _retarget_durable_bindings(
         return
     for binding in bindings.values():
         if not isinstance(binding, dict):
+            continue
+        binding_pane_uuid = message_binding_pane_uuid(binding)
+        binding_identity = message_binding_stable_identity(binding)
+        has_pane_fields = (
+            "pane_uuid" in binding or "pane_uuid_version" in binding
+        )
+        has_stable_fields = (
+            "stable_key" in binding or "stable_key_version" in binding
+        )
+        owned = False
+        for previous in previous_owners:
+            previous_pane_uuid = entry_pane_uuid(previous)
+            previous_identity = entry_continuity_identity(previous)
+            if binding_pane_uuid:
+                owned = binding_pane_uuid == previous_pane_uuid
+            elif has_pane_fields:
+                owned = False
+            elif binding_identity is not None:
+                owned = binding_identity == previous_identity
+            elif has_stable_fields:
+                owned = False
+            else:
+                owned = _binding_matches_previous_entry(
+                    binding,
+                    worker_id=str(
+                        previous.get("tendwire_worker_id")
+                        or previous.get("worker_id")
+                        or ""
+                    ),
+                    fingerprint=str(
+                        previous.get("tendwire_fingerprint") or ""
+                    ),
+                    space_id=str(
+                        previous.get("tendwire_space_id")
+                        or previous.get("space_id")
+                        or ""
+                    ),
+                )
+            if owned:
+                break
+        if not owned:
             continue
         topic_id = str(binding.get("topic_id") or "")
         if topic_id not in related_topic_ids:
@@ -1656,6 +1830,7 @@ def reconcile_durable_pane_identities(
         }
         related_topic_ids.discard("")
         surviving_topic_id = str(survivor.get("topic_id") or "")
+        previous_owners = tuple(deepcopy(entries[key]) for key in group)
 
         protected = {
             "topic_id",
@@ -1720,6 +1895,7 @@ def reconcile_durable_pane_identities(
         _retarget_durable_bindings(
             data,
             survivor,
+            previous_owners=previous_owners,
             related_topic_ids=related_topic_ids,
             surviving_topic_id=surviving_topic_id,
         )
@@ -2386,490 +2562,13 @@ def finalize_worker_rekey_topic_handoff(
     return True
 
 
-
-
-class PersistedStableKeyMigration(NamedTuple):
-    """One immutable decision from the missing-version migration preflight."""
-
-    stable_key: str
-    action: str
-    worker_ref: int | None
-    candidate_key: str | None
-    claimant_entry_keys: tuple[str, ...]
-    stale_entry_keys: tuple[str, ...]
-    compatible_binding_ids: tuple[str, ...]
-    quarantine_binding_ids: tuple[str, ...]
-    reason: str
-
-
-class PersistedStableKeyMigrationPlan(NamedTuple):
-    """Complete deterministic plan for all private missing-version claimants."""
-
-    migrations: tuple[PersistedStableKeyMigration, ...]
-    blocked_stable_keys: frozenset[str]
-
-
-def _persisted_pane_entries(
-    data: dict[str, Any],
-) -> dict[str, dict[str, Any]]:
-    panes = data.get("panes")
-    if not isinstance(panes, dict):
-        return {}
-    return {
-        str(key): entry
-        for key, entry in panes.items()
-        if isinstance(entry, dict)
-    }
-
-
-def _persisted_missing_version_stable_key(entry: dict[str, Any]) -> str:
-    stable_key = entry.get("tendwire_stable_key")
-    if (
-        "tendwire_stable_key_version" not in entry
-        and isinstance(stable_key, str)
-        and STABLE_WORKER_KEY_RE.fullmatch(stable_key) is not None
-    ):
-        return stable_key
-    return ""
-
-
-def _migration_candidate_matches_worker(
-    entry: dict[str, Any], worker: dict[str, Any]
-) -> bool:
-    worker_id = compact_ws(worker.get("id"), 160)
-    space_id = compact_ws(worker.get("space_id"), 160)
-    fingerprint = compact_ws(worker.get("fingerprint"), 160)
-    agent = worker_agent(worker)
-    return (
-        bool(worker_id and space_id and fingerprint and agent)
-        and normalized_status(worker.get("status")) not in {"closed", "failed"}
-        and entry.get("source") == "tendwire"
-        and entry.get("entry_type") == "worker"
-        and entry.get("tendwire_worker_id") == worker_id
-        and (
-            "worker_id" not in entry
-            or entry.get("worker_id") == worker_id
-        )
-        and entry.get("tendwire_space_id") == space_id
-        and (
-            "space_id" not in entry
-            or entry.get("space_id") == space_id
-        )
-        and entry.get("agent") == agent
-        and bool(str(entry.get("tendwire_fingerprint") or ""))
-        and _entry_is_live(entry)
-        and not entry_is_quarantined(entry)
-    )
-
-
-def _migration_entry_owner(
-    entry: dict[str, Any],
-) -> tuple[str, str, str] | None:
-    owner = (
-        str(entry.get("tendwire_worker_id") or ""),
-        str(entry.get("tendwire_fingerprint") or ""),
-        str(entry.get("tendwire_space_id") or ""),
-    )
-    return owner if all(owner) else None
-
-
-def _migration_worker_owner(
-    worker: dict[str, Any],
-) -> tuple[str, str, str] | None:
-    owner = (
-        compact_ws(worker.get("id"), 160),
-        compact_ws(worker.get("fingerprint"), 160),
-        compact_ws(worker.get("space_id"), 160),
-    )
-    return owner if all(owner) else None
-
-
-def _migration_binding_owner(
-    binding: dict[str, Any],
-) -> tuple[str, str, str] | None:
-    owner = (
-        str(binding.get("worker_id") or ""),
-        str(binding.get("worker_fingerprint") or ""),
-        str(binding.get("space_id") or ""),
-    )
-    return owner if all(owner) else None
-
-
-def _migration_stale_owner_claim(
-    entry: dict[str, Any],
-) -> tuple[str, str, str, str, int] | None:
-    identity = entry_stable_identity(entry)
-    owner = _migration_entry_owner(entry)
-    if identity is None or owner is None:
-        return None
-    return owner[0], owner[1], owner[2], identity[0], identity[1]
-
-
-def _migration_binding_decisions(
-    data: dict[str, Any],
-    *,
-    stable_key: str,
-    entry: dict[str, Any],
-    stale_owner_claims: frozenset[
-        tuple[str, str, str, str, int]
-    ] = frozenset(),
-) -> tuple[tuple[str, ...], tuple[str, ...], bool]:
-    """Classify replies without ever treating a worker-id match as ownership."""
-    bindings = data.get("telegram_message_bindings")
-    if not isinstance(bindings, dict):
-        return (), (), False
-    worker_id = str(entry.get("tendwire_worker_id") or "")
-    fingerprint = str(entry.get("tendwire_fingerprint") or "")
-    space_id = str(entry.get("tendwire_space_id") or "")
-    topic_id = str(entry.get("topic_id") or "")
-    compatible: list[str] = []
-    quarantine: list[str] = []
-    conflicting_owner = False
-    for message_id in sorted(bindings, key=str):
-        binding = bindings.get(message_id)
-        if not isinstance(binding, dict):
-            continue
-        bound_worker = str(binding.get("worker_id") or "")
-        bound_fingerprint = str(binding.get("worker_fingerprint") or "")
-        bound_space = str(binding.get("space_id") or "")
-        bound_topic = str(binding.get("topic_id") or "")
-        raw_key_match = binding.get("stable_key") == stable_key
-        topic_match = bool(topic_id and bound_topic == topic_id)
-        exact_old_owner = (
-            bound_worker == worker_id
-            and bound_fingerprint == fingerprint
-            and bound_space == space_id
-        )
-        core_owner = bound_worker == worker_id and bound_space == space_id
-        related = raw_key_match or exact_old_owner
-        if not related:
-            continue
-        binding_identity = message_binding_stable_identity(binding)
-        if (
-            binding_identity is not None
-            and (
-                bound_worker,
-                bound_fingerprint,
-                bound_space,
-                binding_identity[0],
-                binding_identity[1],
-            )
-            in stale_owner_claims
-        ):
-            quarantine.append(str(message_id))
-            continue
-        has_stable_fields = (
-            "stable_key" in binding or "stable_key_version" in binding
-        )
-        if (
-            has_stable_fields
-            and message_binding_stable_identity(binding)
-            != (stable_key, STABLE_WORKER_KEY_VERSION)
-        ):
-            conflicting_owner = True
-            quarantine.append(str(message_id))
-            continue
-        if (
-            (raw_key_match or topic_match)
-            and (
-                not core_owner
-                or (
-                    bool(bound_fingerprint)
-                    and bound_fingerprint != fingerprint
-                )
-            )
-        ):
-            conflicting_owner = True
-            quarantine.append(str(message_id))
-            continue
-        if "routing_quarantined" in binding:
-            conflicting_owner = True
-            quarantine.append(str(message_id))
-            continue
-        identity_compatible = (
-            not has_stable_fields
-            or message_binding_stable_identity(binding)
-            == (stable_key, STABLE_WORKER_KEY_VERSION)
-        )
-        if exact_old_owner and topic_match and identity_compatible:
-            compatible.append(str(message_id))
-        else:
-            quarantine.append(str(message_id))
-    return tuple(compatible), tuple(dict.fromkeys(quarantine)), conflicting_owner
-
-
-def plan_persisted_stable_key_migrations(
-    data: dict[str, Any], workers: list[dict[str, Any]]
-) -> PersistedStableKeyMigrationPlan:
-    """Plan exact-key private adoption before any state mutation or reservation.
-
-    Source observations remain subject to the public exact-v1 classifier.  The
-    only private exception is a persisted exact ``wsk1_`` key whose version
-    field is absent; an absent key, legacy hash, explicit null, or malformed
-    version is never a candidate.
-    """
-    entries = _persisted_pane_entries(data)
-    candidates_by_key: dict[str, list[str]] = {}
-    for entry_key, entry in entries.items():
-        stable_key = _persisted_missing_version_stable_key(entry)
-        if stable_key:
-            candidates_by_key.setdefault(stable_key, []).append(entry_key)
-    workers_by_key: dict[str, list[dict[str, Any]]] = {}
-    for worker in workers:
-        identity = worker_stable_identity(worker)
-        if identity is not None:
-            workers_by_key.setdefault(identity[0], []).append(worker)
-
-    migrations: list[PersistedStableKeyMigration] = []
-    blocked: set[str] = set()
-    for stable_key in sorted(candidates_by_key):
-        candidate_keys = tuple(sorted(candidates_by_key[stable_key]))
-        claimants = sorted(
-            workers_by_key.get(stable_key, []),
-            key=canonical_worker_observation_key,
-        )
-        raw_same_key = tuple(
-            sorted(
-                entry_key
-                for entry_key, entry in entries.items()
-                if entry.get("tendwire_stable_key") == stable_key
-            )
-        )
-        exact_v1_owners = tuple(
-            entry_key
-            for entry_key in raw_same_key
-            if entry_stable_identity(entries.get(entry_key) or {})
-            == (stable_key, STABLE_WORKER_KEY_VERSION)
-        )
-        if not claimants:
-            migrations.append(
-                PersistedStableKeyMigration(
-                    stable_key,
-                    "wait",
-                    None,
-                    None,
-                    candidate_keys,
-                    (),
-                    (),
-                    (),
-                    "no_current_claimant",
-                )
-            )
-            continue
-
-        reason = ""
-        worker = claimants[0] if len(claimants) == 1 else None
-        candidate_key = candidate_keys[0] if len(candidate_keys) == 1 else None
-        candidate = entries.get(candidate_key) if candidate_key is not None else None
-        compatible_bindings: tuple[str, ...] = ()
-        quarantine_bindings: tuple[str, ...] = ()
-        terminal_topic_history: tuple[str, ...] = ()
-        if len(claimants) != 1:
-            reason = "multiple_current_claimants"
-        elif len(candidate_keys) != 1:
-            reason = "multiple_persisted_candidates"
-        elif exact_v1_owners:
-            reason = "existing_exact_v1_owner"
-        elif not isinstance(candidate, dict) or not _migration_candidate_matches_worker(
-            candidate, worker
-        ):
-            reason = "incompatible_persisted_candidate"
-        else:
-            topic_id = str(candidate.get("topic_id") or "")
-            terminal_topic_history = tuple(
-                sorted(
-                    entry_key
-                    for entry_key, entry in entries.items()
-                    if entry_key != candidate_key
-                    and not _entry_is_live(entry)
-                    and str(entry.get("topic_id") or "") == topic_id
-                )
-            )
-            topic_owners = tuple(
-                sorted(
-                    entry_key
-                    for entry_key, entry in entries.items()
-                    if _entry_is_live(entry)
-                    and str(entry.get("topic_id") or "") == topic_id
-                )
-            )
-            if not topic_id or topic_owners != (candidate_key,):
-                reason = "ambiguous_topic_owner"
-            else:
-                stale_owner_claims = frozenset(
-                    claim
-                    for entry_key in terminal_topic_history
-                    if (
-                        claim := _migration_stale_owner_claim(
-                            entries.get(entry_key) or {}
-                        )
-                    )
-                    is not None
-                )
-                (
-                    compatible_bindings,
-                    quarantine_bindings,
-                    conflicting_owner,
-                ) = _migration_binding_decisions(
-                    data,
-                    stable_key=stable_key,
-                    entry=candidate,
-                    stale_owner_claims=stale_owner_claims,
-                )
-                if conflicting_owner:
-                    reason = "conflicting_binding_owner"
-
-        if reason:
-            blocked.add(stable_key)
-            blocked_owner_tuples = {
-                owner
-                for entry_key in raw_same_key
-                if (
-                    owner := _migration_entry_owner(
-                        entries.get(entry_key) or {}
-                    )
-                )
-                is not None
-            }
-            blocked_owner_tuples.update(
-                owner
-                for claimant in claimants
-                if (owner := _migration_worker_owner(claimant)) is not None
-            )
-            planned_quarantines = set(quarantine_bindings)
-            bindings = data.get("telegram_message_bindings")
-            if isinstance(bindings, dict):
-                planned_quarantines.update(
-                    str(message_id)
-                    for message_id, binding in bindings.items()
-                    if isinstance(binding, dict)
-                    and (
-                        binding.get("stable_key") == stable_key
-                        or _migration_binding_owner(binding)
-                        in blocked_owner_tuples
-                    )
-                )
-            quarantine_bindings = tuple(sorted(planned_quarantines))
-            migrations.append(
-                PersistedStableKeyMigration(
-                    stable_key,
-                    "block",
-                    id(worker) if worker is not None else None,
-                    candidate_key,
-                    candidate_keys,
-                    (),
-                    (),
-                    quarantine_bindings,
-                    reason,
-                )
-            )
-            continue
-
-        stale_entries = tuple(
-            sorted(
-                {
-                    entry_key
-                    for entry_key in raw_same_key
-                    if entry_key != candidate_key
-                }
-                | set(terminal_topic_history)
-            )
-        )
-        migrations.append(
-            PersistedStableKeyMigration(
-                stable_key,
-                "adopt",
-                id(worker),
-                candidate_key,
-                candidate_keys,
-                stale_entries,
-                compatible_bindings,
-                quarantine_bindings,
-                "",
-            )
-        )
-    return PersistedStableKeyMigrationPlan(
-        tuple(migrations), frozenset(blocked)
-    )
-
-
-def _quarantine_private_migration_entry(
-    entry: dict[str, Any], *, reason: str
-) -> None:
-    entry["stable_key_quarantined"] = True
-    entry.setdefault("stable_key_quarantine_reason", reason)
-
-
-def apply_persisted_stable_key_migration_plan(
-    data: dict[str, Any],
-    workers: list[dict[str, Any]],
-    plan: PersistedStableKeyMigrationPlan,
-) -> Mapping[int, str]:
-    """Revalidate and atomically apply a previously computed private plan."""
-    if plan_persisted_stable_key_migrations(data, workers) != plan:
-        return MappingProxyType({})
-    entries = _persisted_pane_entries(data)
-    workers_by_ref = {id(worker): worker for worker in workers}
-    adopted: dict[int, str] = {}
-    bindings = data.get("telegram_message_bindings")
-    for migration in plan.migrations:
-        if migration.action == "wait":
-            continue
-        if migration.action == "block":
-            for entry_key in migration.claimant_entry_keys:
-                entry = entries.get(entry_key)
-                if entry is not None:
-                    _quarantine_private_migration_entry(
-                        entry, reason=migration.reason
-                    )
-            if isinstance(bindings, dict):
-                for message_id in migration.quarantine_binding_ids:
-                    binding = bindings.get(message_id)
-                    if isinstance(binding, dict):
-                        binding["routing_quarantined"] = True
-            continue
-        worker = workers_by_ref.get(migration.worker_ref)
-        entry = entries.get(migration.candidate_key or "")
-        if worker is None or entry is None:
-            return MappingProxyType({})
-        for entry_key in migration.stale_entry_keys:
-            stale = entries.get(entry_key)
-            if stale is not None:
-                _quarantine_private_migration_entry(
-                    stale, reason="stale_same_stable_key_claimant"
-                )
-        entry["tendwire_stable_key_version"] = STABLE_WORKER_KEY_VERSION
-        entry["tendwire_stable_identity_class"] = "current_v1"
-        entry["tendwire_fingerprint"] = compact_ws(
-            worker.get("fingerprint"), 160
-        )
-        if isinstance(bindings, dict):
-            for message_id in migration.compatible_binding_ids:
-                binding = bindings.get(message_id)
-                if not isinstance(binding, dict):
-                    continue
-                binding["worker_id"] = compact_ws(worker.get("id"), 160)
-                binding["worker_fingerprint"] = compact_ws(
-                    worker.get("fingerprint"), 160
-                )
-                binding["space_id"] = compact_ws(worker.get("space_id"), 160)
-                binding["stable_key"] = migration.stable_key
-                binding["stable_key_version"] = STABLE_WORKER_KEY_VERSION
-            for message_id in migration.quarantine_binding_ids:
-                binding = bindings.get(message_id)
-                if isinstance(binding, dict):
-                    binding["routing_quarantined"] = True
-        adopted[migration.worker_ref] = migration.candidate_key or ""
-    return MappingProxyType(adopted)
-
-
 def resolve_worker_entry_key(
     data: dict[str, Any],
     worker: dict[str, Any],
     *,
     blocked_stable_keys: set[str] | None = None,
 ) -> str | None:
-    """Resolve a current v1 worker; private migration is planned separately."""
+    """Resolve a worker from its current stable-key identity."""
     worker_id = compact_ws(worker.get("id"), 160)
     identity = worker_stable_identity(worker)
     if identity is None:
@@ -2963,14 +2662,7 @@ def precompute_worker_entry_reservations(
     deterministically paired with exact-identity storage owners only to keep
     quarantine repeatable.
     """
-    migration_plan = plan_persisted_stable_key_migrations(data, workers)
     effective_blocked_stable_keys = set(blocked_stable_keys or ())
-    effective_blocked_stable_keys.update(migration_plan.blocked_stable_keys)
-    if blocked_stable_keys is not None:
-        blocked_stable_keys.update(migration_plan.blocked_stable_keys)
-    apply_persisted_stable_key_migration_plan(
-        data, workers, migration_plan
-    )
     preliminary = {
         id(worker): _resolve_worker_upsert_entry_key(
             data,
@@ -3258,26 +2950,6 @@ def topic_name_for_space(space: dict[str, Any]) -> str:
     return value or "Space"
 
 
-def find_legacy_topic_id_by_name(data: dict[str, Any], name: str) -> str:
-    wanted = compact_ws(name, 120).casefold()
-    if not wanted:
-        return ""
-    eligible_entries = list(source_space_entries(data).values())
-    eligible_entries.extend(
-        entry
-        for key, entry in source_worker_entries(data).items()
-        if worker_entry_is_uniquely_routable(data, key, entry)
-    )
-    matches = {
-        str(entry["topic_id"])
-        for entry in eligible_entries
-        if compact_ws(entry.get("topic_name"), 120).casefold() == wanted
-        and entry.get("topic_id")
-        and not topic_id_is_tombstoned(data, entry.get("topic_id"))
-    }
-    return next(iter(matches)) if len(matches) == 1 else ""
-
-
 def upsert_space_entry(data: dict[str, Any], space: dict[str, Any], *, topic_id: str = "") -> tuple[str, dict[str, Any], bool]:
     space_id = compact_ws(space.get("id"), 160)
     fingerprint = compact_ws(space.get("fingerprint"), 160)
@@ -3487,7 +3159,6 @@ def record_worker_generation_rebind(
     to_worker_id: str,
     reason: str,
     observed_at: float,
-    evidence_turn_id: str = "",
 ) -> bool:
     """Persist bounded #174 evidence for a stable-key cache refresh."""
     if (
@@ -3509,16 +3180,6 @@ def record_worker_generation_rebind(
     }
     audit.append(record)
     data["tendwire_worker_rebind_audit"] = audit[-WORKER_REBIND_AUDIT_LIMIT:]
-    if reason == "freshest_turn_activity" and evidence_turn_id:
-        entry.pop("tendwire_rebind_catchup_bound", None)
-        entry["tendwire_rebind_catchup_pending"] = {
-            "from_worker_id": str(from_worker_id),
-            "to_worker_id": str(to_worker_id),
-            "evidence_turn_id": str(evidence_turn_id),
-        }
-    else:
-        entry.pop("tendwire_rebind_catchup_pending", None)
-        entry.pop("tendwire_rebind_catchup_bound", None)
     entry.pop("tendwire_worker_generation_ambiguity", None)
     return True
 
@@ -3790,570 +3451,6 @@ def mark_delivered(data: dict[str, Any], identity: str, record: dict[str, Any]) 
     return True
 
 
-def partial_final_delivery_key(turn_id: str, content_hash: str) -> str:
-    """Return the durable replay-witness identity for one turn revision."""
-
-    turn = compact_ws(turn_id, 200)
-    content = compact_ws(content_hash, 200)
-    if not turn or not content:
-        raise ValueError("partial final requires turn and content identity")
-    return short_hash(
-        {"partial_final_turn_id": turn, "content_hash": content},
-        40,
-    )
-
-
-def partial_final_deliveries(
-    data: dict[str, Any],
-    *,
-    create: bool = False,
-) -> dict[str, Any]:
-    """Return content-keyed records whose active members hold their turn.
-
-    Schema v2 briefly stored one turn-keyed slot. Re-key every valid record by
-    content so resolved replay witnesses survive later revisions. Multiple
-    active content records for one turn remain independently visible and
-    resolvable; their presence collectively forms the turn-scoped hold.
-    """
-
-    records = data.get("telegram_partial_final_deliveries")
-    if not isinstance(records, dict):
-        records = {}
-        if create:
-            data["telegram_partial_final_deliveries"] = records
-        return records
-    normalized: dict[str, Any] = {}
-    for record in records.values():
-        if not isinstance(record, dict):
-            continue
-        turn_id = compact_ws(record.get("turn_id"), 200)
-        content_hash = compact_ws(record.get("content_hash"), 200)
-        if not turn_id or not content_hash:
-            continue
-        record["schema_version"] = PARTIAL_FINAL_DELIVERY_SCHEMA_VERSION
-        key = partial_final_delivery_key(turn_id, content_hash)
-        incumbent = normalized.get(key)
-        if not isinstance(incumbent, dict):
-            normalized[key] = record
-            continue
-        incumbent_active = (
-            incumbent.get("status") in {"held", "retry_authorized"}
-            and incumbent.get("operator_attention_required") is True
-        )
-        record_active = (
-            record.get("status") in {"held", "retry_authorized"}
-            and record.get("operator_attention_required") is True
-        )
-        if record_active and not incumbent_active:
-            normalized[key] = record
-    if len(normalized) > PARTIAL_FINAL_DELIVERY_LIMIT:
-        # Active/unresolved records are operator obligations and are never
-        # silently evicted. Resolved witnesses are replay protection, but the
-        # oldest resolved entries are the only safe candidates when bounding
-        # state growth. If legacy input already contains more unresolved
-        # obligations than the bound, preserve them all and let health remain
-        # non-healthy; losing an obligation is worse than a temporary overflow.
-        def record_time(record: dict[str, Any]) -> float:
-            value = (
-                record.get("resolved_at")
-                or record.get("updated_at")
-                or record.get("created_at")
-                or 0
-            )
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return 0.0
-
-        resolved = sorted(
-            (
-                (key, record)
-                for key, record in normalized.items()
-                if record.get("status") == "resolved"
-                and record.get("operator_attention_required") is not True
-            ),
-            key=lambda pair: (
-                record_time(pair[1]),
-                pair[0],
-            ),
-        )
-        evict_count = min(
-            len(resolved),
-            len(normalized) - PARTIAL_FINAL_DELIVERY_LIMIT,
-        )
-        for key, _record in resolved[:evict_count]:
-            normalized.pop(key, None)
-    if list(records.items()) != list(normalized.items()):
-        records.clear()
-        records.update(normalized)
-    return records
-
-
-def partial_final_delivery_has_unresolved_capacity(
-    data: dict[str, Any],
-) -> bool:
-    """Return whether another unresolved provider fact can be recorded."""
-
-    unresolved = sum(
-        1
-        for record in partial_final_deliveries(data).values()
-        if isinstance(record, dict)
-        and (
-            record.get("status") != "resolved"
-            or record.get("operator_attention_required") is True
-        )
-    )
-    return unresolved < PARTIAL_FINAL_DELIVERY_LIMIT
-
-
-def find_partial_final_delivery(
-    data: dict[str, Any],
-    turn_id: str,
-    content_hash: str,
-) -> dict[str, Any] | None:
-    record = partial_final_deliveries(data).get(
-        partial_final_delivery_key(turn_id, content_hash)
-    )
-    return record if isinstance(record, dict) else None
-
-
-def partial_final_delivery_records_for_turn(
-    data: dict[str, Any],
-    turn_id: str,
-) -> list[dict[str, Any]]:
-    """Return every content witness for a turn without collapsing revisions."""
-
-    return [
-        record
-        for record in partial_final_deliveries(data).values()
-        if isinstance(record, dict) and record.get("turn_id") == turn_id
-    ]
-
-
-def active_partial_final_deliveries_for_turn(
-    data: dict[str, Any],
-    turn_id: str,
-) -> list[dict[str, Any]]:
-    """Return every unresolved content record forming this turn's hold."""
-
-    return [
-        record
-        for record in partial_final_delivery_records_for_turn(data, turn_id)
-        if record.get("status") in {"held", "retry_authorized"}
-        and record.get("operator_attention_required") is True
-    ]
-
-
-def active_partial_final_deliveries(
-    data: dict[str, Any],
-) -> list[dict[str, Any]]:
-    return [
-        record
-        for record in partial_final_deliveries(data).values()
-        if isinstance(record, dict)
-        and record.get("status") in {"held", "retry_authorized"}
-        and record.get("operator_attention_required") is True
-    ]
-
-
-def _partial_final_created_at(
-    record: dict[str, Any], *, now: float
-) -> float:
-    value = record.get("created_at")
-    return (
-        float(value)
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
-        else float(now)
-    )
-
-
-def _partial_final_operator_row(
-    record: dict[str, Any], *, now: float
-) -> dict[str, Any]:
-    row = {
-        key: deepcopy(record.get(key))
-        for key in (
-            "turn_id",
-            "content_hash",
-            "blocked_revision_content_hash",
-            "superseded_by_content_hash",
-            "superseded_at",
-            "supersession",
-            "supersession_message_ids",
-            "terminal_outcome",
-            "status",
-            "request_phase",
-            "transport_disposition",
-            "original_worker_id",
-            "original_topic_id",
-            "original_bot_kind",
-            "current_worker_id",
-            "current_topic_id",
-            "current_bot_kind",
-            "recovery_action",
-            "error",
-            "created_at",
-            "updated_at",
-            "required_part_count",
-            "content_locator",
-            "oversize_notice_status",
-            "oversize_notice_error",
-            "oversize_notice_attempt_count",
-            "oversize_notice_attempt_cap",
-            "oversize_notice_terminal",
-        )
-    }
-    row["age_seconds"] = max(
-        0.0, float(now) - _partial_final_created_at(record, now=now)
-    )
-    resolution_action = {
-        "delivery_unknown": "accept-partial",
-        "not_delivered": "retry-missing",
-    }.get(str(record.get("terminal_outcome") or ""))
-    row["resolution_action"] = resolution_action
-    if resolution_action:
-        row["resolution_command"] = [
-            "herdres",
-            "resolve-partial-final",
-            "--turn-id",
-            str(record.get("turn_id") or ""),
-            "--content-hash",
-            str(record.get("content_hash") or ""),
-            "--action",
-            resolution_action,
-            "--request-id",
-            "<unique-request-id>",
-        ]
-    return row
-
-
-def partial_final_delivery_operator_rows(
-    data: dict[str, Any], *, now: float
-) -> list[dict[str, Any]]:
-    """Return every active hold with identity and supported recovery action.
-
-    This intentionally has no presentation cap: it backs an operator-invoked
-    listing rather than the continuously journaled health result. Normal state
-    bounds unresolved records at ``PARTIAL_FINAL_DELIVERY_LIMIT``; if legacy
-    state exceeds that bound, dropping identities here would make the excess
-    obligations impossible to resolve without reading private state.
-    """
-
-    records = sorted(
-        active_partial_final_deliveries(data),
-        key=lambda record: (
-            _partial_final_created_at(record, now=now),
-            str(record.get("turn_id") or ""),
-            str(record.get("content_hash") or ""),
-        ),
-    )
-    return [
-        _partial_final_operator_row(record, now=now)
-        for record in records
-    ]
-
-
-def partial_final_delivery_health(
-    data: dict[str, Any],
-    *,
-    now: float,
-    escalation_seconds: int,
-) -> dict[str, Any]:
-    """Return the operator-facing health state for incomplete final delivery."""
-
-    records = active_partial_final_deliveries(data)
-    stalled_plans: list[tuple[float, str, dict[str, Any]]] = []
-    for entry_key, entry in source_worker_entries(data).items():
-        plan_token = compact_ws(entry.get("pending_plan_token"), 280)
-        turn_id = compact_ws(entry.get("pending_turn_id"), 200)
-        started_at = entry.get("pending_turn_started_at")
-        if (
-            not plan_token.startswith("twplan1.")
-            or not turn_id
-            or not isinstance(started_at, (int, float))
-            or isinstance(started_at, bool)
-        ):
-            continue
-        age = max(0.0, float(now) - float(started_at))
-        if age >= float(escalation_seconds):
-            stalled_plans.append((age, entry_key, entry))
-    stalled_plans.sort(key=lambda row: (-row[0], row[1]))
-    if not records and not stalled_plans:
-        return {
-            "ok": True,
-            "status": "healthy",
-            "signal": "",
-            "held_count": 0,
-            "stalled_plan_count": 0,
-            "escalation_seconds": int(escalation_seconds),
-        }
-
-    first_stalled: dict[str, Any] | None = None
-    if stalled_plans:
-        stalled_age, entry_key, entry = stalled_plans[0]
-        first_stalled = {
-            "entry_key": entry_key,
-            "turn_id": str(entry.get("pending_turn_id") or ""),
-            "content_hash": str(
-                entry.get("pending_content_revision") or ""
-            ),
-            "plan_token": str(entry.get("pending_plan_token") or ""),
-            "worker_id": str(
-                entry.get("tendwire_worker_id")
-                or entry.get("active_worker_id")
-                or ""
-            ),
-            "topic_id": str(entry.get("topic_id") or ""),
-            "started_at": float(entry["pending_turn_started_at"]),
-            "age_seconds": stalled_age,
-            "declared_part_count": entry.get("pending_turn_part_count"),
-            "created_job_count": entry.get("pending_turn_job_count"),
-        }
-    if not records:
-        return {
-            "ok": False,
-            "status": "pending_turn_plan_stalled",
-            "signal": "outbound_pending_turn_plan_stalled",
-            "held_count": 0,
-            "stalled_plan_count": len(stalled_plans),
-            "escalation_seconds": int(escalation_seconds),
-            "oldest_age_seconds": stalled_plans[0][0],
-            "first_stalled_plan": first_stalled,
-        }
-
-    ordered = sorted(
-        records,
-        key=lambda record: (
-            _partial_final_created_at(record, now=now),
-            str(record.get("turn_id") or ""),
-            str(record.get("content_hash") or ""),
-        ),
-    )
-    operator_rows = partial_final_delivery_operator_rows(data, now=now)
-
-    def bounded_projection(
-        selected: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        total = len(selected)
-        returned = min(total, PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT)
-        omitted = total - returned
-        return (
-            deepcopy(selected[:returned]),
-            {
-                "total": total,
-                "returned": returned,
-                "omitted": omitted,
-                "truncated": omitted > 0,
-                "limit": PARTIAL_FINAL_HEALTH_PROJECTION_LIMIT,
-            },
-        )
-
-    active_holds, active_holds_projection = bounded_projection(operator_rows)
-    oversize_notice_rows = [
-        row
-        for row in operator_rows
-        if row.get("request_phase") == "oversize_presentation"
-        and str(row.get("oversize_notice_status") or "not_attempted")
-        != "accepted"
-    ]
-    (
-        oversize_notice_attention,
-        oversize_notice_attention_projection,
-    ) = (
-        deepcopy(oversize_notice_rows),
-        {
-            "total": len(oversize_notice_rows),
-            "returned": len(oversize_notice_rows),
-            "omitted": 0,
-            "truncated": False,
-            "limit": None,
-        },
-    )
-    first = ordered[0]
-    age = max(
-        0.0,
-        float(now) - _partial_final_created_at(first, now=now),
-    )
-    escalated = any(
-        max(
-            0.0,
-            float(now) - _partial_final_created_at(record, now=now),
-        )
-        >= float(escalation_seconds)
-        for record in records
-    )
-    unknown = any(
-        record.get("terminal_outcome") == "delivery_unknown"
-        for record in records
-    )
-    retry_pending = any(
-        record.get("status") == "retry_authorized"
-        for record in records
-    )
-    if escalated:
-        status = "partial_final_escalated"
-        signal = "outbound_partial_final_escalated"
-    elif unknown:
-        status = "partial_final_delivery_unknown"
-        signal = "outbound_partial_final_delivery_unknown"
-    elif retry_pending:
-        status = "partial_final_recovery_pending"
-        signal = "outbound_partial_final_recovery_pending"
-    else:
-        status = "partial_final_not_delivered"
-        signal = "outbound_partial_final_not_delivered"
-    result = {
-        "ok": False,
-        "status": status,
-        "signal": signal,
-        "held_count": len(records),
-        "stalled_plan_count": len(stalled_plans),
-        "escalation_seconds": int(escalation_seconds),
-        "oldest_age_seconds": age,
-        # Keep the historical single-record projection for compatibility, but
-        # never make operator discovery depend on which hold sorts first.
-        "first_hold": operator_rows[0],
-        "active_holds": active_holds,
-        "active_holds_projection": active_holds_projection,
-        "operator_listing_command": ["herdres", "list-partial-finals"],
-        # This independently scans and returns every attention record. Unlike
-        # the general health list it is intentionally uncapped: a large set of
-        # failed notices is itself an incident, and identities must remain
-        # actionable even if the manual listing command is unavailable.
-        "oversize_notice_attention": oversize_notice_attention,
-        "oversize_notice_attention_projection": (
-            oversize_notice_attention_projection
-        ),
-    }
-    if first_stalled is not None:
-        result["first_stalled_plan"] = first_stalled
-    return result
-
-
-def _clear_embedded_partial_final_delivery(
-    data: dict[str, Any],
-    *,
-    turn_id: str,
-    content_hash: str,
-    error: str,
-) -> None:
-    for entry in source_worker_entries(data).values():
-        partial = entry.get("partial_final_delivery")
-        if (
-            isinstance(partial, dict)
-            and partial.get("turn_id") == turn_id
-            and partial.get("content_hash") == content_hash
-        ):
-            entry.pop("partial_final_delivery", None)
-            if entry.get("last_delivery_error") == error:
-                entry.pop("last_delivery_error", None)
-    for binding in message_bindings(data).values():
-        partial = (
-            binding.get("partial_final_delivery")
-            if isinstance(binding, dict)
-            else None
-        )
-        if (
-            isinstance(partial, dict)
-            and partial.get("turn_id") == turn_id
-            and partial.get("content_hash") == content_hash
-        ):
-            binding.pop("partial_final_delivery", None)
-
-
-def resolve_partial_final_delivery(
-    data: dict[str, Any],
-    *,
-    turn_id: str,
-    content_hash: str,
-    action: str,
-    request_id: str,
-    now: float,
-) -> dict[str, Any]:
-    """Apply the only operator-authorized exits from an incomplete-final hold.
-
-    An ambiguous suffix may only be accepted as an explicitly incomplete
-    delivery. A definitely rejected suffix may authorize a suffix-only retry.
-    Neither action authorizes replay of the already accepted prefix.
-    """
-
-    record = find_partial_final_delivery(data, turn_id, content_hash)
-    if record is None:
-        raise KeyError("partial final delivery not found")
-    prior_request = str(record.get("resolution_request_id") or "")
-    prior_action = str(record.get("resolution_action") or "")
-    if prior_request:
-        if prior_request == request_id and prior_action == action:
-            return deepcopy(record)
-        raise ValueError("partial final already has a different resolution")
-    outcome = str(record.get("terminal_outcome") or "")
-    allowed = {
-        "delivery_unknown": "accept-partial",
-        "not_delivered": "retry-missing",
-    }.get(outcome)
-    if action != allowed:
-        raise ValueError(
-            f"{outcome or 'unknown'} requires recovery action {allowed or 'none'}"
-        )
-    record["resolution_request_id"] = compact_ws(request_id, 128)
-    record["resolution_action"] = action
-    record["resolution_requested_at"] = float(now)
-    if action == "retry-missing":
-        record["status"] = "retry_authorized"
-        record["recovery_action"] = "await-suffix-retry"
-        return deepcopy(record)
-    record["status"] = "resolved"
-    record["resolved_at"] = float(now)
-    record["resolution"] = "accepted_incomplete"
-    record["operator_attention_required"] = False
-    record["recovery_action"] = "none"
-    _clear_embedded_partial_final_delivery(
-        data,
-        turn_id=str(record["turn_id"]),
-        content_hash=str(record["content_hash"]),
-        error=str(record.get("error") or ""),
-    )
-    return deepcopy(record)
-
-
-def complete_partial_final_retry(
-    data: dict[str, Any],
-    *,
-    turn_id: str,
-    content_hash: str,
-    message_ids: list[str],
-    now: float,
-) -> dict[str, Any]:
-    """Complete a previously operator-authorized missing-suffix retry."""
-
-    record = find_partial_final_delivery(data, turn_id, content_hash)
-    if record is None or record.get("status") != "retry_authorized":
-        raise ValueError("partial final suffix retry is not authorized")
-    record["status"] = "resolved"
-    record["resolved_at"] = float(now)
-    record["resolution"] = "missing_suffix_delivered"
-    record["operator_attention_required"] = False
-    record["recovery_action"] = "none"
-    record["message_ids"] = list(message_ids)
-    record["canonical_message_id"] = message_ids[0] if message_ids else ""
-    _clear_embedded_partial_final_delivery(
-        data,
-        turn_id=str(record["turn_id"]),
-        content_hash=str(record["content_hash"]),
-        error=str(record.get("error") or ""),
-    )
-    return deepcopy(record)
-
-
-def tendwire_turn_jobs(data: dict[str, Any]) -> dict[str, Any]:
-    """Return the private, stable-job-keyed multipart checkpoint ledger."""
-    jobs = data.get("tendwire_turn_jobs")
-    if not isinstance(jobs, dict):
-        jobs = {}
-        data["tendwire_turn_jobs"] = jobs
-    return jobs
-
-
 def _tendwire_opaque_token(value: Any, *, kind: str) -> str:
     if not isinstance(value, str) or not _TENDWIRE_OPAQUE_TOKEN_RE.fullmatch(value):
         raise ValueError(f"invalid {kind}")
@@ -4384,498 +3481,6 @@ def _tendwire_job_outcome_value(value: Any, *, field: str, limit: int) -> str:
     if not isinstance(value, str) or not value or len(value) > limit:
         raise ValueError(f"invalid {field}")
     return value
-
-
-def _next_tendwire_turn_job_checkpoint(data: dict[str, Any]) -> int:
-    previous = data.get("tendwire_turn_job_checkpoint_sequence")
-    if isinstance(previous, bool) or not isinstance(previous, int) or previous < 0:
-        previous = 0
-    current = previous + 1
-    data["tendwire_turn_job_checkpoint_sequence"] = current
-    return current
-
-
-def find_tendwire_turn_job(
-    data: dict[str, Any], job_key: str
-) -> dict[str, Any] | None:
-    """Find a receipt by stable outbox key; transient lease refs are never accepted."""
-    _tendwire_job_key_parts(job_key)
-    receipt = tendwire_turn_jobs(data).get(job_key)
-    return receipt if isinstance(receipt, dict) else None
-
-
-def _active_tendwire_turn_job_references(
-    data: dict[str, Any],
-) -> tuple[set[str], set[str], set[str]]:
-    job_keys: set[str] = set()
-    plan_tokens: set[str] = set()
-    content_revisions: set[str] = set()
-    bindings = data.get("telegram_message_bindings")
-    if not isinstance(bindings, dict):
-        bindings = {}
-
-    active_bindings: list[dict[str, Any]] = []
-    for binding in bindings.values():
-        if not isinstance(binding, dict):
-            continue
-        if (
-            binding.get("active") is False
-            or binding.get("retired") is True
-            or binding.get("superseded") is True
-            or binding.get("folded") is True
-        ):
-            continue
-        active_bindings.append(binding)
-        job_key = binding.get("tendwire_job_key")
-        if isinstance(job_key, str):
-            job_keys.add(job_key)
-        plan_token = binding.get("plan_token")
-        if isinstance(plan_token, str) and plan_token:
-            plan_tokens.add(plan_token)
-        else:
-            content_revision = binding.get("content_revision")
-            if isinstance(content_revision, str) and content_revision:
-                content_revisions.add(content_revision)
-
-    for collection_name in ("panes", "spaces"):
-        collection = data.get(collection_name)
-        if not isinstance(collection, dict):
-            continue
-        for entry in collection.values():
-            if not isinstance(entry, dict):
-                continue
-            for field in (
-                "tendwire_job_key",
-                "active_turn_job_key",
-                "pending_turn_job_key",
-                "last_clean_job_key",
-            ):
-                value = entry.get(field)
-                if isinstance(value, str):
-                    job_keys.add(value)
-            for field in ("active_turn_job_keys", "pending_turn_job_keys"):
-                values = entry.get(field)
-                if isinstance(values, list):
-                    job_keys.update(value for value in values if isinstance(value, str))
-            entry_plan_tokens: set[str] = set()
-            for field in (
-                "last_clean_plan_token",
-                "active_plan_token",
-                "pending_plan_token",
-                "tendwire_plan_token",
-            ):
-                value = entry.get(field)
-                if isinstance(value, str) and value:
-                    entry_plan_tokens.add(value)
-            plan_tokens.update(entry_plan_tokens)
-            if not entry_plan_tokens:
-                for field in (
-                    "last_clean_content_revision",
-                    "active_content_revision",
-                    "pending_content_revision",
-                ):
-                    value = entry.get(field)
-                    if isinstance(value, str) and value:
-                        content_revisions.add(value)
-            message_ids: list[Any] = [entry.get("last_clean_message_id")]
-            stored_ids = entry.get("last_clean_message_ids")
-            if isinstance(stored_ids, list):
-                message_ids.extend(stored_ids)
-            for message_id in message_ids:
-                binding = bindings.get(str(message_id or ""))
-                if isinstance(binding, dict) and binding in active_bindings:
-                    job_key = binding.get("tendwire_job_key")
-                    if isinstance(job_key, str):
-                        job_keys.add(job_key)
-
-    return job_keys, plan_tokens, content_revisions
-
-
-def cleanup_tendwire_turn_jobs(
-    data: dict[str, Any], *, max_records: int = TENDWIRE_TURN_JOB_LIMIT
-) -> int:
-    """Remove only oldest terminal receipts not required by live delivery state."""
-    max_records = _tendwire_job_index(
-        max_records, field="max_records", positive=False
-    )
-    jobs = tendwire_turn_jobs(data)
-    excess = len(jobs) - max_records
-    if excess <= 0:
-        return 0
-    job_refs, plan_refs, revision_refs = _active_tendwire_turn_job_references(data)
-    removable: list[tuple[int, str]] = []
-    for job_key, receipt in jobs.items():
-        if not isinstance(receipt, dict):
-            continue
-        if receipt.get("substate") not in _TENDWIRE_TURN_JOB_TERMINAL_SUBSTATES:
-            continue
-        if isinstance(receipt.get("post_ack_reconcile"), dict):
-            continue
-        if (
-            job_key in job_refs
-            or receipt.get("plan_token") in plan_refs
-            or receipt.get("content_revision") in revision_refs
-        ):
-            continue
-        sequence = receipt.get("checkpoint_sequence")
-        if isinstance(sequence, bool) or not isinstance(sequence, int):
-            sequence = 0
-        removable.append((sequence, job_key))
-    removable.sort(key=lambda item: (item[0], item[1]))
-    for _sequence, job_key in removable[:excess]:
-        jobs.pop(job_key, None)
-    return min(excess, len(removable))
-
-
-def reserve_tendwire_turn_job(
-    data: dict[str, Any],
-    job_key: str,
-    *,
-    plan_token: str,
-    content_revision: str,
-    operation: str,
-    sequence_index: int,
-    part_ordinal: int,
-    part_count: int,
-    telegram_message_id: str = "",
-    prior_message_id: str = "",
-    bot_kind: str = "",
-) -> dict[str, Any]:
-    """Reserve one immutable delivery intent, idempotently, by stable outbox key."""
-    key_plan_token, key_sequence = _tendwire_job_key_parts(job_key)
-    plan_token = _tendwire_opaque_token(plan_token, kind="plan_token")
-    content_revision = _tendwire_opaque_token(
-        content_revision, kind="content_revision"
-    )
-    if key_plan_token != plan_token:
-        raise ValueError("tendwire job key plan mismatch")
-    sequence_index = _tendwire_job_index(
-        sequence_index, field="sequence_index"
-    )
-    if key_sequence != sequence_index:
-        raise ValueError("tendwire job key sequence mismatch")
-    if operation not in {"upsert", "retire"}:
-        raise ValueError("invalid operation")
-    part_ordinal = _tendwire_job_index(part_ordinal, field="part_ordinal")
-    part_count = _tendwire_job_index(
-        part_count, field="part_count", positive=True
-    )
-    if operation == "upsert" and part_ordinal >= part_count:
-        raise ValueError("upsert ordinal outside part count")
-
-    optional_values = {
-        "telegram_message_id": (telegram_message_id, 80),
-        "prior_message_id": (prior_message_id, 80),
-        "bot_kind": (bot_kind, 40),
-    }
-    clean_optional: dict[str, str] = {}
-    for field, (value, limit) in optional_values.items():
-        if value:
-            clean_optional[field] = _tendwire_job_outcome_value(
-                value, field=field, limit=limit
-            )
-
-    immutable = {
-        "plan_token": plan_token,
-        "content_revision": content_revision,
-        "operation": operation,
-        "sequence_index": sequence_index,
-        "part_ordinal": part_ordinal,
-        "part_count": part_count,
-    }
-    jobs = tendwire_turn_jobs(data)
-    existing = jobs.get(job_key)
-    if existing is not None:
-        if not isinstance(existing, dict):
-            raise ValueError("invalid existing tendwire job receipt")
-        if any(existing.get(field) != value for field, value in immutable.items()):
-            raise ValueError("conflicting tendwire job reservation")
-        for field, value in clean_optional.items():
-            if existing.get(field) not in (None, "", value):
-                raise ValueError("conflicting tendwire job outcome")
-        return existing
-
-    cleanup_tendwire_turn_jobs(
-        data, max_records=TENDWIRE_TURN_JOB_LIMIT - 1
-    )
-    if len(jobs) >= TENDWIRE_TURN_JOB_LIMIT:
-        raise RuntimeError("tendwire turn job ledger is full")
-    receipt: dict[str, Any] = {
-        **immutable,
-        **clean_optional,
-        "substate": "reserved",
-        "checkpoint_sequence": _next_tendwire_turn_job_checkpoint(data),
-    }
-    jobs[job_key] = receipt
-    return receipt
-
-
-def update_tendwire_turn_job(
-    data: dict[str, Any],
-    job_key: str,
-    *,
-    substate: str,
-    telegram_message_id: str | None = None,
-    prior_message_id: str | None = None,
-    bot_kind: str | None = None,
-) -> dict[str, Any]:
-    """Advance a reserved intent through the durable Telegram/ACK substates."""
-    receipt = find_tendwire_turn_job(data, job_key)
-    if receipt is None:
-        raise KeyError(job_key)
-    if substate not in TENDWIRE_TURN_JOB_SUBSTATES:
-        raise ValueError("invalid tendwire job substate")
-    current = receipt.get("substate")
-    transitions = {
-        "reserved": {
-            "reserved",
-            "retryable",
-            "telegram_applied",
-            "suppressed",
-            "failed",
-        },
-        "retryable": {"retryable", "reserved", "failed"},
-        "telegram_applied": {
-            "telegram_applied",
-            "old_slot_retired",
-            "acknowledged",
-            "failed",
-        },
-        "old_slot_retired": {"old_slot_retired", "acknowledged", "failed"},
-        "suppressed": {"suppressed", "acknowledged", "failed"},
-        "acknowledged": {"acknowledged"},
-        "failed": {"failed"},
-    }
-    if current not in transitions or substate not in transitions[current]:
-        raise ValueError(f"invalid tendwire job transition {current!r} -> {substate!r}")
-
-    updates = {
-        "telegram_message_id": (telegram_message_id, 80),
-        "prior_message_id": (prior_message_id, 80),
-        "bot_kind": (bot_kind, 40),
-    }
-    for field, (value, limit) in updates.items():
-        if value is None:
-            continue
-        clean = _tendwire_job_outcome_value(value, field=field, limit=limit)
-        if receipt.get(field) not in (None, "", clean):
-            raise ValueError("conflicting tendwire job outcome")
-        receipt[field] = clean
-
-    if substate == "telegram_applied":
-        if receipt.get("operation") == "upsert" and not receipt.get(
-            "telegram_message_id"
-        ):
-            raise ValueError("upsert telegram outcome requires message id")
-        if receipt.get("operation") == "retire" and not receipt.get(
-            "prior_message_id"
-        ):
-            raise ValueError("retire telegram outcome requires prior message id")
-    if substate == "old_slot_retired":
-        if receipt.get("operation") != "upsert" or not receipt.get(
-            "prior_message_id"
-        ):
-            raise ValueError("old slot retirement requires an upsert prior message")
-
-    if substate != current or any(value is not None for value, _limit in updates.values()):
-        receipt["substate"] = substate
-        receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
-    return receipt
-
-
-def tendwire_turn_job_stale_copies(
-    receipt: dict[str, Any] | None,
-) -> list[dict[str, str]]:
-    """Return the ordered, validated provider-accepted stale copies."""
-
-    values = (receipt or {}).get("stale_applied_copies")
-    if not isinstance(values, list):
-        return []
-    copies: list[dict[str, str]] = []
-    for value in values:
-        if not isinstance(value, dict):
-            continue
-        message_id = str(value.get("message_id") or "")
-        topic_id = str(value.get("topic_id") or "")
-        bot_kind = str(value.get("bot_kind") or "")
-        if not message_id or not topic_id:
-            continue
-        copies.append(
-            {
-                "message_id": message_id,
-                "topic_id": topic_id,
-                "bot_kind": bot_kind,
-            }
-        )
-    return copies
-
-
-def tendwire_turn_job_has_stale_copy_capacity(
-    receipt: dict[str, Any] | None,
-) -> bool:
-    return (
-        len(tendwire_turn_job_stale_copies(receipt))
-        < TENDWIRE_TURN_JOB_STALE_COPY_LIMIT
-    )
-
-
-def reconcile_tendwire_turn_job_route(
-    data: dict[str, Any],
-    job_key: str,
-    *,
-    message_id: str,
-    topic_id: str,
-    bot_kind: str,
-) -> dict[str, Any]:
-    """Checkpoint an accepted stale copy and make the intent retryable.
-
-    The ordered collection is the receipt's single reconciliation authority.
-    Unlike the legacy immutable prior slot it can represent any number of
-    consecutive route changes without losing an accepted provider outcome.
-    """
-
-    receipt = find_tendwire_turn_job(data, job_key)
-    if receipt is None:
-        raise KeyError(job_key)
-    copy = {
-        "message_id": _tendwire_job_outcome_value(
-            message_id, field="message_id", limit=80
-        ),
-        "topic_id": _tendwire_job_outcome_value(
-            topic_id, field="topic_id", limit=80
-        ),
-        "bot_kind": _tendwire_job_outcome_value(
-            bot_kind or "manager", field="bot_kind", limit=40
-        ),
-    }
-    copies = tendwire_turn_job_stale_copies(receipt)
-    if not any(
-        item["message_id"] == copy["message_id"]
-        and item["topic_id"] == copy["topic_id"]
-        and item["bot_kind"] == copy["bot_kind"]
-        for item in copies
-    ):
-        if len(copies) >= TENDWIRE_TURN_JOB_STALE_COPY_LIMIT:
-            raise RuntimeError("tendwire turn job stale-copy ledger is full")
-        copies.append(copy)
-    receipt["stale_applied_copies"] = copies
-    receipt.pop("telegram_message_id", None)
-    receipt.pop("prior_message_id", None)
-    receipt.pop("bot_kind", None)
-    receipt["substate"] = "retryable"
-    receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
-    return receipt
-
-
-def retire_tendwire_turn_job_stale_copy(
-    data: dict[str, Any],
-    job_key: str,
-    *,
-    message_id: str,
-    topic_id: str,
-    bot_kind: str,
-) -> bool:
-    """Remove one exact stale copy after its provider retirement succeeds."""
-
-    receipt = find_tendwire_turn_job(data, job_key)
-    if receipt is None:
-        raise KeyError(job_key)
-    copies = tendwire_turn_job_stale_copies(receipt)
-    for index, item in enumerate(copies):
-        if (
-            item["message_id"] == str(message_id)
-            and item["topic_id"] == str(topic_id)
-            and item["bot_kind"] == str(bot_kind)
-        ):
-            copies.pop(index)
-            if copies:
-                receipt["stale_applied_copies"] = copies
-            else:
-                receipt.pop("stale_applied_copies", None)
-            receipt["checkpoint_sequence"] = (
-                _next_tendwire_turn_job_checkpoint(data)
-            )
-            return True
-    return False
-
-
-def record_tendwire_turn_job_post_ack_reconcile(
-    data: dict[str, Any],
-    job_key: str,
-    obligation: Mapping[str, Any],
-    *,
-    acknowledged: bool = True,
-) -> dict[str, Any]:
-    """Checkpoint locally drainable work after Tendwire already accepted ACK."""
-
-    receipt = find_tendwire_turn_job(data, job_key)
-    if receipt is None:
-        raise KeyError(job_key)
-    clean = deepcopy(dict(obligation))
-    existing = receipt.get("post_ack_reconcile")
-    replace_inflight = (
-        isinstance(existing, dict)
-        and existing.get("status") == "ack_inflight"
-        and clean.get("status") in {"ack_inflight", "reconcile"}
-    )
-    if (
-        isinstance(existing, dict)
-        and existing != clean
-        and not replace_inflight
-    ):
-        raise ValueError("conflicting post-ACK reconciliation obligation")
-    if acknowledged:
-        receipt["substate"] = "acknowledged"
-    if existing != clean:
-        receipt["post_ack_reconcile"] = clean
-        receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
-    return receipt
-
-
-def clear_tendwire_turn_job_post_ack_reconcile(
-    data: dict[str, Any], job_key: str
-) -> bool:
-    receipt = find_tendwire_turn_job(data, job_key)
-    if receipt is None or not isinstance(
-        receipt.get("post_ack_reconcile"), dict
-    ):
-        return False
-    receipt.pop("post_ack_reconcile", None)
-    receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
-    return True
-
-
-def record_tendwire_turn_job_post_ack_error(
-    data: dict[str, Any],
-    job_key: str,
-    *,
-    status: str,
-    error: str,
-) -> dict[str, Any]:
-    """Keep reconciliation diagnostics with the obligation until it heals."""
-
-    receipt = find_tendwire_turn_job(data, job_key)
-    if receipt is None:
-        raise KeyError(job_key)
-    obligation = receipt.get("post_ack_reconcile")
-    if not isinstance(obligation, dict):
-        raise ValueError("turn job has no post-ACK reconciliation obligation")
-    previous = obligation.get("planning_error")
-    attempts = (
-        int(previous.get("attempts") or 0)
-        if isinstance(previous, dict)
-        and isinstance(previous.get("attempts"), int)
-        and not isinstance(previous.get("attempts"), bool)
-        else 0
-    )
-    diagnostic = {
-        "status": compact_ws(status, 80),
-        "error": compact_ws(error, 240),
-        "attempts": attempts + 1,
-    }
-    obligation["planning_error"] = diagnostic
-    receipt["checkpoint_sequence"] = _next_tendwire_turn_job_checkpoint(data)
-    return diagnostic
 
 
 def orphaned_created_topics(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5023,6 +3628,7 @@ def bind_message_to_worker(
     if not message or message == "0":
         return
     bindings = message_bindings(data)
+    existing = bindings.get(message)
     binding = {
         "topic_id": str(topic_id or entry.get("topic_id") or ""),
         "worker_id": str(entry.get("tendwire_worker_id") or entry.get("active_worker_id") or ""),
@@ -5070,6 +3676,26 @@ def bind_message_to_worker(
                 "tendwire_job_key": tendwire_job_key,
             }
         )
+    elif (
+        isinstance(existing, dict)
+        and str(existing.get("kind") or "") == "final"
+        and str(kind or "") == "final"
+        and str(existing.get("turn_id") or "") == str(turn_id or "")
+    ):
+        # A modern Tendwire final binding is the durable receipt that joins an
+        # acknowledged provider write back to its exact plan slot. Legacy
+        # reconciliation may rediscover the same Telegram card without plan
+        # metadata; that weaker observation must not downgrade the binding.
+        for field in (
+            "content_revision",
+            "plan_token",
+            "part_ordinal",
+            "part_count",
+            "tendwire_job_key",
+            "delivery_format",
+        ):
+            if field in existing:
+                binding[field] = existing[field]
     identity = entry_stable_identity(entry)
     if identity is not None:
         binding["stable_key"] = identity[0]
@@ -5078,6 +3704,14 @@ def bind_message_to_worker(
     if pane_uuid:
         binding["pane_uuid"] = pane_uuid
         binding["pane_uuid_version"] = PANE_UUID_VERSION
+    # H8-SLOC-BEGIN state-binding-route-generation
+    route_generation = entry.get("route_generation")
+    if (
+        isinstance(route_generation, str)
+        and _ROUTE_GENERATION_RE.fullmatch(route_generation) is not None
+    ):
+        binding["route_generation"] = route_generation
+    # H8-SLOC-END state-binding-route-generation
     if entry_is_quarantined(entry):
         binding["routing_quarantined"] = True
     bindings[message] = binding
@@ -5096,3 +3730,329 @@ def find_message_binding(data: dict[str, Any], message_id: str | int | None, *, 
     if topic_id and str(binding.get("topic_id") or "") and str(binding.get("topic_id")) != str(topic_id):
         return None
     return binding
+
+
+# H8-SLOC-BEGIN state-routing
+def _entry_route(
+    entry: Mapping[str, Any],
+) -> tuple[str, str | None, StableOwner | None, str, str]:
+    from .managed_bots import managed_bot_kind_for_entry
+
+    identity = entry_stable_identity(dict(entry))
+    generation = entry.get("route_generation")
+    if generation is not None and (
+        not isinstance(generation, str) or not _ROUTE_GENERATION_RE.fullmatch(generation)
+    ):
+        identity = None
+    owner = StableOwner(*identity, generation) if identity else None
+    worker_id = str(entry.get("tendwire_worker_id") or entry.get("active_worker_id") or entry.get("worker_id") or "")
+    fingerprint = str(entry.get("tendwire_fingerprint") or entry.get("active_worker_fingerprint") or "") or None
+    space_id = str(entry.get("tendwire_space_id") or entry.get("space_id") or "")
+    return worker_id, fingerprint, owner, space_id, managed_bot_kind_for_entry(dict(entry)) or "manager"
+
+
+def _route_result(
+    query: IngressRouteQuery | IngressReplyQuery, token: StateToken,
+    status: RouteStatus, reason: str, *, entry: Mapping[str, Any] | None = None,
+    binding: bool = False,
+) -> IngressRouteResult:
+    fields = _entry_route(entry or {}) if entry else ("", None, None, "", "")
+    return IngressRouteResult(status, token, query.chat_id, query.topic_id, *fields,
+                              getattr(query, "reply_message_id", None) if binding else None,
+                              binding, reason)
+
+
+def _route_matches(
+    data: dict[str, Any], query: IngressRouteQuery, *, space_id: str = "",
+    inactive: bool = False,
+) -> list[tuple[str, dict[str, Any]]]:
+    alias, kind = _alias_token(query.explicit_alias), str(query.explicit_bot_kind or "").strip().lower()
+    matches: list[tuple[str, dict[str, Any]]] = []
+    for key, entry in source_worker_entries(data).items():
+        blocked = entry_is_quarantined(entry) or entry_is_retired(entry)
+        if inactive != blocked or (inactive and _entry_route(entry)[2] is None):
+            continue
+        if not inactive and not worker_entry_is_uniquely_routable(data, key, entry):
+            continue
+        if query.topic_id not in worker_entry_allowed_topic_ids(data, entry) or (space_id and _entry_route(entry)[3] != space_id):
+            continue
+        aliases = {_alias_token(value) for value in (entry.get("worker_name"), entry.get("agent"), entry.get("topic_name"), entry.get("tendwire_worker_id"), entry.get("worker_id")) if value}
+        if (alias and alias not in aliases) or (not alias and kind and _entry_route(entry)[4] != kind):
+            continue
+        matches.append((key, entry))
+    return matches
+
+
+def _bound_entry(
+    data: dict[str, Any], binding: Mapping[str, Any]
+) -> tuple[str | None, dict[str, Any] | None]:
+    rows = source_worker_entries(data)
+    source = message_binding_source_identity(dict(binding))
+    stable = message_binding_stable_identity(dict(binding))
+    pane_uuid = message_binding_pane_uuid(dict(binding))
+    if source:
+        keys = _all_worker_entry_keys_by_stable_key(data, source[0])
+    elif "tendwire_stable_key" in binding or "tendwire_stable_key_version" in binding:
+        keys = []
+    elif pane_uuid:
+        keys = [key for key, row in rows.items() if entry_pane_uuid(row) == pane_uuid]
+    elif "pane_uuid" in binding or "pane_uuid_version" in binding:
+        keys = []
+    elif stable:
+        keys = _all_worker_entry_keys_by_stable_key(data, stable[0])
+    elif "stable_key" in binding or "stable_key_version" in binding:
+        keys = []
+    else:
+        keys = _all_worker_entry_keys_by_worker(data, str(binding.get("worker_id") or ""))
+    return (keys[0], rows.get(keys[0])) if len(keys) == 1 else (None, None)
+
+
+def _binding_evidence_matches(
+    data: dict[str, Any], binding: Mapping[str, Any], entry: Mapping[str, Any]
+) -> bool:
+    worker_id, fingerprint, owner, space_id, _kind = _entry_route(entry)
+    bound_generation = binding.get("route_generation")
+    return bool(
+        str(binding.get("topic_id") or "") in worker_entry_allowed_topic_ids(data, dict(entry))
+        and (not binding.get("worker_id") or str(binding.get("worker_id")) == worker_id)
+        and (not binding.get("worker_fingerprint") or str(binding.get("worker_fingerprint")) == fingerprint)
+        and (not binding.get("space_id") or str(binding.get("space_id")) == space_id)
+        and ("route_generation" not in binding or isinstance(bound_generation, str)
+             and _ROUTE_GENERATION_RE.fullmatch(bound_generation) is not None
+             and owner is not None and owner.route_generation == bound_generation)
+    )
+
+
+def read_ingress_policy(state_path: Path) -> IngressPolicy:
+    from .managed_bots import normalize_username
+
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_ingress_policy"):
+        data, token = _load_schema2_locked(state_file)
+    telegram = data.get("telegram") if isinstance(data.get("telegram"), dict) else {}
+    owners = telegram.get("owner_user_ids", [])
+    owners = owners if isinstance(owners, list) else []
+    managed = telegram.get("managed_bots")
+    usernames = [
+        (normalize_username(raw.get("username")), str(kind).strip().lower())
+        for kind, raw in (managed.items() if isinstance(managed, dict) else ())
+        if isinstance(raw, dict) and raw.get("enabled") is not False
+        and normalize_username(raw.get("username"))
+    ]
+    return IngressPolicy(
+        chat_id=config.telegram_chat_id(data),
+        general_topic_id=config.general_thread_id(data),
+        owner_user_ids=frozenset(str(value) for value in owners),
+        managed_usernames=tuple(sorted(set(usernames))),
+        state_token=token,
+    )
+
+
+def read_ingress_receivers(state_path: Path) -> tuple[IngressReceiver, ...]:
+    from .managed_bots import MANAGED_BOT_KINDS
+
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_ingress_receivers"):
+        data, _token = _load_schema2_locked(state_file)
+    telegram = data.get("telegram") if isinstance(data.get("telegram"), dict) else {}
+    managed = telegram.get("managed_bots")
+    managed = managed if isinstance(managed, dict) else {}
+    receivers: list[IngressReceiver] = []
+    for kind in ("manager", *sorted(MANAGED_BOT_KINDS)):
+        raw = telegram if kind == "manager" else managed.get(kind, {})
+        if not isinstance(raw, dict) or raw.get("enabled") is False:
+            continue
+        token = (config.telegram_token() if kind == "manager" else
+                 config.managed_bot_token(kind) or str(raw.get("token") or "").strip())
+        if not token:
+            continue
+        username = raw.get("username") or (raw.get("bot_username") if kind == "manager" else "")
+        receivers.append(
+            IngressReceiver("manager" if kind == "manager" else f"managed-{kind}",
+                            kind, str(username or "").strip().lstrip("@").lower(),
+                            SecretStr(token))
+        )
+    return tuple(receivers)
+
+
+def _resolve_ingress_route_locked(
+    data: dict[str, Any], token: StateToken, query: IngressRouteQuery
+) -> IngressRouteResult:
+    if query.state_token != token:
+        return _route_result(query, token, RouteStatus.STALE, "stale_state")
+    if query.chat_id != config.telegram_chat_id(data):
+        return _route_result(query, token, RouteStatus.MISSING, "chat_mismatch")
+    matches = _route_matches(data, query)
+    if len(matches) == 1:
+        reason = "explicit_alias" if query.explicit_alias else "explicit_bot_kind" if query.explicit_bot_kind else "topic_route"
+        return _route_result(query, token, RouteStatus.RESOLVED, reason, entry=matches[0][1])
+    if len(matches) > 1:
+        return _route_result(query, token, RouteStatus.AMBIGUOUS, "route_ambiguous")
+    inactive = _route_matches(data, query, inactive=True)
+    if len(inactive) == 1:
+        entry = inactive[0][1]
+        status = RouteStatus.QUARANTINED if entry_is_quarantined(entry) else RouteStatus.RETIRED
+        return _route_result(query, token, status, "route_" + status.value, entry=entry)
+    status = RouteStatus.AMBIGUOUS if inactive else RouteStatus.MISSING
+    return _route_result(query, token, status, "route_ambiguous" if inactive else "route_missing")
+
+
+def resolve_ingress_route(
+    state_path: Path, query: IngressRouteQuery
+) -> IngressRouteResult:
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_ingress_route"):
+        data, token = _load_schema2_locked(state_file)
+        return _resolve_ingress_route_locked(data, token, query)
+
+
+def resolve_ingress_reply(
+    state_path: Path, query: IngressReplyQuery
+) -> IngressRouteResult:
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_ingress_reply"):
+        data, token = _load_schema2_locked(state_file)
+        if query.state_token != token:
+            return _route_result(query, token, RouteStatus.STALE, "stale_state")
+        if query.chat_id != config.telegram_chat_id(data):
+            return _route_result(query, token, RouteStatus.MISSING, "chat_mismatch")
+        if query.explicit_alias:
+            route = IngressRouteQuery(query.chat_id, query.topic_id, "", query.explicit_alias, "", token)
+            return _resolve_ingress_route_locked(data, token, route)
+        binding_id = str(query.reply_message_id or "").strip()
+        bindings = message_bindings(data)
+        binding_was_present = bool(binding_id) and binding_id in bindings
+        binding = find_message_binding(data, query.reply_message_id, topic_id=query.topic_id)
+        if binding_was_present and binding is None:
+            return _route_result(query, token, RouteStatus.BINDING_AMBIGUOUS, "binding_topic_mismatch_or_malformed", binding=True)
+        if binding is not None:
+            if "routing_quarantined" in binding:
+                return _route_result(query, token, RouteStatus.BINDING_AMBIGUOUS, "reply_binding_quarantined", binding=True)
+            key, entry = _bound_entry(data, binding)
+            if entry is not None and not _binding_evidence_matches(data, binding, entry):
+                return _route_result(query, token, RouteStatus.BINDING_AMBIGUOUS, "reply_binding_evidence_mismatch", binding=True)
+            observed = str(query.observed_author_bot_kind or "").strip().lower()
+            binding_kind = str(binding.get("bot_kind") or "").strip().lower()
+            resolved_kind = _entry_route(entry)[4] if entry is not None else binding_kind
+            if observed and resolved_kind != observed:
+                author_query = IngressRouteQuery(query.chat_id, query.topic_id, "", "", observed, token)
+                author_matches = _route_matches(data, author_query, space_id=_entry_route(entry)[3] if entry else str(binding.get("space_id") or ""))
+                if len(author_matches) != 1:
+                    return _route_result(query, token, RouteStatus.AUTHOR_AMBIGUOUS, "ambiguous_reply_author_target", binding=True)
+                key, entry = author_matches[0]
+            if entry is not None and key is not None and worker_entry_is_uniquely_routable(data, key, entry):
+                return _route_result(query, token, RouteStatus.RESOLVED, "reply_binding", entry=entry, binding=True)
+            if entry is not None and (entry_is_quarantined(entry) or entry_is_retired(entry)):
+                status = RouteStatus.QUARANTINED if entry_is_quarantined(entry) else RouteStatus.RETIRED
+                return _route_result(query, token, status, "reply_binding_" + status.value, entry=entry, binding=True)
+            return _route_result(query, token, RouteStatus.BINDING_AMBIGUOUS, "ambiguous_reply_target", binding=True)
+        route = IngressRouteQuery(query.chat_id, query.topic_id, "", query.explicit_alias,
+                                  query.observed_author_bot_kind or query.explicit_bot_kind, token)
+        return _resolve_ingress_route_locked(data, token, route)
+# H8-SLOC-END state-routing
+
+
+# H8-SLOC-BEGIN state-decisions
+def _decision_result(
+    status: DecisionStatus, token: StateToken, chat_id: str, topic_id: str,
+    projected: Mapping[str, Any] | None = None, owner: StableOwner | None = None,
+) -> DecisionIngressResult:
+    row = projected or {}
+    options = tuple(DecisionOption(*pair) for pair in row.get("options", ()))
+    return DecisionIngressResult(
+        status, token, str(row.get("decision_ref") or ""), str(row.get("revision") or ""),
+        str(row.get("mode") or ""), str(row.get("worker_id") or ""), owner,
+        str(row.get("binding_id") or ""), chat_id, topic_id, str(row.get("message_id") or ""),
+        tuple(row.get("refs", ())), options, tuple(row.get("selected", ())),
+        row.get("await_freeform") is True, str(row.get("render_fingerprint") or ""),
+        PhysicalOwner(str(row.get("bot_identity") or "manager"), chat_id or "unknown", topic_id or "unknown"),
+    )
+
+
+def read_decision_ingress(
+    state_path: Path, query: DecisionIngressQuery
+) -> DecisionIngressResult:
+    from . import decisions
+
+    if query.callback_ref is not None and (not isinstance(query.callback_ref, str) or not query.callback_ref):
+        raise ValueError("decision callback ref must be nonempty or null")
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_decision_read"):
+        data, token = _load_schema2_locked(state_file)
+        status = DecisionStatus.STALE if query.state_token != token else DecisionStatus.MISSING
+        if status is DecisionStatus.STALE or query.chat_id != config.telegram_chat_id(data):
+            return _decision_result(status, token, query.chat_id, query.topic_id)
+        record = decisions.active_decision(data, query.topic_id)
+        if record is None:
+            return _decision_result(DecisionStatus.MISSING, token, query.chat_id, query.topic_id)
+        decision_ref = str(record.get("decision_id") or record.get("decision_ref") or "")
+        if query.callback_ref is not None and not hmac.compare_digest(decisions._ref56(decision_ref), query.callback_ref):
+            return _decision_result(DecisionStatus.EXPIRED, token, query.chat_id, query.topic_id)
+        projected = decisions._project_ingress_record(record)
+        if projected is None:
+            return _decision_result(DecisionStatus.QUARANTINED, token, query.chat_id, query.topic_id)
+        _key, entry = find_worker_entry_by_id(data, projected["worker_id"])
+        owner = _entry_route(entry or {})[2]
+        status = (DecisionStatus.ACTIVE if entry is not None and owner is not None
+                  and not entry_is_quarantined(entry) else DecisionStatus.QUARANTINED)
+        return _decision_result(status, token, query.chat_id, query.topic_id, projected, owner)
+
+
+def _mutation_result(
+    status: DecisionMutationStatus, token: StateToken,
+    projected: Mapping[str, Any] | None = None,
+) -> DecisionMutationResult:
+    row = projected or {}
+    return DecisionMutationResult(
+        status=status, state_token=token, decision_ref=str(row.get("decision_ref") or ""),
+        selected_refs=tuple(row.get("selected", ())), await_freeform=row.get("await_freeform") is True,
+        message_binding_id=str(row.get("binding_id") or ""), message_id=str(row.get("message_id") or ""),
+        desired_markup_fingerprint=str(row.get("desired_markup_fingerprint") or ""),
+    )
+
+
+def apply_decision_ingress(
+    state_path: Path, mutation: DecisionMutation
+) -> DecisionMutationResult:
+    from . import decisions
+    from .ingress_identity import validate_request_id
+
+    if not isinstance(mutation, DecisionMutation):
+        raise TypeError("decision mutation must be DecisionMutation")
+    validate_request_id(mutation.request_id)
+    if not isinstance(mutation.kind, DecisionMutationKind):
+        raise ValueError("invalid decision mutation kind")
+    _bounded_text(mutation.decision_ref, field="decision ref")
+    _bounded_text(mutation.revision_digest, field="decision revision")
+    if mutation.option_ref is not None:
+        _bounded_text(mutation.option_ref, field="decision option ref")
+    if len(mutation.desired_selected_refs) > 64:
+        raise ValueError("too many desired decision selections")
+    for desired_ref in mutation.desired_selected_refs:
+        _bounded_text(desired_ref, field="desired decision option ref")
+    if mutation.desired_markup_fingerprint:
+        _bounded_text(
+            mutation.desired_markup_fingerprint,
+            field="desired markup fingerprint",
+        )
+    state_file = Path(state_path)
+    with state_lock(state_file, phase="typed_decision_mutation"):
+        data, token = _load_schema2_locked(state_file)
+        if mutation.expected_state_token != token:
+            return _mutation_result(DecisionMutationStatus.STALE, token)
+        matches = [
+            record
+            for record in decisions._active_records(data, create=False).values()
+            if str(record.get("decision_id") or record.get("decision_ref") or "")
+            == mutation.decision_ref
+        ]
+        if len(matches) != 1:
+            status = DecisionMutationStatus.EXPIRED if not matches else DecisionMutationStatus.CONFLICT
+            return _mutation_result(status, token)
+        record = matches[0]
+        status = decisions._reduce_ingress_mutation(record, mutation)
+        if status is DecisionMutationStatus.APPLIED:
+            save_state(data, state_file)
+            token = _state_token(data, state_file)
+        return _mutation_result(status, token, decisions._project_ingress_record(record))
+# H8-SLOC-END state-decisions
