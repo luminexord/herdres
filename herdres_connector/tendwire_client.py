@@ -83,11 +83,6 @@ _PUBLIC_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
 )
 _OPAQUE_CHARS = _PUBLIC_CHARS - {"."}
-_FORBIDDEN_RECOVERY_TEXT = (
-    "telegram", "herdr", "herdres", "backend_target", "pane_id", "session_id",
-    "terminal_id", "chat_id", "topic_id", "message_id", "bot_token", "shell",
-    "argv", "connector", "delivery",
-)
 _NOT_STARTED = object()
 _AMBIGUOUS = object()
 
@@ -135,19 +130,6 @@ def _opaque(value: Any, prefix: str, *, limit: int = 264) -> bool:
     suffix = value[len(prefix) :]
     return bool(suffix) and len(value) <= limit and all(
         char in _OPAQUE_CHARS for char in suffix
-    )
-
-
-def valid_recovery_request_id(value: Any) -> bool:
-    if not isinstance(value, str) or not 1 <= len(value) <= 128:
-        return False
-    if any(char not in _PUBLIC_CHARS for char in value):
-        return False
-    lowered = value.lower()
-    compact = "".join(char for char in lowered if char.isalnum())
-    return not any(
-        token in lowered or token.replace("_", "") in compact
-        for token in _FORBIDDEN_RECOVERY_TEXT
     )
 
 
@@ -847,8 +829,6 @@ class TendwireClient:
     @staticmethod
     def _valid_prepare_result(params: dict[str, Any], result: dict[str, Any]) -> bool:
         action = params.get("action")
-        if action == "recover":
-            return TendwireClient._valid_recovery_result(params, result)
         valid_plan = bool(
             result.get("status") == "ok"
             and _text(result.get("host_id"))
@@ -878,31 +858,6 @@ class TendwireClient:
             or (
                 type(result.get("accepted_parts")) is int
                 and result["accepted_parts"] >= 0
-            )
-        )
-
-    @staticmethod
-    def _valid_recovery_result(
-        params: dict[str, Any],
-        result: dict[str, Any],
-    ) -> bool:
-        integers = (
-            "generation",
-            "acknowledged_prefix_count",
-            "executable_job_count",
-            "retained_failed_job_count",
-            "prior_attempt_count",
-        )
-        return all(
-            (
-                result.get("status") == "recovered",
-                result.get("failed_plan_token") == params.get("failed_plan_token"),
-                _opaque(result.get("failed_plan_token"), "twplan1."),
-                _opaque(result.get("plan_token"), "twplan1."),
-                _opaque(result.get("content_revision"), "twrev1."),
-                _text(result.get("state")),
-                all(type(result.get(key)) is int for key in integers),
-                type(result.get("idempotent_replay")) is bool,
             )
         )
 
@@ -1015,24 +970,6 @@ class TendwireClient:
         if source_ref is not None:
             params["source_ref"] = str(source_ref)
         return self._prepare_action("commit", **params)
-
-    def connector_prepare_recover(
-        self, *, failed_plan_token: str, request_id: str
-    ) -> dict[str, Any]:
-        if not _opaque(failed_plan_token, "twplan1."):
-            return self._invalid_recovery_request()
-        if not valid_recovery_request_id(request_id):
-            return self._invalid_recovery_request()
-        return self._prepare_action(
-            "recover", failed_plan_token=failed_plan_token, request_id=request_id
-        )
-
-    @staticmethod
-    def _invalid_recovery_request() -> dict[str, Any]:
-        return _error(
-            "invalid_recovery_request",
-            "recovery coordinates must be public-safe opaque values",
-        )
 
     def turn_final_poll(
         self, *, limit: int = 1, lease_seconds: int = 60

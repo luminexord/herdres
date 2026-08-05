@@ -70,7 +70,7 @@ Only five daemon verbs are in the current Herdres connector path:
 
 | Herdres helper | Daemon RPC | Queue |
 |---|---|---|
-| `connector_prepare_begin/part/commit/recover` | `connector.prepare` | `turn-final` |
+| `connector_prepare_begin/part/commit` | `connector.prepare` | `turn-final` |
 | `connector_poll` | `connector.poll` | `attention` by default |
 | `connector_ack` | `connector.ack` | `attention` by default |
 | `connector_fail` | `connector.fail` | `attention` by default |
@@ -150,21 +150,8 @@ Commit:
 }
 ```
 
-`source_ref` is optional. Recover:
-
-```json
-{
-  "schema_version": 1,
-  "action": "recover",
-  "name": "turn-final",
-  "failed_plan_token": "twplan1....",
-  "request_id": "public-safe-id"
-}
-```
-
-The Herdres client requires a `twplan1.` token with a non-empty ASCII
-alphanumeric/`_`/`-` body and a 1-128 character public-safe request id using
-ASCII alphanumerics plus `.`, `_`, or `-`.
+`source_ref` is optional. Failed-plan recovery is owned by Tendwire and is not
+exposed by the Herdres client.
 
 ### `connector.poll`
 
@@ -249,7 +236,6 @@ Successful action-specific fields currently consumed or preserved are:
 | `begin` | `plan_token`, `state`, `part_count`, `accepted_parts`, optionally `generation` |
 | `part` | `plan_token`, `ordinal`, `accepted_parts` |
 | `commit` | `plan_token`, `state`, `job_count`, optionally `generation` |
-| `recover` | `failed_plan_token`, `plan_token`, `generation`, `content_revision`, `state`, `acknowledged_prefix_count`, `executable_job_count`, `retained_failed_job_count`, `prior_attempt_count`, `idempotent_replay` |
 
 A poll result is:
 

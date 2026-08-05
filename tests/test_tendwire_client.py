@@ -561,41 +561,10 @@ def test_ack_response_loss_is_not_retried_and_repoll_observes_authoritative_stat
     assert [call["method"] for call in calls] == ["connector.poll", "connector.ack", "connector.poll"]
 
 
-def test_prepare_rejects_invalid_ranges_and_recovery_coordinates_without_rpc(tmp_path: Path) -> None:
+def test_prepare_rejects_invalid_ranges_without_rpc(tmp_path: Path) -> None:
     client = TendwireClient(socket_path=tmp_path / "never.sock")
     assert client.connector_prepare_part(plan_token="twplan1.public", ordinal=0, spans=[])["status"] == "invalid_prepare_part"
     assert client.connector_prepare_part(plan_token="twplan1.public", ordinal=0, spans=[{"field": "assistant_final_text", "start_char": 2, "end_char": 1}])["status"] == "invalid_prepare_part"
-    assert client.connector_prepare_recover(failed_plan_token="bad", request_id="ok")["status"] == "invalid_recovery_request"
-    assert client.connector_prepare_recover(failed_plan_token="twplan1.public", request_id="bad:id")["status"] == "invalid_recovery_request"
-    for reserved in ("telegram.request", "HERDRESrequest", "chat-id", "delivery_1"):
-        assert client.connector_prepare_recover(
-            failed_plan_token="twplan1.public", request_id=reserved
-        )["status"] == "invalid_recovery_request"
-
-
-def test_prepare_accepts_public_safe_recovery_request_id(tmp_path: Path) -> None:
-    response = {
-        "schema_version": 1,
-        "ok": True,
-        "status": "recovered",
-        "failed_plan_token": "twplan1.failed",
-        "plan_token": "twplan1.recovered",
-        "generation": 2,
-        "content_revision": "twrev1.public",
-        "state": "active",
-        "acknowledged_prefix_count": 0,
-        "executable_job_count": 1,
-        "retained_failed_job_count": 1,
-        "prior_attempt_count": 1,
-        "idempotent_replay": False,
-    }
-    with _daemon(tmp_path, [_return(response)]) as (client, calls):
-        result = client.connector_prepare_recover(
-            failed_plan_token="twplan1.failed",
-            request_id="recover.request-42_ok",
-        )
-    assert result["status"] == "recovered"
-    assert calls[0]["params"]["request_id"] == "recover.request-42_ok"
 
 
 @pytest.mark.parametrize(

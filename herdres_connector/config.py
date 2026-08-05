@@ -155,22 +155,6 @@ def tendwire_turn_final_lease_seconds(env: Any | None = None) -> int:
     return min(3600, max(60, value))
 
 
-def partial_final_escalation_seconds(env: Any | None = None) -> int:
-    """Bound before escalation and explicit newer-revision supersession."""
-
-    source = os.environ if env is None else env
-    raw = source.get(
-        "HERDRES_PARTIAL_FINAL_ESCALATION_SECONDS", "300"
-    )
-    if raw is None or not str(raw).strip():
-        raw = "300"
-    try:
-        value = int(str(raw))
-    except (TypeError, ValueError):
-        return 300
-    return min(3600, max(30, value))
-
-
 def unbound_final_notice_cooldown_seconds(
     env: Any | None = None,
 ) -> int:

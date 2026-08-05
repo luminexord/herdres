@@ -151,27 +151,6 @@ def test_real_socket_poll_binding_ack_and_ack_response_loss(tmp_path: Path) -> N
         assert status == "delivered"
         assert client.connector_poll(limit=1)["items"] == []
 
-        invalid_ids = ("recover:invalid", "telegram.request", "HERDRESrequest")
-        invalid = []
-        for request_id in invalid_ids:
-            invalid.append(
-                connector.prepare(
-                    {
-                        "schema_version": 1,
-                        "action": "recover",
-                        "name": "turn-final",
-                        "failed_plan_token": "twplan1.missing",
-                        "request_id": request_id,
-                    }
-                )
-            )
-        valid = client.connector_prepare_recover(
-            failed_plan_token="twplan1.missing",
-            request_id="recover.request-42_ok",
-        )
-        assert {result["status"] for result in invalid} == {"invalid_params"}
-        assert valid["status"] != "invalid_params"
-        assert valid["status"] != "invalid_connector_response"
     finally:
         stop.set()
         server.close()

@@ -184,8 +184,8 @@ The paired gate must establish all of the following:
 - Tendwire's SQLite store is schema version `14` and provides turn-list-v2
   observational projections, immutable content pages, durable retained
   `final_ready` roots, range-only turn-final plans, restart-stable ordered jobs,
-  leases/ACK/dead-letter state, and explicit replacement-generation records
-  expected by this Herdres consumer. Do not qualify either side in isolation.
+  outbox recovery, and leases/ACK/dead-letter state expected by this Herdres
+  consumer. Do not qualify either side in isolation.
 - Production Herdres requests and accepts only exact integer `2` in the
   top-level Tendwire turn-list response. A v1 producer returns
   `upgrade_required`; a missing or unsupported content schema returns
@@ -211,39 +211,38 @@ The paired gate must establish all of the following:
   `schema_version: 2` and carries the exact public opaque
   `stable_key`/integer-`1` `stable_key_version` pair, binding retained work to
   the accepted worker continuity identity. A schema-v1 root never routes by
-  reusable worker or space IDs alone, and no private checkpoint or Telegram
-  state crosses in the root. A schema-v2 turn-list final remains observational
-  only and never by itself marks the final delivered.
-- Herdres leases the root and materializes exact content before deriving
-  ordered multipart ranges. Prepare begin/part/commit sends only neutral
-  field/start/end spans, never turn text. Begin and commit bind the leased
-  `source_ref`; part requests carry only the plan token, ordinal, and ranges.
-  Every leased span must match the local plan.
+  reusable worker or space IDs alone, and no exact Telegram binding, delivered
+  identity, or provider state crosses in the root. A schema-v2 turn-list final
+  remains observational only and never by itself marks the final delivered.
+- Herdres leases the root, materializes exact content, and submits neutral
+  ordered spans. Tendwire owns durable roots, plans, ordered jobs, leases,
+  retries, and dead-letter state.
+- Before Telegram mutation, Herdres checks for one exact message binding by job
+  key, turn, revision, plan, ordinal, and part count. A match is ACK replay
+  evidence and causes zero Telegram writes.
+- After a successful Telegram mutation, Herdres fsyncs that exact message
+  binding. When every part is bound, it fsyncs the ordered message ids and
+  delivered identity and clears pending presentation fields before issuing the
+  Tendwire ACK. Tendwire alone owns job/outbox recovery; restart re-polls it and
+  the exact Telegram binding prevents a duplicate provider mutation.
+- Working-to-final edits, multipart ordering, supersession, retirement,
+  managed-bot ownership, folds, and reply routing remain binding-driven.
+  Missing retire targets are idempotent; route changes quarantine and retire
+  accepted stale-route messages before retry.
 - Rich plans retain Telegram's 32,768-character and 500-block limits for
-  complete single-card messages. Multipart plans default to 24,000-character
-  source chunks and a 28 KiB rendered UTF-8 ceiling, avoiding fragile
-  boundary-sized cards without returning to the obsolete small-span behavior.
-  Plain-message fallback keeps an independent 4,096-safe plan. Successful topic
-  creation is checkpointed immediately so a later sync failure cannot create a
-  duplicate.
-- `HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` defaults or falls back to 60 when
-  unset, empty, or invalid, and clamps configured values to 60 through 3600
-  seconds. This bounds recovery after an ambiguous connector poll response;
-  durable checkpoints preserve restart-safe plan and provider progress.
-- Stable job-key receipts progress strictly through reservation, Telegram
-  apply, optional old-slot retirement, Tendwire ACK, and `acknowledged`, with a
-  durable private checkpoint after every provider-side transition and after
-  ACK. The stable job key, not a transient lease ref, is restart identity.
-- An ordinary restart resumes proven work under a fresh ref without repeating
-  Telegram work and reconciles a committed pending plan after lost final-ACK
-  response or completed-plan observation, even without a turn-list row. Only a
-  Tendwire-confirmed `superseded` or `plan_not_found` pending plan clears before
-  a newer root; other unresolved states continue to block it.
-- Tendwire owns final-ready/dead-letter retention and the bounded, public-safe
-  connector inspect plus identity-specific retry surfaces. Herdres owns
-  Telegram formatting, private provider state, and local checkpoints. Retry
-  can return `not_retryable` or `stale_revision` and does not remove provider
-  acceptance ambiguity.
+  complete single-card messages. Multipart source chunks use a 28 KiB rendered
+  UTF-8 ceiling, and formatted-plain fallback keeps an independent 4,096-safe
+  plan.
+- `HERDRES_TENDWIRE_TURN_FINAL_LEASE_SECONDS` defaults or falls back to 60
+  seconds and clamps to 60 through 3600. Lease refs are transient; replay
+  identity is the Tendwire job key plus the exact Herdres message binding.
+- Topic creation checkpoints a compact accepted-create receipt immediately,
+  then absorbs it into the resolved topic binding. Restart adopts or retires
+  that accepted topic instead of creating a duplicate.
+- Tendwire owns final-ready/dead-letter inspection and identity-specific retry.
+  Herdres owns Telegram formatting, private message bindings, delivered
+  identities, and topic lifecycle state.
+
 - Public absent, legacy-24, malformed, partial, and explicitly invalid
   identities are not private adoption candidates. The only private exception
   is one persisted exact-shaped v1 handle whose version field is absent.
@@ -252,7 +251,7 @@ The paired gate must establish all of the following:
   nonquarantined persisted candidate, sole live topic ownership, no exact-v1
   owner, and no conflicting binding ownership. It never falls back to worker
   ID.
-- A safe adoption preserves topic/message/private state and delivery ledgers
+- A safe adoption preserves topic/message/private state and delivered identities
   and retargets only compatible owned bindings. No current claimant waits
   without mutation; ambiguity or incompatibility blocks adoption and
   quarantines affected claimants and related unsafe bindings while leaving
@@ -266,12 +265,11 @@ The paired gate must establish all of the following:
   repeated faulty snapshots create no duplicate state entries or topics.
 - Reply binding resolution additionally requires the resolved worker to own the
   binding topic directly or through its matching Tendwire source-space topic.
-- Goal 01B recovery still flows through Tendwire's existing `turn.list`
-  refresh and durable public source projection; Herdres never refreshes Herdr
-  itself.
+- Recovery flows through Tendwire's durable public projection and outbox;
+  Herdres never maintains a local job ledger or refreshes Herdr itself.
 - For a matching editable Working card, the authoritative completed revision
   uses the same ordered plan and produces one Working-to-final edit; repeated
-  identical source syncs make paging, prepare, edit/send, and ledger no-ops.
+  identical source syncs make paging, prepare, edit/send, and binding no-ops.
 - An exception after possible Telegram acceptance or an omitted message receipt
   is `delivery_uncertain`. It is failed closed, not automatically replayed, and
   these checks do not establish perfect provider exactly-once behavior.
@@ -280,54 +278,6 @@ The paired gate must establish all of the following:
   never imports or invokes a direct Herdr client, and never opens a direct
   Herdr process/socket path. The separate Herdres ingress request-ID key stays
   private to Herdres. The smoke result reports `direct_herdr_calls=0`.
-
-### Failed-plan operator evidence
-
-An `attempts_exhausted` plan must remain idle on ordinary sync until an operator
-issues an explicit command for that failed generation:
-
-```sh
-herdres tendwire recover-turn-final \
-  --plan-token twplan1.<failed-plan> \
-  --request-id operator-2026.07.11-1
-```
-
-The request ID is 1–128 ASCII `[A-Za-z0-9._-]` characters, excludes reserved
-public-boundary vocabulary, and is both the idempotency key and audit key.
-Local preflight must stop before RPC with:
-
-- `invalid_recovery_request` for a malformed/bounded-coordinate failure;
-- `recovery_request_conflict` when the request ID is bound elsewhere;
-- `recovery_plan_not_found` when the token is not the unique pending plan,
-  including a plan that is no longer pending or is already complete;
-- `recovery_route_ambiguous` for a quarantined or nonunique route;
-- `recovery_state_invalid` for invalid coordinates, unknown substates, or a
-  noncontiguous acknowledged prefix;
-- `recovery_receipt_uncertain` for a reserved/unproven operation or binding
-  without an acknowledged receipt;
-- `recovery_receipt_inflight` for `telegram_applied` or `old_slot_retired`
-  provider outcomes still awaiting durable ACK; and
-- `recovery_capacity_exceeded` when both immutable generations will not fit or
-  every bounded audit slot is protected by a pending replacement plan.
-
-Typed Tendwire failures pass through. A malformed/mismatched response or any
-state change across the RPC is `recovery_state_uncertain`. Success must return a
-different token and exact next generation for the same revision, with exact
-prefix and executable counts. A failed replacement must have one uniquely
-matching inherited recovery audit and request binding for the preceding
-generation. Herdres adds that audit's retained-failure count to the current
-failed tail and binds the inherited identity and cumulative count into
-preflight revalidation. Audits needed by pending replacements are protected
-from bounded-detail eviction; an all-protected audit table fails before RPC
-rather than stranding a later generation. The old receipt values remain
-unchanged. Herdres clones the contiguous acknowledged prefix, retargets only
-its bindings,
-records the request-keyed audit, validates the suffix's predecessor against the
-old ACK-prefix barrier, and executes only the suffix. Output records both
-tokens, generation, prefix/executable/retained/prior-attempt counts, state, and
-`idempotent_replay`. Repeating the same request returns the same audited token
-with `idempotent_replay=true`; each generation requires one explicit request
-and there is no automatic recovery loop.
 
 Do not treat exact identity format as cryptographic proof: a correctly shaped
 spoof in altered public input is outside Herdres's ability to authenticate. Do

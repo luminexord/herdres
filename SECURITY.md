@@ -3,25 +3,26 @@
 The tendwired branch keeps direct Herdr access out of Herdres.
 
 Herdres private state may contain Telegram chat/topic/message IDs, bot tokens
-and routing/ownership, ingress command request records, final message bindings,
-and stable-job checkpoints and receipts. Retain that state across restart and
-never publish it. Public JSON from Herdres commands is pruned so it does not
+and routing/ownership, ingress command request records, exact Telegram message
+bindings, delivered identities used for deduplication, and compact
+accepted-topic receipts. Retain that state across restart and never publish it.
+Public JSON from Herdres commands is pruned so it does not
 expose tokens, socket paths, raw backend targets, command stdout/stderr,
-Telegram IDs, or private checkpoints.
+Telegram IDs, exact message bindings, delivered identities, or ingress state.
 
 The connector boundary remains neutral. Herdres sends Tendwire only bounded
 canonical character ranges, Tendwire-issued stable public identities/tokens
 and job keys, leased `source_ref` values, and neutral outcome or reason codes.
 It never sends Telegram chat/topic/message IDs, bot tokens or routing, or
-provider error prose to Tendwire. Tendwire owns canonical content, durable
-final-ready roots, range validation, jobs, leases, ACK/dead-letter state, and
-retention; Herdres owns Telegram formatting and private provider state.
+provider error prose to Tendwire. Tendwire exclusively owns canonical content,
+durable final-ready roots, range validation, connector jobs, leases, attempts,
+recovery, ACK/dead-letter state, and retention. Herdres owns Telegram
+formatting and private provider state.
 
-When Herdres invokes the Tendwire CLI, it builds a child environment that keeps
-public Tendwire overrides but removes Telegram variables and private ingress,
-gateway, managed-bot, state, request-key, and binary-selector variables. This
-prevents inherited bot credentials and private connector paths from crossing
-the process boundary even when an explicit Tendwire command is configured.
+Herdres never invokes a Tendwire CLI or child process. Its bounded client talks
+only to the configured owner-private AF_UNIX daemon endpoint, so no inherited
+Telegram credentials, private connector paths, child environment, or process
+output crosses the boundary.
 
 ## Inbound command request identity
 
@@ -61,18 +62,16 @@ persist the resulting exact bytes, and reuses the same request ID. No other
 status, route change, transcription, or worker observation may rebuild the
 request.
 
-Herdres treats the Tendwire schema-v2 disposition and the CLI exit/body pair as
-one authority. It requires the exact response field set and request
-correlation, validates public pruning and the complete
-disposition/`ok`/`status`/result/error tuple, and accepts only exit `0` with
-`ok: true` or exit `1` with `ok: false`. Status alone is not authority:
+Herdres treats the correlated Tendwire AF_UNIX response as the only command
+authority. It requires the exact negotiated schema-v2 or schema-v3 field set,
+validates public pruning and the complete
+disposition/`ok`/`status`/result/error tuple. Status alone is not authority:
 `backend_unavailable` plus `no_receipt` is retryable, whereas
-`backend_unavailable` plus `terminal_rejected` is terminal. Exit `2`,
-timeout, malformed or non-UTF-8 output, a wrong field/correlation/tuple, or an
-exit/body mismatch supplies no proven schema-v2 envelope. Herdres keeps that
-process evidence private, exposes no marker/stdout/stderr, forges no
-disposition, and retries only the already durable request within its fixed
-deadline.
+`backend_unavailable` plus `terminal_rejected` is terminal. A pre-send socket
+failure is definite; timeout, EOF, malformed or non-UTF-8 data, or a wrong
+field/correlation/tuple after request start supplies no proven response and is
+transport ambiguity. Herdres forges no disposition and retries only the
+already durable request within its fixed deadline.
 
 `HERDRES_COMMAND_RETRY_HORIZON_SECONDS` defaults/falls back to `86400` seconds
 and clamps to `60` through `604800`. The stored deadline is first-seen plus
@@ -88,7 +87,7 @@ An authoritative `terminal_uncertain`, deadline expiry, or corrupt/conflicting
 receipt evidence is quarantined (locally dead-lettered) rather than retried
 forever. Terminal rejection and quarantine cache the fixed sanitized reply
 `Could not send safely. Refresh status and choose the target again.` in an
-`advance` child outcome. The gateway sends the reply, advances the stable
+`advance` terminal outcome. The gateway sends the reply, advances the stable
 polling offset, and permits later updates; restart/redelivery reuses the cache
 without a Tendwire call. This local ingress quarantine is distinct from
 Tendwire's final-delivery dead-letter queue.
@@ -108,19 +107,20 @@ recovery operation.
 ## Final delivery ambiguity
 
 Dead-letter inspection is bounded and public-safe, and retry selects one exact
-public `final_identity`; neither surface exposes Herdres's private checkpoint
-or Telegram routing. Provider acceptance without a recorded receipt remains
-ambiguous, so an explicit retry may duplicate a Telegram operation and must
-not be represented as provider-perfect exactly-once.
+public `final_identity`; neither surface exposes Herdres's exact Telegram
+bindings, delivered identities, or provider routing. Provider acceptance
+without an exact message binding remains ambiguous, so an explicit retry may
+duplicate a Telegram operation and must not be represented as provider-perfect
+exactly-once.
 
 The `final_ready` materialization-root payload uses exact integer
 `schema_version: 2` and carries an exact public opaque `stable_key` plus integer
 `stable_key_version: 1`. That pair binds retained work to the accepted worker
-continuity identity; it is protocol metadata, not a private checkpoint or
-secret. A schema-v1 root cannot authorize routing through reusable `worker_id`
-or `space_id` values alone. Canonical descriptors and the public identity pair
-may cross this boundary; Telegram routing, credentials, message state, and
-private checkpoints never do.
+continuity identity; it is protocol metadata, not a private Telegram binding,
+delivered identity, or secret. A schema-v1 root cannot authorize routing through
+reusable `worker_id` or `space_id` values alone. Canonical descriptors and the
+public identity pair may cross this boundary; Telegram routing, credentials,
+message state, exact bindings, and delivered identities never do.
 
 ## Stable worker handle boundary
 
@@ -145,7 +145,7 @@ who can alter Tendwire's public output can supply an exact-format spoof.
 Tendwire alone owns the 32-byte installation key used to derive handles.
 Herdres never reads or stores that key, never receives raw pane or terminal
 identity, never queries Herdr, and has no way to recompute or verify a handle.
-Protect the local Tendwire CLI/daemon boundary and its output from untrusted
+Protect the local Tendwire daemon boundary and its output from untrusted
 writers.
 
 Tendwire keeps its continuity triplet at `data_dir/installation.key`, the
@@ -176,9 +176,9 @@ binding topic directly or through its matching Tendwire source-space topic.
 
 A one-time migration can annotate only an unambiguous, live absent-identity or
 legacy-24 entry for the same compatible current valid-v1 worker. It preserves
-the existing topic, message bindings, and delivery ledgers and does not replay
-already delivered turns. Ambiguity or a failed sanity check is quarantined
-instead of being rebound.
+the existing topic, exact message bindings, and delivered identities used for
+deduplication and does not replay already delivered turns. Ambiguity or a failed
+sanity check is quarantined instead of being rebound.
 
 Normal verification:
 
